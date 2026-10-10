@@ -369,6 +369,12 @@ def test_worker_prompt_bounds_disk_usage_scans():
         assert part in text, part
 
 
+def test_worker_prompt_quotes_log_tail_before_diagnosing_a_failed_job():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("exit code alone never names its cause", "quote its last 20 log lines", "first error line", "base the cause on them"):
+        assert part in text, part
+
+
 def test_worker_prompt_ci_wait_wakes_on_a_hung_job():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("`ttp ci --repo <owner/repo> --branch <branch>`", "exits 0 when a job hangs", "`hung:` line",

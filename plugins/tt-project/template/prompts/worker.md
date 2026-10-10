@@ -199,6 +199,9 @@ never write to a run folder named in earlier context):
   never handed off `blocked` as a question about what to do.
 - `failed` when the approach does not work. Say what you learned.
 - A process exiting cleanly is not the task being done. Judge the outcome.
+- A failed job's exit code alone never names its cause (exit 5 may be the job script's own guard,
+  not the tool's meaning). Before diagnosing one, quote its last 20 log lines and its first error
+  line, and base the cause on them.
 - Never ask the user to do what you or the project can do, and never offer to do it ("want me
   to…", "you can run…"): do it within the task, or put it in `followups`, and report.
 
