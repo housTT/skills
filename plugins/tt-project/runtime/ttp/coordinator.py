@@ -81,7 +81,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
-            "waits_on": {"type": "string"}, "heal": {"type": ["object", "null"]}},
+            "waits_on": {"type": "string"}, "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -945,10 +945,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     old = None
                 # A task on another branch carries it (worktree on it, `ttp push --own` onto it): one a
                 # `pr_branch: <branch>` line names, else a finished task's work branch the spec names.
-                # Failed or cancelled work is continued then (taken over); done work is not.
+                # Failed or cancelled work is continued then (taken over); done work is not. A follow-up
+                # carries only a branch its own `pr_branch:` line names: a branch it merely mentions
+                # (the work it lands elsewhere) would make `ttp push` refuse it.
                 spec_text = a.get("spec") or ""
                 given = None if review else SPEC_PR_BRANCH.search(spec_text)
-                carried = None if review or given else _named_branch(db, spec_text)
+                carried = None if review or given or followup else _named_branch(db, spec_text)
                 if carried and old and old["id"] == carried[0]["id"]:
                     carried = None   # it continues that branch's task already
                 elif carried and a.get("continues") is None and carried[0]["status"] in ("failed", "cancelled"):
@@ -964,6 +966,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
+                # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
+                # it says it carries none (`pr_branch: ""`) or names only the push branch to land on.
+                inherited = push.pr_branch_of(p, old) if old and not onto else ""
+                if inherited and (a.get("pr_branch") == "" or _lands_on_push_branch(cfg, spec_text, inherited)):
+                    labels.append(worktree.NO_PR_BRANCH)
                 after, when = _start_args(a, {}, p)
                 labels += defer_labels(after, when, start_why(a, {}, when))
                 stale = marker_only_probe(when)
@@ -996,6 +1003,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
                                  f"so `ttp push --own` publishes onto it")
+                if worktree.NO_PR_BRANCH in labels:
+                    notes.append(f"task_add: #{new_id} continues #{old['id']} but not its branch {inherited}: "
+                                 f"it delivers to the push branch with `ttp push`")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if pr_ask:
@@ -1049,6 +1059,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         prev = load_result(upd.get("result") or task["result"])
                         prev.pop("waiting_since", None)
                         upd["result"] = dump_result(prev)
+                if a.get("pr_branch") == "":
+                    # Carries no branch (its own label or one inherited through `continues`): it delivers
+                    # to the push branch.
+                    if task["status"] in ("running", *TERMINAL_TASK_STATES):
+                        raise ValueError(f"task #{task['id']} is {task['status']}: its branch changes only before "
+                                         f"it starts; add a new one with continues and pr_branch \"\"")
+                    labels = upd.get("labels")
+                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+                    upd["labels"] = [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(
+                        ("pr_branch:", "rebases:")) or lb == worktree.NO_PR_BRANCH)] + [worktree.NO_PR_BRANCH]
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
@@ -1469,6 +1489,14 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
 SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:\s*[`'\"]?([A-Za-z0-9][\w./-]*[\w-])")
+
+
+def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:
+    """Whether `spec` names the push branch (delivery.push_branch, with or without its remote) and not
+    `branch`: the task lands its work there, not on the branch a task it continues carried."""
+    ref = str((cfg.get("delivery") or {}).get("push_branch") or "").strip()
+    return bool(ref) and not names_branch(spec, branch) and \
+        any(names_branch(spec, r) for r in {ref, ref.partition("/")[2]} if r)
 
 
 def _named_branch(db, spec: str) -> tuple[dict, str] | None:

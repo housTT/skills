@@ -1232,11 +1232,14 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
 def pr_branch_of(p: Project, task: dict | None) -> str:
     """The branch a task's `pr_branch:` label delivers onto (worktree.carried_branch), its own branch
     when it rebases one (`rebases:<branch>`: a rebase cannot fast-forward the old branch), or that of
-    the task it continues (a fix of a failed review's findings builds on that task's work), or ""."""
+    the task it continues (a fix of a failed review's findings builds on that task's work), or "".
+    A task labelled worktree.NO_PR_BRANCH carries none, whatever the tasks it continues carry."""
     from .db import continues_id
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
+        if worktree.NO_PR_BRANCH in _labels(task):
+            return ""
         if onto := worktree.carried_branch(task):
             return onto
         if worktree.rebased_branch(task) and (onto := str(task.get("branch") or "")):

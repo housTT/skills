@@ -29876,6 +29876,70 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
         assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], title
 
 
+def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
+    """A follow-up (`continues` on a done task) that names a finished task's branch but has no
+    `pr_branch:` line carries no branch, so it lands on the push branch with `ttp push`; one with its
+    own line carries that branch. A continuation of a failed task keeps the branch that task carried,
+    unless its spec names only the push branch or the coordinator sets `pr_branch` to "" (task_add, or
+    task_update before it starts): then it carries none (push.pr_branch_of)."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import push
+
+    def task(title):
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    def labels(title):
+        return json.loads(task(title)["labels"])
+
+    p.set_config("delivery.push_branch", "origin/proj")
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    b = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", branch=b)
+    rev = p.db.add_task("Review the loader", "s", kind="review")
+    p.db.update_task(rev, status="done")
+    # A follow-up naming the done task's branch as where its commit comes from: no label.
+    assert coord.apply(p, [{"type": "task_add", "title": "Land the last commit", "kind": "code", "continues": rev,
+                            "spec": f"Cherry-pick the last commit of {b} and land it on proj with `ttp push`."}]) == []
+    assert labels("Land the last commit") == []
+    assert push.pr_branch_of(p, task("Land the last commit")) == ""
+    # A follow-up with its own line carries that branch.
+    assert coord.apply(p, [{"type": "task_add", "title": "Fix the loader PR", "kind": "code", "continues": rev,
+                            "spec": f"pr_branch: `{b}`\nFix the PR's CI."}]) == []
+    assert labels("Fix the loader PR") == [f"pr_branch:{b}"]
+    # A continuation of a failed task keeps the branch that task carried.
+    gone = p.db.add_task("Fix the feature PR", "s", kind="code", labels=["pr_branch:feature/x"])
+    p.db.update_task(gone, status="failed", branch=f"ttp/t{gone}-fix-the-feature-pr")
+    assert coord.apply(p, [{"type": "task_add", "title": "Feature PR again", "kind": "code", "continues": gone,
+                            "spec": "Finish the CI fix."}]) == []
+    assert labels("Feature PR again") == [f"continues:{gone}"]
+    assert push.pr_branch_of(p, task("Feature PR again")) == "feature/x"
+    # A redo of a cancelled, mislabelled task whose spec names only the push branch carries none.
+    bad = p.db.add_task("Land the entry", "s", kind="code", labels=[f"pr_branch:{b}"])
+    p.db.update_task(bad, status="cancelled")
+    assert coord.apply(p, [{"type": "task_add", "title": "Land the entry, redo", "kind": "code", "continues": bad,
+                            "spec": "Land the entry on proj with `ttp push`; this task has no PR-branch label."}]) == []
+    redo = task("Land the entry, redo")
+    assert labels("Land the entry, redo") == [f"continues:{bad}", "no_pr_branch"]
+    assert push.pr_branch_of(p, redo) == "" and push.pr_elsewhere(p, redo, p.config()["delivery"]) == ""
+    assert any(f"#{redo['id']} continues #{bad} but not its branch {b}" in n for n in p.db.kv(coord.NOTES_KEY))
+    # Or the coordinator says so: pr_branch "" on task_add ...
+    bad2 = p.db.add_task("Land the docs", "s", kind="code", labels=["pr_branch:feature/x"])
+    p.db.update_task(bad2, status="cancelled")
+    assert coord.apply(p, [{"type": "task_add", "title": "Land the docs, redo", "kind": "code", "continues": bad2,
+                            "pr_branch": "", "spec": "Land the docs."}]) == []
+    assert push.pr_branch_of(p, task("Land the docs, redo")) == ""
+    # ... or on task_update before it starts, which also drops its own label; never once it runs.
+    assert coord.apply(p, [{"type": "task_update", "id": task("Feature PR again")["id"], "pr_branch": ""},
+                           {"type": "task_update", "id": task("Fix the loader PR")["id"], "pr_branch": ""}]) == []
+    assert labels("Feature PR again") == [f"continues:{gone}", "no_pr_branch"]
+    assert labels("Fix the loader PR") == ["no_pr_branch"]
+    assert push.pr_branch_of(p, task("Feature PR again")) == ""
+    p.db.update_task(task("Land the docs, redo")["id"], status="running")
+    problems = coord.apply(p, [{"type": "task_update", "id": task("Land the docs, redo")["id"], "pr_branch": ""}])
+    assert problems and "running" in problems[0]
+
+
 def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
     """A spec's `pr_branch:` line labels the task with the branch right after it, backticks or quotes
     aside, even with more text on the same line, and writes no note about it. A label that is not a

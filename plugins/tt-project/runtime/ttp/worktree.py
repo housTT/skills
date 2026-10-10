@@ -127,6 +127,11 @@ def valid_branch(name: str) -> bool:
     return _VALID_BRANCHES[name]
 
 
+# A task that carries no branch, even one the task it continues carries (push.pr_branch_of): a redo
+# of a mislabelled task that lands on the push branch.
+NO_PR_BRANCH = "no_pr_branch"
+
+
 def carried_branch(task: dict) -> str:
     """The branch a task's `pr_branch:<branch>` label names (it delivers onto it), or "" (also when
     the label's value is not a valid branch name: valid_branch)."""
