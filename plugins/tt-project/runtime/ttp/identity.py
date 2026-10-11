@@ -69,7 +69,8 @@ def mark_tick(state: Path, receipt: dict, first: bool) -> None:
     f = state / TICK_FILE
     try:
         if first or not f.exists():
-            f.write_text(json.dumps({"instance": receipt.get("instance"), "pid": receipt.get("pid")}))
+            from .project import durable_write
+            durable_write(f, json.dumps({"instance": receipt.get("instance"), "pid": receipt.get("pid")}))
         else:
             os.utime(f, None)
     except OSError:
