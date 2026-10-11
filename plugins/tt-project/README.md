@@ -441,9 +441,11 @@ and preferences you add later become part of the project's charter and memory.
   a priority-1 review's approval starts at once; 0 = off), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
-  with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION`, `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`,
-  `TTP_PUSH_BATCH` and `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never
-  fails the reviews: their change is already on the branch. It also runs, queue on or off, after
+  with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION` (the version `version_bump` reads at the pushed
+  commit; empty without `version_bump`), `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`, `TTP_PUSH_BATCH` and
+  `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never fails the reviews:
+  their change is already on the branch. A malformed `after_push` (a scalar such as `true`) counts
+  as a failed one. It also runs, queue on or off, after
   each `ttp push` or `ttp push --detach` that pushed to the push branch (never after `--own`), with
   `TTP_PUSH_RECEIPT` instead of `TTP_PUSH_BATCH`: a receipt under the project's state records it,
   a detached push runs it once its outcome is written and its locks are let go, and the daemon

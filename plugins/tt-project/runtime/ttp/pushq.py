@@ -1064,7 +1064,7 @@ def _after_push_set(p: Project, cfg: dict | None) -> bool:
     if v is None or str(v).strip().lower() in ("", "none"):
         return False
     try:
-        return bool(push.check_list(v))
+        return bool(push.scalar_problem(v) or push.check_list(v))   # a malformed one fails, so it is on
     except (TypeError, ValueError):
         return True
 
@@ -1139,7 +1139,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             took = float(ap.get("ended") or 0) - float(ap.get("started") or 0)
             _event(p.db, None, "after_push_ok", f"after_push of {what} succeeded"
                                                 + (f" in {took:.0f} s" if took > 0 else ""), queued=False)
-            p.db.set_kv(AFTER_PUSH_OK, now)
+            p.db.set_kv(AFTER_PUSH_OK, max(now, time.time()))   # after an alert an older receipt raised this tick
         elif status != "skipped":
             how = {"failed": f"failed (exit {ap.get('exit')})", "timeout": "timed out",
                    "killed": "stopped before it finished"}.get(status, status)

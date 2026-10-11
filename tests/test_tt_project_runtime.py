@@ -16506,6 +16506,68 @@ def test_an_after_push_whose_process_died_is_reported_as_killed(env, monkeypatch
     assert json.loads((folder / "p1.json").read_text())["after_push"]["status"] == "killed"
 
 
+def test_a_newer_ok_receipt_clears_an_after_push_failure_an_older_one_raised_in_the_same_tick(env, monkeypatch):
+    """The tick's `now` is earlier than the alert an older failed receipt raises in that tick: the
+    success a newer receipt records must still count as after it."""
+    from ttp import alerts as alerts_mod, pushq
+    p = make(env)
+    folder = p.state / "after_push"
+    folder.mkdir(parents=True)
+    for rid, status in (("p1", "failed"), ("p2", "ok")):
+        (folder / f"{rid}.json").write_text(json.dumps({
+            "id": rid, "status": "finished", "pushed_sha": "a" * 40, "target": "origin/proj",
+            "after_push": {"status": status, "exit": 3 if status == "failed" else 0}}))
+    raised = []
+    assert pushq.tend_receipts(p, lambda key, text, **k: raised.append(time.time()),
+                               now=time.time() - 5) == ["p1", "p2"]
+    assert len(raised) == 1
+    assert not alerts_mod.holds(p.db, "after_push_failed", raised[0], time.time()), "the newer success clears it"
+
+
+def test_an_ordinary_push_gives_after_push_the_version_at_the_pushed_commit(env, monkeypatch):
+    from ttp import push
+    seen = env["tmp"] / "version.txt"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", [f"echo \"v=$TTP_PUSHED_VERSION\" > {seen}"])
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0 and push.last_after["status"] == "ok"
+    assert seen.read_text().strip() == "v=0.1.0"
+    assert _receipts(p)[0]["version"] == "0.1.0"
+    p.set_config("delivery.version_bump", None)   # no version_bump: no version to give
+    _commit(repo, "two.txt", "two\n")
+    assert push.run(p, repo) == 0
+    assert seen.read_text().strip() == "v="
+
+
+def test_a_malformed_after_push_is_recorded_as_a_failure_that_alerts(env, monkeypatch, capsys):
+    from ttp import push, pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", 5)
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0, "the push stands"
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    assert push.last_after["status"] == "failed" and "not a list" in push.last_after["tail"]
+    (r,) = _receipts(p)
+    assert r["status"] == "finished" and r["after_push"]["status"] == "failed"
+    raised = []
+    pushq.tend_receipts(p, lambda key, text, **k: raised.append(key))
+    assert raised == ["after_push_failed"]
+    assert pushq._after_push_set(p, None), "a malformed after_push is not off: its failure stands"
+    # A value that makes reading the commands raise is recorded the same way.
+    p.set_config("delivery.after_push", ["./deploy"])
+    real = push.check_list
+
+    def check_list(v):
+        if v == ["./deploy"]:
+            raise ValueError("bad entry")
+        return real(v)
+    monkeypatch.setattr(push, "check_list", check_list)
+    _commit(repo, "two.txt", "two\n")
+    assert push.run(p, repo) == 0 and push.last_after["status"] == "failed"
+    pushq.tend_receipts(p, lambda key, text, **k: raised.append(key))
+    assert raised == ["after_push_failed"] * 2 and "bad entry" in _receipts(p)[-1]["after_push"]["tail"]
+
+
 def test_a_detached_push_runs_after_push_once_its_outcome_is_written_and_its_locks_are_let_go(env, monkeypatch, capsys):
     seen = env["tmp"] / "after_push.txt"
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])

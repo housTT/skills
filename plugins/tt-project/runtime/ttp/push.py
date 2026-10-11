@@ -1619,6 +1619,20 @@ def _version(repo: Path, rev: str, path: str) -> str:
     return str(v or "")
 
 
+def pushed_version(p: Project, repo: Path, rev: str) -> str | None:
+    """The version `delivery.version_bump` reads at `rev` (its first file), or None when it is not
+    set, malformed or has no version there (TTP_PUSHED_VERSION is then empty)."""
+    try:
+        cfg = bump_of((p.config().get("delivery") or {}).get("version_bump"))
+    except ValueError:
+        return None
+    if not cfg:
+        return None
+    show = _git(repo, "show", f"{rev}:{cfg['files'][0]}")
+    m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
+    return ".".join(m.group(2, 3, 4)) if m else None
+
+
 def stale_versions(repo: Path, tip: str) -> list[str]:
     """Plugins under `plugins/<name>/` whose content HEAD changes since `tip` while a manifest
     keeps tip's version, as "plugins/<name> <version>". Two changes that each bumped to the same
@@ -2514,14 +2528,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     if rc == 0:
         sha = (None if own else last_pushed) or _git(top, "rev-parse", "HEAD").stdout.strip() or None
     if rc == 0 and not own:
-        try:
-            cfg = bump_of((p.config().get("delivery") or {}).get("version_bump"))
-        except ValueError:
-            cfg = None
-        if cfg:
-            show = _git(top, "show", f"{sha or 'HEAD'}:{cfg['files'][0]}")
-            m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
-            version = ".".join(m.group(2, 3, 4)) if m else None
+        version = pushed_version(p, top, sha or "HEAD")
     sys.stdout.flush()
     sys.stderr.flush()
     try:
@@ -2553,8 +2560,9 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
 
 def after_set(p: Project) -> bool:
     """Whether `delivery.after_push` names a command (a malformed value counts: it fails loudly)."""
+    v = (p.config().get("delivery") or {}).get("after_push")
     try:
-        return bool(check_list((p.config().get("delivery") or {}).get("after_push")))
+        return bool(scalar_problem(v) or check_list(v))
     except (TypeError, ValueError):
         return True
 

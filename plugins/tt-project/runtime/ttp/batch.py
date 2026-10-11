@@ -1090,10 +1090,15 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     """Step 12: run `delivery.after_push` at the pushed commit, in a fresh detached worktree, under
     `delivery.after_push_timeout_s`. Its output goes to the batch log."""
     d = p.config().get("delivery") or {}
-    cmds = push.check_list(d.get("after_push"))
     sha = m.get("pushed_sha")
     if m.get("outcome") != "pushed" or not sha:
         return {"status": "skipped", "reason": "nothing was pushed"}
+    if why := push.scalar_problem(d.get("after_push")):   # malformed (true, 5): a failure, never a quiet skip
+        say(f"after_push: delivery.after_push: {why}")
+        now = time.time()
+        return {"status": "failed", "exit": None, "cmd": None, "started": now, "ended": now,
+                "tail": f"delivery.after_push: {why}"}
+    cmds = push.check_list(d.get("after_push"))
     if not cmds:
         return {"status": "skipped", "reason": "delivery.after_push is not set"}
     timeout = _seconds(d.get("after_push_timeout_s"), DEFAULT_AFTER_PUSH_TIMEOUT_S)
@@ -1159,8 +1164,9 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
     """Run `delivery.after_push` after an ordinary or detached `ttp push` that pushed `sha` to
     `target` (a batch runs its own). A receipt under the project's state records it before it starts
     and how it ended; the daemon turns it into an event, and an alert when it failed
-    (pushq.tend_receipts). Its failure never changes the push. None when after_push is not set."""
-    if not push.check_list((p.config().get("delivery") or {}).get("after_push")):
+    (pushq.tend_receipts). Its failure never changes the push. None when after_push is not set; a
+    malformed one is recorded as a failure, so it alerts."""
+    if not push.after_set(p):
         return None
     rid = f"p{time.strftime('%Y%m%dT%H%M%S')}-{sha[:10]}-{secrets.token_hex(2)}"
     folder = p.state / RECEIPTS
@@ -1171,6 +1177,10 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
     m = {"v": 1, "kind": "push", "id": rid, "status": "running", "outcome": "pushed", "pushed_sha": sha,
          "target": target, "tip": tip, "repo": str(repo), "task": task, "pid": os.getpid(), "boot": boot_id(),
          "started": time.time(), "results": [{"task": task, "status": "pushed"}] if task else []}
+    try:
+        m["version"] = push.pushed_version(p, repo, sha)
+    except Exception:      # an unreadable version leaves TTP_PUSHED_VERSION empty; the deploy still runs
+        m["version"] = None
     lock = locks.try_take([_after_lock(p, rid)], f"after_push of {sha[:10]}", "ttp push")
     write_json(receipt, m)
     try:
