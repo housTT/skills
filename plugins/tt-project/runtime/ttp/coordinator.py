@@ -184,7 +184,6 @@ EFFORT_EVENT_TRIGGERS = {
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
     "charter_conflict": "conflict", "charter_retry": "conflict",
-    "setup_question": "conflict",   # the charter allows pushes a user-only setting refuses (settinghold)
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
@@ -889,6 +888,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
     turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
     new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
+    cfg_refused: dict[str, str] = {}   # config_set key -> why it was rejected (sorted first, so memory_add sees it)
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
@@ -1226,7 +1226,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
-                added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
+                text = _unapplied_config_note(a["text"], cfg_refused)
+                if text != a["text"]:
+                    notes.append("memory_add: noted in the entry that a config_set it names was rejected")
+                added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
                                      end=ends.from_action(a), standing=a.get("standing") is True)
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
@@ -1361,8 +1364,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if key == "delivery.fast_forward_also":
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "", [])):
-                    raise ValueError(f"{key} needs the user's approval: ask_user (blocking {NEEDS_USER[key]}) with the "
-                                     f"exact value, and set it in the turn that carries their yes")
+                    open_ask = settinghold.asked(db, key)
+                    raise ValueError(f"{key} needs the user's approval: "
+                                     + (f"open ask #{open_ask} already asks; " if open_ask else
+                                        f"ask_user (blocking {NEEDS_USER[key]}) with the exact value, and ")
+                                     + "set it in the turn that carries their yes")
                 p.set_config(key, value)
                 cfg = p.config()
             elif t == "resource_pause":
@@ -1388,6 +1394,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+            if t == "config_set" and a.get("key"):
+                cfg_refused[str(a["key"])] = str(e)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)
         now_labels = json.loads((db.task(before["id"]) or before)["labels"] or "[]")
@@ -1406,6 +1414,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         db.x(f"UPDATE messages SET text=text||? WHERE id IN ({','.join('?' * len(replies))})",
              [f"\n\n(not done: {note})", *replies])
     return problems
+
+
+def _unapplied_config_note(text: str, refused: dict[str, str]) -> str:
+    """A memory entry naming a setting whose config_set this turn was rejected (by its dotted key or
+    last part) says so, so it can never read as if the change took effect."""
+    for key, why in refused.items():
+        if re.search(rf"(?<!\w){re.escape(key.rpartition('.')[2])}(?!\w)", text):
+            text = (f"{text.rstrip()}\n\n(Not in effect: config_set {key} was rejected in the same turn, so the "
+                    f"setting is unchanged: {clip(' '.join(why.split()), 200)})")
+    return text
 
 
 def _delivery_kind(kind: str, text: str) -> tuple[str, str | None]:

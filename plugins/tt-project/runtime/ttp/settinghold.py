@@ -18,10 +18,12 @@ Work that already ran joins the same hold: a blocked task a worker handed off na
 has a push step still runs while the hold stands, as review only (`prompt_line`): it hands off blocked
 naming the setting, so it is held and pushes once released.
 
-When the charter says pushes there need no approval while the setting is off and nothing asks about
-it, `setup_question` raises one `setup_question` event for the coordinator to ask the user once, instead
-of every landing task finding the refusal for itself. It fires once per setting state (the push branch
-and the charter's wording), never per tick.
+When the charter grants pushes there (they are allowed, or need no approval; the verbatim Brief is the
+user's own word) while the setting is off and nothing asks about it, `setup_question` asks the user
+itself, model-free: one ask (blocking restriction) naming the setting, raised at setup or the first
+tick after a charter or delivery edit, instead of every landing task, or the coordinator's config_set,
+finding the refusal for itself days later. It fires once per grant (the push branch and the charter's
+wording), never per tick or turn. It never turns the setting on: the user's yes to the ask does.
 """
 from __future__ import annotations
 
@@ -48,6 +50,11 @@ _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 _PUSH = re.compile(r"\bpush(?:es|ed|ing)?\b", re.I)
 _NO_APPROVAL = re.compile(r"\b(?:no|not|without|never)\b[^.!?\n]{0,40}?\b(?:approval|permission|asking|ask)\b", re.I)
 _FORBIDS = re.compile(r"\b(?:never|do not|don't|must not|may not)\s+(?:force-)?push", re.I)
+# A grant in plain words ("pushing to main is allowed", "you may push to main"), read only in a sentence
+# with no negation at all, so "not allowed" or "only after approval ... may not" never counts.
+_GRANTS = re.compile(r"\b(?:allowed|permitted|ok|okay|fine|free to|go ahead)\b|\b(?:may|can)\s+(?:\w+\s+){0,2}?push",
+                     re.I)
+_ONLY_IF = re.compile(r"\b(?:only|unless|until|except)\b", re.I)   # a conditional grant is not a standing one
 
 
 def _allow_protected(cfg: dict) -> bool:
@@ -207,23 +214,40 @@ def prompt_line(db, cfg: dict, task: dict, repo: Path | None = None) -> str:
 
 
 def charter_says_no_approval(charter: str, push_branch: str = "") -> str:
-    """The charter sentence saying pushes to main, master, the default branch or the push branch need
-    no approval (and not forbidding them), or ""."""
+    """The charter sentence granting pushes to main, master, the default branch or the push branch:
+    they need no approval, or are allowed in plain words with no negation or condition in the
+    sentence (and it does not forbid them), or ""."""
     names = {"main", "master"} | {n for n in (push_branch, push_branch.partition("/")[2]) if n}
     target = re.compile(r"\b(?:default|push)[ \t]+branch\b|(?<![\w/-])(?:"
                         + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")(?![\w/-])", re.I)
     for s in _SENTENCE.split(charter or ""):
         s = " ".join(s.split())
-        if _PUSH.search(s) and target.search(s) and _NO_APPROVAL.search(s) and not _FORBIDS.search(s):
+        if not _PUSH.search(s) or not target.search(s) or _FORBIDS.search(s):
+            continue
+        if _NO_APPROVAL.search(s) or (_GRANTS.search(s) and not NEGATION.search(s) and not _ONLY_IF.search(s)):
             return s
     return ""
 
 
+def _section(charter: str, line: str) -> str:
+    """The `## ` heading of the charter section holding the granting sentence (its first words), or ""."""
+    head, words = "", " ".join(line.split()[:6])
+    for raw in (charter or "").splitlines():
+        if raw.startswith("## "):
+            head = raw[3:].strip()
+        elif words and words in " ".join(raw.split()):
+            return head
+    return ""
+
+
 def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = None) -> str:
-    """Raise one `setup_question` event when the charter says pushes to the push branch need no
-    approval but delivery.allow_protected_push_branch is off and refuses it, and no open ask names
-    it. Once per setting state (push branch and charter wording): the state is recorded even while an
-    ask is open, so a later answer is not asked again. Returns the event text, or ""."""
+    """Ask the user once, model-free, when the charter grants pushes to the push branch but
+    delivery.allow_protected_push_branch is off and refuses it, and no open ask names it: one ask
+    (blocking restriction) naming the setting, so landing tasks are held on it until the answer. Once
+    per grant (push branch and charter wording): the state is recorded even while an ask is open, so a
+    later answer is not asked again. The setting stays off: only the user's yes turns it on. Returns
+    the ask's text, or ""."""
+    from .prguard import BLOCKING_REF
     key = "delivery.allow_protected_push_branch"
     on, applies = SETTINGS[key]
     branch = _push_branch(cfg)
@@ -231,6 +255,13 @@ def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = 
     if not line or not applies(cfg, repo):
         return ""
     fp = hashlib.sha256(f"{key}\n{branch}\n{line}".encode()).hexdigest()[:16]
+    where = _section(charter, line)
+    said = (f"The charter's {where} (your own words)" if where.lower().startswith("brief")
+            else f"The charter{f' ({where})' if where else ''}")
+    text = (f"{said} allows pushes to {branch}: \"{line[:300]}\". But {key} is off, so `ttp push` refuses "
+            f"every push there and reviewed work cannot land. Turn {key} on? Reply yes to turn it on, or no to "
+            f"keep it off (then the charter's grant should be reworded). Until you answer, push and landing "
+            f"tasks wait on this question without spending runs.")
     with db.tx():
         seen = db.kv(SETUP_KEY, {}) or {}
         if seen.get(key) == fp:
@@ -239,13 +270,13 @@ def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = 
         db.set_kv(SETUP_KEY, seen)
         if asked(db, key) is not None:
             return ""
-        text = (f"Setup question: the charter says pushes to {branch} need no approval (\"{line[:300]}\"), but "
-                f"{key} is off, so `ttp push` refuses every push there and each push or landing task would spend "
-                f"a run on that refusal. Ask the user once (ask_user, blocking restriction) whether to turn it "
-                f"on, naming {key} in the ask: while it is open every push or landing task is held on it, and "
-                f"the setting turning on or the ask being resolved releases them all.")
+        mid = db.post("out", text[:1500], chat=None, kind="ask", severity="high",
+                      ref=f"{BLOCKING_REF}restriction")
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-             (now, "daemon", SETUP_EVENT, "normal", text[:1000], "queued"))
+             (now, "daemon", SETUP_EVENT, "low",
+              f"Setup ask #{mid} raised by the daemon: the charter grants pushes to {branch} but {key} is off. "
+              f"Do not ask again; when the user answers yes, config_set {key} true in that turn and resolve "
+              f"#{mid}; on no, resolve it and keep landing work review only.", "queued"))
     return text
 
 

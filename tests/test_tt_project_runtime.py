@@ -37488,11 +37488,12 @@ def test_setting_hold_applies_only_to_a_push_branch_the_setting_refuses(env, tmp
 
 
 def test_setting_setup_question_fires_once_per_setting_state(env):
-    """A charter saying pushes to the push branch need no approval, while
-    delivery.allow_protected_push_branch is off and refuses that branch and no ask names it, raises
-    one setup_question event: not again on later ticks or after a restart, again only for a new wording."""
+    """A charter granting pushes to the push branch, while delivery.allow_protected_push_branch is off and
+    refuses that branch and no ask names it, makes the daemon itself raise one ask (blocking restriction)
+    naming the setting: not again on later ticks or after a restart, again only for a new wording. The
+    setting stays off, and the open ask holds landing tasks."""
     from ttp import coordinator as coord
-    from ttp import settinghold
+    from ttp import prguard, settinghold
     from ttp.daemon import Daemon
     p = make(env)
     _remote_origin(p)
@@ -37500,7 +37501,7 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
     base = p.charter_path.read_text()
 
     def asked():
-        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=?", (settinghold.SETUP_EVENT,))]
+        return [m for m in p.db.q("SELECT * FROM messages WHERE kind='ask' AND direction='out' ORDER BY id")]
     # No such charter line: nothing.
     Daemon(p.base).sweep_holds()
     assert asked() == []
@@ -37510,21 +37511,26 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
     d.sweep_holds()
     Daemon(p.base).sweep_holds()   # a restart
     got = asked()
-    assert len(got) == 1 and "delivery.allow_protected_push_branch" in got[0] and "origin/main" in got[0], got
-    assert coord.EFFORT_EVENT_TRIGGERS[settinghold.SETUP_EVENT]
-    # A new wording is a new state: asked once more. An open ask naming the setting records it unasked.
+    assert len(got) == 1 and "delivery.allow_protected_push_branch" in got[0]["text"], got
+    assert "origin/main" in got[0]["text"] and got[0]["ref"] == f"{prguard.BLOCKING_REF}restriction"
+    assert got[0]["severity"] == "high" and not got[0]["handled"]
+    assert settinghold.SETUP_EVENT not in coord.EFFORT_EVENT_TRIGGERS   # asked already: no high-effort turn
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (settinghold.SETUP_EVENT,))
+    assert len(ev) == 1 and f"#{got[0]['id']}" in ev[0]["text"] and ev[0]["severity"] == "low"
+    assert not p.config()["delivery"].get("allow_protected_push_branch")   # never turned on by itself
+    assert settinghold.active(p.db, p.config(), p.root) == {"delivery.allow_protected_push_branch": got[0]["id"]}
+    # A new wording is a new grant: asked once more once the first ask is answered.
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     p.charter_path.write_text(base + "\n- Pushes to main need no approval.\n")
     Daemon(p.base).sweep_holds()
     assert len(asked()) == 2
-    _setting_ask(p)
+    # An open ask naming the setting records the new wording unasked; answering it does not re-ask.
     p.charter_path.write_text(base + "\n- Pushing to main needs no approval from the user.\n")
     Daemon(p.base).sweep_holds()
     p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     Daemon(p.base).sweep_holds()
     assert len(asked()) == 2
-    # The setting on, an ordinary push branch or a charter forbidding such pushes raises nothing.
-    for line in ("Never push to main without approval.", "Pushes to main are fine without asking anyone."):
-        assert bool(settinghold.charter_says_no_approval(line)) is line.startswith("Pushes"), line
+    # The setting on or an ordinary push branch raises nothing.
     p.charter_path.write_text(base + "\n- Main gets pushes without asking anyone.\n")
     p.set_config("delivery.allow_protected_push_branch", True)
     Daemon(p.base).sweep_holds()
@@ -37532,6 +37538,84 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
     p.set_config("delivery.push_branch", "origin/feature")
     Daemon(p.base).sweep_holds()
     assert len(asked()) == 2
+
+
+@pytest.mark.parametrize("line,grants", [
+    ("Pushes to main are fine without asking anyone.", True),
+    ("Reviewed changes are pushed to main without per-push approval.", True),
+    ("Pushing to main is allowed.", True),
+    ("You may push reviewed work straight to main.", True),
+    ("Work lands on the push branch; pushing there is OK.", True),
+    ("Never push to main without approval.", False),
+    ("Do not push to main.", False),
+    ("Pushing to main is not allowed.", False),
+    ("Pushing to main isn't allowed.", False),
+    ("You may push to main only after I approve.", False),
+    ("Push to main is allowed unless CI is red.", False),
+    ("Pushing reviewed changes to the feature branch is allowed.", False),
+    ("Main is the default.", False),
+    ("Pushing to main can break CI for everyone.", False),
+    ("We can also push to main.", True),
+])
+def test_charter_grant_wording(line, grants):
+    """A grant is a push to main, master, the default or the push branch that needs no approval, or is
+    allowed in plain words with no negation or condition; a prohibition or another branch never is."""
+    from ttp.settinghold import charter_says_no_approval
+    assert bool(charter_says_no_approval(line, "origin/main")) is grants
+
+
+def test_setup_ask_quotes_the_brief_as_the_users_own_words(env):
+    """A grant in the verbatim Brief written at setup is the user's word: the ask, raised on the first
+    tick after setup, says it came from the Brief and quotes it."""
+    from ttp import settinghold
+    from ttp.daemon import Daemon
+    p = make(env)
+    _remote_origin(p)
+    p.set_config("delivery.push_branch", "origin/main")
+    p.charter_path.write_text("# x — charter\n\n## Brief (verbatim from the user)\nBuild the thing. Pushing to "
+                              "main is allowed.\n\n## Goals\nShip it.\n")
+    Daemon(p.base).sweep_holds()
+    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")
+    assert ask and "Brief" in ask["text"] and "your own words" in ask["text"]
+    assert "Pushing to main is allowed." in ask["text"]
+    assert settinghold.active(p.db, p.config(), p.root)
+
+
+def test_rejected_config_set_points_at_the_open_setup_ask(env):
+    """A coordinator config_set of the setting outside a user turn is still rejected, and names the open
+    ask instead of telling the coordinator to ask again."""
+    from ttp import coordinator as coord
+    p = make(env)
+    mid = _setting_ask(p)
+    probs = coord.apply(p, [{"type": "config_set", "key": "delivery.allow_protected_push_branch", "value": True}])
+    assert probs and f"open ask #{mid} already asks" in probs[0], probs
+    assert not p.config()["delivery"].get("allow_protected_push_branch")
+
+
+def test_memory_never_claims_a_rejected_config_change(env):
+    """A memory_add naming a setting whose config_set the same turn was rejected says in the entry that
+    the change is not in effect (whatever the action order); one naming nothing rejected is kept as is."""
+    from ttp import coordinator as coord
+    p = make(env)
+    probs = coord.apply(p, [
+        {"type": "memory_add", "text": "Enabled allow_protected_push_branch: reviewed work lands on main now.",
+         "title": "push to main on"},
+        {"type": "config_set", "key": "delivery.allow_protected_push_branch", "value": True},
+        {"type": "memory_add", "text": "The daily review runs at 09:00.", "title": "review time"}], turn=7)
+    assert any("needs the user's approval" in x for x in probs), probs
+    assert not p.config()["delivery"].get("allow_protected_push_branch")
+    entries = {f.name: f.read_text() for f in p.memory_dir.glob("*.md")}
+    on = next(t for n, t in entries.items() if "push-to-main-on" in n)
+    assert "Not in effect: config_set delivery.allow_protected_push_branch was rejected" in on
+    assert "setting is unchanged" in on
+    other = next(t for n, t in entries.items() if "review-time" in n)
+    assert "Not in effect" not in other
+    # In a user turn the change goes through, and the memory stays as written.
+    coord.apply(p, [{"type": "config_set", "key": "delivery.allow_protected_push_branch", "value": True},
+                    {"type": "memory_add", "text": "delivery.allow_protected_push_branch is on, by the user's yes.",
+                     "title": "user turned it on"}], user_turn=True, turn=8)
+    assert p.config()["delivery"]["allow_protected_push_branch"] is True
+    assert "Not in effect" not in next(f for f in p.memory_dir.glob("*user-turned-it-on*.md")).read_text()
 
 
 def test_a_review_with_a_push_step_runs_review_only_while_a_setting_hold_stands(env):
