@@ -123,6 +123,17 @@ def lands(task: dict, push_branch: str = "") -> bool:
     return any(not _negated(text, m.start()) for text in (title, spec) for m in land_on.finditer(text))
 
 
+def asks_own(task: dict) -> bool:
+    """Whether the task's title or spec tells it to publish with `ttp push --own` (an INSTRUCTION or
+    LINE whose flags hold `--own`, not negated earlier in its sentence): it means to create or update
+    its own branch, not to land on the push branch."""
+    for text, command in ((str(task.get("title") or ""), INSTRUCTION), (str(task.get("spec") or ""), LINE)):
+        for m in command.finditer(text):
+            if "--own" in m.group("flags").split() and not _negated(text, m.start()):
+                return True
+    return False
+
+
 def refused_by(task: dict, holds: dict[str, int], cfg: dict | None = None) -> str | None:
     """The held setting that would refuse this queued task, or None."""
     if "delivery.allow_protected_push_branch" in holds and lands(task, _push_branch(cfg or {})):

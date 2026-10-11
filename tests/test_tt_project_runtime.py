@@ -31106,6 +31106,41 @@ def test_the_review_prompt_keeps_the_own_publish_step_when_the_push_queue_is_on(
     assert "## Publishing onto its own PR branch" in off and "## Approving into the push queue" not in off
 
 
+def test_the_review_of_a_task_whose_pr_branch_is_absent_from_the_remote_delivers_to_the_push_branch(
+        env, monkeypatch):
+    """With the push queue on, a pr_branch the push remote has no branch of is ignored, as the queue's
+    check_approval ignores it: the review gets the usual push step and the label is named as ignored.
+    A task whose spec asks for `ttp push --own` (it creates that branch) keeps the --own step, and so
+    does a pr_branch the remote has."""
+    from ttp import push, pushq, settinghold
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.push_queue", True)
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: True)
+    monkeypatch.setattr(Daemon, "_precheck", lambda *a: None)   # no checks: the spec text is the subject
+    _, _, _, (gone,) = _finish_code(env, p, "gone", {"g.py": 3}, labels=["pr_branch:feature/x"])
+    assert "ttp push` from" in gone["spec"] and "--own" not in gone["spec"], gone["spec"]
+    assert "pr_branch label feature/x was ignored: origin has no such branch" in gone["spec"]
+    assert push.REVIEW_ONLY_LABEL not in json.loads(gone["labels"])
+
+    def own(tid, head):
+        p.db.update_task(tid, spec="Create feature/x: publish it with `ttp push --own --detach`.")
+    _, _, _, (mine,) = _finish_code(env, p, "own", {"m.py": 3}, labels=["pr_branch:feature/x"], before=own)
+    assert "`ttp push --own --detach`" in mine["spec"] and "was ignored" not in mine["spec"], mine["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(mine["labels"])
+    # A pr_branch the remote has: its PR's branch, --own as before.
+    monkeypatch.setattr(pushq, "_absent", lambda *a: False)
+    _, _, _, (there,) = _finish_code(env, p, "there", {"t.py": 3}, labels=["pr_branch:feature/x"])
+    assert "`ttp push --own --detach`" in there["spec"] and "was ignored" not in there["spec"]
+    # asks_own reads an --own instruction, never a negated one or a plain push.
+    assert settinghold.asks_own({"spec": "- ttp push --own --detach"})
+    assert settinghold.asks_own({"title": "publish it with `ttp push --own`"})
+    for spec in ("Do not use `ttp push --own` here.", "push it with `ttp push --detach`", "mentions --own"):
+        assert not settinghold.asks_own({"spec": spec}), spec
+
+
 def test_pr_elsewhere_compares_the_push_branchs_branch_part(env):
     """push_branch `team/x` is branch team/x of origin (team is no remote): pr_branch x is another
     branch; `origin/x` and `refs/heads/x` are x."""

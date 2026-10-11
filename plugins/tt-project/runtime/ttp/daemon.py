@@ -4996,6 +4996,13 @@ class Daemon:
         # A task that delivers onto a pr_branch other than the push branch goes to that PR with
         # `ttp push --own`: a plain push or a push-queue approval would rebase it onto the push branch.
         elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)
+        # Unless it means to create that branch (its spec asks for `ttp push --own`), a pr_branch the push
+        # remote has no branch of is ignored, as the push queue's check_approval ignores it.
+        ignored = ""
+        if elsewhere and not worktree.rebased_branch(task) and pushq.enabled(self.p, cfg) \
+                and not settinghold.asks_own(task) and (tgt := pushq.target(self.p)) \
+                and pushq._absent(self.p, tgt[0], elsewhere):
+            ignored, elsewhere = f"Its pr_branch label {elsewhere} was ignored: {tgt[0]} has no such branch.", ""
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
         off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d)
@@ -5034,8 +5041,8 @@ class Daemon:
                          f"never fall back to a raw `git push` to {d['push_branch']}. Leave the branch"
                          + (" and the PR" if pr else "") + " as they are.")
         elif pushes:
-            lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
-                         f"{d['push_branch']}).")
+            lines.append((f"{ignored} " if ignored else "") + f"If it passes, push it with `ttp push` from the "
+                         f"change's worktree (it publishes to {d['push_branch']}).")
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
         checks = self._precheck(task, full) if pushes else None
