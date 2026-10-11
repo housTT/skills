@@ -1459,9 +1459,36 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`.
+    A tool sandbox queues the launch and cancellation through the daemon (detach.tend).
     checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
     again, model-free, after a reboot killed them (Daemon._relaunch_checks)."""
-    from . import push
+    from . import detach, push
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    rc = run_dir / CHECKS_RC
+    detach.lost(rc).unlink(missing_ok=True)
+    if push._boxed():
+        if not p:
+            die("ttp checks: sandboxed detached checks need a project daemon; set TTP_PROJECT")
+        detach.enqueue(p.state, rc, run_dir / CHECKS_OUT, [], top or os.getcwd(), env,
+                       checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh)})
+        print("ttp checks: queued; the daemon starts them outside this command's sandbox")
+    else:
+        # A foreground launcher can replace a request that the daemon has not started yet.
+        queued = detach.queued(rc)
+        if queued.exists():
+            Path(queued.read_text().strip()).unlink(missing_ok=True)
+        pid = _checks_start(a, run_dir, top, head, env)
+        queued.unlink(missing_ok=True)
+        print(f"ttp checks: started in the background (pid {pid}); output in {run_dir / CHECKS_OUT}, "
+              f"exit code in {rc}")
+    print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
+    print("on_pass: if nothing is left after them but recording the result, put that final hand-off "
+          "(done or needs_review) in the waiting hand-off's on_pass; a pass records it without a model run")
+
+
+def _checks_start(a, run_dir: Path, top: str, head: str, env: dict) -> int:
+    """Launch outside the tool sandbox, cancelling the earlier host process before replacing its
+    metadata. The child waits for that metadata, so even a very short check records its identity."""
     from .runner import boot_id, proc_start
     old = _read_checks_pid(run_dir)
     if _checks_alive(old):
@@ -1478,20 +1505,16 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
             except OSError:
                 pass
     (run_dir / CHECKS_RC).unlink(missing_ok=True)
-    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     with open(run_dir / CHECKS_OUT, "wb") as out:
         child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                   *(["--fresh"] if a.fresh else []), *a.cmd],
-                                 cwd=Path.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                 cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True)
     write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
                                       "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
                                       "fresh": bool(a.fresh)})
-    print(f"ttp checks: started in the background (pid {child.pid}); output in {run_dir / CHECKS_OUT}, "
-          f"exit code in {run_dir / CHECKS_RC}")
-    print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
-    print("on_pass: if nothing is left after them but recording the result, put that final hand-off "
-          "(done or needs_review) in the waiting hand-off's on_pass; a pass records it without a model run")
+    child.stdin.close()   # go: checks.pid is durable before the checks start
+    return child.pid
 
 
 def _checks_child(a) -> int:
@@ -1505,6 +1528,7 @@ def _checks_child(a) -> int:
         signal.signal(sig, stop)
     code: int | str = 1
     try:
+        sys.stdin.read()   # the launcher's go, after recording our process identity
         cmd_checks(argparse.Namespace(**{**vars(a), "rc": None, "detach": False, "own_group": True}))
         code = 0
     except SystemExit as e:
@@ -1521,6 +1545,14 @@ def _checks_result(run_dir: Path) -> int:
     """`retry_when` probe of detached checks: 0 once checks.rc exists or the checks died without
     writing it (it then writes `killed` there), 1 while they run."""
     rc_file = run_dir / CHECKS_RC
+    from . import detach
+    if detach.queued(rc_file).exists():
+        print("ttp checks: queued for the daemon, which starts them outside the sandbox")
+        return 1
+    if detach.lost(rc_file).exists():
+        durable_write(rc_file, "killed\n")
+        print(f"ttp checks: not started: {detach.lost(rc_file).read_text().strip()}")
+        return 0
     info = _read_checks_pid(run_dir)
     alive = _checks_alive(info)
     if not rc_file.exists() and alive:

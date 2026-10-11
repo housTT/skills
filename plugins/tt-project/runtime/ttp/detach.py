@@ -57,13 +57,13 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
     return proc.pid
 
 
-def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict) -> Path:
+def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None) -> Path:
     """Queue the job for the daemon to start; returns the queue file."""
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
     write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep,
-                   "queued": time.time()}, mode=0o600)
+                   "queued": time.time(), **({"checks": checks} if checks is not None else {})}, mode=0o600)
     durable_write(queued(rc), str(q) + "\n")
     return q
 
@@ -89,6 +89,18 @@ def tend(p: Project) -> None:
         if time.time() - float(m.get("queued") or 0) > QUEUED_S:
             _mark_lost(rc, f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
                            f"(was the daemon down?)")
+        elif "checks" in m and not lost(rc).exists():
+            # Replacement checks must cancel their earlier host pid here, never in the tool's
+            # PID namespace. An earlier checks.rc is removed only after that process ends.
+            from argparse import Namespace
+            from .cli import _checks_start
+            try:
+                c = m["checks"]
+                pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"]), rc.parent,
+                                    c["worktree"], c["head"], {**os.environ, **(m.get("env") or {})})
+                renice(pid, nice_level(p.config().get("runner"))[0])
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                _mark_lost(rc, f"the daemon could not start the checks: {e}")
         elif not (lost(rc).exists() or rc.exists()):
             lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
             if lock is not None:   # else it already runs

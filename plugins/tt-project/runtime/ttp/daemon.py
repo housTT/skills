@@ -4773,6 +4773,8 @@ class Daemon:
             out = None
         if not out or not db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(out))):
             return False, 0
+        if detach.queued(out / CHECKS_RC).exists():
+            return True, 0   # the durable request will start on this boot, without a model wake
         mine = f"checks_relaunched:{tid}:{self.boot}:"
         if db.one("SELECT id FROM events WHERE fingerprint LIKE ?", (mine + "%",)):
             return True, 0

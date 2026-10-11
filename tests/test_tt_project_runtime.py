@@ -29113,6 +29113,95 @@ def test_detached_ttp_checks_finish_record_the_pass_and_a_rerun_stops_the_earlie
             pass
     assert _ttp("checks", "--result", str(tmp_path / "nothing")) == 0, "no record must not keep a task asleep"
 
+@pytest.mark.parametrize("box", ["pidns", "cgroup"])
+def test_sandboxed_checks_are_queued_and_finish_model_free(env, tmp_path, monkeypatch, capsys, box):
+    from ttp import cli, detach, push
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    if not (push.pid_ns() if box == "pidns" else push.cgroup()):
+        pytest.skip("no /proc")
+    p = make(env)
+    tid, repo = _checks_wait_task(p, tmp_path, {"status": "done", "summary": "checks passed"}, rc=None)
+    run = pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    marker = "TTP_PIDNS" if box == "pidns" else "TTP_CGROUP"
+    monkeypatch.setenv(marker, "another sandbox")
+    monkeypatch.setenv("SOME_API_TOKEN", "keep-off-disk")
+    monkeypatch.setenv("CHECK_VALUE", "preserved")
+    cli.main(["checks", "--detach", "--fresh", "--", 'test "$CHECK_VALUE" = preserved'])
+    assert "queued" in capsys.readouterr().out
+    assert not (run / cli.CHECKS_PID).exists(), "the sandbox must launch no child"
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    assert "keep-off-disk" not in q.read_text() and marker not in json.loads(q.read_text())["env"]
+    assert cli._checks_result(run) == 1 and not (run / cli.CHECKS_RC).exists()
+    monkeypatch.delenv(marker)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 30   # queued work survives a daemon restart or host reboot
+    d.wake_after_reboot()
+    assert p.db.task(tid)["not_before"] and "woke" not in json.loads(p.db.task(tid)["result"])
+    d.tend_pushes()
+    info = cli._read_checks_pid(run)
+    assert info["pid"] and info["started"] == proc_start(info["pid"])
+    assert info["worktree"] == str(repo) and info["fresh"] is True
+    assert _wait_precheck(run) == "0"
+    assert not q.exists() and not detach.queued(run / cli.CHECKS_RC).exists()
+    assert cli._checks_result(run) == 0
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "done"
+    assert json.loads(p.db.task(tid)["result"])["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started, child = tmp_path / "started", tmp_path / "child.pid"
+    first = _detached_checks(run, capsys, "sh", "-c", f"echo $$ > {child}; touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists)
+        monkeypatch.setattr(push, "_boxed", lambda: True)
+        cli.main(["checks", "--detach", "--", "false"])
+        cli.main(["checks", "--detach", "--", "true"])
+        assert len(list((p.state / detach.QUEUE).glob("*.json"))) == 1
+        assert cli._checks_alive(cli._read_checks_pid(run)), "cancellation belongs to the daemon"
+        assert cli._checks_result(run) == 1
+        detach.tend(p)
+        assert _gone_pid(first) and _gone_pid(int(child.read_text()))
+        assert _wait_precheck(run) == "0", "the latest request replaces the pending one"
+        assert cli._read_checks_pid(run)["cmd"] == ["--", "true"]
+    finally:
+        for pid in (first, int(child.read_text()) if child.exists() else 0):
+            if pid:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+@pytest.mark.parametrize("failure", ["expired", "missing_worktree"])
+def test_queued_checks_that_cannot_start_end_the_wait(env, tmp_path, monkeypatch, capsys, failure):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    (run / cli.CHECKS_RC).write_text("0\n")   # an old pass must not settle a replacement
+    cli.main(["checks", "--detach", "--", "true"])
+    assert cli._checks_result(run) == 1
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    m = json.loads(q.read_text())
+    if failure == "expired":
+        m["queued"] -= detach.QUEUED_S + 1
+    else:
+        m["checks"]["worktree"] = str(tmp_path / "gone")
+    q.write_text(json.dumps(m))
+    detach.tend(p)
+    assert cli._checks_result(run) == 0
+    assert (run / cli.CHECKS_RC).read_text().strip() == "killed"
+    assert "not started" in capsys.readouterr().out
+    assert not q.exists() and not (run / cli.CHECKS_PID).exists()
+
+
 def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(env, tmp_path):
     from ttp import push
     repo = tmp_path / "r"
