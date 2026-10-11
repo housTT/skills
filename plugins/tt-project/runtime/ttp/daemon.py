@@ -378,6 +378,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
@@ -3034,7 +3035,7 @@ class Daemon:
                 continue
             when = deferral(t).get("when")
             probe = when or (load_result(t["result"]).get("retry_when") if (t["not_before"] or 0) > now else None)
-            got = self._probe_rc.get(t["id"])
+            got = (self._start_rc if when else self._probe_rc).get(t["id"])
             if probe and got and got[0] == netwait.UNREACHABLE_RC and got[2] == probe \
                     and now - got[1] <= 3 * PROBE_EVERY_S:
                 out = self._probe_out.get(t["id"])
@@ -4281,7 +4282,11 @@ class Daemon:
         met after `coordinator.defer_max_days`."""
         db = self.p.db
         max_days = float(self.cfg["coordinator"].get("defer_max_days") or 14)
-        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'"):
+        deferred = db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'")
+        ids = {t["id"] for t in deferred}
+        for tid in [k for k in self._start_rc if k not in ids]:
+            del self._start_rc[tid]   # started, cancelled or no longer deferred
+        for t in deferred:
             d = deferral(t)
             if not d.get("when") or (t["not_before"] or 0) > now:
                 continue
@@ -4309,17 +4314,24 @@ class Daemon:
         if tid in self._probe_rc and self._probe_rc[tid][2] != probe:
             del self._probe_rc[tid]
             self._probed.pop(tid, None)
+        if tid in self._start_rc and self._start_rc[tid][2] != probe:
+            del self._start_rc[tid]
 
     def _start_verdict(self, task: dict, rc, now: float) -> None:
         d = deferral(task)
         if rc == 0:
             self._probe_rc.pop(task["id"], None)
+            self._start_rc.pop(task["id"], None)
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
-        elif rc in NOT_YET_RCS:
-            self._start_resource_stale(task, d, now)
         else:
+            # Kept apart from _probe_rc, whose verdicts tasks on the same probe take and pop: the
+            # network outage check reads it.
+            self._start_rc[task["id"]] = (rc, now, d.get("when") or "")
+        if rc in NOT_YET_RCS:
+            self._start_resource_stale(task, d, now)
+        elif rc != 0:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
                                  f"its start_when probe is broken ({why}; only 0 = start and 1, 75 or 255 = not "

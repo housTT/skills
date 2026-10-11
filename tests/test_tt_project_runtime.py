@@ -39786,6 +39786,7 @@ def _net_setup(env, monkeypatch, n=2):
     from ttp import alerts, timefmt
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
+    from ttp.db import deferral
     p = make(env)
     _no_events(p)
     timefmt.set_home(p, "America/Los_Angeles")
@@ -39800,10 +39801,12 @@ def _net_setup(env, monkeypatch, n=2):
     def one(at, rc):
         clock["now"] = at
         for tid in tids:
+            # A start_when's verdict goes where the daemon keeps it (_start_verdict), a retry_when's to _probe_rc.
+            verdicts = d._start_rc if deferral(p.db.task(tid)).get("when") else d._probe_rc
             if rc is None:
-                d._probe_rc.pop(tid, None)
+                verdicts.pop(tid, None)
             else:
-                d._probe_rc[tid] = (rc, at, NET_PROBE)
+                verdicts[tid] = (rc, at, NET_PROBE)
                 d._probe_out[tid] = (NET_OUT if rc == 255 else "", at, NET_PROBE)
         d._net_checked = 0.0
         d.check_unreachable()
@@ -39931,3 +39934,59 @@ def test_network_outage_counts_a_waiting_hand_off_whose_retry_when_cannot_reach_
     assert len(sent) == 1 and "1 queued task(s)" in sent[0]["text"], sent
     p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": "test -e /tmp/other"}))
     assert d._reachability_holds(now + 960) == ([], False), "a verdict for another probe is not counted"
+
+
+def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they_pass(env, monkeypatch):
+    """No verdict written by hand: two tasks deferred on a start_when probe that, like ssh to a host
+    out of reach, prints ssh's error and exits 255. The daemon's own probe cycles feed the check."""
+    from ttp import alerts
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    _no_events(p)
+    stub = p.root / "reach.sh"
+    stub.write_text("echo 'ssh: connect to host gw.example port 22: Connection timed out' >&2; exit 255\n")
+    probe = f"sh {stub}"
+    d = Daemon(p.base)
+    for i in range(2):
+        assert coord.apply(p, [{"type": "task_add", "title": f"device job {i}", "spec": "s",
+                                "start_when": probe}]) == []
+    tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='queued' ORDER BY id")]
+    clock = {"now": time.time()}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    start = clock["now"]
+
+    def cycle(at):
+        clock["now"] = at
+        d.probe_waiting()   # starts the probe once its last run is PROBE_EVERY_S old
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(timeout=30)
+        d.probe_waiting()   # reads its verdict
+        d._net_checked = 0.0
+        d.check_unreachable()
+        alerts.sweep(p.db, at)
+        return p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='network:unreachable' ORDER BY id")
+
+    step = dmod.PROBE_EVERY_S + 20
+    at = start
+    while at < start + 900:
+        assert cycle(at) == [], "within the grace nothing is said"
+        at += step
+    sent = cycle(at)
+    assert len(sent) == 1 and "gw.example" in sent[0]["text"] and "2 queued task(s)" in sent[0]["text"], sent
+    assert all(p.db.task(t)["status"] == "queued" and deferral(p.db.task(t)).get("when") for t in tids)
+    # The network is back: the probe passes and the tasks are free to start.
+    stub.write_text("exit 0\n")
+    at += step
+    assert len(cycle(at)) == 1 and alerts.needs_you(p.db, at), "the alert holds through the debounce"
+    assert all(not deferral(p.db.task(t)).get("when") for t in tids), "start_when passed"
+    assert not d._start_rc, "a passed start_when leaves no verdict behind"
+    for t in tids:
+        p.db.update_task(t, status="running")
+        p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,'worker',?,'running')", (t, at))
+    at += 660
+    assert len(cycle(at)) == 1, "clearing posts no new alert"
+    assert not alerts.needs_you(p.db, at) and not p.db.kv("network_outage"), "the outage ended after the debounce"
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved' AND ref='network:unreachable'")) == 1
