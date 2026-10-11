@@ -14,6 +14,6 @@ Ask the user which workflow to run, briefly distinguishing them:
 - `measured-op-analysis`: run the test under Tracy and report observed timing and footprint.
 
 Stop until the user explicitly chooses one. After the choice, invoke only that skill and follow
-its interactive setup one question at a time. Never batch the model, test, implementation,
+its interactive setup one question at a time. Never batch the model, implementation, test,
 source ref, targets, or output location into one confirmation. Do not begin source inspection,
 device checks, output creation, or delegation while waiting for the workflow choice.

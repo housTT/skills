@@ -23,14 +23,14 @@ def test_plugin_has_router_and_both_workflows():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.1.1"
+    assert claude["version"] == codex["version"] == "0.1.2"
 
 
 def test_generic_router_requires_explicit_workflow_choice():
     router = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text()
     assert "Do not infer one from open files" in router
     assert "Stop until the user explicitly chooses one" in router
-    assert "Never batch the model, test, implementation" in router
+    assert "Never batch the model, implementation, test" in router
 
 
 def test_shared_setup_is_step_by_step():
@@ -51,13 +51,15 @@ def write_rows(path: pathlib.Path, rows: list[dict], fieldnames: list[str] | Non
         writer.writerows(rows)
 
 
-def op_row(i: int, launches_p150: int, quasar_port: str = "⚠️", quasar_ev: str = "test_x.py") -> dict:
+def op_row(i: int, launches_p150: int, quasar_port: str = "⚠️", quasar_ev: str = "test_x.py",
+           projection: str = "⚠️", projection_ev: str = "fork x") -> dict:
     return {
         "id": str(i), "stage": "encoder", "ttnn_api": f"ttnn.op{i}", "op_code": f"Op{i}DeviceOperation",
         "device_op": f"prim::op{i}", "program_factory": f"Op{i}Factory", "call_site": "model.py",
         "evidence": "op.cpp", "confidence": "verified", "grid_dependency": "",
         "p150:shapes": "(1,32)", "p150:launches": str(launches_p150), "p150:status": "✅",
         "quasar:as_written": "❌", "quasar:port": quasar_port, "quasar:evidence": quasar_ev,
+        "quasar:bf16_projection": projection, "quasar:bf16_projection_evidence": projection_ev,
     }
 
 
@@ -112,6 +114,29 @@ def test_quasar_check_without_evidence_fails(tmp_path):
     result = run_script("validate_static.py", str(run))
     assert result.returncode == 1
     assert "op_table.csv row 1: ✅ in quasar:port without quasar:evidence" in result.stdout
+
+
+def test_projection_check_without_evidence_fails(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1, projection="✅", projection_ev="")], [trace_row(1, 1, 1)])
+    result = run_script("validate_static.py", str(run))
+    assert result.returncode == 1
+    assert "op_table.csv row 1: ✅ in quasar:bf16_projection without quasar:bf16_projection_evidence" in result.stdout
+
+
+def test_projection_rejects_port_only_status(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1, projection="variant not used by port")], [trace_row(1, 1, 1)])
+    result = run_script("validate_static.py", str(run))
+    assert result.returncode == 1
+    assert "quasar:bf16_projection 'variant not used by port' not in" in result.stdout
+
+
+def test_missing_projection_column_fails(tmp_path):
+    rows = [op_row(1, 1)]
+    del rows[0]["quasar:bf16_projection"]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1)])
+    result = run_script("validate_static.py", str(run))
+    assert result.returncode == 1
+    assert "op_table.csv missing column quasar:bf16_projection" in result.stdout
 
 
 def test_unknown_status_fails(tmp_path):

@@ -16,14 +16,17 @@ OP_TABLE_BASE = (
 CALL_TRACE_COLUMNS = ("id", "profile", "stage", "ops", "repeats", "launches_per_repeat", "notes")
 MATCH_KEY = ("stage", "ttnn_api", "device_op", "program_factory")
 
-QUASAR_STATUS_COLUMNS = ("quasar:as_written", "quasar:port")
+QUASAR_STATUS_COLUMNS = ("quasar:as_written", "quasar:port", "quasar:bf16_projection")
+# A projection describes code that does not exist yet, so no port can be "not using" a variant.
+PROJECTION_STATUS_VALUES = ("✅", "⚠️", "❌", "n/a")
 
 
 def op_table_columns(profiles: list[str]) -> list[str]:
     columns = list(OP_TABLE_BASE)
     for profile in profiles:
         if profile == "quasar":
-            columns += ["quasar:as_written", "quasar:port", "quasar:evidence"]
+            columns += ["quasar:as_written", "quasar:port", "quasar:evidence",
+                        "quasar:bf16_projection", "quasar:bf16_projection_evidence"]
         else:
             columns += [f"{profile}:shapes", f"{profile}:launches", f"{profile}:status"]
     return columns

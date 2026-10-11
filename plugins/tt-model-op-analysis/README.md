@@ -18,7 +18,7 @@ start a new run, or merge with `changes_<table>.csv` files against the previous 
 happens only when the host has a Drive/Sheets connector and the user agrees.
 
 A generic plugin invocation first asks whether to run `static-op-analysis` or
-`measured-op-analysis`. Each workflow then confirms its model, test, implementation, source ref,
+`measured-op-analysis`. Each workflow then confirms its model, implementation, test, source ref,
 and output root instead of inferring them from IDE state.
 
 Counts, totals, schema checks and diffs come from the scripts in `scripts/`, not from the agent.

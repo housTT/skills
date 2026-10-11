@@ -10,8 +10,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CSV_ENCODING, PROFILES, STATUS_VALUES,
-    op_table_columns, read_csv, status_columns,
+    CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CSV_ENCODING, PROFILES, PROJECTION_STATUS_VALUES,
+    STATUS_VALUES, op_table_columns, read_csv, status_columns,
 )
 
 
@@ -57,12 +57,14 @@ def validate(run_dir: pathlib.Path) -> list[str]:
         if row["confidence"] not in CONFIDENCE_VALUES:
             errors.append(f"op_table.csv row {n}: confidence '{row['confidence']}' not in {CONFIDENCE_VALUES}")
         for col in status_columns(targets):
-            if row[col] not in STATUS_VALUES:
-                errors.append(f"op_table.csv row {n}: {col} '{row[col]}' not in {STATUS_VALUES}")
+            allowed = PROJECTION_STATUS_VALUES if col == "quasar:bf16_projection" else STATUS_VALUES
+            if row[col] not in allowed:
+                errors.append(f"op_table.csv row {n}: {col} '{row[col]}' not in {allowed}")
         if "quasar" in targets:
-            for col in ("quasar:as_written", "quasar:port"):
-                if row[col] == "✅" and not row["quasar:evidence"].strip():
-                    errors.append(f"op_table.csv row {n}: ✅ in {col} without quasar:evidence")
+            for col, evidence in (("quasar:as_written", "quasar:evidence"), ("quasar:port", "quasar:evidence"),
+                                  ("quasar:bf16_projection", "quasar:bf16_projection_evidence")):
+                if row[col] in ("✅", "❌") and not row[evidence].strip():
+                    errors.append(f"op_table.csv row {n}: {row[col]} in {col} without {evidence}")
 
     for profile in (p for p in targets if p != "quasar"):
         op_total = sum(_int(r[f"{profile}:launches"], f"op_table.csv row {r['id']} {profile}:launches", errors)

@@ -1,6 +1,6 @@
 ---
 name: measured-op-analysis
-description: Run a tt-metal model test under Tracy and report the ops that actually executed, host versus device op time, and max cores per op, then diff against a static op table. Use for "measure the ops of model X", host fallback percentage, or tt-metal#58113 criteria 2 and 4a.
+description: Run a tt-metal model test under Tracy and report the ops that actually executed, host versus device op time, and max cores per op, then diff against a static op table. Use for "measure the ops of model X", host fallback percentage, or measured core and DRAM footprint.
 ---
 
 # Measured op analysis
@@ -38,7 +38,12 @@ SKILL.md; resolve every `<plugin-root>/...` path against it.
 
 ## Rules
 
-- Revert any local test edit after the run and say so.
+- Revert any local test edit and delete any temporary test from the checkout after the run, and
+  say so.
 - A cold window's host times include compilation; label it, never present it as warm.
 - Keep the raw ops CSV path in `run.json` (`ops_csv`); copy the file into the run directory.
 - Do not claim a host % or footprint that the scripts did not produce.
+- Output stands alone: a reader who knows no issue, ticket, tracker or earlier conversation must
+  understand every file. Never refer to criteria, items or numbers defined elsewhere; state what
+  is meant instead. `summary.md` ends with a "How to read this" section defining every column,
+  the window label, and which Tracy `OP TYPE` values count as device and as host ops.
