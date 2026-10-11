@@ -144,7 +144,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "hold_max_h": 12,
                     # A queued task waiting on a task in 'review' longer than this is raised to the
                     # coordinator once per review stint; 0 turns it off.
-                    "review_stall_s": 14400},
+                    "review_stall_s": 14400,
+                    # Provider failover (failover.py): a queued or waiting task whose provider cannot
+                    # start new work for longer than provider_failover_after_h hours (0: off) moves to
+                    # the first usable of provider_failover_to (provider names), then the core provider.
+                    "provider_failover_after_h": 4, "provider_failover_to": []},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
     # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.

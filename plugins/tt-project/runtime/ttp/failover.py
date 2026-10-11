@@ -46,6 +46,32 @@ def after_h(cfg: dict) -> float:
         return AFTER_H
 
 
+def after_h_of(v: Any) -> float:
+    """coordinator.provider_failover_after_h as config_set takes it: hours >= 0 (0 turns failover off)."""
+    try:
+        h = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"provider_failover_after_h needs a number of hours >= 0 (0: off), not {v!r}") from None
+    if not h >= 0:
+        raise ValueError(f"provider_failover_after_h needs a number of hours >= 0 (0: off), not {v!r}")
+    return h
+
+
+def to_of(v: Any, providers: dict | None) -> list[str]:
+    """coordinator.provider_failover_to as config_set takes it: configured provider names, best first
+    ("a,b" or a list; "" or [] leaves only the core provider)."""
+    if v is None or v == "":
+        return []
+    names = v.split(",") if isinstance(v, str) else v if isinstance(v, (list, tuple)) else None
+    if names is None or not all(isinstance(n, str) for n in names):
+        raise ValueError(f"provider_failover_to needs a list of provider names, not {v!r}")
+    out = [n.strip() for n in names if n.strip()]
+    if bad := [n for n in out if n not in (providers or {})]:
+        raise ValueError(f"provider_failover_to: not a configured provider: {', '.join(bad)} "
+                         f"(configured: {', '.join(sorted(providers or {})) or 'none'})")
+    return [n for i, n in enumerate(out) if n not in out[:i]]
+
+
 def targets(cfg: dict) -> list[str]:
     """Providers a task may move to, best first: coordinator.provider_failover_to, then the core one."""
     raw = (cfg.get("coordinator") or {}).get("provider_failover_to") or []

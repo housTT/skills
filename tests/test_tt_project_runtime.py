@@ -42585,3 +42585,40 @@ def test_failover_stop_reads_each_reason_for_red_and_its_end(env):
     assert failover.mapped_tier(cfg, "codex", {"effort": "xhigh", "tier": "standard"}) == "deep"
     assert failover.mapped_tier(cfg, "claude", {"effort": "low", "tier": "deep"}) == "light"
     assert failover.mapped_tier(cfg, "codex", {"effort": None, "tier": "standard"}) == "standard"
+
+
+def test_failover_settings_are_known_keys_and_settable_from_cli_and_chat(env, capsys):
+    from ttp import cli, failover
+    from ttp.coordinator import apply
+    from ttp.project import DEFAULT_CONFIG, config_problems, unknown_key_hint
+    p, d, now = _failover_setup(env)
+    for key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to"):
+        assert unknown_key_hint(key) is None, key
+    assert DEFAULT_CONFIG["coordinator"]["provider_failover_after_h"] == failover.AFTER_H
+    # The CLI sets 0, which turns failover off.
+    cli.main(["config", p.name, "coordinator.provider_failover_after_h", "0"])
+    assert p.config()["coordinator"]["provider_failover_after_h"] == 0
+    tid = _codex_task(p)
+    d._load_config()
+    d.update_gates()
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "0 set through the CLI turns failover off"
+    for bad in ("soon", "-1"):
+        with pytest.raises(SystemExit):
+            cli.main(["config", p.name, "coordinator.provider_failover_after_h", bad])
+    with pytest.raises(SystemExit):
+        cli.main(["config", p.name, "coordinator.provider_failover_to", '["nosuch"]'])
+    # The coordinator's config_set: a threshold, then a target list checked against the providers.
+    assert apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_after_h", "value": "1"},
+                     {"type": "config_set", "key": "coordinator.provider_failover_to", "value": "claude, codex"}]) == []
+    assert p.config()["coordinator"]["provider_failover_after_h"] == 1.0
+    assert p.config()["coordinator"]["provider_failover_to"] == ["claude", "codex"]
+    probs = apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_after_h", "value": "-2"},
+                      {"type": "config_set", "key": "coordinator.provider_failover_to", "value": "nosuch"}])
+    assert any("hours >= 0" in x for x in probs) and any("not a configured provider: nosuch" in x for x in probs)
+    assert p.config()["coordinator"]["provider_failover_after_h"] == 1.0
+    assert config_problems(p.raw_config()) == []
+    d._load_config()
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] != "codex", "1 h set through config_set turns failover back on"

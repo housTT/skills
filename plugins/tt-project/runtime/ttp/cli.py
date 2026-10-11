@@ -2625,6 +2625,13 @@ def cmd_config(a) -> None:
     hint = unknown_key_hint(a.key)
     if hint:
         die(hint)
+    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to"):
+        from . import failover
+        try:
+            val = (failover.after_h_of(val) if a.key.endswith("_after_h")
+                   else failover.to_of(val, p.config().get("providers")))
+        except ValueError as e:
+            die(str(e))
     if a.key == "delivery.push_checks":
         from .push import checks_of
         try:

@@ -23,7 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -182,6 +182,10 @@ USER_SETTABLE = {
     "coordinator.ask_timeout_h": float,
     # Days a user's yes to a charter change that failed to apply stays valid for a retry (_charter_approval).
     "coordinator.charter_approval_days": float,
+    # Provider failover (failover.py): hours a provider may be unable to start work before its queued
+    # and waiting tasks move (0: off), and the providers they move to first.
+    "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
+    "coordinator.provider_failover_to": lambda v: v,   # checked against the configured providers in config_set
 }
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
@@ -1418,6 +1422,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(why)
                 if key == "delivery.fast_forward_also":
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
+                if key == "coordinator.provider_failover_to":
+                    value = failover.to_of(value, cfg.get("providers"))
                 if key == "delivery.mirror_remotes":
                     value = push.mirror_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 # Merges count only the user's own message of this turn (none the harness posted).
