@@ -21,9 +21,9 @@ open asks naming the setting, instead of asking again. Nothing the charter does 
 set; the config only gains what the grant names.
 
 A mismatch it cannot apply (no user word on record, a charter sentence forbidding it, a value it
-cannot parse, config granting more than the charter, a setting or part of one set back after the daemon
-applied it, a failed write) is a harness defect: one keyed
-event (EVENT, fingerprint per setting and state) for the coordinator, never an ask. One exception
+cannot parse, config granting more than the charter, a setting or part of one set back after the
+daemon applied it, a failed write) is a harness defect: one keyed event (EVENT, fingerprint per
+setting and state) for the coordinator, never an ask. One exception
 keeps a single question: a protected-branch grant with no user word on record is settinghold's
 setup ask, which this leaves to it.
 """
