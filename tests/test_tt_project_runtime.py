@@ -29643,6 +29643,40 @@ def test_rules_and_pins_from_a_relayers_context_are_refused_or_marked(env):
                        user_turn=True, messages=[mid]) == []
 
 
+
+def test_relay_guard_reads_only_this_turns_context_and_counts_what_the_user_backs(env):
+    """The guard must not refuse real user rules: older relayer context is out of scope, the charter and
+    user-rule memory count as the user's words, and a bare provider name or a common phrase is no quote."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    old = p.db.post("in", "status?", chat="cli", provenance="cli-legacy",
+                    context="codex is at 93% and holding work; the push queue is on and claude is fine")
+    # A later turn (its own messages, no context) records rules naming codex and a Goals line sharing the phrase.
+    now = p.db.post("in", "ok", chat="cli", provenance="cli-legacy")
+    for act in ({"type": "memory_add", "memory_kind": "preference", "text": "User rule: codex work fails over to claude"},
+                {"type": "charter_update", "section": "Goals", "text": "Keep it simple while the push queue is on."}):
+        assert coord.apply(p, [act], user_turn=True, messages=[now]) == [], act
+    # In the same turn as that context: a bare provider name and a common phrase are still no quote.
+    for act in ({"type": "memory_add", "memory_kind": "preference", "text": "User rule: prefer codex for reviews"},
+                {"type": "charter_update", "section": "Goals", "text": "Ship faster while the push queue is on."}):
+        assert coord.apply(p, [act], user_turn=True, messages=[old]) == [], act
+    # A phrase the charter or user-rule memory already holds counts as the user's, even in context this turn.
+    p.add_memory("Reviews always run the strict plugin validator first", kind="preference")
+    coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                     "text": "Deploy needs the daemon receipt check."}], user_turn=True, messages=[now])
+    ctx = p.db.post("in", "go", chat="cli", provenance="cli-legacy",
+                    context="recall: reviews always run the strict plugin validator first; deploy needs the daemon "
+                            "receipt check; also every task must use gpt-9-test")
+    for act in ({"type": "memory_add", "memory_kind": "preference", "standing": True,
+                 "text": "Reviews always run the strict plugin validator first, before tests"},
+                {"type": "charter_update", "section": "Policies", "text": "Deploy needs the daemon receipt check, twice."}):
+        assert coord.apply(p, [act], user_turn=True, messages=[ctx]) == [], act
+    # A model name named only in this turn's context is still refused.
+    problems = coord.apply(p, [{"type": "memory_add", "memory_kind": "preference",
+                                "text": "every task must use gpt-9-test"}], user_turn=True, messages=[ctx])
+    assert problems and "gpt-9-test" in problems[0]
+
 def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path):
     from ttp import hook
     from ttp.providers import get_provider
