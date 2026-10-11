@@ -212,7 +212,7 @@ def can_act(name: str, here: str | None = None) -> tuple[bool, str]:
     except Exception:
         return False, "its state cannot be read"
     try:
-        status = overview._daemon(conn, state, here)
+        status, _ = overview._daemon(conn, state, here)
         if status != "running":
             return False, f"its daemon is {status}"
         paused = conn.execute("SELECT value FROM kv WHERE key='paused'").fetchone()

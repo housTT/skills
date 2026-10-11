@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from . import globalcap as gcap
-from . import project
+from . import identity, project
 from .release import installed, is_newer, runtime_version
 
 GATE_FRESH_S = 900   # a daemon's last global count older than this is not shown as current
@@ -34,7 +34,8 @@ def _settings(base: Path) -> dict:
     return project.layered(raw if isinstance(raw, dict) else {})
 
 
-def _daemon(conn: sqlite3.Connection, state: Path, here: str) -> str:
+def _daemon(conn: sqlite3.Connection, state: Path, here: str) -> tuple[str, int]:
+    """("running", "stopped" or "stale (...)", the running daemon's pid or 0)."""
     from .daemon import HEARTBEAT_STALE_S, _alive
     r = conn.execute("SELECT value FROM kv WHERE key='daemon'").fetchone()
     try:
@@ -43,15 +44,15 @@ def _daemon(conn: sqlite3.Connection, state: Path, here: str) -> str:
         d = {}
     pid = int(d.get("pid") or 0) if isinstance(d, dict) else 0
     if not pid or d.get("host") != here or not _alive(pid):
-        return "stopped"
+        return "stopped", 0
     try:
         hb = json.loads((state / "heartbeat").read_text())
         age = time.time() - (state / "heartbeat").stat().st_mtime
     except (OSError, ValueError):
-        return "running"
+        return "running", pid
     if isinstance(hb, dict) and int(hb.get("pid") or 0) == pid and age > HEARTBEAT_STALE_S:
-        return f"stale (no tick for {int(age // 60)} min)"
-    return "running"
+        return f"stale (no tick for {int(age // 60)} min)", pid
+    return "running", pid
 
 
 def _gate_global(conn: sqlite3.Connection) -> tuple[float, dict]:
@@ -93,7 +94,11 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
         row["note"] = f"database unreadable: {e}"
         return row
     try:
-        row["daemon"] = _daemon(conn, base / "state", here)
+        row["daemon"], pid = _daemon(conn, base / "state", here)
+        # what the daemon process loaded, against the files a restart would load
+        rt = identity.summary(base / "state", pid, base / "harness" / "runtime", _settings(base), now)
+        row.update({k: rt[k] for k in ("running_version", "running_commit", "instance", "tick_done",
+                                       "files_version", "restart_pending")})
         row["asks"] = conn.execute("SELECT COUNT(*) FROM messages WHERE kind='ask' AND handled=0").fetchone()[0]
         row["waiting_on_user"] = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='blocked'").fetchone()[0]
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
@@ -160,6 +165,10 @@ def line(r: dict) -> str:
         return f"{r['name']}\t{r.get('note')}" + (f"\t{r['host']}:{r['dir']}" if r.get("remote") else "")
     v = r["version"] + (f" (behind installed {r['lib']})" if r["lag"] else
                         f" (ahead of installed {r['lib']})" if r["ahead"] else "")
+    if r.get("restart_pending"):
+        v += f" (restart pending: running {r['running_version']})"
+    elif r.get("running_version") == "unverified":
+        v += " (running version unverified)"
     return (f"{r['name']}\tdaemon {r['daemon']} · v{v} · {r['asks']} open ask{'s' if r['asks'] != 1 else ''}"
             f" · {r['waiting_on_user']} waiting on you · {r['running']} running · {spend(r)}")
 

@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import heal, pushq, release, responsibilities, timefmt, waits
+from . import heal, identity, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
 from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -368,6 +368,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "host": host_line(db.boots(now - DAY), tz),
         "idle_sleep": awake.line(db.kv(awake.KV), (db.kv("daemon", {}) or {}).get("pid")) if alive else "",
         "release": release.line(p, db, cfg),
+        "runtime": runtime_receipt(p, db, alive, now, tz),
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),
         "health": heal.line(db, now),
@@ -376,6 +377,16 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),
     }
+
+
+def runtime_receipt(p: Project, db: DB, alive: bool = True, now: float | None = None, where=None) -> dict:
+    """What code the running daemon loaded (identity.summary): its version, commit, instance, last
+    completed tick, and whether the files on disk differ ("restart pending")."""
+    from .daemon import _alive
+    from .project import hostname
+    d = db.kv("daemon", {}) or {}
+    pid = int(d.get("pid") or 0) if alive and isinstance(d, dict) and d.get("host") == hostname() else 0
+    return identity.summary(p.state, pid if pid and _alive(pid) else 0, p.harness / "runtime", where, now)
 
 
 def breaker_lines(db: DB, now: float, where=None) -> list[dict]:
@@ -478,12 +489,13 @@ def state_payload(p: Project, db: DB) -> dict:
         del t["labels"]
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
+    health_now = health(p, db, now=now)
     return {
         "project": {"name": p.name, "root": str(p.root), "config": p.config(),
                     "zone": timefmt.zone_name(p.raw_config())},   # the web app shows every time in it
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
         "gates": {k: {**g, "detail": gate_detail(g, now, tz)} for k, g in db.kv("gates", {}).items()},
-        "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
+        "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
@@ -495,7 +507,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
-        "health": health(p, db, now=now),
+        "health": health_now,
         "push_queue": pushq.web(p, db, now),
         "accounts": db.q("SELECT provider, account, MAX(started) last FROM runs WHERE account IS NOT NULL "
                          "GROUP BY provider, account ORDER BY last DESC"),

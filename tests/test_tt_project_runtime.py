@@ -42186,3 +42186,118 @@ def test_a_ref_wait_keeps_its_planned_window_and_start_after(env):
     d.probe_waiting()
     assert sw2 in d._probes
     d._probes[sw2][0].wait(10)
+
+
+def _fake_runtime(root, version, commit="0123456789abcdef0123"):
+    """A runtime folder (runtime/ttp/__init__.py, SOURCE_COMMIT) and a module object as if imported from it."""
+    pkg = root / "runtime" / "ttp"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text(f'__version__ = "{version}"\n')
+    if commit is None:
+        (pkg / "SOURCE_COMMIT").unlink(missing_ok=True)
+    else:
+        (pkg / "SOURCE_COMMIT").write_text(commit + "\n")
+    return types.SimpleNamespace(__name__="ttp_fake", __file__=str(pkg / "__init__.py"), __version__=version)
+
+
+def test_identity_receipt_is_captured_once_and_survives_file_rewrites(env, tmp_path):
+    p = make(env)
+    import ttp
+    from ttp import identity
+    from ttp.daemon import Daemon, heartbeat, start_marker
+    d = Daemon(p.base)
+    assert d.identity["version"] == ttp.__version__ and d.identity["pid"] == os.getpid()
+    assert d.identity["boot"] == d.boot and d.identity["instance"]
+    mod = _fake_runtime(tmp_path, "9.9.1")
+    d.identity = identity.capture(mod=mod, boot=d.boot, started=d._started)
+    assert d.identity["provenance"] == "verified", d.identity
+    assert d.identity["commit"] == "0123456789abcdef0123"
+    d._mark_start()
+    d._beat()
+    _fake_runtime(tmp_path, "9.9.2", commit="fedcba9876543210")   # a deploy rewrites the files under it
+    d._healthy = False   # the heartbeat is written in full again
+    d._beat()
+    hb = heartbeat(p)
+    assert hb["receipt"]["version"] == "9.9.1" and hb["receipt"]["commit"] == "0123456789abcdef0123"
+    assert hb["receipt"] == d.identity == start_marker(p)["receipt"]
+    # mixed or missing provenance is unverified, never assumed
+    mixed = types.SimpleNamespace(__name__="ttp_fake", __file__=mod.__file__, __version__="9.9.1")
+    assert identity.capture(mod=mixed)["provenance"] == "unverified"   # files say 9.9.2
+    assert identity.capture(mod=_fake_runtime(tmp_path, "9.9.3", commit=None))["provenance"] == "unverified"
+
+
+def test_old_daemon_heartbeat_reads_as_unverified_never_as_the_files_version(env):
+    p = make(env)
+    from ttp import overview
+    from ttp.cli import status_text
+    from ttp.release import runtime_version
+    from ttp.web import health
+    files = runtime_version(p.harness / "runtime")
+    (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "host": "testhost", "started": time.time()}))
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    rt = health(p, p.db)["runtime"]
+    assert rt["running_version"] == "unverified" and rt["files_version"] == files and not rt["restart_pending"]
+    text = status_text(p)
+    assert "running version unverified" in text and f"running {files}" not in text
+    row = overview.project_status(p.name, {"host": "testhost", "dir": str(p.root)}, time.time(), "testhost",
+                                  files, (time.time() - 86400, time.time()))
+    assert row["running_version"] == "unverified" and row["running_commit"] is None
+    assert "running version unverified" in overview.line(row)
+
+
+def test_overview_and_status_flag_running_code_older_than_its_files(env, tmp_path):
+    p = make(env)
+    from ttp import identity, overview, timefmt
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.identity = identity.capture(mod=_fake_runtime(tmp_path, "0.0.1"), boot=d.boot, started=d._started)
+    d._beat()
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    now = time.time()
+    entry = {"host": "testhost", "dir": str(p.root)}
+    row = overview.project_status(p.name, entry, now, "testhost", "0.0.1", (now - 86400, now))
+    assert row["running_version"] == "0.0.1" and row["files_version"] == "0.0.1" and not row["restart_pending"]
+    assert row["instance"] == d.identity["instance"] and row["tick_done"]
+    assert f"running 0.0.1 (0123456789ab) since {timefmt.short(d._started, p)}" in status_text(p)
+    _fake_runtime(tmp_path, "0.0.2")   # new files on disk, the process still runs the old code
+    row = overview.project_status(p.name, entry, now, "testhost", "0.0.2", (now - 86400, now))
+    assert row["running_version"] == "0.0.1" and row["files_version"] == "0.0.2" and row["restart_pending"]
+    assert "restart pending: running 0.0.1" in overview.line(row)
+    assert "restart pending: running 0.0.1, files 0.0.2" in status_text(p)
+
+
+def test_tick_done_does_not_advance_on_progress_touches(env):
+    p = make(env)
+    from ttp.daemon import Daemon, heartbeat
+    d = Daemon(p.base)
+    d._beat()
+    old = time.time() - 600
+    for f in ("heartbeat", "tick_done"):
+        os.utime(p.state / f, (old, old))
+    assert abs(heartbeat(p)["tick_done"] - old) < 1
+    d._progressed = 0.0
+    d._progress()   # a step of a long tick: the heartbeat is fresh, the tick not done
+    hb = heartbeat(p)
+    assert hb["age"] < 60 and abs(hb["tick_done"] - old) < 1
+    d._beat()
+    assert heartbeat(p)["tick_done"] > old + 500
+    # another daemon's tick file is never read as this one's
+    (p.state / "tick_done").write_text(json.dumps({"instance": "someone-else", "pid": 1}))
+    assert heartbeat(p)["tick_done"] is None
+
+
+def test_api_state_and_health_carry_the_runtime_receipt(env):
+    p = make(env)
+    from ttp import web
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d._beat()
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    h = web.health(p, p.db)["runtime"]
+    assert h["running_version"] == d.identity["version"] and h["instance"] == d.identity["instance"]
+    assert h["tick_done"] and h["line"].startswith(f"running {d.identity['version']}")
+    st = json.loads(json.dumps(web.state_payload(p, p.db), default=str))
+    assert st["heartbeat"]["receipt"]["instance"] == d.identity["instance"]
+    assert st["runtime"]["instance"] == st["health"]["runtime"]["instance"] == d.identity["instance"]
+    assert st["heartbeat"]["tick_done"] == st["runtime"]["tick_done"]

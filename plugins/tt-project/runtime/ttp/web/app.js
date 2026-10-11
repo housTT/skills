@@ -235,6 +235,8 @@ async function refresh() {
   $("#hostline").hidden = !h.host; text($("#hostline"), h.host || "");
   $("#sleepline").hidden = !h.idle_sleep; text($("#sleepline"), h.idle_sleep || "");
   $("#relline").hidden = !h.release; text($("#relline"), h.release || "");
+  const rt = (h.runtime || {}).restart_pending ? h.runtime.line : "";   // the header shows only what needs action
+  $("#runline").hidden = !rt; text($("#runline"), rt);
   $("#localline").hidden = !h.local_only; text($("#localline"), h.local_only || "");
   const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
   $("#disk").hidden = !dk;

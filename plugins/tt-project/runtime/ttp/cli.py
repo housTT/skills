@@ -728,6 +728,8 @@ def status_text(p: Project) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
+    if h["runtime"]["line"]:
+        lines.append(h["runtime"]["line"])
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"

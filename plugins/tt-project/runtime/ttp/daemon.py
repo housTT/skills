@@ -44,6 +44,7 @@ from . import ends
 from . import heal
 from . import pauseends
 from . import hold
+from . import identity
 from . import integrity
 from . import jevuse
 from . import landed
@@ -356,6 +357,8 @@ class Daemon:
         self._start_failures = 0
         self._lock_fd: int | None = None
         self._started = time.time()
+        # what code this process loaded, captured once before the first tick (never re-read)
+        self.identity = identity.capture(boot=self.boot, started=self._started)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._last_prune = 0.0
@@ -425,8 +428,11 @@ class Daemon:
             log(self.p, f"home time zone not set: {e}")
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
-        log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")
-        self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time()})
+        r = self.identity
+        log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
+                    f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']}")
+        self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time(),
+                                    "instance": r["instance"]})
         if self.p.db.kv(unblock.ESCALATION_LOG_KEY) is None:   # timestamped escalation records start here
             self.p.db.set_kv(unblock.ESCALATION_LOG_KEY, time.time())
         self._check_config()
@@ -485,7 +491,7 @@ class Daemon:
         try:
             (self.p.state / "daemon.start").write_text(json.dumps(
                 {"pid": os.getpid(), "host": hostname(), "started": self._started, "tick_errors": self._tick_errors,
-                 "progress": self._progressed or None}))
+                 "progress": self._progressed or None, "receipt": self.identity}))
         except OSError:
             pass
 
@@ -591,17 +597,20 @@ class Daemon:
 
     def _beat(self) -> None:
         """A completed tick. `status`, the web app and `ttp restart` read its age; the first one
-        marks the harness commit this runtime is known to run on. The file names the boot and the
-        resources held, so the next boot can say what a reboot cut off; it is rewritten only when
-        those change."""
+        marks the harness commit this runtime is known to run on. The file names the boot, the
+        resources held and this process's identity receipt, so the next boot can say what a reboot
+        cut off; it is rewritten only when those change. The completed tick itself goes to the tick
+        file (identity.mark_tick), which `_progress()` never touches."""
         hb = self.p.state / "heartbeat"
         held = shared.held(self.p, self.cfg)
         if not self._healthy or held != self._held:
             durable_write(hb, json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
-                                          "boot": self.boot, "held": held, "takes": ["restart_requests"]}))
+                                          "boot": self.boot, "held": held, "takes": ["restart_requests"],
+                                          "receipt": self.identity}))
             self._held = held
         else:
             os.utime(hb, None)
+        identity.mark_tick(self.p.state, self.identity, first=not self._healthy)
         sd_notify("WATCHDOG=1", self._notify)
         self._progressed = time.time()
         if not self._healthy:
@@ -6593,18 +6602,21 @@ def ordinal(n: int) -> str:
 
 
 def heartbeat(p: Project) -> dict | None:
-    """The daemon's last completed tick: {pid, host, started, age}, or None if it never ticked."""
+    """The daemon's last sign of life: {pid, host, started, receipt, age, tick_done}, or None if it never
+    ticked. `age` is the heartbeat's (a step of a long tick refreshes it); `tick_done` is when the
+    daemon last completed a full tick (None for a daemon without a receipt)."""
     hb = p.state / "heartbeat"
     try:
         info = json.loads(hb.read_text())
         info["age"] = max(0.0, time.time() - hb.stat().st_mtime)
+        info["tick_done"] = identity.tick_done(p.state, info.get("receipt"))
         return info
     except (OSError, ValueError, TypeError):
         return None
 
 
 def start_marker(p: Project) -> dict | None:
-    """The last daemon process to start: {pid, host, started, tick_errors}, or None."""
+    """The last daemon process to start: {pid, host, started, tick_errors, progress, receipt}, or None."""
     try:
         info = json.loads((p.state / "daemon.start").read_text())
         return info if isinstance(info, dict) else None
