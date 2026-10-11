@@ -12,7 +12,8 @@ pushes it without force. It always runs them itself and never reads the passes `
 entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
 
-After the push the process lets go of the push lock and of its `push:run-<id>` lock (automatic
+After the push it moves `delivery.fast_forward_also` and pushes the same commit to
+`delivery.mirror_remotes`, fast-forward only; neither undoes the push. Then the process lets go of the push lock and of its `push:run-<id>` lock (automatic
 upgrades wait only for that one). It then runs `delivery.after_push` (a deploy) at the pushed commit,
 under a lock of its own, `after_push:run-<id>`. A marker that has an outcome but whose after_push did
 not finish is resumed: only the after_push step runs. Before `git push` the marker records what the push
@@ -1188,6 +1189,8 @@ def run_batch(p: Project, marker: Path) -> int:
             ff = push.fast_forward(b.repo, b.remote, b.pushed_sha, also, b.branch, say=say)
         except Exception as e:
             ff = [f"not ff {x}: {type(e).__name__}: {e}" for x in also]
+    if b.pushed_sha and (mirrors := push.mirror_list(b.d.get("mirror_remotes"))):
+        ff += push.mirror_safely(b.repo, b.pushed_sha, mirrors, f"{b.remote}/{b.branch}", say=say)
     # The reach check comes before the outcome is written: finalize settles a marker as soon as it has
     # one, so a later reach would miss the review's summary. Its fetch is bounded and it never raises.
     if outcome in ("pushed", "landed"):

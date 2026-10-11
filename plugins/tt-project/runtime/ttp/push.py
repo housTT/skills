@@ -32,7 +32,7 @@ from urllib.parse import quote, unquote
 
 from . import locks, worktree
 from .budget import DOC_SUFFIXES
-from .project import Project, durable_write, git_fsync_env, nice_level, renice, write_json
+from .project import Project, durable_append, durable_write, git_fsync_env, nice_level, renice, write_json
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -403,8 +403,137 @@ def fast_forward(repo: Path, remote: str, sha: str, branches: list[str], push_br
 
 
 def ff_warnings(lines: Any) -> list[str]:
-    """The `not ff` lines of a recorded fast_forward outcome."""
-    return [str(x) for x in lines or [] if str(x).startswith("not ff ")]
+    """The `not ff` and `not mirrored` lines of a recorded fast_forward outcome."""
+    return [str(x) for x in lines or [] if str(x).startswith(("not ff ", "not mirrored "))]
+
+
+MIRROR_TIMEOUT_S = 300   # each network step of one mirror (ls-remote, fetch, push)
+
+
+def mirror_list(v: Any) -> list[dict]:
+    """`delivery.mirror_remotes` as {remote, branch} tables (a list, a JSON list, or `<remote>/<branch>`
+    strings); empty, the default, turns it off. Anything else comes back with an empty remote, so
+    mirror_problem names it."""
+    out: list[dict] = []
+    for x in _entries(v):
+        if isinstance(x, dict):
+            m = {"remote": str(x.get("remote") or "").strip(), "branch": str(x.get("branch") or "").strip()}
+        else:
+            r, _, b = str(x).strip().partition("/")
+            m = {"remote": r, "branch": b} if b else {"remote": "", "branch": r}
+        if m not in out:
+            out.append(m)
+    return out
+
+
+def mirror_problem(m: dict, push_branch: str) -> str:
+    """Why the mirror `m` ({remote, branch}) may not be in `delivery.mirror_remotes`, or "" when it may.
+    `push_branch` is the resolved `<remote>/<branch>`, or the raw setting."""
+    remote, branch = m.get("remote") or "", m.get("branch") or ""
+    if not REMOTE_NAME.fullmatch(remote):
+        return "not a {remote, branch} table naming a git remote"
+    if f"{remote}/{branch}" == push_branch or remote == "origin" and branch == push_branch:
+        return "it is the push branch itself (delivery.push_branch)"
+    if branch.startswith("-") or subprocess.run(["git", "check-ref-format", f"refs/heads/{branch}"],
+                                                capture_output=True).returncode != 0:
+        return "not a valid branch name"
+    return ""
+
+
+def mirror_check(v: Any, push_branch: str) -> list[dict]:
+    """`delivery.mirror_remotes` as config_set takes it; ValueError naming the first bad entry."""
+    out = mirror_list(v)
+    for m in out:
+        if why := mirror_problem(m, push_branch):
+            raise ValueError(f"delivery.mirror_remotes: {m['remote']}/{m['branch']}: {why}")
+    return out
+
+
+def _git_net(repo: Path, *args: str, timeout_s: float = MIRROR_TIMEOUT_S) -> subprocess.CompletedProcess:
+    """git that talks to a remote: no prompt, no stdin, at most `timeout_s` (exit 124 when it runs past)."""
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout_s,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout_s:.0f} s")
+
+
+def _remote_head(repo: Path, remote: str, branch: str) -> tuple[bool, str]:
+    """(read, tip) of `branch` on `remote` by ls-remote: tip is "" when the branch does not exist."""
+    ls = _git_net(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    tip = next((ln.split()[0] for ln in ls.stdout.splitlines() if ln.endswith(f"\trefs/heads/{branch}")), "")
+    return ls.returncode == 0, tip
+
+
+def mirror(repo: Path, sha: str, mirrors: list[dict], push_branch: str,
+           say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr)) -> list[str]:
+    """After `sha` reached `push_branch`, push it to each of `mirrors` (delivery.mirror_remotes): fetch
+    the mirror branch, and push `sha` to it without force only when its tip is an ancestor of `sha` (a
+    branch the mirror lacks is created). Each outcome is read back with ls-remote: `mirror <remote>/<branch>
+    <sha>`, or `not mirrored <remote>/<branch>: <reason>`, which names both commits when the mirror has
+    diverged. A `not mirrored` never undoes the main push; the caller reports it as a warning."""
+    out = []
+    remotes = _git(repo, "remote").stdout.split()
+    for m in mirrors:
+        name = f"{m.get('remote')}/{m.get('branch')}"
+        try:
+            line = _mirror_one(repo, sha, m, push_branch, remotes)
+        except Exception as e:      # one mirror's trouble never stops the others or the push
+            line = f"not mirrored {name}: {type(e).__name__}: {e}"
+        say(line if line.startswith("mirror ") else f"warning: {line}")
+        out.append(line)
+    return out
+
+
+def mirror_safely(repo: Path, sha: str, mirrors: list[dict], push_branch: str,
+                  say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr)) -> list[str]:
+    """mirror(), whose failure is only a `not mirrored` line per mirror: the main push stands."""
+    try:
+        return mirror(repo, sha, mirrors, push_branch, say=say)
+    except Exception as e:
+        return [f"not mirrored {x.get('remote')}/{x.get('branch')}: {type(e).__name__}: {e}" for x in mirrors]
+
+
+def _mirror_one(repo: Path, sha: str, m: dict, push_branch: str, remotes: list[str]) -> str:
+    remote, branch = m["remote"], m["branch"]
+    name = f"{remote}/{branch}"
+    if why := mirror_problem(m, push_branch):
+        return f"not mirrored {name}: {why}"
+    if remote not in remotes:
+        return f"not mirrored {name}: there is no git remote named {remote}"
+    read, tip = _remote_head(repo, remote, branch)
+    if not read:
+        return f"not mirrored {name}: {remote} cannot be read; nothing pushed"
+    if tip:
+        f = _git_net(repo, "fetch", "--no-tags", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+        if f.returncode != 0:
+            return f"not mirrored {name}: cannot fetch it ({_tail_line(f.stderr)}); nothing pushed"
+        if tip != sha and not descends(repo, tip, sha):
+            return f"not mirrored {name}: it is at {tip}, not an ancestor of the pushed {sha}; left as it is"
+    r = None
+    if tip != sha:   # no leading + and no --force: git itself refuses anything but a fast-forward
+        r = _git_net(repo, "push", "--porcelain", remote, f"{sha}:refs/heads/{branch}")
+    read, now = _remote_head(repo, remote, branch)
+    if now == sha:
+        return f"mirror {name} {sha}"
+    if r is not None and r.returncode != 0:
+        return f"not mirrored {name}: the push was rejected: {_tail_line(r.stderr or r.stdout)}"
+    return f"not mirrored {name}: it reads {now[:10] or '(nothing)'} after the push, not {sha[:10]}"
+
+
+def _tail_line(text: str) -> str:
+    return " / ".join((text or "").strip().splitlines()[-3:])[-300:]
+
+
+def run_note(text: str) -> None:
+    """A line in the run's notes (progress.md), the feed people read live; nothing outside a run."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir:
+        try:
+            durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {text}\n")
+        except OSError:
+            pass
 
 
 def excluded(repo: Path, tip: str, head: str, globs: list[str]) -> list[str]:
@@ -2063,6 +2192,11 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
                   exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
+        if rc == 0 and last_pushed and (mirrors := mirror_list(d.get("mirror_remotes"))):
+            last_ff = last_ff + mirror_safely(repo, last_pushed, mirrors, f"{remote}/{branch}")
+            for line in ff_warnings(last_ff):
+                if line.startswith("not mirrored "):
+                    run_note(f"ttp push: pushed {last_pushed[:10]} to {remote}/{branch}, but {line}")
     if rc == 0 and remote != LOCAL:   # no remote: nothing to fetch the intended branch from
         sha = (None if own else last_pushed) or _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
@@ -2075,7 +2209,7 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
     return rc
 
 
-last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff ...` / `not ff ...` lines
+last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff`/`not ff` and `mirror`/`not mirrored` lines
 
 
 def free(p: Project, repo: Path) -> int:

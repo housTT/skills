@@ -776,9 +776,12 @@ def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | N
     m.update(outcome="pushed", pushed_sha=sha, tip=pg.get("tip"), version=pg.get("version"),
              results=pg.get("results") or [], checks=pg.get("checks") or {}, rounds=pg.get("rounds"),
              message=None, recovered=now)
-    if also:
+    mirrors = [f"{x['remote']}/{x['branch']}" for x in push.mirror_list(_delivery(p).get("mirror_remotes"))]
+    if also or mirrors:
         m["fast_forward"] = [f"not ff {x}: the batch stopped after its push, before this step (a reboot?); "
-                             f"not run" for x in also]
+                             f"not run" for x in also] + \
+                            [f"not mirrored {x}: the batch stopped after its push, before this step (a reboot?); "
+                             f"not run" for x in mirrors]
     write_json(marker, m)
     _event(p.db, None, "push_batch_recovered", f"push batch {b['id']} stopped after pushing {_short(sha)} to "
                                                f"{b['target']}, before it wrote its outcome (a reboot?); it is on the "
@@ -860,7 +863,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         tail = _landing({**last, "status": "pushed" if new else "landed"}, last["target"] or target,
                         _reach(db, last["batch"], b, m))
         ff = [str(x) for x in m.get("fast_forward") or []] if new else []
-        if ff:   # delivery.fast_forward_also, as read back from the remote
+        if ff:   # delivery.fast_forward_also and mirror_remotes, as read back from the remotes
             tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
                   "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
@@ -1011,7 +1014,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                                                 f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
         if warn := push.ff_warnings(m.get("fast_forward")):
             _event(db, None, "push_not_ff", f"push batch {b['id']} pushed {_short(sha)} to {b['target']}, but "
-                                            f"delivery.fast_forward_also did not move every branch: "
+                                            f"delivery.fast_forward_also or delivery.mirror_remotes did not move "
+                                            f"every branch: "
                                             + "; ".join(warn), queued=True)
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S

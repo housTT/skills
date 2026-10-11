@@ -128,6 +128,8 @@ USER_SETTABLE = {
     "delivery.backup_remote": lambda v: _backup_remote(v),
     # Branches each push also fast-forwards to the pushed commit (e.g. a 'last best' main); [] turns it off.
     "delivery.fast_forward_also": lambda v: v,   # checked against delivery.push_branch in config_set
+    # {remote, branch} mirrors each push also sends the pushed commit to, fast-forward only; [] turns it off.
+    "delivery.mirror_remotes": lambda v: v,   # checked against delivery.push_branch in config_set
     # Lets ttp push and the push queue publish to a push branch that is main, master or the remote's default.
     "delivery.allow_protected_push_branch": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
@@ -617,8 +619,10 @@ def _norm_severity(s: str | None) -> str:
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
               "budget.global_daily_usd": "spend",
               "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
-              "delivery.fast_forward_also": "restriction", "delivery.allow_protected_push_branch": "restriction"}
+              "delivery.fast_forward_also": "restriction", "delivery.mirror_remotes": "restriction",
+              "delivery.allow_protected_push_branch": "restriction"}
 SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also",
+                 "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch"}
 
 
@@ -1363,6 +1367,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(why)
                 if key == "delivery.fast_forward_also":
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
+                if key == "delivery.mirror_remotes":
+                    value = push.mirror_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "", [])):
                     open_ask = settinghold.asked(db, key)
                     raise ValueError(f"{key} needs the user's approval: "

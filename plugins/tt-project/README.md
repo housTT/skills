@@ -469,6 +469,19 @@ and preferences you add later become part of the project's charter and memory.
   `not ff` is a warning and never undoes the main push. The push branch itself and invalid names
   are refused. Like other delivery keys that widen where work lands, setting it needs the user's
   word, and a charter that forbids pushing to a listed branch wins: leave that branch out.
+- `delivery.mirror_remotes` (off by default) sends each pushed commit on to other git remotes,
+  such as a mirror of the repository elsewhere: a list of `{remote, branch}` tables (or
+  `<remote>/<branch>` strings), e.g. `[{"remote": "mirror", "branch": "dev"}]`, where `remote` is a
+  git remote of the project's repository. After each successful `ttp push` or push queue batch,
+  each mirror branch is fetched; when its tip is an ancestor of the pushed commit (or the branch
+  does not exist yet) that same commit is pushed to it, never forced. A mirror that has diverged is
+  left as it is. The result is read back from the mirror and recorded with the
+  `delivery.fast_forward_also` lines as `mirror <remote>/<branch> <sha>` or
+  `not mirrored <remote>/<branch>: <reason>`; a divergence names both commits. A `not mirrored`
+  is a warning in the feed (a push queue event, or a line in the run's notes for a worker's
+  `ttp push`) and never fails or undoes the main push. Mirrors run right after the push and
+  before `delivery.after_push`, which still runs as before. The push branch itself and invalid
+  names are refused, and setting it needs the user's word.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

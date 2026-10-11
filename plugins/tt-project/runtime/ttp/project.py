@@ -231,10 +231,11 @@ EXTRA_KEYS = {
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
+    # mirror_remotes: {remote, branch} tables each push also sends the pushed commit to, fast-forward only.
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
-                 "after_push_timeout_s", "backup_remote", "fast_forward_also",
+                 "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch"},
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
@@ -408,12 +409,16 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                 walk(v, path + [str(k)])
     walk(raw, [])
     from .push import (allow_protected, backup_problem, bump_problems, check_problems,   # push imports this module
-                       fast_forward_check, push_branch_problem)
+                       fast_forward_check, mirror_check, push_branch_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
     out += [why for why in [push_branch_problem(delivery.get("push_branch"), root, allow_protected(delivery))] if why]
     try:
         fast_forward_check(delivery.get("fast_forward_also"), str(delivery.get("push_branch") or ""))
+    except ValueError as e:
+        out.append(str(e))
+    try:
+        mirror_check(delivery.get("mirror_remotes"), str(delivery.get("push_branch") or ""))
     except ValueError as e:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
