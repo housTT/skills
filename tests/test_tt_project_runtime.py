@@ -37998,21 +37998,162 @@ def test_charter_grant_wording(line, grants):
     assert bool(charter_says_no_approval(line, "origin/main")) is grants
 
 
-def test_setup_ask_quotes_the_brief_as_the_users_own_words(env):
-    """A grant in the verbatim Brief written at setup is the user's word: the ask, raised on the first
-    tick after setup, says it came from the Brief and quotes it."""
-    from ttp import settinghold
+def test_brief_grant_is_applied_without_asking(env):
+    """A grant in the verbatim Brief is the user's own word on record: the first tick after setup turns
+    delivery.allow_protected_push_branch on itself, says so in one low alert quoting it, and closes an
+    open ask about the setting instead of raising one."""
+    from ttp import grants, settinghold
     from ttp.daemon import Daemon
     p = make(env)
     _remote_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
+    mid = _setting_ask(p)
     p.charter_path.write_text("# x — charter\n\n## Brief (verbatim from the user)\nBuild the thing. Pushing to "
                               "main is allowed.\n\n## Goals\nShip it.\n")
     Daemon(p.base).sweep_holds()
-    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")
-    assert ask and "Brief" in ask["text"] and "your own words" in ask["text"]
-    assert "Pushing to main is allowed." in ask["text"]
-    assert settinghold.active(p.db, p.config(), p.root)
+    Daemon(p.base).sweep_holds()   # a restart: nothing more
+    assert p.config()["delivery"]["allow_protected_push_branch"] is True
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0") == []
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 1
+    alerts = p.db.q("SELECT * FROM messages WHERE kind='alert' AND text LIKE '%allow_protected_push_branch%'")
+    assert len(alerts) == 1 and alerts[0]["severity"] == "low"
+    assert "Pushing to main is allowed." in alerts[0]["text"] and "the Brief" in alerts[0]["text"]
+    assert f"#{mid}" in alerts[0]["text"]
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (grants.APPLIED,))) == 1
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (grants.EVENT,))
+    assert not settinghold.active(p.db, p.config(), p.root)
+
+
+def _policies_line(p, line, user_text=None, provenance=None):
+    """Add `line` to the charter's Policies as the coordinator does, logged in CHARTER.history.md, in a
+    turn carrying a user message `user_text` (None: a turn of its own)."""
+    from ttp import ends
+    said = ""
+    if user_text is not None:
+        mid = p.db.post("in", user_text, chat="c", kind="user", provenance=provenance)
+        said = f", user message #{mid}"
+    p.charter_path.write_text(p.charter_path.read_text().replace("## Policies\n", f"## Policies\n\n{line}\n", 1))
+    hist = p.harness / ends.CHARTER_HISTORY
+    old = hist.read_text() if hist.exists() else "# Charter history\n"
+    hist.write_text(old + f"\n### Added to Policies (2026-10-01{said}, turn 7)\n{line}\n")
+
+
+def _grant_events(p, kind=None):
+    from ttp import grants
+    return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (kind or grants.EVENT,))
+
+
+def test_charter_grants_matching_the_config_raise_nothing(env):
+    """The template's 'Auto-merge repositories: none.', a listed repo the config already auto-merges, and
+    a push grant for an ordinary branch that pushing already allows: no change, no event, no ask."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    Daemon(p.base).sweep_holds()
+    assert grants.checks(p.config(), p.charter_path.read_text()) == []
+    p.set_config("delivery.auto_merge_repos", ["acme/widgets"])
+    p.set_config("delivery.push_branch", "origin/feature")
+    _policies_line(p, "- Auto-merge repositories: acme/widgets.\n- Pushes to the push branch need no approval.")
+    Daemon(p.base).sweep_holds()
+    assert grants.checks(p.config(), p.charter_path.read_text(), p.root) == []
+    assert _grant_events(p) == [] and _grant_events(p, grants.APPLIED) == []
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+
+
+def test_auto_merge_grant_on_the_users_word_is_applied_once(env):
+    """A Policies auto-merge line logged as added in a turn with the user's message is applied to
+    delivery.auto_merge_repos by the daemon, once: no ask, no defect. Set back later, the later setting
+    wins: one defect, never flipped again."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    _policies_line(p, "- Auto-merge repositories: acme/widgets, acme/gears.", "auto-merge acme/widgets and gears")
+    Daemon(p.base).sweep_holds()
+    Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/gears", "acme/widgets"]
+    assert len(_grant_events(p, grants.APPLIED)) == 1 and _grant_events(p) == []
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE '%auto_merge_repos%'")
+    assert alert and "user message #" in alert["text"]
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+    p.set_config("delivery.auto_merge_repos", [])
+    for _ in range(2):
+        Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == []
+    assert len(_grant_events(p)) == 1 and "set back" in _grant_events(p)[0]["text"]
+
+
+@pytest.mark.parametrize("user_text,provenance", [(None, None), ("hi", "system")])
+def test_grant_without_the_users_word_is_a_defect_not_an_ask(env, user_text, provenance):
+    """An auto-merge line the coordinator wrote on its own (or in a turn whose only message the harness
+    posted) is not the user's word: the config stays as is, one keyed defect event is raised across
+    ticks and restarts, and nothing is asked."""
+    from ttp import coordinator as coord
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    _policies_line(p, "- Auto-merge repositories: acme/widgets.", user_text, provenance)
+    d = Daemon(p.base)
+    d.sweep_holds()
+    d.sweep_holds()
+    Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == []
+    ev = _grant_events(p)
+    assert len(ev) == 1 and "auto_merge_repos" in ev[0]["text"] and "Not an ask" in ev[0]["text"]
+    assert coord.EFFORT_EVENT_TRIGGERS[grants.EVENT] == "conflict"
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+
+
+def test_grant_refused_by_the_charter_or_config_is_a_defect(env):
+    """A grant the user's word covers is still not applied when the charter also forbids it, or the
+    config auto-merges more than the charter lists: one defect each, no ask (not even the setup
+    question), nothing set. 'Never force-push' forbids nothing."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    _remote_origin(p)
+    p.set_config("delivery.push_branch", "origin/main")
+    p.set_config("delivery.push_allowed", False)
+    p.set_config("delivery.auto_merge_repos", ["acme/other"])
+    _policies_line(p, "- Pushes to main need no approval.\n- Auto-merge repositories: acme/widgets.\n"
+                      "- Never push to main.", "ok")
+    Daemon(p.base).sweep_holds()
+    Daemon(p.base).sweep_holds()
+    d = p.config()["delivery"]
+    assert d["push_allowed"] is False and not d.get("allow_protected_push_branch")
+    assert d["auto_merge_repos"] == ["acme/other"]
+    keys = sorted(t for e in _grant_events(p) for t in (grants.PUSH, grants.PROTECTED, grants.AUTO_MERGE)
+                  if f"grants {t} " in e["text"])
+    assert keys == sorted([grants.PUSH, grants.PROTECTED, grants.AUTO_MERGE]), _grant_events(p)
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+    assert not grants.forbidden("Never force-push to main.", "origin/main")
+
+
+def test_push_permission_grant_in_the_brief_turns_pushing_on(env):
+    """delivery.push_allowed off while the Brief grants pushes to the (ordinary) push branch: turned on,
+    once, with no ask."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/feature")
+    p.set_config("delivery.push_allowed", False)
+    p.charter_path.write_text("# x\n\n## Brief (verbatim from the user)\nReviewed work is pushed to "
+                              "origin/feature without asking for approval.\n\n## Policies\n- Be kind.\n")
+    Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["push_allowed"] is True
+    assert len(_grant_events(p, grants.APPLIED)) == 1 and _grant_events(p) == []
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+
+
+@pytest.mark.parametrize("line,repos", [
+    ("- Auto-merge repositories: none.", []),
+    ("- Auto-merge repositories: acme/widgets.", ["acme/widgets"]),
+    ("- **Auto-merge repositories**: acme/a, acme/b", ["acme/a", "acme/b"]),
+    ("- Auto-merge repositories: the usual ones", None),
+])
+def test_auto_merge_policies_line(line, repos):
+    from ttp.grants import auto_merge_repos
+    assert auto_merge_repos(line)[0] == repos
+    assert auto_merge_repos("- Auto-merge repositories: none.\n- Auto-merge repositories: acme/a.")[0] == ["acme/a"]
 
 
 def test_rejected_config_set_points_at_the_open_setup_ask(env):

@@ -39,6 +39,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import detach
 from . import effort
+from . import grants
 from . import ends
 from . import heal
 from . import pauseends
@@ -4188,8 +4189,10 @@ class Daemon:
                                       blocked_reason=settinghold.reason(key, holds[key], self.cfg))
 
     def _setting_setup_question(self, now: float) -> None:
-        """settinghold.setup_question, run only when the charter or the delivery settings changed
-        since the last check (its git check stays off the tick); the kv makes it once per state."""
+        """grants.reconcile, then settinghold.setup_question, run only when the charter or the delivery
+        settings changed since the last check (their git check stays off the tick): a grant the user's
+        word on record covers is applied first, so it is never asked about; the kv makes the question
+        once per state, keyed events make each defect once per state."""
         try:
             state = (self.p.charter_path.stat().st_mtime_ns, json.dumps(self.cfg.get("delivery") or {}, sort_keys=True))
         except OSError:
@@ -4197,6 +4200,16 @@ class Daemon:
         if getattr(self, "_setup_state", None) == state:
             return
         self._setup_state = state
+        try:
+            applied = grants.reconcile(self.p, self.p.db, self.cfg, now, self.p.root)
+        except Exception as e:   # a broken check never stops the tick; the setup question still runs
+            applied = []
+            log(self.p, f"charter grant check failed: {e}")
+        if applied:
+            self.cfg = self.p.config()
+            self._setup_state = (state[0], json.dumps(self.cfg.get("delivery") or {}, sort_keys=True))
+            for line in applied:
+                log(self.p, "charter grant applied: " + line[:300])
         if settinghold.setup_question(self.p.db, self.cfg, self.p.charter_path.read_text(), now, self.p.root):
             log(self.p, "setup question asked of the user: " + ", ".join(settinghold.SETTINGS))
 

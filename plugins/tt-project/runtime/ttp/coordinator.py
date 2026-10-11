@@ -188,7 +188,7 @@ EFFORT_EVENT_TRIGGERS = {
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
-    "charter_conflict": "conflict", "charter_retry": "conflict",
+    "charter_conflict": "conflict", "charter_retry": "conflict", "grant_mismatch": "conflict",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine

@@ -23,7 +23,9 @@ user's own word) while the setting is off and nothing asks about it, `setup_ques
 itself, model-free: one ask (blocking restriction) naming the setting, raised at setup or the first
 tick after a charter or delivery edit, instead of every landing task, or the coordinator's config_set,
 finding the refusal for itself days later. It fires once per grant (the push branch and the charter's
-wording), never per tick or turn. It never turns the setting on: the user's yes to the ask does.
+wording), never per tick or turn. It never turns the setting on: a grant the user's word on record
+covers (the Brief, or a Policies line logged with a user message) is applied before it by grants.reconcile
+and never asked about; a charter that also forbids the push is a grants defect, not a question.
 """
 from __future__ import annotations
 
@@ -253,6 +255,9 @@ def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = 
     branch = _push_branch(cfg)
     line = "" if on(cfg) else charter_says_no_approval(charter, branch)
     if not line or not applies(cfg, repo):
+        return ""
+    from .grants import forbidden
+    if forbidden(charter, branch):   # the charter says both: a defect grants.reconcile raises, not a question
         return ""
     fp = hashlib.sha256(f"{key}\n{branch}\n{line}".encode()).hexdigest()[:16]
     where = _section(charter, line)
