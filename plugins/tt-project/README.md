@@ -209,6 +209,14 @@ and preferences you add later become part of the project's charter and memory.
   offline provider, or the budget gate's slots are never counted: each hold has its own alert.
   Known gap: a hold that is itself wrong (a lock that never clears, a probe that can never pass) is
   not reported by this check; the lock, hold and wait checks cover it.
+- Network outage (model-free): when every task that could start waits on a probe saying this
+  machine cannot reach its host (ssh exit 255), no worker runs and nothing else can start, for
+  `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect
+  the VPN or network sign-in on the machine running the project. It names the hosts, when the outage
+  began (home time zone) and how many tasks wait, stays in the top section, is sent once per outage
+  (also across projects on the same machine) and wakes no coordinator. A heal check still trying its
+  fix delays it by one more grace. It clears with one low feed line once no probe has said
+  unreachable for `waiting.unreachable_debounce_s` (600), so a brief reconnect stays one outage.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

@@ -7,6 +7,10 @@ A high alert posted with a condition key (Daemon.alert, the budget gate) opens a
 and why; nothing is deleted. Readers (web app, `ttp status`, chat relay, desktop notifier, Slack)
 ask `active()`, which also checks the condition live, so a cleared alert disappears at once.
 
+A condition only the user can clear (USER_BLOCKERS: a lost VPN or network sign-in, netwait.py) is
+alerted at normal severity yet tracked like a high alert: an episode, the top section, and a clearing
+told as one low feed line.
+
 A host reboot is information only: it is posted as kind `info` and never opens an episode.
 
 One condition is one broadcast: while its episode is open a repeat only updates `last`, with one
@@ -57,16 +61,26 @@ CLEARED_TEXT = {
     "heal": "Heal check {arg} passes again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
+    "network": "The hosts the queued work waits on answer again; it resumes by itself.",
 }
+# Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
+# high alert; their clearing is a low feed line, not a new notification (netwait.py).
+USER_BLOCKERS = ("network",)
+CLEARED_SEVERITY = {"network": "low"}
 
 
 def _urgent(severity: str | None) -> bool:
     return SEVERITY_RANK.get(severity or "normal", 1) >= SEVERITY_RANK["high"]
 
 
+def _top(severity: str | None, ref: str | None) -> bool:
+    """An alert for the top section: high or above, or a keyed condition only the user can clear."""
+    return _urgent(severity) or bool(ref) and str(ref).partition(":")[0] in USER_BLOCKERS
+
+
 def tracked(kind: str, severity: str | None, ref: str | None) -> bool:
-    """Whether a broadcast opens an episode: a high alert with a condition key, never a reboot."""
-    return kind == "alert" and bool(ref) and _urgent(severity) and not str(ref).startswith("reboot:")
+    """Whether a broadcast opens an episode: a top-section alert with a condition key, never a reboot."""
+    return kind == "alert" and bool(ref) and _top(severity, ref) and not str(ref).startswith("reboot:")
 
 
 def open_episode(db: DB, key: str, ts: float, message: int, severity: str, text: str) -> None:
@@ -159,6 +173,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "machine-change":
         from . import machine_ledger
         return arg.isdigit() and machine_ledger.change_overdue(int(arg), now)
+    if kind == "network":   # Daemon.check_unreachable keeps the outage until reachability is back
+        return bool((db.kv("network_outage") or {}).get("alerted"))
     if key == "push_queue_dying":
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
                           "AND finalized>=? LIMIT 1", (since,))
@@ -182,7 +198,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "heal",
-                                         "machine", "machine-change")
+                                         "machine", "machine-change", "network")
 
 
 def _since(ep: dict) -> float:
@@ -194,7 +210,7 @@ def _since(ep: dict) -> float:
 def cleared(db: DB, m: dict, now: float) -> bool:
     """A high alert whose condition no longer holds: not worth delivering late. Lower-severity
     messages sharing the key (a budget back to normal) are news whatever the state."""
-    return (m.get("kind") == "alert" and _urgent(m.get("severity")) and bool(m.get("ref"))
+    return (m.get("kind") == "alert" and _top(m.get("severity"), m.get("ref")) and bool(m.get("ref"))
             and not active(db, m["ref"], m["ts"], now))
 
 
@@ -220,7 +236,7 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 # A quiet episode clears quietly: the project holding the claim tells the chats.
                 first = db.one("SELECT channel FROM messages WHERE id=?", (ep["message"],)) if ep["message"] else None
                 db.post("out", "Cleared: " + CLEARED_TEXT[kind].format(arg=arg), chat=None, kind="resolved",
-                        severity="normal", ref=ep["key"],
+                        severity=CLEARED_SEVERITY.get(kind, "normal"), ref=ep["key"],
                         channel=QUIET if first and first["channel"] == QUIET else "chat")
             closed.append({**ep, "cleared": now, "cleared_why": why})
     return closed
@@ -377,7 +393,7 @@ KEYLESS_TTL = 3600   # seconds an alert without a condition key stays in the top
 
 
 def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
-    """The top section: open asks first, then high alerts about problems that are active now, each
+    """The top section: open asks first, then top alerts (_top) about problems that are active now, each
     newest first. A newer alert on the same condition replaces the older one. Open asks are kept
     whatever their age and are never cut by `limit`, which only caps the alerts after them."""
     asks = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
@@ -391,7 +407,7 @@ def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
         if len(out) >= limit - len(asks):
             break
         ref = m.pop("ref")
-        if not _urgent(m["severity"]):
+        if not _top(m["severity"], ref):
             continue
         if ref:
             if ref in seen:
@@ -414,7 +430,7 @@ def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
     for m in rows:
         ref = m.pop("ref")
         m["state"] = "info" if m["kind"] in ("info", "resolved") else "fyi"
-        if m["kind"] == "alert" and _urgent(m["severity"]):
+        if m["kind"] == "alert" and _top(m["severity"], ref):
             if (ref and active(db, ref, m["ts"], now)) or (not ref and now - m["ts"] < KEYLESS_TTL):
                 continue   # in the top section
             m["state"] = "cleared"

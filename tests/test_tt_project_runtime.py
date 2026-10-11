@@ -39771,3 +39771,163 @@ def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_
     assert own.startswith(f"ttp/t{code}-") and push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == own
     assert f"It rebases feature/x and delivers onto its own branch {own}" in rev["spec"], rev["spec"]
     assert "`ttp push --own --detach`" in rev["spec"] and "do not approve it for the push queue" in rev["spec"]
+
+
+# One alert per network outage (netwait, Daemon.check_unreachable) -----------------------------------
+NET_PROBE = "ssh -o ConnectTimeout=5 jump.example true"
+NET_OUT = "ssh: connect to host jump.example port 22: Connection timed out"
+
+
+def _net_setup(env, monkeypatch, n=2):
+    """Two tasks deferred on a start_when probe that reaches a host over ssh, a home zone that is not
+    the machine's, a clock the test moves, and `check(at, rc)`: the probes' latest verdict (None: no
+    verdict, as once a probe passed and the task started), one check, the alert sweep; it returns the
+    network alerts posted so far."""
+    from ttp import alerts, timefmt
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    timefmt.set_home(p, "America/Los_Angeles")
+    d = Daemon(p.base)
+    for i in range(n):
+        assert coord.apply(p, [{"type": "task_add", "title": f"device job {i}", "spec": "s",
+                                "start_when": NET_PROBE}]) == []
+    tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='queued' ORDER BY id")]
+    clock = {"now": time.time(), "rc": 255}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+
+    def one(at, rc):
+        clock["now"] = at
+        for tid in tids:
+            if rc is None:
+                d._probe_rc.pop(tid, None)
+            else:
+                d._probe_rc[tid] = (rc, at, NET_PROBE)
+                d._probe_out[tid] = (NET_OUT if rc == 255 else "", at, NET_PROBE)
+        d._net_checked = 0.0
+        d.check_unreachable()
+        alerts.sweep(p.db, at)
+
+    def check(at, rc=255):
+        # The daemon checks every minute: between calls the last verdict holds (a check every 5 min here).
+        t = clock["now"] + 300
+        while t < at:
+            one(t, clock["rc"])
+            t += 300
+        one(at, rc)
+        clock["rc"] = rc
+        return p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='network:unreachable' ORDER BY id")
+    return p, d, tids, clock["now"], check
+
+
+def test_network_outage_alerts_once_after_the_grace_in_the_home_zone_and_shows_in_the_top_section(env, monkeypatch):
+    from ttp import alerts, timefmt
+    from ttp.cli import status_text
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    assert check(now) == [], "the grace starts at the first check that sees the outage"
+    assert check(now + 600) == [], "within the grace (15 min by default) nothing is said"
+    sent = check(now + 900)
+    assert len(sent) == 1, "every task that could start waits on an unreachable host: one alert"
+    m = sent[0]
+    assert m["severity"] == "normal" and m["chat"] is None and m["channel"] == "chat", m
+    assert "jump.example" in m["text"] and "2 queued task(s)" in m["text"], m["text"]
+    assert "VPN or network sign-in" in m["text"] and "resumes by itself" in m["text"], m["text"]
+    assert timefmt.long(now, "America/Los_Angeles") in m["text"] and ("PDT" in m["text"] or "PST" in m["text"])
+    assert "ttp " not in m["text"], "no command the harness could run itself"
+    assert [x["id"] for x in alerts.needs_you(p.db, now + 900)] == [m["id"]], "a normal alert, yet in the top section"
+    assert "needs you (alert" in status_text(p) and "VPN" in status_text(p)
+    for at in (now + 1800, now + 3600, now + 6 * 3600, now + 30 * 3600):
+        assert len(check(at)) == 1, "no repeat while the outage lasts, not even a daily reminder"
+    assert not p.db.q("SELECT id FROM events WHERE status IN ('new','queued')"), "the coordinator is not woken"
+    assert p.db.one("SELECT COUNT(*) n FROM alerts WHERE key='network:unreachable'")["n"] == 1
+
+
+def test_network_outage_clears_once_hosts_answer_with_a_low_feed_line_and_a_brief_reconnect_stays_one(env, monkeypatch):
+    from ttp import alerts
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    check(now)
+    assert len(check(now + 900)) == 1
+    since = p.db.kv("network_outage")["since"]
+    # A brief reconnect: the probes pass, then fail again within the debounce (600 s by default).
+    assert len(check(now + 960, rc=None)) == 1
+    assert alerts.needs_you(p.db, now + 960), "the alert stays through the debounce"
+    assert len(check(now + 1300)) == 1 and p.db.kv("network_outage")["since"] == since, "the same outage"
+    # Reachability is back for good: the probes passed and the tasks started.
+    t0 = now + 1400
+    assert len(check(t0, rc=None)) == 1
+    assert len(check(t0 + 300, rc=None)) == 1 and alerts.needs_you(p.db, t0 + 300)
+    assert len(check(t0 + 660, rc=None)) == 1, "clearing posts no new alert"
+    assert not alerts.needs_you(p.db, t0 + 660), "cleared once the hosts answered for the debounce"
+    done = p.db.q("SELECT * FROM messages WHERE kind='resolved' AND ref='network:unreachable'")
+    assert len(done) == 1 and done[0]["severity"] == "low", "one low feed line, not a notification"
+    assert not p.db.kv("network_outage")
+    assert [x for x in alerts.feed(p.db, t0 + 660) if x.get("state") == "cleared"]
+    # A later outage is a new one: alerted once more after its own grace.
+    t1 = t0 + 3600
+    assert len(check(t1)) == 1 and len(check(t1 + 600)) == 1
+    assert len(check(t1 + 900)) == 2
+
+
+def test_network_outage_stays_quiet_when_a_task_could_start_or_is_held_for_another_reason(env, monkeypatch):
+    from ttp import budget as bud
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    other = p.db.add_task("local work", "s", kind="work", tier="light", origin="coordinator")
+    for k in range(5):
+        assert check(now + k * 900) == [], "a task that could start: the project is not blocked"
+    prov = d.cfg.get("core_provider", "claude")
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=4, allow_new_work=False)}
+    for k in range(5, 10):
+        assert check(now + k * 900) == [], "a task held by the budget gate: mixed causes, nothing said"
+    p.db.update_task(other, status="cancelled")
+    d.gates = {}
+    run = p.db.x("INSERT INTO runs(task,role,started,status) VALUES(NULL,'worker',?,'running')", (now,))
+    for k in range(10, 15):
+        assert check(now + k * 900) == [], "a worker still runs: the project is not idle"
+    p.db.x("UPDATE runs SET status='ok' WHERE id=?", (run,))
+    assert check(now + 14 * 900 + 60, rc=1) == [] and check(now + 16 * 3600, rc=1) == [], \
+        "a probe saying plain not yet (exit 1) is no network outage"
+
+
+def test_network_outage_ignores_neutral_holds_and_honours_off_and_self_heal(env, monkeypatch):
+    from ttp import coordinator as coord
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    later = p.db.add_task("on a timer", "s", kind="work", tier="light", origin="coordinator", not_before=now + 86400)
+    p.db.add_task("after a timer task", "s", kind="work", tier="light", origin="coordinator", depends_on=[later])
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    p.db.add_task("needs the paused board", "s", kind="work", tier="light", origin="coordinator",
+                  labels=["exclusive:board"])
+    monkeypatch.setattr(d, "_healing", lambda: True)
+    check(now)
+    assert check(now + 900) == [], "a heal check still trying its fix gets one more grace"
+    assert len(check(now + 1800)) == 1, "timers, dependencies and user pauses do not count against the alert"
+    assert "2 queued task(s)" in p.db.q("SELECT text FROM messages WHERE ref='network:unreachable'")[0]["text"]
+
+    check(now + 1860, rc=None)
+    assert len(check(now + 2500, rc=None)) == 1 and not p.db.kv("network_outage"), "the outage ended"
+    d.cfg = {**d.cfg, "waiting": {**(d.cfg.get("waiting") or {}), "unreachable_alert_s": 0}}
+    assert len(check(now + 6000)) == 1 and not p.db.kv("network_outage"), "0 turns the alert off"
+
+
+def test_network_outage_names_the_hosts_from_ssh_errors_or_the_probe(env):
+    from ttp import netwait
+    assert netwait.hosts("ssh -p 2222 -o BatchMode=yes -i key user@box1 test -e /m") == ["box1"]
+    assert netwait.hosts("ssh -q box2 true && ssh box3 true") == ["box2", "box3"]
+    assert netwait.hosts("ttp detach --check --host box4 /runs/1/x") == ["box4"]
+    assert netwait.hosts("ssh box5 true", "ssh: Could not resolve hostname gw.example: Name or service not known") \
+        == ["gw.example"]
+    assert netwait.hosts("test -e /tmp/x") == []
+    assert "The hosts this project's work needs cannot be reached" in netwait.text("UTC", 0.0, 1, [])
+
+
+def test_network_outage_counts_a_waiting_hand_off_whose_retry_when_cannot_reach_its_host(env, monkeypatch):
+    p, d, tids, now, check = _net_setup(env, monkeypatch, n=0)
+    tid = p.db.add_task("device run", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(tid, not_before=now + 86400, result=json.dumps(
+        {"status": "waiting", "waiting_for": "the box", "retry_when": NET_PROBE, "waiting_since": now}))
+    tids.append(tid)
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1 and "1 queued task(s)" in sent[0]["text"], sent
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": "test -e /tmp/other"}))
+    assert d._reachability_holds(now + 960) == ([], False), "a verdict for another probe is not counted"

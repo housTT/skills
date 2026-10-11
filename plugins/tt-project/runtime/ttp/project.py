@@ -88,6 +88,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # serving resource is raised once (0: never)
                 "start_resource_stale_s": 10800,
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
+                # every task that could start waits on hosts this machine cannot reach (probe exit 255),
+                # nothing runs: one normal alert this long into the outage (0: never); the outage ends
+                # once no probe has said unreachable for the debounce (netwait.py)
+                "unreachable_alert_s": 900, "unreachable_debounce_s": 600,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
                 "on_pass_timeout_s": 600},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}

@@ -49,6 +49,7 @@ from . import landed
 from . import localspend
 from . import locks
 from . import machine_ledger
+from . import netwait
 from . import machines
 from . import prguard
 from . import push
@@ -653,7 +654,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2985,6 +2986,78 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
+
+    def check_unreachable(self, every_s: float = 60) -> None:
+        """One alert per network outage (netwait): every task that could start waits on a probe saying
+        this machine cannot reach its host (exit 255), no worker runs and nothing else can start, for
+        `waiting.unreachable_alert_s`. Only the user can sign back in to a VPN or network; the alert
+        says so once, stays in the top section and clears itself once the hosts answer again."""
+        now = time.time()
+        if now - getattr(self, "_net_checked", 0.0) < every_s:
+            return
+        self._net_checked = now
+        db = self.p.db
+        grace, debounce = netwait.settings(self.cfg)
+        st = db.kv(netwait.STATE_KEY) or {}
+        if grace <= 0 and not st:
+            return
+        unreachable, other = self._reachability_holds(now)
+        running = db.one("SELECT id FROM runs WHERE role!='coordinator' AND status='running' LIMIT 1")
+        blocking = bool(unreachable) and not other and not running
+        new, action = netwait.step(st, blocking, len(unreachable), now, grace, debounce,
+                                   healing=blocking and self._healing())
+        if action == "alert":
+            names = list(dict.fromkeys(h for _, hs in unreachable for h in hs))
+            new.update(tasks=[tid for tid, _ in unreachable], hosts=names)
+        if new != st:
+            db.set_kv(netwait.STATE_KEY, new)
+        if action == "alert":
+            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names),
+                       severity="normal")
+            log(self.p, f"network: {len(unreachable)} task(s) wait on unreachable hosts "
+                        f"({', '.join(names) or 'unnamed'}); alerted once")
+        elif action == "clear":
+            log(self.p, "network: the hosts answer again; the outage alert clears")
+
+    def _reachability_holds(self, now: float) -> tuple[list[tuple[int, list[str]]], bool]:
+        """(queued tasks whose current probe last said unreachable, with the hosts it names; whether a
+        task could start now or is held by anything but a neutral hold). Neutral: dependencies, a timer,
+        a probe that says plain "not yet", a user-paused resource."""
+        db = self.p.db
+        core = self.cfg.get("core_provider") or "claude"
+        queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id")
+        unmet = db.unmet_dependencies(queued)
+        ctx = {"now": now, "paused": db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
+        unreachable, other = [], False
+        for t in queued:
+            if unmet[t["id"]]:
+                continue
+            when = deferral(t).get("when")
+            probe = when or (load_result(t["result"]).get("retry_when") if (t["not_before"] or 0) > now else None)
+            got = self._probe_rc.get(t["id"])
+            if probe and got and got[0] == netwait.UNREACHABLE_RC and got[2] == probe \
+                    and now - got[1] <= 3 * PROBE_EVERY_S:
+                out = self._probe_out.get(t["id"])
+                unreachable.append((t["id"], netwait.hosts(probe, out[0] if out and out[2] == probe else "")))
+                continue
+            if when or (t["not_before"] or 0) > now:
+                continue
+            prov = t["provider"] or core
+            if prov not in ctx["logged_out"]:
+                ctx["logged_out"][prov] = self._logged_out(prov)
+            if self._start_hold(t, prov, ctx) != "paused":
+                other = True
+        return unreachable, other
+
+    def _healing(self) -> bool:
+        """A heal check is still trying its own fix: unhealthy, not escalated, no self-fix task yet."""
+        db = self.p.db
+        for r, _ in heal.checks(db):
+            s = heal.state(db, r["name"])
+            if s.get("phase") in ("fixing", "settling") or (
+                    s.get("status") == "unhealthy" and not s.get("escalated") and not heal.has_open_task(db, r["name"])):
+                return True
+        return False
 
     # coordinator ------------------------------------------------------------------------------------
     def retry_rejected(self) -> None:
@@ -5612,8 +5685,9 @@ class Daemon:
 
     def _machine_wide(self, key: str) -> str | None:
         """The per-user claim key of a condition every project on this machine sees alike: a
-        logged-out CLI, or a low disk on the filesystem the guard found short. None otherwise."""
-        if key.startswith("auth:"):
+        logged-out CLI, a lost VPN or network sign-in (netwait), or a low disk on the filesystem the
+        guard found short. None otherwise."""
+        if key.startswith("auth:") or key == netwait.KEY:
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")
@@ -5626,7 +5700,7 @@ class Daemon:
     def _cleared_claims(self, key: str) -> list[str]:
         """The claim keys a cleared machine-wide episode ends: the CLI's, or each filesystem this
         project's disk guard watches (the low one is no longer recorded once it cleared)."""
-        if key.startswith("auth:"):
+        if key.startswith("auth:") or key == netwait.KEY:
             return [f"{hostname()}|{key}"]
         out = []
         for path in (self.p.base, self.p.worktrees):
@@ -5642,7 +5716,7 @@ class Daemon:
         self.check_logins()
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
-            if ep["key"].startswith("auth:") or ep["key"] == "disk":
+            if ep["key"].startswith("auth:") or ep["key"] in ("disk", netwait.KEY):
                 # Whoever holds the claim: the next project to see the condition again broadcasts it.
                 alerts.release(self._cleared_claims(ep["key"]), ep["cleared"])
             kind, _, prov = ep["key"].partition(":")
