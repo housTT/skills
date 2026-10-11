@@ -4158,7 +4158,7 @@ class Daemon:
             return
         self._setup_state = state
         if settinghold.setup_question(self.p.db, self.cfg, self.p.charter_path.read_text(), now, self.p.root):
-            log(self.p, "setup question raised to the coordinator: " + ", ".join(settinghold.SETTINGS))
+            log(self.p, "setup question asked of the user: " + ", ".join(settinghold.SETTINGS))
 
     def _hold_probe(self, task: dict, probe: str, now: float) -> str:
         """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, else ''."""
