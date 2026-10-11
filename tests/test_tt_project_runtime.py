@@ -16270,6 +16270,117 @@ def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatc
     assert coord.apply(p, [{**bad, "value": []}]) == []
 
 
+
+def _mirror_setup(env, monkeypatch, mirrors=None, branch="dev"):
+    """_push_setup plus a second bare repository, git remote `mirror`, whose `branch` is at the
+    target's tip, kept in step by delivery.mirror_remotes."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    mirror = env["tmp"] / "mirror.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(mirror)], check=True)
+    _git_out(repo, "remote", "add", "mirror", str(mirror))
+    _git_out(repo, "push", "-q", "mirror", f"HEAD:refs/heads/{branch}")
+    p.set_config("delivery.mirror_remotes", mirrors if mirrors is not None else [{"remote": "mirror", "branch": branch}])
+    return p, repo, origin, mirror
+
+
+def _no_force(monkeypatch):
+    """Every git call mirror() makes, recorded; none may force."""
+    from ttp import push
+    calls, real = [], push._git_net
+    monkeypatch.setattr(push, "_git_net", lambda repo, *a, **k: (calls.append(a), real(repo, *a, **k))[1])
+    forced = lambda: [a for a in calls if a[0] == "push" and (  # noqa: E731
+        {"-f", "--force", "--force-with-lease", "--mirror"} & set(a) or any(x.startswith("+") for x in a[1:]))]
+    return calls, forced
+
+
+def test_push_mirrors_the_pushed_head_to_another_remote_fast_forward_only(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, mirror = _mirror_setup(env, monkeypatch, [{"remote": "mirror", "branch": "dev"}, "mirror/new"])
+    calls, forced = _no_force(monkeypatch)
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(mirror, "rev-parse", "dev") == sha and _git_out(mirror, "rev-parse", "new") == sha, \
+        "the same commit goes to the mirror; a branch it lacks is created"
+    assert push.last_ff == [f"mirror mirror/dev {sha}", f"mirror mirror/new {sha}"]
+    assert any(a[0] == "fetch" for a in calls), "each mirror is fetched first"
+    assert [a for a in calls if a[0] == "push"] and forced() == [], calls
+    assert f"ttp push: mirror mirror/dev {sha}" in capsys.readouterr().err
+    # Already there: nothing is pushed, and it still reads back as mirrored.
+    calls.clear()
+    assert push.mirror(repo, sha, push.mirror_list([{"remote": "mirror", "branch": "dev"}]), "origin/proj") == \
+        [f"mirror mirror/dev {sha}"] and not [a for a in calls if a[0] == "push"]
+
+
+def test_push_skips_a_diverged_mirror_names_both_commits_and_notes_it(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, mirror = _mirror_setup(env, monkeypatch)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    side = env["tmp"] / "side"
+    subprocess.run(["git", "clone", "-q", "-b", "dev", str(mirror), str(side)], check=True)
+    _commit(side, "hotfix.txt", "fix\n")
+    _git_out(side, "push", "-q", "origin", "HEAD:dev")
+    theirs = _git_out(mirror, "rev-parse", "dev")
+    calls, forced = _no_force(monkeypatch)
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0, "a diverged mirror never fails the main push"
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(mirror, "rev-parse", "dev") == theirs, "the mirror stays as it was"
+    assert not [a for a in calls if a[0] == "push"] and forced() == [], "nothing is pushed to a diverged mirror"
+    [line] = push.last_ff
+    assert line.startswith("not mirrored mirror/dev: ") and theirs in line and sha in line, line
+    assert push.ff_warnings(push.last_ff) == push.last_ff
+    note = (run_dir / "progress.md").read_text()
+    assert "not mirrored mirror/dev" in note and theirs in note and sha in note, note
+
+
+def test_a_mirror_that_fails_never_fails_the_main_push(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, mirror = _mirror_setup(env, monkeypatch, [{"remote": "gone", "branch": "dev"},
+                                                                {"remote": "mirror", "branch": "dev"},
+                                                                {"remote": "nowhere", "branch": "dev"}])
+    _git_out(repo, "remote", "add", "gone", str(env["tmp"] / "no-such-repo.git"))
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert push.last_ff[0].startswith("not mirrored gone/dev: gone cannot be read"), push.last_ff
+    assert push.last_ff[1:] == [f"mirror mirror/dev {sha}", "not mirrored nowhere/dev: there is no git remote named nowhere"]
+    # mirror() itself raising: the push stands and each mirror says why.
+    monkeypatch.setattr(push, "mirror", lambda *a, **k: 1 / 0)
+    _commit(repo, "more.txt", "more\n")
+    assert push.run(p, repo) == 0 and _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    assert push.last_ff[0] == "not mirrored gone/dev: ZeroDivisionError: division by zero", push.last_ff
+    # Off by default and when emptied: nothing else moves.
+    for off in ([], ""):
+        p.set_config("delivery.mirror_remotes", off)
+        _commit(repo, f"off{off!r}.txt", "x\n")
+        assert push.run(p, repo) == 0 and push.last_ff == []
+
+
+def test_mirror_remotes_refuses_the_push_branch_and_bad_entries(env, monkeypatch):
+    from ttp import push
+    from ttp import coordinator as coord
+    from ttp.project import config_problems
+    p, repo, origin, mirror = _mirror_setup(env, monkeypatch)
+    for bad in ([{"remote": "origin", "branch": "proj"}], ["origin/proj"], [{"remote": "mirror", "branch": "a..b"}],
+                [{"remote": "-x", "branch": "dev"}], [{"branch": "dev"}], ["dev"], [{"remote": "mirror", "branch": ""}]):
+        with pytest.raises(ValueError):
+            push.mirror_check(bad, "origin/proj")
+        assert config_problems({"delivery": {"push_branch": "origin/proj", "mirror_remotes": bad}}), bad
+    assert push.mirror_check('[{"remote": "mirror", "branch": "dev"}, " mirror/dev ", "m2/a/b"]', "origin/proj") == \
+        [{"remote": "mirror", "branch": "dev"}, {"remote": "m2", "branch": "a/b"}]
+    assert push.mirror(repo, "ab" * 20, [{"remote": "origin", "branch": "proj"}], "origin/proj") == \
+        ["not mirrored origin/proj: it is the push branch itself (delivery.push_branch)"]
+    # From chat it needs the user's word; turning it off does not.
+    ask = {"type": "config_set", "key": "delivery.mirror_remotes", "value": [{"remote": "mirror", "branch": "dev"}]}
+    assert "ask_user (blocking restriction)" in coord.apply(p, [ask])[0]
+    assert "push branch" in coord.apply(p, [{**ask, "value": ["origin/proj"]}], user_turn=True)[0]
+    assert coord.apply(p, [ask], user_turn=True) == []
+    assert p.config()["delivery"]["mirror_remotes"] == [{"remote": "mirror", "branch": "dev"}]
+    assert coord.apply(p, [{**ask, "value": []}]) == []
+
 def test_push_starts_over_when_the_target_moves_during_the_checks(env, monkeypatch):
     log, once = env["tmp"] / "checked", env["tmp"] / "moved"
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
@@ -17894,6 +18005,34 @@ def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypa
     assert f"  ff main {sha}" in out and "  warning: not ff old: " in out
 
 
+
+def test_a_push_batch_mirrors_its_pushed_commit_and_still_runs_after_push(env, monkeypatch, capsys):
+    from ttp import batch
+    p, repo, origin, mirror = _mirror_setup(env, monkeypatch)
+    deployed = env["tmp"] / "deployed"
+    p.set_config("delivery.after_push", [f'echo "$TTP_PUSHED_SHA" > {deployed}'])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    marker = _batch_marker(p, heads)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert rc == 0 and m["outcome"] == "pushed" and m["pushed_sha"] == sha, m
+    assert _git_out(mirror, "rev-parse", "dev") == sha and m["fast_forward"] == [f"mirror mirror/dev {sha}"], m
+    assert m["after_push"]["status"] == "ok" and deployed.read_text().strip() == sha, "after_push still runs"
+    capsys.readouterr()
+    assert batch.summary(marker) == 0 and f"  mirror mirror/dev {sha}" in capsys.readouterr().out
+    # A diverged mirror: the batch still pushes, the mirror stays, after_push still runs.
+    side = env["tmp"] / "side"
+    subprocess.run(["git", "clone", "-q", "-b", "dev", str(mirror), str(side)], check=True)
+    _commit(side, "hotfix.txt", "fix\n")
+    _git_out(side, "push", "-q", "origin", "HEAD:dev")
+    theirs = _git_out(mirror, "rev-parse", "dev")
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e2", {"f2.txt": "2\n"})], bid="b2"), monkeypatch)
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert rc == 0 and m["outcome"] == "pushed" and _git_out(mirror, "rev-parse", "dev") == theirs, m
+    [line] = m["fast_forward"]
+    assert line.startswith("not mirrored mirror/dev: ") and theirs in line and sha in line, line
+    assert deployed.read_text().strip() == sha
+
 def _merge_entry(repo, name):
     """Entry `name`: a --no-ff merge, on origin/proj, of a task branch whose first commit is tagged."""
     _entry(repo, f"{name}-task", {f"plugins/p/{name}a.txt": "a\n"})
@@ -19013,6 +19152,22 @@ def test_a_pushed_batch_reports_fast_forward_also_in_its_notice_and_warns_on_not
     [warn] = [e for e in evs if e["kind"] == "push_not_ff"]
     assert warn["status"] == "queued" and "not ff release" in warn["text"] and f"ff main {sha}" not in warn["text"]
 
+
+
+def test_a_pushed_batch_puts_a_diverged_mirror_in_the_feed(env, monkeypatch):
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    sha, theirs = "ab" * 20, "ef" * 20
+    line = f"not mirrored mirror/dev: it is at {theirs}, not an ancestor of the pushed {sha}; left as it is"
+    _pq_plan(s, outcome="pushed", sha=sha, tip="cd" * 20, version="0.3.1", ff=[line])
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    s.p.db.set_kv("last_coordinator_turn", time.time())
+    d = Daemon(s.p.base)
+    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done", timeout=60)
+    assert f"warning: {line}" in json.loads(s.p.db.task(s.review)["result"])["summary"]
+    [warn] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_not_ff"]
+    assert line in warn["text"] and "delivery.mirror_remotes" in warn["text"]
 
 def _pq_rows(env, on=True):
     """A plain project (no git remote) with the push queue on or off, for the displays: rows are
