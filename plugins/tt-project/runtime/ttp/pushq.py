@@ -18,10 +18,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import locks, push, timefmt
+from . import batch, locks, push, timefmt
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  review_subject, reviewed_ids)
+from .landed import on_branch
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
+from .worktree import fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
@@ -176,8 +178,7 @@ def target_line(db, tz: str | None = None) -> str | None:
     if not r or not r.get("ref") or r["ref"] == row["target"]:
         return None
     if tz:   # the project's home zone
-        from .timefmt import long
-        when = long(row["ended"] or row["started"], tz)
+        when = timefmt.long(row["ended"] or row["started"], tz)
     else:
         when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(row["ended"] or row["started"]))
     if r.get("on") is None:
@@ -286,7 +287,6 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     unless its entry lists that task under "inherited": the review judged them; "inherited" then
     names them per head for the event. A reviewed task whose pr_branch (push.pr_elsewhere) the push
     remote has no branch of is a push-branch delivery: "notes" says its label was ignored and why."""
-    from .worktree import fix_branches, named_refs
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
         if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
@@ -717,7 +717,6 @@ def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, q
 def _on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> bool | None:
     """Whether `sha` is on remote/branch: the tracking ref first (a push that went through moved it),
     then a bounded fetch when asked. None when the branch cannot be read."""
-    from .landed import on_branch
     if fetch:
         try:
             if subprocess.run(["git", "-C", str(repo), "fetch", "-q", remote,
@@ -1074,9 +1073,8 @@ def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
     `ttp push --batch <marker>`, which resumes at after_push since the marker has an outcome. It holds
     the batch's after_push lock (not `push:`, so upgrades do not wait for it), passed down as at the
     start, and the marker names it."""
-    from .batch import _after_lock
     db = p.db
-    lock_path = _after_lock(p, b["id"])
+    lock_path = batch._after_lock(p, b["id"])
     lock = locks.try_take([lock_path], f"push batch {b['id']} after_push (resumed)", "the push queue")
     if lock is None:
         return False
@@ -1110,9 +1108,8 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
     each receipt that ended, or whose process died in it (its lock is free while it reads running),
     becomes one event, and a failure also an after_push_failed alert; then it is marked reported.
     Reported receipts older than push.KEEP_S go. Returns the ids it reported."""
-    from .batch import RECEIPTS, _after_lock
     now = time.time() if now is None else now
-    folder = p.state / RECEIPTS
+    folder = p.state / batch.RECEIPTS
     done = []
     for receipt in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         m = _read(receipt)
@@ -1124,7 +1121,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             continue
         rid = str(m.get("id") or receipt.stem)
         if m.get("status") == "running":
-            if not locks.any_free([_after_lock(p, rid)]):
+            if not locks.any_free([batch._after_lock(p, rid)]):
                 continue
             m = _read(receipt)     # read after the lock: the process writes its outcome before letting go
             if m.get("status") == "running":

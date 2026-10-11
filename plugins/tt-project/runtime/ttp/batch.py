@@ -37,7 +37,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import locks, push, worktree
+from . import locks, push, runner, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1173,9 +1173,8 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
     folder.mkdir(parents=True, exist_ok=True)
     receipt = folder / f"{rid}.json"
     task = os.environ.get("TTP_TASK") or ""
-    from .runner import boot_id
     m = {"v": 1, "kind": "push", "id": rid, "status": "running", "outcome": "pushed", "pushed_sha": sha,
-         "target": target, "tip": tip, "repo": str(repo), "task": task, "pid": os.getpid(), "boot": boot_id(),
+         "target": target, "tip": tip, "repo": str(repo), "task": task, "pid": os.getpid(), "boot": runner.boot_id(),
          "started": time.time(), "results": [{"task": task, "status": "pushed"}] if task else []}
     try:
         m["version"] = push.pushed_version(p, repo, sha)

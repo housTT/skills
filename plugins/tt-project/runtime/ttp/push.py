@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import locks, worktree
+from . import locks, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
+from .db import continues_id, dependency_ids, load_result
 from .project import Project, durable_append, durable_write, git_fsync_env, nice_level, renice, write_json
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
@@ -1297,10 +1298,9 @@ def base_candidates(p: Project, repo: Path, remote: str, push_to: str, branch: s
     by. Other: the branch's upstream and the remote's default branch (else its main or master).
     Never the branch's own copy on the remote, nor another task's ttp/t<id>-... branch: that is
     work landing by the same flow, not a base."""
-    from .worktree import named_base
     configured = [f"{remote}/{push_to}"]
     d = p.config().get("delivery") or {}
-    for ref in (str(d.get("base_ref") or "").strip(), named_base(p)):
+    for ref in (str(d.get("base_ref") or "").strip(), worktree.named_base(p)):
         if ref:
             name = ref_name(repo, ref)
             configured.append(name if _commit_of(repo, name) else ref)
@@ -1369,7 +1369,6 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
     head as pr-watch last read it decides, and a PR it read as no longer open does not count; before
     pr-watch read it, a `ttp push --own` of this task that pushed exactly `head` does. A review of
     such a head is review only: the work is delivered, so a pass publishes nothing more."""
-    from . import prguard
     url = str(task.get("pr_url") or "").strip()
     key = prguard.pr_key(url) if url and head else None
     if not key:
@@ -1404,7 +1403,6 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
     globs = exclude_list(d.get("push_exclude_paths"))
     if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
         return "every file it changes is one delivery.push_exclude_paths keeps off the push branch"
-    from .db import load_result
     result = load_result(task.get("result"))
     flag = result.get("no_push")
     if flag not in (None, False, "", 0):
@@ -1428,7 +1426,6 @@ def pr_branch_of(p: Project, task: dict | None) -> str:
 def pr_branch_source(p: Project, task: dict | None) -> tuple[dict | None, str]:
     """(the task whose label gives `task` its branch, that branch) as pr_branch_of finds them: `task`
     itself or one it continues; (None, "") when it carries none."""
-    from .db import continues_id
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
@@ -1490,7 +1487,6 @@ def _reviewed(p: Project, task: str | None) -> list[dict]:
     t = _task_row(p, task)
     if not t or t.get("kind") != "review":
         return []
-    from .db import dependency_ids
     ids = [i for i in dependency_ids(t) if i is not None]
     ids += [int(x[12:]) for x in _labels(t) if x.startswith("auto_review:") and x[12:].isdigit()]
     return [r for r in (_task_row(p, str(i)) for i in dict.fromkeys(ids)) if r]
@@ -2253,7 +2249,6 @@ def run_after(p: Project, repo: Path) -> dict | None:
         return None
     sha, target, tip = pending_after
     pending_after = None
-    from . import batch
     try:
         out = batch.after_ordinary_push(p, repo, sha, target, tip)
     except Exception as e:   # never changes what the push did
@@ -2416,8 +2411,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
                                  stderr=subprocess.STDOUT, start_new_session=True,
                                  pass_fds=(lock.fileno(),))
     renice(child.pid, nice)  # before the go
-    from .runner import boot_id
-    m.update(status="running", pid=child.pid, started=time.time(), boot=boot_id())
+    m.update(status="running", pid=child.pid, started=time.time(), boot=runner.boot_id())
     write_json(marker, m)
     child.stdin.close()      # the go: the push starts once its marker is written
     return child.pid
@@ -2568,8 +2562,7 @@ def after_set(p: Project) -> bool:
 
 
 def _dead_reason(m: dict) -> str:
-    from .runner import same_boot
-    if m.get("boot") and not same_boot(m["boot"]):
+    if m.get("boot") and not runner.same_boot(m["boot"]):
         return "the push process ended without writing an outcome: the host rebooted while it ran"
     if m.get("boot") and not m.get("alive"):   # written by a version that marks the start
         return ("the push process ended without writing an outcome before it began: it was probably "
@@ -2661,7 +2654,6 @@ def result(marker: Path) -> int:
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
     if _read(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
-        from . import batch
         return batch.summary(marker)
     try:
         m = _settle(marker)
@@ -2719,3 +2711,9 @@ def running(p: Project) -> list[dict]:
         if m.get("status") == "queued" or m.get("status") == "running" and not locks.any_free([_run_lock(marker)]):
             out.append({**m, "marker": str(marker)})
     return out
+
+
+# Last, not at the top: batch imports push and reads its constants at import time. Loaded with push,
+# never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
+# that calls into this older push (after_push would fail on a missing attribute).
+from . import batch  # noqa: E402

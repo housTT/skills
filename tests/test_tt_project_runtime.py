@@ -42757,3 +42757,168 @@ def test_deployed_cannot_tell_without_a_receipt_and_waits_for_a_fresh_tick(env, 
     project.register("epsilon", {"host": "testhost", "dir": str(tmp_path / "missing")})
     assert overview.deployed(names=["epsilon"])["rc"] == 2
     db.close()
+
+
+def _ttp_sources() -> list[tuple[str, pathlib.Path]]:
+    """(dotted module name, path) of every module in the ttp package, subpackages included."""
+    pkg = RUNTIME / "ttp"
+    out = []
+    for f in sorted(pkg.rglob("*.py")):
+        parts = list(f.relative_to(RUNTIME).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        out.append((".".join(parts), f))
+    return out
+
+
+def _sibling_imports(name: str, path: pathlib.Path) -> tuple[dict, list]:
+    """For one ttp module: {local name: sibling module} for its `from . import x` (anywhere in the
+    file), and [(lineno, sibling module, attr)] for each `from .x import attr`."""
+    import ast
+    aliases, froms = {}, []
+    for node in ast.walk(ast.parse(path.read_text(), str(path))):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            got = _imported_modules(name, path, node)
+            aliases.update(got[0])
+            froms += got[1]
+    return aliases, froms
+
+
+def _imported_modules(name: str, path: pathlib.Path, node) -> tuple[dict, list]:
+    import ast
+    import importlib.util
+    pkg = name if path.name == "__init__.py" else name.rpartition(".")[0]
+    aliases, froms = {}, []
+    if isinstance(node, ast.ImportFrom) and node.level:
+        base = importlib.util.resolve_name("." * node.level + (node.module or ""), pkg)
+        for a in node.names:
+            if node.module:
+                froms.append((node.lineno, base, a.name))
+            else:
+                aliases[a.asname or a.name] = f"{base}.{a.name}"
+    elif isinstance(node, ast.Import):
+        for a in node.names:
+            if a.name.startswith("ttp.") and a.asname:
+                aliases[a.asname] = a.name
+    return aliases, froms
+
+
+def _module_attribute_refs(name: str, path: pathlib.Path) -> list[tuple[int, str, str, str]]:
+    """[(lineno, local name, sibling module, attr)] for each `x.attr` where x names a sibling module in
+    that scope: a function's own imports and local names (a parameter or variable called like a
+    module) shadow the enclosing scope's."""
+    import ast
+    tree = ast.parse(path.read_text(), str(path))
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    out = []
+
+    def own_nodes(scope):   # the nodes of a scope, not those of the functions nested in it
+        todo = list(ast.iter_child_nodes(scope))
+        while todo:
+            n = todo.pop()
+            yield n
+            if not isinstance(n, scopes):
+                todo.extend(ast.iter_child_nodes(n))
+
+    def visit(scope, outer: dict):
+        mods, bound = {}, set()
+        if isinstance(scope, scopes):
+            a = scope.args
+            bound |= {x.arg for x in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg] if x}
+        for n in own_nodes(scope):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                got = _imported_modules(name, path, n)[0]
+                mods.update(got)
+                bound |= {a.asname or a.name.split(".")[0] for a in n.names} - set(got)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                bound.add(n.id)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(n.name)
+        seen = {k: v for k, v in outer.items() if k not in bound or k in mods}
+        seen.update(mods)
+        for n in own_nodes(scope):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in seen:
+                out.append((n.lineno, n.value.id, seen[n.value.id], n.attr))
+            if isinstance(n, scopes):
+                visit(n, seen)
+
+    visit(tree, {})
+    return out
+
+
+def test_every_cross_module_attribute_between_ttp_modules_resolves():
+    """A `push.scalar_problem` in batch.py, or a `from .push import scalar_problem`, names an attribute
+    the sibling module really has: a rename or removal in one module cannot leave a caller that only
+    fails at run time (an AttributeError in a rarely taken path, such as after_push)."""
+    import importlib
+    import importlib.util
+    missing, checked = [], 0
+    for name, path in _ttp_sources():
+        for lineno, mod, attr in _sibling_imports(name, path)[1]:
+            m = importlib.import_module(mod)
+            checked += 1
+            if not hasattr(m, attr) and importlib.util.find_spec(f"{mod}.{attr}") is None:
+                missing.append(f"{path.name}:{lineno}: from {mod} import {attr}")
+        for lineno, local, mod, attr in _module_attribute_refs(name, path):
+            checked += 1
+            if not hasattr(importlib.import_module(mod), attr):
+                missing.append(f"{path.name}:{lineno}: {local}.{attr}")
+    assert checked > 500   # the walk really found the references
+    assert not missing, "references to attributes the sibling module lacks:\n" + "\n".join(missing)
+
+
+def test_the_cross_module_attribute_check_sees_a_missing_attribute_and_respects_scope(tmp_path):
+    src = tmp_path / "ttp" / "fake.py"
+    src.parent.mkdir()
+    src.write_text("from . import push\n\n\ndef a():\n    return push.no_such_name\n\n\n"
+                   "def b(push):\n    return push.get\n\n\ndef c():\n    push = {}\n    return push.get\n\n\n"
+                   "def d():\n    from . import db as push\n    return push.DB\n")
+    refs = {(ln, attr): mod for ln, _, mod, attr in _module_attribute_refs("ttp.fake", src)}
+    assert refs == {(5, "no_such_name"): "ttp.push", (19, "DB"): "ttp.db"}
+
+
+def test_a_push_process_loads_every_module_of_its_push_and_after_push_path_at_start():
+    """An upgrade may replace runtime/ while a `ttp push` runs. A sibling module first imported late
+    (batch for after_push) would then be the new version calling into the old, already loaded push
+    module (batch calling a push.scalar_problem the old push lacked: AttributeError, after_push failed,
+    the mirror left behind). So push, pushq and batch import their sibling modules at module level,
+    never inside a function, and importing push alone loads them all."""
+    import ast
+    path_mods = ("push", "pushq", "batch")
+    late = []
+    for mod in path_mods:
+        f = RUNTIME / "ttp" / f"{mod}.py"
+        tree = ast.parse(f.read_text(), str(f))
+        top = {id(n) for n in tree.body}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level and id(node) not in top:
+                late.append(f"{mod}.py:{node.lineno}: from {'.' * node.level}{node.module or ''} import "
+                            + ", ".join(a.name for a in node.names))
+    assert not late, "sibling imports inside functions on the push path:\n" + "\n".join(late)
+    needs = {}   # each path module: the sibling modules it uses
+    for mod in path_mods:
+        aliases, froms = _sibling_imports(f"ttp.{mod}", RUNTIME / "ttp" / f"{mod}.py")
+        needs[f"ttp.{mod}"] = sorted(set(aliases.values()) | {m for _, m, _ in froms})
+    assert "ttp.batch" in needs["ttp.push"]
+    for entry in ("ttp.push", "ttp.batch", "ttp.pushq"):   # whichever a process imports first
+        code = (f"import sys, {entry}\n"
+                f"print(' '.join(sorted({{n for m, ns in {needs!r}.items() if m in sys.modules for n in ns}}"
+                f" - set(sys.modules))))")
+        out = subprocess.run([sys.executable, "-c", code], cwd=RUNTIME, capture_output=True, text=True,
+                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "", f"importing {entry} leaves unloaded: {out.stdout.strip()}"
+
+
+def test_after_push_uses_the_push_module_the_process_started_with(monkeypatch):
+    """The regression: run_after reaches batch.after_ordinary_push through the batch module loaded at
+    start. A batch.py swapped on disk mid-push (an upgrade) is not imported into the running process."""
+    import ttp.batch
+    from ttp import push
+    assert push.batch is ttp.batch and ttp.batch.push is push
+    calls = []
+    monkeypatch.setattr(ttp.batch, "after_ordinary_push", lambda *a: calls.append(a) or {"status": "ok"})
+    monkeypatch.delitem(sys.modules, "ttp.batch")   # as if the file on disk were new: a re-import would differ
+    monkeypatch.setattr(push, "pending_after", ("a" * 40, "origin/b", "b" * 40))
+    assert push.run_after(None, pathlib.Path(".")) == {"status": "ok"}
+    assert calls and "ttp.batch" not in sys.modules
