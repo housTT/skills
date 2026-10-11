@@ -451,6 +451,8 @@ def mirror_problem(m: dict, push_branch: str) -> str:
 
 def mirror_check(v: Any, push_branch: str) -> list[dict]:
     """`delivery.mirror_remotes` as config_set takes it; ValueError naming the first bad entry."""
+    if why := scalar_problem(v):
+        raise ValueError(f"delivery.mirror_remotes: {why}")
     out = mirror_list(v)
     for m in out:
         if why := mirror_problem(m, push_branch):

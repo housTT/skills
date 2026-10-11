@@ -16360,7 +16360,7 @@ def test_scalar_push_checks_after_push_and_exclude_paths_are_reported_and_refuse
     from ttp.project import config_problems
     p = make(env)
     for bad in (True, 5, 1.5):
-        for key in ("push_checks", "after_push", "push_exclude_paths"):
+        for key in ("push_checks", "after_push", "push_exclude_paths", "mirror_remotes"):
             assert config_problems({"delivery": {key: bad}}) == [f"delivery.{key}: {bad!r}: not a list"], (key, bad)
         with pytest.raises(ValueError, match="not a list"):
             push.checks_of(bad)
@@ -16368,6 +16368,9 @@ def test_scalar_push_checks_after_push_and_exclude_paths_are_reported_and_refuse
                           for k in ("push_checks", "after_push")])
         assert len(probs) == 2 and all("not a list" in x for x in probs), probs
         assert "push_checks" not in (p.config().get("delivery") or {})
+        probs = apply(p, [{"type": "config_set", "key": "delivery.mirror_remotes", "value": bad}])
+        assert probs == [f"delivery.mirror_remotes: {bad!r}: not a list"] or "not a list" in str(probs), probs
+        assert "mirror_remotes" not in (p.config().get("delivery") or {})
     for ok in (None, False, 0, "", [], "tmp", ["tmp"]):   # off or a list: no problem
         assert config_problems({"delivery": {"push_exclude_paths": ok}}) == [], ok
     # A scalar push_exclude_paths would turn the guard off: the push branch refuses, --own does not.
