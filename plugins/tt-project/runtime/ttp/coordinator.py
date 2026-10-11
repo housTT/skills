@@ -1446,10 +1446,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"obligation {oid} recorded")
                 elif str(a.get("evidence") or "").strip():
                     notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None))
+                elif str(a.get("why") or "").strip():
+                    notes.append(obligations.drop(p, oid, str(a["why"]), by="coordinator"))
                 elif owners:
                     obligations.attach(p, oid, owners)
                 else:
-                    raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach) or `evidence` (receipt)")
+                    raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach), "
+                                     "`evidence` (receipt) or `why` (drop)")
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")

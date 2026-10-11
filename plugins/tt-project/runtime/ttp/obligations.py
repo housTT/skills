@@ -21,8 +21,9 @@ run's RUN_FILE, and the daemon files them (only for an obligation that run's tas
 Daemon.check_obligations looks every CHECK_EVERY_S, model-free: it files new run records, and for each
 open obligation with an owner past its clock (or no owner at all, past the clock from its creation)
 raises one high observation keyed `obligation:<id>:<episode>` for the coordinator. It is not raised
-again on a timer while the stall lasts; once every owner has fresh progress the episode ends, and a
-later stall raises the next one.
+again on a timer while the same owners stay stalled; an owner not yet covered that stalls (say one
+attached after an earlier owner ended) opens the next episode, and once no owner is late the episode ends.
+A mistaken or no longer wanted obligation is withdrawn with `ttp obligation drop <id> "<why>"`.
 """
 from __future__ import annotations
 
@@ -69,16 +70,33 @@ def add(p, text: str, owners: list[int] = (), by: str = "user", now: float | Non
     if not text:
         raise ValueError("an obligation needs a text: what is owed")
     now = time.time() if now is None else now
-    with p.db.tx():
+    with p.db.tx():   # one transaction with its owners: a refused owner leaves no obligation behind
         st = _load(p.db)
         oid = f"o{st['next']}"
         st["next"] += 1
-        st["items"][oid] = {"id": oid, "text": text, "by": by, "created": now, "owners": {},
-                            "receipt": None, "episode": 0, "raised": None}
+        o = st["items"][oid] = {"id": oid, "text": text, "by": by, "created": now, "owners": {},
+                                "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": []}
+        _attach(p, o, owners, now)
         p.db.set_kv(KV, st)
-    if owners:
-        attach(p, oid, owners, now=now)
     return oid
+
+
+def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> str:
+    """Withdraw an obligation recorded by mistake or no longer wanted: it is not owed and raises nothing."""
+    why = " ".join(str(why or "").split())[:EVIDENCE_MAX]
+    if not why:
+        raise ValueError("drop needs a reason: why it is no longer owed")
+    now = time.time() if now is None else now
+    with p.db.tx():
+        st = _load(p.db)
+        o = _need(st, oid)
+        if o["receipt"]:
+            raise ValueError(f"obligation {oid} already has a receipt")
+        if o.get("dropped"):
+            return f"{oid} was already dropped"
+        o["dropped"] = {"at": now, "by": by, "why": why}
+        p.db.set_kv(KV, st)
+    return f"{oid} dropped; it is no longer owed"
 
 
 def _owner_note(o: dict) -> str:
@@ -92,32 +110,47 @@ def _owner_note(o: dict) -> str:
 def attach(p, oid: str, tids: list[int], now: float | None = None) -> list[int]:
     """Make tasks required owners; returns the ones newly attached. Each is told through its spec, and a
     running one also through its run's steer.md. An owner already attached keeps its clock."""
-    from .coordinator import _append_update
     now = time.time() if now is None else now
-    db = p.db
-    new: list[int] = []
-    with db.tx():
-        st = _load(db)
+    with p.db.tx():
+        st = _load(p.db)
         o = _need(st, oid)
         if o["receipt"]:
             raise ValueError(f"obligation {oid} already has a receipt")
-        for tid in tids:
-            t = db.task(int(tid))
-            if not t:
-                raise ValueError(f"no task #{tid}")
-            if str(tid) in o["owners"]:
-                continue
-            if t["status"] in CLOSED:
-                raise ValueError(f"task #{tid} is {t['status']}: attach the task that will produce it")
-            o["owners"][str(tid)] = {"since": now, "progress": None, "evidence": []}
-            if f"## Obligation {oid} " not in (t["spec"] or ""):
-                db.update_task(int(tid), spec=(t["spec"] or "").rstrip() + "\n\n" + _owner_note(o) + "\n")
-            new.append(int(tid))
-        db.set_kv(KV, st)
+        if o.get("dropped"):
+            raise ValueError(f"obligation {oid} was dropped")
+        new = _attach(p, o, tids, now)
+        p.db.set_kv(KV, st)
+    return new
+
+
+def _attach(p, o: dict, tids, now: float) -> list[int]:
+    """attach() inside the caller's transaction: every owner is checked before anything is written, and
+    running owners hear it only once the transaction commits."""
+    from .coordinator import _append_update
+    db, oid = p.db, o["id"]
+    tasks = {}
+    for tid in tids:
+        t = db.task(int(tid))
+        if not t:
+            raise ValueError(f"no task #{tid}")
+        if str(tid) not in o["owners"] and t["status"] in CLOSED:
+            raise ValueError(f"task #{tid} is {t['status']}: attach the task that will produce it")
+        tasks[int(tid)] = t
+    new: list[int] = []
+    for tid, t in tasks.items():
+        if str(tid) in o["owners"]:
+            continue
+        o["owners"][str(tid)] = {"since": now, "progress": None, "evidence": []}
+        if f"## Obligation {oid} " not in (t["spec"] or ""):
+            db.update_task(tid, spec=(t["spec"] or "").rstrip() + "\n\n" + _owner_note(o) + "\n")
+        new.append(tid)
     note = _owner_note(o)
-    for tid in new:
-        for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running' AND dir IS NOT NULL", (tid,)):
-            _append_update(Path(r["dir"]) / "steer.md", note, f"obligation-{oid}-{tid}")
+
+    def tell():
+        for tid in new:
+            for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running' AND dir IS NOT NULL", (tid,)):
+                _append_update(Path(r["dir"]) / "steer.md", note, f"obligation-{oid}-{tid}")
+    db.after_commit(tell)
     return new
 
 
@@ -135,6 +168,8 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         o = _need(st, oid)
         if o["receipt"]:
             return f"{oid} already has a receipt"
+        if o.get("dropped"):
+            return f"{oid} was dropped; nothing to record"
         own = o["owners"].get(str(task)) if task is not None else None
         if task is not None and own is None:
             raise ValueError(f"task #{task} is not a required owner of {oid}")
@@ -169,7 +204,8 @@ def file_runs(p, now: float | None = None) -> list[str]:
     for r in runs:
         f = Path(r["dir"]) / RUN_FILE
         try:
-            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+            # Only whole lines: an append still being written is read on a later pass, not lost.
+            lines = f.read_text(encoding="utf-8", errors="replace").split("\n")[:-1]
         except OSError:
             continue
         done = int(seen.get(str(r["id"]), 0))
@@ -189,16 +225,21 @@ def file_runs(p, now: float | None = None) -> list[str]:
     return out
 
 
+def _last(own: dict) -> float:
+    """When an owner's clock last started: its attach time, or its latest progress if later."""
+    return max(float(own["since"]), float(own.get("progress") or 0))
+
+
 def overdue(o: dict, now: float) -> list[tuple[str, float]]:
     """(owner task id, or "" for no owner; seconds since its last durable progress) for each clock run out."""
-    if o["receipt"]:
+    if o["receipt"] or o.get("dropped"):
         return []
     if not o["owners"]:
         age = now - float(o["created"])
         return [("", age)] if age >= CLOCK_S else []
     out = []
     for tid, own in sorted(o["owners"].items(), key=lambda kv: int(kv[0])):
-        age = now - float(own.get("progress") or own["since"])
+        age = now - _last(own)
         if age >= CLOCK_S:
             out.append((tid, age))
     return out
@@ -219,8 +260,9 @@ def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str])
 
 
 def check(p, now: float | None = None) -> list[str]:
-    """Raise one keyed observation per obligation whose clock ran out (none again while that stall
-    lasts; file_runs first). Returns the fingerprints raised."""
+    """Raise one keyed observation per stall (file_runs first). An episode covers the owners late when it
+    was raised: none again while they stay late, a new one when an owner it does not cover runs late, and
+    it ends once no owner is late. Returns the fingerprints raised."""
     now = time.time() if now is None else now
     db = p.db
     raised: list[str] = []
@@ -229,15 +271,20 @@ def check(p, now: float | None = None) -> list[str]:
         changed = False
         for o in st["items"].values():
             late = overdue(o, now)
+            late_ids = [t for t, _ in late]
+            covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
             if not late:
-                if o.get("raised"):
-                    o["raised"] = None   # the stall is over: a later one is a new episode
+                if o.get("raised") or o.get("covered"):
+                    o["raised"], o["covered"] = None, []   # the stall is over: a later one is a new episode
                     changed = True
                 continue
-            if o.get("raised"):
+            if set(late_ids) <= set(covered):
+                if covered != o.get("covered"):
+                    o["covered"] = covered
+                    changed = True
                 continue
             o["episode"] = int(o.get("episode") or 0) + 1
-            o["raised"] = now
+            o["raised"], o["covered"] = now, late_ids
             changed = True
             fp = f"obligation:{o['id']}:{o['episode']}"
             if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -260,10 +307,12 @@ def lines(db, now: float | None = None) -> list[str]:
     for o in items(db):
         if o["receipt"]:
             state = f"received ({o['receipt']['evidence'][:80]})"
+        elif o.get("dropped"):
+            state = f"dropped ({o['dropped']['why'][:80]})"
         else:
             late = {t for t, _ in overdue(o, now)}
             owners = ", ".join(
-                f"#{t} {(now - float(w.get('progress') or w['since'])) / 3600:.1f} h"
+                f"#{t} {(now - _last(w)) / 3600:.1f} h"
                 + (" OVERDUE" if t in late else "") for t, w in sorted(o["owners"].items(), key=lambda kv: int(kv[0])))
             state = "owed; " + (f"owners: {owners}" if owners else "no owner attached" + (" OVERDUE" if late else ""))
         out.append(f"{o['id']}  {o['text'][:100]}  [{state}]")

@@ -2280,7 +2280,7 @@ def cmd_heal(a) -> None:
 
 
 def cmd_obligation(a) -> None:
-    """`ttp obligation add|attach|progress|receipt|list`: urgent deliverables owed to the user (obligations.py).
+    """`ttp obligation add|attach|progress|receipt|drop|list`: urgent deliverables owed to the user (obligations.py).
     Inside a run, progress and receipts go to the run's file and the daemon files them for its task."""
     from . import obligations as ob
     run_dir = os.environ.get("TTP_RUN_DIR")
@@ -2316,6 +2316,10 @@ def cmd_obligation(a) -> None:
             if len(a.args) != 2:
                 die(f"usage: ttp obligation {a.action} <id> \"<evidence>\" [--task <owner>]")
             print(ob.record(p, a.args[0], a.action, a.args[1], a.task))
+        elif a.action == "drop":
+            if len(a.args) != 2:
+                die('usage: ttp obligation drop <id> "<why it is no longer owed>"')
+            print(ob.drop(p, a.args[0], a.args[1]))
         elif a.json:
             print(json.dumps(ob.items(p.db), indent=1))
         else:
@@ -3673,9 +3677,10 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_task)
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
-                                          "record progress and receipts, list")
-    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "list"])
-    s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>")
+                                          "record progress and receipts, drop one recorded by mistake, list")
+    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "drop", "list"])
+    s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>; "
+                                           "drop: <id> <why>")
     s.add_argument("--owner", type=int, action="append", help="add: a required owner task (repeatable)")
     s.add_argument("--task", type=int, help="progress/receipt outside a run: the owner task it is for")
     s.add_argument("--project", help="the project (default: the one here)")

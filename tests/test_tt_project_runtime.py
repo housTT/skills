@@ -41557,6 +41557,86 @@ def test_obligation_records_from_a_run_are_filed_for_its_own_task_only(env, monk
     assert ob.get(p.db, oid)["receipt"]["at"] == now + 2 * 3600 + 180, "a record is never dated in the future"
 
 
+def test_obligation_new_owner_stall_after_an_ended_owner_is_raised(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    p.db.update_task(tid, status="done")
+    evs = check(now + 2 * 3600 + 60)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"]
+    b = p.db.add_task("second try", "s", kind="work", tier="light", origin="coordinator")
+    ob.attach(p, oid, [b], now=now + 2 * 3600 + 120)
+    assert len(check(now + 3 * 3600)) == 1, "the ended owner, already covered, does not raise again"
+    evs = check(now + 4 * 3600 + 600)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1", f"obligation:{oid}:2"], \
+        "a newly attached owner's stall is raised even though the ended owner stays late"
+    assert f"#{b} " in evs[1]["text"]
+    for h in (5, 8, 24):
+        assert len(check(now + h * 3600)) == 2, "still-stalled covered owners do not re-raise"
+    ob.record(p, oid, "progress", "commit abc", b, now=now + 24 * 3600)
+    assert len(check(now + 25 * 3600)) == 2
+    evs = check(now + 26 * 3600 + 60)
+    assert len(evs) == 3 and evs[2]["fingerprint"] == f"obligation:{oid}:3", "the new owner stalling again is new"
+
+
+def test_obligation_progress_before_attach_is_clamped_to_the_attach_time(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", now=now)
+    ob.attach(p, oid, [tid], now=now + 3 * 3600)
+    o = ob.get(p.db, oid)
+    o["owners"][str(tid)]["progress"] = now   # a record dated before the owner was attached
+    assert ob.overdue(o, now + 4 * 3600) == [], "the clock starts no earlier than the attach time"
+    assert [t for t, _ in ob.overdue(o, now + 5 * 3600 + 60)] == [str(tid)]
+
+
+def test_obligation_run_record_written_in_two_parts_is_not_lost(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    run_dir = p.runs / "r-part"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    line = json.dumps({"ts": now + 600, "id": oid, "kind": "progress", "evidence": "commit abc"}) + "\n"
+    (run_dir / ob.RUN_FILE).write_text(line[:20])
+    check(now + 700)
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"] == [], "a half-written line waits"
+    (run_dir / ob.RUN_FILE).open("a").write(line[20:])
+    check(now + 800)
+    assert [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]] == ["commit abc"]
+    check(now + 900)
+    assert len(ob.get(p.db, oid)["owners"][str(tid)]["evidence"]) == 1, "and is filed once"
+
+
+def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(env, monkeypatch):
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    closed = p.db.add_task("finished", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(closed, status="done")
+    spec = p.db.task(tid)["spec"]
+    for owners in ([tid, closed], [tid, 999999]):
+        with pytest.raises(ValueError):
+            ob.add(p, "the urgent report", owners, now=now)
+    assert ob.items(p.db) == [] and p.db.task(tid)["spec"] == spec, "a refused add writes nothing"
+    assert coord.apply(p, [{"type": "obligation", "text": "the urgent report", "owners": [closed]}]) != []
+    assert ob.items(p.db) == []
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    assert oid == "o1", "a refused add uses no id"
+    monkeypatch.chdir(p.root)
+    cli.main(["obligation", "drop", oid, "recorded by mistake", "--project", p.name])
+    assert ob.get(p.db, oid)["dropped"]["why"] == "recorded by mistake"
+    assert check(now + 9 * 3600) == [], "a dropped obligation raises nothing"
+    assert "dropped" in ob.lines(p.db)[0]
+    with pytest.raises(ValueError, match="dropped"):
+        ob.attach(p, oid, [tid])
+    o2 = ob.add(p, "another", now=now)
+    assert coord.apply(p, [{"type": "obligation", "key": o2, "why": "no longer wanted"}]) == []
+    assert ob.get(p.db, o2)["dropped"]["by"] == "coordinator"
+
+
 def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob
