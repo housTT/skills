@@ -253,47 +253,16 @@ class Codex(Provider):
         return f"codex ({mode})"
 
     def meter(self) -> list:
-        """Plan windows via the app-server protocol; spends no model tokens. The server answers
-        asynchronously, so stdin stays open until the reply arrives (closing it early loses it)."""
+        """Plan windows via the app-server protocol; spends no model tokens."""
         exe = self.binary()
         if not exe:
             return []
-        import select
-        import time
         from ..budget import Window
-        try:
-            proc = subprocess.Popen([exe, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        except OSError:
+        msg = app_server_call([exe, "app-server"], "account/rateLimits/read")
+        if msg is None:
             return []
-        rl, allowed = {}, True
-        try:
-            for m in ({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                       "params": {"clientInfo": {"name": "tt-project", "version": "1"}}},
-                      {"jsonrpc": "2.0", "method": "initialized"},
-                      {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}):
-                proc.stdin.write(json.dumps(m) + "\n")
-                proc.stdin.flush()
-            deadline = time.time() + 25
-            while time.time() < deadline:
-                ready, _, _ = select.select([proc.stdout], [], [], 1)
-                if not ready:
-                    continue
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if msg.get("id") == 2:
-                    res = msg.get("result") or {}
-                    rl, allowed = res.get("rateLimits") or {}, res.get("ordinaryUsageAllowed", True)
-                    break
-        except (OSError, ValueError):
-            return []
-        finally:
-            proc.terminate()
+        res = msg.get("result") or {}
+        rl, allowed = res.get("rateLimits") or {}, res.get("ordinaryUsageAllowed", True)
         wins = []
         for key in ("primary", "secondary"):
             w = rl.get(key)
@@ -306,6 +275,21 @@ class Codex(Provider):
             wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), self.account()))
         return wins
 
+    def resolved_session(self, argv, cwd, env=None):
+        # The app-server's `thread/start` answers with the model and reasoning effort the session
+        # resolved from the same config and `-c` overrides; an ephemeral thread starts no turn and
+        # spends nothing. `codex exec`'s own stream does not report them before its first turn.
+        exe = self.binary()
+        if not exe:
+            return None
+        msg = app_server_call([exe, "app-server", *session_config_args(argv)], "thread/start",
+                              {"cwd": cwd, "ephemeral": True}, cwd=cwd, env=env)
+        if msg is None:
+            return {"error": "no answer from `codex app-server`"}
+        if "error" in msg or not isinstance(msg.get("result"), dict) or not msg["result"].get("model"):
+            return {"error": "thread/start: " + json.dumps(msg.get("error") or msg.get("result"))[:300]}
+        res = msg["result"]
+        return {"model": str(res.get("model") or ""), "effort": str(res.get("reasoningEffort") or "")}
 
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""
@@ -317,6 +301,76 @@ def _read(path: Path) -> str:
         return path.read_text(errors="replace")
     except OSError:
         return ""
+
+
+# `codex exec` options that change which model or effort a session resolves. The hook keys and the
+# instructions do not, and `developer_instructions` may be too long to pass twice.
+SESSION_KEYS_SKIP = ("hooks.", "developer_instructions=")
+
+
+def session_config_args(argv: list[str]) -> list[str]:
+    """The `-c` overrides of a `codex exec` command line, with its `-m` as `-c model=...`, for an
+    app-server that should resolve the same session."""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--config") and i + 1 < len(argv):
+            if not argv[i + 1].startswith(SESSION_KEYS_SKIP):
+                out += ["-c", argv[i + 1]]
+            i += 2
+        elif a in ("-m", "--model") and i + 1 < len(argv):
+            out += ["-c", "model=" + toml_string(argv[i + 1])]
+            i += 2
+        else:
+            i += 1
+    return out
+
+
+def app_server_call(argv: list[str], method: str, params: dict | None = None, cwd: str | None = None,
+                    env: dict | None = None, timeout_s: float = 25) -> dict | None:
+    """The reply to one request to a `codex app-server` started with `argv`, after the protocol's
+    initialize handshake; None when it cannot start or does not answer in time. The server answers
+    asynchronously, so stdin stays open until the reply arrives (closing it early loses it)."""
+    import select
+    import time
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, bufsize=1, cwd=cwd, env=None if env is None else {**os.environ, **env})
+    except OSError:
+        return None
+    try:
+        for m in ({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"clientInfo": {"name": "tt-project", "version": "1"}}},
+                  {"jsonrpc": "2.0", "method": "initialized"},
+                  {"jsonrpc": "2.0", "id": 2, "method": method, **({"params": params} if params is not None else {})}):
+            proc.stdin.write(json.dumps(m) + "\n")
+            proc.stdin.flush()
+        # Raw reads: a buffered readline could swallow the reply select() then never reports.
+        deadline, fd, buf = time.time() + timeout_s, proc.stdout.fileno(), b""
+        while time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 1)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            *lines, buf = (buf + chunk).split(b"\n")
+            for line in lines:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("id") == 2:
+                    return msg
+    except (OSError, ValueError):
+        return None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return None
 
 
 def hook_sources(cwd: str, user_config: bool = True) -> list[str]:

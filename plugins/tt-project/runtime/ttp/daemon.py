@@ -1143,11 +1143,14 @@ class Daemon:
             if unblock and not str(c.get("effort") or ""):
                 # A tricky or blocking turn thinks harder (raise only); a pinned effort wins.
                 effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
-        elif task:
+        pin: dict = {}
+        if role != "coordinator" and task:
             # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
             # pick, a review's sizing, a retry) moves its budget and timeout, never a pinned model or effort.
-            model = str(task.get("model") or "") or model
-            effort = str(task.get("effort") or "") or effort
+            # The runner checks that the agent's session resolves the pin before its first turn (check_pin).
+            pin = {k: str(task.get(k)) for k in ("model", "effort") if str(task.get(k) or "")}
+            model = pin.get("model") or model
+            effort = pin.get("effort") or effort
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})
@@ -1282,7 +1285,8 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                    "model": model, "effort": effort, "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
+                    "model": model, "effort": effort, **({"pin": pin} if pin else {}),
+                    "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
@@ -1726,6 +1730,9 @@ class Daemon:
         self._priced(r, usage)
         self._net_of_session(r, usage)
         stopped = exit_info.get("stopped")
+        refused = str(exit_info.get("refused") or "")
+        if refused and not usage.error:
+            usage.error = str(exit_info.get("error") or refused)[:400]
         # A long sleep can drop the CLI's login under a run ("Not logged in" after hours of a closed
         # lid). That run is lost to the sleep; a real log-out shows again on the next run.
         slept_auth = usage.auth_failed and float(exit_info.get("slept_s") or 0) >= SLEPT_LONG_S
@@ -1767,6 +1774,14 @@ class Daemon:
             note["stopped"] = stopped
         if usage.session_id:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
+        if refused:
+            note.update(refused=refused, not_waste="refused")   # never started a model turn: spent nothing
+        try:   # the model and effort the agent's session resolved for a pinned task (runner.check_pin)
+            session = exit_info.get("session") or json.loads((run_dir / "run.json").read_text()).get("session")
+        except (OSError, ValueError, AttributeError):
+            session = None
+        if isinstance(session, dict):
+            note["session"] = {k: session[k] for k in ("model", "effort", "error") if k in session}
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
@@ -1851,7 +1866,7 @@ class Daemon:
                 except Exception:   # a report only: the run's end stands
                     log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
-                                    rebooted=bool(note.get("lost_to_reboot")),
+                                    refused=refused, rebooted=bool(note.get("lost_to_reboot")),
                                     orderly=note.get("shutdown") == "orderly",
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
         self._check_price_table(r, usage)
@@ -2083,9 +2098,10 @@ class Daemon:
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
-                       orderly: bool = False) -> None:
+                       orderly: bool = False, refused: str = "") -> None:
         """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
-        `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task."""
+        `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task.
+        `refused`: why the runner refused to start the agent (model_mismatch: runner.check_pin)."""
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -2139,6 +2155,18 @@ class Daemon:
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
                       f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
+            return
+        if refused == "model_mismatch":
+            # The agent would run another model or effort than the task pins. Nothing ran and nothing
+            # was spent; a retry would resolve the same, so the task waits for a new pin, no attempt spent.
+            why = f"model pin not honoured: {usage.error}"[:500]
+            with db.tx():
+                db.update_task(task["id"], status="blocked", blocked_reason=why,
+                               result=dump_result({"status": "blocked", "summary": why}))
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "task_blocked", "normal",
+                      f"#{task['id']} {task['title']} → blocked: {why}. Change or clear its model/effort pin "
+                      f"(task_update) and requeue it.", "queued", task["id"]))
             return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.

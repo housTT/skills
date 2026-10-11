@@ -250,6 +250,12 @@ class Provider:
         """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
         return None
 
+    def resolved_session(self, argv: list[str], cwd: str, env: dict | None = None) -> dict | None:
+        """The model and reasoning effort a run started with `argv` in `cwd` would actually use, asked
+        from the agent without starting a model turn: {"model", "effort"}, or {"error"} when the
+        question failed. None when this agent cannot be asked."""
+        return None
+
     def account(self) -> str:
         """Who pays: an email/org/plan label. Never a secret."""
         return ""

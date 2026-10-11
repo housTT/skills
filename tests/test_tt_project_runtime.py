@@ -14461,6 +14461,29 @@ if "--help" in sys.argv[1:] or sys.argv[1:3] == ["features", "list"]:
     sys.exit(0)
 log = Path(os.environ["FAKE_CLI_LOG"])
 log.mkdir(parents=True, exist_ok=True)
+if sys.argv[1:2] == ["app-server"]:
+    # thread/start answers with the session its -c overrides resolve, or FAKE_CLI_SESSION's fields;
+    # FAKE_CLI_SESSION "exit" is a CLI that cannot answer.
+    with open(log / "app_server.jsonl", "a") as f:
+        f.write(json.dumps({{"argv": sys.argv, "cwd": os.getcwd()}}) + "\\n")
+    if os.environ.get("FAKE_CLI_SESSION") == "exit":
+        sys.exit(1)
+    conf = dict(a.split("=", 1) for a in sys.argv[2:] if "=" in a)
+    for line in sys.stdin:
+        msg = json.loads(line)
+        if msg.get("id") == 1:
+            print(json.dumps({{"id": 1, "result": {{}}}}), flush=True)
+        elif msg.get("id") == 2:
+            with open(log / "app_server.jsonl", "a") as f:
+                f.write(json.dumps({{"request": msg}}) + "\\n")
+            if msg["method"] == "account/rateLimits/read":
+                print(json.dumps({{"id": 2, "result": json.loads(os.environ["FAKE_CLI_SESSION"])}}), flush=True)
+                continue
+            res = {{"model": json.loads(conf.get("model", '"tier-default"')),
+                   "reasoningEffort": conf.get("model_reasoning_effort")}}
+            res.update(json.loads(os.environ.get("FAKE_CLI_SESSION") or "{{}}"))
+            print(json.dumps({{"id": 2, "result": res}}), flush=True)
+    sys.exit(0)
 (log / "argv.json").write_text(json.dumps(sys.argv))
 (log / "cwd.txt").write_text(os.getcwd())
 (log / "stdin.txt").write_text(sys.stdin.read())
@@ -14487,7 +14510,7 @@ sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
 
 def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
              read_only=False, schema=None, note=None, before=None, budget_usd=2.0, help_text="", pace=0,
-             resume=None):
+             resume=None, pin=None, session=None):
     """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
     reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
     bin_dir = env["tmp"] / "fakebin"
@@ -14505,6 +14528,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
     monkeypatch.setenv("FAKE_CLI_RESULT", json.dumps(result) if result else "")
     monkeypatch.setenv("FAKE_CLI_HELP", help_text)
     monkeypatch.setenv("FAKE_CLI_PACE", str(pace))
+    monkeypatch.setenv("FAKE_CLI_SESSION", session if isinstance(session, str) else json.dumps(session or {}))
     p = make(env)
     if before:
         before(p)
@@ -14512,7 +14536,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
     d = Daemon(p.base)
     tid = None
     if role != "coordinator":
-        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user", **(pin or {}))
         p.db.update_task(tid, status="running")
     rid = d.start_run(role, "PROMPT-MARKER", provider, "light", str(env["repo"]),
                       task=p.db.task(tid) if tid else None, budget_usd=budget_usd, timeout_s=100,
@@ -14523,6 +14547,8 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
         time.sleep(0.05)
     assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
     d.reap_runs()
+    if not (log_dir / "argv.json").exists() and json.loads(exit_file.read_text()).get("launched") is False:
+        return p, p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid) if tid else None, None, None
     argv = json.loads((log_dir / "argv.json").read_text())
     assert argv[0] == str(bin_dir / ("codex" if provider == "codex" else "agent")), "not the fake CLI"
     return (p, p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid) if tid else None, argv,
@@ -41139,3 +41165,91 @@ def test_blocker_sweep_refreshes_a_first_seen_time_stale_from_an_unobserved_requ
     db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 60, t))        # a later spec addendum
     [i] = sweep.items(db, now)
     assert round(i["age_s"] / 3600, 1) == 3.0
+
+
+def _app_server_log(env):
+    f = env["tmp"] / "fakecli" / "app_server.jsonl"
+    return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+
+def test_a_codex_task_pin_is_checked_against_the_session_before_the_agent_starts(env, monkeypatch):
+    """A pinned Codex task asks the app-server which model and effort its session resolves (an
+    ephemeral thread, no turn) with the run's own overrides, records them, and then runs."""
+    done = {"status": "done", "summary": "ok"}
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
+                                     pin={"model": "pinned-model-1", "effort": "xhigh"})
+    assert argv[argv.index("-m") + 1] == "pinned-model-1" and "model_reasoning_effort=xhigh" in argv
+    asked = _app_server_log(env)
+    started = [a for a in asked if "argv" in a]
+    assert len(started) == 1, "one session check before the run"
+    server = started[0]["argv"]
+    assert 'model="pinned-model-1"' in server and "model_reasoning_effort=xhigh" in server
+    assert not any(a.startswith(("hooks.", "developer_instructions=")) for a in server)
+    req = [a["request"] for a in asked if "request" in a][0]
+    assert req["method"] == "thread/start" and req["params"]["ephemeral"] is True
+    assert req["params"]["cwd"] == str(env["repo"])
+    assert run["status"] == "ok" and task["status"] == "done"
+    note = json.loads(run["note"])
+    assert note["session"] == {"model": "pinned-model-1", "effort": "xhigh"}, "the actual session is recorded"
+    spec = json.loads((p.runs / str(run["id"]) / "run.json").read_text())
+    assert spec["pin"] == {"model": "pinned-model-1", "effort": "xhigh"}
+    assert (spec["session"]["model"], spec["session"]["effort"]) == ("pinned-model-1", "xhigh")
+
+
+@pytest.mark.parametrize("session, wrong", [({"reasoningEffort": "high"}, "effort high (pinned xhigh)"),
+                                            ({"model": "other-model"}, "model other-model (pinned pinned-model-1)")])
+def test_a_codex_session_that_does_not_honour_the_pin_is_refused_before_any_spend(env, monkeypatch, session, wrong):
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
+                                     pin={"model": "pinned-model-1", "effort": "xhigh"}, session=session)
+    assert argv is None and not (env["tmp"] / "fakecli" / "argv.json").exists(), "codex exec must never start"
+    exit_info = json.loads((p.runs / str(run["id"]) / "exit.json").read_text())
+    assert exit_info["launched"] is False and exit_info["model_turn_started"] is False
+    assert exit_info["refused"] == "model_mismatch" and wrong in exit_info["error"]
+    assert run["status"] == "failed" and run["cost_usd"] == 0 and task["spent_usd"] == 0, "no spend is estimated"
+    note = json.loads(run["note"])
+    assert note["refused"] == "model_mismatch" and note["not_waste"] == "refused"
+    assert note["session"]["model"] == session.get("model", "pinned-model-1")
+    assert task["status"] == "blocked" and task["attempts"] == 0, "a retry would resolve the same: no attempt"
+    assert wrong in task["blocked_reason"]
+    ev = p.db.one("SELECT * FROM events WHERE kind='task_blocked' AND task=?", (task["id"],))
+    assert ev and ev["status"] == "queued" and "pin" in ev["text"]
+
+
+def test_an_unpinned_codex_task_never_asks_the_app_server(env, monkeypatch):
+    done = {"status": "done", "summary": "ok"}
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
+                                  session={"model": "anything-else"})
+    assert _app_server_log(env) == [] and run["status"] == "ok" and task["status"] == "done"
+    assert "session" not in json.loads(run["note"] or "{}")
+
+
+def test_a_pinned_run_whose_session_cannot_be_checked_goes_ahead_unverified(env, monkeypatch):
+    done = {"status": "done", "summary": "ok"}
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
+                                     pin={"effort": "xhigh"}, session="exit")
+    assert argv and run["status"] == "ok" and task["status"] == "done"
+    assert "error" in json.loads(run["note"])["session"], "the run record says the pin went unverified"
+    assert "could not verify" in (p.runs / str(run["id"]) / "runner.log").read_text()
+
+
+def test_codex_session_config_args_mirror_the_exec_overrides():
+    from ttp.providers import codex
+    argv = ["codex", "exec", "--json", "-C", "/w", "-m", "m-1", "-c", "model_reasoning_effort=high",
+            "-c", "approval_policy=never", "-c", "hooks.PreToolUse=[]", "-c", "developer_instructions=\"x\"",
+            "--config", "profile=p", "-s", "workspace-write", "-"]
+    assert codex.session_config_args(argv) == ["-c", 'model="m-1"', "-c", "model_reasoning_effort=high",
+                                               "-c", "approval_policy=never", "-c", "profile=p"]
+
+
+def test_codex_meter_reads_plan_windows_from_the_app_server(env, monkeypatch, tmp_path):
+    from ttp.providers import codex
+    exe = tmp_path / "codex"
+    exe.write_text(FAKE_CLI.format(python=sys.executable))
+    exe.chmod(0o755)
+    monkeypatch.setattr(codex.Codex, "binary", lambda self: str(exe))
+    monkeypatch.setenv("FAKE_CLI_LOG", str(tmp_path / "log"))
+    monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"rateLimits": {
+        "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1700000000},
+        "secondary": {"usedPercent": 7.5, "windowDurationMins": 10080}}}))
+    wins = codex.Codex().meter()
+    assert [(w.window, w.utilization) for w in wins] == [("5h", 42.0), ("7d", 7.5)]

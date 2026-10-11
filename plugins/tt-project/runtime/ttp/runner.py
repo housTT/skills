@@ -31,6 +31,8 @@
   queued behind a shared device is not cut off for the queue; at most by the limit itself, since a
   wait in the background (or with --timeout 0) must not lift the only spend bound of providers
   that report cost only at the end;
+- before a task that pins its model or effort starts its agent, asks the agent which model and
+  effort its session resolves (no model turn) and refuses the run on a mismatch (check_pin);
 - writes exit.json exactly once, then asks the provider adapter for usage and records it.
 
 It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot id.
@@ -284,6 +286,14 @@ def supervise(run_dir: Path) -> int:
     env = {**os.environ, **env_extra}
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     started = time.time()
+    if spec.get("pin") and not stop_reason(run_dir):
+        refused = check_pin(run_dir, spec, env)
+        if refused:
+            remove_files(spec.get("private_files") or [])
+            remove_tmp(run_dir, spec)
+            _write_exit(run_dir, {"rc": None, "started": started, "ended": time.time(), "launched": False,
+                                  "model_turn_started": False, **refused})
+            return 1
     # A stop that came before the agent started (a cancel right after start_run): it never starts.
     held = None if stop_reason(run_dir) else []
     inherited: list[str] = []
@@ -430,6 +440,36 @@ def supervise(run_dir: Path) -> int:
                  "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
     _write_exit(run_dir, exit_info)
     return rc
+
+
+def check_pin(run_dir: Path, spec: dict, env: dict) -> dict | None:
+    """Before a task that pins its model or effort starts its agent: ask the agent which model and
+    effort the session resolves (no model turn) and record them in run.json (`session`). Returns the
+    refusal for exit.json when either differs from the pin; None when they match, or when the agent
+    cannot be asked (the run goes ahead unverified, and run.json says why)."""
+    from .providers import get_provider
+    pin = {k: str(v) for k, v in (spec.get("pin") or {}).items() if k in ("model", "effort") and v}
+    try:
+        got = get_provider(spec["provider"]).resolved_session(spec["argv"], spec["cwd"], env)
+    except Exception as e:
+        got = {"error": f"{type(e).__name__}: {e}"[:300]}
+    if got is None:
+        return None   # this agent cannot tell before its first turn
+    session = {**got, "checked": time.time()}
+    try:
+        durable_write(run_dir / "run.json", json.dumps({**spec, "session": session}, indent=1))
+    except OSError:
+        pass
+    if got.get("error"):
+        print(f"runner: could not verify the pinned {', '.join(pin)}: {got['error']}", flush=True)
+        return None
+    off = [f"{k} {got.get(k) or 'unset'} (pinned {v})" for k, v in pin.items()
+           if str(got.get(k) or "").lower() != v.lower()]
+    if not off:
+        return None
+    why = f"{spec['provider']} resolved {' and '.join(off)}; the run was refused before its first model turn"
+    print(f"runner: {why}", flush=True)
+    return {"refused": "model_mismatch", "error": why, "session": session}
 
 
 def _niceness(pid: int) -> int | None:
