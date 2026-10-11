@@ -37328,6 +37328,131 @@ def test_setting_hold_applies_only_to_a_push_branch_the_setting_refuses(env, tmp
     assert "no longer refuses" in settinghold.over(p.config(), "delivery.allow_protected_push_branch", {}, repo)
 
 
+def test_setting_setup_question_fires_once_per_setting_state(env):
+    """A charter saying pushes to the push branch need no approval, while
+    delivery.allow_protected_push_branch is off and refuses that branch and no ask names it, raises
+    one setup_question event: not again on later ticks or after a restart, again only for a new wording."""
+    from ttp import coordinator as coord
+    from ttp import settinghold
+    from ttp.daemon import Daemon
+    p = make(env)
+    _remote_origin(p)
+    p.set_config("delivery.push_branch", "origin/main")
+    base = p.charter_path.read_text()
+
+    def asked():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=?", (settinghold.SETUP_EVENT,))]
+    # No such charter line: nothing.
+    Daemon(p.base).sweep_holds()
+    assert asked() == []
+    p.charter_path.write_text(base + "\n- Reviewed changes are pushed to main without per-push approval.\n")
+    d = Daemon(p.base)
+    d.sweep_holds()
+    d.sweep_holds()
+    Daemon(p.base).sweep_holds()   # a restart
+    got = asked()
+    assert len(got) == 1 and "delivery.allow_protected_push_branch" in got[0] and "origin/main" in got[0], got
+    assert coord.EFFORT_EVENT_TRIGGERS[settinghold.SETUP_EVENT]
+    # A new wording is a new state: asked once more. An open ask naming the setting records it unasked.
+    p.charter_path.write_text(base + "\n- Pushes to main need no approval.\n")
+    Daemon(p.base).sweep_holds()
+    assert len(asked()) == 2
+    _setting_ask(p)
+    p.charter_path.write_text(base + "\n- Pushing to main needs no approval from the user.\n")
+    Daemon(p.base).sweep_holds()
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    Daemon(p.base).sweep_holds()
+    assert len(asked()) == 2
+    # The setting on, an ordinary push branch or a charter forbidding such pushes raises nothing.
+    for line in ("Never push to main without approval.", "Pushes to main are fine without asking anyone."):
+        assert bool(settinghold.charter_says_no_approval(line)) is line.startswith("Pushes"), line
+    p.charter_path.write_text(base + "\n- Main gets pushes without asking anyone.\n")
+    p.set_config("delivery.allow_protected_push_branch", True)
+    Daemon(p.base).sweep_holds()
+    p.set_config("delivery.allow_protected_push_branch", False)
+    p.set_config("delivery.push_branch", "origin/feature")
+    Daemon(p.base).sweep_holds()
+    assert len(asked()) == 2
+
+
+def test_a_review_with_a_push_step_runs_review_only_while_a_setting_hold_stands(env):
+    from ttp import prompts
+    p = make(env)
+    _remote_origin(p)
+    p.set_config("delivery.push_branch", "origin/main")
+    review = p.db.add_task("Review #5", "Review it. If it passes, push it with `ttp push`.", kind="review",
+                           tier="light", origin="user")
+    plain = p.db.add_task("Review #6", "Review it and report.", kind="review", tier="light", origin="user")
+
+    def line(tid):
+        text = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+        return "Review only: do not run `ttp push`" in text, text
+    assert not line(review)[0]   # no ask open: no hold
+    aid = _setting_ask(p)
+    has, text = line(review)
+    assert has and f"ask #{aid}" in text and "hand off `blocked`" in text and \
+        "naming delivery.allow_protected_push_branch" in text, text
+    assert not line(plain)[0]
+    p.set_config("delivery.allow_protected_push_branch", True)
+    assert not line(review)[0]
+
+
+def test_tasks_a_worker_handed_off_blocked_on_the_setting_join_its_hold_and_are_released_with_it(env):
+    """A blocked task with no anchor whose hand-off names the held setting is anchored to the open ask
+    and released with the rest: when the setting turns on, or when the ask is resolved."""
+    from ttp import coordinator as coord
+    from ttp import settinghold
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    p = make(env)
+    _remote_origin(p)
+    p.set_config("delivery.push_branch", "origin/main")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    ids = {n: p.db.add_task(f"Task {n}", "fix it", kind="code", tier="light", origin="user")
+           for n in ("reason", "summary", "other", "anchored")}
+
+    def block():
+        p.db.update_task(ids["reason"], status="blocked",
+                         blocked_reason="ttp push refused: delivery.allow_protected_push_branch is off")
+        p.db.update_task(ids["summary"], status="blocked", blocked_reason="need the user's word",
+                         result=dump_result({"status": "blocked",
+                                             "summary": "Reviewed head abc; allow_protected_push_branch is off."}))
+        p.db.update_task(ids["other"], status="blocked", blocked_reason="needs a credential")
+        p.db.update_task(ids["anchored"], status="blocked", labels=json.dumps(["waits:until:9999999999"]),
+                         blocked_reason="allow_protected_push_branch is off; waiting a day")
+    block()
+    d = Daemon(p.base)
+    d.sweep_holds()   # no ask names it: nothing joins
+    assert all("waits:ask" not in (p.db.task(t)["labels"] or "") for t in ids.values())
+    for resolve_by in ("setting", "ask"):
+        aid = _setting_ask(p)
+        d.sweep_holds()
+        for n in ("reason", "summary"):
+            t = p.db.task(ids[n])
+            assert t["status"] == "blocked" and f'"waits:ask:{aid}"' in t["labels"], t
+            assert settinghold.held_key(t) and "Handed off:" in t["blocked_reason"], t
+        assert "waits:" not in (p.db.task(ids["other"])["labels"] or "")
+        assert "waits:until" in p.db.task(ids["anchored"])["labels"]
+        lines = [ln for ln in coord.digest(p, {}, [], []).splitlines() if "setting hold" in ln]
+        assert len(lines) == 1 and f"#{ids['reason']}, #{ids['summary']}" in lines[0], lines
+        if resolve_by == "setting":
+            p.set_config("delivery.allow_protected_push_branch", True)
+            d.cfg = p.config()
+        else:
+            assert coord.apply(p, [{"type": "resolve", "id": aid}]) == []
+        d.sweep_holds()
+        for n in ("reason", "summary"):
+            assert p.db.task(ids[n])["status"] == "queued", (resolve_by, p.db.task(ids[n]))
+        assert p.db.task(ids["other"])["status"] == "blocked"
+        why = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released'")]
+        assert len(why) == (2 if resolve_by == "setting" else 4), why
+        assert ("was turned on" if resolve_by == "setting" else "no open ask names") in why[-1], why
+        p.set_config("delivery.allow_protected_push_branch", False)
+        d.cfg = p.config()
+        p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+        block()
+
+
 def test_stale_holds_raise_one_trigger_per_new_set_and_legacy_holds_count(env):
     p = make(env)
     from ttp import anchors

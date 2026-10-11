@@ -184,6 +184,7 @@ EFFORT_EVENT_TRIGGERS = {
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
     "charter_conflict": "conflict", "charter_retry": "conflict",
+    "setup_question": "conflict",   # the charter allows pushes a user-only setting refuses (settinghold)
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine

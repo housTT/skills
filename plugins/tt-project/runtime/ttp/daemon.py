@@ -4029,12 +4029,34 @@ class Daemon:
 
     def _sweep_setting_holds(self, rows: list[dict], now: float) -> None:
         """Release every task held on a setting together once the setting is on or no open ask names
-        it; one still held moves its anchor to the newest open ask about it."""
+        it; one still held moves its anchor to the newest open ask about it. A blocked task with no
+        anchor that a worker handed off naming a held setting joins that hold first. Then raise the
+        setup question (settinghold.setup_question) when its inputs changed."""
+        self._setting_setup_question(now)
         held = [(t, settinghold.held_key(t)) for t in rows]
         held = [(t, k) for t, k in held if k]
-        if not held:
+        db = self.p.db
+        names = sorted({k.rpartition(".")[2] for k in settinghold.SETTINGS})
+        loose = db.q("SELECT * FROM tasks WHERE status='blocked' AND labels NOT LIKE '%\"waits:%' AND ("
+                     + " OR ".join("blocked_reason LIKE ? OR result LIKE ?" for _ in names) + ")",
+                     [f"%{n}%" for n in names for _ in (0, 1)])
+        if not held and not loose:
             return
-        holds = settinghold.active(self.p.db, self.cfg, self.p.root)
+        holds = settinghold.active(db, self.cfg, self.p.root)
+        for t in loose if holds else []:
+            res = load_result(t["result"])
+            key = settinghold.anchor_blocked(t, holds, str(res.get("question") or res.get("summary") or ""))
+            if not key:
+                continue
+            labels = anchors.without(json.loads(t["labels"] or "[]")) + [anchors.label("ask", str(holds[key]))]
+            with db.tx():
+                cur = db.task(t["id"]) or {}
+                if cur.get("status") != "blocked" or anchors.anchor(cur):
+                    continue
+                db.update_task(t["id"], labels=labels,
+                               blocked_reason=settinghold.handed_off_reason(key, holds[key], self.cfg,
+                                                                            t["blocked_reason"]))
+            log(self.p, f"task {t['id']} held with the rest: handed off on {key}, ask #{holds[key]} is open")
         for t, key in held:
             why = settinghold.over(self.cfg, key, holds, self.p.root)
             if why:
@@ -4043,6 +4065,19 @@ class Daemon:
                 labels = anchors.without(json.loads(t["labels"] or "[]")) + [anchors.label("ask", str(holds[key]))]
                 self.p.db.update_task(t["id"], labels=labels,
                                       blocked_reason=settinghold.reason(key, holds[key], self.cfg))
+
+    def _setting_setup_question(self, now: float) -> None:
+        """settinghold.setup_question, run only when the charter or the delivery settings changed
+        since the last check (its git check stays off the tick); the kv makes it once per state."""
+        try:
+            state = (self.p.charter_path.stat().st_mtime_ns, json.dumps(self.cfg.get("delivery") or {}, sort_keys=True))
+        except OSError:
+            return
+        if getattr(self, "_setup_state", None) == state:
+            return
+        self._setup_state = state
+        if settinghold.setup_question(self.p.db, self.cfg, self.p.charter_path.read_text(), now, self.p.root):
+            log(self.p, "setup question raised to the coordinator: " + ", ".join(settinghold.SETTINGS))
 
     def _hold_probe(self, task: dict, probe: str, now: float) -> str:
         """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, else ''."""

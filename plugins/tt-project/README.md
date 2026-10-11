@@ -444,6 +444,14 @@ and preferences you add later become part of the project's charter and memory.
   push branch is refused, the config alert and `ttp doctor` say so, and every review is review
   only, never followed by a raw `git push`. On, the push checks, the rebase before the push and
   the no-force rule apply as to any branch. Only the user's word sets it.
+  While it is off, refuses the push branch and an open ask names it (a setting hold), every task
+  told to land work there waits blocked on that ask, attempts untouched, instead of running into
+  the refusal: queued ones before they start, and blocked ones a worker handed off naming the
+  setting. A review with a push step still runs, as review only, and hands off blocked to join
+  them. The daemon releases them all together once the setting is on or the ask is resolved. When
+  the charter says pushes there need no approval while the setting is off and nothing asks about
+  it, the coordinator gets one setup question to ask the user, once per push branch and charter
+  wording.
 - `delivery.fast_forward_also` (branch names, off by default) keeps more branches in step with
   the push branch, such as a `main` that holds the last good state: after each successful `ttp push`
   or push queue batch, each listed branch on the push remote is moved to the pushed commit, never

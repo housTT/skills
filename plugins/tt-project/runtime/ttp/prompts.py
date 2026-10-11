@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import timefmt
+from . import settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
@@ -238,6 +238,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         if not str(prev.get("retry_when") or "").strip():
             history += ("The last hand-off gave no `retry_when`, so only a model run could check this wait. "
                         "If you hand off `waiting` again, give one.\n")
+    # A review with a push step run while a setting hold stands: review only, then blocked.
+    history += settinghold.prompt_line(p.db, cfg, task, p.root)
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:

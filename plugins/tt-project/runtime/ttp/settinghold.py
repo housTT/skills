@@ -12,9 +12,20 @@ The daemon (dispatch) blocks such a task before it starts, attempts untouched, w
 starting NOTE and the anchor `waits:ask:<id>` of the newest open ask naming the setting. The hold
 sweep (Daemon.sweep_holds) releases them all together once the setting is on, or once no open ask
 names it (resolved or expired). The coordinator's digest shows each setting's hold as one line.
+
+Work that already ran joins the same hold: a blocked task a worker handed off naming the setting
+(`anchor_blocked`) is moved onto the ask the same way, and released with the rest. A review whose spec
+has a push step still runs while the hold stands, as review only (`prompt_line`): it hands off blocked
+naming the setting, so it is held and pushes once released.
+
+When the charter says pushes there need no approval while the setting is off and nothing asks about
+it, `setup_question` raises one `setup_question` event for the coordinator to ask the user once, instead
+of every landing task finding the refusal for itself. It fires once per setting state (the push branch
+and the charter's wording), never per tick.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -31,6 +42,12 @@ LINE = re.compile(rf"(?:^[ \t]*(?:[-*>$]|\d+[.)])?[ \t]*|{_VERB})`?ttp push\b{_F
 LAND_ON = r"\bland(?:s|ing)?\b[^.!?\n]{{0,80}}?\bon[ \t]+`?(?:the[ \t]+(?:configured[ \t]+)?push[ \t]+branch\b{names})"
 NEGATION = re.compile(r"\b(?:not|never|no|without)\b|n't\b", re.I)
 SENTENCE_END = re.compile(r"[.!?;](?:\s|$)|\n")
+SETUP_EVENT = "setup_question"
+SETUP_KEY = "setting_setup_asked"   # kv {setting: fingerprint of the setting state it was raised for}
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+_PUSH = re.compile(r"\bpush(?:es|ed|ing)?\b", re.I)
+_NO_APPROVAL = re.compile(r"\b(?:no|not|without|never)\b[^.!?\n]{0,40}?\b(?:approval|permission|asking|ask)\b", re.I)
+_FORBIDS = re.compile(r"\b(?:never|do not|don't|must not|may not)\s+(?:force-)?push", re.I)
 
 
 def _allow_protected(cfg: dict) -> bool:
@@ -107,6 +124,11 @@ def lands(task: dict, push_branch: str = "") -> bool:
     (push.kept_off's marker) never count."""
     if task.get("kind") == "review":   # a review of a branch that can never be pushed to is review only
         return False
+    return _push_step(task, push_branch)
+
+
+def _push_step(task: dict, push_branch: str) -> bool:
+    """lands() for any kind: whether the title or spec has a landing step."""
     from .push import _NO_PUSH_MARKER
     spec = str(task.get("spec") or "")
     if any(m.group(1).strip("`\"' ").lower() not in ("false", "no", "0") for m in _NO_PUSH_MARKER.finditer(spec)):
@@ -146,6 +168,85 @@ def reason(key: str, ask: int, cfg: dict) -> str:
         else "it is refused"
     return (f"{NOTE} {key} is off and ask #{ask} about it is open; {what} until the user turns it on. "
             f"Released by itself once it is on or the ask is resolved; no attempts spent")[:500]
+
+
+def anchor_blocked(task: dict, holds: dict[str, int], blocked_text: str = "") -> str | None:
+    """The held setting a blocked task with no anchor was handed off on (its blocked_reason, or
+    `blocked_text` from its hand-off, names the setting's key or last part), or None."""
+    if task.get("status") != "blocked" or held_key(task):
+        return None
+    text = f"{task.get('blocked_reason') or ''}\n{blocked_text}"
+    for key in holds:
+        if re.search(rf"(?<!\w){re.escape(key.rpartition('.')[2])}(?!\w)", text):   # the dotted key too
+            return key
+    return None
+
+
+def handed_off_reason(key: str, ask: int, cfg: dict, was: str) -> str:
+    """The hold note for a task a worker handed off blocked on the setting, keeping its own words."""
+    note = reason(key, ask, cfg)
+    was = " ".join(str(was or "").split())
+    return (f"{note}. Handed off: {was}" if was else note)[:500]
+
+
+def prompt_line(db, cfg: dict, task: dict, repo: Path | None = None) -> str:
+    """For a review with a push step that runs while a setting hold stands: review only, then hand
+    off blocked naming the setting, which holds it on the ask with the rest (anchor_blocked)."""
+    if task.get("kind") != "review":
+        return ""
+    holds = active(db, cfg, repo)
+    key = "delivery.allow_protected_push_branch"
+    if key not in holds or not _push_step(task, _push_branch(cfg)):
+        return ""
+    ask = holds[key]
+    return (f"Setting hold: {key} is off and ask #{ask} about it is open, so `ttp push` to {_push_branch(cfg)} "
+            f"is refused until the user turns it on. Review only: do not run `ttp push` or a raw `git push`. "
+            f"Give your verdict; if it passes, hand off `blocked` with the verdict and the reviewed head, naming "
+            f"{key}: the daemon holds it on ask #{ask} and queues it again once the setting is on or the ask is "
+            f"resolved, to push then.\n")
+
+
+def charter_says_no_approval(charter: str, push_branch: str = "") -> str:
+    """The charter sentence saying pushes to main, master, the default branch or the push branch need
+    no approval (and not forbidding them), or ""."""
+    names = {"main", "master"} | {n for n in (push_branch, push_branch.partition("/")[2]) if n}
+    target = re.compile(r"\b(?:default|push)[ \t]+branch\b|(?<![\w/-])(?:"
+                        + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")(?![\w/-])", re.I)
+    for s in _SENTENCE.split(charter or ""):
+        s = " ".join(s.split())
+        if _PUSH.search(s) and target.search(s) and _NO_APPROVAL.search(s) and not _FORBIDS.search(s):
+            return s
+    return ""
+
+
+def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = None) -> str:
+    """Raise one `setup_question` event when the charter says pushes to the push branch need no
+    approval but delivery.allow_protected_push_branch is off and refuses it, and no open ask names
+    it. Once per setting state (push branch and charter wording): the state is recorded even while an
+    ask is open, so a later answer is not asked again. Returns the event text, or ""."""
+    key = "delivery.allow_protected_push_branch"
+    on, applies = SETTINGS[key]
+    branch = _push_branch(cfg)
+    line = "" if on(cfg) else charter_says_no_approval(charter, branch)
+    if not line or not applies(cfg, repo):
+        return ""
+    fp = hashlib.sha256(f"{key}\n{branch}\n{line}".encode()).hexdigest()[:16]
+    with db.tx():
+        seen = db.kv(SETUP_KEY, {}) or {}
+        if seen.get(key) == fp:
+            return ""
+        seen[key] = fp
+        db.set_kv(SETUP_KEY, seen)
+        if asked(db, key) is not None:
+            return ""
+        text = (f"Setup question: the charter says pushes to {branch} need no approval (\"{line[:300]}\"), but "
+                f"{key} is off, so `ttp push` refuses every push there and each push or landing task would spend "
+                f"a run on that refusal. Ask the user once (ask_user, blocking restriction) whether to turn it "
+                f"on, naming {key} in the ask: while it is open every push or landing task is held on it, and "
+                f"the setting turning on or the ask being resolved releases them all.")
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (now, "daemon", SETUP_EVENT, "normal", text[:1000], "queued"))
+    return text
 
 
 def held_key(task: dict) -> str | None:
