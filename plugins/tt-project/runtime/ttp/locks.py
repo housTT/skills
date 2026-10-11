@@ -336,8 +336,10 @@ def job_lock(rc: Path) -> Path:
 
 
 def job_ended(rc: Path) -> bool:
-    """Whether a detached job ended: it wrote its exit code, or its process is gone without one."""
-    return Path(rc).exists() or any_free([job_lock(rc)])
+    """Whether a detached job ended: it wrote its exit code, or it is gone without one (detach.state);
+    one the daemon is yet to start has not."""
+    from .detach import state
+    return state(Path(rc))[0] in ("ended", "lost")
 
 
 def job_probe(rcs: list, ttp: str = "ttp") -> str:

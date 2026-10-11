@@ -178,7 +178,8 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
-    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS"):
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
+                "TTP_CGROUP"):
         monkeypatch.delenv(var, raising=False)
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
@@ -34572,6 +34573,99 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     check = _ttp_run(p, "detach", "--check", str(rc))
     assert check.returncode == 0 and "gone without an exit code" in check.stdout
     assert not rc.exists()
+
+
+def _check_until_ended(p, rc, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
+        time.sleep(0.1)
+    return _ttp_run(p, "detach", "--check", str(rc))
+
+
+@pytest.mark.parametrize("box", ["pidns", "cgroup"])
+def test_detach_from_a_sandboxed_command_is_queued_and_the_daemon_starts_it(env, box):
+    """A command in a PID namespace or cgroup other than its run's may take everything it started
+    along when it ends: the job is queued, reads as waiting, and the daemon starts it."""
+    from ttp import detach, locks, push
+    if not (push.pid_ns() if box == "pidns" else push.cgroup()):
+        pytest.skip("no /proc")
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    other = {"TTP_PIDNS": "pid:[1]"} if box == "pidns" else {"TTP_CGROUP": "0::/elsewhere"}
+    r = _ttp_run(p, "detach", "job1", "--", "sh", "-c", 'echo "hi $JOB_VAR"; exit 3',
+                 env={"TTP_RUN_DIR": str(run_dir), "JOB_VAR": "there", "SOME_API_TOKEN": "s3cret", **other})
+    assert r.returncode == 0 and "queued" in r.stdout, r
+    rc = run_dir / "job1.rc"
+    queue = list((p.state / detach.QUEUE).glob("*.json"))
+    assert len(queue) == 1 and "s3cret" not in queue[0].read_text(), "secrets stay off disk"
+    assert json.loads((run_dir / "detached.json").read_text())[0]["pid"] is None
+    check = _ttp_run(p, "detach", "--check", str(rc))
+    assert check.returncode == 1 and "queued for the daemon" in check.stdout, check
+    assert not locks.job_ended(rc), "an exclusive task's resources stay held while its job waits"
+    detach.tend(p)
+    assert not list((p.state / detach.QUEUE).glob("*.json")) and not detach.queued(rc).exists()
+    check = _check_until_ended(p, rc)
+    assert check.returncode == 0 and "exit 3" in check.stdout, check
+    assert (run_dir / "job1.log").read_text().strip() == "hi there"
+
+
+def test_detach_inside_a_pid_namespace_that_ends_with_the_command_still_runs_the_job(env, tmp_path):
+    """The reported failure, reproduced: a namespace that ends with the command kills what it started,
+    so a job started in it never wrote a line. Queued, the daemon runs it to its exit code."""
+    from ttp import detach, push
+    unshare = shutil.which("unshare")
+    if not (unshare and push.pid_ns()):
+        pytest.skip("no unshare or /proc")
+    box = [unshare, "--user", "--pid", "--fork", "--map-root-user", "--mount-proc"]
+    if subprocess.run([*box, "true"], capture_output=True).returncode:
+        pytest.skip("unprivileged PID namespaces are not allowed here")
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run_dir), "TTP_PIDNS": push.pid_ns()}
+    for name, pidns in (("bare", ""), ("job", push.pid_ns())):   # bare: as before, no run namespace to compare
+        r = subprocess.run([*box, sys.executable, str(TTP), "detach", name, "--", "sh", "-c", "sleep 1; echo done; exit 5"],
+                           env={**e, "TTP_PIDNS": pidns}, cwd=str(p.root), capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r
+    bare = _check_until_ended(p, run_dir / "bare.rc")
+    assert "gone without an exit code (it " in bare.stdout and (run_dir / "bare.lost").exists(), bare
+    assert _ttp_run(p, "detach", "--check", str(run_dir / "job.rc")).returncode == 1
+    detach.tend(p)
+    check = _check_until_ended(p, run_dir / "job.rc")
+    assert check.returncode == 0 and "exit 5" in check.stdout, check
+    assert (run_dir / "job.log").read_text().strip() == "done"
+
+
+def test_a_detached_job_gone_without_an_exit_code_says_why(env, monkeypatch):
+    from ttp import detach, locks
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    from ttp.runner import boot_id
+    jobs = [{"name": n, "rc": str(run_dir / f"{n}.rc"), "log": str(run_dir / f"{n}.log"), "boot": b}
+            for n, b in (("never", boot_id()), ("killed", boot_id()), ("reboot", "an-earlier-boot"))]
+    (run_dir / "detached.json").write_text(json.dumps(jobs))
+    detach.started(run_dir / "killed.rc").write_text("123\n")
+    assert detach.state(run_dir / "never.rc") == ("lost", detach.lost(run_dir / "never.rc").read_text().strip())
+    assert "never started" in detach.state(run_dir / "never.rc")[1]
+    assert "killed after it started" in detach.state(run_dir / "killed.rc")[1]
+    assert "host restarted" in detach.state(run_dir / "reboot.rc")[1]
+    assert all(locks.job_ended(run_dir / f"{n}.rc") for n in ("never", "killed", "reboot"))
+    # A job the daemon did not start in time is recorded as lost, never started late.
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")
+    if not __import__("ttp.push", fromlist=["x"]).pid_ns():
+        return
+    r = _ttp_run(p, "detach", "late", "--", "true", env={"TTP_RUN_DIR": str(run_dir), "TTP_PIDNS": "pid:[1]"})
+    assert r.returncode == 0 and "queued" in r.stdout, r
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    m = json.loads(q.read_text())
+    m["queued"] -= detach.QUEUED_S + 60
+    q.write_text(json.dumps(m))
+    detach.tend(p)
+    check = _ttp_run(p, "detach", "--check", str(run_dir / "late.rc"))
+    assert check.returncode == 0 and "did not start it" in check.stdout, check
+    assert not (run_dir / "late.log").exists() and not q.exists()
 
 
 def _ssh_stub(tmp_path):

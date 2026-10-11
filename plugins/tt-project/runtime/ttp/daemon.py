@@ -37,6 +37,7 @@ from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordcheck
+from . import detach
 from . import effort
 from . import ends
 from . import heal
@@ -923,11 +924,15 @@ class Daemon:
             log(self.p, "checking resource pause ends failed\n" + traceback.format_exc())
 
     def tend_pushes(self) -> None:
-        """Start the detached pushes queued from inside a sandbox; record the dead ones as failed. Then
+        """Start the detached pushes and jobs queued from inside a sandbox; record the dead pushes as failed. Then
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
         turned off, and batches that ended (pushq.tend). Now and then, pins of settled rows go and code
         tasks left in 'review' after their review pushed their work are closed (pushq.settle_reviewed)."""
         push.tend(self.p)
+        try:
+            detach.tend(self.p)
+        except Exception:
+            log(self.p, "starting queued detached jobs failed\n" + traceback.format_exc())
         try:
             changed = pushq.tend(self.p, self.cfg, self.alert, may_requeue=self.cfg_status != "unavailable")
         except Exception:
@@ -1254,9 +1259,11 @@ class Daemon:
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
-                   # A worker's sandbox may run commands in a PID namespace of their own, which ends
-                   # with the command: `ttp push --detach` compares and has the daemon start the push.
+                   # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which
+                   # ends with the command: `ttp push --detach` and `ttp detach` compare and have the
+                   # daemon start the push or job.
                    **({"TTP_PIDNS": ns} if (ns := push.pid_ns()) else {}),
+                   **({"TTP_CGROUP": cg} if (cg := push.cgroup()) else {}),
                    "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)

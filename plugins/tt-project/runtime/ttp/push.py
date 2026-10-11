@@ -2181,11 +2181,19 @@ def pid_ns() -> str | None:
         return None
 
 
+def cgroup() -> str | None:
+    """This process's control group(s); None where there is no /proc."""
+    try:
+        return Path("/proc/self/cgroup").read_text().strip() or None
+    except OSError:
+        return None
+
+
 def _boxed() -> bool:
-    """Whether this process runs in a PID namespace other than its run's: one that ends with the
-    command, and takes every process started in it along."""
-    run_ns = os.environ.get("TTP_PIDNS")
-    return bool(run_ns) and pid_ns() not in (None, run_ns)
+    """Whether this process runs in a PID namespace or a cgroup other than its run's: one that may
+    end with the command, and take every process started in it along."""
+    run_ns, run_cg = os.environ.get("TTP_PIDNS"), os.environ.get("TTP_CGROUP")
+    return bool(run_ns) and pid_ns() not in (None, run_ns) or bool(run_cg) and cgroup() not in (None, run_cg)
 
 
 def _log_line(log: Path, text: str) -> None:
@@ -2200,7 +2208,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
     """Start the push process of `marker`, holding `lock` (its run lock, taken by the caller), `nice`
     levels below this process, write the marker as running, then give the go. Returns the pid."""
     log = Path(m["log"])
-    env = {k: v for k, v in env.items() if k not in ("TTP_RUN_DIR", "TTP_PIDNS")}   # the run ends first
+    env = {k: v for k, v in env.items() if k not in ("TTP_RUN_DIR", "TTP_PIDNS", "TTP_CGROUP")}   # the run ends first
     env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
     _log_line(log, f"starting the push process for marker {marker}")
     with open(log, "ab") as out:

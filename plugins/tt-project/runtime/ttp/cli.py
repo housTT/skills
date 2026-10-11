@@ -1747,11 +1747,15 @@ def cmd_detach(a) -> None:
 
     Output goes to $TTP_RUN_DIR/<name>.log and the exit code to $TTP_RUN_DIR/<name>.rc once it
     ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
-    once the job wrote its .rc, or once its process is gone without one (a kill, a reboot), else 1.
+    once the job wrote its .rc, or once its process is gone without one (a kill, a reboot: it says
+    why, see detach.state), else 1. From a command a sandbox would end with everything it started,
+    the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py)."""
+    from . import detach
     from . import locks as lk
-    from .push import _own_ttp
+    from .push import _boxed, _own_ttp
+    from .runner import boot_id
     if a.check is not None:   # `--check --host <alias> <path>` leaves the paths to the positionals
         a.check = [*a.check, *([a.name] if a.name else []), *(a.command or [])]
         if not a.check:
@@ -1764,14 +1768,14 @@ def cmd_detach(a) -> None:
     if a.check is not None:
         ended = True
         for rc in map(Path, a.check):
-            if rc.exists():
-                print(f"{rc.stem}: ended, exit {rc.read_text().strip() or '?'}")
-            elif lk.job_ended(rc):
-                print(f"{rc.stem}: gone without an exit code (killed, or the host restarted); "
-                      f"see {rc.with_suffix('.log')}")
+            st, why = detach.state(rc)
+            if st == "ended":
+                print(f"{rc.stem}: ended, exit {why}")
+            elif st == "lost":
+                print(f"{rc.stem}: gone without an exit code ({why}); see {rc.with_suffix('.log')}")
             else:
                 ended = False
-                print(f"{rc.stem}: running")
+                print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}")
         sys.exit(0 if ended else 1)
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
@@ -1784,31 +1788,33 @@ def cmd_detach(a) -> None:
         die("ttp detach only works inside a tt-project run")
     rd = Path(run_dir).resolve()
     rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
-    if rc.exists() or logf.exists():
+    if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
         die(f"a detached job named {a.name} already ran in this run; pick another name")
-    # The job inherits this lock and holds it while any of its processes lives, so a job gone without
-    # an .rc is told apart from one still running (lk.job_ended).
-    lock = lk.try_take([lk.job_lock(rc)], f"detached job {a.name}", " ".join(cmd))
-    if lock is None:
-        die(f"a detached job named {a.name} is still running in this run; pick another name")
-    wrapper = 'o="$1" r="$2"; shift 2; "$@" >"$o" 2>&1 </dev/null; c=$?; echo $c >"$r.tmp"; mv "$r.tmp" "$r"'
-    try:
-        proc = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rc), *cmd], cwd=os.getcwd(),
-                                env={**os.environ, "TTP_DETACHED": "1"}, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                pass_fds=(lock.fileno(),))
-    finally:
-        lock.close()
+    pid = None
+    if _boxed() and rd.parent.name == "runs":   # this command's sandbox would end the job: the daemon starts it
+        detach.enqueue(rd.parent.parent, rc, logf, cmd, os.getcwd(), dict(os.environ))
+    else:
+        # The job inherits this lock and holds it while any of its processes lives, so a job gone
+        # without an .rc is told apart from one still running (detach.state).
+        lock = lk.try_take([lk.job_lock(rc)], f"detached job {a.name}", " ".join(cmd))
+        if lock is None:
+            die(f"a detached job named {a.name} is still running in this run; pick another name")
+        try:
+            pid = detach.start(rc, logf, cmd, os.getcwd(), dict(os.environ), lock)
+        finally:
+            lock.close()
     reg = rd / "detached.json"
     try:
         jobs = json.loads(reg.read_text())
     except (OSError, ValueError):
         jobs = []
     jobs = jobs if isinstance(jobs, list) else []
-    jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": proc.pid, "started": time.time(),
-                 "command": " ".join(cmd)[:300]})
+    jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
+                 "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300]})
     durable_write(reg, json.dumps(jobs, indent=1))
-    print(f"detached {a.name} (pid {proc.pid})\nlog: {logf}\nrc:  {rc}\n"
+    how = (f"(pid {pid})" if pid else
+           "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
+    print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
 
 
