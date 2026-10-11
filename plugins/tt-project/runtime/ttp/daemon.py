@@ -1828,7 +1828,7 @@ class Daemon:
             # way keeps its session (below), so this comes before the fresh-start fallback.
             note.update(not_waste="sleep", lost_to_sleep=True, slept_s=exit_info.get("slept_s"))
             status = "lost"
-        elif status == "failed" and _resume_never_started(note, usage):
+        elif status == "failed" and _resume_never_started(note, usage) and not refused:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
             # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
@@ -2188,18 +2188,10 @@ class Daemon:
             # The project was stopped, not the task: it resumes on the next start, on its own branch.
             db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
             return
-        if status == "failed" and _resume_never_started(json.loads(r["note"] or "{}"), usage) and not handoff:
-            # The lost run's session could not be continued after all: nothing ran, so the task starts
-            # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again.
-            with db.tx():
-                db.update_task(task["id"], status="queued", blocked_reason=None, not_before=None)
-                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
-                      f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
-            return
         if refused in ("model_mismatch", "pin_unverified"):
             # A mismatch or strict unverifiable pin: nothing ran or was spent. Retrying the same
-            # configuration would loop, so block without spending an attempt.
+            # configuration would loop, so block without spending an attempt. Before the resume
+            # fallback: a refused resume must not start fresh under the same pin.
             prefix = "model pin not honoured" if refused == "model_mismatch" else "model pin could not be verified"
             why = f"{prefix}: {usage.error}"[:500]
             remedy = ("Change or clear its model/effort pin (task_update) and requeue it."
@@ -2211,6 +2203,15 @@ class Daemon:
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), f"task:{task['id']}", "task_blocked", "normal",
                       f"#{task['id']} {task['title']} → blocked: {why}. {remedy}", "queued", task["id"]))
+            return
+        if status == "failed" and _resume_never_started(json.loads(r["note"] or "{}"), usage) and not handoff:
+            # The lost run's session could not be continued after all: nothing ran, so the task starts
+            # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again.
+            with db.tx():
+                db.update_task(task["id"], status="queued", blocked_reason=None, not_before=None)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
+                      f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
             return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.

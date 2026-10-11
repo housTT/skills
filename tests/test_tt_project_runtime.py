@@ -42494,6 +42494,29 @@ def test_strict_project_pin_verification_blocks_without_spend_or_retry(env, monk
     assert not (run_dir / "tmp").exists()
 
 
+@pytest.mark.parametrize("pin, session, refused, reason", [
+    ({"effort": "high", "pin_verify": "strict"}, "exit", "pin_unverified", "could not verify"),
+    ({"model": "pinned-model-1", "effort": "xhigh"}, {"model": "other-model"}, "model_mismatch",
+     "model other-model (pinned pinned-model-1)"),
+])
+def test_a_refused_pin_on_a_resumed_run_blocks_instead_of_starting_fresh(env, monkeypatch, pin, session, refused,
+                                                                         reason):
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
+                                     help_text=CODEX_EXEC_HELP, pin=pin, session=session, resume=THREAD,
+                                     note={"resumes": {"run": 1, "session": THREAD}})
+    assert argv is None and not (env["tmp"] / "fakecli" / "argv.json").exists(), "codex exec must never start"
+    assert run["status"] == "failed" and run["cost_usd"] == 0 and task["spent_usd"] == 0
+    note = json.loads(run["note"])
+    assert note["refused"] == refused and note["not_waste"] == "refused", "the refusal is kept, not a resume"
+    assert task["status"] == "blocked" and task["attempts"] == 0 and task["not_before"] is None
+    assert reason in task["blocked_reason"]
+    assert json.loads(task["result"])["status"] == "blocked"
+    ev = p.db.one("SELECT * FROM events WHERE kind='task_blocked' AND task=?", (task["id"],))
+    assert ev and ("requeue" in ev["text"])
+    assert not p.db.one("SELECT * FROM events WHERE kind='task_requeued' AND task=?", (task["id"],)), \
+        "a refused pin must not fall back to a fresh start"
+
+
 @pytest.mark.parametrize("provider, project_mode, task_mode, runs", [
     ("codex", "lenient", "strict", False),
     ("codex", "strict", "lenient", True),
