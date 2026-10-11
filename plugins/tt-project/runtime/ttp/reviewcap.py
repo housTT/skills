@@ -17,6 +17,8 @@ spawned many tasks joins none.
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
 changes within AREA_WINDOW_S, the daemon queues no automatic fix for it and raises a
 REVIEW_AREA_EVENT, which makes the coordinator's turn a high-effort one (TRIGGER) that re-plans.
+A review whose hand-off says `review_failure: check_only` (daemon.review_failure) found no code
+problem, only a missing or inapplicable check, so it does not count toward the cap.
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ import json
 import re
 import time
 
-from .db import DB, continues_id, dependency_ids
+from .db import DB, continues_id, dependency_ids, load_result
 
 AREA_WINDOW_S = 48 * 3600
 LOOKBACK_S = 14 * 86400   # tasks this recent are searched for links back into a lineage
@@ -179,18 +181,24 @@ def overlaps(a: tuple[list[tuple[int, int]], set[str]], b: tuple[list[tuple[int,
     return bool(a[1] & b[1]) or any(s1 < e2 and s2 < e1 for s1, e1 in a[0] for s2, e2 in b[0])
 
 
+def check_only(task: dict) -> bool:
+    """Whether review `task`'s latest hand-off says it failed only on a check, with no code finding."""
+    return load_result(task.get("result")).get("review_failure") == "check_only"
+
+
 def failed_reviews(db: DB, since: float) -> list[int]:
-    """Reviews that failed or asked for changes since `since`, each once."""
+    """Reviews that failed or asked for changes since `since`, each once, but none that failed check-only."""
     return [r["task"] for r in db.q(
-        "SELECT DISTINCT e.task FROM events e JOIN tasks t ON t.id=e.task WHERE t.kind='review' AND e.ts>? "
-        f"AND e.kind IN ({','.join('?' * len(FAILED_KINDS))}) ORDER BY e.task", (since, *FAILED_KINDS))]
+        "SELECT DISTINCT e.task, t.result FROM events e JOIN tasks t ON t.id=e.task WHERE t.kind='review' AND e.ts>? "
+        f"AND e.kind IN ({','.join('?' * len(FAILED_KINDS))}) ORDER BY e.task", (since, *FAILED_KINDS))
+        if not check_only(r)]
 
 
 def area(p, cfg: dict, review: dict, now: float | None = None) -> dict | None:
     """When `review` (failing now) makes area_fail_cap failed reviews of its area within
     AREA_WINDOW_S: {root, title, reviews, tasks, files}; None below it or with the cap off."""
     n = cap(cfg)
-    if not n:
+    if not n or check_only(review):
         return None
     db, now = p.db, time.time() if now is None else now
     fails = set(failed_reviews(db, now - AREA_WINDOW_S)) | {review["id"]}

@@ -31584,6 +31584,42 @@ def test_repeated_review_failures_across_stacks_stop_auto_fixes_and_raise_a_re_p
     assert f"{reviewcap.TRIGGER}, 24 h: 1 area(s): #{code_a} (3 failed reviews: 3 own, 0 pooled, a.py, b.py, c.py)" in lines
 
 
+def test_a_check_only_review_failure_does_not_count_toward_the_review_area_cap(env):
+    """A review that failed only on a check (review_failure: check_only) found nothing to fix in the
+    code: a substantive failure after it in the same lineage still gets its fix and re-review."""
+    p = make(env)
+    from ttp import reviewcap
+    p.set_config("review.area_fail_cap", 2)
+    fups = [{"title": "handle the edge case", "spec": "parse('') raises"}]
+    code_a, _, _, (rev_a,) = _finish_code(env, p, "feature", {"a.py": 40})
+    _fail_review(env, p, rev_a["id"], review_failure="check_only")
+    code_b, _, _, (rev_b,) = _finish_code(env, p, f"#{code_a} follow-up: feature", {"b.py": 40})
+    assert reviewcap.lineage(p.db, rev_b["id"]) >= {rev_a["id"], rev_b["id"]}
+    failed = _fail_review(env, p, rev_b["id"], fups, review_failure="substantive")
+    fix = p.db.one("SELECT * FROM tasks WHERE title=?", (f"Fix review #{rev_b['id']}: #{code_a} follow-up: feature",))
+    assert fix, "a check-only failure counted toward the review-area cap"
+    assert p.db.one("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([fix["id"]]),))
+    assert reviewcap.TRIGGER not in failed["text"]
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    assert reviewcap.failed_reviews(p.db, 0) == [rev_b["id"]]
+
+
+def test_check_only_review_failures_alone_never_reach_the_review_area_cap(env):
+    p = make(env)
+    from ttp import reviewcap
+    code, _, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 40})
+    _fail_review(env, p, rev["id"], review_failure="check_only")
+    last = rev
+    for i in range(3):
+        _, _, _, (last,) = _finish_code(env, p, f"#{code} follow-up: part {i}", {f"p{i}.py": 40})
+        _fail_review(env, p, last["id"], review_failure="check_only")
+    assert len(reviewcap.lineage(p.db, last["id"]) & {r["task"] for r in p.db.q(
+        "SELECT task FROM events WHERE kind IN ('task_failed','task_changes_needed')")}) == 4
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    assert reviewcap.failed_reviews(p.db, 0) == []
+    assert reviewcap.area(p, p.config(), p.db.task(last["id"])) is None
+
+
 def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
     p = make(env)
     from ttp import reviewcap
