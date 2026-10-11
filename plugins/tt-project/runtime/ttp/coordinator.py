@@ -1126,6 +1126,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             prev.pop("waiting_since", None)
                             upd["result"] = dump_result(prev)
                         elif rest is not None:
+                            # The run's result.json keeps the probe it wrote: the on_pass paths match either.
+                            prev.setdefault("retry_when_orig", probe)
                             prev["retry_when"] = rest
                             upd["result"] = dump_result(prev)
                 if a.get("pr_branch") == "":

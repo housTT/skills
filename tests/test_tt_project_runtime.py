@@ -21163,6 +21163,58 @@ def test_an_on_pass_cmd_runs_only_for_the_hand_off_the_task_waits_on(env, monkey
     assert "cannot carry on_pass_cmd" in on_pass_problem({**DONE_ON_PASS, "on_pass_cmd": "true"})
 
 
+@pytest.mark.parametrize("unrelated", [False, True])
+def test_an_on_pass_cmd_still_runs_model_free_after_a_resource_move_rewrites_its_probe(env, monkeypatch, tmp_path,
+                                                                                      unrelated):
+    p = make(env)
+    from ttp import coordinator as coord, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    probe = "ttp lock --probe box-a && true"
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, f"touch {flag}; printf '{{\"status\":\"done\",\"summary\":"
+                                                  f"\"verified\"}}' > \"$TTP_RESULT\"", probe=probe)
+    p.db.update_task(tid, labels=["resource:box-a"])
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"]}]) == []
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == "true" and res["retry_when_orig"] == probe, res
+    if unrelated:   # a result.json naming some other probe is still not the hand-off the task waits on
+        hand = json.loads((run_dir / "result.json").read_text())
+        (run_dir / "result.json").write_text(json.dumps({**hand, "retry_when": "test -e /tmp/other"}))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    if unrelated:
+        assert _ready(p, tid) and not flag.exists()
+        assert "its on_pass_cmd was not run: the task's last run's result.json is not the hand-off" in res["woke"]
+    else:
+        assert task["status"] == "done" and flag.exists(), (task["status"], task["blocked_reason"], res)
+        assert res["summary"] == "verified" and res["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_passed_checks_still_record_on_pass_after_a_resource_move_rewrites_the_probe(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    run_dir = tmp_path / f"run-{tid}"
+    hand = json.loads((run_dir / "result.json").read_text())
+    checks = hand["retry_when"]
+    hand["retry_when"] = f"ttp lock --probe box-a && {checks}"
+    (run_dir / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, labels=["resource:box-a"], result=json.dumps({**hand, "waiting_since": time.time() - 60}))
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"]}]) == []
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == checks
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done" and res["summary"] == DONE_ON_PASS["summary"], (task["status"], res)
+    assert res["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
 def test_on_pass_must_be_a_final_hand_off():
     from ttp.daemon import on_pass_problem
     assert on_pass_problem(DONE_ON_PASS) == ""

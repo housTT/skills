@@ -4922,7 +4922,7 @@ class Daemon:
                           "ORDER BY id DESC LIMIT 1", (tid,))
         full = _read_result(Path(r["dir"]) / RESULT_FILE) if r and r["dir"] else None
         if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
-                or full.get("retry_when") != prev.get("retry_when"):
+                or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
         out = Path(r["dir"]) / ON_PASS_DIR
         shutil.rmtree(out, ignore_errors=True)   # a result from an earlier try must not count
@@ -5021,7 +5021,7 @@ class Daemon:
         full = _read_result(run_dir / RESULT_FILE) or {}
         if "on_pass" not in full:
             return None
-        if full.get("status") != "waiting" or full.get("retry_when") != prev.get("retry_when"):
+        if full.get("status") != "waiting" or not _same_probe(full, prev):
             return "unclear", "the run's result.json is not the hand-off the task waits on"
         problem = on_pass_problem(full["on_pass"])
         if problem:
@@ -6419,6 +6419,13 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     except OSError:
         return []
     return [x[:300] for x in lines if x.strip()][-n:]
+
+
+def _same_probe(full: dict, prev: dict) -> bool:
+    """Whether a run's result.json `full` wrote the retry_when the task waits on (`prev`): the same one,
+    or the one a resource move rewrote (task_update keeps it as retry_when_orig)."""
+    probe = full.get("retry_when")
+    return probe == prev.get("retry_when") or probe is not None and probe == prev.get("retry_when_orig")
 
 
 def _wait_key(result: dict) -> str:
