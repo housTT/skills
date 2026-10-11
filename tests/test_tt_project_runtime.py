@@ -40522,6 +40522,51 @@ def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
     assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
 
 
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+@pytest.mark.parametrize("task_status", ["running", "done", "failed", "blocked", "gone", "escalated-only"])
+def test_heal_known_fault_added_after_self_fix_stays_quiet(env, escalate, task_status):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, fix=None, escalate=escalate,
+                          check="echo 'ttp-heal: not-outage'; exit 1")
+    spec, now = _heal_spec(p), time.time()
+    assert "self-fix task" in heal.run(d, "svc", spec, now)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="running")
+    assert heal.run(d, "svc", spec, now + 1)[0] == f"unhealthy (self-fix task #{tid} open)"
+
+    # The self-fix identifies a known fault instead of repairing the hardware.
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["known_fault"] = "vendor bug"
+    p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    quiet = _heal_spec(p)
+    if task_status == "gone":
+        p.db.x("DELETE FROM tasks WHERE id=?", (tid,))
+    elif task_status == "escalated-only":
+        st = heal.state(p.db, "svc")
+        st.pop("task")
+        heal._save(p.db, "svc", st)
+    else:
+        p.db.update_task(tid, status=task_status)
+    for dt in (2, heal.OUTAGE_S, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", quiet, now + dt) == ("unhealthy (known fault: kept quiet)", None)
+        st = heal.state(p.db, "svc")
+        assert st["finding"] and st["status"] == "unhealthy"
+        assert not {"task", "escalated", "alerted", "observed"} & set(st)
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == (0 if task_status == "gone" else 1)
+    if task_status not in ("gone", "escalated-only"):
+        assert p.db.task(tid)["status"] == task_status
+
+    # A real outage must still escalate even though the same fault is known.
+    outage = dict(quiet, check="exit 1")
+    assert "self-fix task" in heal.run(d, "svc", outage, now + 4 * heal.OUTAGE_S)[0]
+    outage_tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(outage_tid, status="failed")
+    assert ("alerted" if escalate == "user" else "coordinator told") in heal.run(
+        d, "svc", outage, now + 4 * heal.OUTAGE_S + 1)[0]
+
+
 def test_heal_check_marks_a_non_outage_finding_with_one_output_line():
     from ttp import heal
     assert heal.finding(1, "keeper stale\nttp-heal: not-outage\n")

@@ -483,6 +483,12 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     since = st.setdefault("since", now)
     down = now - float(since)
     outage = bool(spec.get("outage")) and down >= min(OUTAGE_S, spec["grace_s"] or OUTAGE_S)
+    if st.get("finding") and spec.get("known_fault"):
+        # A self-fix may identify a known fault while its task is still open.
+        st.pop("task", None)
+        st.pop("escalated", None)
+        _save(db, name, st)
+        return "unhealthy (known fault: kept quiet)", None
     if st.get("task") or st.get("escalated"):
         return _escalated(host, name, spec, st, now)
     if pending:
