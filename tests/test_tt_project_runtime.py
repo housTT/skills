@@ -6970,6 +6970,24 @@ def test_disallowed_tools_are_validated_and_reach_dispatched_workers(env, monkey
     assert not any("disallowed_tools" in l for l in config_problems({"providers": {"claude": {}}}))
 
 
+def test_doctor_scheduler_checks_the_watcher_lifecycle_in_fresh_processes(env, capsys, monkeypatch):
+    from ttp import cli, schedcheck
+    with pytest.raises(SystemExit) as ex:
+        cli.cmd_doctor(types.SimpleNamespace(name=None, live=None, scheduler=True))
+    lines = capsys.readouterr().out.splitlines()
+    assert ex.value.code == 0 and len(lines) == len(schedcheck.STEPS) and all(l.startswith("pass") for l in lines)
+    assert not list(pathlib.Path(os.environ["TTP_HOME"]).glob("sched-check-*")), "the scratch project is removed"
+    assert not (pathlib.Path(os.environ["TTP_HOME"]) / "registry.json").exists(), "and was never registered"
+    # A step whose outcome differs fails, says how, and the command exits 1.
+    what, printed, status, issues, _ = schedcheck.STEPS[1]
+    steps = list(schedcheck.STEPS)
+    steps[1] = (what, printed, status, {**issues, schedcheck.ERROR: "open"}, 0)
+    monkeypatch.setattr(schedcheck, "STEPS", tuple(steps))
+    rows = schedcheck.run()
+    assert [ok for _, ok, _ in rows] == [True, False, True, True]
+    assert "issues" in rows[1][2] and "'fixed'" in rows[1][2]
+
+
 def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     p = make(env)
     from ttp import cli

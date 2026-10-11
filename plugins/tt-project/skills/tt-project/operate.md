@@ -27,7 +27,7 @@
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks |
 | `ttp landed <sha>` / `ttp landed --task <id>` | probe: exit 0 once the commit, or the task's landing, is on the push branch, also after a rebase gave it a new sha (same patch-id, or same author, date and subject); 1 not yet. `start_when` `landed:#<id>` runs it |
-| `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
+| `ttp doctor <name>` / `ttp doctor --scheduler` | providers, accounts, Jev, notifications, web / the installed runtime's command-watcher lifecycle (reports at exit 1, an `"error": true` line repaired and reopening, a clean run closing all) in a scratch project, each tick in a fresh process: no model, $0, exit 1 on a failed step; run it after an upgrade instead of the repository's tests, which are not installed |
 | `ttp alerts <name> --after N` | alerts since a message id |
 | `ttp stats [<name>] [--days N] [--json]` | context re-read (cache-read) tokens per run and per $, by role, task kind, tier and effort, and the runs that re-read most |
 | `ttp audit [<name>] [--hours N] [--json]` | the daily review's self-efficiency audit: every ask with its blocking reason and answer, failed, lost, retried and continued runs, idle wakes, $ per done task by kind and tier, review-loop spend per change, stuck work and overrides held past their end |

@@ -3431,8 +3431,15 @@ def cmd_doctor(a) -> None:
         r = live.row(a.live)
         print(json.dumps(r, indent=1) if a.json else live.format_row(r))
         sys.exit(1 if any(c["status"] == live.FAIL for c in r["checks"].values()) else 0)
+    if getattr(a, "scheduler", False):
+        # The installed runtime's command-watcher lifecycle, in a scratch project: model-free, $0.
+        from . import schedcheck
+        rows = schedcheck.run()
+        for what, ok, why in rows:
+            print(f"{'pass' if ok else 'FAIL'}  {what}" + (f": {why}" if why else ""))
+        sys.exit(0 if rows and all(ok for _, ok, _ in rows) else 1)
     if not a.name:
-        die("ttp doctor: name a project, or --live <provider>")
+        die("ttp doctor: name a project, --live <provider> or --scheduler")
     p = need(a.name, sys.argv[1:])
     from .providers import all_providers
     print(status_text(p))
@@ -3540,6 +3547,9 @@ def main(argv: list[str] | None = None) -> None:
                            help="measure one agent CLI with real runs in a scratch project (spends up to "
                            "about $0.55; a missing or logged-out CLI is reported, exit 0)")
             s.add_argument("--json", action="store_true", help="with --live: the row as JSON")
+            s.add_argument("--scheduler", action="store_true",
+                           help="check the command-watcher scheduler's lifecycle in a scratch project, each tick in "
+                           "a fresh process (no model, $0; exit 1 on a failed step)")
         s.set_defaults(fn=fn)
 
     s = sub.add_parser("say", help="send a message to the coordinator")
