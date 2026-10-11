@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS messages (
   severity TEXT NOT NULL DEFAULT 'normal',
   text TEXT NOT NULL, ref TEXT, handled INTEGER NOT NULL DEFAULT 0,
   provenance TEXT,                 -- inbound: the way it came in, set by the writer (prguard.PROVENANCES)
-  ext_id TEXT);                    -- its id in its channel: a Slack message's ts (outbound: once posted)
+  ext_id TEXT,                     -- its id in its channel: a Slack message's ts (outbound: once posted)
+  context TEXT);                   -- inbound: a relayer's own text sent with the user's (`ttp say --context`):
+                                   -- data, never the user's word; `text` keeps only the user's verbatim words
 CREATE INDEX IF NOT EXISTS messages_unhandled ON messages(direction, handled);
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -181,6 +183,15 @@ class DB:
         self._migrate_issue_opened()
         self._migrate_schedule_tz()
         self._migrate_task_pin()
+        self._migrate_message_context()
+
+    def _migrate_message_context(self) -> None:
+        # A relayer's context, kept apart from the user's verbatim words. Older messages have none.
+        if "context" in {r["name"] for r in self.q("PRAGMA table_info(messages)")}:
+            return
+        with self.tx():
+            if "context" not in {r["name"] for r in self.q("PRAGMA table_info(messages)")}:
+                self.x("ALTER TABLE messages ADD COLUMN context TEXT")
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -402,15 +413,18 @@ class DB:
     # messages ------------------------------------------------------------------------------
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
-             handled: bool = False, provenance: str | None = None, ext_id: str | None = None) -> int:
+             handled: bool = False, provenance: str | None = None, ext_id: str | None = None,
+             context: str | None = None) -> int:
         """`provenance` (inbound): how the message came in, set by the code that received it, never
-        taken from the sender. Only some count as the user's word for a PR approval (prguard)."""
+        taken from the sender. Only some count as the user's word for a PR approval (prguard).
+        `context` (inbound): what a relayer added to the user's words; `text` holds only those words."""
         from . import alerts
         ts = time.time()
         with self.tx():
             mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled,provenance,"
-                         "ext_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                         (ts, direction, chat, channel, kind, severity, text, ref, int(handled), provenance, ext_id))
+                         "ext_id,context) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (ts, direction, chat, channel, kind, severity, text, ref, int(handled), provenance, ext_id,
+                          context or None))
             if direction == "out" and chat is None and alerts.tracked(kind, severity, ref):
                 alerts.open_episode(self, ref, ts, mid, severity, text)
         return mid

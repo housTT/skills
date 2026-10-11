@@ -30,7 +30,7 @@ only requirements; the runtime uses the standard library.
 |---|---|
 | "Start a tt-project called X on box B: <brief>" | the project is created on B and starts working |
 | "Connect to project X" | this chat attaches; replies and alerts arrive here |
-| anything addressed to the project | relayed to the coordinator; its answer comes back to this chat |
+| anything addressed to the project | relayed to the coordinator verbatim (the chat's own context goes apart, in `ttp say --context`, and never counts as your word); its answer comes back to this chat |
 | "What is X doing?" | `ttp status X`: running work, blockers, spend, why idle |
 | "How are all my projects?" | `ttp overview` (or the web app's Projects tab): one line per project on this machine |
 

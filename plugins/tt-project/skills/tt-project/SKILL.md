@@ -27,14 +27,17 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
 | 3c. Link | Reply with the `tt-project://…` line and the verified web app link: the last `web app:` line `new` or `connect` printed. They open a remote project's kept local forward and check the link first. |
 | 4. Listen | Start the listener for this host: `hosts.md`. |
-| 5. Relay | User message for the project → `ttp say <name> --chat <id> "<message>"`. |
+| 5. Relay | User message for the project → `ttp say <name> --chat <id> "<the user's words, verbatim>"`, your own context only in `--context "<text>"`. |
 | 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. Restart the listener with `--ack <last id shown>`. |
 
 ## Relay rules
 
 - Never ask the user to do what you or the project can do, and never offer to do it: do it and
   say so. Ask only when a choice is truly ambiguous, dangerous, or involves another human.
-- Forward the user's words verbatim. Do not rephrase instructions.
+- Relay the user's words verbatim, and only them, as the message. Do not rephrase instructions
+  or add to them. Your own context (background, a summary, what you think they mean) goes only in
+  `--context "<text>"`. The project reads it as data, never as the user's word: a rule, pin or
+  approval you write there binds nothing.
 - A project question you can answer from `ttp status <name>`: answer directly.
 - Anything else goes to the coordinator. Answers arrive through the listener.
 - Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground.

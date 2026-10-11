@@ -127,7 +127,18 @@ def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = Fals
     r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
     if r.returncode == 2 and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
         r = _ssh(entry, argv, capture)
+    if r.returncode == 2 and "--context" in (r.stderr or "") and "--context" in argv:
+        return _send_say(entry, _fold_context(argv), client_id, capture)
     return r
+
+
+def _fold_context(argv: list[str]) -> list[str]:
+    """The `ttp say` argv for a runtime without `--context`: the relayer's context goes after a
+    relay.MARK line in the text, which that runtime keeps and a newer one splits off again."""
+    from . import relay
+    i = argv.index("--context")
+    rest = argv[:i] + argv[i + 2:]
+    return rest[:-1] + [f"{rest[-1]}\n\n{relay.MARK}\n{argv[i + 1]}"]
 
 
 def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.CompletedProcess | None:
@@ -160,10 +171,11 @@ def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.Comp
     return failed
 
 
-def say_remote(name: str, entry: dict, text: str, chat: str | None) -> int:
+def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "") -> int:
     """Send a message to a project on another machine. If that machine cannot be reached, or older
     messages are still queued for it, queue this one here: it is never dropped, and goes out in order."""
-    argv = ["say", name, *(["--chat", chat] if chat else []), "--", text]
+    argv = ["say", name, *(["--chat", chat] if chat else []), *(["--context", context] if context else []),
+            "--", text]
     cid = outbox.new_id()
     if flush_outbox(name, entry) is None and not outbox.entries(name):
         r = _send_say(entry, argv, cid)
@@ -600,12 +612,14 @@ def cmd_say(a) -> None:
         # A message posted here counts as the user's (pr_approve reads approvals from it), so a run
         # must not post one. Runs report through `ttp note` and their hand-off.
         die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
+    from . import relay
     p, entry = resolve(a.name)
-    text = a.text if a.text != "-" else sys.stdin.read()
-    if not text.strip():
-        die("empty message")
+    # Only the user's verbatim words are the message; what a relayer adds is kept apart (relay.py).
+    text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
+    if not text:
+        die("empty message" if not context else "no user's words: --context alone is not a message")
     if entry:
-        sys.exit(say_remote(a.name, entry, text, a.chat))
+        sys.exit(say_remote(a.name, entry, text, a.chat, context))
     p = p or need(a.name, sys.argv[1:])
     seen = None
     with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
@@ -613,7 +627,7 @@ def cmd_say(a) -> None:
             seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
         mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
                                                  kind="user", ref=f"client:{a.client_id}" if a.client_id else None,
-                                                 provenance="cli-legacy")
+                                                 provenance="cli-legacy", context=context)
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
     if seen:
@@ -3630,8 +3644,10 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("say", help="send a message to the coordinator")
     s.add_argument("name")
-    s.add_argument("text", help="message, or '-' for stdin")
+    s.add_argument("text", help="the user's words, verbatim, or '-' for stdin")
     s.add_argument("--chat")
+    s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
+                   "kept apart from the user's words")
     s.add_argument("--client-id", help=argparse.SUPPRESS)   # set by a forwarding machine; resends are skipped
     s.set_defaults(fn=cmd_say)
 
