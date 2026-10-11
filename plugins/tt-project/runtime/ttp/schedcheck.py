@@ -91,9 +91,9 @@ def run(home: Path | None = None) -> list[tuple[str, bool, str]]:
         write_json(p.config_path, {**json.loads(p.config_path.read_text()),
                                    "jev": {"enabled": False}, "notify": {"slack": False}})
         out = tmp / "out.txt"
-        (p.harness / "schedules.json").write_text(json.dumps([{
+        write_json(p.harness / "schedules.json", [{
             "name": NAME, "kind": "command", "every": "1h",
-            "payload": {"command": f"cat {shlex.quote(str(out))}; exit 1"}}]))
+            "payload": {"command": f"cat {shlex.quote(str(out))}; exit 1"}}])
         for i, (what, printed, status, issues, woke) in enumerate(STEPS):
             out.write_text(printed)
             try:
