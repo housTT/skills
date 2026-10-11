@@ -3028,7 +3028,7 @@ class Daemon:
         queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id")
         unmet = db.unmet_dependencies(queued)
         ctx = {"now": now, "paused": db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
-        unreachable, other = [], False
+        unreachable, ready = [], []
         for t in queued:
             if unmet[t["id"]]:
                 continue
@@ -3039,15 +3039,15 @@ class Daemon:
                     and now - got[1] <= 3 * PROBE_EVERY_S:
                 out = self._probe_out.get(t["id"])
                 unreachable.append((t["id"], netwait.hosts(probe, out[0] if out and out[2] == probe else "")))
-                continue
-            if when or (t["not_before"] or 0) > now:
-                continue
+            elif not when and (t["not_before"] or 0) <= now:
+                ready.append(t)
+        for t in ready if unreachable else []:   # dispatch's checks only while a probe says unreachable
             prov = t["provider"] or core
             if prov not in ctx["logged_out"]:
                 ctx["logged_out"][prov] = self._logged_out(prov)
             if self._start_hold(t, prov, ctx) != "paused":
-                other = True
-        return unreachable, other
+                return unreachable, True
+        return unreachable, False
 
     def _healing(self) -> bool:
         """A heal check is still trying its own fix: unhealthy, not escalated, no self-fix task yet."""
