@@ -56,6 +56,7 @@ from . import machines
 from . import prguard
 from . import push
 from . import pushq
+from . import refwaits
 from . import release
 from . import responsibilities
 from . import reviewcap
@@ -94,7 +95,7 @@ NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (
 NOTIFIES_PER_RUN = 3
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
-             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd")
+             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY)
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -658,7 +659,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4306,6 +4307,77 @@ class Daemon:
                   "handled", task["id"]))
         log(self.p, f"task {task['id']} hold released: {why}")
 
+    def refresh_ref_waits(self) -> None:
+        """Model-free (refwaits.py): a queued task whose wait note names an ask now resolved or a task
+        now done gets a note that says so, its cached probe verdicts dropped and its probe (retry_when
+        or start_when) rerun at once by probe_waiting, which runs next. A wait with no probe is made due
+        now unless it is on a window it planned or before its start_after. Its probe, dependencies,
+        start_when, start_after and attempts stay; each piece of evidence counts once per wait."""
+        db, now = self.p.db, time.time()
+        rows = db.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NOT NULL "
+                    "OR labels LIKE '%\"start_when:%')")
+        seen = db.kv(refwaits.SEEN_KEY, {}) or {}
+        keep: dict = {}
+        for t in rows:
+            prev = load_result(t["result"])
+            d = deferral(t)
+            waiting = prev.get("status") == "waiting"
+            if not d.get("when") and not waiting:
+                continue
+            ep = d.get("since") if d.get("when") else prev.get("waiting_since")
+            ep = f"{float(ep):.0f}" if isinstance(ep, (int, float)) else f"u{float(t['created'] or 0):.0f}"
+            text = " ".join(str(x or "") for x in (prev.get("waiting_for") if waiting else "",
+                                                   d.get("why"), t["blocked_reason"]))
+            named = refwaits.refs(text, own=t["id"])
+            if not named:
+                continue
+            had = seen.get(str(t["id"])) or {}
+            done = list(had.get("seen") or []) if had.get("ep") == ep else []
+            keep[str(t["id"])] = {"ep": ep, "seen": done}
+            new = [(k, fact) for k, fact in refwaits.over(db, named) if k not in done]
+            if not new:
+                continue
+            keep[str(t["id"])]["seen"] = done + [k for k, _ in new]
+            self._refresh_ref_wait(t, prev, d, [f for _, f in new], now)
+        if keep != seen:
+            db.set_kv(refwaits.SEEN_KEY, keep)
+
+    def _refresh_ref_wait(self, t: dict, prev: dict, d: dict, facts: list[str], now: float) -> None:
+        tid, db = t["id"], self.p.db
+        probe = d.get("when") or prev.get("retry_when")
+        probe = probe if isinstance(probe, str) and probe.strip() else ""
+        later = (d.get("after") or 0) > now
+        upd: dict = {}
+        if probe:
+            # Its cached verdicts were for before the evidence: drop them (a 0 is acted on at once, so
+            # only not-yet and broken ones are cached), and let probe_waiting run it now.
+            self._probe_rc.pop(tid, None)
+            self._start_rc.pop(tid, None)
+            for other, got in list(self._probe_rc.items()):
+                if got[2] == probe and got[0] != 0:
+                    del self._probe_rc[other]
+            self._probed.pop(tid, None)
+            then = "its probe runs again after its start_after" if later else "its probe runs again now"
+        elif unblock.classify_wait(prev)[0] != "self" and not later and (t["not_before"] or 0) > now:
+            upd.update(not_before=now)
+            then = "it runs again now to check"
+        else:
+            then = "it keeps its own window" if (t["not_before"] or 0) > now else "it runs at its turn"
+        if prev.get("status") == "waiting":
+            facts = [f for f in prev.get(refwaits.FACTS_KEY) or [] if f not in facts] + facts
+            upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: facts,
+                                         **({"woke": "; ".join(facts)} if "not_before" in upd else {})})
+        what = str((prev.get("waiting_for") if prev.get("status") == "waiting" else None)
+                   or d.get("why") or prev.get("summary") or "its start condition")[:300]
+        if not str(t["blocked_reason"] or "").startswith(refwaits.HELD_NOTES):
+            upd["blocked_reason"] = f"waiting for {what}; {'; '.join(facts)}; {then}"[:500]
+        with db.tx():
+            cur = db.task(tid) or {}
+            if cur.get("status") != "queued" or cur.get("result") != t["result"]:
+                return   # it moved meanwhile: the next tick looks again
+            db.update_task(tid, **upd)
+        log(self.p, f"task {tid} wait note refreshed: {'; '.join(facts)}; {then}")
+
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
         runs here, model-free and in the background. Exit 0 makes the task due at once. When its
@@ -4817,7 +4889,7 @@ class Daemon:
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
             nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), since + max_hold)
-            what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+            what = refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
             says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
@@ -4838,7 +4910,7 @@ class Daemon:
         fp = f"wait_stale:{task['id']}:{since:.0f}"
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             return
-        what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+        what = refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
         probe = str(prev.get("retry_when") or "")
         got = self._probe_out.get(task["id"])
         last = got[0] if got and got[2] == probe else ""

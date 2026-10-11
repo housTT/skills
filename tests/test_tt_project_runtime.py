@@ -42054,3 +42054,119 @@ def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkey
     assert coord.apply(p, [{"type": "obligation", "key": "o1", "evidence": "docs/report.md (owner checked)"}]) == []
     assert ob.get(p.db, "o1")["receipt"]["evidence"] == "docs/report.md (owner checked)"
     assert coord.apply(p, [{"type": "obligation", "key": "o1"}]) != [], "an action with nothing to do is rejected"
+
+
+def _ask(p, handled=0):
+    return p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)",
+                  (time.time(), "out", "ask", "which way?", handled))
+
+
+def _ref_wait(p, waiting_for, probe=None, **kw):
+    """A queued task asleep on a waiting hand-off that names something in its waiting_for."""
+    nb = time.time() + 3600
+    tid = p.db.add_task("follow up", "s", kind="work", tier="light", origin="user", not_before=nb, **kw)
+    res = {"status": "waiting", "waiting_for": waiting_for, "waiting_since": time.time() - 60,
+           "retry_after_s": 3600, **({"retry_when": probe} if probe else {})}
+    p.db.update_task(tid, result=json.dumps(res), blocked_reason=f"waiting for {waiting_for}; next try later",
+                     attempts=1)
+    return tid, nb
+
+
+def test_ref_wait_parser_names_asks_and_tasks_not_prs_or_itself():
+    from ttp.refwaits import refs
+    assert refs("ask #12 and task #34, then #56", own=99) == [("ask", 12), ("task", 34), ("task", 56)]
+    assert refs("PR #55 and issue #9 and run #3") == []
+    assert refs("task #7 lands", own=7) == []
+
+
+def test_a_resolved_ask_refreshes_a_waits_note_and_reruns_its_probe_now(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    dep = p.db.add_task("dep", "s", kind="work", origin="user")
+    ask = _ask(p)
+    tid, nb = _ref_wait(p, f"the answer to ask #{ask}", probe="false", depends_on=[dep])
+    other, _ = _ref_wait(p, "something else", probe="false")
+    before = p.db.task(tid)
+    d._probe_rc[tid] = (1, time.time(), "false")
+    d._probe_rc[other] = (1, time.time(), "false")   # a shared verdict from before the answer
+    d._probed[tid] = time.time()
+    d.refresh_ref_waits()
+    assert p.db.task(tid)["updated"] == before["updated"]   # the ask is still open: nothing to do
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
+    d.refresh_ref_waits()
+    t = p.db.task(tid)
+    assert f"ask #{ask} is resolved" in t["blocked_reason"] and "probe runs again now" in t["blocked_reason"]
+    assert tid not in d._probe_rc and other not in d._probe_rc and tid not in d._probed
+    res = json.loads(t["result"])
+    assert res["retry_when"] == "false" and res["waiting_since"] == json.loads(before["result"])["waiting_since"]
+    assert t["not_before"] == nb and t["attempts"] == 1 and json.loads(t["depends_on"]) == [dep]
+    assert t["labels"] == before["labels"] and t["status"] == "queued"
+    d.probe_waiting()
+    assert tid in d._probes   # rechecked at once, not after PROBE_EVERY_S
+    d._probes[tid][0].wait(10)
+    # A later rewrite of the note (its probe still says not yet) keeps the fact, not the stale reason.
+    d._probe_rc[tid] = (1, time.time(), "false")
+    d._hold_waiting(p.db.task(tid), json.loads(p.db.task(tid)["result"]), time.time())
+    assert f"ask #{ask} is resolved" in p.db.task(tid)["blocked_reason"]
+
+
+def test_a_done_task_wakes_a_probe_less_wait_on_it_once_per_wait(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    dep = p.db.add_task("upstream fix", "s", kind="code", origin="user")
+    tid, nb = _ref_wait(p, f"#{dep} to land on the branch")
+    p.db.update_task(dep, status="done")
+    d.refresh_ref_waits()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert t["not_before"] <= time.time() and t["attempts"] == 1 and t["status"] == "queued"
+    assert f"task #{dep} is done" in res["woke"] and "not proof" in t["blocked_reason"]
+    assert res[dmod.refwaits.FACTS_KEY] == [f"task #{dep} is done (not proof its work landed)"]
+    # The same evidence in the same wait is not acted on again.
+    p.db.update_task(tid, not_before=nb, blocked_reason="x")
+    d.refresh_ref_waits()
+    assert p.db.task(tid)["blocked_reason"] == "x" and p.db.task(tid)["not_before"] == nb
+    logged = (p.logs / "daemon.log").read_text()
+    assert logged.count(f"task {tid} wait note refreshed") == 1
+    # A new wait (a new hand-off) is a new episode: the evidence counts again.
+    res.update(waiting_since=time.time())
+    p.db.update_task(tid, result=json.dumps(res))
+    d.refresh_ref_waits()
+    assert p.db.task(tid)["not_before"] <= time.time()
+
+
+def test_a_ref_wait_keeps_its_planned_window_and_start_after(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    dep = p.db.add_task("dep", "s", kind="work", origin="user", status="done")
+    tid, nb = _ref_wait(p, f"a 2 h soak window after task #{dep}")
+    d.refresh_ref_waits()
+    t = p.db.task(tid)
+    assert t["not_before"] == nb and "keeps its own window" in t["blocked_reason"]
+    # A start_when task naming an ask: its probe reruns, but only after its start_after.
+    ask = _ask(p, handled=1)
+    after = time.time() + 7200
+    sw = p.db.add_task("later", "s", kind="work", origin="user", not_before=after,
+                       labels=["start_when:false", f"start_why:ask #{ask} answered",
+                               f"start_after:{after:.0f}", f"deferred_since:{time.time():.0f}"])
+    labels = p.db.task(sw)["labels"]
+    d._start_rc[sw] = (1, time.time(), "false")
+    d.refresh_ref_waits()
+    t = p.db.task(sw)
+    assert t["labels"] == labels and t["not_before"] == after and sw not in d._start_rc
+    assert "after its start_after" in t["blocked_reason"]
+    d.probe_waiting()
+    assert sw not in d._probes
+    # Once due, a start_when that names a resolved ask is probed at once.
+    sw2 = p.db.add_task("now", "s", kind="work", origin="user",
+                        labels=["start_when:false", f"start_why:ask #{ask} answered",
+                                f"deferred_since:{time.time():.0f}"])
+    d._probed[sw2] = time.time()
+    d.refresh_ref_waits()
+    assert "probe runs again now" in p.db.task(sw2)["blocked_reason"]
+    d.probe_waiting()
+    assert sw2 in d._probes
+    d._probes[sw2][0].wait(10)
