@@ -106,7 +106,9 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
             _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False)
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
-        start = carried_head(p, task) if carried else continued_head(p, task) or carried_head(p, task)
+        # A rebase starts from the branch it rebases, even when it also continues a review.
+        start = carried_head(p, task) if carried or rebased_branch(task) else None
+        start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
         _git(p.root, "worktree", "add", "-b", branch, str(path), start or resolve_base(p))
     prepare(p, path)
     return path, branch

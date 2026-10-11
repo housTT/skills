@@ -12490,6 +12490,28 @@ def test_a_task_continuing_a_failed_review_starts_from_the_reviewed_branch(env, 
     assert worktree.continued_head(p, p.db.task(stray)) is None
 
 
+def test_a_task_rebasing_a_branch_and_continuing_a_review_starts_from_the_rebased_branch(env, monkeypatch):
+    # rebases:<branch> wins over continues:<review>: the rebase works on that branch's head, not on
+    # what the earlier review reviewed.
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    _, path, branch = _code_task(p, "change", status="done")
+    _commit_file(path, "change")
+    review = p.db.add_task("review change", f"Review branch {branch}.", kind="review", tier="light",
+                           origin="user")
+    p.db.update_task(review, status="failed")
+    _, other_path, other = _code_task(p, "other", status="done")
+    _commit_file(other_path, "other")
+    other_head = _git_out(other_path, "rev-parse", "HEAD")
+    task = p.db.add_task("rebase other", "s", kind="code", tier="light", origin="user",
+                         labels=[f"rebases:{other}", f"continues:{review}"])
+    assert worktree.continued_head(p, p.db.task(task)) != other_head
+    new_path, new_branch = worktree.ensure(p, p.db.task(task))
+    assert new_branch != other and _git_out(new_path, "rev-parse", "HEAD") == other_head
+    assert (new_path / "other.txt").exists() and not (new_path / "change.txt").exists()
+
+
 def test_worktree_retention_delays_removal(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
