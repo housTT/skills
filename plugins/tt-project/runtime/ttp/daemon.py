@@ -69,7 +69,7 @@ from . import watchdup
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
+from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, push_allowed, zombie)
@@ -1137,6 +1137,11 @@ class Daemon:
             if unblock and not str(c.get("effort") or ""):
                 # A tricky or blocking turn thinks harder (raise only); a pinned effort wins.
                 effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
+        elif task:
+            # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
+            # pick, a review's sizing, a retry) moves its budget and timeout, never a pinned model or effort.
+            model = str(task.get("model") or "") or model
+            effort = str(task.get("effort") or "") or effort
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})
@@ -1271,7 +1276,7 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                    "model": model, "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
+                    "model": model, "effort": effort, "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
@@ -5246,7 +5251,7 @@ class Daemon:
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                          depends_on=[task["id"]], labels=labels)
+                          depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
 
@@ -5406,7 +5411,7 @@ class Daemon:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                                   priority=review["priority"], origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                                  labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"])
+                                  labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                               "\n".join([
@@ -5421,7 +5426,7 @@ class Daemon:
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"]
-                              + ([push.REVIEW_ONLY_LABEL] if only else []))
+                              + ([push.REVIEW_ONLY_LABEL] if only else []), **(pin_of(review) or pin_of(code)))
             if prfix:
                 extra = "\n".join([
                     f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "
@@ -5501,7 +5506,7 @@ class Daemon:
                               budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               branch=branch if branch and not held else None,
                               labels=[f"continues:{src['id']}", f"pr_fix:{key}"]
-                              + ([f"pr_branch:{branch}"] if branch else []))
+                              + ([f"pr_branch:{branch}"] if branch else []), **pin_of(src))
         log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
         return db.task(fid), True
 

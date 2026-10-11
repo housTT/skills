@@ -26,7 +26,7 @@ from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machi
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, names_branch, task_outcome,
+                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, task_outcome,
                  without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
                       durable_write, push_queue_number, push_queue_on)
@@ -60,6 +60,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "chat": {"type": "string"}, "text": {"type": "string"}, "severity": {"type": "string"},
             "title": {"type": "string"}, "spec": {"type": "string"}, "kind": {"type": "string"},
             "tier": {"type": "string"}, "priority": {"type": "integer"}, "provider": {"type": "string"},
+            "model": {"type": "string"}, "effort": {"type": "string"},
             "budget_usd": {"type": "number"}, "depends_on": {"type": "array", "items": {"type": "integer"}},
             "reply_chat": {"type": "string"}, "id": {"type": "integer"}, "status": {"type": "string"},
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
@@ -1003,9 +1004,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     raise ValueError(f"task_add rejected: {why}")
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
+                pin = _task_pin(cfg, a, pin_of(old or followup))
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
-                                         priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
+                                         priority=int(a.get("priority") or 3), **pin,
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
                                          labels=labels, not_before=after,
@@ -1126,6 +1128,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
+                if any(a.get(k) is not None for k in ("provider", "model", "effort")):
+                    if task["status"] == "running":
+                        raise ValueError(f"task #{task['id']} is running: its provider, model and effort change only "
+                                         f"while it is not; cancel it and re-add it with `continues` to change them now")
+                    pin = _task_pin(cfg, a, {k: task.get(k) for k in ("provider", "model", "effort")})
+                    upd.update({k: v for k, v in pin.items() if v != task.get(k)})
                 if spec:
                     why = prguard.spec_problem(db, spec)
                     if why:
@@ -1503,6 +1511,36 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
     if task and db.dependency_cycle(task["id"], deps):
         raise ValueError(f"{who} depends_on {deps} would create a cycle")
     return deps
+
+
+PIN_MODEL_RE = re.compile(r"[A-Za-z0-9][\w.:/@+-]{0,99}")   # a model name as the agent CLIs take it
+
+
+def _task_pin(cfg: dict, a: dict, base: dict) -> dict:
+    """A task's provider, model and effort (add_task keywords) from a task_add or task_update action
+    over `base`: the task's own (an update) or the pin of the task it continues (inherited unless the
+    action names another provider: a model or effort is one provider's). "" clears a field."""
+    out = {k: base.get(k) or None for k in ("provider", "model", "effort")}
+    prov = a.get("provider")
+    if prov is not None:
+        prov = str(prov).strip()
+        if prov and prov not in (cfg.get("providers") or {}):
+            raise ValueError(f"provider {prov!r} is not configured (providers: "
+                             f"{', '.join(sorted(cfg.get('providers') or {}))})")
+        if (prov or None) != out["provider"] and a.get("model") is None and a.get("effort") is None:
+            out.update(model=None, effort=None)   # another provider's model and effort do not carry over
+        out["provider"] = prov or None
+    if a.get("model") is not None:
+        model = str(a["model"]).strip()
+        if model and not PIN_MODEL_RE.fullmatch(model):
+            raise ValueError(f"model {model[:60]!r} is not a model name (letters, digits and ._:/@+-, at most 100)")
+        out["model"] = model or None
+    if a.get("effort") is not None:
+        eff = str(a["effort"]).strip().lower()
+        if eff and eff not in EFFORT_ORDER:
+            raise ValueError(f"effort {eff[:30]!r} is not one of {', '.join(EFFORT_ORDER)}")
+        out["effort"] = eff or None
+    return out
 
 
 def _continued(db, raw: Any, deps: list[int]) -> dict:

@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempts INTEGER DEFAULT 0, max_attempts INTEGER DEFAULT 3, parent INTEGER, reply_chat TEXT,
   origin TEXT NOT NULL DEFAULT 'coordinator', branch TEXT, pr_url TEXT, result TEXT,
   blocked_reason TEXT, depends_on TEXT NOT NULL DEFAULT '[]', labels TEXT NOT NULL DEFAULT '[]',
-  not_before REAL);
+  not_before REAL,
+  model TEXT, effort TEXT);        -- the task's own model and effort; NULL: its provider's tier decides
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority);
 -- A hold's anchor (anchors.py, the label `waits:<kind>:<value>`) lives only while the task is blocked.
 -- Every write that leaves it on a task not blocked, raw SQL included, drops it: else a later block
@@ -179,6 +180,7 @@ class DB:
         self._migrate_push_landed()
         self._migrate_issue_opened()
         self._migrate_schedule_tz()
+        self._migrate_task_pin()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -236,6 +238,16 @@ class DB:
             if "tz" not in {r["name"] for r in self.q("PRAGMA table_info(schedules)")}:
                 self.x("ALTER TABLE schedules ADD COLUMN tz TEXT")
                 self.x("UPDATE schedules SET tz=? WHERE at IS NOT NULL AND at!=''", (detect_local(),))
+
+    def _migrate_task_pin(self) -> None:
+        # A task's own model and effort (see pin_of). Older tasks keep NULL: their tier decides.
+        if {"model", "effort"} <= {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
+            return
+        with self.tx():
+            have = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
+            for col in ("model", "effort"):
+                if col not in have:
+                    self.x(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
 
     def _migrate_issue_opened(self) -> None:
         # When each issue's current open stretch began (screen._issue sets it on insert and on each
@@ -419,7 +431,7 @@ class DB:
         now = time.time()
         cols = {"created": now, "updated": now, "title": title.strip()[:200], "spec": spec}
         for k in ("kind", "status", "priority", "tier", "provider", "budget_usd", "max_attempts",
-                  "parent", "reply_chat", "origin", "branch", "not_before"):
+                  "parent", "reply_chat", "origin", "branch", "not_before", "model", "effort"):
             if kw.get(k) is not None:
                 cols[k] = kw[k]
         for k in ("depends_on", "labels"):
@@ -601,6 +613,15 @@ def dependency_ids(task: dict) -> list:
         except (TypeError, ValueError):
             out.append(None)
     return out
+
+
+def pin_of(task: dict | None) -> dict:
+    """The task's explicit model and effort pin, as add_task keywords a review, re-review or
+    continuation of it takes over: with its provider, so the model is never handed to another
+    agent. {} when it pins neither (a derived task then runs as it always did)."""
+    if not task or not (task.get("model") or task.get("effort")):
+        return {}
+    return {k: task.get(k) or None for k in ("provider", "model", "effort")}
 
 
 def continues_id(task: dict) -> int | None:

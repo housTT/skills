@@ -40269,3 +40269,117 @@ def test_ssh_pipe_bypasses_controlmaster_so_host_key_is_checked(monkeypatch):
     for opt in ("StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
         assert argv[argv.index(opt) - 1] == "-o"
     assert argv.index("ControlPath=none") < argv.index("--")
+
+
+def test_a_task_pinned_to_a_codex_model_and_effort_runs_on_them_and_keeps_the_pin(env, monkeypatch):
+    """A task's own model and effort win over its provider's tier, are recorded with the run, and
+    survive a restart; an unpinned task keeps its tier's defaults."""
+    import sqlite3
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.db import DB
+    from ttp.providers import codex as codex_provider
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    p = make(env)
+    tiers = p.config()["providers"]["codex"]["tiers"]
+    assert coord.apply(p, [{"type": "task_add", "title": "research the decoder", "spec": "s", "kind": "work",
+                            "tier": "light", "provider": "codex", "model": "research-model-1",
+                            "effort": "xhigh"}]) == []
+    tid = p.db.one("SELECT id FROM tasks WHERE title='research the decoder'")["id"]
+    plain = p.db.add_task("plain", "s", kind="work", tier="light", origin="user", provider="codex")
+    # A restart reopens the database: the pin is still there.
+    db = DB(p.db.path)
+    assert {k: db.task(tid)[k] for k in ("provider", "model", "effort")} == \
+        {"provider": "codex", "model": "research-model-1", "effort": "xhigh"}
+    d = Daemon(p.base)
+
+    def launch(task_id):
+        rid = d.start_run("worker", "go", "codex", "light", str(p.root), task=db.task(task_id))
+        (p.runs / str(rid) / "STOP").touch()
+        return rid, json.loads((p.runs / str(rid) / "run.json").read_text()), \
+            db.one("SELECT model, effort FROM runs WHERE id=?", (rid,))
+
+    _, spec, row = launch(tid)
+    argv = spec["argv"]
+    assert argv[argv.index("-m") + 1] == "research-model-1" and "model_reasoning_effort=xhigh" in argv
+    assert (spec["model"], spec["effort"]) == ("research-model-1", "xhigh")
+    assert (row["model"], row["effort"]) == ("research-model-1", "xhigh")
+    # Unpinned: the tier decides, exactly as before (no -m when the tier names no model).
+    _, spec, row = launch(plain)
+    want = (tiers["light"].get("model", ""), tiers["light"].get("effort", ""))
+    assert (row["model"], row["effort"]) == want and (spec["model"], spec["effort"]) == want
+    assert ("-m" in spec["argv"]) == bool(want[0])
+    # A database from before the pin gets its columns, NULL on older tasks.
+    old = env["tmp"] / "old.db"
+    con = sqlite3.connect(old)
+    con.executescript("CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL, updated REAL, "
+                      "title TEXT NOT NULL, spec TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'work', "
+                      "status TEXT NOT NULL DEFAULT 'queued', priority INTEGER NOT NULL DEFAULT 3, "
+                      "tier TEXT NOT NULL DEFAULT 'standard', provider TEXT, budget_usd REAL, spent_usd REAL DEFAULT 0, "
+                      "attempts INTEGER DEFAULT 0, max_attempts INTEGER DEFAULT 3, parent INTEGER, reply_chat TEXT, "
+                      "origin TEXT NOT NULL DEFAULT 'coordinator', branch TEXT, pr_url TEXT, result TEXT, "
+                      "blocked_reason TEXT, depends_on TEXT NOT NULL DEFAULT '[]', labels TEXT NOT NULL DEFAULT '[]', "
+                      "not_before REAL); INSERT INTO tasks(title) VALUES('older');")
+    con.commit()
+    con.close()
+    migrated = DB(old)
+    t = migrated.one("SELECT * FROM tasks WHERE title='older'")
+    assert t["model"] is None and t["effort"] is None
+    assert migrated.task(migrated.add_task("new", model="m", effort="high"))["model"] == "m"
+
+
+def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    add = {"type": "task_add", "spec": "s", "kind": "work", "provider": "codex", "model": "research-model-1",
+           "effort": "xhigh"}
+    assert "is not one of" in " ".join(coord.apply(p, [{**add, "title": "bad effort", "effort": "huge"}]))
+    assert "not a model name" in " ".join(coord.apply(p, [{**add, "title": "bad model", "model": "-x y"}]))
+    assert "not configured" in " ".join(coord.apply(p, [{**add, "title": "bad provider", "provider": "nope"}]))
+    assert not p.db.q("SELECT id FROM tasks")
+    assert coord.apply(p, [{**add, "title": "pinned study"}]) == []
+    first = p.db.one("SELECT * FROM tasks WHERE title='pinned study'")
+    # A continuation of a failed try keeps the pin; naming another provider drops its model and effort.
+    p.db.update_task(first["id"], status="failed")
+    assert coord.apply(p, [{"type": "task_add", "title": "pinned study again", "spec": "s",
+                            "continues": first["id"]}]) == []
+    again = p.db.one("SELECT * FROM tasks WHERE title='pinned study again'")
+    assert (again["provider"], again["model"], again["effort"]) == ("codex", "research-model-1", "xhigh")
+    p.db.update_task(again["id"], status="failed")
+    assert coord.apply(p, [{"type": "task_add", "title": "on claude now", "spec": "s", "provider": "claude",
+                            "continues": again["id"]}]) == []
+    moved = p.db.one("SELECT * FROM tasks WHERE title='on claude now'")
+    assert (moved["provider"], moved["model"], moved["effort"]) == ("claude", None, None)
+    # task_update re-pins a task that is not running, clears with "", and refuses a running one.
+    assert coord.apply(p, [{"type": "task_update", "id": moved["id"], "effort": "high"}]) == []
+    assert p.db.task(moved["id"])["effort"] == "high"
+    assert coord.apply(p, [{"type": "task_update", "id": moved["id"], "effort": ""}]) == []
+    assert p.db.task(moved["id"])["effort"] is None
+    p.db.update_task(moved["id"], status="running")
+    assert "is running" in " ".join(coord.apply(p, [{"type": "task_update", "id": moved["id"], "model": "m2"}]))
+    assert p.db.task(moved["id"])["model"] is None
+
+
+def test_reviews_fixes_and_re_reviews_of_a_pinned_task_keep_its_pin(env, monkeypatch):
+    from ttp.daemon import Daemon
+    from ttp.providers import codex as codex_provider
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    p = make(env)
+    pin = {"provider": "codex", "model": "research-model-1", "effort": "xhigh"}
+    code, _, _, (rev,) = _finish_code(env, p, "pinned feature", {"app.py": 20},
+                                      before=lambda tid, head: p.db.update_task(tid, **pin))
+    assert {k: rev[k] for k in pin} == pin
+    # Review sizing lowers the tier of a small diff, never the pinned effort.
+    d = Daemon(p.base)
+    sized, _ = d._size_review(p.db.task(rev["id"]))
+    rid = d.start_run("reviewer", "go", "codex", sized["tier"], str(p.root), task=sized)
+    (p.runs / str(rid) / "STOP").touch()
+    assert p.db.one("SELECT model, effort FROM runs WHERE id=?", (rid,)) == \
+        {"model": "research-model-1", "effort": "xhigh"}
+    _fail_review(env, p, rev["id"], [{"title": "add the missing test", "spec": "test_x must fail without it"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert {k: fix[k] for k in pin} == pin and {k: re_rev[k] for k in pin} == pin
+    # An unpinned task's review runs as before: no pin, the core provider.
+    _, _, _, (plain,) = _finish_code(env, p, "plain feature", {"b.py": 20})
+    assert (plain["provider"], plain["model"], plain["effort"]) == (None, None, None)
