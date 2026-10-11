@@ -931,21 +931,32 @@ def _local_tip(repo: Path, branch: str) -> str:
     return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}").stdout.strip()
 
 
+def _holder(repo: Path, branch: str) -> str:
+    """The other worktree that has local branch `branch` checked out, or "" (none, or `repo` itself)."""
+    top, cur = Path(repo).resolve(), ""
+    for line in _git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            cur = line[9:]
+        elif line == f"branch refs/heads/{branch}" and Path(cur).resolve() != top:
+            return cur
+    return ""
+
+
 def local_refusal(repo: Path, branch: str) -> str:
     """Why `ttp push --own` in a repo with no git remote must not move local branch `branch` to HEAD,
-    or "": that branch is the published copy there. Never main/master, never a branch another
-    worktree has checked out (its files would no longer match), and only as a fast-forward."""
+    or "": that branch is the published copy there. Never main/master, only as a fast-forward, and
+    when another worktree has it checked out only while that worktree has no uncommitted changes
+    (_move_local then updates its files with the branch)."""
     if branch in PROTECTED:
         return f"refusing to move the local branch {branch}"
-    if branch != _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip():
-        top, cur = Path(repo).resolve(), ""
-        for line in _git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
-            if line.startswith("worktree "):
-                cur = line[9:]
-            elif line == f"branch refs/heads/{branch}" and Path(cur).resolve() != top:
-                return (f"no git remote, and {branch} is checked out in another worktree ({cur}): moving it "
-                        f"would leave that worktree's files behind its branch; not publishing. Publish "
-                        f"onto a branch no worktree holds, e.g. this task's own")
+    if branch != _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() \
+            and (held := _holder(repo, branch)):
+        dirty = _git(Path(held), "status", "--porcelain", "--untracked-files=no")
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return (f"no git remote, and {branch} is checked out in another worktree ({held}) with "
+                    f"uncommitted changes: fast-forwarding it there would mix them with this work; "
+                    f"not publishing. Commit or discard them there, or publish onto a branch no "
+                    f"worktree holds, e.g. this task's own")
     tip = _local_tip(repo, branch)
     if tip and _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
         return (f"local branch {branch} ({tip[:10]}) is not an ancestor of HEAD: with no git remote --own "
@@ -955,7 +966,8 @@ def local_refusal(repo: Path, branch: str) -> str:
 
 def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) -> int:
     """Publish `head` in a repo with no git remote: fast-forward local branch `branch` to it, guarded
-    by the tip it had (another writer in between makes git refuse)."""
+    by the tip it had (another writer in between makes git refuse). A branch another worktree has
+    checked out is fast-forwarded there (`merge --ff-only`), so that worktree's files follow it."""
     if branch == _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip():
         say(f"pushed {head[:10]} to local branch {branch}: no git remote, so the branch is the published "
             f"copy and it is already there")
@@ -963,6 +975,18 @@ def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) 
     if why := local_refusal(repo, branch):   # again: it may have changed during the checks
         say(why)
         return REJECTED
+    if held := _holder(repo, branch):
+        wt = Path(held)
+        if _git(wt, "symbolic-ref", "--quiet", "HEAD").stdout.strip() != f"refs/heads/{branch}":
+            say(f"could not move local branch {branch}: the worktree {held} no longer has it checked out")
+            return REJECTED
+        r = _git(wt, "merge", "--ff-only", "--quiet", head)
+        if r.returncode != 0:
+            say(f"could not fast-forward {branch} in the worktree {held}: {(r.stderr or r.stdout).strip()}")
+            return REJECTED
+        say(f"pushed {head[:10]} to local branch {branch} (no git remote: the local branch is the published "
+            f"copy), fast-forwarded in the worktree {held} that has it checked out")
+        return 0
     old = _local_tip(repo, branch) or "0" * len(head)
     r = _git(repo, "update-ref", "-m", "ttp push --own", f"refs/heads/{branch}", head, old)
     if r.returncode != 0:

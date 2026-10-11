@@ -39320,8 +39320,8 @@ def _local_push_setup(env, monkeypatch, checks):
 def test_push_own_without_a_git_remote_fast_forwards_the_local_branch(env, monkeypatch, capsys):
     """In a code repo with no git remote, `ttp push --own` (and --detach) publishes by moving the
     local branch, fast-forward only, after its checks: the task's own branch is already there, and a
-    pr_branch it carries is fast-forwarded to HEAD. A diverged branch, or one another worktree has
-    checked out, is refused before the checks and keeps its tip."""
+    pr_branch it carries is fast-forwarded to HEAD. A diverged branch is refused before the checks and
+    keeps its tip (a branch another worktree has checked out: the next test)."""
     log = env["tmp"] / "checked"
     p, repo = _local_push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
     t = p.db.add_task("Speed it up", "s", kind="code")
@@ -39359,17 +39359,81 @@ def test_push_own_without_a_git_remote_fast_forwards_the_local_branch(env, monke
     ran = log.read_text().split()
     assert _ttp("push", "--own") == 2 and "not an ancestor of HEAD" in capsys.readouterr().err
     assert _git_out(repo, "rev-parse", "feature/x") == theirs and log.read_text().split() == ran
-    # Checked out in another worktree: refused, whatever its history.
-    _git_out(repo, "branch", "-f", "feature/x", head)
-    _git_out(repo, "worktree", "add", "-q", str(side), "feature/x")
-    assert _ttp("push", "--own") == 2 and "checked out in another worktree" in capsys.readouterr().err
-    assert _git_out(repo, "rev-parse", "feature/x") == head and log.read_text().split() == ran
     # Shared branches stay refused.
     p.db.update_task(t, labels=[])
-    _git_out(repo, "worktree", "remove", str(side))
     for name in ("proj", "main"):
         _git_out(repo, "checkout", "-q", "-B", name)
         assert _ttp("push", "--own") == 2 and "shared branch" in capsys.readouterr().err, name
+
+
+def test_push_own_without_a_git_remote_fast_forwards_a_pr_branch_checked_out_in_another_worktree(
+        env, monkeypatch, capsys):
+    """With no git remote, a pr_branch another worktree has checked out is fast-forwarded there, so
+    that worktree's files follow the branch (--detach too). Refused, before the checks and with the
+    branch and the worktree untouched, while that worktree has uncommitted changes or the branch is
+    not an ancestor of HEAD."""
+    log = env["tmp"] / "checked"
+    p, repo = _local_push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    t = p.db.add_task("Fix it", "s", kind="code", labels=["pr_branch:feature/x"])
+    monkeypatch.setenv("TTP_TASK", str(t))
+    _git_out(repo, "branch", "feature/x", "proj")
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "feature/x")
+    (side / "scratch.log").write_text("untracked\n")   # untracked files do not count as changes
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{t}-fix-it")
+    _commit(repo, "a.txt", "a\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0
+    err = capsys.readouterr().err
+    assert f"pushed {head[:10]} to local branch feature/x" in err and str(side) in err, err
+    assert _git_out(side, "rev-parse", "HEAD") == head and (side / "a.txt").read_text() == "a\n"
+    assert _git_out(side, "symbolic-ref", "--short", "HEAD") == "feature/x"
+    assert _git_out(side, "status", "--porcelain", "--untracked-files=no") == ""
+    # --detach: the same, reported by its probe.
+    _commit(repo, "b.txt", "b\n")
+    second = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own", "--detach") == 0
+    probe = next(ln.split(": ", 1)[1] for ln in capsys.readouterr().out.splitlines()
+                 if ln.startswith("retry_when: "))
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0 and f"pushed {second}" in r.stdout, r
+    assert _git_out(side, "rev-parse", "HEAD") == second and (side / "b.txt").read_text() == "b\n"
+    # Dirty there: refused, nothing moves and nothing is checked.
+    ran = log.read_text().split()
+    _commit(repo, "c.txt", "c\n")
+    (side / "a.txt").write_text("edited there\n")
+    assert _ttp("push", "--own") == 2 and "uncommitted changes" in capsys.readouterr().err
+    assert _git_out(side, "rev-parse", "HEAD") == second and (side / "a.txt").read_text() == "edited there\n"
+    assert log.read_text().split() == ran
+    _git_out(side, "checkout", "--", "a.txt")
+    # Not a fast-forward (the worktree's branch moved on): refused, the branch keeps its commit.
+    _commit(side, "theirs.txt", "theirs\n")
+    theirs = _git_out(side, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 2 and "not an ancestor of HEAD" in capsys.readouterr().err
+    assert _git_out(repo, "rev-parse", "feature/x") == theirs and (side / "theirs.txt").exists()
+    assert not (side / "c.txt").exists() and log.read_text().split() == ran
+
+
+def test_move_local_rechecks_the_worktree_after_the_checks(env, monkeypatch):
+    """The checks take time: a worktree that took uncommitted changes meanwhile is refused at the
+    move itself, and the branch keeps its tip; once clean, the move goes through there."""
+    from ttp import push
+    p, repo = _local_push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "branch", "feature/x", "proj")
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "feature/x")
+    _git_out(repo, "checkout", "-q", "-b", "work")
+    _commit(repo, "a.txt", "a\n")
+    head, before = _git_out(repo, "rev-parse", "HEAD"), _git_out(repo, "rev-parse", "feature/x")
+    said = []
+    (side / "x.txt").write_text("staged\n")
+    _git_out(side, "add", "x.txt")
+    assert push._move_local(repo, "feature/x", head, said.append) == push.REJECTED
+    assert "uncommitted changes" in said[-1] and _git_out(repo, "rev-parse", "feature/x") == before
+    _git_out(side, "reset", "-q", "--hard")
+    assert push._move_local(repo, "feature/x", head, said.append) == 0
+    assert _git_out(side, "rev-parse", "HEAD") == head
 
 
 def test_push_own_with_a_git_remote_still_pushes_to_it_and_never_falls_back_to_the_local_branch(
