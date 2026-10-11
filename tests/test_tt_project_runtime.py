@@ -3132,6 +3132,48 @@ def test_unreadable_config_starts_no_model_work_and_alerts_once(env, monkeypatch
     assert p.db.one("SELECT id FROM messages WHERE ref='config' AND kind='resolved'")
 
 
+@pytest.mark.parametrize("var", ["TTP_RUN_ID", "TTP_RUN_DIR"])
+def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, var):
+    """A run can be steered by text it reads, so `ttp config` inside one refuses every setting only
+    the user may change (coordinator.NEEDS_USER), directly, through a parent key or account-wide.
+    Reading still works, other keys still set, and turning a SAFE_WHEN_OFF switch off is allowed."""
+    from ttp import cli
+    from ttp.coordinator import MERGE_KEY, NEEDS_USER, SAFE_WHEN_OFF
+    p = make(env)
+    p.set_config("delivery.code_tasks_may_push", True)
+    p.set_config("delivery.mirror_remotes", ["backup"])
+    before = p.raw_config()
+    monkeypatch.setenv(var, "7")
+    refused = [["config", "demo", k, json.dumps(["o/r"] if k == MERGE_KEY else 9)] for k in NEEDS_USER]
+    refused += [["config", "demo", "budget", json.dumps({"daily_usd": 999})],          # parent key
+                ["config", "demo", "delivery", json.dumps({})],                        # wipes a user-only key
+                ["config", "demo", MERGE_KEY, "o/r"],                                   # plain string
+                ["config", "demo", "delivery.mirror_remotes", json.dumps(["other"])],  # not the off direction
+                ["config", "--account", "budget.global_daily_usd", "5000"],
+                ["config", "--account", "budget.global_daily_usd", ""]]               # removes the cap
+    for argv in refused:
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 2, argv
+        assert "only the user may change" in capsys.readouterr().err, argv
+    assert p.raw_config() == before
+    from ttp.project import load_account_settings
+    assert "global_daily_usd" not in load_account_settings().get("budget", {})
+    cli.main(["config", "demo", "budget.daily_usd"])                     # reading works
+    cli.main(["config", "--account", "budget.global_daily_usd"])
+    capsys.readouterr()
+    cli.main(["config", "demo", "budget.max_pace_hold_s", "60"])         # not user-only
+    cli.main(["config", "demo", "budget", json.dumps({**before.get("budget", {}), "max_pace_hold_s": 90})])
+    for k in SAFE_WHEN_OFF:                                              # the safe direction
+        cli.main(["config", "demo", k, json.dumps(False if k == "delivery.code_tasks_may_push" else [])])
+    cfg = p.raw_config()
+    assert cfg["budget"]["max_pace_hold_s"] == 90 and cfg["delivery"]["code_tasks_may_push"] is False
+    assert cfg["delivery"]["mirror_remotes"] == []
+    monkeypatch.delenv(var)
+    cli.main(["config", "demo", "budget.daily_usd", "12"])               # outside a run: the user's own
+    assert p.raw_config()["budget"]["daily_usd"] == 12
+
+
 def test_unreadable_config_refuses_settings_cleanly(env, capsys, monkeypatch):
     """With no project.json and no last good copy, `ttp config` set says why instead of a traceback,
     and the web app still opens (on a port it does not save)."""

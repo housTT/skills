@@ -2559,10 +2559,52 @@ def cmd_account_config(key: str, value: str | None) -> None:
           else f"{key} removed (account-level); the default applies")
 
 
+def _user_only_change(raw: dict, key: str, val) -> str | None:
+    """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
+    `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
+    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
+    import copy
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
+
+    def at(node, dotted):
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+
+    after = copy.deepcopy(raw)
+    node = after
+    for part in key.split(".")[:-1]:
+        nxt = node.get(part) if isinstance(node, dict) else None
+        node = node.setdefault(part, {}) if isinstance(nxt, dict) or nxt is None else None
+        if node is None:   # set_config fails on a scalar parent; nothing user-only changes here
+            return None
+    node[key.split(".")[-1]] = val
+    for k in NEEDS_USER:
+        if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
+            continue
+        new = at(after, k)
+        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
+            return k
+    return None
+
+
+def _refuse_user_only_in_run(key: str) -> None:
+    die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
+        f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
+        f"so the coordinator can ask the user")
+
+
 def cmd_config(a) -> None:
+    in_run = bool(os.environ.get("TTP_RUN_ID") or os.environ.get("TTP_RUN_DIR"))
     if a.account:
         if a.value is not None:
             die("usage: ttp config --account KEY [VALUE]")
+        from .coordinator import NEEDS_USER
+        if in_run and a.key is not None and a.name in NEEDS_USER:
+            # A run can be steered by text it reads; spend caps change only on the user's word.
+            _refuse_user_only_in_run(a.name)
         return cmd_account_config(a.name, a.key)
     if a.key is None:
         die("usage: ttp config NAME KEY [VALUE]")
@@ -2587,6 +2629,10 @@ def cmd_config(a) -> None:
             val = checks_of(val)
         except ValueError as e:
             die(str(e))
+    if in_run and (k := _user_only_change(p.raw_config(), a.key, val)):
+        # A run can be steered by text it reads; these change only in a coordinator turn that carries
+        # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
+        _refuse_user_only_in_run(k)
     try:
         p.set_config(a.key, val)
     except RuntimeError as e:   # project.json unreadable with no last good copy
