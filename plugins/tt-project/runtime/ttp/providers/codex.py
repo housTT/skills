@@ -279,19 +279,20 @@ class Codex(Provider):
         return wins
 
     def consume_reset(self, credit_id: str, key: str) -> dict | None:
-        """`account/rateLimitResetCredit/consume`: resets the plan windows at once. Outcome 'reset'
-        is success; the idempotency key makes a retry of the same consume a no-op."""
+        """`account/rateLimitResetCredit/consume`: resets the plan windows at once. Its outcome is
+        passed on as it is (credits.classify judges it); no answer, or a timeout, connection or 5xx
+        error, is a transport error, which the idempotency key makes safe to retry."""
+        from ..credits import transport_error
         exe = self.binary()
         if not exe:
-            return {"ok": False, "error": "codex not found"}
+            return {"transport": True, "error": "codex not found"}
         msg = app_server_call([exe, "app-server"], "account/rateLimitResetCredit/consume",
                               {"creditId": credit_id, "idempotencyKey": key})
         if msg is None:
-            return {"ok": False, "error": "no answer from `codex app-server`"}
+            return {"transport": True, "error": "no answer from `codex app-server` (did not start or timed out)"}
         if "error" in msg:
-            return {"ok": False, "error": json.dumps(msg["error"])[:300]}
-        outcome = str((msg.get("result") or {}).get("outcome") or "")
-        return {"ok": outcome == "reset", "outcome": outcome or "no outcome"}
+            return {"transport": transport_error(msg["error"]), "error": json.dumps(msg["error"])[:300]}
+        return {"outcome": str((msg.get("result") or {}).get("outcome") or "")}
 
     def resolved_session(self, argv, cwd, env=None):
         # The app-server's `thread/start` answers with the model and reasoning effort the session

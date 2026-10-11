@@ -273,8 +273,9 @@ class Provider:
     last_credits: dict | None = None
 
     def consume_reset(self, credit_id: str, key: str) -> dict | None:
-        """Consume one free window reset: {"ok", "outcome", "error"}; None when the provider has none.
-        `key` is the idempotency key: the same key never consumes twice."""
+        """Consume one free window reset: {"outcome"} for an answer, {"error", "transport"} for an
+        error (transport: it may not have reached the provider, so a retry is safe); None when the
+        provider has none. `key` is the idempotency key: the same key never consumes twice."""
         return None
 
 

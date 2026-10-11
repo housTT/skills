@@ -43816,7 +43816,7 @@ def _credit_answer(**over):
 def test_credits_parse_reads_every_field_and_takes_missing_or_malformed_as_unknown():
     from ttp import credits
     r = credits.parse(_credit_answer())
-    assert r == {"paid": {"has_credits": False, "unlimited": False, "balance": 0.0},
+    assert r == {"listed": True, "paid": {"has_credits": False, "unlimited": False, "balance": 0.0},
                  "spend_control_reached": False, "reached_type": None, "free_resets": 2,
                  "resets": [{"id": "early", "expires_at": 1790000000.0}, {"id": "late", "expires_at": 1800000000.0}]}, r
     assert not credits.paid_open(r) and credits.summary(r) == "2 free resets"
@@ -43825,6 +43825,7 @@ def test_credits_parse_reads_every_field_and_takes_missing_or_malformed_as_unkno
         r = credits.parse(empty)
         assert r["paid"] == {"has_credits": None, "unlimited": None, "balance": None}, r
         assert r["free_resets"] is None and r["resets"] == [] and r["spend_control_reached"] is None
+        assert r["listed"] is False, "no list: a missing credit says nothing"
         assert not credits.paid_open(r) and credits.summary(r) == ""
     # Malformed: strings for booleans, a list for the credits, bad ids and times.
     r = credits.parse({"rateLimits": {"credits": {"hasCredits": "true", "unlimited": 1, "balance": "lots"},
@@ -43919,7 +43920,7 @@ def test_reset_consume_saves_its_key_first_reuses_it_after_a_crash_and_never_spe
 
     class Dies(_ResetProvider):
         def consume_reset(self, credit, key):
-            seen["pending"] = p.db.kv(credits.PENDING + "codex")
+            seen["pending"] = credits.shared("codex", "acct")[-1]
             super().consume_reset(credit, key)
             raise Crash()   # the daemon dies mid-call: no answer, nothing recorded after
     prov = Dies([None])
@@ -43928,47 +43929,206 @@ def test_reset_consume_saves_its_key_first_reuses_it_after_a_crash_and_never_spe
     key = prov.calls[0][1]
     assert prov.calls == [("c1", key)] and len(key) >= 16
     assert seen["pending"]["key"] == key and seen["pending"]["credit"] == "c1", "saved before the call"
+    assert seen["pending"]["state"] == "pending"
     # After the restart: no retry before RETRY_S; then the same credit with the same key.
-    again = _ResetProvider([{"ok": True, "outcome": "reset"}])
+    again = _ResetProvider([{"outcome": "reset"}])
     assert credits.consume(p.db, cfg, "codex", again, wins, reading, now + 60) is None and again.calls == []
     done = credits.consume(p.db, cfg, "codex", again, wins, reading, now + credits.RETRY_S + 1)
     assert again.calls == [("c1", key)] and done["outcome"] == "reset" and done["credit"] == "c1", done
-    assert p.db.kv(credits.PENDING + "codex") is None
+    assert [e["state"] for e in credits.shared("codex", "acct")] == ["done"]
     # The window had its reset: a later reading still at the line consumes nothing more.
-    later = _ResetProvider([{"ok": True, "outcome": "reset"}])
+    later = _ResetProvider([{"outcome": "reset"}])
     assert credits.consume(p.db, cfg, "codex", later, wins, reading, now + 3600) is None and later.calls == []
     assert [u["credit"] for u in credits.used(p.db, "codex")] == ["c1"]
 
 
-def test_reset_consume_confirmed_by_the_next_reading_gives_up_after_tries_and_skips_unsupported(env):
+def _fresh_credits(p):
+    """Forget every consume: this project's records and the machine-wide one."""
+    from ttp import credits
+    p.db.x("DELETE FROM kv WHERE key=?", (credits.USED + "codex",))
+    credits._file(credits.SHARED, "codex", "acct").unlink(missing_ok=True)
+
+
+def test_reset_consume_confirmed_only_by_a_reading_that_lists_the_credits_and_skips_unsupported(env):
     from ttp import credits
     p = make(env)
     cfg = p.config()
     now = time.time()
     wins = _held(p, now=now)
-    reading = {"resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1}
-    # A lost answer: the next reading no longer lists the credit, so the consume went through.
-    lost = _ResetProvider([{"ok": False, "error": "no answer from `codex app-server`"}])
+    reading = {"listed": True, "resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1}
+    # A lost answer: the consume stays in flight with its key.
+    lost = _ResetProvider([{"transport": True, "error": "no answer from `codex app-server`"}])
     assert credits.consume(p.db, cfg, "codex", lost, wins, reading, now) == {
         "error": "no answer from `codex app-server`", "attempts": 1}
-    done = credits.consume(p.db, cfg, "codex", lost, wins, {"resets": [], "free_resets": 0}, now + 5)
+    # A reading without the credits list says nothing: still in flight, nothing called, nothing recorded.
+    absent = {"listed": False, "resets": [], "free_resets": None}
+    assert credits.consume(p.db, cfg, "codex", lost, wins, absent, now + 5) is None
+    assert credits.consume(p.db, cfg, "codex", lost, wins, absent, now + credits.RETRY_S + 5) is None
+    assert credits.used(p.db, "codex") == [] and credits.shared("codex", "acct")[0]["state"] == "pending"
+    # One that lists the credits without it: the consume went through.
+    done = credits.consume(p.db, cfg, "codex", lost, wins, {"listed": True, "resets": [], "free_resets": 0}, now + 9)
     assert done["outcome"] == "reset (confirmed by the next reading)" and len(lost.calls) == 1
-    # Errors with the credit still listed: retried with one key up to MAX_TRIES, then given up.
-    p.db.x("DELETE FROM kv WHERE key=?", (credits.USED + "codex",))
-    bad = _ResetProvider([{"ok": False, "error": "e1"}, RuntimeError("e2"), {"ok": False, "outcome": "denied"}])
+    # A provider without a consume endpoint: nothing kept in flight.
+    _fresh_credits(p)
+    assert credits.consume(p.db, cfg, "codex", _ResetProvider([None]), wins, reading, now) is None
+    assert credits.shared("codex", "acct") == []
+
+
+@pytest.mark.parametrize("outcome", ["reset", "alreadyRedeemed"])
+def test_reset_consume_counts_reset_and_already_redeemed_as_success_once_per_window(env, outcome):
+    from ttp import credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    reading = {"listed": True, "resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1}
+    prov = _ResetProvider([{"outcome": outcome}])
+    done = credits.consume(p.db, cfg, "codex", prov, wins, reading, now)
+    assert done["outcome"] == outcome and len(prov.calls) == 1, done
+    assert credits.report_text("codex", done).startswith("Used one free codex window reset")
+    assert [(e["state"], e["outcome"]) for e in credits.shared("codex", "acct")] == [("done", outcome)]
+    # Recorded against the window: no second consume in it, whatever the readings say.
+    for t in (now + 60, now + credits.RETRY_S + 1, now + 3600):
+        assert credits.consume(p.db, cfg, "codex", prov, wins, reading, t) is None
+    assert len(prov.calls) == 1 and credits.unreported(p.db, "codex") == [done]
+
+
+@pytest.mark.parametrize("outcome", ["noCredit", "nothingToReset"])
+def test_reset_consume_final_answers_are_not_retried_and_stop_offering_that_reset(env, outcome):
+    from ttp import budget as bud, credits
+    from ttp.web import budget_line
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    bud.record_windows(p.db, wins)
+    ans = {"listed": True, "resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1, "paid": {}}
+    credits.record(p.db, "codex", ans, "acct", now)
+    assert "1 free reset" in budget_line(p.db, now)
+    prov = _ResetProvider([{"outcome": outcome}])
+    done = credits.consume(p.db, cfg, "codex", prov, wins, ans, now)
+    assert done["outcome"] == outcome and done["reason"] == credits.FINAL[outcome] and len(prov.calls) == 1
+    assert done, "a truthy answer: the daemon reads the meter again at once"
+    text = credits.report_text("codex", done)
+    assert text.startswith("Did not use a free codex window reset") and outcome in text and done["reason"] in text
+    # Final: never retried, also not after RETRY_S, nor with a re-read that still lists the same credit.
+    credits.record(p.db, "codex", ans, "acct", now + 5)
+    for t in (now + 60, now + credits.RETRY_S + 1, now + 3 * credits.RETRY_S):
+        assert credits.consume(p.db, cfg, "codex", prov, wins, ans, t) is None
+    assert len(prov.calls) == 1
+    # Not offered as an unblock path from a reading that has not changed.
+    r = credits.latest(p.db, "codex", now + 10)
+    assert r["refused"] == outcome and credits.summary(r) == ""
+    assert "free reset" not in budget_line(p.db, now + 10)
+    path = credits.unblock_path(p.db, cfg, "codex", now + 10)
+    assert "free window reset(s)" not in path and outcome in path, path
+    # A new reading that changes things offers it again.
+    changed = {**ans, "resets": [{"id": "c2", "expires_at": now + 86400 * 20}]}
+    credits.record(p.db, "codex", changed, "acct", now + 20)
+    assert "free window reset(s)" in credits.unblock_path(p.db, cfg, "codex", now + 20)
+    assert credits.decide(p.db, cfg, "codex", wins, changed, now + 20) is None, "that window had its answer"
+    if outcome == "nothingToReset":   # recorded against the window: the next one may try again
+        nxt = _held(p, resets_in_h=40 + 7 * 24, now=now)
+        assert credits.decide(p.db, cfg, "codex", nxt, ans, now + 20)["credit"] == "c1"
+    else:   # no credit: the same stale list is not offered for any window
+        nxt = _held(p, resets_in_h=40 + 7 * 24, now=now)
+        assert credits.decide(p.db, cfg, "codex", nxt, ans, now + 20) is None
+
+
+def test_reset_consume_retries_only_transport_errors_with_one_key_and_records_the_rest(env):
+    from ttp import credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    reading = {"listed": True, "resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1}
+    # Transport errors (no answer, an exception, a 5xx): retried with the saved key, MAX_TRIES at most.
+    bad = _ResetProvider([{"transport": True, "error": "e1"}, RuntimeError("e2"), {"transport": True, "error": "503"}])
     t = now
-    for i in range(credits.MAX_TRIES):
+    for _ in range(credits.MAX_TRIES):
         out = credits.consume(p.db, cfg, "codex", bad, wins, reading, t)
+        assert credits.consume(p.db, cfg, "codex", bad, wins, reading, t + 60) is None, "not before RETRY_S"
         t += credits.RETRY_S + 1
     assert len({k for _, k in bad.calls}) == 1 and len(bad.calls) == credits.MAX_TRIES
-    assert out["outcome"] == "failed: denied", out
-    text = credits.report_text("codex", out)
-    assert text.startswith("Could not use a free codex window reset") and "denied" in text
+    assert out["outcome"] == "failed: 503", out
+    assert credits.report_text("codex", out).startswith("Could not use a free codex window reset")
     assert credits.consume(p.db, cfg, "codex", bad, wins, reading, t + 3600) is None, "that window gets no more tries"
-    # A provider without a consume endpoint: nothing kept pending.
-    p.db.x("DELETE FROM kv WHERE key=?", (credits.USED + "codex",))
-    assert credits.consume(p.db, cfg, "codex", _ResetProvider([None]), wins, reading, now) is None
-    assert p.db.kv(credits.PENDING + "codex") is None
+    # Unknown outcomes and JSON-RPC errors that are not transport errors: recorded, not retried.
+    for answer, want in (({"outcome": "weird"}, "failed: weird"), ({}, "failed: no outcome"),
+                         ({"transport": False, "error": '{"code": -32602, "message": "bad id"}'},
+                          'failed: {"code": -32602, "message": "bad id"}')):
+        _fresh_credits(p)
+        once = _ResetProvider([answer])
+        assert credits.consume(p.db, cfg, "codex", once, wins, reading, now)["outcome"] == want
+        assert credits.consume(p.db, cfg, "codex", once, wins, reading, now + credits.RETRY_S + 1) is None
+        assert len(once.calls) == 1, answer
+    assert credits.transport_error({"code": -32000, "message": "request timed out"})
+    assert credits.transport_error({"code": -32000, "message": "x", "data": {"status": 503}})
+    assert credits.transport_error({"status": 502}) and credits.transport_error("connection reset by peer")
+    assert not credits.transport_error({"code": -32602, "message": "invalid creditId"})
+
+
+def test_reset_consume_is_once_per_account_window_across_projects_on_one_machine(env, tmp_path):
+    import threading
+    from ttp import credits
+    from ttp.db import DB
+    p = make(env)
+    other = DB(tmp_path / "other" / "project.db")   # a second project's database, same TTP_HOME
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    reading = {"listed": True, "resets": [{"id": "c1", "expires_at": now + 86400 * 9},
+                                         {"id": "c2", "expires_at": now + 86400 * 20}], "free_resets": 2}
+    # Both see the same held window: one consume between them, even with a stale reading.
+    prov = _ResetProvider([{"outcome": "reset"}, {"outcome": "reset"}])
+    assert credits.consume(p.db, cfg, "codex", prov, wins, reading, now)["outcome"] == "reset"
+    assert credits.consume(other, cfg, "codex", prov, wins, reading, now + 5) is None
+    assert credits.consume(other, cfg, "codex", prov, wins, reading, now + 3600) is None
+    assert len(prov.calls) == 1 and credits.used(other, "codex") == []
+    # A crash after the shared record was written: either project retries with the same key.
+    _fresh_credits(p)
+
+    class Crash(BaseException):
+        pass
+
+    class Dies(_ResetProvider):
+        def consume_reset(self, credit, key):
+            super().consume_reset(credit, key)
+            raise Crash()
+    dies = Dies([None])
+    with pytest.raises(Crash):
+        credits.consume(p.db, cfg, "codex", dies, wins, reading, now)
+    key = dies.calls[0][1]
+    flaky = _ResetProvider([{"transport": True, "error": "no answer"}])
+    assert credits.consume(other, cfg, "codex", flaky, wins, reading, now + credits.RETRY_S + 1)["attempts"] == 2
+    ok = _ResetProvider([{"outcome": "alreadyRedeemed"}])
+    done = credits.consume(p.db, cfg, "codex", ok, wins, reading, now + 2 * credits.RETRY_S + 2)
+    assert [k for _, k in flaky.calls + ok.calls] == [key, key] and done["outcome"] == "alreadyRedeemed"
+    # The lock is real: while one project's consume is in its call, the other waits, then sees it done.
+    _fresh_credits(p)
+    inside, release = threading.Event(), threading.Event()
+
+    class Slow(_ResetProvider):
+        def consume_reset(self, credit, key):
+            inside.set()
+            release.wait(10)
+            return super().consume_reset(credit, key)
+    slow, second = Slow([{"outcome": "reset"}]), _ResetProvider([{"outcome": "reset"}])
+    seen = {}
+    a = threading.Thread(target=lambda: credits.consume(DB(p.state / "project.db"), cfg, "codex", slow, wins, reading, now))
+    a.start()
+    assert inside.wait(10)
+    remetered = []
+    b = threading.Thread(target=lambda: seen.update(out=credits.consume(
+        DB(tmp_path / "other" / "project.db"), cfg, "codex", second, wins, reading, now + 1,
+        remeter=lambda: remetered.append(1) or (wins, reading))))
+    b.start()
+    b.join(0.5)
+    assert b.is_alive() and remetered == [], "the second project waits for the lock before reading again"
+    release.set()
+    a.join(10)
+    b.join(10)
+    assert seen["out"] is None and remetered == [1] and second.calls == [] and len(slow.calls) == 1
 
 
 def test_codex_meter_reads_credits_and_consume_sends_the_key(env, monkeypatch, tmp_path):
@@ -43985,13 +44145,20 @@ def test_codex_meter_reads_credits_and_consume_sends_the_key(env, monkeypatch, t
     assert c.last_credits["free_resets"] == 2 and c.last_credits["resets"][0]["id"] == "early"
     # The consume call goes to the stand-in CLI only (its answer echoes FAKE_CLI_SESSION).
     monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"outcome": "reset"}))
-    assert c.consume_reset("early", "k1") == {"ok": True, "outcome": "reset"}
+    assert c.consume_reset("early", "k1") == {"outcome": "reset"}
     reqs = [json.loads(x)["request"] for x in (tmp_path / "log" / "app_server.jsonl").read_text().splitlines()
             if "request" in json.loads(x)]
     assert reqs[-1]["method"] == "account/rateLimitResetCredit/consume"
     assert reqs[-1]["params"] == {"creditId": "early", "idempotencyKey": "k1"}
-    monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"outcome": "alreadyConsumed"}))
-    assert c.consume_reset("early", "k1") == {"ok": False, "outcome": "alreadyConsumed"}
+    for outcome in ("alreadyRedeemed", "noCredit", "alreadyConsumed"):   # passed on as it is: credits judges it
+        monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"outcome": outcome}))
+        assert c.consume_reset("early", "k1") == {"outcome": outcome}
+    monkeypatch.setattr(codex, "app_server_call", lambda *a, **k: None)
+    assert c.consume_reset("early", "k1")["transport"] is True, "no answer: a transport error"
+    monkeypatch.setattr(codex, "app_server_call", lambda *a, **k: {"id": 2, "error": {"code": -32602, "message": "bad id"}})
+    assert c.consume_reset("early", "k1")["transport"] is False
+    monkeypatch.setattr(codex, "app_server_call", lambda *a, **k: {"id": 2, "error": {"code": -32000, "message": "upstream 502"}})
+    assert c.consume_reset("early", "k1")["transport"] is True
 
 
 def test_paid_credits_open_a_full_window_but_the_dollar_and_spend_limits_still_hold(env):
@@ -44043,7 +44210,7 @@ class _MeterProvider(_ResetProvider):
 
     def consume_reset(self, credit, key):
         out = super().consume_reset(credit, key)
-        if out and out.get("ok"):
+        if out and out.get("outcome") in ("reset", "alreadyRedeemed"):
             self.util, self.resets = 0.0, [r for r in self.resets if r["id"] != credit]
         return out
 
@@ -44088,12 +44255,13 @@ def test_a_red_provider_is_remetered_every_10_min_and_starts_on_the_first_readin
     assert [w.utilization for w in bud.plan_windows(p.db, clock["t"]) if w.provider == "codex"] == [40.0]
 
 
-def test_a_consumed_reset_remeters_at_once_and_is_reported_once_at_low_severity(env, monkeypatch):
+@pytest.mark.parametrize("outcome", ["reset", "alreadyRedeemed"])
+def test_a_consumed_reset_remeters_at_once_and_is_reported_once_at_low_severity(env, monkeypatch, outcome):
     from ttp import credits, daemon as dm
     p = make(env)
     d = dm.Daemon(p.base)
     now = time.time()
-    prov = _MeterProvider(95.0, [{"ok": True, "outcome": "reset"}],
+    prov = _MeterProvider(95.0, [{"outcome": outcome}],
                           resets=[{"id": "r2", "expires_at": now + 20 * 86400}, {"id": "r1", "expires_at": now + 9 * 86400}])
     prov.resets.sort(key=lambda r: r["expires_at"])
     prov.at = now + 60 * 3600
@@ -44101,17 +44269,19 @@ def test_a_consumed_reset_remeters_at_once_and_is_reported_once_at_low_severity(
     sent = []
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", every_s=0: sent.append((key, text, severity)))
     d._meter_providers(p.db, ["codex"])
-    assert prov.calls and prov.calls[0][0] == "r1" and prov.reads == 2, "consumed the earliest, then read again"
+    # Read, read again inside the account's lock before deciding, consume the earliest, read again.
+    assert prov.calls and prov.calls[0][0] == "r1" and prov.reads == 3, "consumed the earliest, then read again"
     assert credits.latest(p.db, "codex")["free_resets"] == 1
     d._report_resets()
     d._report_resets()
     assert len(sent) == 1 and sent[0][2] == "low" and sent[0][0] == "reset-credit:codex:r1", sent
     assert "Used one free codex window reset" in sent[0][1] and "95%" in sent[0][1] and "Held work starts again" in sent[0][1]
+    assert f"Outcome: {outcome}." in sent[0][1]
     assert credits.unreported(p.db, "codex") == []
     # Read again at the line in the same window: no second consume.
     prov.util = 95.0
     d._meter_providers(p.db, ["codex"])
-    assert len(prov.calls) == 1
+    assert len(prov.calls) == 1 and prov.reads == 4, "no second consume, and no second reading for nothing"
 
 
 def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):

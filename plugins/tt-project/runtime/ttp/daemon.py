@@ -2550,13 +2550,15 @@ class Daemon:
         threading.Thread(target=work, daemon=True).start()
 
     def _meter_providers(self, db, names: list[str]) -> None:
-        """Read each provider's windows and credits; when a free reset is due, consume it and read
-        again at once, so held work starts on the next tick."""
+        """Read each provider's windows and credits; when a free reset is due, read again inside the
+        account's machine-wide lock, consume it and read again at once, so held work starts on the
+        next tick."""
         for name in names:
             try:
                 prov = get_provider(name)
                 wins = self._meter_one(db, name, prov)
-                if wins and credits.consume(db, self.cfg, name, prov, wins, prov.last_credits):
+                remeter = lambda n=name, pv=prov: (self._meter_one(db, n, pv), pv.last_credits)  # noqa: E731
+                if wins and credits.consume(db, self.cfg, name, prov, wins, prov.last_credits, remeter=remeter):
                     self._meter_one(db, name, prov)
             except Exception:
                 log(self.p, f"meter {name} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
