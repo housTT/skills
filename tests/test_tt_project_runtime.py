@@ -31302,7 +31302,7 @@ def test_repeated_review_failures_across_stacks_stop_auto_fixes_and_raise_a_re_p
            (time.time(), time.time(), json.dumps({"triggers": labels})))
     lines = unblock.lines(p.db)
     assert f"per trigger: {reviewcap.TRIGGER} 1" in next(x for x in lines if x.startswith("coordinator triggers"))
-    assert f"{reviewcap.TRIGGER}, 24 h: 1 area(s): #{code_a} (3 failed reviews, a.py, b.py, c.py)" in lines
+    assert f"{reviewcap.TRIGGER}, 24 h: 1 area(s): #{code_a} (3 failed reviews: 3 own, 0 pooled, a.py, b.py, c.py)" in lines
 
 
 def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
@@ -31336,6 +31336,7 @@ def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
     assert not fixed(s4), "the same main file did not join the area"
     data = json.loads(p.db.one("SELECT data FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))["data"])
     assert data["reviews"] == [s2["id"], s3["id"], s4["id"]] and data["files"] == ["core.py"]
+    assert data["own"] == [s4["id"]] and data["pooled"] == [s2["id"], s3["id"]]
     # 0 turns the cap off.
     p.set_config("review.area_fail_cap", 0)
     assert reviewcap.area(p, p.config(), p.db.task(s4["id"])) is None
@@ -31343,10 +31344,12 @@ def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
 
 def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_the_changes_overlap(env):
     """A lineage with one failed review was capped because 12 failures of a separate lineage had the
-    same main file. Now the main-file fallback needs 2 failures in the review's own lineage; before
-    that only overlapping hunks or functions in the main file join."""
+    same main file. Then the plain main-file fallback came back at 2 failures in the review's own
+    lineage, and unrelated lineages on a file most changes touch reported 14-18 failures. Now only
+    overlapping hunks or functions in the main file join, however many failed in its own lineage,
+    and the event and daily review report own-lineage and pooled failures apart."""
     p = make(env)
-    from ttp import reviewcap
+    from ttp import reviewcap, unblock
     fups = [{"title": "fix it", "spec": "it breaks"}]
     (p.root / "core.py").write_text("".join(f"def f{i}():\n" + "    x = 1\n" * 8 + f"    return {i}\n\n\n"
                                             for i in range(10)))
@@ -31380,11 +31383,22 @@ def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_t
     # One failure that changes the busy lineage's own function does join it.
     c = stack("another take on f0", 0)
     assert not fixed(c) and capped()[-1]["reviews"] == [a1["id"], a2["id"], a3["id"], c["id"]]
-    # Its second failure in its own lineage brings the plain main-file fallback back.
+    # Two failures in its own lineage do not pool the unrelated ones on the same main file.
     d1 = stack("d work", 5)
     assert fixed(d1) and len(capped()) == 2
     d2 = stack(f"#{d1['depends_on'][1:-1]} follow-up: d work", 5)
-    assert not fixed(d2) and {b["id"], d1["id"], d2["id"]} <= set(capped()[-1]["reviews"])
+    assert fixed(d2) and len(capped()) == 2, "unrelated failures on one busy main file were pooled"
+    assert reviewcap.area(p, p.config(), p.db.task(d2["id"])) is None
+    # A separate lineage that changes d's function joins it; own and pooled are reported apart.
+    e = stack("another take on f5", 5)
+    assert not fixed(e)
+    ev = p.db.one("SELECT * FROM events WHERE kind=? ORDER BY id DESC", (reviewcap.REVIEW_AREA_EVENT,))
+    data = json.loads(ev["data"])
+    assert data["reviews"] == [d1["id"], d2["id"], e["id"]]
+    assert data["own"] == [e["id"]] and data["pooled"] == [d1["id"], d2["id"]]
+    assert (f"1 in its own lineage (#{e['id']}), 2 pooled from other lineages with overlapping changes "
+            f"to the same main file (#{d1['id']}, #{d2['id']})") in ev["text"]
+    assert f"#{data['root']} (3 failed reviews: 1 own, 2 pooled, core.py)" in "\n".join(unblock.lines(p.db))
 
 
 def test_edits_to_different_methods_of_one_class_do_not_overlap(env):

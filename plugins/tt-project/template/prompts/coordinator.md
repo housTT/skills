@@ -70,7 +70,7 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   and schedule. After two failed rounds on a stack, or a failure without fix follow-ups, it is
   yours as before. So is an area whose reviews keep failing across stacks: at `review.area_fail_cap`
   (3) failed reviews within 48 h in one lineage (linked by `continues`, follow-ups, `depends_on` and
-  `Review #N` / `Fix review #N` titles, or changes with the same main file), the daemon queues no
+  `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the daemon queues no
   fix and a `review_area_cap` event (repeated review failures in one area) names its tasks and
   files. Re-plan that area: narrow the scope, accept and document the known gaps, or redesign. Do
   not add another edge-case fix, and do not raise the tier to `deep` for that reason alone.

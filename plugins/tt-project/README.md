@@ -161,7 +161,7 @@ and preferences you add later become part of the project's charter and memory.
   rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
   deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
-  `depends_on` and `Review #N` / `Fix review #N` titles, or changes with the same main file), the
+  `depends_on` and `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the
   daemon queues no more fixes there and raises a high-effort coordinator turn to re-plan it
   ("repeated review failures in one area", also counted in the daily review).
 - A review's result: `done` lets the change proceed (its PR, push or push-queue approval and its

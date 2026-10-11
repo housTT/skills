@@ -7,12 +7,12 @@ a new stack on the same component (`Fix re-review #N`, `#N follow-up`, a task th
 started the count again. Here an area is a lineage of code and review tasks linked by `continues:`,
 follow-ups (`parent`), a review's `depends_on`, the daemon's `review_fix:`/`auto_review:` labels and
 `Review #N` / `Fix review #N` / `#N follow-up` titles; as a fallback, reviews whose diffs have the
-same main file (the non-test file with the most changed lines) count as one area too. On a busy
-file that fallback would pool unrelated work, so it applies only once the review's own lineage has
-OWN_FAILS_FOR_FILE failed reviews in the window; before that, a review on the same main file joins
-only when its changes there overlap: a shared hunk line range, or a shared function around or changed by
-its hunks (an enclosing class alone does not count). Links run
-only between code and review tasks, so a plan or daily review that spawned many tasks joins none.
+same main file (the non-test file with the most changed lines) count as one area too, but only
+when their changes there overlap: a shared hunk line range, or a shared function around or changed
+by its hunks (an enclosing class alone does not count). A busy file is touched by most changes, so
+this holds however many failures the review's own lineage has. Own-lineage and pooled failures are
+reported apart. Links run only between code and review tasks, so a plan or daily review that
+spawned many tasks joins none.
 
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
 changes within AREA_WINDOW_S, the daemon queues no automatic fix for it and raises a
@@ -30,7 +30,6 @@ AREA_WINDOW_S = 48 * 3600
 LOOKBACK_S = 14 * 86400   # tasks this recent are searched for links back into a lineage
 MAX_LINEAGE = 400         # a lineage this big stops growing: the search must stay cheap
 DEFAULT_CAP = 3
-OWN_FAILS_FOR_FILE = 2    # failed reviews in its own lineage before any review on the same main file joins
 REVIEW_AREA_EVENT = "review_area_cap"
 TRIGGER = "repeated review failures in one area"
 FAILED_KINDS = ("task_failed", "task_changes_needed")
@@ -201,26 +200,38 @@ def area(p, cfg: dict, review: dict, now: float | None = None) -> dict | None:
     hit = fails & line
     mains: dict[int, str | None] = {}
     if len(hit) < n and (main := main_file(p, review)):
-        # A lineage with one failure joins others on its main file only where their changes overlap.
-        mine = touched(p, review, main) if len(hit) < OWN_FAILS_FOR_FILE else None
+        # Others on its main file join only where their changes overlap, however many failed in its own lineage.
+        mine = touched(p, review, main)
         for i in sorted(fails - hit):
             t = db.task(i)
-            if t and (mains.setdefault(i, main_file(p, t)) == main) \
-                    and (mine is None or overlaps(mine, touched(p, t, main))):
+            if t and mains.setdefault(i, main_file(p, t)) == main and overlaps(mine, touched(p, t, main)):
                 hit.add(i)
     if len(hit) < n:
         return None
     files = sorted({f for i in hit if (f := mains[i] if i in mains else main_file(p, db.task(i) or review))})
     root = db.task(min(line)) or review
     return {"root": root["id"], "title": str(root["title"])[:120], "reviews": sorted(hit),
-            "tasks": sorted(line | hit), "files": files}
+            "own": sorted(hit & line), "pooled": sorted(hit - line), "tasks": sorted(line | hit), "files": files}
+
+
+def _refs(ids) -> str:
+    return ", ".join(f"#{i}" for i in ids)
+
+
+def _split(a: dict) -> str:
+    """The failed reviews, own lineage apart from those pooled on the same main file."""
+    if "own" not in a:   # an event from before the split
+        return "reviews " + _refs(a.get("reviews") or [])
+    own, pooled = a.get("own") or [], a.get("pooled") or []
+    return (f"{len(own)} in its own lineage ({_refs(own) or 'none'}), {len(pooled)} pooled from other lineages "
+            f"with overlapping changes to the same main file ({_refs(pooled) or 'none'})")
 
 
 def event_text(a: dict) -> str:
     tasks = ", ".join(f"#{i}" for i in a["tasks"][:30]) + (" ..." if len(a["tasks"]) > 30 else "")
     return (f"{TRIGGER}: {len(a['reviews'])} reviews failed or asked for changes within "
-            f"{AREA_WINDOW_S / 3600:g} h in the lineage of #{a['root']} ({a['title']}): reviews "
-            + ", ".join(f"#{i}" for i in a["reviews"]) + f"; tasks {tasks}; main files: "
+            f"{AREA_WINDOW_S / 3600:g} h in the lineage of #{a['root']} ({a['title']}): "
+            + _split(a) + f"; tasks {tasks}; main files: "
             + (", ".join(a["files"]) or "unknown")
             + ". The daemon queues no more automatic fixes for it. Re-plan this area: narrow the scope, accept "
               "and document the known gaps, or redesign. Do not add another edge-case fix, and do not raise "
@@ -241,5 +252,6 @@ def daily_line(db: DB, since: float) -> str:
         return "none"
     return f"{len(seen)} area(s): " + "; ".join(
         f"#{k} ({len(d.get('reviews') or [])} failed reviews"
+        + (f": {len(d.get('own') or [])} own, {len(d.get('pooled') or [])} pooled" if "own" in d else "")
         + (f", {', '.join(d.get('files') or [])}" if d.get("files") else "") + ")" for k, d in seen.items())
 
