@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import locks, prguard, runner, worktree
+from . import landed, locks, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import Project, durable_append, durable_write, git_fsync_env, nice_level, renice, write_json
@@ -2609,8 +2609,7 @@ def tend(p: Project) -> None:
 
 def _tend_one(p: Project, marker: Path) -> None:
     m = _settle(marker)
-    from .landed import record_push
-    record_push(p, marker, m)
+    landed.record_push(p, marker, m)
     if m.get("status") != "queued" or m.get("kind") == "batch":
         return
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")
