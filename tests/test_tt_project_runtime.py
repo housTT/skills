@@ -40611,3 +40611,63 @@ def test_the_daily_review_lists_items_stuck_over_6h_with_their_sweep_outcome(env
     assert f"Stuck longer than 6h, with the blocker sweep's outcome:\n- #{old} old block: blocked 10.0h" in spec
     db.x("DELETE FROM tasks")
     assert sweep.review_lines(db, now) == ["nothing stuck longer than 6h"]
+
+
+def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
+    """A block the coordinator set (task_update, no task_blocked event) keeps its age after a spec
+    addendum or any other update, so the daily review still lists it as stuck over 6h."""
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db = p.db
+    t = db.add_task("coordinator block", spec="do the thing")
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    assert coord.apply(p, [{"type": "task_update", "id": t, "status": "blocked", "text": "until the rig is back",
+                            "waits_on": "when:test -e /nonexistent-rig-marker"}]) == []
+    assert db.task(t)["status"] == "blocked"
+    assert not db.q("SELECT id FROM events WHERE task=? AND kind='task_blocked'", (t,))
+    then = time.time() - 20 * 3600
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (then, t))
+    assert sweep.due(db, p.config(), then + 60) == "every 6h"       # the daemon's minute check sees it
+    now = time.time()
+    db.update_task(t, spec="do the thing\n\nAddendum: accepted evidence only; retain blocked status")
+    [i] = sweep.items(db, now)
+    assert round(i["age_s"] / 3600) == 20
+    assert any(ln.startswith(f"#{t} coordinator block: blocked 20.0h") for ln in sweep.review_lines(db, now))
+    sweep.start(db, p.config(), "every 6h", now)                    # a sweep keeps it too
+    db.update_task(t, blocked_reason="still no rig")
+    assert round(sweep.items(db, now + 3600)[0]["age_s"] / 3600) == 21
+    db.x("UPDATE tasks SET updated=NULL WHERE id=?", (t,))
+    db.set_kv(sweep.STATE_KEY, {})                                   # no source at all: unknown, not 0
+    [i] = sweep.items(db, now)
+    assert i["age_s"] is None and sweep._dur(i["age_s"]) == "unknown"
+
+
+def test_blocker_sweep_ages_a_reblocked_task_from_its_second_block(env):
+    """Blocked, requeued and blocked again: the age starts at the second block, also for a coordinator
+    block whose first-seen time predates the requeue."""
+    p = make(env)
+    from ttp import sweep
+    db, now = p.db, time.time()
+    a = db.add_task("re-blocked")
+    db.update_task(a, status="blocked", blocked_reason="first")
+    _sweep_ev(db, a, "task_blocked", f"#{a} re-blocked: first", now - 10 * 3600)
+    _sweep_ev(db, a, "task_requeued", f"#{a} requeued", now - 5 * 3600)
+    _sweep_ev(db, a, "task_blocked", f"#{a} re-blocked: second", now - 2 * 3600)
+    b = db.add_task("run then re-blocked")
+    db.update_task(b, status="blocked", blocked_reason="first")
+    _sweep_ev(db, b, "task_blocked", f"#{b} run then re-blocked: first", now - 10 * 3600)
+    db.x("INSERT INTO runs(task,role,status,started) VALUES(?,?,?,?)", (b, "worker", "done", now - 4 * 3600))
+    _sweep_ev(db, b, "task_blocked", f"#{b} run then re-blocked: second", now - 3 * 3600)
+    c = db.add_task("coordinator re-block")
+    db.update_task(c, status="blocked", blocked_reason="first")
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 10 * 3600, c))
+    sweep.remember(db, sweep.items(db, now - 9 * 3600))               # first seen blocked 10 h ago
+    _sweep_ev(db, c, "task_requeued", f"#{c} requeued", now - 5 * 3600)
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 1 * 3600, c))  # blocked again by the coordinator
+    d = db.add_task("event block, then coordinator re-block")
+    db.update_task(d, status="blocked", blocked_reason="first")
+    _sweep_ev(db, d, "task_blocked", f"#{d} event block: first", now - 10 * 3600)
+    _sweep_ev(db, d, "task_requeued", f"#{d} requeued", now - 5 * 3600)
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 1 * 3600, d))  # blocked again, no task_blocked event
+    ages = {i["task"]: round(i["age_s"] / 3600, 1) for i in sweep.items(db, now)}
+    assert ages == {a: 2.0, b: 3.0, c: 1.0, d: 1.0}

@@ -34,7 +34,8 @@ from . import settinghold, unblock
 from .db import DB, deferral, dependency_ids, load_result
 
 SWEEP_KIND = "blocker_sweep"
-STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...]}
+STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...],
+#                                         "seen": {key: {"status", "since"}}: when each item was first seen stuck}
 OUTCOMES_KEY = "blocker_sweep_outcomes"  # kv: {key: {"outcome", "ts", "until", "probe", "next", "why", "sweep"}}
 SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why"}]: signal() requests not yet swept
 OUTCOMES = ("unblocked", "rerouted", "retired", "closed", "still_blocked", "human_indispensable")
@@ -91,12 +92,24 @@ def _spec_sha(t: dict) -> str:
     return hashlib.sha256((t["spec"] or "").encode()).hexdigest()[:16]
 
 
+def _moved_at(db: DB, tid: int) -> float:
+    """When the task last moved on (a requeue, a hand-off out of stuck, or a run started): 0 if never."""
+    ev = db.one(f"SELECT MAX(ts) ts FROM events WHERE task=? AND kind IN ({','.join('?' * len(unblock.MOVED))})",
+                (tid, *sorted(unblock.MOVED)))
+    run = db.one("SELECT MAX(started) ts FROM runs WHERE task=? AND role!='coordinator'", (tid,))
+    return max(float((ev or {}).get("ts") or 0), float((run or {}).get("ts") or 0))
+
+
 def items(db: DB, now: float | None = None) -> list[dict]:
-    """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s, reason, status,
-    spec_sha}. Kinds: blocked, setting-held, waiting (not a self-wait), review, deferred, paused."""
+    """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
+    unknown), since, reason, status, spec_sha}. Kinds: blocked, setting-held, waiting (not a self-wait),
+    review, deferred, paused. A task's age comes from its open stuck episode (unblock._task_episodes);
+    without that history (a block the coordinator set) from when the sweep first saw it in this status
+    (remember()), first seeded from its last update, so a later update (an addendum) never resets it."""
     now = time.time() if now is None else now
     out: list[dict] = []
     since_review = db.review_since()
+    seen = (db.kv(STATE_KEY, {}) or {}).get("seen") or {}
     for t in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','review','queued') ORDER BY id"):
         kind, start, reason = t["status"], None, _reason(t)
         if kind == "queued":
@@ -113,23 +126,48 @@ def items(db: DB, now: float | None = None) -> list[dict]:
                 continue
             if kind == "review":
                 start = since_review.get(t["id"])
-            elif last and unblock.STUCK.get(last[0]["kind"]) == kind:
-                start = last[0]["ts"]
+            else:
+                eps = unblock._task_episodes(db, t, now)
+                if eps and eps[-1]["open"]:
+                    start = eps[-1]["start"]
             if kind == "waiting" and last:
                 reason = _clip(unblock.wait_reason(last[0])) or reason
             if kind == "blocked" and settinghold.held_key(t):
                 kind = "setting-held"
-        start = float(start if isinstance(start, (int, float)) else (t["updated"] or now))
+        if not isinstance(start, (int, float)):
+            prev = seen.get(f"task:{t['id']}") or {}
+            start = prev.get("since") if prev.get("status") == t["status"] else None
+            if not isinstance(start, (int, float)) or start < _moved_at(db, t["id"]):
+                start = float(t["updated"]) if t["updated"] else None
         out.append({"key": f"task:{t['id']}", "kind": kind, "task": t["id"], "resource": None,
-                    "title": t["title"], "age_s": max(0.0, now - start), "reason": reason, "status": t["status"],
-                    "spec_sha": _spec_sha(t)})
+                    "title": t["title"], "age_s": None if start is None else max(0.0, now - float(start)),
+                    "since": start, "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t)})
     for name, v in sorted(db.paused_resources().items()):
-        since = v.get("since")
+        since = v.get("since") if isinstance(v.get("since"), (int, float)) else None
         out.append({"key": f"resource:{name}", "kind": "paused", "task": None, "resource": name, "title": name,
-                    "age_s": max(0.0, now - float(since)) if isinstance(since, (int, float)) else None,
+                    "age_s": None if since is None else max(0.0, now - float(since)), "since": since,
                     "reason": _clip(f"by {v.get('by') or 'user'}" + (f": {v['reason']}" if v.get("reason") else "")),
                     "status": "paused", "spec_sha": ""})
     return out
+
+
+def _seen(state: dict, live: list[dict]) -> dict:
+    """The `seen` map for these live items: an entry kept while the item stays in the same status."""
+    old = state.get("seen") or {}
+    out = {}
+    for i in live:
+        o = old.get(i["key"]) or {}
+        out[i["key"]] = o if o.get("status") == i["status"] and o.get("since") is not None else \
+            {"status": i["status"], "since": i["since"]}
+    return out
+
+
+def remember(db: DB, live: list[dict]) -> None:
+    """Keep when each stuck item was first seen in its status (the age source for holds without history)."""
+    state = db.kv(STATE_KEY, {}) or {}
+    seen = _seen(state, live)
+    if seen != (state.get("seen") or {}):
+        db.set_kv(STATE_KEY, {**state, "seen": seen})
 
 
 def loop(db: DB, item: dict, prev: dict | None) -> str | None:
@@ -221,10 +259,9 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     every = _cfg(cfg, "blocker_sweep_h", EVERY_H) * 3600
     if every <= 0:
         return None
-    if db.one("SELECT id FROM events WHERE kind=? AND status='queued' LIMIT 1", (SWEEP_KIND,)):
-        return None
     live = items(db, now)
-    if not live:
+    remember(db, live)
+    if not live or db.one("SELECT id FROM events WHERE kind=? AND status='queued' LIMIT 1", (SWEEP_KIND,)):
         return None
     state = db.kv(STATE_KEY, {}) or {}
     since = now - float(state.get("last") or 0)
@@ -283,6 +320,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     with db.tx():
         db.set_kv(STATE_KEY, {"last": now, "n": n, "why": why, "flags": flagged, "loops": loops, "reviews": reviews,
                               "paused": [i["resource"] for i in live if i["kind"] == "paused"],
+                              "seen": _seen(state, live),
                               "items": {i["key"]: {"status": i["status"], "spec_sha": i["spec_sha"]} for i in live}})
         db.x("DELETE FROM kv WHERE key=?", (SIGNAL_KEY,))
         eid = db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
