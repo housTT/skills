@@ -42670,6 +42670,34 @@ def test_failover_moves_an_unmarked_pin_at_once_and_keeps_a_required_one_held(en
     assert [m["task"]["id"] for m in moves] == [other] and moves[0]["at_once"] and moves[0]["new"] == "fake"
 
 
+def test_failover_moves_a_preference_pin_off_a_gate_that_allows_no_new_start_below_red(env):
+    # Plan pacing just under the line raises orange with 'no new starts' (max_parallel 0): the
+    # dispatcher starts nothing there, so a preference pin moves at once; a required one stays held.
+    from ttp import budget as bud, failover
+    p, d, now = _failover_setup(env, util=80.0, hours=100)
+    pref = _codex_task(p, "preference")
+    req = _codex_task(p, "required", labels=["pin:required"])
+    d.update_gates()
+    reason = "seven_day window at 80%, 2.0 points under the 90% line; one more run may add ~5.0 points: no new starts"
+    plan = [{"window": "seven_day", "allowed": 0, "resets_at": now + 100 * 3600}]
+    d.gates["codex"] = bud.Gate("codex", level="orange", reasons=[reason], regime="windows", max_parallel=0,
+                                numbers={"plan": plan})
+    assert failover.stop(d.gates["codex"], None, False, now) is None, "the threshold path stays red-only"
+    assert failover.hold(d.gates["codex"], None, False, now) == (reason, now + 100 * 3600)
+    d.failover_pinned()
+    assert p.db.task(pref)["provider"] == "fake", "a preference pin sat held behind 'no new starts'"
+    assert p.db.task(req)["provider"] == "codex"
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='provider_failover'")
+    assert ev["task"] == pref and "moved at once from codex" in ev["text"]
+    # Orange with room for a run moves nothing.
+    other = _codex_task(p, "room left")
+    d.gates["codex"] = bud.Gate("codex", level="orange", reasons=["x"], regime="windows", max_parallel=1)
+    d._failover_checked = 0.0
+    d.failover_pinned()
+    assert p.db.task(other)["provider"] == "codex"
+    assert len(p.db.q("SELECT id FROM events WHERE kind='provider_failover'")) == 1
+
+
 def test_pin_required_is_set_by_the_coordinator_and_kept_by_continues(env):
     from ttp import failover
     from ttp.coordinator import apply

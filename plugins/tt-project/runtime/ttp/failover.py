@@ -12,7 +12,8 @@ a red gate whose end is unknown moves nothing.
 
 A pin to a provider other than the core one is a preference unless it is marked required (the
 task's `pin_required`, kept as the label REQUIRED_LABEL): such a task moves at once, with no wait,
-whenever its provider cannot start new work, whatever the reason and its end (hold()). Only the
+whenever its provider cannot start new work, whatever the reason and its end (hold()), including a
+gate below red that allows no new start (plan pacing just under the line). Only the
 user's own words mark a pin required; an unmarked pin, old tasks' included, is a preference.
 
 Targets: coordinator.provider_failover_to (provider names, in order of preference) and then the
@@ -93,13 +94,26 @@ def stop(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[s
     """Why the provider cannot start new work and when that ends (None: logged out, no known end), or
     None if it can or its red gate has no known end. `gate` is a budget Gate (or its dict), `pause`
     its limited:<provider> record."""
-    got = hold(gate, pause, logged_out, now)
+    got = _held(gate, pause, logged_out, now)
     return None if got is None or (got[1] is None and not logged_out) else got
 
 
 def hold(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[str, float | None] | None:
-    """Like stop(), but a red gate whose end is unknown holds too (end None): what moves a preference
-    pin at once."""
+    """Like stop(), but a red gate whose end is unknown holds too (end None), and so does a gate
+    below red that allows no new start (plan pacing's 'no new starts': max_parallel 0), ending at
+    the reset of the plan windows that leave no room: what moves a preference pin at once."""
+    if got := _held(gate, pause, logged_out, now):
+        return got
+    g = gate.as_dict() if hasattr(gate, "as_dict") else (gate or {})
+    if not g or (g.get("allow_new_work", True) and (g.get("max_parallel") is None or g["max_parallel"] > 0)):
+        return None
+    full = [w.get("resets_at") for w in (g.get("numbers") or {}).get("plan") or [] if w.get("allowed") == 0]
+    end = max(full) if full and all(full) else None
+    return "; ".join(g.get("reasons") or []) or "budget gate allows no new start", end
+
+
+def _held(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[str, float | None] | None:
+    """Logged out, a running limit pause or a red gate (end None where unknown)."""
     if logged_out:
         return "logged out", None
     if pause and float(pause.get("until") or 0) > now:
