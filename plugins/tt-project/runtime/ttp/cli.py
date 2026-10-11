@@ -2775,10 +2775,19 @@ def cmd_upgrade(a) -> None:
         die(f"upgrade refused: another upgrade of {p.name} is running"
             + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:
+        own = _own_run(p)
+        if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
+            die(f"--apply refused: a host-side upgrade took the template merge over from task "
+                f"#{os.environ['TTP_TASK']} (its finish-lock generation is older); nothing was changed", 1)
         # Read under the lock: an upgrade that just ended may have queued it. A stale record goes here.
         holder = release.finish_holder(p, clean=True)
         tid = holder["task"] if holder else None
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
+        took = False
+        if tid and not mine and a.apply is None and not a.auto and not own:
+            took = _take_over_finish(p, holder)     # a blocked or idle task cannot hold off a host-side upgrade
+            if took:
+                holder, tid = None, None
         if tid and not mine and a.apply is None:    # the open task takes this release on: one merge, not two
             release.guard_harness(p.harness)
             _retarget_upgrade_task(p, holder, a.auto)
@@ -2787,7 +2796,7 @@ def cmd_upgrade(a) -> None:
             if a.auto:
                 release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
             die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
-                f"nothing was changed. Rerun once it has ended.", 75)
+                f"nothing was changed ({release.holder_line(p, holder)}).", 75)
         if a.apply is None and mine:
             die(f"task #{tid} finishes the merge in its own worktree and applies it with "
                 f"`ttp upgrade {p.name} --apply <commit>`", 2)
@@ -2795,7 +2804,7 @@ def cmd_upgrade(a) -> None:
         if a.apply is not None:
             _apply_upgrade(p, a.apply)
         else:
-            _upgrade(p, a.auto)
+            _upgrade(p, a.auto, explicit=not a.auto and not own, took_over=took)
     except SystemExit as e:
         if a.auto and e.code and (p.db.kv(release.KV_AUTO) or {}).get("outcome") == "running":
             release.finish(p, "failed", why=f"exit {e.code}; see logs/upgrade.log")
@@ -2808,7 +2817,39 @@ def cmd_upgrade(a) -> None:
         held.close()
 
 
-def _upgrade(p: Project, auto: bool = False) -> None:
+def _own_run(p: Project) -> bool:
+    """This command runs inside one of `p`'s own runs (a task or coordinator turn of that project)."""
+    base = os.environ.get("TTP_PROJECT")
+    try:
+        return bool(base) and Path(base).resolve() == Path(p.base).resolve()
+    except OSError:
+        return False
+
+
+def _take_over_finish(p: Project, holder: dict) -> bool:
+    """An explicit host-side upgrade while finish task holder["task"] is blocked or idle past
+    release.STALE_S: fence that task (cancelled, superseded; its `--apply` refused from now on) so this
+    upgrade proceeds. True when it took the lock over."""
+    from . import release, sweep
+    from .project import HOME_DIR
+    why = release.stale_holder(p.db, holder)
+    src = HOME_DIR / "lib" / "current" / "runtime"
+    if not why or not src.is_dir():
+        return False
+    tid = holder["task"]
+    target = f"{_runtime_version(src)} ({recorded_commit(src)})"
+    gen = release.fence(p, tid, target)
+    sweep.signal(p.db, f"host upgrade took the template merge over from harness task #{tid} ({why})")
+    print(f"harness task #{tid} held the template merge but is {why}; this host-side upgrade takes it over: "
+          f"task #{tid} is cancelled (superseded by host upgrade to {target}) and its `--apply` is refused "
+          f"(finish-lock generation {gen})")
+    return True
+
+
+def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: bool = False) -> None:
+    """`explicit`: run by hand on the host, not --auto and not from one of the project's runs. A conflict
+    then queues the merge task once the last one ended upgrade.merge_retry_h ago (`took_over`: at once,
+    the last one was just superseded), not only once a day."""
     from . import release
     from .project import HOME_DIR
     src = HOME_DIR / "lib" / "current"
@@ -2842,6 +2883,12 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
         last = None if tid else release.recent_upgrade_task(p)
+        sooner = None       # an explicit host-side upgrade may queue the merge task this soon
+        if last and explicit:
+            ended = release.task_ended(p.db, last["id"])
+            sooner = None if ended is None else ended + release.merge_retry_s(p.config())
+            if took_over or (sooner is not None and time.time() >= sooner):
+                last = None
         if last:        # at most one model task a day: each release would otherwise queue its own
             until = float(last["created"]) + release.TASK_EVERY_S
             release.note_deferred(p, problem, last["id"])
@@ -2851,8 +2898,12 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
                     f"#{last['id']} took on a template merge less than a day ago, so none is queued now; ")
             # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
+            if sooner is not None and sooner < until:
+                at = timefmt.long(sooner, p)    # a host-side rerun queues it before the daemon's daily retry
+                took += f"a host-side `ttp upgrade {p.name}` queues one from {at}; "
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
-                print(took + f"upgrade deferred: with upgrade.auto on the daemon tries again after {at}.")
+                print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which tries again "
+                             f"after the day is up; resumes at {timefmt.long(until, p)}.")
                 sys.exit(75)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
@@ -2967,14 +3018,16 @@ def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
             for r in p.db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (tid,)):
                 if r["dir"]:
                     _append_update(Path(r["dir"], "steer.md"), upd, f"retarget-{tid}-{new_c}")
-        p.db.update_task(tid, spec=spec)
+        # Not through update_task: a retarget is not the task's own progress, and its `updated` time is
+        # what tells a stuck finish task (release.stale_holder) from one that moves.
+        p.db.x("UPDATE tasks SET spec=? WHERE id=?", (spec, tid))
         release.take_finish_lock(p, tid, key, target)
     release.note_deferred(p, task=tid)
     if auto:
         release.finish(p, "conflict", task=tid, why=f"harness task #{tid} takes this release on")
     print(f"upgrade not applied; the running harness is unchanged. Harness task #{tid} is finishing the "
           f"template merge" + (f" and now targets {target}" if moved or holder.get("key") != key else "")
-          + " (upgrade deferred to that task).")
+          + f" (upgrade deferred to that task; {release.holder_line(p, holder)}).")
     sys.exit(75)
 
 

@@ -10831,14 +10831,15 @@ def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, c
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
     assert e.value.code == 75 and f"Harness task #{first} took on a template merge" in out
-    assert "upgrade deferred" in out and "tries again after" in out
+    assert "upgrade deferred" in out and "tries again after" in out and "owner: this project's daemon" in out
+    assert "resumes at" in out
     assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first] and not restarts
     rec = p.db.kv(release.KV_AUTO)
     assert rec["outcome"] == "deferred" and rec["key"].endswith(" bbbb2222") and rec["until"] > time.time()
     d = {"key": rec["key"]}
     assert "less than a day ago" in release.hold_reason(p, d)
     p.db.set_kv(release.KV_RELEASE, {"installed": "x (bbbb2222)", "current": "y", "key": rec["key"], "newer": True})
-    assert "next try after" in release.line(p, p.db, {})
+    assert "owner: this project's daemon; resumes at" in release.line(p, p.db, {})
     # a day later the conflict gets a task of its own again
     p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (release.TASK_EVERY_S + 60, first))
     p.db.set_kv(release.KV_AUTO, {**rec, "until": time.time() - 1})
@@ -11260,6 +11261,156 @@ def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(e
     tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
     assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
     assert "Retargeted" not in p.db.task(tids[1])["spec"]
+
+
+def _old_finish_merge(h, tmp_path):
+    """The finish task's own resolution of the merge, in its worktree."""
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    wt = tmp_path / "merge"
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "upstream"], capture_output=True)
+    (wt / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(wt, "add", "-A")
+    _git_out(wt, *ident, "commit", "-qm", "merge upstream")
+    return _git_out(wt, "rev-parse", "HEAD")
+
+
+def test_a_host_upgrade_takes_over_a_blocked_finish_task_and_fences_its_apply(env, monkeypatch, tmp_path, capsys):
+    """A finish task stuck blocked held the live harness for days: every upgrade exited 75. An explicit
+    host-side upgrade now cancels it (superseded), bumps the lock's generation and proceeds; the old
+    task's later `--apply` is refused by the generation compare, even though its merge would apply."""
+    from ttp import cli, release, sweep
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    old_merge = _old_finish_merge(h, tmp_path)
+    p.db.update_task(tid, status="blocked", blocked_reason="Failed to connect to bus")
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})   # merges cleanly now
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    t = p.db.task(tid)
+    assert t["status"] == "cancelled" and t["blocked_reason"].startswith("superseded by host upgrade to ")
+    assert "takes it over" in out and "Failed to connect to bus" in out and restarts == [1]
+    assert release.fenced(p, tid) and release.finish_holder(p) is None
+    assert any("took the template merge over" in s["why"] for s in p.db.kv(sweep.SIGNAL_KEY))
+    head = _git_out(h, "rev-parse", "HEAD")
+    # The old task's run comes back and applies its merge: refused, nothing changed.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", old_merge])
+    assert e.value.code == 1 and _git_out(h, "rev-parse", "HEAD") == head and restarts == [1]
+    # the generation outlives later finish tasks and cleanups
+    release.take_finish_lock(p, 999, "k", "t")
+    release.finish_holder(p, clean=True)
+    assert release.fenced(p, tid) and not release.fenced(p, 999)
+
+
+@pytest.mark.parametrize("case", ["progressing", "auto", "own-run"])
+def test_only_an_explicit_host_upgrade_takes_over_and_only_a_stuck_finish_task(env, monkeypatch, case, capsys):
+    """A finish task with a run or update in the last 6 h still holds (75, naming the owner and when it
+    resumes); --auto and a run of the project itself never take over, even from a blocked task. The
+    same task idle past 6 h is taken over by the host."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    if case == "progressing":
+        p.db.x("UPDATE tasks SET status='queued', created=?, updated=? WHERE id=?",
+               (time.time() - 9 * 3600, time.time() - 5 * 3600, tid))
+        argv = ["upgrade", "demo"]
+    else:
+        p.db.update_task(tid, status="blocked", blocked_reason="Failed to connect to bus")
+        argv = ["upgrade", "demo"] + (["--auto", "--project-dir", str(p.base)] if case == "auto" else [])
+        if case == "own-run":
+            monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(argv)
+    out = capsys.readouterr()
+    assert e.value.code == 75 and p.db.task(tid)["status"] != "cancelled" and not restarts
+    assert not release.fenced(p, tid) and release.finish_holder(p)["task"] == tid
+    if case == "progressing":
+        assert f"owner: harness task #{tid} (queued)" in out.out and "resumes when it ends, or at" in out.out
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 7 * 3600, tid))
+        cli.main(argv)                       # idle past 6 h: the host takes it over
+        assert p.db.task(tid)["status"] == "cancelled" and restarts == [1]
+
+
+def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
+    """The once-a-day merge task limit counted from the last task's creation, also for a host-side
+    upgrade: a project with local edits trailed each release by up to a day. Now a host-side upgrade
+    queues the task once the last one ended 6 h ago (upgrade.merge_retry_h); --auto keeps the daily
+    limit, and there is never more than one open merge task."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    p.db.update_task(first, status="done")
+    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (time.time() - 8 * 3600, time.time() - 7 * 3600, first))
+    _next_release(env)
+    harness = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    assert e.value.code == 75 and harness() == [first]          # the daemon keeps once a day
+    p.set_config("upgrade.merge_retry_h", 8)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and harness() == [first]          # configurable: 8 h not up yet
+    p.set_config("upgrade.merge_retry_h", 6)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    tids = harness()
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    with pytest.raises(SystemExit) as e:                       # still one open merge task
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and harness() == tids and not restarts
+
+
+def test_check_release_escalates_a_stuck_finish_task_once_across_restarts(env, monkeypatch):
+    """A finish task blocked for days only produced an hourly 'held' log line. After 6 h blocked or
+    idle, check_release files ONE upstream note (block reason, what a host upgrade does); the first-seen
+    time is kept in kv, so a restart neither repeats nor resets it, and it clears when the task ends."""
+    from ttp import release, upstream
+    from ttp.daemon import Daemon
+    p, d, launches = _release_daemon(env, monkeypatch)
+    p.set_config("upgrade.auto", False)
+    d.cfg = p.config()
+    tid = p.db.add_task(release.UPGRADE_TASK_TITLE, "x", kind="harness")
+    release.take_finish_lock(p, tid, "k", "9.9.9 (bbbb2222)")
+    p.db.update_task(tid, status="blocked", blocked_reason="Failed to connect to bus")
+
+    def notes():
+        return [n for n in (json.loads(x) for x in upstream.path().read_text().splitlines())
+                if n["task"] == tid] if upstream.path().exists() else []
+    d.check_release()
+    rec = p.db.kv(release.KV_FINISH_STUCK)
+    assert rec and rec["task"] == tid and not rec.get("sent") and not notes()     # blocked under 6 h
+    first = rec["first"]
+    d2 = Daemon(p.base)                                       # a restart keeps the first-seen time
+    d2.check_release()
+    assert p.db.kv(release.KV_FINISH_STUCK)["first"] == first and not notes()
+    p.db.set_kv(release.KV_FINISH_STUCK, {**rec, "first": time.time() - 7 * 3600})   # 7 h later
+    d2._release_due = 0
+    d2.check_release()
+    got = notes()
+    assert len(got) == 1 and "Failed to connect to bus" in got[0]["spec"] and "--apply` is refused" in got[0]["spec"]
+    assert "9.9.9 (bbbb2222)" in got[0]["title"] and got[0]["project"] == p.name
+    d3 = Daemon(p.base)                                       # another restart: no repeat
+    d3.check_release()
+    d3._release_due = 0
+    d3.check_release()
+    assert len(notes()) == 1
+    p.db.update_task(tid, status="done")
+    d3._release_due = 0
+    d3.check_release()
+    assert p.db.kv(release.KV_FINISH_STUCK) is None and len(notes()) == 1
 
 
 def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, monkeypatch, capsys):

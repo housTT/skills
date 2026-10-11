@@ -3691,6 +3691,12 @@ class Daemon:
             db.set_kv(release.KV_RELEASE, d)
             if d:
                 log(self.p, f"tt-project {d['installed']} installed; harness on {d['current']}")
+        try:        # a finish task stuck past release.STALE_S is told to the maintainers once
+            done = release.escalate_stuck(self.p)
+            if done:
+                log(self.p, f"template upgrade {done}; one note went to the upstream inbox")
+        except Exception as e:
+            log(self.p, f"finish-task escalation failed: {type(e).__name__}: {e}")
         if not release.retried(d, self.cfg) or db.kv("paused", False):
             return
         why = release.hold_reason(self.p, d)

@@ -23,6 +23,8 @@ CHECK_S = 3600          # how often the daemon compares the installed release wi
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
 UPGRADE_TASK_TITLE = "Finish the tt-project template upgrade"
 TASK_EVERY_S = 86400    # at most one upgrade task per project this often; a conflict meanwhile waits
+STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
+MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
 
 
@@ -210,10 +212,93 @@ def finish_lock(p: Project) -> Path:
     return p.state / "locks" / f"{UPGRADE_RESOURCE}.task"
 
 
+def _lock_rec(p: Project) -> dict:
+    try:
+        rec = json.loads(finish_lock(p).read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _fence_fields(rec: dict) -> dict:
+    """The record's generation and the tasks fenced off it: kept across every rewrite of the record."""
+    return {"gen": int(rec.get("gen") or 0), "fenced": rec.get("fenced") or {}} if rec.get("gen") else {}
+
+
 def take_finish_lock(p: Project, task: int, key: str, target: str) -> None:
     """Called under the upgrade lock (`ttp upgrade`), like every write of this record."""
     durable_write(finish_lock(p), json.dumps({"task": int(task), "key": key, "target": target,
-                                              "since": time.time()}) + "\n")
+                                              "since": time.time(), **_fence_fields(_lock_rec(p))}) + "\n")
+
+
+def fence(p: Project, task: int, target: str) -> int:
+    """Under the upgrade lock: a host-side upgrade takes the finish lock over from `task`. The lock's
+    generation goes up first, with the task's own generation kept, so the task's later `--apply` is
+    refused (fenced); then the task is cancelled. Returns the new generation."""
+    rec = _lock_rec(p)
+    gen = int(rec.get("gen") or 0)
+    fenced = {**(rec.get("fenced") or {}), str(int(task)): gen}
+    durable_write(finish_lock(p), json.dumps({"gen": gen + 1, "fenced": dict(list(fenced.items())[-20:])}) + "\n")
+    p.db.update_task(int(task), status="cancelled", blocked_reason=f"superseded by host upgrade to {target}")
+    return gen + 1
+
+
+def fenced(p: Project, task) -> bool:
+    """`task` held the finish lock at an older generation than the lock's now: a host-side upgrade took
+    it over, so nothing that task does may land in the live harness."""
+    rec = _lock_rec(p)
+    g = (rec.get("fenced") or {}).get(str(task).strip())
+    return g is not None and int(g) < int(rec.get("gen") or 0)
+
+
+def task_activity(db, tid: int) -> tuple[dict | None, float]:
+    """The task and its last sign of life: its last update or run start or end, now while a run runs."""
+    t = db.one("SELECT id, status, blocked_reason, created, updated FROM tasks WHERE id=?", (int(tid),))
+    if not t:
+        return None, 0.0
+    r = db.one("SELECT MAX(COALESCE(ended, started, 0)) AS last, SUM(status='running') AS live FROM runs "
+               "WHERE task=?", (int(tid),)) or {}
+    if r.get("live"):
+        return dict(t), time.time()
+    return dict(t), max(float(t["updated"] or 0), float(t["created"] or 0), float(r.get("last") or 0))
+
+
+def stale_holder(db, h: dict | None) -> str:
+    """Why the finish task `h` no longer holds off a host-side upgrade ("" = it still does): it is
+    blocked, or has had no run or update for STALE_S."""
+    if not h or not h.get("task"):
+        return ""
+    t, last = task_activity(db, h["task"])
+    if not t:
+        return ""
+    if t["status"] == "blocked":
+        return "blocked: " + " ".join(str(t.get("blocked_reason") or "no reason given").split())[:300]
+    idle = time.time() - last
+    return f"{t['status']} with no run or update for {idle / 3600:.0f} h" if idle > STALE_S else ""
+
+
+def holder_line(p: Project, h: dict, db=None) -> str:
+    """Who owns a deferral behind finish task `h`, and when it resumes, for deferral lines."""
+    t, last = task_activity(db or p.db, h["task"])
+    status = t["status"] if t else "gone"
+    at = time.time() if status == "blocked" else last + STALE_S
+    return (f"owner: harness task #{h['task']} ({status}); resumes when it ends, or at "
+            f"{timefmt.long(max(at, time.time()), p)} when a host-side `ttp upgrade {p.name}` may take it over")
+
+
+def merge_retry_s(cfg: dict) -> float:
+    try:
+        return max(0.0, float((cfg.get("upgrade") or {}).get("merge_retry_h", MERGE_RETRY_H))) * 3600
+    except (TypeError, ValueError):
+        return MERGE_RETRY_H * 3600
+
+
+def task_ended(db, tid: int) -> float | None:
+    """When task `tid` ended (its last update or run end); None while it is open."""
+    t, last = task_activity(db, tid)
+    if t and t["status"] not in ("done", "failed", "cancelled"):
+        return None
+    return last
 
 
 def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
@@ -232,8 +317,16 @@ def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
         if t and t["status"] not in ("done", "failed", "cancelled"):
             return {"task": int(rec["task"]), "key": rec.get("key"), "target": rec.get("target")}
     if clean and path.exists():
-        path.unlink(missing_ok=True)
+        keep = _fence_fields(rec)     # the generation outlives the task: a fenced task's --apply stays refused
+        if not keep:
+            path.unlink(missing_ok=True)
+        elif rec.get("task"):
+            durable_write(path, json.dumps(keep) + "\n")
     tid = open_upgrade_task(p, db)
+    if tid and fenced(p, tid):      # a crash between fencing it and cancelling it
+        if clean:
+            db.update_task(tid, status="cancelled", blocked_reason="superseded by host upgrade")
+        return None
     return {"task": tid, "key": None, "target": None} if tid else None
 
 
@@ -293,6 +386,51 @@ def note_deferred(p: Project, why: str = "", task: int | None = None) -> None:
     p.db.set_kv(KV_STUCK, rec)
 
 
+KV_FINISH_STUCK = "upgrade_finish_stuck"    # the finish task seen blocked or idle: first seen, escalation sent
+
+
+def escalate_stuck(p: Project) -> str:
+    """The daemon's hourly look at the finish task: once it has been blocked or idle past STALE_S, ONE
+    note goes to the maintainers' upstream inbox with why it is stuck and what a host-side upgrade will
+    do. The first-seen time and the send live in kv, so a restart neither resets nor repeats it; the
+    record goes when the task ends. Returns what it did, for the log ("" = nothing)."""
+    db = p.db
+    rec = db.kv(KV_FINISH_STUCK) or {}
+    h = finish_holder(p)
+    if not h or (rec and rec.get("task") != h["task"]):
+        if rec:
+            db.x("DELETE FROM kv WHERE key=?", (KV_FINISH_STUCK,))
+            rec = {}
+        if not h:
+            return ""
+    why = stale_holder(db, h)
+    if not why:
+        if rec and not rec.get("sent"):     # it moved again before anyone was told
+            db.x("DELETE FROM kv WHERE key=?", (KV_FINISH_STUCK,))
+        return ""
+    now = time.time()
+    if not rec:
+        rec = {"task": h["task"], "first": min(now, task_activity(db, h["task"])[1] or now)}
+    if rec.get("sent") or now - float(rec["first"]) < STALE_S:
+        db.set_kv(KV_FINISH_STUCK, rec)
+        return ""
+    from . import upstream
+    target = h.get("target") or "the installed release"
+    reason = why if why.startswith("blocked") else \
+        f"idle: {why.split(' with ')[0]} with no run or update for over {STALE_S // 3600} h"   # no hours: one fingerprint
+    note = {"title": f"upstream: {p.name}: template upgrade finish task #{h['task']} to {target} is stuck",
+            "spec": f"Harness task #{h['task']} holds the template merge of project {p.name} toward tt-project "
+                    f"{target} and is {reason}. While it holds, the daemon's automatic upgrades wait and the "
+                    f"project runs older code. A host-side `ttp upgrade {p.name}` (not --auto, not from one of "
+                    f"its runs) takes the lock over: it cancels task #{h['task']} (superseded), bumps the lock's "
+                    f"generation so that task's `--apply` is refused, merges the release, and queues one new "
+                    f"merge task if the merge conflicts. Local harness edits are committed and kept."}
+    upstream.append(p.name, h["task"], [note])
+    rec.update(sent=now, target=target, why=reason[:300])
+    db.set_kv(KV_FINISH_STUCK, rec)
+    return f"escalated: harness task #{h['task']} is {reason}"
+
+
 def clear_stuck(p: Project) -> None:
     """The harness took in the template: no conflict is outstanding."""
     p.db.x("DELETE FROM kv WHERE key=?", (KV_STUCK,))
@@ -312,11 +450,12 @@ def hold_reason(p: Project, d: dict) -> str:
     h = finish_holder(p)
     if h:       # a newer release than it targets: `ttp upgrade --auto` retargets the task (once per release)
         if h["key"] == d["key"] or rec.get("key") == d["key"]:
-            return f"harness task #{h['task']} finishes an earlier upgrade"
+            return f"harness task #{h['task']} finishes an earlier upgrade ({holder_line(p, h)})"
         return ""
     if rec.get("key") == d["key"] and rec.get("outcome") == "deferred":
         if time.time() < float(rec.get("until") or 0):
-            return "the merge needs a harness task and one ran less than a day ago"
+            return (f"the merge needs a harness task and one ran less than a day ago (owner: this project's "
+                    f"daemon; resumes at {timefmt.long(float(rec.get('until') or 0), p)})")
         return ""
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
@@ -360,7 +499,7 @@ def line(p: Project, db, cfg: dict) -> str:
         return text + f" (upgrade.auto is off: `ttp upgrade {p.name}` applies it)"
     h = finish_holder(p, db)
     if h:
-        return text + f" (the merge needs harness task #{h['task']})"
+        return text + f" (the merge needs harness task #{h['task']}; {holder_line(p, h, db)})"
     rec = db.kv(KV_AUTO) or {}
     if rec.get("key") == d["key"]:
         if rec.get("outcome") == "running":
@@ -369,7 +508,7 @@ def line(p: Project, db, cfg: dict) -> str:
             return text + " (the automatic upgrade did not finish: see logs/upgrade.log)"
         if rec.get("outcome") == "deferred":
             at = timefmt.long(float(rec.get("until") or 0), p)
-            return text + f" (the merge needs judgment; one harness task a day at most, next try after {at})"
+            return text + f" (the merge needs judgment; one harness task a day at most; owner: this project's daemon; resumes at {at})"
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"
     return text
