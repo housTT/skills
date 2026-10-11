@@ -38304,6 +38304,99 @@ def test_rejected_config_set_points_at_the_open_setup_ask(env):
     assert not p.config()["delivery"].get("allow_protected_push_branch")
 
 
+_MERGE_LINE = "Auto-merge (user, 2026-10-09): PRs in acme/widgets may be merged once CI is green."
+_ONLY_USER_MERGES = "PR flow (user, 2026-10-04): only the user merges PRs in acme/widgets."
+
+
+def _merge_set(value, quote=None):
+    a = {"type": "config_set", "key": "delivery.auto_merge_repos", "value": value}
+    return {**a, "quote": quote} if quote is not None else a
+
+
+def _config_grant_events(p):
+    return p.db.q("SELECT text, data, status FROM events WHERE kind='config_grant' ORDER BY id")
+
+
+def test_auto_merge_repos_never_set_outside_the_user_turn(env):
+    """Outside the user's turn a config_set of delivery.auto_merge_repos is rejected whatever it quotes: a
+    dated '(user, date)' Policies line granting auto-merge, a line reserving merges to the user, or
+    nothing. Removing repos is refused too. The rejection says only the user's word in chat grants it."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nShip it.\n\n## Policies\n- " + _MERGE_LINE + "\n- "
+                              + _ONLY_USER_MERGES + "\n")
+    for value, quote in [(["acme/widgets"], _MERGE_LINE), ("acme/widgets", "- " + _MERGE_LINE),
+                         (["acme/widgets"], _ONLY_USER_MERGES), (["acme/widgets"], None)]:
+        probs = coord.apply(p, [_merge_set(value, quote)])
+        assert probs and "delivery.auto_merge_repos needs the user's approval" in probs[0], (quote, probs)
+        assert "ask_user (blocking merge)" in probs[0] and "never a charter line or a quote" in probs[0], probs
+        assert not p.config()["delivery"]["auto_merge_repos"], quote
+    p.set_config("delivery.auto_merge_repos", ["acme/kept"])
+    for value in ([], "none", ["acme/other"]):
+        probs = coord.apply(p, [_merge_set(value, _MERGE_LINE)])
+        assert probs and "needs the user's approval" in probs[0], (value, probs)
+        assert p.config()["delivery"]["auto_merge_repos"] == ["acme/kept"], value
+    mid = _setting_ask(p, "May the project merge PRs in acme/widgets? That needs delivery.auto_merge_repos.")
+    probs = coord.apply(p, [_merge_set(["acme/kept", "acme/widgets"], _MERGE_LINE)])
+    assert probs and f"open ask #{mid} already asks" in probs[0], probs
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/kept"]
+    assert not _config_grant_events(p)
+
+
+def test_auto_merge_repos_not_opened_by_a_grant_line_the_coordinator_wrote(env):
+    """A coordinator turn without the user can append a dated '(user, date)' auto-merge line to Policies;
+    quoting it in a later turn without the user still changes nothing."""
+    from ttp import coordinator as coord
+    p = make(env)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": _MERGE_LINE}], turn=2) == []
+    assert _MERGE_LINE in p.charter_path.read_text()
+    probs = coord.apply(p, [_merge_set(["acme/widgets"], _MERGE_LINE)], turn=3)
+    assert probs and "needs the user's approval" in probs[0], probs
+    assert not p.config()["delivery"]["auto_merge_repos"]
+    assert not _config_grant_events(p)
+
+
+def test_auto_merge_repos_set_in_the_user_turn_is_logged(env):
+    """In the turn carrying the user's own message a config_set adds repos, and each one is logged as a
+    config_grant event naming that message; a harness-posted message is not the user's word."""
+    from ttp import coordinator as coord
+    p = make(env)
+    system = p.db.one("SELECT id FROM messages WHERE provenance='system'")["id"]
+    probs = coord.apply(p, [_merge_set("acme/a", _MERGE_LINE)], user_turn=True, messages=[system])
+    assert probs and "needs the user's approval" in probs[0], probs
+    assert not p.config()["delivery"]["auto_merge_repos"]
+    said = p.db.post("in", "you may merge PRs in acme/a and acme/b", chat=None, channel="web", kind="user",
+                     provenance="web-session")
+    assert coord.apply(p, [_merge_set("acme/a, acme/b")], user_turn=True, messages=[said]) == []
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/a", "acme/b"]
+    more = p.db.post("in", "acme/c too", chat=None, channel="web", kind="user", provenance="web-session")
+    assert coord.apply(p, [_merge_set(["acme/b", "ACME/A", "acme/c"])], user_turn=True, messages=[system, more]) == []
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/b", "ACME/A", "acme/c"]
+    ev = _config_grant_events(p)
+    assert [e["status"] for e in ev] == ["handled", "handled"]
+    assert f"message #{said}" in ev[0]["text"] and f"message #{more}" in ev[1]["text"], ev
+    first, second = (json.loads(e["data"]) for e in ev)
+    assert first == {"key": "delivery.auto_merge_repos", "value": ["acme/a", "acme/b"], "before": [],
+                     "messages": [said]}
+    assert second["before"] == ["acme/a", "acme/b"] and second["messages"] == [more]
+    probs = coord.apply(p, [_merge_set("acme/x y")], user_turn=True, messages=[more])
+    assert probs and "not an owner/repo name" in probs[0], probs
+
+
+def test_auto_merge_repos_config_set_only_adds_in_the_user_turn(env):
+    """Even in the user's turn a value that drops a listed repo is refused, naming it, and nothing changes."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("delivery.auto_merge_repos", ["acme/kept", "acme/also"])
+    said = p.db.post("in", "merge in acme/new too", chat=None, channel="web", kind="user", provenance="web-session")
+    for value, gone in [(["acme/new"], "acme/kept, acme/also"), ("acme/kept acme/new", "acme/also"),
+                        ([], "acme/kept, acme/also"), ("none", "acme/kept, acme/also")]:
+        probs = coord.apply(p, [_merge_set(value)], user_turn=True, messages=[said])
+        assert probs and f"config_set only adds repos, and this value drops {gone}" in probs[0], (value, probs)
+        assert p.config()["delivery"]["auto_merge_repos"] == ["acme/kept", "acme/also"], value
+    assert not _config_grant_events(p)
+
+
 def test_memory_never_claims_a_rejected_config_change(env):
     """A memory_add naming a setting whose config_set the same turn was rejected says in the entry that
     the change is not in effect (whatever the action order); one naming nothing rejected is kept as is."""

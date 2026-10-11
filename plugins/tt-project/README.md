@@ -495,6 +495,11 @@ and preferences you add later become part of the project's charter and memory.
   `ttp push`) and never fails or undoes the main push. Mirrors run right after the push and
   before `delivery.after_push`, which still runs as before. The push branch itself and invalid
   names are refused, and setting it needs the user's word.
+- `delivery.auto_merge_repos` (`owner/repo` names, none by default) lists the repositories whose
+  pull requests the project may merge itself. The coordinator sets it only in the turn that carries
+  the user's own message saying so, and only adds repos; each change is logged as a `config_grant`
+  event naming that message. A charter Policies line granting auto-merge does not turn it on by
+  itself; the coordinator sets the key in the turn where the user says so.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

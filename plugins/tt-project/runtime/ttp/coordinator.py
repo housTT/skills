@@ -101,6 +101,25 @@ def _backup_remote(v: Any) -> str:
     return v
 
 
+MERGE_KEY = "delivery.auto_merge_repos"
+_REPO = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]*\w")
+
+
+def _repo_list(v: Any) -> list[str]:
+    """delivery.auto_merge_repos as config_set takes it: owner/repo names, as a list or separated by
+    commas or spaces; "none" or empty is []."""
+    if v in (None, False, "") or str(v).strip().lower() == "none":
+        return []
+    out: list[str] = []
+    for r in (v if isinstance(v, list) else re.split(r"[,\s]+", str(v))):
+        r = str(r).strip()
+        if r and not _REPO.fullmatch(r):
+            raise ValueError(f"not an owner/repo name: {r!r}")
+        if r and r not in out:
+            out.append(r)
+    return out
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -137,6 +156,9 @@ USER_SETTABLE = {
     "delivery.allow_protected_push_branch": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
     "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # Repos whose PRs the project may merge itself. Set only in the turn carrying the user's own message,
+    # and only added to (_only_adds_repos); a charter line or a quote never opens it.
+    MERGE_KEY: _repo_list,
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     # 0 stops new tasks.
     "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),
@@ -624,7 +646,7 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "budget.global_daily_usd": "spend",
               "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
               "delivery.fast_forward_also": "restriction", "delivery.mirror_remotes": "restriction",
-              "delivery.allow_protected_push_branch": "restriction"}
+              "delivery.allow_protected_push_branch": "restriction", MERGE_KEY: "merge"}
 SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch"}
@@ -1395,14 +1417,26 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 if key == "delivery.mirror_remotes":
                     value = push.mirror_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
-                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "", [])):
+                # Merges count only the user's own message of this turn (none the harness posted).
+                said = _users_own(db, messages or []) if user_turn and key == MERGE_KEY else []
+                by_user = bool(said) if key == MERGE_KEY else user_turn
+                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and value in (False, "", [])):
                     open_ask = settinghold.asked(db, key)
                     raise ValueError(f"{key} needs the user's approval: "
                                      + (f"open ask #{open_ask} already asks; " if open_ask else
                                         f"ask_user (blocking {NEEDS_USER[key]}) with the exact value, and ")
-                                     + "set it in the turn that carries their yes")
+                                     + "set it in the turn that carries their yes"
+                                     + ("; only their word in chat grants it, never a charter line or a quote"
+                                        if key == MERGE_KEY else ""))
+                before = _only_adds_repos(cfg, value) if key == MERGE_KEY else []
                 p.set_config(key, value)
                 cfg = p.config()
+                if key == MERGE_KEY:   # the audit trail: which of the user's messages let this turn set it
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", "config_grant", "low",
+                          f"config_set {key} {json.dumps(value)} on the user's word in message "
+                          + ", ".join(f"#{m}" for m in said),
+                          json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")
@@ -1448,6 +1482,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         db.x(f"UPDATE messages SET text=text||? WHERE id IN ({','.join('?' * len(replies))})",
              [f"\n\n(not done: {note})", *replies])
     return problems
+
+
+def _only_adds_repos(cfg: dict, value: list[str]) -> list[str]:
+    """delivery.auto_merge_repos before a config_set to `value`, when `value` keeps every repo it lists:
+    a config_set only adds repos, so a whole-list value that leaves one out by mistake never drops a
+    grant the user gave. Raises ValueError naming the repos it would remove."""
+    cur = (cfg.get("delivery") or {}).get("auto_merge_repos") or []
+    have = [str(r).strip() for r in (cur if isinstance(cur, list) else re.split(r"[,\s]+", str(cur))) if str(r).strip()]
+    keep = {r.lower() for r in value}   # GitHub names ignore case
+    if gone := [r for r in have if r.lower() not in keep]:
+        raise ValueError(f"{MERGE_KEY}: config_set only adds repos, and this value drops {', '.join(gone)}; "
+                         f"list every repo already in it ({', '.join(have)}) plus the new ones. A repo "
+                         f"comes off the list only by the user's own `ttp config` change")
+    return have
 
 
 def _unapplied_config_note(text: str, refused: dict[str, str]) -> str:
