@@ -37,12 +37,18 @@ sys.path.insert(0, str(RUNTIME))
 
 def _sockets_refused() -> bool:
     """Some sandboxes (`codex sandbox` with the network off) refuse to create a network socket at all,
-    even one for loopback, and to bind a Unix socket."""
+    even one for loopback, and to bind a Unix socket. The probe binds a name relative to its temporary
+    folder, so a deep TMPDIR (past the ~104-byte Unix socket path limit) is not taken for a refusal."""
     import tempfile
     try:
         socket.socket().close()
         with tempfile.TemporaryDirectory() as d, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
-            s.bind(os.path.join(d, "s"))
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                s.bind("s")
+            finally:
+                os.chdir(cwd)
         return False
     except PermissionError:
         return True
@@ -38375,6 +38381,87 @@ def test_check_commands_have_first_failure_semantics(env, tmp_path):
     assert run(f'head=$({git}) || exit 1; [ "$head" = "" ] && echo skipped') != 0
 
 
+# A pytest plugin for a child test run: an audit hook logs every write, folder, link or socket bind
+# under TTP_TEST_FORBID_ROOT that is not under TTP_TEST_ALLOW_ROOT to TTP_TEST_FORBID_LOG. Forked
+# workers inherit the hook.
+_FORBID_AUDIT = """
+import os, sys
+_forbid = os.path.realpath(os.environ["TTP_TEST_FORBID_ROOT"])
+_allow = os.path.realpath(os.environ["TTP_TEST_ALLOW_ROOT"])
+_log = os.environ["TTP_TEST_FORBID_LOG"]
+_WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+
+def _under(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _hook(event, args):
+    if event == "open":
+        path, mode, flags = args
+        if not (isinstance(flags, int) and flags & _WRITE) and not any(c in str(mode or "") for c in "wax+"):
+            return
+    elif event in ("os.mkdir", "os.symlink", "os.rename", "socket.bind", "tempfile.mkdtemp", "tempfile.mkstemp"):
+        path = args[1] if event in ("os.symlink", "os.rename", "socket.bind") else args[0]
+    else:
+        return
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    if not isinstance(path, (str, os.PathLike)) or not str(path):
+        return
+    real = os.path.realpath(path)
+    if _under(real, _forbid) and not _under(real, _allow):
+        with open(_log, "a") as f:
+            f.write(f"{event} {real}\\n")
+
+
+sys.addaudithook(_hook)
+"""
+
+
+def _forbid_audit_plugin(where: pathlib.Path) -> pathlib.Path:
+    where.mkdir(parents=True, exist_ok=True)
+    (where / "ttp_forbid_audit.py").write_text(_FORBID_AUDIT)
+    return where
+
+
+def test_the_forbidden_root_audit_logs_writes_outside_the_allowed_root(tmp_path):
+    # Negative control for the audit the isolation regression relies on, with a forbidden root of its
+    # own (never /tmp): writes outside the allowed root are logged, writes inside it are not.
+    forbid, log = tmp_path / "forbid", tmp_path / "audit.log"
+    allow = forbid / "allow"
+    allow.mkdir(parents=True)
+    plugin = _forbid_audit_plugin(tmp_path / "plugin")
+    code = ("import ttp_forbid_audit, os, sys, tempfile\n"
+            "f, a = sys.argv[1:]\n"
+            "open(os.path.join(a, 'ok'), 'w').close()\n"
+            "tempfile.mkdtemp(dir=a)\n"
+            "open(os.path.join(f, 'leak'), 'w').close()\n"
+            "tempfile.mkdtemp(dir=f, prefix='leakdir')\n"
+            "open(os.path.join(f, 'leak')).read()\n")
+    env = {**os.environ, "PYTHONPATH": str(plugin), "TTP_TEST_FORBID_ROOT": str(forbid),
+           "TTP_TEST_ALLOW_ROOT": str(allow), "TTP_TEST_FORBID_LOG": str(log)}
+    subprocess.run([sys.executable, "-c", code, str(forbid), str(allow)], env=env, check=True)
+    lines = log.read_text().splitlines()
+    assert any(x.startswith("open ") and x.endswith("/leak") for x in lines), lines
+    assert any(x.startswith("tempfile.mkdtemp ") and "/leakdir" in x for x in lines), lines
+    assert not any(str(allow) in x for x in lines), lines
+    assert len([x for x in lines if x.startswith("open ")]) == 1, "a read is not a write"
+
+
+def test_the_socket_probe_survives_a_tmpdir_past_the_unix_socket_path_limit(tmp_path, monkeypatch):
+    # Deep enough that an absolute socket path in it is too long for any platform's sun_path.
+    deep = tmp_path / ("d" * 60) / ("e" * 60)
+    deep.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(deep))
+    with tempfile.TemporaryDirectory() as d, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        with pytest.raises(OSError):
+            s.bind(os.path.join(d, "s"))
+    cwd = os.getcwd()
+    assert _sockets_refused() is False
+    assert os.getcwd() == cwd and not list(deep.iterdir()), "the probe restores the folder and cleans up"
+
+
 @pytest.mark.parametrize("jobs", [1, 2])
 def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp_path, monkeypatch, jobs):
     from ttp import cli
@@ -38388,21 +38475,25 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
         "test_check_commands_have_first_failure_semantics",
     )]
     p.set_config("delivery.push_checks", [shlex.join([
-        sys.executable, "-m", "pytest", "-q", "-o", "tmp_path_retention_policy=all", *targets,
+        sys.executable, "-m", "pytest", "-q", "-p", "ttp_forbid_audit", "-o", "tmp_path_retention_policy=all",
+        *targets,
     ])])
-    # Double nesting a pytest run exceeds Unix socket path limits in the collection-time socket
-    # probe. A short alias keeps that probe usable; all temporary files still live in nested_tmp,
-    # and pytest resolves its basetemp, so both git and project discovery see the real ancestors.
-    with tempfile.TemporaryDirectory(prefix="ttp-test-", dir="/tmp") as alias:
-        link = pathlib.Path(alias) / "tmp"
-        link.symlink_to(nested_tmp, target_is_directory=True)
-        for var in ("TMPDIR", "TMP", "TEMP"):
-            monkeypatch.setenv(var, str(link))
-        cli.main(["checks"])
+    # The child run's TMPDIR is the deep run-local folder itself, with no short alias elsewhere; the
+    # audit logs anything the child creates under /tmp outside it.
+    audit_log = tmp_path / "forbid-audit.log"
+    plugin = _forbid_audit_plugin(tmp_path / "audit-plugin")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(plugin), os.environ.get("PYTHONPATH")])))
+    monkeypatch.setenv("TTP_TEST_FORBID_ROOT", "/tmp")
+    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", str(nested_tmp))
+    monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(var, str(nested_tmp))
+    cli.main(["checks"])
     record = json.loads((run / "checks.json").read_text())
     assert record["passed"] is True
     assert "2 passed" in (run / "checks.log").read_text()
     assert list(nested_tmp.glob("pytest-of-*/pytest-*")), "pytest kept its files under the run's TMPDIR"
+    assert not audit_log.exists(), audit_log.read_text()
 
 
 def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monkeypatch, capsys):
