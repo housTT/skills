@@ -1009,11 +1009,12 @@ def cmd_web(a) -> None:
 
 
 def cmd_note(a) -> None:
-    run_dir = os.environ.get("TTP_RUN_DIR")
+    # Model-free completion commands get only note context, never a full worker context.
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get("TTP_NOTE_RUN_DIR")
     if not run_dir:
         die("ttp note only works inside a tt-project run")
     if a.to:
-        _note_to(a)
+        _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {a.text}\n")
 
 
@@ -1035,7 +1036,7 @@ def cmd_notify(a) -> None:
     print("queued for the user: it is sent when this run ends; say so in the hand-off")
 
 
-def _note_to(a) -> None:
+def _note_to(a, run_dir: str) -> None:
     """`ttp note --to <project>`: a worker's note for another project, filed in the user's upstream
     inbox with this run's project and task (upstream.send); one on another machine is sent on there by
     the daemon (upstream.forward). Nothing of the other project's is written; its daemon reads the
@@ -1070,7 +1071,7 @@ def _note_to(a) -> None:
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
-        upstream.queue(Path(os.environ["TTP_RUN_DIR"]), a.to, text, a.severity)
+        upstream.queue(Path(run_dir), a.to, text, a.severity)
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, text)} when the run ends{sent}")
         return

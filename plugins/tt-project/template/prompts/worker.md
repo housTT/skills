@@ -160,6 +160,8 @@ never write to a run folder named in earlier context):
   `retry_when` passes, the daemon runs it model-free from the project root (killed after
   `waiting.on_pass_timeout_s`, 600 s by default). Exit 0 with a `done` hand-off written to `$TTP_RESULT`
   ends the task with no model run; anything else wakes it as usual with the command's output tail.
+  It may use `ttp note` or `ttp note --to <project>`; notes retain the waiting task's attribution
+  and durable delivery. This note-only context does not enable other commands that require a run.
   Make it safe to run twice.
   The driver runs with `set -eo pipefail`, never pipes a step into tail/head, logs each step's
   exit code and writes the first non-zero one into the marker, so the next run sees the refusal.

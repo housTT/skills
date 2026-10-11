@@ -21552,6 +21552,63 @@ def test_an_on_pass_cmd_keeps_the_task_asleep_while_it_runs_and_runs_once(env, m
         dmod._kill_group(d._on_pass[tid][0])
 
 
+@pytest.mark.parametrize("stale_context", [False, True])
+def test_an_on_pass_cmd_can_send_notes_with_only_note_context(env, monkeypatch, tmp_path, stale_context):
+    from ttp import daemon as dmod
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "second").mkdir()
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    cmd = ("set -e; ttp note 'job checked'; "
+           "ttp note --to second 'job finished'; ttp note --to second 'job finished'; "
+           "test -z \"$TTP_RUN_DIR$TTP_RUN_ID\"; "
+           "if ttp notify 'should refuse'; then exit 10; fi; "
+           "if ttp checks; then exit 11; fi; "
+           "printf '{\"status\":\"done\",\"summary\":\"checked and reported\"}' > \"$TTP_RESULT\"")
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd)
+    # Even a daemon launched with stale worker variables must not grant a full run context.
+    if stale_context:
+        monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "stale-run"))
+        monkeypatch.setenv("TTP_RUN_ID", "999")
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    output = (run_dir / "on_pass" / "on_pass.log").read_text()
+    assert task["status"] == "done", (task["result"], output)
+    (note,) = _upstream_inbox(env)
+    assert (note["project"], note["task"], note["to"], note["from"], note["spec"]) == (
+        p.name, tid, "second", "worker", "job finished")
+    assert "stored 12 characters" in output and "sha256" in output
+    assert "job checked" in (run_dir / "progress.md").read_text()
+    assert "ttp notify only works inside a tt-project run" in output
+    assert "ttp checks only works inside a tt-project run" in output
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_on_pass_note_context_preserves_deferred_delivery(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "second").mkdir()
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    run_dir = _note_run(env, monkeypatch, p)
+    monkeypatch.delenv("TTP_RUN_DIR")
+    monkeypatch.delenv("TTP_RUN_ID")
+    monkeypatch.setenv("TTP_NOTE_RUN_DIR", str(run_dir))
+
+    def denied(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "read-only inbox")
+
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "send_or_queue", denied)
+        assert _note(cli, "--to", "second", "job finished") == 0
+    assert "stored 12 characters" in capsys.readouterr().out
+    assert upstream.send_queued(run_dir, p.name, 57, p.state)["sent"] == 1
+    (note,) = _upstream_inbox(env)
+    assert (note["project"], note["task"], note["spec"]) == (p.name, 57, "job finished")
+
+
 _TO_RESULT = ' > "$TTP_RESULT"'
 
 

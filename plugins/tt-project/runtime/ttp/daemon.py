@@ -5092,11 +5092,15 @@ class Daemon:
         shutil.rmtree(out, ignore_errors=True)   # a result from an earlier try must not count
         out.mkdir(parents=True)
         timeout = float((self.cfg.get("waiting") or {}).get("on_pass_timeout_s") or ON_PASS_TIMEOUT_S)
+        # Only `ttp note` reads this context. Other commands must not become worker commands,
+        # even when the daemon inherited a run's environment. Keep deferred notes in the original
+        # run, where _finish_worker files them, rather than the disposable on_pass output folder.
+        env = {k: v for k, v in self._probe_env().items() if k not in ("TTP_RUN_DIR", "TTP_RUN_ID")}
+        env.update(TTP_TASK=str(tid), TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
         with open(out / ON_PASS_LOG, "wb") as f:
             proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
                                     stderr=subprocess.STDOUT, start_new_session=True,
-                                    env={**self._probe_env(), "TTP_TASK": str(tid),
-                                         "TTP_RESULT": str(out / RESULT_FILE)})
+                                    env=env)
         self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
