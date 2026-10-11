@@ -9418,6 +9418,114 @@ def test_plain_command_watcher_errors_clear_on_the_next_successful_run(env, tmp_
     assert r["open_titles"]() == {"disk 1: nearly full"}
 
 
+def test_command_watcher_exit_1_is_a_normal_run_and_only_error_true_lines_are_errors(env, tmp_path):
+    """The documented protocol: exit 0 or 1 is a normal run, so every line it prints is a report under
+    watcher:<name>, however it is worded; only a JSON line with "error": true (the JSON boolean) is the
+    watcher's own error, under watcher-error:<name>, cleared by the next successful run without it."""
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path, name="acct", lifecycle=None)
+    tick, db, src, err, out = r["tick"], r["db"], r["src"], r["err"], r["out"]
+
+    def issues(source):
+        return db().q("SELECT title, status, lifecycle, cleared_why FROM issues WHERE source=?", (source,))
+
+    def fix_tasks():
+        return db().one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE '%schedule_fix:acct%'")["n"]
+
+    # Exit 1 without error:true, even when the text says error: reports, and the run is ok.
+    plain = (_line("ledger: entry missing") + _line("ledger: error reading the books")
+             + _line("ledger: a string is not the flag", error="true"))
+    assert tick(plain, command=f"cat {out}; exit 1") == ("ok (3 observations)", 3)
+    assert len(issues(src)) == 3 and issues(err) == []
+    # Twice in a row is still a healthy schedule: no fix task.
+    assert tick(command=f"cat {out}; exit 1")[0] == "ok (3 observations)" and fix_tasks() == 0
+    # The same failure with "error": true is the watcher's own error, also at exit 1.
+    assert tick(_line("ledger: cannot read the books", error=True), command=f"cat {out}; exit 1") \
+        == ("ok (1 observations)", 1)
+    assert [(x["title"], x["status"], x["lifecycle"]) for x in issues(err)] \
+        == [("ledger: cannot read the books", "open", scr.ERROR)]
+    assert len(issues(src)) == 3, "an error line opens no report"
+    assert tick(command=f"cat {out}; exit 1")[1] == 0, "a known error does not wake again"
+    # The next successful run that no longer prints it repairs it; its reports stay as they were.
+    assert tick(_line("ledger: entry missing"), command=f"cat {out}; exit 1")[1] == 0
+    assert [(x["status"], x["cleared_why"]) for x in issues(err)] == [("fixed", scr.REPAIRED_WHY)]
+    # Any other exit code is a failed run: its lines still stand, and the failure is an error of its own.
+    assert tick(command=f"cat {out}; echo broke >&2; exit 2")[1] == 1
+    assert any(x["title"].startswith("watcher command exited rc=2") and x["status"] == "open"
+               for x in issues(err))
+    assert fix_tasks() == 0
+    # The skill and the coordinator's schedule_set entry say so.
+    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
+    prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "exit 0 or 1 is a normal run" in skill and '`"error": true` (the JSON boolean' in skill
+    assert "any other exit code is a failed run" in skill.lower()
+    assert "exit 0 or 1 is a normal run" in prompt and '`"error": true` (the JSON boolean)' in prompt
+
+
+def test_watcher_sweep_before_its_schedule_exists_then_its_first_run(env, tmp_path):
+    """The tick sweeps watcher issues before any command schedule exists (a new project, or a schedule
+    still to come from schedules.json or schedule_set): nothing breaks, a leftover issue of an unknown
+    watcher closes on the default 24 h rule, and the schedule's first run then works as usual."""
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    from ttp.daemon import Daemon
+    p = make(env)
+    assert not p.db.q("SELECT name FROM schedules WHERE kind='command'")
+    d = Daemon(p.base)
+    d.gates = {}
+    assert d.sweep_watcher_issues() == 0
+    now = time.time()
+    for fp, source, seen, life in (("old", "watcher:later", now - 25 * 3600, None),
+                                   ("recent", "watcher:later", now - 3600, None),
+                                   ("err", "watcher-error:later", now - 3600, scr.ERROR)):
+        p.db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,status,lifecycle) "
+               "VALUES(?,?,?,?,?,?,?)", (fp, source, seen, seen, fp, "open", life))
+    assert d.sweep_watcher_issues() == 1
+    status = lambda fp: p.db.one("SELECT status FROM issues WHERE fingerprint=?", (fp,))["status"]
+    assert (status("old"), status("recent"), status("err")) == ("fixed", "open", "open")
+    out = tmp_path / "later.txt"
+    out.write_text(_line("books: 2 entries late"))
+    assert coord.apply(p, [{"type": "schedule_set", "name": "later", "kind": "command", "every": "1h",
+                            "command": f"cat {out}; exit 1"}]) == []
+    d.p.db.x("UPDATE schedules SET next_run=? WHERE name='later'", (time.time() - 1,))
+    d.sweep_watcher_issues()
+    d.run_schedules()
+    assert d.p.db.one("SELECT last_status FROM schedules WHERE name='later'")["last_status"] == "ok (1 observations)"
+    assert status("err") == "fixed", "its first successful run repairs the error it no longer reports"
+    assert d.p.db.one("SELECT COUNT(*) n FROM issues WHERE source='watcher:later' AND status='open' "
+                      "AND fingerprint NOT IN ('old','recent')")["n"] == 1
+
+
+def test_an_old_database_with_open_watcher_issues_migrates_and_then_recovers(env, tmp_path):
+    """A database from before issue lifecycles, with open watcher reports and errors in it, keeps them
+    open through the migration; the watcher's next runs then recover it as on a new one."""
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path, name="acct", lifecycle=None)
+    db, src, err, out = r["db"], r["src"], r["err"], r["out"]
+    r["tick"](_line("ledger: entry missing") + _line("ledger: cannot read the books", error=True))
+    before = {(x["source"], x["title"]) for x in db().q("SELECT source, title FROM issues WHERE status='open'")}
+    assert before == {(src, "ledger: entry missing"), (err, "ledger: cannot read the books")}
+    # Back to the old schema: no lifecycle, subject or opened columns.
+    for col in ("lifecycle", "subject", "opened"):
+        db().x(f"ALTER TABLE issues DROP COLUMN {col}")
+    r["restart"]()
+    cols = {x["name"] for x in db().q("PRAGMA table_info(issues)")}
+    assert {"lifecycle", "subject", "opened"} <= cols
+    assert {(x["source"], x["title"]) for x in db().q("SELECT source, title FROM issues WHERE status='open'")} \
+        == before, "the migration closes nothing"
+    assert all(x["opened"] == x["first_seen"] for x in db().q("SELECT opened, first_seen FROM issues"))
+    # A recurrence of the error after the migration wakes nothing new and keeps one issue.
+    assert r["tick"]()[1] == 0
+    assert db().one("SELECT lifecycle FROM issues WHERE source=?", (err,))["lifecycle"] == scr.ERROR
+    # Repaired: a successful run without the error line closes it; the report stays.
+    assert r["tick"](_line("ledger: entry missing"))[1] == 0
+    assert db().one("SELECT status FROM issues WHERE source=?", (err,))["status"] == "fixed"
+    assert r["open_titles"]() == {"ledger: entry missing"}
+    # A run that prints nothing closes the rest.
+    out.write_text("")
+    assert r["tick"]()[0] == "ok (0 observations)" and r["open_titles"]() == set()
+
+
 def test_ordinary_expiry_stays_for_sources_that_did_not_opt_in(env, tmp_path):
     from ttp import coordinator as coord
     r = _receipt_rig(env, tmp_path, name="plain", lifecycle=None)
