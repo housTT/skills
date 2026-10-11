@@ -41409,3 +41409,162 @@ def test_codex_meter_reads_plan_windows_from_the_app_server(env, monkeypatch, tm
         "secondary": {"usedPercent": 7.5, "windowDurationMins": 10080}}}))
     wins = codex.Codex().meter()
     assert [(w.window, w.utilization) for w in wins] == [("5h", 42.0), ("7d", 7.5)]
+
+
+# Urgent user obligations (obligations.py, Daemon.check_obligations) ----------------------------------
+def _ob_setup(env, monkeypatch):
+    """A project, an owner task, and `check(at)`: one daemon pass (files run records, raises
+    anomalies) at time `at`; it returns the obligation anomalies raised so far."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    d = Daemon(p.base)
+    now = time.time()
+    tid = p.db.add_task("build the deliverable", "make it", kind="work", tier="light", origin="coordinator")
+
+    def check(at):
+        monkeypatch.setattr(time, "time", lambda: at)
+        d._obligations_at = 0.0
+        d.check_obligations()
+        return p.db.q("SELECT * FROM events WHERE kind='obligation_overdue' ORDER BY id")
+    return p, d, now, tid, check
+
+
+def test_obligation_clock_is_not_reset_by_edits_tokens_running_or_waiting(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    assert "## Obligation o1 " in p.db.task(tid)["spec"], "the owner is told through its spec"
+    # Activity of every kind but durable progress, within the first two hours.
+    p.db.update_task(tid, status="running", spec=p.db.task(tid)["spec"] + "\nedited", title="renamed")
+    run_dir = p.runs / "r1"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir,progress_ts,input_tokens,output_tokens) "
+           "VALUES(?,?,?,?,?,?,?,?)", (tid, "worker", now + 600, "running", str(run_dir), now + 7000, 90000, 5000))
+    assert ob.attach(p, oid, [tid], now=now + 3600) == [], "a re-attach keeps the clock"
+    p.db.update_task(tid, status="waiting", not_before=now + 9000)
+    assert check(now + 2 * 3600 - 60) == []
+    evs = check(now + 2 * 3600 + 60)
+    assert len(evs) == 1, "two hours with no durable progress raise, whatever the task did meanwhile"
+    assert evs[0]["fingerprint"] == f"obligation:{oid}:1" and evs[0]["severity"] == "high" \
+        and evs[0]["status"] == "queued" and evs[0]["task"] == tid
+    assert f"#{tid} (waiting)" in evs[0]["text"] and "the urgent report" in evs[0]["text"], evs[0]["text"]
+
+
+def test_obligation_progress_resets_only_its_owners_clock(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("second part", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the urgent report", [tid, other], now=now)
+    ob.record(p, oid, "progress", "commit abc123", tid, now=now + 3600)
+    evs = check(now + 2 * 3600 + 60)
+    assert len(evs) == 1 and f"#{other} " in evs[0]["text"] and f"#{tid} " not in evs[0]["text"], \
+        "each owner has its own clock"
+    stranger = p.db.add_task("unrelated", "s", kind="work", tier="light", origin="coordinator")
+    with pytest.raises(ValueError, match="not a required owner"):
+        ob.record(p, oid, "progress", "commit def", stranger, now=now + 2 * 3600 + 120)
+    with pytest.raises(ValueError, match="needs evidence"):
+        ob.record(p, oid, "progress", "  ", tid)
+
+
+def test_obligation_done_without_receipt_stays_owed_until_a_receipt(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "finished"}))
+    assert check(now + 3600) == []
+    assert ob.get(p.db, oid)["receipt"] is None and "owed" in ob.lines(p.db, now + 3600)[0]
+    evs = check(now + 2 * 3600 + 60)
+    assert len(evs) == 1 and f"#{tid} (done without a receipt)" in evs[0]["text"], evs[0]["text"]
+    with pytest.raises(ValueError, match="is done"):
+        ob.attach(p, ob.add(p, "another", now=now), [tid], now=now)
+    ob.record(p, oid, "receipt", "report at docs/report.md, checked", None, now=now + 3 * 3600)
+    assert ob.overdue(ob.get(p.db, oid), now + 99 * 3600) == []
+    assert [e["fingerprint"] for e in check(now + 10 * 3600)].count(f"obligation:{oid}:1") == 1 \
+        and not [e for e in check(now + 10 * 3600) if e["fingerprint"].startswith(f"obligation:{oid}:2")], \
+        "a receipt ends it: nothing more is raised"
+    assert "received" in ob.lines(p.db)[0]
+
+
+def test_obligation_anomaly_is_raised_once_per_stall_with_no_timed_rewakes(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    for h in (2.1, 3, 6, 24, 72):
+        evs = check(now + h * 3600)
+        assert len(evs) == 1, f"one keyed anomaly per obligation, not repeated on a timer ({h} h)"
+    ob.record(p, oid, "progress", "commit abc", tid, now=now + 72 * 3600)
+    assert len(check(now + 73 * 3600)) == 1, "fresh progress ends the stall"
+    evs = check(now + 74.5 * 3600)
+    assert len(evs) == 2 and evs[1]["fingerprint"] == f"obligation:{oid}:2", "a new stall is a new episode"
+    assert len(check(now + 80 * 3600)) == 2
+
+
+def test_obligation_without_owner_raises_after_the_clock(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    ob.add(p, "a deliverable nobody owns", now=now)
+    assert check(now + 3600) == []
+    evs = check(now + 2 * 3600 + 60)
+    assert len(evs) == 1 and "no owner task is attached" in evs[0]["text"] and evs[0]["task"] is None
+
+
+def test_obligation_attach_tells_a_running_owner_through_steer(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", now=now)
+    run_dir = p.runs / "r9"
+    run_dir.mkdir(parents=True)
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)", (tid, "worker", now, "running",
+                                                                               str(run_dir)))
+    assert ob.attach(p, oid, [tid], now=now) == [tid]
+    steer = (run_dir / "steer.md").read_text()
+    assert f"Obligation {oid}" in steer and f"ttp obligation progress {oid}" in steer
+    assert p.db.task(tid)["spec"].count(f"## Obligation {oid} ") == 1
+    ob.attach(p, oid, [tid], now=now + 60)
+    assert (run_dir / "steer.md").read_text() == steer, "attaching again tells nobody twice"
+
+
+def test_obligation_records_from_a_run_are_filed_for_its_own_task_only(env, monkeypatch):
+    from ttp import cli
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    stranger = p.db.add_task("unrelated", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    dirs = {}
+    for t in (tid, stranger):
+        dirs[t] = p.runs / f"run-{t}"
+        dirs[t].mkdir(parents=True)
+        p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+               (t, "worker", now, "running", str(dirs[t])))
+    monkeypatch.setattr(time, "time", lambda: now + 3600)
+    for t in (tid, stranger):
+        monkeypatch.setenv("TTP_RUN_DIR", str(dirs[t]))
+        monkeypatch.setenv("TTP_TASK", str(t))
+        cli.main(["obligation", "progress", oid, "commit abc123"])
+    with pytest.raises(SystemExit):
+        cli.main(["obligation", "add", "something"])
+    monkeypatch.delenv("TTP_RUN_DIR")
+    monkeypatch.delenv("TTP_TASK")
+    assert check(now + 2 * 3600 + 60) == [], "the owner's run record reset its clock"
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"][0]["text"] == "commit abc123"
+    assert check(now + 2 * 3600 + 120) == [], "a record is filed once"
+    assert len(ob.get(p.db, oid)["owners"][str(tid)]["evidence"]) == 1
+    (dirs[tid] / ob.RUN_FILE).open("a").write(json.dumps({"ts": now + 99 * 3600, "id": oid, "kind": "receipt",
+                                                           "evidence": "docs/report.md"}) + "\n")
+    check(now + 2 * 3600 + 180)
+    assert ob.get(p.db, oid)["receipt"]["at"] == now + 2 * 3600 + 180, "a record is never dated in the future"
+
+
+def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "obligation", "text": "the urgent report"}]) == []
+    assert ob.get(p.db, "o1")["owners"] == {}
+    assert coord.apply(p, [{"type": "obligation", "key": "o1", "owners": [tid]}]) == []
+    assert str(tid) in ob.get(p.db, "o1")["owners"] and "## Obligation o1 " in p.db.task(tid)["spec"]
+    assert coord.apply(p, [{"type": "obligation", "key": "o1", "evidence": "docs/report.md (owner checked)"}]) == []
+    assert ob.get(p.db, "o1")["receipt"]["evidence"] == "docs/report.md (owner checked)"
+    assert coord.apply(p, [{"type": "obligation", "key": "o1"}]) != [], "an action with nothing to do is rejected"

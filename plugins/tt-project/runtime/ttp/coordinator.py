@@ -35,7 +35,7 @@ from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "escalate", "sweep", "noop")
+                "escalate", "sweep", "obligation", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -84,7 +84,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
-            "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"}},
+            "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"},
+            "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -1437,6 +1438,18 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                           f"config_set {key} {json.dumps(value)} on the user's word in message "
                           + ", ".join(f"#{m}" for m in said),
                           json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
+            elif t == "obligation":
+                from . import obligations
+                oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
+                if not oid:
+                    oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator")
+                    notes.append(f"obligation {oid} recorded")
+                elif str(a.get("evidence") or "").strip():
+                    notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None))
+                elif owners:
+                    obligations.attach(p, oid, owners)
+                else:
+                    raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach) or `evidence` (receipt)")
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")

@@ -2279,6 +2279,51 @@ def cmd_heal(a) -> None:
     sys.exit(0 if rc == 0 else 1 if rc == 1 or heal.finding(rc, out) else 75)
 
 
+def cmd_obligation(a) -> None:
+    """`ttp obligation add|attach|progress|receipt|list`: urgent deliverables owed to the user (obligations.py).
+    Inside a run, progress and receipts go to the run's file and the daemon files them for its task."""
+    from . import obligations as ob
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir and a.action in ("progress", "receipt"):
+        task = os.environ.get("TTP_TASK") or ""
+        if not task.isdigit():
+            die(f"ttp obligation {a.action}: this run has no task (TTP_TASK)")
+        if len(a.args) != 2 or not a.args[1].strip():
+            die(f"usage: ttp obligation {a.action} <id> \"<evidence>\"")
+        ob.append_run(Path(run_dir), a.args[0], a.action, a.args[1], task)
+        print(f"{a.action} on {a.args[0]} recorded for task #{task}; the daemon files it within "
+              f"{ob.CHECK_EVERY_S // 60} min (only if this task owns {a.args[0]})")
+        return
+    if run_dir:
+        die(f"ttp obligation {a.action} is for the user or the coordinator, not inside a run; an owner "
+            f"records `progress` and `receipt`")
+    p = need(a.project, sys.argv[1:]) if a.project else here()
+    if not p:
+        die("no tt-project project here; name one with --project")
+    try:
+        if a.action == "add":
+            if len(a.args) != 1:
+                die('usage: ttp obligation add "<what is owed>" [--owner <task>]...')
+            oid = ob.add(p, a.args[0], [int(t) for t in a.owner or []])
+            print(f"obligation {oid} recorded" + (f"; owners: {', '.join('#' + str(t) for t in a.owner)}"
+                                                  if a.owner else "; attach its owner tasks with `ttp obligation attach`"))
+        elif a.action == "attach":
+            if len(a.args) < 2 or not all(x.lstrip("#").isdigit() for x in a.args[1:]):
+                die("usage: ttp obligation attach <id> <task>...")
+            new = ob.attach(p, a.args[0], [int(x.lstrip("#")) for x in a.args[1:]])
+            print(f"attached to {', '.join('#' + str(t) for t in new)}" if new else "already attached")
+        elif a.action in ("progress", "receipt"):
+            if len(a.args) != 2:
+                die(f"usage: ttp obligation {a.action} <id> \"<evidence>\" [--task <owner>]")
+            print(ob.record(p, a.args[0], a.action, a.args[1], a.task))
+        elif a.json:
+            print(json.dumps(ob.items(p.db), indent=1))
+        else:
+            print("\n".join(ob.lines(p.db)) or "no obligations")
+    except ValueError as e:
+        die(str(e))
+
+
 def cmd_machines(a) -> None:
     """The user's machines (~/.tt-project/machines.json), shared by all their projects. Each
     project's charter says which of them it may use; its coordinator routes work only to those.
@@ -3626,6 +3671,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--tier", default="standard")
     s.add_argument("--priority", type=int, default=3)
     s.set_defaults(fn=cmd_task)
+
+    s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
+                                          "record progress and receipts, list")
+    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "list"])
+    s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>")
+    s.add_argument("--owner", type=int, action="append", help="add: a required owner task (repeatable)")
+    s.add_argument("--task", type=int, help="progress/receipt outside a run: the owner task it is for")
+    s.add_argument("--project", help="the project (default: the one here)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_obligation)
 
     s = sub.add_parser("memory", help="add a memory, or retire one with --forget")
     s.add_argument("name")

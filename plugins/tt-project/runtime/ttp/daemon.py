@@ -51,6 +51,7 @@ from . import localspend
 from . import locks
 from . import machine_ledger
 from . import netwait
+from . import obligations
 from . import machines
 from . import prguard
 from . import push
@@ -657,7 +658,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3028,6 +3029,22 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
+
+    def check_obligations(self) -> None:
+        """Urgent user obligations (obligations.py), model-free: file the progress and receipts runs
+        recorded, then one keyed high observation per obligation whose owner went CLOCK_S without durable
+        progress; never repeated on a timer while that stall lasts."""
+        now = time.time()
+        if now - getattr(self, "_obligations_at", 0.0) < obligations.CHECK_EVERY_S:
+            return
+        self._obligations_at = now
+        try:
+            for line in obligations.file_runs(self.p, now):
+                log(self.p, f"obligation record refused: {line}")
+            for fp in obligations.check(self.p, now):
+                log(self.p, f"obligation overdue: raised {fp}")
+        except Exception:
+            log(self.p, "obligations: check failed\n" + traceback.format_exc())
 
     def check_unreachable(self, every_s: float = 60) -> None:
         """One alert per network outage (netwait): every task that could start waits on a probe saying
