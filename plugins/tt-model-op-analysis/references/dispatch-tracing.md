@@ -34,6 +34,44 @@ evidence (file basename plus function or identifier).
 - `avg_pool2d` takes the global fast path only when the input allows it; otherwise halo + pool2d.
 - Count totals by stage in a scratch list, then sum once. Do not add up by hand across messages.
 
+## Row normalization and confidence
+
+`op_table.csv` contains launching device-op variants, not every Python call. Preserve every
+zero-launch decision in the inventory and in `call_trace.csv` notes or `summary.md` so the reader
+can see why it was excluded. Typical zero-launch decisions are a view reshape, an equal-config
+`to_memory_config`, an untaken conditional `reallocate`, metadata-only squeeze/unsqueeze and
+`deallocate`.
+
+Merge call sites into one row only when all dispatch-relevant facts match: device op, program
+factory, input/output shape, dtype, layout, memory placement, grid/shard/program config, profile
+statuses and confidence. Sum their launches and list every call site. If any fact differs, give the
+rows distinct, stable stage names (for example `attention QK matmul` and `attention PV matmul`) so
+the schema key remains unique. Keep `device_op` and `program_factory` canonical; put source paths,
+Metal generation details and commentary in `evidence`, not in those key columns.
+
+Treat `unverified` as the default until the Python binding, composite helpers, primitive dispatch,
+factory selector and exact input-dependent branch have all been followed. Before setting
+`confidence=verified`, inspect the selected factory and every helper used to choose it. A choice is
+runtime-dependent when it reads free/live L1 (`get_max_l1_space`, allocator
+reservations), buffer addresses, allocator placement, optional preallocated outputs, or another
+value unavailable from pinned source. Mark it `unverified` unless static bounds prove the same
+factory for every possible runtime value. Name every possible factory and the deciding condition
+in `evidence`. A runtime-dependent factory may still have a verified launch count; explain that
+distinction rather than upgrading the whole row.
+
+Do not classify a call as a view, equality no-op or untaken branch from a common-case assumption.
+Prove the exact shapes/configs and predicate at the pinned SHA. If the launch decision itself still
+depends on runtime state, retain it as an `unverified` potential launch, use the conservative
+launch count in the tables, and state in `call_trace.csv` and `summary.md` that the validated total
+is an upper bound rather than an exact count.
+
+When subagents traced blocks, the main agent owns this normalization and must reconcile their
+naming, duplicate variants, zero-launch decisions and totals before validation.
+
+Subagent agreement is not evidence. The main agent must reopen pinned source for every definitive
+claim during the re-check; analogous reports, earlier runs and another agent's conclusion only
+identify what needs verification.
+
 ## Subagent contract (larger models)
 
 Give each subagent one block (stem, one layer type, head), the pinned SHA, the profiles, and this
