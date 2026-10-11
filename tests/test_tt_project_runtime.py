@@ -42622,3 +42622,138 @@ def test_failover_settings_are_known_keys_and_settable_from_cli_and_chat(env, ca
     d._failover_checked = 0
     d.failover_pinned()
     assert p.db.task(tid)["provider"] != "codex", "1 h set through config_set turns failover back on"
+
+
+DEPLOY_C = "abcdef0123456789abcd"
+
+
+def _deploy_lib(version, commit=DEPLOY_C):
+    from ttp import project
+    lib = project.HOME_DIR / "lib" / "current" / "runtime" / "ttp"
+    lib.mkdir(parents=True, exist_ok=True)
+    (lib / "__init__.py").write_text(f'__version__ = "{version}"\n')
+    (lib / "SOURCE_COMMIT").write_text(commit + "\n")
+
+
+def _deploy_project(tmp_path, name, files, running=None, commit=DEPLOY_C, receipt=True, tick_age=5.0):
+    """A registered project whose harness files are at `files` and whose daemon (this process) reports
+    by its receipt that it runs `running` (default: the files' version), last tick `tick_age` s ago."""
+    base, db = _overview_project(tmp_path, name, files)
+    rt = base / "harness" / "runtime"
+    (rt / "ttp" / "SOURCE_COMMIT").write_text(commit + "\n")
+    old = time.time() - 3600       # the files were installed an hour ago
+    for f in ("__init__.py", "SOURCE_COMMIT"):
+        os.utime(rt / "ttp" / f, (old, old))
+    pid = os.getpid()
+    db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": old})
+    hb = {"pid": pid, "host": "testhost"}
+    if receipt:
+        inst = f"inst-{name}"
+        hb["receipt"] = {"version": running or files, "commit": commit, "runtime": str(rt), "pid": pid,
+                         "started": old, "instance": inst, "provenance": "verified"}
+        (base / "state" / "tick_done").write_text(json.dumps({"instance": inst, "pid": pid}))
+        t = time.time() - tick_age
+        os.utime(base / "state" / "tick_done", (t, t))
+    (base / "state" / "heartbeat").write_text(json.dumps(hb))
+    return base, db
+
+
+def test_deployed_accepts_only_every_daemons_own_receipt(env, tmp_path, capsys):
+    from ttp import overview
+    from ttp.cli import main
+    _deploy_lib("0.5.0")
+    _, a = _deploy_project(tmp_path, "alpha", "0.5.0")
+    _, b = _deploy_project(tmp_path, "beta", "0.5.0")
+    before = _tree(tmp_path / "alpha"), _tree(tmp_path / "beta")
+    r = overview.deployed()
+    assert r["rc"] == 0 and [x["state"] for x in r["projects"]] == [0, 0], r["text"]
+    assert r["text"].splitlines()[0] == "tt-project 0.5.0 (abcdef012345): deployed to all 2 projects on this machine"
+    with pytest.raises(SystemExit) as e:
+        main(["deployed", "0.5.0", "--commit", DEPLOY_C[:10]])
+    assert e.value.code == 0
+    # strictly read-only
+    assert (_tree(tmp_path / "alpha"), _tree(tmp_path / "beta")) == before
+    # another commit of the same version is not this deploy
+    with pytest.raises(SystemExit) as e:
+        main(["deployed", "0.5.0", "--commit", "1234567890"])
+    assert e.value.code == 1
+    # a project registered after the deploy started is checked too: its daemon still runs old code
+    _, c = _deploy_project(tmp_path, "gamma", "0.5.0", running="0.4.9")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        main(["deployed"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1, out
+    line = next(x for x in out.splitlines() if x.startswith("gamma\t"))
+    assert "pending: files at 0.5.0, daemon still runs 0.4.9" in line and "restart pending" in line, out
+    assert "owner: this project's daemon" in line and "resumes when it restarts" in line, out
+    assert "alpha\tok: running 0.5.0" in out
+    # --projects narrows the check
+    assert overview.deployed(names=["alpha", "beta"])["rc"] == 0
+    assert overview.deployed(names=["alpha", "nosuch"])["rc"] == 2
+    for x in (a, b, c):
+        x.close()
+
+
+def test_deployed_counts_a_deferred_merge_as_pending_with_owner_and_resume_time(env, tmp_path):
+    from ttp import overview, release, timefmt
+    _deploy_lib("0.5.0")
+    _deploy_project(tmp_path, "alpha", "0.5.0")
+    base, db = _deploy_project(tmp_path, "beta", "0.4.9")   # its merge conflicted: files stay old
+    until = time.time() + 7 * 3600
+    db.set_kv(release.KV_AUTO, {"key": "0.5.0 x", "to": "0.5.0", "outcome": "deferred", "until": until,
+                                "why": "the merge conflicts in prompts/worker.md"})
+    r = overview.deployed()
+    beta = next(x for x in r["projects"] if x["name"] == "beta")
+    assert r["rc"] == 1 and beta["state"] == 1, r["text"]
+    at = timefmt.short(until, overview._settings(base), time.time())
+    assert beta["line"].startswith("beta\tpending: files at 0.4.9: merge deferred (the merge conflicts in "
+                                   "prompts/worker.md); daemon runs 0.4.9"), beta["line"]
+    assert f"resumes at {at}, owner: this project's daemon" in beta["line"], beta["line"]
+    # a finish task holding the merge owns it
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, "merge", kind="harness")
+    (base / "state" / "locks").mkdir(parents=True, exist_ok=True)
+    (base / "state" / "locks" / f"{release.UPGRADE_RESOURCE}.task").write_text(
+        json.dumps({"task": tid, "key": "0.5.0 x", "target": "0.5.0"}))
+    beta = next(x for x in overview.deployed()["projects"] if x["name"] == "beta")
+    assert beta["state"] == 1 and f"merge held by harness task #{tid} (queued)" in beta["line"], beta["line"]
+    assert beta["line"].endswith(f"owner: harness task #{tid}"), beta["line"]
+    assert "resumes when it ends, or at " in beta["line"]
+    db.close()
+
+
+def test_deployed_cannot_tell_without_a_receipt_and_waits_for_a_fresh_tick(env, tmp_path):
+    from ttp import overview
+    _deploy_lib("0.5.0")
+    base, db = _deploy_project(tmp_path, "alpha", "0.5.0", receipt=False)   # a daemon older than receipts
+    r = overview.deployed()
+    assert r["rc"] == 2 and "cannot tell: daemon" in r["projects"][0]["line"], r["text"]
+    assert "no runtime receipt" in r["projects"][0]["line"]
+    # unverified provenance cannot tell either
+    _deploy_project(tmp_path, "beta", "0.5.0")
+    bb = tmp_path / "beta" / "tt-project" / "state" / "heartbeat"
+    hb = json.loads(bb.read_text())
+    hb["receipt"].update(provenance="unverified", why="no SOURCE_COMMIT")
+    bb.write_text(json.dumps(hb))
+    beta = overview.deployed(names=["beta"])
+    assert beta["rc"] == 2 and "receipt unverified: no SOURCE_COMMIT" in beta["text"], beta["text"]
+    # the matching receipt with a stale completed tick is pending, however fresh its heartbeat
+    _deploy_project(tmp_path, "gamma", "0.5.0", tick_age=1200)
+    g = overview.deployed(names=["gamma"])
+    assert g["rc"] == 1 and "last completed tick was 20 min ago" in g["text"], g["text"]
+    assert overview.deployed(names=["gamma"], fresh_s=3600)["rc"] == 0
+    # a tick that completed before the files were installed does not count
+    _deploy_project(tmp_path, "delta", "0.5.0", tick_age=7200)
+    d = overview.deployed(names=["delta"], fresh_s=86400)
+    assert d["rc"] == 1 and "has not completed a tick since the files were installed" in d["text"], d["text"]
+    # a stopped daemon is pending; a missing project database cannot tell
+    gb = tmp_path / "gamma" / "tt-project" / "state" / "project.db"
+    from ttp.db import DB
+    g_db = DB(gb)
+    g_db.set_kv("daemon", {"pid": 0, "host": "testhost"})
+    g_db.close()
+    assert overview.deployed(names=["gamma"])["rc"] == 1
+    from ttp import project
+    project.register("epsilon", {"host": "testhost", "dir": str(tmp_path / "missing")})
+    assert overview.deployed(names=["epsilon"])["rc"] == 2
+    db.close()

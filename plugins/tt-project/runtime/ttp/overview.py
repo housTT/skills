@@ -193,3 +193,188 @@ def text(ov: dict) -> str:
     if not ov["projects"]:
         return "no projects registered on this machine"
     return "\n".join([line(r) for r in ov["projects"]] + [footer(ov["global"])])
+
+
+# `ttp deployed`: a deploy is accepted only from what each daemon reports it runs ---------------------
+DEPLOY_FRESH_S = 300    # the receipt's instance must have completed a tick this recently
+OK, PENDING, CANNOT = 0, 1, 2
+
+
+class _RO:
+    """The one-row query release.task_activity needs, on a read-only connection."""
+    def __init__(self, conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        self.conn = conn
+
+    def one(self, sql: str, args=()) -> dict | None:
+        r = self.conn.execute(sql, tuple(args)).fetchone()
+        return dict(r) if r else None
+
+    def kv(self, key: str) -> tuple[dict, float]:
+        r = self.one("SELECT value, ts FROM kv WHERE key=?", (key,))
+        try:
+            v = json.loads(r["value"]) if r else {}
+        except ValueError:
+            v = {}
+        return (v if isinstance(v, dict) else {}), float((r or {}).get("ts") or 0)
+
+
+def _same_commit(a: str | None, b: str | None) -> bool:
+    a, b = (a or "").strip(), (b or "").strip()
+    return bool(a and b and len(min(a, b, key=len)) >= 7 and (a.startswith(b) or b.startswith(a)))
+
+
+def _holder(db: _RO, state: Path) -> int | None:
+    """The open finish task holding the template merge (release.finish_holder, read-only)."""
+    from .release import UPGRADE_RESOURCE, UPGRADE_TASK_TITLE
+    try:
+        rec = json.loads((state / "locks" / f"{UPGRADE_RESOURCE}.task").read_text() or "{}")
+    except (OSError, ValueError):
+        rec = {}
+    open_ = "status NOT IN ('done','failed','cancelled')"
+    if isinstance(rec, dict) and rec.get("task"):
+        if db.one(f"SELECT id FROM tasks WHERE id=? AND {open_}", (int(rec["task"]),)):
+            return int(rec["task"])
+    t = db.one(f"SELECT id FROM tasks WHERE kind='harness' AND title=? AND {open_} ORDER BY id LIMIT 1",
+               (UPGRADE_TASK_TITLE,))
+    return int(t["id"]) if t else None
+
+
+def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> tuple[str, str, str]:
+    """(reason, owner, resumes) for a project whose harness files are not at the target yet."""
+    from . import timefmt
+    from .release import CHECK_S, KV_AUTO, KV_RELEASE, STALE_S, task_activity
+    at = lambda ts: timefmt.short(max(ts, now), where, now)  # noqa: E731
+    tid = _holder(db, state)
+    if tid:
+        t, last = task_activity(db, tid)
+        status = t["status"] if t else "gone"
+        return (f"files at {files}: merge held by harness task #{tid} ({status})", f"harness task #{tid}",
+                f"when it ends, or at {at(now if status == 'blocked' else last + STALE_S)} when a host-side "
+                f"`ttp upgrade {name}` may take it over")
+    rec, _ = db.kv(KV_AUTO)
+    if rec.get("outcome") == "deferred":
+        why = " ".join(str(rec.get("why") or "").split())[:160]
+        return (f"files at {files}: merge deferred" + (f" ({why})" if why else ""), "this project's daemon",
+                f"at {at(float(rec.get('until') or 0))}")
+    if rec.get("outcome") == "running":
+        return f"files at {files}: upgrading now", "this project's daemon", "when the upgrade ends"
+    if rec.get("outcome") == "failed":
+        why = " ".join(str(rec.get("why") or "see logs/upgrade.log").split())[:160]
+        return (f"files at {files}: the last upgrade failed ({why})", "this project's coordinator",
+                "once the failure is fixed")
+    _, seen = db.kv(KV_RELEASE)
+    return (f"files at {files}: not upgraded yet", f"the deploy (`ttp upgrade {name}`) or this project's daemon",
+            f"at {at(seen + CHECK_S)} (its next release check)" if seen else "at its next release check (hourly)")
+
+
+def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
+                  fresh_s: float = DEPLOY_FRESH_S) -> dict:
+    """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
+    CANNOT, "line", ...}. Read only, like project_status: the database read-only, no lock taken."""
+    from .release import runtime_commit
+    row = {"name": name, "state": CANNOT, "reason": "", "owner": None, "resumes": None}
+
+    def done(state: int, reason: str, owner: str | None = None, resumes: str | None = None) -> dict:
+        row.update(state=state, reason=reason, owner=owner, resumes=resumes)
+        tail = "".join([f", resumes {resumes}" if resumes else "", f", owner: {owner}" if owner else ""])
+        row["line"] = f"{name}\t{('ok', 'pending', 'cannot tell')[state]}: {reason}{tail}"
+        return row
+
+    if entry.get("host") not in (None, here):
+        return done(CANNOT, f"registered on {entry.get('host')}, not this machine")
+    base = Path(str(entry.get("dir") or "")) / project.FOLDER
+    state, db_path = base / "state", base / "state" / "project.db"
+    if not entry.get("dir") or not db_path.is_file():
+        return done(CANNOT, "no project database at its folder")
+    where = _settings(base)
+    files = runtime_version(base / "harness" / "runtime")
+    files_c = runtime_commit(base / "harness" / "runtime")
+    at_target = files == target and (not commit or _same_commit(files_c, commit))
+    try:
+        conn = gcap.connect_ro(db_path, timeout=2)
+    except sqlite3.Error as e:
+        return done(CANNOT, f"database unreadable: {e}")
+    try:
+        db = _RO(conn)
+        daemon, pid = _daemon(conn, state, here)
+        if not pid:
+            if not at_target:
+                return done(PENDING, *_behind(name, db, state, files, now, where))
+            return done(PENDING, f"files at {files}, daemon {daemon}", "this project's service", "when its daemon starts")
+        r = identity.running(state, pid)
+        if not r:
+            return done(CANNOT, f"daemon {pid} reports no runtime receipt (running version unverified)")
+        if r.get("provenance") != "verified":
+            return done(CANNOT, f"receipt unverified: {r.get('why') or 'unknown provenance'}")
+        rv, rc = str(r.get("version") or "?"), r.get("commit")
+        row.update(running_version=rv, running_commit=rc, instance=r.get("instance"))
+        if rv != target or (commit and not _same_commit(rc, commit)):
+            running = f"{rv} ({(rc or '?')[:12]})"
+            if not at_target:
+                reason, owner, resumes = _behind(name, db, state, files, now, where)
+                return done(PENDING, f"{reason}; daemon runs {running}", owner, resumes)
+            return done(PENDING, f"files at {files}, daemon still runs {running}: restart pending",
+                        "this project's daemon", "when it restarts onto the new files")
+        tick = identity.tick_done(state, r)
+        rt = Path(r["runtime"]) if r.get("runtime") else base / "harness" / "runtime"
+        try:
+            installed_at = max((rt / "ttp" / f).stat().st_mtime for f in ("__init__.py", identity.SOURCE_FILE)
+                               if (rt / "ttp" / f).exists())
+        except ValueError:
+            installed_at = 0.0
+        row["tick_done"] = tick
+        if not tick:
+            return done(PENDING, f"daemon runs {target} but has not completed a tick yet", "this project's daemon",
+                        "at its first completed tick")
+        if tick < installed_at:
+            return done(PENDING, f"daemon runs {target} but has not completed a tick since the files were installed",
+                        "this project's daemon", "at its next completed tick")
+        if now - tick > fresh_s:
+            return done(PENDING, f"daemon runs {target} but its last completed tick was {_ago(now - tick)} ago "
+                                 f"(over {_ago(fresh_s)}; daemon {daemon})", "this project's daemon",
+                        "at its next completed tick")
+        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {_ago(max(now - tick, 0))} ago")
+    except sqlite3.Error as e:
+        return done(CANNOT, f"database unreadable: {e}")
+    finally:
+        conn.close()
+
+
+def deployed(target: str | None = None, commit: str | None = None, names: list[str] | None = None,
+             fresh_s: float = DEPLOY_FRESH_S, now: float | None = None) -> dict:
+    """{"rc", "target", "commit", "projects": [...], "text"} for `ttp deployed`. The registry is read now,
+    so a project registered after the deploy started is checked too; projects on other machines are
+    not (unless named). rc: 0 every project passes, 1 some are pending, 2 some cannot be told."""
+    from .release import runtime_commit
+    now = now or time.time()
+    here = project.hostname()
+    lib = installed() / "runtime"
+    if not target:
+        target, commit = runtime_version(lib), commit or runtime_commit(lib)
+    elif not commit and runtime_version(lib) == target:
+        commit = runtime_commit(lib)
+    commit = None if commit in (None, "", "unknown") else commit
+    out = {"target": target, "commit": commit, "projects": []}
+    if not target or target == "unknown":
+        return {**out, "rc": CANNOT, "text": "cannot tell: no version given and no release installed (`ttp setup`)"}
+    reg = project.load_registry().get("projects") or {}
+    pick = sorted(reg) if not names else names
+    rows = []
+    for n in pick:
+        e = reg.get(n)
+        if not isinstance(e, dict):
+            rows.append({"name": n, "state": CANNOT, "reason": "not registered on this machine",
+                         "line": f"{n}\tcannot tell: not registered on this machine"})
+        elif names or e.get("host") in (None, here):
+            rows.append(deploy_status(n, e, target, commit, now, here, fresh_s))
+    rc = max((r["state"] for r in rows), default=OK)
+    head = f"tt-project {target}" + (f" ({commit[:12]})" if commit else "")
+    counts = {s: sum(1 for r in rows if r["state"] == s) for s in (OK, PENDING, CANNOT)}
+    first = (f"{head}: deployed to all {len(rows)} project{'s' if len(rows) != 1 else ''} on this machine"
+             if rc == OK else f"{head}: {counts[OK]} of {len(rows)} running it, {counts[PENDING]} pending"
+             + (f", {counts[CANNOT]} cannot tell" if counts[CANNOT] else ""))
+    if not rows:
+        first = f"{head}: no projects registered on this machine"
+    lines = [first] + [r["line"] for r in sorted(rows, key=lambda r: -r["state"])]   # what holds it back first
+    return {**out, "rc": rc, "projects": rows, "text": "\n".join(lines)}

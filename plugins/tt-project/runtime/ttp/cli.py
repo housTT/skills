@@ -2097,6 +2097,18 @@ def cmd_overview(a) -> None:
     print(json.dumps(data, indent=1, default=str) if getattr(a, "json", False) else ov.text(data))
 
 
+def cmd_deployed(a) -> None:
+    """Probe for a deploy (and a retry_when): exit 0 once every project `ttp list` shows on this machine
+    runs the target version and commit by its daemon's own receipt and completed a tick since; 1 while
+    any is pending (a deferred merge, a restart not yet done), one line each with owner and resume time;
+    2 when it cannot tell. Read only (overview.deployed)."""
+    from . import overview as ov
+    names = [n.strip() for n in (a.projects or "").split(",") if n.strip()] or None
+    data = ov.deployed(a.version, a.commit, names, a.fresh_s)
+    print(json.dumps(data, indent=1, default=str) if a.json else data["text"])
+    sys.exit(data["rc"])
+
+
 def cmd_find(a) -> None:
     p, entry = resolve(a.name)
     if p:
@@ -3781,6 +3793,15 @@ def main(argv: list[str] | None = None) -> None:
                                         "spend today; other projects are only read")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_overview)
+    s = sub.add_parser("deployed", help="exit 0 once every project on this machine runs a release by its daemon's "
+                                        "own receipt, 1 while any is pending (with owner and resume time), 2 if "
+                                        "it cannot tell; read only (for retry_when)")
+    s.add_argument("version", nargs="?", help="the release to look for (default: the installed one)")
+    s.add_argument("--commit", help="its commit (default: the installed one's, when the versions match)")
+    s.add_argument("--projects", help="only these projects, comma-separated (default: every one `ttp list` shows here)")
+    s.add_argument("--fresh-s", type=float, default=300, help="a completed tick at most this old (default 300)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_deployed)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name")
     s.set_defaults(fn=cmd_find)
