@@ -21,6 +21,10 @@
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->
 - `followups`: one entry per blocking problem, each a self-contained fix spec naming its bug class.
+- When it must not proceed, say what failed in `review_failure`: `check_only` when the only blocker
+  is a check or gate that is missing or does not apply and the change has no blocking code finding,
+  `substantive` for code findings, `mixed` for both. A `check_only` failure gets no fix task or
+  re-review: the coordinator routes the check to its owner. Left out, it counts as `substantive`.
 - A head the spec says is already delivered as a PR, or a change it says must not reach the push
   branch, is review only: a pass is `done`, with no push and no approval for the push queue,
   whatever the sections below say.

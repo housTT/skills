@@ -31441,6 +31441,52 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
 
 
+def test_a_check_only_review_failure_gets_no_fix_pair_and_keeps_its_dependents(env):
+    """A review that failed only because a check or gate is missing or does not apply
+    (review_failure: check_only) gets no empty fix and re-review: it stays failed, the reviewed code
+    task stays done, its dependents stay on it, and the coordinator gets the failure to route. A run
+    whose hand-off is read again after a daemon restart queues no pair either."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dependency_ids
+    from ttp.providers.base import RunUsage as Usage
+    code, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    fups = [{"title": "run the device gate", "spec": "the gate did not run on this head"}]
+    failed = _fail_review(env, p, rev["id"], fups, review_failure="check_only")
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind IN ('code','review') AND id!=?",
+                      (rev["id"],)), "a check-only failure queued a fix or re-review"
+    assert p.db.task(rev["id"])["status"] == "failed" and p.db.task(code)["status"] == "done"
+    assert failed["status"] == "queued" and "Check-only failure" in failed["text"] and "Fix #" not in failed["text"]
+    w = p.db.task(waiter)
+    assert dependency_ids(w) == [rev["id"]] and w["status"] == "blocked", "the dependent left the failed review"
+    assert p.db.one("SELECT status FROM events WHERE kind='followup_proposed' AND task=?",
+                    (rev["id"],))["status"] == "queued", "the check's follow-up never reached the coordinator"
+    # A restarted daemon reading the same hand-off again still queues nothing.
+    p.db.update_task(rev["id"], status="running")
+    d = Daemon(p.base)
+    d._finish_worker({"task": rev["id"]}, Usage(cost_usd=1.0), "ok", env["tmp"] / f"run-{rev['id']}")
+    d.reconcile_tasks()
+    assert len(p.db.q("SELECT id FROM tasks")) == 3 and dependency_ids(p.db.task(waiter)) == [rev["id"]]
+
+
+@pytest.mark.parametrize("kind", ["mixed", "substantive", None, "gate-only"])
+def test_a_review_failure_other_than_check_only_still_gets_its_fix_pair(env, kind):
+    """Mixed, substantive, absent or unknown classifications keep the fix and independent re-review."""
+    p = make(env)
+    from ttp.daemon import review_failure
+    from ttp.db import dependency_ids
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    extra = {"review_failure": kind} if kind else {}
+    failed = _fail_review(env, p, rev["id"], [{"title": "handle empty input", "spec": "parse('') raises"}], **extra)
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert dependency_ids(re_rev) == [fix["id"]] and dependency_ids(p.db.task(waiter)) == [re_rev["id"]]
+    assert "Check-only" not in failed["text"]
+    assert review_failure(extra) == (kind if kind in ("mixed", "substantive") else "unknown")
+
+
 def test_review_lineage_follows_continues_follow_ups_depends_on_and_titles_but_no_plan_hub(env):
     p = make(env)
     from ttp import reviewcap

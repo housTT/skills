@@ -101,6 +101,11 @@ PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
+# What a failed review's hand-off says failed (review_failure; kind-review.md): only a check or gate
+# that is missing or does not apply, with no code finding (check_only), code findings (substantive),
+# or both (mixed). A check-only failure gets no fix and re-review: nothing in the change is to fix.
+# Any other value is unknown and handled like substantive.
+REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed")
 # A PR whose open findings outlive the task that delivered it gets this many fix tasks from the daemon.
 PR_FIX_ROUNDS = 2
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
@@ -2382,15 +2387,22 @@ class Daemon:
         fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after") and not f.get("start_when")]
         # Across stacks, an area whose reviews keep failing gets no more automatic fixes: the
         # coordinator re-plans it (reviewcap).
-        area = self._review_area(dict(task, **upd)) if new == "failed" and task["kind"] == "review" else None
+        # A check-only failure stays failed: the coordinator routes the missing check to its owner,
+        # and what waited on the review stays on it.
+        check_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "check_only"
+        area = self._review_area(dict(task, **upd)) \
+            if new == "failed" and task["kind"] == "review" and not check_only else None
         fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
             if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
-            and not area else None
+            and not area and not check_only else None
         folded = {id(f) for f in fixes} if fix else set()
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
             text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
                      + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
+        if check_only:
+            text += ("\nCheck-only failure (review_failure: check_only): no automatic fix or re-review. Route the "
+                     "missing or inapplicable check to the task that owns it; what waits on this review stays on it.")
         if outcome == "done" and task["kind"] == "review":
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
@@ -5927,6 +5939,12 @@ def review_rejects(result: dict) -> bool:
 
 
 RELAY_SHOWN = 8   # consuming tasks a passed review's event names
+
+
+def review_failure(result) -> str:
+    """A failed review's hand-off's REVIEW_FAILURE_KEY: one of REVIEW_FAILURE_KINDS, else "unknown"."""
+    v = result.get(REVIEW_FAILURE_KEY) if isinstance(result, dict) else None
+    return v if v in REVIEW_FAILURE_KINDS else "unknown"
 
 
 def relay_hint(dependents: list[dict]) -> str:
