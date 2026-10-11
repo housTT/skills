@@ -28,6 +28,85 @@ FUNDS_RE = re.compile(r"(out of credits|insufficient (credits|balance|funds)|spe
                       r"credit balance)", re.I)
 
 
+# Strict output pads absent optional fields with null. These schedule fields also have an
+# explicit-null operation; clear_fields distinguishes that operation from padding. Sparse
+# legacy actions without clear_fields retain their original explicit-null semantics.
+NULL_OPERATIONS = ("debounce_h", "rewake_after_h", "issue_lifecycle", "heal")
+
+
+def normalize_action(action: dict) -> dict:
+    clears = action.get("clear_fields") or []
+    if not isinstance(clears, list) or any(k not in NULL_OPERATIONS for k in clears):
+        raise ValueError("clear_fields must list nullable schedule fields")
+    if clears and action.get("type") != "schedule_set":
+        raise ValueError("clear_fields is only for schedule_set")
+    legacy = "clear_fields" not in action
+    out = {k: drop_nulls(v) for k, v in action.items() if k != "clear_fields" and
+           (v is not None or legacy and k in NULL_OPERATIONS)}
+    for k in clears:
+        if action.get(k) is not None:
+            raise ValueError(f"clear_fields {k}: supply null, not a value")
+        out[k] = None
+    return out
+
+
+def drop_nulls(value):
+    if isinstance(value, dict):
+        if value.get("type") and ("clear_fields" in value or any(k in value for k in NULL_OPERATIONS)):
+            try:
+                return normalize_action(value)
+            except ValueError:
+                return value   # the application boundary rejects an invalid clear operation
+        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [drop_nulls(v) for v in value]
+    return value
+
+
+def strict_schema(schema):
+    """Close every object (including nullable objects and anyOf branches), and require all
+    properties. Optional properties are nullable. Pattern validation stays in the local parser
+    so the wire schema also works with providers/models that do not accept that keyword.
+    Unspecified free-form objects are refused instead of silently losing their keys.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: v for k, v in schema.items() if k != "pattern"}
+    for key in ("items",):
+        if key in out:
+            out[key] = strict_schema(out[key])
+    if "anyOf" in out:
+        out["anyOf"] = [strict_schema(s) for s in out["anyOf"]]
+    if "$defs" in out:
+        out["$defs"] = {k: strict_schema(v) for k, v in out["$defs"].items()}
+    types = schema.get("type", [])
+    types = [types] if isinstance(types, str) else types
+    if "object" in types or "properties" in schema:
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            raise ValueError("strict output requires a full object properties schema")
+        required = set(schema.get("required") or [])
+        out["properties"] = {k: strict_schema(v) if k in required else _nullable(strict_schema(v))
+                             for k, v in props.items()}
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+    return out
+
+
+def _nullable(sub):
+    sub = dict(sub)
+    if "anyOf" in sub or "$ref" in sub:
+        if {"type": "null"} not in sub.get("anyOf", []):
+            return {"anyOf": [sub, {"type": "null"}]}
+        return sub
+    t = sub.get("type")
+    types = t if isinstance(t, list) else [t]
+    sub["type"] = types if "null" in types else [*types, "null"]
+    if "enum" in sub and None not in sub["enum"]:
+        sub["enum"] = [*sub["enum"], None]
+    return sub
+
+
 # The API takes at most this many cache_control breakpoints per request; one more fails the whole
 # call with a 400 ("A maximum of 4 blocks with cache_control may be provided").
 MAX_CACHE_BREAKPOINTS = 4

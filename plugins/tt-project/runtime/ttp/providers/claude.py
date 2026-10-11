@@ -31,7 +31,7 @@ from pathlib import Path
 from . import register
 from ..budget import Window
 from .base import (AUTH_RE, LIMIT_RE, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints, cli_output,
-                   find_binary, status_check)
+                   find_binary, status_check, strict_schema, drop_nulls)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -102,7 +102,7 @@ class Claude(Provider):
         else:
             argv += ["--permission-mode", "bypassPermissions"]
         if schema:
-            argv += ["--json-schema", json.dumps(schema)]
+            argv += ["--json-schema", json.dumps(strict_schema(schema))]
         if not read_only:
             denied = list(WORKER_DENIED_TOOLS)
             if restrictions.get("no_internet"):
@@ -283,7 +283,7 @@ class Claude(Provider):
                 u.cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
                 u.cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
-                u.structured = ev.get("structured_output")
+                u.structured = drop_nulls(ev.get("structured_output"))
                 if ev.get("is_error"):
                     u.error = f"{ev.get('subtype')}: {str(ev.get('result'))[:300]}"
                 u.extra["subtype"] = ev.get("subtype")

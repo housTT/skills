@@ -38,7 +38,8 @@ import sys
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, status_check, stderr_tail
+from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, status_check,
+                   stderr_tail, strict_schema, drop_nulls)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -440,48 +441,6 @@ def toml_string(text: str) -> str:
         else:
             out.append(ch)
     return '"' + "".join(out) + '"'
-
-
-def strict_schema(schema):
-    """`--output-schema` is enforced in strict mode: every object closed and every property
-    required. Optional properties become nullable instead; drop_nulls() undoes that on the way back."""
-    if not isinstance(schema, dict):
-        return schema
-    out = dict(schema)
-    if "items" in out:
-        out["items"] = strict_schema(out["items"])
-    props = schema.get("properties")
-    if schema.get("type") == "object" and isinstance(props, dict):
-        required = set(schema.get("required") or [])
-        out["properties"] = {}
-        for name, sub in props.items():
-            sub = strict_schema(sub)
-            if name not in required:
-                sub = _nullable(sub)
-            out["properties"][name] = sub
-        out["required"] = list(props)
-        out["additionalProperties"] = False
-    return out
-
-
-def _nullable(sub: dict) -> dict:
-    # A repeated "null" in `type` (a property already nullable in the source schema) makes the
-    # API reject the whole schema as "invalid schema keyword".
-    t = sub.get("type")
-    sub = dict(sub)
-    types = (t if isinstance(t, list) else [t]) if t else []
-    sub["type"] = types if "null" in types else [*types, "null"]
-    if "enum" in sub and None not in sub["enum"]:
-        sub["enum"] = [*sub["enum"], None]
-    return sub
-
-
-def drop_nulls(value):
-    if isinstance(value, dict):
-        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
-    if isinstance(value, list):
-        return [drop_nulls(v) for v in value]
-    return value
 
 
 def schema_file(schema: dict) -> str:

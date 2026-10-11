@@ -10,6 +10,13 @@ previous turn and shown in one line; a turn that needs it whole gets it whole.
 
 Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 
+Strict structured output requires all schema fields. Set unused optional fields to null;
+those nulls mean absent. For a schedule field whose null is an operation (`debounce_h`,
+`rewake_after_h`, `issue_lifecycle`, `heal`), also list its name in `clear_fields` to explicitly
+turn it off/remove it. Leave `clear_fields` null otherwise. Sparse output without `clear_fields`
+keeps the legacy rule: a supplied null on those fields performs the operation. Nulls inside a
+`heal` object are unused fields: defaults and preset validation still apply.
+
 Your actions are applied after you answer, and any of them can be rejected. In a `reply`, say what
 you are doing ("I'm raising the cap"), never that it is done. A rejection comes back in your next
 turn's STATE: tell the user then, plainly, if it changes what you told them.

@@ -44785,3 +44785,128 @@ def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock
     assert "unblock path: 2 free window reset(s)" in text, text[:2000]
     src = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "free window resets and paid credits are an unblock path" in " ".join(src.split())
+
+
+def _assert_openai_strict_schema(schema):
+    """Check the conservative subset used by every coordinator schema adapter."""
+    allowed = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum',
+               'anyOf', '$defs', '$ref', 'description', 'title'}
+    assert set(schema) <= allowed, schema
+    types = schema.get('type', [])
+    types = [types] if isinstance(types, str) else types
+    if 'object' in types or 'properties' in schema:
+        assert schema.get('additionalProperties') is False, schema
+        assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        for sub in schema.get('properties', {}).values():
+            _assert_openai_strict_schema(sub)
+    if 'items' in schema:
+        _assert_openai_strict_schema(schema['items'])
+    for sub in schema.get('anyOf', []):
+        _assert_openai_strict_schema(sub)
+    for sub in schema.get('$defs', {}).values():
+        _assert_openai_strict_schema(sub)
+
+
+@pytest.mark.parametrize('provider', ['codex', 'claude'])
+def test_coordinator_wire_schema_closes_nullable_heal_and_covers_prompt(env, tmp_path, provider):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    argv, _ = get_provider(provider).build(role='coordinator', model='', effort='low', cwd=str(tmp_path),
+                                           budget_usd=1, read_only=True, schema=coord.ACTIONS_SCHEMA,
+                                           restrictions={})
+    flag = '--output-schema' if provider == 'codex' else '--json-schema'
+    raw = argv[argv.index(flag) + 1]
+    wire = json.loads(pathlib.Path(raw).read_text() if provider == 'codex' else raw)
+    _assert_openai_strict_schema(wire)
+    item = wire['properties']['actions']['items']['properties']
+    prompt = (RUNTIME.parent / 'template/prompts/coordinator.md').read_text()
+    documented = set(re.findall(r'^\| `([a-z_]+)` \|', prompt, re.M))
+    assert set(item['type']['enum']) == documented == set(coord.ACTION_TYPES)
+    from ttp import heal
+    block = item['heal']
+    assert set(block['properties']) == heal._COMMON | set().union(*heal.PRESETS.values())
+    for sub in block['properties'].values():
+        assert 'null' in sub.get('type', []) or {'type': 'null'} in sub.get('anyOf', [])
+
+
+@pytest.mark.parametrize('provider', ['codex', 'claude', 'cursor'])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_coordinator_padded_nulls_keep_schedule_defaults_and_explicit_off(env, tmp_path, provider, explicit):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    p = make(env)
+    for name, kind, fields in [('llm-check', 'llm', {'debounce_h': 2}),
+                               ('command-check', 'command', {'command': 'true', 'rewake_after_h': 6,
+                                'issue_lifecycle': 'explicit_clear', 'heal': {'check': 'true'}})]:
+        assert coord.apply(p, [{'type': 'schedule_set', 'name': name, 'kind': kind, **fields}]) == []
+        filled = dict.fromkeys(coord.ACTIONS_SCHEMA['properties']['actions']['items']['properties'])
+        filled.update(type='schedule_set', name=name,
+                      clear_fields=list(fields.keys() - {'command'}) if explicit else None)
+        payload = {'actions': [filled], 'summary': None}
+        out = tmp_path / 'out.jsonl'
+        if provider == 'codex':
+            event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(payload)}}
+        else:
+            event = {'type': 'result', 'subtype': 'success', 'result': json.dumps(payload)}
+            if provider == 'claude':
+                event['structured_output'] = payload
+        out.write_text(json.dumps(event) + '\n')
+        usage = get_provider(provider).parse(out)
+        assert coord.apply(p, usage.structured['actions']) == []
+        row = p.db.one('SELECT * FROM schedules WHERE name=?', (name,))
+        kept = json.loads(row['payload'])
+        assert row['enabled'] == 1
+        if explicit:
+            if kind == 'llm':
+                assert kept['debounce_h'] is None
+            else:
+                assert kept['rewake_after_h'] is None
+                assert 'heal' not in kept and 'issue_lifecycle' not in kept
+        else:
+            assert all(kept[k] == v for k, v in fields.items())
+    # Legacy sparse JSON still has an explicit null: absence and off remain distinct.
+    assert coord.apply(p, [{'type': 'schedule_set', 'name': 'llm-check', 'debounce_h': None}]) == []
+    assert json.loads(p.db.one("SELECT payload FROM schedules WHERE name='llm-check'")['payload'])['debounce_h'] is None
+
+
+def test_strict_schema_visits_anyof_definitions_and_refuses_free_objects():
+    from ttp.providers.base import strict_schema
+    source = {'type': 'object', 'properties': {'choice': {'anyOf': [
+        {'type': ['object', 'null'], 'properties': {'flag': {'type': 'boolean'}}},
+        {'type': 'array', 'items': {'type': 'object', 'properties': {'name': {'type': 'string'}}}}]}},
+        '$defs': {'nested': {'type': 'object', 'properties': {'value': {'type': ['string', 'null']}}}}}
+    wire = strict_schema(source)
+    _assert_openai_strict_schema(wire)
+    assert strict_schema(wire) == wire and 'required' not in source
+    for free in ({'type': 'object'}, {'type': ['object', 'null']}):
+        with pytest.raises(ValueError, match='full object'):
+            strict_schema(free)
+
+
+@pytest.mark.parametrize('preset, fields', [(None, {'check': 'true'}),
+                                           ('systemd', {'unit': 'example.service'}),
+                                           ('http', {'url': 'http://example.invalid'}),
+                                           ('broker', {'status_command': 'true'})])
+def test_strict_heal_padding_uses_defaults_and_preset_keys(env, preset, fields):
+    from ttp import coordinator as coord, heal
+    p = make(env)
+    block = dict.fromkeys(coord.HEAL_SCHEMA['properties'])
+    block.update(preset=preset, **fields)
+    action = dict.fromkeys(coord.ACTIONS_SCHEMA['properties']['actions']['items']['properties'])
+    action.update(type='schedule_set', name='probe', kind='command', heal=block)
+    assert coord.apply(p, [action]) == []
+    stored = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")['payload'])['heal']
+    assert all(v is not None for v in stored.values())
+    assert heal.validate(stored)['timeout_s'] == heal.DEFAULTS['timeout_s']
+
+
+@pytest.mark.parametrize('action', [ {'type': 'noop', 'clear_fields': ['heal']},
+                                    {'type': 'schedule_set', 'name': 'probe', 'clear_fields': ['enabled']},
+                                    {'type': 'schedule_set', 'name': 'probe', 'clear_fields': ['heal'],
+                                     'heal': {'check': 'true'}} ])
+def test_invalid_clear_operations_are_rejected_without_schedule_mutation(env, action):
+    from ttp import coordinator as coord
+    p = make(env)
+    before = p.db.q('SELECT * FROM schedules')
+    assert 'clear_fields' in coord.apply(p, [action])[0]
+    assert p.db.q('SELECT * FROM schedules') == before

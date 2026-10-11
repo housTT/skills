@@ -32,6 +32,7 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
 from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
+from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
@@ -52,6 +53,17 @@ BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible
 ASK_CLASSES = ("irreversible", "restriction_change", "neither")
 ASK_REFUSED_KIND = "ask_refused"   # events: an ask the gate refused, counted in the unblocking metrics
 ASK_FLAGGED_KIND = "ask_flagged"   # events: an ask the gate sent but flagged as likely the coordinator's own call
+
+# Superset of the heal validator's common and preset fields. Strict null padding is
+# removed before validation, so unrelated preset keys never become unknown keys.
+HEAL_SCHEMA = {"type": ["object", "null"], "properties": {
+    **{k: {"type": "string"} for k in ("check", "preset", "fix", "resource", "machine", "condition",
+                                      "known_fault", "escalate", "unit", "host", "url", "status_command", "hold_field")},
+    **{k: {"type": "number"} for k in heal.DEFAULTS},
+    **{k: {"type": "boolean"} for k in ("outage", "user")},
+    "expect": {"type": "array", "items": {"type": "integer"}},
+    "auto_fields": {"type": "array", "items": {"type": "string"}},
+}}
 
 ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -85,7 +97,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
-            "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"},
+            "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
+            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
@@ -942,6 +955,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
         try:
+            a = normalize_action(a)
             if t == "reply":
                 chat = a.get("chat") or default_chat
                 replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
