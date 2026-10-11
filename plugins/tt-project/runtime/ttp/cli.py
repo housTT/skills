@@ -30,7 +30,8 @@ from . import timefmt
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
-                      load_account_settings, set_account_setting, zombie, device_timeout_max, command_env)
+                      load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
+                      NOTE_RUN_ENV, in_run)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -608,7 +609,7 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
 
 
 def cmd_say(a) -> None:
-    if os.environ.get("TTP_RUN_ID") or os.environ.get("TTP_RUN_DIR"):
+    if in_run():
         # A message posted here counts as the user's (pr_approve reads approvals from it), so a run
         # must not post one. Runs report through `ttp note` and their hand-off.
         die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
@@ -1010,7 +1011,7 @@ def cmd_web(a) -> None:
 
 def cmd_note(a) -> None:
     # Model-free completion commands get only note context, never a full worker context.
-    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get("TTP_NOTE_RUN_DIR")
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
     if not run_dir:
         die("ttp note only works inside a tt-project run")
     if a.to:
@@ -2330,7 +2331,7 @@ def cmd_obligation(a) -> None:
         print(f"{a.action} on {a.args[0]} recorded for task #{task}; the daemon files it within "
               f"{ob.CHECK_EVERY_S // 60} min (only if this task owns {a.args[0]})")
         return
-    if run_dir:
+    if in_run():
         die(f"ttp obligation {a.action} is for the user or the coordinator, not inside a run; an owner "
             f"records `progress` and `receipt`")
     p = need(a.project, sys.argv[1:]) if a.project else here()
@@ -2626,12 +2627,12 @@ def _refuse_user_only_in_run(key: str) -> None:
 
 
 def cmd_config(a) -> None:
-    in_run = bool(os.environ.get("TTP_RUN_ID") or os.environ.get("TTP_RUN_DIR"))
+    run = in_run()
     if a.account:
         if a.value is not None:
             die("usage: ttp config --account KEY [VALUE]")
         from .coordinator import NEEDS_USER
-        if in_run and a.key is not None and a.name in NEEDS_USER:
+        if run and a.key is not None and a.name in NEEDS_USER:
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
         return cmd_account_config(a.name, a.key)
@@ -2665,7 +2666,7 @@ def cmd_config(a) -> None:
             val = checks_of(val)
         except ValueError as e:
             die(str(e))
-    if in_run and (k := _user_only_change(p.raw_config(), a.key, val)):
+    if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
         _refuse_user_only_in_run(k)

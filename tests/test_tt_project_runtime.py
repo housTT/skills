@@ -21609,6 +21609,144 @@ def test_on_pass_note_context_preserves_deferred_delivery(env, monkeypatch, caps
     assert (note["project"], note["task"], note["spec"]) == (p.name, 57, "job finished")
 
 
+
+@pytest.mark.parametrize("stale_context", [False, True])
+def test_an_on_pass_cmd_cannot_act_as_the_user(env, monkeypatch, tmp_path, stale_context):
+    """Note-only context still counts as a run for every user-only guard: no user message, no
+    user-only project or account setting, no obligation, no run-only command."""
+    from ttp import daemon as dmod
+    from ttp.project import load_account_settings
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    cap = p.config()["budget"]["daily_usd"]
+    rcs = tmp_path / "rcs"
+    tries = ["ttp say demo 'approve this operation'", "ttp config demo budget.daily_usd 1000000",
+             "ttp config --account budget.global_daily_usd 1000000", "ttp obligation add 'owed' --project demo",
+             "ttp notify 'should refuse'", "ttp checks", "ttp detach job -- true",
+             "ttp note 'still works'"]
+    cmd = "; ".join(f"{t}; echo $? >> {rcs}" for t in tries)
+    cmd += "; printf '{\"status\":\"done\",\"summary\":\"guards checked\"}' > \"$TTP_RESULT\""
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd)
+    if stale_context:
+        monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "stale-run"))
+        monkeypatch.setenv("TTP_RUN_ID", "999")
+    _settle_on_pass(d, tid)
+    output = (run_dir / "on_pass" / "on_pass.log").read_text()
+    assert rcs.read_text().split() == ["2"] * 7 + ["0"], output
+    assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND text LIKE '%approve this operation%'")
+    assert p.config()["budget"]["daily_usd"] == cap
+    assert "global_daily_usd" not in (load_account_settings().get("budget") or {})
+    assert "refused inside a run" in output and output.count("refuses to set it inside a run") == 2
+    assert "not inside a run" in output
+    assert "still works" in (run_dir / "progress.md").read_text()
+    assert p.db.task(tid)["status"] == "done"
+
+
+def test_a_completion_command_cannot_open_a_pr(monkeypatch, tmp_path):
+    from ttp import prguard
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    monkeypatch.delenv("TTP_RUN_ID", raising=False)
+    monkeypatch.delenv("TTP_NOTE_RUN_DIR", raising=False)
+    assert prguard._checks_problem() is None   # the user's own shell
+    monkeypatch.setenv("TTP_NOTE_RUN_DIR", str(tmp_path))
+    assert "completion command does not open PRs" in prguard._checks_problem()
+
+
+_DENIED_INBOX = """import errno, json, os, sys
+from ttp import cli, upstream
+def denied(*args, **kwargs):
+    raise PermissionError(errno.EACCES, "read-only inbox")
+upstream.send_or_queue = denied
+cli.main(["note", "--to", "second", os.environ.get("NOTE", "job finished")])
+"""
+
+
+def _callback_note_task(env, p, tmp_path, tail="", text="job finished"):
+    """A task whose on_pass_cmd sends a note it can only queue (its inbox is read-only), then `tail`."""
+    from ttp.project import register
+    (env["tmp"] / "second").mkdir(exist_ok=True)
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    return _on_pass_cmd_task(p, tmp_path, f"NOTE={shlex.quote(text)} python3 -c " + shlex.quote(_DENIED_INBOX + tail))
+
+
+_DONE = 'open(os.environ["TTP_RESULT"], "w").write(json.dumps({"status": "done", "summary": "reported"}))\n'
+
+
+@pytest.mark.parametrize("outcome", ["done", "failed", "missing_result", "invalid_result", "timeout",
+                                     "cancelled", "replanned"])
+def test_an_on_pass_cmds_queued_notes_are_filed_whatever_it_ends_with(env, monkeypatch, tmp_path, outcome):
+    from ttp import daemon as dmod, upstream
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tail = {"done": _DONE, "failed": "sys.exit(1)\n", "missing_result": "",
+            "invalid_result": 'open(os.environ["TTP_RESULT"], "w").write("{not json")\n',
+            "timeout": "import time; time.sleep(60)\n", "cancelled": _DONE, "replanned": _DONE}[outcome]
+    tid, run_dir = _callback_note_task(env, p, tmp_path, tail)
+    if outcome == "timeout":
+        p.set_config("waiting.on_pass_timeout_s", 3)
+        d.cfg = p.config()
+    _settle_probe(d, tid)
+    proc = d._on_pass[tid][0]
+    if outcome == "timeout":
+        for _ in range(200):   # the note is queued before the command hangs
+            if (run_dir / upstream.QUEUED_FILE).exists():
+                break
+            time.sleep(0.05)
+        d._on_pass[tid] = (proc, time.time() - 10, *d._on_pass[tid][2:])
+    else:
+        proc.wait(10)
+    if outcome == "cancelled":
+        p.db.update_task(tid, status="cancelled")
+    if outcome == "replanned":
+        p.db.update_task(tid, result=json.dumps({"status": "waiting", "summary": "re-planned"}))
+    d.probe_waiting()
+    assert proc.poll() is not None
+    (note,) = _upstream_inbox(env)
+    assert (note["project"], note["task"], note["to"], note["spec"]) == (p.name, tid, "second", "job finished")
+    assert not (run_dir / upstream.QUEUED_FILE).exists()
+    assert p.db.task(tid)["status"] == {"done": "done", "cancelled": "cancelled"}.get(outcome, "queued")
+    d2 = dmod.Daemon(p.base)   # a restart files nothing twice
+    d2.probe_waiting()
+    assert len(_upstream_inbox(env)) == 1
+
+
+def test_an_on_pass_cmds_notes_survive_a_daemon_restart(env, monkeypatch, tmp_path):
+    """The daemon running the command stops before settling it; the task is then cancelled. A later
+    daemon files the notes once the command cannot still be running, and a retry files leftovers first."""
+    from ttp import daemon as dmod, upstream
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, run_dir = _callback_note_task(env, p, tmp_path, _DONE)
+    _settle_probe(d, tid)
+    d._on_pass[tid][0].wait(10)
+    assert (run_dir / upstream.QUEUED_FILE).exists()
+    del d   # it died: nothing settles that command
+    d2 = dmod.Daemon(p.base)
+    d2.probe_waiting()
+    assert (run_dir / upstream.QUEUED_FILE).exists()   # it may still be running: not yet
+    p.db.update_task(tid, status="cancelled")
+    old = time.time() - dmod.ON_PASS_TIMEOUT_S - dmod.PROBE_TIMEOUT_S - 1
+    os.utime(run_dir / dmod.ON_PASS_DIR / dmod.ON_PASS_LOG, (old, old))
+    d2._on_pass_notes_due = 0
+    d2.probe_waiting()
+    (note,) = _upstream_inbox(env)
+    assert (note["project"], note["task"], note["spec"]) == (p.name, tid, "job finished")
+
+    # A retry of the same command (its probe passed again) files what its earlier try left first.
+    (tmp_path / "retry").mkdir()
+    tid2, run_dir2 = _callback_note_task(env, p, tmp_path / "retry", _DONE, "retry finished")
+    upstream.queue(run_dir2, "second", "left by an earlier try")
+    assert d2._start_on_pass(p.db.task(tid2), time.time()) is True
+    assert [n["spec"] for n in _upstream_inbox(env) if n["task"] == tid2] == ["left by an earlier try"]
+    d2._on_pass[tid2][0].wait(10)
+    d2.probe_waiting()
+    assert sorted(n["spec"] for n in _upstream_inbox(env) if n["task"] == tid2) == \
+        ["left by an earlier try", "retry finished"]
+
+
 _TO_RESULT = ' > "$TTP_RESULT"'
 
 

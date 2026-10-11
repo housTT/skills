@@ -803,6 +803,18 @@ class Project:
 OUTPUT_TAIL = 2000   # chars of a failed daemon-run command's output kept for its event or observation
 
 
+# A model-free completion command (a task's on_pass_cmd) gets only this: `ttp note` writes to that
+# run, and every guard that refuses user-only actions inside a run refuses them here too.
+NOTE_RUN_ENV = "TTP_NOTE_RUN_DIR"
+
+
+def in_run(env=None) -> bool:
+    """Whether a command runs for a worker (a run, or a completion command with note-only context):
+    it may not act as the user (post a user message, change user-only settings)."""
+    env = os.environ if env is None else env
+    return any(env.get(k) for k in ("TTP_RUN_ID", "TTP_RUN_DIR", NOTE_RUN_ENV))
+
+
 def command_env(p: Project, base: dict | None = None) -> dict[str, str]:
     """The environment of a shell command the daemon runs for `p` (command schedule, heal check and
     fix, start_when/retry_when, until_probe, pause end_when, after_push), as a worker's commands see

@@ -121,6 +121,7 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
 ON_PASS_TIMEOUT_S, ON_PASS_DIR, ON_PASS_LOG = 600, "on_pass", "on_pass.log"   # a hand-off's on_pass_cmd
+ON_PASS_NOTES_EVERY_S, ON_PASS_NOTES_DAYS = 600, 14   # sweep for notes an unsettled on_pass_cmd queued
 AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
 AUTH_CHECK_S = (60, 120, 300, 600, 1200, 1800)   # backoff of the model-free login checks of an open breaker
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
@@ -392,6 +393,7 @@ class Daemon:
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
         self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str]] = {}
+        self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
@@ -2124,6 +2126,16 @@ class Daemon:
                      f"#{task['id']} run {r['id']} wrote its hand-off to {src} instead of its own run dir; "
                      f"adopted it", "handled", task["id"]))
 
+    def _file_queued_notes(self, run_id, tid: int, run_dir: Path) -> None:
+        """File the notes for other projects that a run (or its task's on_pass_cmd) queued in `run_dir`
+        because it could not write the inbox itself (ttp note --to), as task `tid`'s."""
+        try:
+            sent = upstream.send_queued(run_dir, self.p.name, tid, self.p.state)
+            if any(sent.values()):
+                log(self.p, f"run {run_id} of #{tid}: queued notes to other projects: {sent}")
+        except OSError as e:
+            log(self.p, f"could not file the queued notes of #{tid}: {e}")
+
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
                        orderly: bool = False, refused: str = "") -> None:
@@ -2135,12 +2147,7 @@ class Daemon:
         if not task:
             return
         relay_worker_notifies(self.p, task, run_dir)
-        try:   # notes for other projects a sandboxed worker could not file itself (ttp note --to)
-            sent = upstream.send_queued(run_dir, self.p.name, task["id"], self.p.state)
-            if any(sent.values()):
-                log(self.p, f"run {r.get('id')} of #{task['id']}: queued notes to other projects: {sent}")
-        except OSError as e:
-            log(self.p, f"could not file the queued notes of #{task['id']}: {e}")
+        self._file_queued_notes(r.get("id"), task["id"], run_dir)
         if handoff is None and not (run_dir / RESULT_FILE).exists():
             self._adopt_misplaced_handoff(r, task, run_dir)
         handoff = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
@@ -4483,6 +4490,7 @@ class Daemon:
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
         self._poll_on_pass(now)
+        self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -5088,6 +5096,8 @@ class Daemon:
         if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
                 or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
+        # Notes an earlier try queued (its daemon restarted before settling it) go out before this one.
+        self._file_queued_notes(r["id"], tid, Path(r["dir"]))
         out = Path(r["dir"]) / ON_PASS_DIR
         shutil.rmtree(out, ignore_errors=True)   # a result from an earlier try must not count
         out.mkdir(parents=True)
@@ -5122,6 +5132,10 @@ class Daemon:
             del self._on_pass[tid]
             if rc is None:
                 _kill_group(proc)
+            r = db.one("SELECT * FROM runs WHERE id=?", (run_id,))
+            if r and r["dir"]:
+                # Its notes were acknowledged when sent: they go out whatever it ends with.
+                self._file_queued_notes(run_id, tid, Path(r["dir"]))
             task = db.task(tid)
             prev = load_result(task["result"]) if task else {}
             if not task or task["status"] != "queued" or prev.get("status") != "waiting" \
@@ -5143,7 +5157,6 @@ class Daemon:
                 why = f"its result.json says {str(result.get('status'))[:40]!r}, not done"
             else:
                 why = on_pass_problem(result)
-            r = db.one("SELECT * FROM runs WHERE id=?", (run_id,))
             if not why and r:
                 from .providers.base import RunUsage
                 self._probe_rc.pop(tid, None)
@@ -5154,6 +5167,27 @@ class Daemon:
             log(self.p, f"task {tid} on_pass_cmd did not record done: {why or 'its run is gone'}")
             self._wake_waiting(task, f"probe passed; its on_pass_cmd did not record done "
                                      f"({why or 'its run is gone'}); the end of its output:\n{tail}", now)
+
+    def _sweep_on_pass_notes(self, now: float) -> None:
+        """File the notes an on_pass_cmd queued that no settle filed (a daemon restarted while it ran,
+        and its task then moved on), once that command cannot still be running. At start, then every
+        ON_PASS_NOTES_EVERY_S."""
+        if now < self._on_pass_notes_due:
+            return
+        self._on_pass_notes_due = now + ON_PASS_NOTES_EVERY_S
+        quiet = float((self.cfg.get("waiting") or {}).get("on_pass_timeout_s") or ON_PASS_TIMEOUT_S) + PROBE_TIMEOUT_S
+        for r in self.p.db.q("SELECT id,task,dir FROM runs WHERE role!='coordinator' AND status!='running' "
+                             "AND dir IS NOT NULL AND task IS NOT NULL AND started>=?",
+                             (now - ON_PASS_NOTES_DAYS * 86400,)):
+            d = Path(r["dir"])
+            if r["task"] in self._on_pass or not (d / upstream.QUEUED_FILE).exists():
+                continue
+            try:
+                if now - (d / ON_PASS_DIR / ON_PASS_LOG).stat().st_mtime < quiet:
+                    continue
+            except OSError:
+                continue   # not an on_pass_cmd's: its run's finish files them
+            self._file_queued_notes(r["id"], r["task"], d)
 
     def _checks_wait(self, task: dict) -> tuple | None:
         """What a passed `ttp checks --result <run dir>` probe of one of this task's runs settles:

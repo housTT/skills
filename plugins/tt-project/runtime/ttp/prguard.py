@@ -626,7 +626,9 @@ def _checks_problem(cwd: str | None = None) -> str | None:
     uncommitted changes, also counts. Outside a run, nothing."""
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
-        return None
+        from .project import in_run
+        # A completion command (note-only context) has no checks of its own and never opens a PR.
+        return "refused: a task's completion command does not open PRs; its task does." if in_run() else None
     try:
         rec = json.loads((Path(run_dir) / CHECKS_FILE).read_text())
     except (OSError, ValueError):
