@@ -38160,6 +38160,40 @@ def test_responsibility_inventory_shows_an_unwatched_machine_until_a_check_names
     assert t and "Responsibilities: health coverage:" in t["spec"]
 
 
+def test_responsibility_inventory_credits_the_recovery_owners_heal_check_for_a_shared_machine(env):
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", "alpha", "beta")
+    me, alpha, beta = make(env), _second_project(env, "alpha"), _second_project(env, "beta")
+    _resources(me, "Machines: box-a")
+    n = len(rs.inventory(me))
+    assert rs.refresh(me, now=1000.0)["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    # The owner's plain command watcher or disabled heal check does not cover it; the fallback's heal check does.
+    sched.upsert(alpha.db, "ping-a", "command", "5m", payload={"command": "ping box-a"})
+    sched.upsert(alpha.db, "box-a-off", "command", "5m", payload={"heal": {"check": "ssh box-a true"}})
+    alpha.db.x("UPDATE schedules SET enabled=0 WHERE name='box-a-off'")
+    sched.upsert(beta.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    mtimes = {q.name: (q.base / "state" / "project.db").stat().st_mtime_ns for q in (alpha, beta)}
+    rec = rs.refresh(me, now=2000.0)
+    assert rec["items"][0] == {"kind": "machine", "name": "box-a", "covered_by": ["beta/box-a-up"],
+                               "via": "fallback beta"}
+    assert rec["line"] == f"health coverage: {n}/{n} (machine box-a covered by fallback beta)"
+    # The owner's own heal check wins over the fallback's.
+    alpha.db.x("UPDATE schedules SET enabled=1 WHERE name='box-a-off'")
+    rec = rs.refresh(me, now=3000.0)
+    assert rec["items"][0]["covered_by"] == ["alpha/box-a-off"]
+    assert rec["line"] == f"health coverage: {n}/{n} (machine box-a covered by owner alpha)"
+    assert {q.name: (q.base / "state" / "project.db").stat().st_mtime_ns for q in (alpha, beta)} == mtimes
+    # A check of this project's own covers it with no owner credit; the owner itself gets none from itself.
+    sched.upsert(me.db, "mine", "command", "5m", payload={"heal": {"check": "ssh box-a true"}})
+    assert rs.refresh(me, now=4000.0)["items"][0] == {"kind": "machine", "name": "box-a", "covered_by": ["mine"]}
+    _resources(alpha, "Machines: box-a")
+    alpha.db.x("DELETE FROM schedules WHERE name IN ('box-a-off', 'ping-a')")
+    assert [i["covered_by"] for i in rs.inventory(alpha) if i["kind"] == "machine"] == [["beta/box-a-up"]]
+
+
 def test_responsibility_inventory_lists_runners_schedules_prs_and_remote_jobs(env):
     from ttp import responsibilities as rs
     from ttp import schedule as sched

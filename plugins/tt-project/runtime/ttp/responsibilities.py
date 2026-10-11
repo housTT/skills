@@ -10,10 +10,12 @@ Responsibility inventory. The daemon lists, model-free, what the project is resp
   `retry_when` is `ttp detach --check --host ...`).
 A machine, runner or tunnel is covered when an enabled heal check or command watcher names it: in its
 `resource` or `machine` (the alias itself, or `<alias>-...`), or as a word of its command, check, fix,
-status command, unit, host or URL. The rest the daemon already watches by itself (a schedule failing
-twice queues its fix task, the push queue recovers dead batches, the PR watcher reads open PRs, a wait
-probe wakes its task when the remote job ends or its host is gone), so they are covered by `builtin`;
-open PRs need the built-in PR watcher schedule to be on.
+status command, unit, host or URL. A shared machine this project has no such check for is covered when
+its recovery owner (else its fallback) runs an enabled heal check naming it: that project's database is
+read read-only, and the line says 'machine <alias> covered by owner <project>'. The rest the daemon
+already watches by itself (a schedule failing twice queues its fix task, the push queue recovers dead
+batches, the PR watcher reads open PRs, a wait probe wakes its task when the remote job ends or its host
+is gone), so they are covered by `builtin`; open PRs need the built-in PR watcher schedule to be on.
 
 `ttp status` and the web app show 'health coverage: n/m (missing: ...)'. The daemon looks every
 CHECK_EVERY_S (a file read and a few queries, no subprocess) and keeps the inventory in kv KV; it
@@ -94,7 +96,12 @@ def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
     known = machines.load()
     for alias in machine_ledger.resource_machines(p):
         needles = [alias] + ([str(known[alias]["hostname"])] if (known.get(alias) or {}).get("hostname") else [])
-        items.append({"kind": "machine", "name": alias, "covered_by": covering(needles, found)})
+        item = {"kind": "machine", "name": alias, "covered_by": covering(needles, found)}
+        if not item["covered_by"]:
+            via, checks = _owner_checks(p, known.get(alias) or {}, needles)
+            if checks:
+                item.update(covered_by=checks, via=via)
+        items.append(item)
     runners = ((cfg.get("device") or {}).get("runners") or {})
     for name in sorted(runners if isinstance(runners, dict) else {}):
         host = str((runners[name] or {}).get("host") or "") if isinstance(runners[name], dict) else ""
@@ -144,6 +151,36 @@ def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
     return items
 
 
+def _owner_checks(p, rec: dict, needles: list[str]) -> tuple[str, list[str]]:
+    """('owner <project>', ['<project>/<check>', ...]): the recovery owner's (else fallback's) enabled heal
+    checks naming the machine, read read-only from its database; ("", []) when neither runs one here."""
+    from . import globalcap
+    bases = dict(_projects(project.hostname()))
+    for role in ("owner", "fallback"):
+        who = str(rec.get(f"recovery_{role}") or "")
+        db_path = bases[who] / "state" / "project.db" if who and who != p.name and who in bases else None
+        if not db_path or not db_path.is_file():
+            continue
+        try:
+            db = ReadOnly(globalcap.connect_ro(db_path))
+        except Exception:
+            continue
+        try:
+            names = covering(needles, [w for w in watchers(db) if w["heal"]])
+        except Exception:
+            names = []
+        finally:
+            db.close()
+        if names:
+            return f"{role} {who}", [f"{who}/{n}" for n in names]
+    return "", []
+
+
+def by_owner(items: list[dict]) -> list[str]:
+    """'machine <alias> covered by owner <project>' for each item only another project's heal check covers."""
+    return [f"{i['kind']} {i['name']} covered by {i['via']}" for i in items if i.get("via") and i["covered_by"]]
+
+
 def missing(items: list[dict]) -> list[str]:
     return [f"{i['kind']} {i['name']}" for i in items if not i["covered_by"]]
 
@@ -153,8 +190,8 @@ def line_of(items: list[dict]) -> str:
     if not items:
         return ""
     gaps = missing(items)
-    return (f"health coverage: {len(items) - len(gaps)}/{len(items)}"
-            + (f" (missing: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''})" if gaps else ""))
+    notes = ([f"missing: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''}"] if gaps else []) + by_owner(items)
+    return f"health coverage: {len(items) - len(gaps)}/{len(items)}" + (f" ({'; '.join(notes)})" if notes else "")
 
 
 def refresh(p, cfg: dict | None = None, now: float | None = None) -> dict:
