@@ -20,6 +20,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import time
@@ -212,6 +213,15 @@ def env(tmp_path, monkeypatch, _git_session):
     # And for the harness's own commits, which pass the fsync settings per command; it doubles their
     # cost. Tests of those settings set TTP_TEST_GIT_FSYNC to get them back.
     from ttp import project
+    # TMPDIR may be a run folder inside a real repository and project. Test directories must
+    # not discover either ancestor; keep the temporary files in the sandbox's writable TMPDIR.
+    ceiling = str(tmp_path.parent.resolve())
+    inherited = os.environ.get("GIT_CEILING_DIRECTORIES", "")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", os.pathsep.join(filter(None, (ceiling, inherited))))
+    ancestors = set(tmp_path.resolve().parents)
+    real_exists = project.Project.exists
+    monkeypatch.setattr(project.Project, "exists",
+                        lambda self: self.root not in ancestors and real_exists(self))
     real_fsync_args = project.git_fsync_args
     monkeypatch.setattr(project, "git_fsync_args",
                         lambda: real_fsync_args() if os.environ.get("TTP_TEST_GIT_FSYNC") else [])
@@ -38363,6 +38373,36 @@ def test_check_commands_have_first_failure_semantics(env, tmp_path):
     git = "git -C " + str(tmp_path) + " rev-parse --verify HEAD"
     assert run(f'[ "$({git})" = "" ] && echo skipped') == 0
     assert run(f'head=$({git}) || exit 1; [ "$head" = "" ] && echo skipped') != 0
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp_path, monkeypatch, jobs):
+    from ttp import cli
+    p, _, run, _ = _checks_repo(env, tmp_path, monkeypatch)
+    nested_tmp = p.runs / "test-run" / "tmp"
+    nested_tmp.mkdir(parents=True)
+    assert p.exists() and _git_out(nested_tmp, "rev-parse", "HEAD"), "the temp root has both ancestors"
+    monkeypatch.setenv("TTP_TEST_JOBS", str(jobs))
+    targets = [f"{__file__}::{name}" for name in (
+        "test_status_without_a_name_uses_the_project_of_the_current_folder",
+        "test_check_commands_have_first_failure_semantics",
+    )]
+    p.set_config("delivery.push_checks", [shlex.join([
+        sys.executable, "-m", "pytest", "-q", "-o", "tmp_path_retention_policy=all", *targets,
+    ])])
+    # Double nesting a pytest run exceeds Unix socket path limits in the collection-time socket
+    # probe. A short alias keeps that probe usable; all temporary files still live in nested_tmp,
+    # and pytest resolves its basetemp, so both git and project discovery see the real ancestors.
+    with tempfile.TemporaryDirectory(prefix="ttp-test-", dir="/tmp") as alias:
+        link = pathlib.Path(alias) / "tmp"
+        link.symlink_to(nested_tmp, target_is_directory=True)
+        for var in ("TMPDIR", "TMP", "TEMP"):
+            monkeypatch.setenv(var, str(link))
+        cli.main(["checks"])
+    record = json.loads((run / "checks.json").read_text())
+    assert record["passed"] is True
+    assert "2 passed" in (run / "checks.log").read_text()
+    assert list(nested_tmp.glob("pytest-of-*/pytest-*")), "pytest kept its files under the run's TMPDIR"
 
 
 def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monkeypatch, capsys):
