@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   origin TEXT NOT NULL DEFAULT 'coordinator', branch TEXT, pr_url TEXT, result TEXT,
   blocked_reason TEXT, depends_on TEXT NOT NULL DEFAULT '[]', labels TEXT NOT NULL DEFAULT '[]',
   not_before REAL,
-  model TEXT, effort TEXT);        -- the task's own model and effort; NULL: its provider's tier decides
+  model TEXT, effort TEXT, pin_verify TEXT); -- NULL pins follow the tier; NULL verification follows the project
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority);
 -- A hold's anchor (anchors.py, the label `waits:<kind>:<value>`) lives only while the task is blocked.
 -- Every write that leaves it on a task not blocked, raw SQL included, drops it: else a later block
@@ -251,12 +251,12 @@ class DB:
                 self.x("UPDATE schedules SET tz=? WHERE at IS NOT NULL AND at!=''", (detect_local(),))
 
     def _migrate_task_pin(self) -> None:
-        # A task's own model and effort (see pin_of). Older tasks keep NULL: their tier decides.
-        if {"model", "effort"} <= {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
+        # Explicit task pins and their verification override (see pin_of). Older tasks keep NULL.
+        if {"model", "effort", "pin_verify"} <= {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
             return
         with self.tx():
             have = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
-            for col in ("model", "effort"):
+            for col in ("model", "effort", "pin_verify"):
                 if col not in have:
                     self.x(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
 
@@ -445,7 +445,7 @@ class DB:
         now = time.time()
         cols = {"created": now, "updated": now, "title": title.strip()[:200], "spec": spec}
         for k in ("kind", "status", "priority", "tier", "provider", "budget_usd", "max_attempts",
-                  "parent", "reply_chat", "origin", "branch", "not_before", "model", "effort"):
+                  "parent", "reply_chat", "origin", "branch", "not_before", "model", "effort", "pin_verify"):
             if kw.get(k) is not None:
                 cols[k] = kw[k]
         for k in ("depends_on", "labels"):
@@ -630,12 +630,12 @@ def dependency_ids(task: dict) -> list:
 
 
 def pin_of(task: dict | None) -> dict:
-    """The task's explicit model and effort pin, as add_task keywords a review, re-review or
+    """The task's explicit model/effort pin and verification override, as keywords a review, re-review or
     continuation of it takes over: with its provider, so the model is never handed to another
     agent. {} when it pins neither (a derived task then runs as it always did)."""
     if not task or not (task.get("model") or task.get("effort")):
         return {}
-    return {k: task.get(k) or None for k in ("provider", "model", "effort")}
+    return {k: task.get(k) or None for k in ("provider", "model", "effort", "pin_verify")}
 
 
 def continues_id(task: dict) -> int | None:

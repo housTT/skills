@@ -2653,6 +2653,12 @@ def cmd_config(a) -> None:
     hint = unknown_key_hint(a.key)
     if hint:
         die(hint)
+    if a.key == "runner.pin_verify":
+        from .project import pin_verify_mode
+        try:
+            val = pin_verify_mode(val)
+        except ValueError as e:
+            die(str(e))
     if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to"):
         from . import failover
         try:

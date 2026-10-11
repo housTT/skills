@@ -1307,7 +1307,9 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                    "model": model, "effort": effort, **({"pin": pin} if pin else {}),
+                    "model": model, "effort": effort,
+                    **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
+                        or self.cfg["runner"]["pin_verify"]} if pin else {}),
                     "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     # What a run without its own budget is priced at when it reports no usage.
@@ -1803,7 +1805,8 @@ class Daemon:
         except (OSError, ValueError, AttributeError):
             session = None
         if isinstance(session, dict):
-            note["session"] = {k: session[k] for k in ("model", "effort", "error") if k in session}
+            note["session"] = {k: session[k] for k in ("model", "effort", "error", "verification", "pin_verify", "checked")
+                               if k in session}
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
@@ -2144,7 +2147,7 @@ class Daemon:
                        orderly: bool = False, refused: str = "") -> None:
         """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
         `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task.
-        `refused`: why the runner refused to start the agent (model_mismatch: runner.check_pin)."""
+        `refused`: why the runner refused to start the agent (runner.check_pin)."""
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -2194,17 +2197,20 @@ class Daemon:
                      (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
                       f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
             return
-        if refused == "model_mismatch":
-            # The agent would run another model or effort than the task pins. Nothing ran and nothing
-            # was spent; a retry would resolve the same, so the task waits for a new pin, no attempt spent.
-            why = f"model pin not honoured: {usage.error}"[:500]
+        if refused in ("model_mismatch", "pin_unverified"):
+            # A mismatch or strict unverifiable pin: nothing ran or was spent. Retrying the same
+            # configuration would loop, so block without spending an attempt.
+            prefix = "model pin not honoured" if refused == "model_mismatch" else "model pin could not be verified"
+            why = f"{prefix}: {usage.error}"[:500]
+            remedy = ("Change or clear its model/effort pin (task_update) and requeue it."
+                      if refused == "model_mismatch" else
+                      "Restore session verification or explicitly change pin_verify, then requeue it.")
             with db.tx():
                 db.update_task(task["id"], status="blocked", blocked_reason=why,
                                result=dump_result({"status": "blocked", "summary": why}))
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), f"task:{task['id']}", "task_blocked", "normal",
-                      f"#{task['id']} {task['title']} → blocked: {why}. Change or clear its model/effort pin "
-                      f"(task_update) and requeue it.", "queued", task["id"]))
+                      f"#{task['id']} {task['title']} → blocked: {why}. {remedy}", "queued", task["id"]))
             return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.

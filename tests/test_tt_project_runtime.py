@@ -42028,7 +42028,7 @@ def test_a_task_pinned_to_a_codex_model_and_effort_runs_on_them_and_keeps_the_pi
     con.close()
     migrated = DB(old)
     t = migrated.one("SELECT * FROM tasks WHERE title='older'")
-    assert t["model"] is None and t["effort"] is None
+    assert t["model"] is None and t["effort"] is None and t["pin_verify"] is None
     assert migrated.task(migrated.add_task("new", model="m", effort="high"))["model"] == "m"
 
 
@@ -42036,10 +42036,11 @@ def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
     from ttp import coordinator as coord
     p = make(env)
     add = {"type": "task_add", "spec": "s", "kind": "work", "provider": "codex", "model": "research-model-1",
-           "effort": "xhigh"}
+           "effort": "xhigh", "pin_verify": "strict"}
     assert "is not one of" in " ".join(coord.apply(p, [{**add, "title": "bad effort", "effort": "huge"}]))
     assert "not a model name" in " ".join(coord.apply(p, [{**add, "title": "bad model", "model": "-x y"}]))
     assert "not configured" in " ".join(coord.apply(p, [{**add, "title": "bad provider", "provider": "nope"}]))
+    assert "pin_verify" in " ".join(coord.apply(p, [{**add, "title": "bad verification", "pin_verify": "maybe"}]))
     assert not p.db.q("SELECT id FROM tasks")
     assert coord.apply(p, [{**add, "title": "pinned study"}]) == []
     first = p.db.one("SELECT * FROM tasks WHERE title='pinned study'")
@@ -42049,6 +42050,9 @@ def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
                             "continues": first["id"]}]) == []
     again = p.db.one("SELECT * FROM tasks WHERE title='pinned study again'")
     assert (again["provider"], again["model"], again["effort"]) == ("codex", "research-model-1", "xhigh")
+    assert again["pin_verify"] == "strict"
+    from ttp.db import DB
+    assert DB(p.db.path).task(again["id"])["pin_verify"] == "strict"
     p.db.update_task(again["id"], status="failed")
     assert coord.apply(p, [{"type": "task_add", "title": "on claude now", "spec": "s", "provider": "claude",
                             "continues": again["id"]}]) == []
@@ -42059,9 +42063,14 @@ def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
     assert p.db.task(moved["id"])["effort"] == "high"
     assert coord.apply(p, [{"type": "task_update", "id": moved["id"], "effort": ""}]) == []
     assert p.db.task(moved["id"])["effort"] is None
+    assert coord.apply(p, [{"type": "task_update", "id": moved["id"], "pin_verify": "lenient"}]) == []
+    assert p.db.task(moved["id"])["pin_verify"] == "lenient"
+    assert coord.apply(p, [{"type": "task_update", "id": moved["id"], "pin_verify": ""}]) == []
+    assert p.db.task(moved["id"])["pin_verify"] is None
     p.db.update_task(moved["id"], status="running")
     assert "is running" in " ".join(coord.apply(p, [{"type": "task_update", "id": moved["id"], "model": "m2"}]))
     assert p.db.task(moved["id"])["model"] is None
+    assert "is running" in " ".join(coord.apply(p, [{"type": "task_update", "id": moved["id"], "pin_verify": "strict"}]))
 
 
 def test_reviews_fixes_and_re_reviews_of_a_pinned_task_keep_its_pin(env, monkeypatch):
@@ -42069,7 +42078,7 @@ def test_reviews_fixes_and_re_reviews_of_a_pinned_task_keep_its_pin(env, monkeyp
     from ttp.providers import codex as codex_provider
     monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")   # never a real agent
     p = make(env)
-    pin = {"provider": "codex", "model": "research-model-1", "effort": "xhigh"}
+    pin = {"provider": "codex", "model": "research-model-1", "effort": "xhigh", "pin_verify": "strict"}
     code, _, _, (rev,) = _finish_code(env, p, "pinned feature", {"app.py": 20},
                                       before=lambda tid, head: p.db.update_task(tid, **pin))
     assert {k: rev[k] for k in pin} == pin
@@ -42418,7 +42427,8 @@ def test_a_codex_task_pin_is_checked_against_the_session_before_the_agent_starts
     assert req["params"]["cwd"] == str(env["repo"])
     assert run["status"] == "ok" and task["status"] == "done"
     note = json.loads(run["note"])
-    assert note["session"] == {"model": "pinned-model-1", "effort": "xhigh"}, "the actual session is recorded"
+    assert {k: note["session"][k] for k in ("model", "effort")} == {"model": "pinned-model-1", "effort": "xhigh"}
+    assert note["session"]["verification"] == "verified"
     spec = json.loads((p.runs / str(run["id"]) / "run.json").read_text())
     assert spec["pin"] == {"model": "pinned-model-1", "effort": "xhigh"}
     assert (spec["session"]["model"], spec["session"]["effort"]) == ("pinned-model-1", "xhigh")
@@ -42457,7 +42467,107 @@ def test_a_pinned_run_whose_session_cannot_be_checked_goes_ahead_unverified(env,
                                      pin={"effort": "xhigh"}, session="exit")
     assert argv and run["status"] == "ok" and task["status"] == "done"
     assert "error" in json.loads(run["note"])["session"], "the run record says the pin went unverified"
+    assert json.loads(run["note"])["session"]["verification"] == "unverifiable"
     assert "could not verify" in (p.runs / str(run["id"]) / "runner.log").read_text()
+
+
+def test_strict_project_pin_verification_blocks_without_spend_or_retry(env, monkeypatch):
+    def strict(p):
+        cfg = p.raw_config()
+        cfg.setdefault("runner", {})["pin_verify"] = "strict"
+        p.config_path.write_text(json.dumps(cfg))
+
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
+                                     pin={"effort": "xhigh"}, session="exit", before=strict)
+    assert argv is None, "strict verification must refuse before codex exec starts"
+    assert run["cost_usd"] == 0 and task["spent_usd"] == 0 and task["attempts"] == 0
+    assert task["status"] == "blocked" and "could not verify" in task["blocked_reason"]
+    assert task["not_before"] is None
+    note = json.loads(run["note"])
+    assert note["refused"] == "pin_unverified" and note["not_waste"] == "refused"
+    assert note["session"]["verification"] == "unverifiable"
+    assert note["session"]["pin_verify"] == "strict"
+    run_dir = p.runs / str(run["id"])
+    exit_info = json.loads((run_dir / "exit.json").read_text())
+    assert exit_info["launched"] is False and exit_info["model_turn_started"] is False
+    assert json.loads(task["result"])["status"] == "blocked"
+    assert not (run_dir / "tmp").exists()
+
+
+@pytest.mark.parametrize("provider, project_mode, task_mode, runs", [
+    ("codex", "lenient", "strict", False),
+    ("codex", "strict", "lenient", True),
+    ("cursor", "lenient", "strict", False),
+    ("cursor", "strict", "lenient", True),
+])
+def test_task_pin_verification_overrides_project_policy(env, monkeypatch, provider, project_mode, task_mode, runs):
+    p, run, task, argv, _ = _cli_run(
+        env, monkeypatch, provider, _codex_events(*_codex_turn("done")) if provider == "codex" else "",
+        result={"status": "done", "summary": "ok"}, pin={"effort": "high", "pin_verify": task_mode},
+        session="exit", before=lambda p: p.set_config("runner.pin_verify", project_mode))
+    assert bool(argv) is runs
+    assert task["status"] == ("done" if runs else "blocked")
+    assert task["attempts"] == (1 if runs else 0)
+    note = json.loads(run["note"])
+    assert note["session"]["pin_verify"] == task_mode
+    assert note["session"]["verification"] == "unverifiable"
+    assert "error" in note["session"]
+
+
+def test_project_pin_verification_config_accepts_only_supported_modes(env, capsys):
+    from ttp import cli, coordinator as coord
+    from ttp.project import config_problems
+    p = make(env)
+    assert p.config()["runner"]["pin_verify"] == "lenient"
+    cli.main(["config", "demo", "runner.pin_verify", "strict"])
+    assert p.config()["runner"]["pin_verify"] == "strict"
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "runner.pin_verify", "strcit"])
+    assert "pin_verify" in capsys.readouterr().err
+    assert p.config()["runner"]["pin_verify"] == "strict"
+    for mode in ("strict", "lenient"):
+        assert config_problems({"runner": {"pin_verify": mode}}) == []
+        assert coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": mode}]) == []
+        assert p.config()["runner"]["pin_verify"] == mode
+    assert "pin_verify" in " ".join(config_problems({"runner": {"pin_verify": "strcit"}}))
+    assert "pin_verify" in " ".join(coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": "strcit"}]))
+    assert p.config()["runner"]["pin_verify"] == "lenient"
+
+
+@pytest.mark.parametrize("mode", ["strict", "lenient"])
+@pytest.mark.parametrize("answer, outcome", [
+    ({"model": "m", "effort": "high"}, "verified"),
+    ({"model": "other", "effort": "high"}, "mismatched"),
+    ({"error": "provider did not answer"}, "unverifiable"),
+    (None, "unverifiable"),
+    (RuntimeError("cannot query session"), "unverifiable"),
+    ({"model": "m"}, "mismatched"),
+    ([], "unverifiable"),
+    ({"model": "other"}, "mismatched"),
+])
+def test_pin_verification_records_every_outcome(tmp_path, monkeypatch, mode, answer, outcome):
+    from ttp import runner, providers
+
+    class Provider:
+        def resolved_session(self, *args):
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    monkeypatch.setattr(providers, "get_provider", lambda _: Provider())
+    spec = {"provider": "codex", "argv": [], "cwd": str(tmp_path),
+            "pin": {"model": "m", "effort": "high"}, "pin_verify": mode}
+    (tmp_path / "run.json").write_text(json.dumps(spec))
+    refused = runner.check_pin(tmp_path, spec, {})
+    session = json.loads((tmp_path / "run.json").read_text())["session"]
+    assert session["verification"] == outcome and session["pin_verify"] == mode
+    assert session["checked"] > 0
+    if outcome == "mismatched":
+        assert refused["refused"] == "model_mismatch"
+    elif outcome == "unverifiable" and mode == "strict":
+        assert refused["refused"] == "pin_unverified" and "could not verify" in refused["error"]
+    else:
+        assert refused is None
 
 
 def test_codex_session_config_args_mirror_the_exec_overrides():

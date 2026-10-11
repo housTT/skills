@@ -444,27 +444,36 @@ def supervise(run_dir: Path) -> int:
 
 def check_pin(run_dir: Path, spec: dict, env: dict) -> dict | None:
     """Before a task that pins its model or effort starts its agent: ask the agent which model and
-    effort the session resolves (no model turn) and record them in run.json (`session`). Returns the
-    refusal for exit.json when either differs from the pin; None when they match, or when the agent
-    cannot be asked (the run goes ahead unverified, and run.json says why)."""
+    effort the session resolves (no model turn), recording the outcome in run.json (`session`).
+    Mismatches always refuse; unverifiable pins refuse only with pin_verify=strict."""
     from .providers import get_provider
     pin = {k: str(v) for k, v in (spec.get("pin") or {}).items() if k in ("model", "effort") and v}
+    mode = spec.get("pin_verify", "lenient")
     try:
         got = get_provider(spec["provider"]).resolved_session(spec["argv"], spec["cwd"], env)
     except Exception as e:
         got = {"error": f"{type(e).__name__}: {e}"[:300]}
     if got is None:
-        return None   # this agent cannot tell before its first turn
-    session = {**got, "checked": time.time()}
+        got = {"error": "provider cannot report its resolved session before its first model turn"}
+    elif not isinstance(got, dict):
+        got = {"error": "provider returned an invalid session response"}
+    # Preserve existing mismatch handling, including an unset resolved model or effort. An
+    # error response cannot establish either a match or a mismatch.
+    off = [] if got.get("error") else [f"{k} {got.get(k) or 'unset'} (pinned {v})" for k, v in pin.items()
+                                      if str(got.get(k) or "").lower() != v.lower()]
+    outcome = "mismatched" if off else "unverifiable" if got.get("error") else "verified"
+    session = {**got, "checked": time.time(), "verification": outcome, "pin_verify": mode}
     try:
         durable_write(run_dir / "run.json", json.dumps({**spec, "session": session}, indent=1))
     except OSError:
         pass
-    if got.get("error"):
-        print(f"runner: could not verify the pinned {', '.join(pin)}: {got['error']}", flush=True)
+    if outcome == "unverifiable":
+        why = f"could not verify the pinned {', '.join(pin)} for {spec['provider']}: {got['error']}"
+        print(f"runner: {why} (pin_verify={mode})", flush=True)
+        if mode == "strict":
+            why += "; pin_verify=strict refused the run before its first model turn"
+            return {"refused": "pin_unverified", "error": why, "session": session}
         return None
-    off = [f"{k} {got.get(k) or 'unset'} (pinned {v})" for k, v in pin.items()
-           if str(got.get(k) or "").lower() != v.lower()]
     if not off:
         return None
     why = f"{spec['provider']} resolved {' and '.join(off)}; the run was refused before its first model turn"

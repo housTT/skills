@@ -235,7 +235,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # prevent_idle_sleep (auto/on/off): on macOS, while the project has work and the machine is on AC
     # power, the daemon keeps the machine from idle-sleeping (`caffeinate -i`; a closed lid or a sleep
     # the user asks for still sleeps it). auto = on for workstations (a Mac is one); other platforms never.
-    "runner": {"nice": 10, "prevent_idle_sleep": "auto"},
+    # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
+    "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
 }
 
 
@@ -414,6 +415,13 @@ def renice(pid: int, n: int) -> None:
         pass
 
 
+def pin_verify_mode(value: Any) -> str:
+    """A project's verification policy for explicit task pins."""
+    if value not in ("strict", "lenient"):
+        raise ValueError("runner.pin_verify must be strict or lenient")
+    return value
+
+
 def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     """Unknown keys, non-command push_checks or after_push, a scalar push_exclude_paths, a malformed version_bump, push queue
     settings out of range and a push branch that can never be pushed to (push_branch_problem; with
@@ -491,6 +499,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None
     if v is not None and not isinstance(v, bool) and str(v).strip().lower() not in ("auto", "on", "off"):
         out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; auto is used")
+    v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
+    if v is not None and v not in ("strict", "lenient"):
+        out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
     return out
 
 def deep_merge(base: dict, over: dict) -> dict:

@@ -30,7 +30,7 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, task_outcome,
                  without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
-                      durable_write, push_queue_number, push_queue_on)
+                      durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
@@ -62,6 +62,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "title": {"type": "string"}, "spec": {"type": "string"}, "kind": {"type": "string"},
             "tier": {"type": "string"}, "priority": {"type": "integer"}, "provider": {"type": "string"},
             "model": {"type": "string"}, "effort": {"type": "string"}, "pin_required": {"type": "boolean"},
+            "pin_verify": {"type": "string", "enum": ["strict", "lenient", ""]},
             "budget_usd": {"type": "number"}, "depends_on": {"type": "array", "items": {"type": "integer"}},
             "reply_chat": {"type": "string"}, "id": {"type": "integer"}, "status": {"type": "string"},
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
@@ -131,6 +132,7 @@ USER_SETTABLE = {
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str,
     "coordinator.unblock_effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "runner.pin_verify": pin_verify_mode,
     # Jev's 'routine or needs thought?' check on coordinator turns (coordcheck): on, off or auto.
     "jev.uses.coord_effort": lambda v: jevuse.mode({"jev": {"uses": {"x": v}}}, "x"),
     # Where code tasks branch from: the project's working branch once it has one.
@@ -1189,11 +1191,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
-                if any(a.get(k) is not None for k in ("provider", "model", "effort")):
+                if any(a.get(k) is not None for k in ("provider", "model", "effort", "pin_verify")):
                     if task["status"] == "running":
-                        raise ValueError(f"task #{task['id']} is running: its provider, model and effort change only "
+                        raise ValueError(f"task #{task['id']} is running: its provider, model, effort and pin verification change only "
                                          f"while it is not; cancel it and re-add it with `continues` to change them now")
-                    pin = _task_pin(cfg, a, {k: task.get(k) for k in ("provider", "model", "effort")})
+                    pin = _task_pin(cfg, a, {k: task.get(k) for k in ("provider", "model", "effort", "pin_verify")})
                     upd.update({k: v for k, v in pin.items() if v != task.get(k)})
                     notes.extend(_relay_pin_note(p, cfg, a, task["id"], messages))
                 if a.get("pin_required") is not None:
@@ -1673,7 +1675,7 @@ def _task_pin(cfg: dict, a: dict, base: dict) -> dict:
     """A task's provider, model and effort (add_task keywords) from a task_add or task_update action
     over `base`: the task's own (an update) or the pin of the task it continues (inherited unless the
     action names another provider: a model or effort is one provider's). "" clears a field."""
-    out = {k: base.get(k) or None for k in ("provider", "model", "effort")}
+    out = {k: base.get(k) or None for k in ("provider", "model", "effort", "pin_verify")}
     prov = a.get("provider")
     if prov is not None:
         prov = str(prov).strip()
@@ -1693,6 +1695,11 @@ def _task_pin(cfg: dict, a: dict, base: dict) -> dict:
         if eff and eff not in EFFORT_ORDER:
             raise ValueError(f"effort {eff[:30]!r} is not one of {', '.join(EFFORT_ORDER)}")
         out["effort"] = eff or None
+    if a.get("pin_verify") is not None:
+        mode = a["pin_verify"]
+        if mode not in ("strict", "lenient", ""):
+            raise ValueError("pin_verify must be strict or lenient (empty clears the override)")
+        out["pin_verify"] = mode or None
     return out
 
 
