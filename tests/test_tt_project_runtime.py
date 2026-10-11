@@ -31263,7 +31263,7 @@ def test_a_notes_branch_publishes_itself_and_never_rebases_onto_the_push_branch_
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     proj, feature = _git_out(origin, "rev-parse", "proj"), _git_out(origin, "rev-parse", "feature/x")
     for labels in ([], ["pr_branch:feature/x"]):
-        tid = p.db.add_task(f"notes {labels}", "s", kind="code", labels=labels)
+        tid = p.db.add_task(f"lessons {labels}", "s", kind="code", labels=labels)
         notes = f"ttp/t{tid}-notes"
         _git_out(repo, "checkout", "-q", "-B", notes, base)
         _commit(repo, f"notes{tid}.md", "notes\n")
@@ -31287,6 +31287,31 @@ def test_a_notes_branch_publishes_itself_and_never_rebases_onto_the_push_branch_
     # Only a whole `notes` word ends a notes branch.
     assert not push.NOTES_BRANCH.fullmatch(f"ttp/t{tid}-keynotes")
     assert push.NOTES_BRANCH.fullmatch(f"ttp/t{tid}-swirl-notes")
+
+
+def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_code(env, monkeypatch):
+    """A code task titled 'Update release notes' works on ttp/t<id>-update-release-notes, which
+    matches NOTES_BRANCH by name: it is still the task's own code branch, so a plain push targets
+    the push branch and own_target carries it onto the task's pr_branch."""
+    from ttp import push, worktree
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
+    for labels in ([], ["pr_branch:feature/x"]):
+        tid = p.db.add_task("Update release notes", "s", kind="code", labels=labels)
+        own = f"ttp/t{tid}-{worktree.slug('Update release notes')}"
+        assert push.NOTES_BRANCH.fullmatch(own)
+        _git_out(repo, "checkout", "-q", "-B", own)
+        _commit(repo, f"rel{tid}.md", "release\n")
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        assert not push.is_notes_branch(p, own)
+        if labels:
+            assert push.own_target(p, repo) == ("origin", "feature/x")
+        else:
+            assert push.resolve(p, repo) == ("origin", "proj", False)
+    # A branch recorded on the task row is its own code branch too; the slug then no longer is.
+    p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/t{tid}-fix-notes", tid))
+    assert not push.is_notes_branch(p, f"ttp/t{tid}-fix-notes")
+    assert push.is_notes_branch(p, own) and push.is_notes_branch(p, f"ttp/t{tid}-notes")
 
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):

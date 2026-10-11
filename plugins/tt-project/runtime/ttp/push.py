@@ -884,7 +884,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     worktree) publishes its head onto that branch instead, and so does a review covering that task.
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
-    A notes branch (NOTES_BRANCH) is published under its own name whatever pr_branch the task carries.
+    A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
     In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
@@ -892,7 +892,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
     onto = _labelled(p, task, "pr_branch") if task else ""
-    notes = bool(NOTES_BRANCH.fullmatch(branch))   # publishes itself, never onto a pr_branch
+    notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
     carried = bool(m and onto and m.group(1) == task and not notes)
     if m and task and m.group(1) != task and not carried and not notes:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would.
@@ -1037,6 +1037,19 @@ def _labelled(p: Project, task: str | None, name: str) -> str:
     return next((x.partition(":")[2] for x in _labels(_task_row(p, task)) if x.startswith(f"{name}:")), "")
 
 
+def is_notes_branch(p: Project, branch: str) -> bool:
+    """Whether `branch` is a task's notes branch: it matches NOTES_BRANCH and is not that task's own
+    code branch (the branch recorded on its row, else ttp/t<id>-<slug(title)>, as worktree.ensure
+    names it), so a code task titled e.g. 'Update release notes' still delivers as code."""
+    m = NOTES_BRANCH.fullmatch(branch)
+    if not m:
+        return False
+    t = _task_row(p, m.group(1))
+    if not t:
+        return True
+    return branch != (str(t.get("branch") or "") or f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}")
+
+
 def _carries(p: Project, task: str, owner: str, branch: str) -> bool:
     """Whether task `task` may publish task `owner`'s ttp/t<id>-... `branch` with --own: it carries
     it as its branch or `pr_branch:` label, or continues `owner` (a fix on a finished task's PR)."""
@@ -1078,7 +1091,7 @@ def _on_remote(repo: Path, remote: str, branch: str) -> bool:
 def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
     `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
-    refused (it would land that task's work: _may_land), a notes branch (NOTES_BRANCH) is published
+    refused (it would land that task's work: _may_land), a notes branch (is_notes_branch) is published
     under its own name as with --own, and with no push_branch set this task's
     own branch, once on the remote, is the default target (published as with --own). A branch based
     on a branch outside the flow work lands by (foreign_base) is never rebased onto the push target:
@@ -1092,7 +1105,7 @@ def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
         raise ValueError(f"this worktree has task #{m.group(1)}'s branch {branch} checked out, not "
                          f"task #{task}'s own (ttp/t{task}-...): ttp push lands only this task's work. "
                          f"Run it in this task's own worktree")
-    if NOTES_BRANCH.fullmatch(branch):
+    if is_notes_branch(p, branch):
         remote, own_branch = own_target(p, repo)
         print(f"ttp push: {branch} is a notes branch; publishing it under its own name as with --own, "
               f"never rebased onto the push branch or a pr_branch", file=sys.stderr)
