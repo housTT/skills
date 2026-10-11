@@ -211,6 +211,14 @@ and preferences you add later become part of the project's charter and memory.
   re-block loops (the same reason twice, or a spec addendum while still blocked) are flagged in the
   next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
   has not run. The daily review lists everything stuck over 6 h with its sweep outcome.
+- Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
+  new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
+  than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable
+  provider in `coordinator.provider_failover_to` (empty) or else the core provider. Its model and
+  effort pin is cleared, the effort mapped to a tier (e.g. Codex `xhigh` to `deep`), and a spec note
+  says what moved, why and when the old provider resets. A task labelled `pin:required` (or one it
+  continues or reviews) stays; running tasks are only reported. Each move is a feed event, one low
+  alert and a line in the daily review.
 - Stall check (model-free): when no worker run has started for `coordinator.stall_wake_h` (3; 0
   turns it off) while a queued task has been one dispatch would start now for that long, one high
   observation lists those tasks and when the last worker run started. It uses dispatch's own checks,

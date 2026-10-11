@@ -42452,3 +42452,136 @@ def test_api_state_and_health_carry_the_runtime_receipt(env):
     assert st["heartbeat"]["receipt"]["instance"] == d.identity["instance"]
     assert st["runtime"]["instance"] == st["health"]["runtime"]["instance"] == d.identity["instance"]
     assert st["heartbeat"]["tick_done"] == st["runtime"]["tick_done"]
+
+
+def _failover_setup(env, util=91.0, hours=150.0):
+    """A project on the fake core provider with codex's 7d plan window at `util`%, resetting in `hours`."""
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    bud.record_windows(p.db, [bud.Window("codex", "seven_day", util, now + hours * 3600)])
+    d = Daemon(p.base)
+    return p, d, now
+
+
+def _codex_task(p, title="deep design", **kw):
+    tid = p.db.add_task(title, "Design the thing.", kind="work", tier="standard", provider="codex",
+                        model="research-model-1", effort="xhigh", **kw)
+    return tid
+
+
+def test_failover_moves_a_codex_pinned_task_off_a_red_window_and_maps_its_effort(env):
+    p, d, now = _failover_setup(env)
+    tid = _codex_task(p)
+    waiting = _codex_task(p, "waits on a job")
+    p.db.update_task(waiting, status="waiting")
+    d.update_gates()
+    assert d.gates["codex"].level == "red" and not d.gates["codex"].allow_new_work
+    d.failover_pinned()
+    for i in (tid, waiting):
+        t = p.db.task(i)
+        assert (t["provider"], t["model"], t["effort"], t["tier"]) == ("fake", None, None, "deep"), t
+        assert "[provider failover" in t["spec"] and "moved from codex (model research-model-1, effort xhigh) to fake" \
+            in t["spec"].lower() and "until " in t["spec"]
+        assert t["spec"].startswith("Design the thing.\n\n")
+    ev = p.db.q("SELECT * FROM events WHERE kind='provider_failover' ORDER BY id")
+    assert [e["task"] for e in ev] == [tid, waiting] and all(e["severity"] == "low" for e in ev)
+    out = p.db.q("SELECT * FROM messages WHERE direction='out' AND text LIKE 'Provider failover:%'")
+    assert len(out) == 1 and out[0]["severity"] == "low", "one low alert per batch of moves"
+    from ttp import failover, sweep
+    assert len(failover.review_lines(p.db)) == 2
+    assert sweep._spec_sha(p.db.task(tid)) == sweep._spec_sha({"spec": "Design the thing."}), \
+        "the failover note counts as a spec change (LOOP flag)"
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert len(p.db.q("SELECT id FROM events WHERE kind='provider_failover'")) == 2, "moved twice"
+
+
+def test_failover_leaves_tasks_when_the_reset_is_near_or_failover_is_off(env):
+    p, d, now = _failover_setup(env, hours=2)
+    tid = _codex_task(p)
+    d.update_gates()
+    assert d.gates["codex"].level == "red"
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "moved although codex resets within the threshold"
+    p.set_config("coordinator.provider_failover_after_h", 1)
+    d._load_config()
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "fake", "a 1 h threshold moves a task whose provider resets in 2 h"
+    other = _codex_task(p, "second")
+    p.set_config("coordinator.provider_failover_after_h", 0)
+    d._load_config()
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert p.db.task(other)["provider"] == "codex", "0 turns failover off"
+
+
+def test_failover_keeps_a_required_pin_and_its_review_chain(env):
+    p, d, now = _failover_setup(env)
+    req = _codex_task(p, labels=["pin:required"])
+    review = p.db.add_task("review it", "", kind="review", provider="codex", model="research-model-1",
+                           effort="xhigh", labels=[f"auto_review:{req}"])
+    d.update_gates()
+    d.failover_pinned()
+    for i in (req, review):
+        t = p.db.task(i)
+        assert (t["provider"], t["model"], t["effort"]) == ("codex", "research-model-1", "xhigh")
+    assert not p.db.q("SELECT id FROM events WHERE kind='provider_failover'")
+
+
+def test_failover_never_touches_a_running_task_and_reports_it_once(env):
+    p, d, now = _failover_setup(env)
+    tid = _codex_task(p)
+    p.db.update_task(tid, status="running")
+    d.update_gates()
+    for _ in range(2):
+        d._failover_checked = 0
+        d.failover_pinned()
+    t = p.db.task(tid)
+    assert (t["provider"], t["model"], t["effort"], t["spec"]) == ("codex", "research-model-1", "xhigh",
+                                                                    "Design the thing.")
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='provider_failover'")
+    assert ev["task"] == tid and "left running on codex" in ev["text"]
+
+
+def test_failover_moves_off_a_logged_out_provider_only_to_a_usable_target(env):
+    p, d, now = _failover_setup(env, util=10.0)
+    tid = _codex_task(p)
+    d.update_gates()
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "moved off a green provider"
+    d.open_breaker("codex", "401")
+    d.open_breaker("fake", "401")
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "moved to a logged-out target"
+    from ttp import alerts
+    p.db.set_kv(alerts.BREAKER + "fake", {})
+    d._failover_checked = 0
+    d.failover_pinned()
+    t = p.db.task(tid)
+    assert (t["provider"], t["model"], t["effort"]) == ("fake", None, None)
+    assert "logged out" in t["spec"] and "no known end" in t["spec"]
+
+
+def test_failover_stop_reads_each_reason_for_red_and_its_end(env):
+    from ttp import failover
+    now = 1000.0
+    red = lambda reasons, **n: {"level": "red", "allow_new_work": False, "reasons": reasons, "numbers": n}  # noqa: E731
+    plan = [{"window": "seven_day", "allowed": 0, "resets_at": now + 9e5}, {"window": "five_hour", "allowed": 3}]
+    assert failover.stop(red(["seven_day window at 91%; the project stops at 90% until it resets"], plan=plan),
+                         None, False, now)[1] == now + 9e5
+    assert failover.stop(red(["runaway guard: $9 spent"]), None, False, now)[1] == now + 3600
+    assert failover.stop(red(["cap reached: $9/day of $5, $9/7d of $50"]), None, False, now) is None, \
+        "a rolling cap has no known end"
+    assert failover.stop({"level": "orange", "allow_new_work": True}, None, False, now) is None
+    assert failover.stop(None, {"until": now + 50, "note": "limit"}, False, now) == ("provider limit: limit", now + 50)
+    assert failover.stop(None, None, True, now) == ("logged out", None)
+    cfg = {"core_provider": "claude", "providers": {"claude": {}, "codex": {"tiers": {"deep": {"effort": "xhigh"}}}},
+           "coordinator": {"provider_failover_to": ["codex", "nope"]}}
+    assert failover.targets(cfg) == ["codex", "claude"]
+    assert failover.mapped_tier(cfg, "codex", {"effort": "xhigh", "tier": "standard"}) == "deep"
+    assert failover.mapped_tier(cfg, "claude", {"effort": "low", "tier": "deep"}) == "light"
+    assert failover.mapped_tier(cfg, "codex", {"effort": None, "tier": "standard"}) == "standard"

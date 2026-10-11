@@ -30,7 +30,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import settinghold, unblock
+from . import failover, settinghold, unblock
 from .db import DB, deferral, dependency_ids, load_result
 
 SWEEP_KIND = "blocker_sweep"
@@ -89,7 +89,8 @@ def _reason(t: dict) -> str:
 
 
 def _spec_sha(t: dict) -> str:
-    return hashlib.sha256((t["spec"] or "").encode()).hexdigest()[:16]
+    # A provider failover's note is no change of the task's own spec (no LOOP flag for it).
+    return hashlib.sha256(failover.strip_notes(t["spec"] or "").encode()).hexdigest()[:16]
 
 
 def _moved_at(db: DB, tid: int) -> float:

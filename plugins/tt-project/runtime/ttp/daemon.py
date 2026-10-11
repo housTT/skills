@@ -39,6 +39,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import detach
 from . import effort
+from . import failover
 from . import grants
 from . import ends
 from . import heal
@@ -668,7 +669,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2915,6 +2916,10 @@ class Daemon:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
                 spec += (f"\n\nStuck longer than {sweep.REVIEW_LONG_H:g}h, with the blocker sweep's outcome:\n"
                          + "\n".join(f"- {line}" for line in sweep.review_lines(db)))
+                moved = failover.review_lines(db)
+                if moved:
+                    spec += ("\n\nProvider failovers (last 24 h; tasks moved off a provider that could not "
+                             "start new work):\n" + "\n".join(f"- {line}" for line in moved))
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
@@ -3149,6 +3154,53 @@ class Daemon:
                  (time.time(), "daemon", "retry_wake", "normal",
                   f"A slot is free for an action an earlier turn could not do ({wake.get('why', '')[:600]}). "
                   f"Do it now if it is still needed.", "queued"))
+
+    def failover_pinned(self, every_s: float = 60) -> None:
+        """Move queued and waiting tasks off a provider that cannot start new work for longer than
+        coordinator.provider_failover_after_h (failover.py), model-free, at most once a minute. Each
+        move is a feed event and one low alert; running tasks are only reported."""
+        now = time.time()
+        if now - getattr(self, "_failover_checked", 0.0) < every_s or not failover.after_h(self.cfg):
+            return
+        self._failover_checked = now
+        db, core = self.p.db, self.cfg.get("core_provider") or "claude"
+        try:
+            provs = {r["p"] or core for r in db.q("SELECT DISTINCT provider p FROM tasks "
+                                                  "WHERE status IN ('queued','waiting','running')")}
+            stops, windows = {}, bud.plan_windows(db)
+            for prov in provs:   # update_gates leaves out providers only waiting tasks use
+                gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
+                why = failover.stop(gate, self._provider_pause(prov), self._logged_out(prov), now)
+                if why:
+                    stops[prov] = why
+            if not stops:
+                return
+            ok = []
+            for prov in failover.targets(self.cfg):
+                if prov in stops or self._logged_out(prov) or self.net_held(prov):
+                    continue
+                try:
+                    if not get_provider(prov).available():
+                        continue
+                except Exception:
+                    continue
+                gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
+                if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
+                        and not failover.stop(gate, self._provider_pause(prov), False, now):
+                    ok.append(prov)
+            moves, running = failover.plan(db, self.cfg, stops, ok, now)
+            where = timefmt.home(self.p)
+            lines = [failover.apply(db, self.cfg, m, now, where) for m in moves]
+            lines += failover.report_running(db, running, now, where)
+        except Exception:
+            log(self.p, "provider failover failed\n" + traceback.format_exc())
+            return
+        for m in moves:
+            log(self.p, f"task {m['task']['id']}: provider {m['old']} -> {m['new']} ({m['why']})")
+        if lines:
+            olds = sorted({m["old"] for m in moves} | {r["provider"] for r in running})
+            self.alert(f"failover:{','.join(olds)}", "Provider failover: " + "; ".join(lines)[:1500],
+                       severity="low", every_s=0)
 
     def blocker_sweep(self) -> None:
         """Queue a blocker sweep (sweep.py) when one is due: a high-effort turn that re-checks every
