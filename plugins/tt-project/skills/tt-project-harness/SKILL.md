@@ -67,6 +67,9 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   one for a project (`ttp note --to`) goes only to the machine that runs it. `ttp upstream
   --forward-status` shows each target's cursor, last success and last error; `ttp upstream
   --forward-to <aliases>|default|none` sets the targets. Received notes stay untrusted data.
+- A `ttp note --to` past 4,000 characters (whitespace joined) is refused whole, never cut; a
+  filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
+  `upstream:` note past the limit is cut with a marker saying how much was kept.
 
 ## Rebooting the harness's own host
 

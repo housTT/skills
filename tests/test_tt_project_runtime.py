@@ -24702,6 +24702,113 @@ def test_a_sandboxed_worker_that_cannot_write_the_inbox_still_sends_its_note(env
     assert "from a worker of demo #%d" % tid in ev["text"] and "the cache is stale" in ev["text"]
 
 
+def _long_note(n: int) -> tuple[str, str]:
+    """A note `n` characters long once whitespace is joined, written with extra spaces and newlines."""
+    words = ("ask " * (n // 4 + 1))[:n].rstrip()
+    words = words + "x" * (n - len(words))
+    return words.replace(" ", "  \n "), words
+
+
+def test_a_note_to_another_project_at_the_limit_is_filed_whole_and_one_past_it_is_refused(env, monkeypatch,
+                                                                                         capsys):
+    """`ttp note --to` never cuts a note: one at SPEC_CHARS once whitespace is joined is filed whole and
+    the command prints the stored length and hash; one character more is refused, naming both numbers,
+    and nothing is filed, queued or noted."""
+    from ttp import cli, upstream
+    p, q = _two_projects_for_outbox(env, monkeypatch)
+    raw, stored = _long_note(upstream.SPEC_CHARS)
+    assert len(raw) > upstream.SPEC_CHARS and len(stored) == upstream.SPEC_CHARS
+    assert _note(cli, "--to", "second", raw) == 0
+    out = capsys.readouterr().out
+    assert "filed in its inbox" in out and upstream.receipt(stored) in out
+    assert f"stored {upstream.SPEC_CHARS} characters, sha256 " in out
+    (n,) = _upstream_inbox(env)
+    assert n["spec"] == stored
+    progress = (pathlib.Path(os.environ["TTP_RUN_DIR"]) / "progress.md").read_text()
+    raw, _ = _long_note(upstream.SPEC_CHARS + 1)
+    assert _note(cli, "--to", "second", raw) == 2
+    err = capsys.readouterr().err
+    assert f"{upstream.SPEC_CHARS + 1} characters" in err and f"limit is {upstream.SPEC_CHARS}" in err
+    assert "not sent" in err and "request first" in err
+    assert len(_upstream_inbox(env)) == 1 and upstream.outbox_pending(p.state) == 0
+    assert (pathlib.Path(os.environ["TTP_RUN_DIR"]) / "progress.md").read_text() == progress
+    for call in (lambda t: upstream.send("demo", 57, "second", t),
+                 lambda t: upstream.send_or_queue(p.state, "demo", 57, "second", t),
+                 lambda t: upstream.queue(pathlib.Path(os.environ["TTP_RUN_DIR"]), "second", t)):
+        with pytest.raises(upstream.NoteTooLong):
+            call(raw)
+    assert not (pathlib.Path(os.environ["TTP_RUN_DIR"]) / upstream.QUEUED_FILE).exists()
+
+
+def test_a_deferred_note_to_another_project_is_kept_whole_or_refused(env, monkeypatch, capsys):
+    """Deferred delivery cuts nothing either: a note past the hourly limit waits whole in the outbox, and one
+    a sandbox cannot file waits whole in the run's directory; both print the stored length and hash, and
+    one past SPEC_CHARS is refused before either. A hand-written line past it is never filed cut."""
+    from ttp import cli, upstream
+    p, q = _two_projects_for_outbox(env, monkeypatch)
+    # A sandbox that cannot write the inbox: the run's directory keeps the note whole.
+    run_dir = pathlib.Path(os.environ["TTP_RUN_DIR"])
+    real_open = os.open
+
+    def ro_open(path, flags, *a):
+        if str(path) == str(upstream.path()) and flags & (os.O_WRONLY | os.O_RDWR):
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return real_open(path, flags, *a)
+
+    monkeypatch.setattr(os, "open", ro_open)
+    raw2, stored2 = _long_note(upstream.SPEC_CHARS - 1)
+    assert _note(cli, "--to", "second", raw2 + "z") == 0
+    out = capsys.readouterr().out
+    assert "queued in this run's directory" in out and upstream.receipt(stored2 + "z") in out
+    assert _note(cli, "--to", "second", raw2 + "zz") == 2
+    assert "not sent" in capsys.readouterr().err
+    monkeypatch.setattr(os, "open", real_open)
+    for i in range(upstream.NOTES_PER_HOUR):
+        assert _note(cli, "--to", "second", f"note {i}") == 0
+    capsys.readouterr()
+    raw, stored = _long_note(upstream.SPEC_CHARS)
+    assert _note(cli, "--to", "second", raw) == 0
+    out = capsys.readouterr().out
+    assert "queued: number 1" in out and upstream.receipt(stored) in out
+    assert [n["text"] for n in upstream._outbox(p.state)] == [stored]
+    assert _note(cli, "--to", "second", raw + " more") == 2
+    assert f"{upstream.SPEC_CHARS + 5} characters" in capsys.readouterr().err
+    assert upstream.outbox_pending(p.state) == 1
+    with open(run_dir / upstream.QUEUED_FILE, "a") as f:
+        f.write(json.dumps({"to": "second", "text": "y" * (upstream.SPEC_CHARS + 1)}) + "\n")
+    got = upstream.send_queued(run_dir, "demo", 57, p.state)
+    assert (got["queued"], got["invalid"]) == (1, 1)
+    assert [n["text"] for n in upstream._outbox(p.state)] == [stored, stored2 + "z"]
+    assert upstream.drain_outbox(p.state, "demo", now=time.time() + 3700)[0] == 2
+    assert [n["spec"] for n in _upstream_inbox(env)][-2:] == [stored, stored2 + "z"]
+    assert not (run_dir / upstream.QUEUED_FILE).exists()
+
+
+def test_an_upstream_note_or_page_past_the_limit_is_cut_saying_so(env):
+    """What cannot be refused is cut visibly, within SPEC_CHARS (so another machine still takes it): a
+    hand-off's `upstream:` note says how much it kept and where the whole text is, and so does a
+    daemon's page to another project."""
+    from ttp import upstream
+    p = make(env)
+    spec = "do this first. " + "detail " * 700
+    _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [{"title": "upstream: big", "spec": spec}]})
+    (n,) = _upstream_inbox(env)
+    kept = len(n["spec"]) - len(n["spec"].split(" … [cut: ")[1]) - len(" … [cut: ")
+    assert len(n["spec"]) <= upstream.SPEC_CHARS and n["spec"].startswith("do this first.")
+    assert f"[cut: {kept} of {len(spec.strip())} characters kept; the whole text is in the hand-off of demo #" in n["spec"]
+    assert upstream.send("demo", None, "other", "page " * 1000, sender="daemon") == "sent"
+    m = _upstream_inbox(env)[-1]
+    assert len(m["spec"]) <= upstream.SPEC_CHARS and "characters kept" in m["spec"]
+    assert upstream._valid(n) and upstream._valid(m)
+
+
+def test_the_worker_prompt_says_a_long_note_is_refused_and_to_put_the_request_first():
+    from ttp import upstream
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "worker.md").read_text().split())
+    assert f"a note over {upstream.SPEC_CHARS:,} characters is refused, not cut" in text
+    assert "question or request first" in text and "length and hash" in text
+
+
 def test_the_worker_hook_allows_a_note_to_another_project(env, monkeypatch, tmp_path):
     from ttp import hook
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
@@ -25089,7 +25196,7 @@ def test_upstream_forward_batches_stay_under_the_receive_limit_and_skip_a_note_o
         return {"accepted": len(lines), "rejected": 0}, ""
     monkeypatch.setattr(upstream, "_ssh_receive", receive)
     monkeypatch.setattr(upstream, "RECEIVE_BYTES", 2000)
-    upstream.send("demo", 3, "example-project", "x" * 5000)     # over the limit by itself
+    upstream.send("demo", 3, "example-project", "x" * upstream.SPEC_CHARS)     # over the limit by itself
     for i in range(6):
         upstream.send("demo", 3, "example-project", f"note {i} " + "y" * 300)
     now = time.time()
@@ -25113,7 +25220,7 @@ def test_upstream_forward_counts_a_skipped_note_once_when_the_send_after_it_fail
         return {"accepted": len(lines), "rejected": 0}, ""
     monkeypatch.setattr(upstream, "_ssh_receive", receive)
     monkeypatch.setattr(upstream, "RECEIVE_BYTES", 2000)
-    upstream.send("demo", 3, "example-project", "x" * 5000)
+    upstream.send("demo", 3, "example-project", "x" * upstream.SPEC_CHARS)
     upstream.send("demo", 3, "example-project", "small note")
     now = time.time()
     for i in range(3):                                           # each send fails; back-off is skipped over

@@ -125,7 +125,8 @@ def append(name: str, task: int | None, followups) -> int:
         have = {n["fp"] for n in _lines(f.read())[0]}
         out = b""
         for n in notes:
-            title, spec = str(n["title"]).strip()[:TITLE_CHARS], str(n.get("spec") or "").strip()[:SPEC_CHARS]
+            title = str(n["title"]).strip()[:TITLE_CHARS]
+            spec = cut(str(n.get("spec") or "").strip(), f"the hand-off of {name} #{task}" if task else "its hand-off")
             fp = fingerprint(title, spec)
             if fp in have:
                 continue
@@ -138,9 +139,39 @@ def append(name: str, task: int | None, followups) -> int:
     return out.count(b"\n")
 
 
+def note_text(text: str) -> str:
+    """A note's text as the inbox stores it: whitespace joined to one line (it cannot pose as another
+    digest entry). Raises NoteTooLong past SPEC_CHARS: a note is never cut where nobody sees it."""
+    out = " ".join(str(text).split())
+    if len(out) > SPEC_CHARS:
+        raise NoteTooLong(len(out))
+    return out
+
+
+class NoteTooLong(ValueError):
+    def __init__(self, length: int):
+        self.length = length
+        super().__init__(f"the note is {length} characters once whitespace is joined; the limit is {SPEC_CHARS}")
+
+
+def cut(text: str, where: str) -> str:
+    """`text` within SPEC_CHARS; a cut one says so, how much it kept and where the whole text is."""
+    if len(text) <= SPEC_CHARS:
+        return text
+    def note(kept: int) -> str:
+        return f" … [cut: {kept} of {len(text)} characters kept; the whole text is in {where}]"
+    keep = max(0, SPEC_CHARS - len(note(SPEC_CHARS)))
+    return text[:keep] + note(keep)
+
+
+def receipt(text: str) -> str:
+    """What the sender checks: the stored text's length and a short hash of it."""
+    return f"{len(text)} characters, sha256 {hashlib.sha256(text.encode()).hexdigest()[:12]}"
+
+
 def note_id(to: str, text: str) -> str:
     """The id (`fp`) of the inbox entry `send` files, or found already there, for this note."""
-    return fingerprint(f"to:{to}", " ".join(str(text).split())[:SPEC_CHARS])
+    return fingerprint(f"to:{to}", note_text(text))
 
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
@@ -150,7 +181,8 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
     addressed notes in the last hour). `sender` "daemon": the source project's daemon routed it, model-free
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes."""
     now = now or time.time()
-    text = " ".join(str(text).split())[:SPEC_CHARS]     # one line: it cannot pose as another digest entry
+    # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
+    text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon" else text)
     title = f"note to {to}"
     fp = note_id(to, text)
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -214,7 +246,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
     Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0)."""
     now = now or time.time()
-    text = " ".join(str(text).split())[:SPEC_CHARS]
+    text = note_text(text)
     fp = note_id(to, text)
     with _outbox_lock(state):
         waiting = _outbox(state)
@@ -287,7 +319,7 @@ QUEUED_MAX = 50                  # queued notes one run may leave
 def queue(run_dir: Path, to: str, text: str, severity: str = "normal") -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
-    line = json.dumps({"to": to, "text": " ".join(str(text).split())[:SPEC_CHARS], "severity": severity},
+    line = json.dumps({"to": to, "text": note_text(text), "severity": severity},
                       sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -320,11 +352,14 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
             got["invalid"] += 1
             continue
         sev = str(n.get("severity") or "normal")
-        if state is None:
-            got[send(source, task, to, text, sev)] += 1
-        else:
-            r = send_or_queue(state, source, task, to, text, sev)[0]
-            got["limited" if r == "full" else r] += 1
+        try:
+            if state is None:
+                got[send(source, task, to, text, sev)] += 1
+            else:
+                r = send_or_queue(state, source, task, to, text, sev)[0]
+                got["limited" if r == "full" else r] += 1
+        except NoteTooLong:
+            got["invalid"] += 1   # `queue` refuses these: only a line written past it is this long
     os.replace(src, src.with_name(QUEUED_FILE + ".filed"))
     return got
 
