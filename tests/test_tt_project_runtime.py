@@ -38149,11 +38149,59 @@ def test_push_permission_grant_in_the_brief_turns_pushing_on(env):
     ("- Auto-merge repositories: acme/widgets.", ["acme/widgets"]),
     ("- **Auto-merge repositories**: acme/a, acme/b", ["acme/a", "acme/b"]),
     ("- Auto-merge repositories: the usual ones", None),
+    ("- Auto-merge repositories: acme/a and acme/b (reviewed first).", ["acme/a", "acme/b"]),
+    ("- Auto-merge repositories: (none)", []),
+    # Negated or non-repo tokens never grant: none first grants nothing, a negation is unreadable.
+    ("- Auto-merge repositories: none (never acme/core; ask first).", []),
+    ("- Auto-merge repositories: none; pushes/merges need review.", []),
+    ("- Auto-merge repositories: acme/tools, but never acme/core.", None),
+    ("- Auto-merge repositories: acme/tools (not acme/core).", None),
+    ("- Auto-merge repositories: all except acme/core", None),
+    ("- Auto-merge repositories: acme/tools without review", None),
+    # One physical line: an empty value never reads the next paragraph.
+    ("- Auto-merge repositories:\n\nDeployment: push to acme/site after review.", None),
 ])
 def test_auto_merge_policies_line(line, repos):
     from ttp.grants import auto_merge_repos
     assert auto_merge_repos(line)[0] == repos
     assert auto_merge_repos("- Auto-merge repositories: none.\n- Auto-merge repositories: acme/a.")[0] == ["acme/a"]
+
+
+def test_negated_auto_merge_repo_is_never_written_to_the_config(env):
+    """A Policies line on the user's word that names a repo only to forbid it grants nothing: the config
+    keeps no repo, the readable 'none' line raises nothing, the unreadable one one defect, no ask."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    _policies_line(p, "- Auto-merge repositories: none (never acme/core; ask first).", "keep core manual")
+    Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == []
+    assert _grant_events(p) == [] and _grant_events(p, grants.APPLIED) == []
+    _policies_line(p, "- Auto-merge repositories: acme/tools, but never acme/core.", "tools only")
+    for _ in range(2):
+        Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == []
+    assert len(_grant_events(p)) == 1 and _grant_events(p, grants.APPLIED) == []
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
+
+
+def test_partial_set_back_of_an_applied_grant_is_not_applied_again(env):
+    """The daemon applied [acme/a, acme/b]; the user then removes acme/b. Two ticks later the config is
+    still [acme/a]: one keyed set-back defect, no ask, no second apply."""
+    from ttp import grants
+    from ttp.daemon import Daemon
+    p = make(env)
+    _policies_line(p, "- Auto-merge repositories: acme/a, acme/b.", "auto-merge a and b")
+    Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/a", "acme/b"]
+    p.set_config("delivery.auto_merge_repos", ["acme/a"])
+    for _ in range(2):
+        Daemon(p.base).sweep_holds()
+    assert p.config()["delivery"]["auto_merge_repos"] == ["acme/a"]
+    ev = _grant_events(p)
+    assert len(ev) == 1 and "set back" in ev[0]["text"] and "acme/b" in ev[0]["text"], ev
+    assert len(_grant_events(p, grants.APPLIED)) == 1
+    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
 
 
 def test_rejected_config_set_points_at_the_open_setup_ask(env):
