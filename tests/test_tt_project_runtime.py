@@ -10111,6 +10111,69 @@ def test_the_queued_upgrade_task_can_merge_and_commit_without_a_git_identity(env
     assert _git_out(wt, "log", "-1", "--format=%an <%ae>") == "tt-project <tt-project@localhost>"
 
 
+def _harness_pytest(cwd, *args):
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS")}
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=cwd,
+                          env=env, capture_output=True, text=True, timeout=300)
+
+
+def test_harness_local_tests_run_isolated_from_an_enclosing_repos_pytest_config(env):
+    """A harness inside a code repository: pytest there read the parent's conftest.py (which imported a
+    dependency the harness lacks) and pytest.ini (without the harness's module paths)."""
+    p = make(env)
+    repo = env["repo"]
+    (repo / "conftest.py").write_text("raise ImportError('the enclosing repository conftest was loaded')\n")
+    (repo / "pytest.ini").write_text("[pytest]\naddopts = -p no_such_plugin_of_the_parent\n")
+    audits = p.harness / "audits"
+    audits.mkdir()
+    (audits / "test_local.py").write_text("from ttp import __version__\n\n\ndef test_runtime_imports():\n"
+                                          "    assert __version__\n")
+    _git_out(p.harness, "add", "-A")
+    _git_out(p.harness, "commit", "-qm", "local audits")
+    wt = p.worktrees / "harness-audit"
+    _git_out(p.harness, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    for cwd in (p.harness, wt):
+        r = _harness_pytest(cwd, "audits")
+        assert r.returncode == 0 and "1 passed" in r.stdout, r.stdout + r.stderr
+    (wt / "pytest.ini").unlink()        # without it pytest reaches the enclosing repository's config
+    r = _harness_pytest(wt, "audits")
+    assert r.returncode != 0 and "1 passed" not in r.stdout
+
+
+@pytest.mark.parametrize("own,kept", [
+    ({}, False),
+    ({"pytest.ini": "[pytest]\npythonpath = runtime audits\n"}, True),
+    ({"pyproject.toml": "[tool.pytest.ini_options]\npythonpath = [\"runtime\"]\n"}, True),
+    ({"pyproject.toml": "[project]\nname = \"x\"\n"}, False),
+])
+def test_upgrade_adds_the_harness_pytest_ini_unless_the_project_has_its_own_pytest_config(env, monkeypatch, own,
+                                                                                            kept):
+    from ttp import cli, service
+    with monkeypatch.context() as m:
+        m.setattr(cli, "HARNESS_ROOT_FILES", ())
+        p = make(env)                   # a project from before the template shipped pytest.ini
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    assert not (p.harness / "pytest.ini").exists()
+    for name, text in own.items():
+        (p.harness / name).write_text(text)
+    _install_template(env)
+    shipped = (env["home"] / "lib" / "current" / "template" / "pytest.ini").read_text()
+    cli.main(["upgrade", "demo"])
+    for name, text in own.items():
+        assert (p.harness / name).read_text() == text
+    has = subprocess.run(["git", "-C", str(p.harness), "cat-file", "-e", "upstream:pytest.ini"]).returncode == 0
+    assert has is not kept
+    if kept:
+        assert (p.harness / "pytest.ini").exists() is ("pytest.ini" in own)
+        return
+    assert (p.harness / "pytest.ini").read_text() == shipped
+    (p.harness / "pytest.ini").write_text(shipped + "pythonpath = runtime . audits\n")   # this project's edit
+    _install_template(env)
+    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("cccc3333\n")
+    cli.main(["upgrade", "demo"])
+    assert (p.harness / "pytest.ini").read_text().endswith("pythonpath = runtime . audits\n")
+
+
 def test_upgrade_reports_a_new_source_commit_at_the_same_version(env, monkeypatch, capsys):
     p = make(env)
     from ttp import __version__, cli, service

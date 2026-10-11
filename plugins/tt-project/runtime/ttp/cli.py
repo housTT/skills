@@ -295,6 +295,29 @@ def source_commit() -> str:
     return got
 
 
+# Template files installed at the harness root. pytest.ini isolates harness-local test runs from an
+# enclosing repository's pytest config and conftest.py (pytest stops looking at the first config).
+HARNESS_ROOT_FILES = ("pytest.ini",)
+# Files that hold a pytest config at a directory's root, and the section that makes them one
+_PYTEST_CONFIGS = {"pytest.ini": "", ".pytest.ini": "", "pytest.toml": "", ".pytest.toml": "",
+                   "pyproject.toml": "[tool.pytest", "tox.ini": "[pytest]", "setup.cfg": "[tool:pytest]"}
+
+
+def _own_pytest_config(h: Path) -> str:
+    """The pytest config file main holds at the harness root that upstream never shipped, or "":
+    the project's own, which an upgrade never overrides with the template's pytest.ini."""
+    def show(ref: str, name: str) -> str | None:
+        r = subprocess.run(["git", "-C", str(h), "show", f"{ref}:{name}"], capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else None
+    if show("upstream", "pytest.ini") is not None:
+        return ""
+    for name, section in _PYTEST_CONFIGS.items():
+        text = show("HEAD", name)
+        if text is not None and section in text:
+            return name
+    return ""
+
+
 def _runtime_version(runtime: Path) -> str:
     m = re.search(r'__version__ = "([^"]+)"', (runtime / "ttp" / "__init__.py").read_text())
     return m.group(1) if m else "unknown"
@@ -319,6 +342,8 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     _copy_tree(template / "bin", p.harness / "bin")
     for f in (p.harness / "bin").iterdir():
         f.chmod(0o755)
+    for f in HARNESS_ROOT_FILES:
+        shutil.copy2(template / f, p.harness / f)
     (p.harness / ".gitignore").write_text("__pycache__/\n*.pyc\n")
     subprocess.run(["git", "init", "-q", "-b", "upstream", str(p.harness)], check=True)
     _git(p.harness, "add", "-A")
@@ -2787,12 +2812,16 @@ def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: lis
     tmp = p.state / "upgrade-wt"
     if tmp.exists():
         shutil.rmtree(tmp)
+    own = _own_pytest_config(h)
     _git(h, "worktree", "add", "-q", str(tmp), "upstream")
     try:
         for part, dst in (("runtime", "runtime"), ("template/prompts", "prompts"), ("template/bin", "bin")):
             if (tmp / dst).exists():
                 shutil.rmtree(tmp / dst)
             _copy_tree(src / part, tmp / dst)
+        for f in HARNESS_ROOT_FILES:
+            if (src / "template" / f).is_file() and not (f == "pytest.ini" and own):
+                shutil.copy2(src / "template" / f, tmp / f)
         _git(tmp, "add", "-A")
         if _git(tmp, "status", "--porcelain"):
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")

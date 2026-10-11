@@ -529,7 +529,7 @@ and preferences you add later become part of the project's charter and memory.
 | Path | Holds |
 |---|---|
 | `<project root>/tt-project/` | everything for the project; ignores itself, so nothing gets committed |
-| `…/harness/` | the project's own harness (git): charter, memory, config, prompts, runtime |
+| `…/harness/` | the project's own harness (git): charter, memory, config, prompts, runtime, and a `pytest.ini` that isolates its own tests from an enclosing repository's pytest config and `conftest.py` (an upgrade adds it unless the harness has a pytest config of its own) |
 | `…/state/` | database, run directories, logs |
 | `…/worktrees/` | one git worktree per code task |
 | `~/.tt-project/` | per-user registry of projects, secrets (mode 0600), the `ttp` install, account-level settings (`settings.json`), the global spend cache (`global-spend.json`) |

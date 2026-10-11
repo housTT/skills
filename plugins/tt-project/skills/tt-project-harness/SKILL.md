@@ -50,6 +50,8 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 - One friction, one small commit, a one-line reason in the message.
 - NEVER loosen a restriction, cap or notification policy without the user.
 - Runtime edits: keep Python 3.9-compatible; run `python3 -m pytest -q runtime/tests` if present;
+  (pytest from the harness root uses its `pytest.ini`, isolated from any enclosing repository's
+  pytest config and `conftest.py`, with `runtime/` on the import path; add local paths to its `pythonpath`)
   then `ttp restart <name>`. It waits for the daemon to tick; if it does not, `runtime/` goes back
   to the last version that ran (a new commit) and the user is alerted.
 - Measure after: same evidence, a day later. Revert what did not help.

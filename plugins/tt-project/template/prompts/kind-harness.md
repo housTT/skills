@@ -11,6 +11,9 @@
   and `<!-- /ttp:local -->` lines: template upgrades keep those blocks without a merge. Never
   reword upstream's text in place; that is what makes an upgrade need a model.
 - Runtime code changes: run `python3 -m pytest -q runtime/tests` if present; keep Python 3.9-compatible.
+  Run pytest from the harness root (or your worktree of it): its `pytest.ini` keeps an enclosing
+  repository's pytest config and `conftest.py` out and puts `runtime/` on the import path. Add
+  other local module paths (such as an `audits/` folder) to its `pythonpath`.
 - The daemon picks up prompt and config changes on its own; runtime changes need `ttp restart <name>`,
   which rolls `runtime/` back if the daemon cannot start with it. Check its output.
 - Change only this project's own harness: its `tt-project/` folder (harness and state). Never
