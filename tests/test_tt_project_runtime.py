@@ -29216,6 +29216,49 @@ def test_pr_watch_skips_mergeable_unknown_flaps_and_honours_pr_mutes(env, monkey
     assert screen.mutes(p.db)[0]["count"] == 1
 
 
+def test_pr_watch_ci_only_flips_on_an_open_pr_raise_no_pr_changed(env, monkeypatch):
+    """CI moving on an open PR (passing -> pending -> passing) raises no pr_changed: the findings
+    check reports each outcome once (a failure as pr_findings, green again as pr_clean). A change of
+    mergeable or state still raises pr_changed."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','done',?,?)", (url, time.time()))
+    pr = {"url": url, "state": "OPEN", "isDraft": True, "title": "t", "mergeable": "MERGEABLE",
+          "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}]}
+    graph = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                     "reviewThreads": {"nodes": []}}}}}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: graph if args[0] == "api" else json.loads(json.dumps(pr)))
+    d = Daemon(p.base)
+
+    def events(kind):
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=? ORDER BY id", (kind,))]
+
+    def ci(**c):
+        pr["statusCheckRollup"] = [{"name": "tests", **c}]
+        watchers.watch_prs(d)
+
+    watchers.watch_prs(d)   # baseline
+    ci(status="IN_PROGRESS")
+    ci(conclusion="SUCCESS")
+    assert events("pr_changed") == [] and events("pr_findings") == [] and events("pr_clean") == []
+    ci(status="QUEUED")
+    ci(conclusion="FAILURE")
+    assert events("pr_changed") == [] and len(events("pr_findings")) == 1 and "CI failing: tests" in events("pr_findings")[0]
+    ci(conclusion="FAILURE")   # unchanged: nothing more
+    ci(status="IN_PROGRESS")
+    ci(conclusion="SUCCESS")
+    assert events("pr_changed") == [] and len(events("pr_findings")) == 1 and len(events("pr_clean")) == 1
+    pr["mergeable"] = "CONFLICTING"
+    ci(status="IN_PROGRESS")   # CI moving alongside a real change still reports the change
+    (changed,) = events("pr_changed")
+    assert "MERGEABLE → CONFLICTING" in changed and "checks: passing → pending" in changed
+    pr["state"] = "MERGED"
+    ci(conclusion="SUCCESS")
+    assert len(events("pr_changed")) == 2 and "OPEN → MERGED" in events("pr_changed")[1]
+
+
 PR_WATCH_GH = '''#!{python}
 import json, os, sys
 a, path = sys.argv[1:], os.environ["FAKE_PRS"]

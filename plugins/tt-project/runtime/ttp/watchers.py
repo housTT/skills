@@ -11,7 +11,7 @@
   that is recorded as their approval, with one line in the feed. Open PRs' findings
   (failing CI, bot review comments neither fixed nor answered) are recorded for prguard and are
   work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
-  the user for a review).
+  the user for a review). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
 from __future__ import annotations
@@ -117,7 +117,9 @@ def watch_prs(daemon) -> str:
         changed += 1
         if old is None:
             continue   # first sighting records a baseline; nothing new has happened yet
-        what = [f"{k}: {old.get(k)} → {v}" for k, v in sig.items() if old.get(k) != v and k != "activity"]
+        if sig["state"] == "OPEN" and {k for k, v in sig.items() if old.get(k) != v} <= {"checks", "failing"}:
+            continue   # only CI moved on an open PR: _check_findings reports each outcome once
+        what =[f"{k}: {old.get(k)} → {v}" for k, v in sig.items() if old.get(k) != v and k != "activity"]
         if sig["activity"] != old.get("activity"):
             what.append(f"new review/comment activity ({sig['n_human']} human items)")
         sev = "high" if sig["state"] == "MERGED" or sig["decision"] == "CHANGES_REQUESTED" else "normal"
