@@ -16565,7 +16565,7 @@ def test_a_malformed_after_push_is_recorded_as_a_failure_that_alerts(env, monkey
     _commit(repo, "two.txt", "two\n")
     assert push.run(p, repo) == 0 and push.last_after["status"] == "failed"
     pushq.tend_receipts(p, lambda key, text, **k: raised.append(key))
-    assert raised == ["after_push_failed"] * 2 and "bad entry" in _receipts(p)[-1]["after_push"]["tail"]
+    assert raised == ["after_push_failed"] * 2 and "bad entry" in max(_receipts(p), key=lambda r: r["started"])["after_push"]["tail"]
 
 
 def test_a_detached_push_runs_after_push_once_its_outcome_is_written_and_its_locks_are_let_go(env, monkeypatch, capsys):
