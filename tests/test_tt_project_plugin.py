@@ -174,6 +174,8 @@ def test_harness_tasks_stay_in_their_own_harness():
         assert re.search(r"[Nn]ever edit[s]?, or (create|make)s? a worktree or branch in, the tt-project "
                          r"plugin's source repository or (any other|another) project's harness", text), path.name
         assert "upstream note" in text and "`upstream: " in text, f"{path.name}: names the upstream notes"
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    assert "in the same run, before the hand-off" in worker and "never leave the entry to a later task" in worker
     coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
     assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
     # A project whose own work is the plugin (its charter says so) may still queue that work.
