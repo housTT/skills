@@ -265,6 +265,34 @@ def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:
     return None
 
 
+_SUBJECT_STOP = frozenset("""
+    about above after again also anything before being could does doing done each from have here into just
+    like look made make more most much need needs next only other over please really right same should
+    since some still such sure than that their them then there these they thing this those through time
+    very want wants were what when where which while will with would your yours ask asks question
+    recommendation recommend approve decide decision answer reply task tasks project""".split())
+# A bare reply: an answer word or a hand-back phrase in a short message.
+_BARE = re.compile(r"^\W*(yes|yeah|yep|yup|no|nope|ok|okay|sure|agreed?|approved?|go( ahead)?|do it|"
+                   r"proceed|fine|lgtm|ship it|option\s+\w+|[a-e1-9])\b", re.I)
+BARE_MAX_WORDS = 8
+
+
+def _subject(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z][a-z0-9_-]{3,}", (text or "").lower()) if w not in _SUBJECT_STOP}
+
+
+def about_ask(text: str, ask_id: int, ask_text: str | None) -> bool:
+    """Whether a reply can answer the one open ask without naming it: it mentions the ask's id or a
+    subject word of the ask, or it is a bare reply (yes/no/ok or a hand-back phrase in a few words).
+    Anything else is a message about something else, not that ask's answer."""
+    text = text or ""
+    if re.search(rf"(?<![\w.]){ask_id}(?![\w.])", text):
+        return True
+    if len(text.split()) <= BARE_MAX_WORDS and (_BARE.search(text) or handback(text)):
+        return True
+    return bool(_subject(text) & _subject(ask_text))
+
+
 def _pct(sorted_vals: list[float], q: float) -> float:
     """Nearest-rank percentile of an ascending list."""
     k = max(0, min(len(sorted_vals) - 1, -(-int(q * 100) * len(sorted_vals) // 100) - 1))
@@ -465,7 +493,7 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     (the earliest linked answer's text, cut to 200 chars) and answered_at (its time)}."""
     now = time.time() if now is None else now
     # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
-    sent = db.q("SELECT id, ts, ref, ext_id, chat FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
+    sent = db.q("SELECT id, ts, ref, ext_id, chat, text FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
                 "ORDER BY id", (since - ANSWER_MAX_AGE_S,))
     if not any(a["ts"] >= since for a in sent):
         return []
@@ -518,7 +546,7 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
             continue
         open_ = [a for a in sent if in_window(a, m) and a["chat"] in (None, m["chat"])
                  and not answered_before(a, m) and not closed_before(a, m)]
-        if len(open_) == 1:
+        if len(open_) == 1 and about_ask(m["text"], open_[0]["id"], open_[0]["text"]):
             link(open_[0], m, m["text"], "only_open")
         elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev:
             link(open_[-1], m, m["text"], "newest")

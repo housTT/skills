@@ -478,8 +478,20 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     in_review = db.review_since()
     setting_held = settinghold.digest_lines(rows)   # tasks held on a setting being asked about: one line each
+    held_on = {}   # blocked tasks held on the same ask or resource: one line for them all
+    for t in rows:
+        held = anchors.anchor(t) if t["status"] == "blocked" else None
+        if held and held[0] in anchors.SHARED_KINDS and not (setting_held and settinghold.held_key(t)):
+            held_on.setdefault(held, []).append(t)
+    held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
+    grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
     for t in rows:
         if setting_held and settinghold.held_key(t):
+            continue
+        if t["id"] in grouped:
+            ts = held_on.pop(grouped[t["id"]], None)
+            if ts:
+                lines.append(anchors.group_line(*grouped[t["id"]], ts, now, p))
             continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         held = anchors.anchor(t) if t["status"] == "blocked" else None

@@ -25,6 +25,7 @@ from . import timefmt
 
 PREFIX = "waits:"
 KINDS = ("ask", "resource", "until", "when")
+SHARED_KINDS = ("ask", "resource")   # anchors many tasks share: the digest lists them on one line
 NEW_ASK = "new"                 # `ask:new`: the ask sent in the same turn
 STALE_EVENT = "stale_holds"
 TRIGGER = "stale holds"
@@ -70,6 +71,16 @@ def describe(kind: str, value: str, where=None) -> str:
         except ValueError:
             return f"waits until {value}"
     return f"waits on {kind} {value[:160]}"
+
+
+def group_line(kind: str, value: str, tasks: list[dict], now: float, where=None) -> str:
+    """One digest line for the blocked tasks held on the same anchor: their ids, the oldest and its title."""
+    old = min(tasks, key=lambda t: t["created"])
+    title = " ".join(str(old["title"] or "").split())[:80]
+    ids = ", ".join(f"#{t['id']}" for t in tasks)
+    return (f"- {ids} | blocked | {len(tasks)} tasks, each "
+            f"{describe(kind, value, where)} | oldest #{old['id']} {(now - old['created']) / 3600:.1f}h: {title} | "
+            "the daemon requeues them together once it is over")
 
 
 def hold_max_h(cfg: dict) -> float:

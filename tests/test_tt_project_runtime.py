@@ -1350,6 +1350,46 @@ def test_unblock_a_plain_reply_answers_the_only_open_ask(env):
     assert "1 with a linked answer (1 the only open ask)" in unblock.asks_line(list(rows.values()))
 
 
+def test_unblock_only_open_links_a_reply_only_when_it_is_about_the_ask(env):
+    """With one ask open, an unrelated message is not its answer: only one that names the ask's id,
+    shares a subject word with it, or is a bare reply (yes/no, a hand-back) links as the only open ask."""
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    a = msg("out", "Should the nightly benchmark run on the spare board?", 5000, "ask")
+    msg("in", "please also add a changelog entry for the parser fix", 4500)   # about something else
+    assert not unblock.asks(p.db, now - 86400, now)[0]["answered"], "an unrelated message was linked"
+    msg("in", "the benchmark can wait until Monday", 4000)   # a subject word of the ask
+    row = unblock.asks(p.db, now - 86400, now)[0]
+    assert row["answered"] and row["how"] == "only_open" and row["answer"].startswith("the benchmark")
+    for text, linked in ((f"re {a}: hold off", True), ("yes", True), ("No, not now.", True),
+                         ("up to you", True), ("fix the docs typo in the readme", False),
+                         ("yes and while you are at it rewrite the whole docs section today", False)):
+        assert unblock.about_ask(text, a, "Should the nightly benchmark run on the spare board?") is linked, text
+
+
+def test_digest_lists_tasks_held_on_one_ask_or_resource_on_one_line(env):
+    """Blocked tasks held on the same ask or resource are one digest line listing their ids, not one
+    line each; a lone hold keeps its own line."""
+    from ttp import coordinator as coord
+    p = make(env)
+    ask = p.db.post("out", "vendor A or B?", chat=None, kind="ask", severity="high")
+    on_ask = [p.db.add_task(f"port kernel {i}", "s", origin="user") for i in range(5)]
+    on_board = [p.db.add_task(f"bench {i}", "s", origin="user") for i in range(2)]
+    alone = p.db.add_task("lone hold", "s", origin="user")
+    for tid in on_ask:
+        p.db.update_task(tid, status="blocked", blocked_reason="r", labels=[f"waits:ask:{ask}"])
+    for tid in on_board:
+        p.db.update_task(tid, status="blocked", blocked_reason="r", labels=["waits:resource:board-a"])
+    p.db.update_task(alone, status="blocked", blocked_reason="r", labels=["waits:resource:board-b"])
+    d = coord.digest(p, {}, [], [])
+    ids = ", ".join(f"#{t}" for t in on_ask)
+    assert f"- {ids} | blocked | 5 tasks, each waits on ask #{ask} | oldest #{on_ask[0]}" in d, d
+    assert f"- #{on_board[0]}, #{on_board[1]} | blocked | 2 tasks, each waits on resource board-a" in d, d
+    assert sum(f"#{t} " in d or f"#{t}," in d for t in on_ask) == len(on_ask), d
+    assert "port kernel 1" not in d and "bench 1" not in d, d
+    assert f"- #{alone} | blocked | " in d and "lone hold" in d, d
+
+
 def test_unblock_a_plain_reply_answers_only_an_ask_in_its_own_chat(env):
     from ttp import unblock
     p, now, msg = _ask_db(env)
