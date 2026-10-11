@@ -46,6 +46,7 @@ BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a 
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
 PROTECTED = {"HEAD", "main", "master"}
 OWN_BRANCH = re.compile(r"ttp/t(\d+)-\S+")   # a task's own branch, as worktree.ensure names it
+NOTES_BRANCH = re.compile(r"ttp/t(\d+)-(?:\S+-)?notes")   # a task's notes branch: ttp/t<id>-notes, ...-notes
 NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
              "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
              "sets it with config_set")
@@ -883,6 +884,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     worktree) publishes its head onto that branch instead, and so does a review covering that task.
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
+    A notes branch (NOTES_BRANCH) is published under its own name whatever pr_branch the task carries.
     In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
@@ -890,8 +892,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
     onto = _labelled(p, task, "pr_branch") if task else ""
-    carried = bool(m and onto and m.group(1) == task)
-    if m and task and m.group(1) != task and not carried:
+    notes = bool(NOTES_BRANCH.fullmatch(branch))   # publishes itself, never onto a pr_branch
+    carried = bool(m and onto and m.group(1) == task and not notes)
+    if m and task and m.group(1) != task and not carried and not notes:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would.
         onto = next((pr_branch_of(p, t) for t in _reviewed(p, task) if str(t["id"]) == m.group(1)), "")
         carried = bool(onto)
@@ -1075,7 +1078,8 @@ def _on_remote(repo: Path, remote: str, branch: str) -> bool:
 def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
     `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
-    refused (it would land that task's work: _may_land), and with no push_branch set this task's
+    refused (it would land that task's work: _may_land), a notes branch (NOTES_BRANCH) is published
+    under its own name as with --own, and with no push_branch set this task's
     own branch, once on the remote, is the default target (published as with --own). A branch based
     on a branch outside the flow work lands by (foreign_base) is never rebased onto the push target:
     once on the remote as a fast-forward it is pushed there as with --own, else it is refused."""
@@ -1088,6 +1092,11 @@ def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
         raise ValueError(f"this worktree has task #{m.group(1)}'s branch {branch} checked out, not "
                          f"task #{task}'s own (ttp/t{task}-...): ttp push lands only this task's work. "
                          f"Run it in this task's own worktree")
+    if NOTES_BRANCH.fullmatch(branch):
+        remote, own_branch = own_target(p, repo)
+        print(f"ttp push: {branch} is a notes branch; publishing it under its own name as with --own, "
+              f"never rebased onto the push branch or a pr_branch", file=sys.stderr)
+        return remote, own_branch, True
     d = p.config().get("delivery") or {}
     if branch and (why := pr_branch_guard(p, branch, task, d)):
         raise ValueError(why)

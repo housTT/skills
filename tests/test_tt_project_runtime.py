@@ -31249,6 +31249,46 @@ def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_pu
     assert push.resolve(p, repo) == ("origin", "proj", False)
 
 
+def test_a_notes_branch_publishes_itself_and_never_rebases_onto_the_push_branch_or_a_pr_branch(
+        env, monkeypatch):
+    """A task's notes branch (ttp/t<id>-notes) is pushed under its own name as it is, whether or not
+    the task carries a pr_branch label: a plain push never rebases it onto the push branch (it
+    conflicted there) and --own never publishes it onto the pr_branch. The task's code branch and
+    the pr_branch's own worktree still deliver onto the pr_branch."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    proj, feature = _git_out(origin, "rev-parse", "proj"), _git_out(origin, "rev-parse", "feature/x")
+    for labels in ([], ["pr_branch:feature/x"]):
+        tid = p.db.add_task(f"notes {labels}", "s", kind="code", labels=labels)
+        notes = f"ttp/t{tid}-notes"
+        _git_out(repo, "checkout", "-q", "-B", notes, base)
+        _commit(repo, f"notes{tid}.md", "notes\n")
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        assert push.resolve(p, repo) == ("origin", notes, True), labels
+        assert push.own_target(p, repo) == ("origin", notes), labels
+        head = _git_out(repo, "rev-parse", "HEAD")
+        assert _ttp_push() == 0, labels
+        assert _git_out(origin, "rev-parse", notes) == head, labels   # as it is: not rebased
+        assert _git_out(origin, "rev-parse", "proj") == proj
+        assert _git_out(origin, "rev-parse", "feature/x") == feature
+    # The same task's code branch, and the pr_branch's own worktree, still go to the pr_branch.
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{tid}-code")
+    assert push.own_target(p, repo) == ("origin", "feature/x")
+    with pytest.raises(ValueError, match="ttp push --own"):
+        push.resolve(p, repo)
+    _git_out(repo, "checkout", "-q", "-B", "feature/x")
+    assert push.own_target(p, repo) == ("origin", "feature/x")
+    with pytest.raises(ValueError, match="ttp push --own"):
+        push.resolve(p, repo)
+    # Only a whole `notes` word ends a notes branch.
+    assert not push.NOTES_BRANCH.fullmatch(f"ttp/t{tid}-keynotes")
+    assert push.NOTES_BRANCH.fullmatch(f"ttp/t{tid}-swirl-notes")
+
+
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     p = make(env)
     # Follow-ups or findings: the coordinator's turn queues the review, so the reviewer sees its decisions.
