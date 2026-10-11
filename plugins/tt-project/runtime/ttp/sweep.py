@@ -152,13 +152,14 @@ def items(db: DB, now: float | None = None) -> list[dict]:
 
 
 def _seen(state: dict, live: list[dict]) -> dict:
-    """The `seen` map for these live items: an entry kept while the item stays in the same status."""
+    """The `seen` map for these live items: an entry kept while the item stays in the same status and
+    items() still ages it from that entry (a requeue or run since makes items() reject it: replaced)."""
     old = state.get("seen") or {}
     out = {}
     for i in live:
         o = old.get(i["key"]) or {}
-        out[i["key"]] = o if o.get("status") == i["status"] and o.get("since") is not None else \
-            {"status": i["status"], "since": i["since"]}
+        out[i["key"]] = o if o.get("status") == i["status"] and o.get("since") is not None \
+            and o.get("since") == i["since"] else {"status": i["status"], "since": i["since"]}
     return out
 
 

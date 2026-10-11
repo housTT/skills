@@ -41121,3 +41121,21 @@ def test_blocker_sweep_ages_a_reblocked_task_from_its_second_block(env):
     db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 1 * 3600, d))  # blocked again, no task_blocked event
     ages = {i["task"]: round(i["age_s"] / 3600, 1) for i in sweep.items(db, now)}
     assert ages == {a: 2.0, b: 3.0, c: 1.0, d: 1.0}
+
+
+def test_blocker_sweep_refreshes_a_first_seen_time_stale_from_an_unobserved_requeue(env):
+    """Requeued and blocked again by the coordinator with no sweep in between: the next remember()
+    replaces the first-seen time from before the requeue, so a later addendum does not reset the age."""
+    p = make(env)
+    from ttp import sweep
+    db, now = p.db, time.time()
+    t = db.add_task("coordinator re-block, unobserved")
+    db.update_task(t, status="blocked", blocked_reason="first")
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 10 * 3600, t))
+    sweep.remember(db, sweep.items(db, now - 9 * 3600))               # first seen blocked 10 h ago
+    _sweep_ev(db, t, "task_requeued", f"#{t} requeued", now - 5 * 3600)
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 3 * 3600, t))  # blocked again, never seen queued
+    sweep.remember(db, sweep.items(db, now - 2 * 3600))
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 60, t))        # a later spec addendum
+    [i] = sweep.items(db, now)
+    assert round(i["age_s"] / 3600, 1) == 3.0
