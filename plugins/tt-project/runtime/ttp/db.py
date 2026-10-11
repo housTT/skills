@@ -113,6 +113,11 @@ CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 
+-- Successful detached pushes, retained after their markers and task worktrees are pruned.
+CREATE TABLE IF NOT EXISTS task_landings (
+  marker TEXT PRIMARY KEY, task INTEGER NOT NULL, sha TEXT NOT NULL, target TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
+
 -- One row per Jev call: its use, decision, cost, estimated cost avoided, whether it changed the rules'
 -- decision (NULL: not known) and later outcome (jevuse.py).
 CREATE TABLE IF NOT EXISTS jev_calls (

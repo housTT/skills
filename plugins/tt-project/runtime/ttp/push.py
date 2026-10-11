@@ -2609,6 +2609,8 @@ def tend(p: Project) -> None:
 
 def _tend_one(p: Project, marker: Path) -> None:
     m = _settle(marker)
+    from .landed import record_push
+    record_push(p, marker, m)
     if m.get("status") != "queued" or m.get("kind") == "batch":
         return
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")

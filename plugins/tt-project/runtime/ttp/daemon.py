@@ -2152,6 +2152,7 @@ class Daemon:
         task = db.task(r["task"]) if r["task"] else None
         if not task:
             return
+        landed.reconcile_pushes(self.p, task["id"])
         relay_worker_notifies(self.p, task, run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
         if handoff is None and not (run_dir / RESULT_FILE).exists():

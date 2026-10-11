@@ -5,8 +5,8 @@ shas. The push queue (and `ttp push`) rebase each approved head onto the branch 
 `git merge-base --is-ancestor <reviewed sha> origin/<branch>` never passes once they did.
 
 - `landed:#<id>` (a start_when or retry_when) passes once task <id>'s landing is on the branch: the
-  commit the push queue recorded for it (push_queue.landed_sha), else (once it is done and committed
-  something) its branch's commits by patch.
+  commit the push queue recorded for it (push_queue.landed_sha), a successful detached push, else
+  (once it is done and committed something) its branch's commits by patch.
 - `git merge-base --is-ancestor <sha> <ref>`, as a whole probe, also passes when every commit of
   <sha> has an equivalent on <ref>: the same `git patch-id --stable` (git cherry), the same author,
   author date and subject (a rebase keeps them; a settled conflict changes the patch), or a commit
@@ -115,10 +115,35 @@ def _push_ref(p, repo: Path) -> str:
     return f"{remote}/{branch}"
 
 
+def record_push(p, marker: Path, m: dict) -> None:
+    """Keep a successful shared-branch push independently of its run's outcome. The marker is
+    written first; the daemon retries this insert on every tick, including after a restart."""
+    if m.get("status") != "pushed" or m.get("own") or m.get("kind") == "batch":
+        return
+    task, sha, target = m.get("task"), m.get("sha"), m.get("target")
+    if not (isinstance(task, (str, int)) and re.fullmatch(r"[0-9]+", str(task))
+            and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40,64}", sha)
+            and isinstance(target, str) and target):
+        return
+    if p.db.one("SELECT marker FROM task_landings WHERE marker=?", (marker.name,)):
+        return
+    if not p.db.task(int(task)):
+        return
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES(?,?,?,?) "
+           "ON CONFLICT(marker) DO NOTHING", (marker.name, int(task), sha, target))
+
+
+def reconcile_pushes(p, tid: int) -> None:
+    """A worker can finish before the daemon tends its detached pushes, regardless of its handoff."""
+    for marker in sorted((p.state / push.DETACHED).glob(f"t{tid}-*.json")):
+        record_push(p, marker, push._read(marker))
+
+
 def task_shas(p, tid: int) -> tuple[list[str], str]:
     """The commits that carry task `tid` to the branch, and where they come from: the landed commits
     the push queue recorded for it (its own approvals, those of a review of it, or of its branch),
-    else, once it is done with commits of its own, its branch's head. ([], why) when there is none yet."""
+    then its successful detached pushes, else, once it is done with commits of its own, its branch's
+    head. ([], why) when there is none yet."""
     db = p.db
     task = db.task(tid)
     if not task:
@@ -135,6 +160,12 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
                 or review_subject({"labels": r["labels"], "title": r["title"]}) == tid)]
     if shas:
         return shas, "its push queue landing"
+    rows = db.q("SELECT l.task, l.sha, t.labels, t.title FROM task_landings l "
+                "LEFT JOIN tasks t ON t.id=l.task ORDER BY l.marker")
+    shas = list(dict.fromkeys(r["sha"] for r in rows if r["task"] == tid
+                             or review_subject({"labels": r["labels"], "title": r["title"]}) == tid))
+    if shas:
+        return shas, "its detached push landing"
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
     if not head:
         return [], f"#{tid} has no landing recorded and no branch"

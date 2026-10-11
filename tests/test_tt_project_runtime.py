@@ -27724,6 +27724,101 @@ def test_landed_task_counts_a_done_tasks_own_commits_once_they_are_on_the_branch
     assert landed.check(p, repo, tid=tid) == (0, f"#{tid} (its branch {branch}) is on origin/proj")
 
 
+@pytest.mark.parametrize("result_status", ["waiting", "blocked", "failed", "needs_review"])
+def test_a_detached_push_records_a_landing_even_with_a_non_done_handoff(env, monkeypatch, result_status):
+    from ttp import landed, push
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    sha = _git_out(other, "rev-parse", "HEAD")
+    # Its branch moved after the push: the marker's rebased sha is the evidence, not its head.
+    _commit(path, "later.txt", "later\n")
+    p.db.update_task(tid, status="running")
+    marker = p.state / push.DETACHED / f"t{tid}-push.json"
+    marker.parent.mkdir()
+    marker.write_text(json.dumps({"status": "pushed", "sha": sha, "head": head,
+                                  "task": str(tid), "target": "origin/proj", "own": False}))
+    run_dir = env["tmp"] / "push-run"
+    run_dir.mkdir()
+    result = {"status": result_status, "summary": "push finished; further work remains",
+              "retry_when": "true", "waiting_for": "push", "retry_after_s": 1800}
+    (run_dir / "result.json").write_text(json.dumps(result))
+    d = Daemon(p.base)
+    d._finish_worker({"task": tid, "note": "{}"}, RunUsage(), "ok", run_dir)
+    assert landed.check(p, repo, tid=tid)[0] == 0
+    assert json.loads(p.db.task(tid)["result"])["status"] == result_status
+    d.tend_pushes()
+    d.tend_pushes()
+    assert p.db.q("SELECT task, sha FROM task_landings") == [{"task": tid, "sha": sha}]
+    # Evidence survives marker pruning and removal of the task's worktree/branch.
+    marker.unlink()
+    p.db.update_task(tid, branch=None)
+    assert landed.check(p, repo, tid=tid)[0] == 0
+
+
+def test_daemon_restart_recovers_a_detached_push_landing_and_releases_its_dependents(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import landed, push
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    p.db.update_task(tid, status="queued", branch=None,
+                     result=json.dumps({"status": "waiting", "retry_when": "true"}))
+    assert coord.apply(p, [{"type": "task_add", "title": "after detached push", "spec": "s",
+                            "start_when": f"landed:#{tid}"}]) == []
+    dependent = _added(p, "after detached push")
+    dmod.Daemon(p.base)   # stopped before it could record the landing
+    marker = p.state / push.DETACHED / f"t{tid}-push.json"
+    marker.parent.mkdir()
+    sha = _git_out(other, "rev-parse", "HEAD")
+    marker.write_text(json.dumps({"status": "pushed", "sha": sha, "task": str(tid),
+                                  "target": "origin/proj", "own": False}))
+    p.db.x("DROP TABLE task_landings")   # upgrading a daemon whose DB predates landing receipts
+    d = dmod.Daemon(p.base)
+    d.tend_pushes()
+    assert landed.check(p, repo, tid=tid)[0] == 0
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _settle_deferred(d, dependent, until=lambda: _ready(p, dependent))
+    assert _ready(p, dependent)
+    dmod.Daemon(p.base).tend_pushes()
+    assert p.db.q("SELECT task, sha FROM task_landings") == [{"task": tid, "sha": sha}]
+
+
+@pytest.mark.parametrize("bad", [
+    {"status": "queued"}, {"status": "running"}, {"status": "failed"},
+    {"own": True}, {"kind": "batch"}, {"sha": None}, {"sha": "bad"},
+    {"task": None}, {"task": "not-a-task"}, {"task": "99999"}, {"target": None},
+])
+def test_detached_push_landing_ignores_publications_and_incomplete_or_failed_markers(env, monkeypatch, bad):
+    from ttp import landed, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "feature", status="running")
+    marker = p.state / push.DETACHED / f"t{tid}-push.json"
+    marker.parent.mkdir()
+    marker.write_text(json.dumps({"status": "pushed", "sha": _git_out(repo, "rev-parse", "HEAD"),
+                                  "task": str(tid), "target": "origin/proj", "own": False, **bad}))
+    landed.reconcile_pushes(p, tid)
+    assert not p.db.q("SELECT * FROM task_landings")
+    assert landed.check(p, repo, tid=tid)[0] == 1
+
+
+def test_a_recorded_detached_push_still_checks_the_push_branch_and_covers_its_reviewed_task(env, monkeypatch):
+    from ttp import landed, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "feature", status="running")
+    _commit(path, "feature.txt", "feature\n")
+    sha = _git_out(path, "rev-parse", "HEAD")
+    review = p.db.add_task(f"Review #{tid}: feature", "review", kind="review", status="running")
+    marker = p.state / push.DETACHED / f"t{review}-push.json"
+    marker.parent.mkdir()
+    marker.write_text(json.dumps({"status": "pushed", "sha": sha, "task": str(review),
+                                  "target": "origin/proj", "own": False}))
+    landed.reconcile_pushes(p, review)
+    assert landed.task_shas(p, tid) == ([sha], "its detached push landing")
+    assert landed.check(p, repo, tid=tid)[0] == 1, "a receipt never replaces the branch check"
+    _git_out(path, "push", "-q", "origin", "HEAD:proj")
+    assert landed.check(p, repo, tid=tid)[0] == landed.check(p, repo, tid=review)[0] == 0
+
+
 def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys):
     p = make(env)
     from ttp import cli
