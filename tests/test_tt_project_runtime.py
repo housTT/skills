@@ -42111,30 +42111,24 @@ def test_a_resolved_ask_refreshes_a_waits_note_and_reruns_its_probe_now(env, mon
     assert f"ask #{ask} is resolved" in p.db.task(tid)["blocked_reason"]
 
 
-def test_a_done_task_wakes_a_probe_less_wait_on_it_once_per_wait(env):
+def test_a_done_task_never_wakes_a_probe_less_wait_across_hand_offs(env):
     p = make(env)
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
-    dep = p.db.add_task("upstream fix", "s", kind="code", origin="user")
-    tid, nb = _ref_wait(p, f"#{dep} to land on the branch")
-    p.db.update_task(dep, status="done")
-    d.refresh_ref_waits()
-    t = p.db.task(tid)
-    res = json.loads(t["result"])
-    assert t["not_before"] <= time.time() and t["attempts"] == 1 and t["status"] == "queued"
-    assert f"task #{dep} is done" in res["woke"] and "not proof" in t["blocked_reason"]
-    assert res[dmod.refwaits.FACTS_KEY] == [f"task #{dep} is done (not proof its work landed)"]
-    # The same evidence in the same wait is not acted on again.
-    p.db.update_task(tid, not_before=nb, blocked_reason="x")
-    d.refresh_ref_waits()
-    assert p.db.task(tid)["blocked_reason"] == "x" and p.db.task(tid)["not_before"] == nb
-    logged = (p.logs / "daemon.log").read_text()
-    assert logged.count(f"task {tid} wait note refreshed") == 1
-    # A new wait (a new hand-off) is a new episode: the evidence counts again.
-    res.update(waiting_since=time.time())
-    p.db.update_task(tid, result=json.dumps(res))
-    d.refresh_ref_waits()
-    assert p.db.task(tid)["not_before"] <= time.time()
+    dep = p.db.add_task("upstream fix", "s", kind="code", origin="user", status="done")
+    tid, _ = _ref_wait(p, f"#{dep} to land on the branch")
+    for i in range(3):   # three hand-offs in a row, each a new wait naming the task already done
+        nb = time.time() + 3600 + i
+        res = {"status": "waiting", "waiting_for": f"#{dep} to land on the branch",
+               "waiting_since": time.time() + i, "retry_after_s": 3600}
+        p.db.update_task(tid, result=json.dumps(res), not_before=nb, blocked_reason="waiting")
+        d.refresh_ref_waits()
+        d.probe_waiting()
+        t = p.db.task(tid)
+        assert t["not_before"] == nb and t["attempts"] == 1 and t["status"] == "queued"
+        assert f"task #{dep} is done" in t["blocked_reason"] and "not proof" in t["blocked_reason"]
+        assert "woke" not in json.loads(t["result"]) and tid not in d._probes
+    assert (p.logs / "daemon.log").read_text().count(f"task {tid} wait note refreshed") == 3
 
 
 def test_a_ref_wait_keeps_its_planned_window_and_start_after(env):

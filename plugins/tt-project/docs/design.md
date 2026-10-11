@@ -54,9 +54,11 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
    unknown to its runner) is raised once per wait when it is first seen.
    A queued wait whose note names an ask or task (`ask #12`, `task #34`, `#34`) is kept current:
    once that ask is resolved or that task is done, the note says so and its probe (retry_when or
-   start_when) runs again at once; a wait with no probe runs now unless it waits on a window it
-   planned or a start_after. Its probe, dependencies, start_when and attempts stay, a done task is
-   only a reason to check again, and each piece of evidence counts once per wait.
+   start_when) runs again at once. Its probe, dependencies, start_when, not_before and attempts
+   stay, a done task is only a reason to check again, and each piece of evidence counts once per
+   wait. Known gap: a wait with no probe is never woken early; its note is refreshed and it waits
+   for its normal retry. A bare `#N` that is really a PR or issue may be read as a task, which only
+   rewrites the note or reruns a model-free probe.
    A wake that hands back the same wait (`waiting_for`, `retry_when`, branch head) made no
    progress: later wakes run light only, and after `waiting.max_stale_wakes` (3) the task is
    blocked for the coordinator to split or re-plan, and not woken again. The block, a requeue or

@@ -5,11 +5,15 @@
 A queued task's wait note (its hand-off's `waiting_for`, its `blocked_reason`, a start_when's `start_why`)
 may name what it waits on: `ask #12`, `task #34` or `#34`. Once that ask is resolved or that task is
 done, the note is stale. The daemon then rewrites the note to say so, drops the cached probe verdicts
-and reruns the task's probe at once (its retry_when or start_when). A wait with no probe, not on a window
-it planned and not before its start_after, is made due now. Its retry_when, dependencies, start_when,
-start_after and attempts stay as they were. A done task is only a reason to check again, not proof that
-its work landed: the probe or the next run decides. Each piece of evidence is acted on once per wait
-(the hand-off's waiting_since, or the deferral's since).
+and reruns the task's probe at once (its retry_when or start_when). Its retry_when, dependencies,
+start_when, start_after, not_before and attempts stay as they were. A done task is only a reason to check
+again, not proof that its work landed: the probe or the next run decides. Each piece of evidence is acted
+on once per wait (the hand-off's waiting_since, or the deferral's since).
+
+Known gap, on purpose: a wait with no probe is never woken early. Its note is refreshed and it waits for
+its normal retry, since evidence from before the wait began would otherwise wake it after every hand-off.
+A bare `#N` that is really a PR or issue may be read as a task; that only refreshes text or reruns a
+model-free probe.
 """
 from __future__ import annotations
 

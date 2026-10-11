@@ -4310,9 +4310,12 @@ class Daemon:
     def refresh_ref_waits(self) -> None:
         """Model-free (refwaits.py): a queued task whose wait note names an ask now resolved or a task
         now done gets a note that says so, its cached probe verdicts dropped and its probe (retry_when
-        or start_when) rerun at once by probe_waiting, which runs next. A wait with no probe is made due
-        now unless it is on a window it planned or before its start_after. Its probe, dependencies,
-        start_when, start_after and attempts stay; each piece of evidence counts once per wait."""
+        or start_when) rerun at once by probe_waiting, which runs next. Its probe, dependencies, start_when,
+        start_after, not_before and attempts stay; each piece of evidence counts once per wait.
+        Known gap, on purpose: a wait with no probe only gets its note refreshed and wakes at its own
+        retry, never early (evidence from before the wait would wake it after every hand-off). A bare
+        `#N` that is really a PR or issue may be read as a task: that only rewrites text or reruns a
+        model-free probe."""
         db, now = self.p.db, time.time()
         rows = db.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NOT NULL "
                     "OR labels LIKE '%\"start_when:%')")
@@ -4358,15 +4361,11 @@ class Daemon:
                     del self._probe_rc[other]
             self._probed.pop(tid, None)
             then = "its probe runs again after its start_after" if later else "its probe runs again now"
-        elif unblock.classify_wait(prev)[0] != "self" and not later and (t["not_before"] or 0) > now:
-            upd.update(not_before=now)
-            then = "it runs again now to check"
-        else:
+        else:   # no probe: the note only, never an early wake (see refresh_ref_waits)
             then = "it keeps its own window" if (t["not_before"] or 0) > now else "it runs at its turn"
         if prev.get("status") == "waiting":
             facts = [f for f in prev.get(refwaits.FACTS_KEY) or [] if f not in facts] + facts
-            upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: facts,
-                                         **({"woke": "; ".join(facts)} if "not_before" in upd else {})})
+            upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: facts})
         what = str((prev.get("waiting_for") if prev.get("status") == "waiting" else None)
                    or d.get("why") or prev.get("summary") or "its start condition")[:300]
         if not str(t["blocked_reason"] or "").startswith(refwaits.HELD_NOTES):
