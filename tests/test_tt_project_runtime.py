@@ -42056,7 +42056,7 @@ def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkey
     assert coord.apply(p, [{"type": "obligation", "key": "o1"}]) != [], "an action with nothing to do is rejected"
 
 
-def _ask(p, handled=0):
+def _refwait_ask(p, handled=0):
     return p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)",
                   (time.time(), "out", "ask", "which way?", handled))
 
@@ -42084,7 +42084,7 @@ def test_a_resolved_ask_refreshes_a_waits_note_and_reruns_its_probe_now(env, mon
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
     dep = p.db.add_task("dep", "s", kind="work", origin="user")
-    ask = _ask(p)
+    ask = _refwait_ask(p)
     tid, nb = _ref_wait(p, f"the answer to ask #{ask}", probe="false", depends_on=[dep])
     other, _ = _ref_wait(p, "something else", probe="false")
     before = p.db.task(tid)
@@ -42147,7 +42147,7 @@ def test_a_ref_wait_keeps_its_planned_window_and_start_after(env):
     t = p.db.task(tid)
     assert t["not_before"] == nb and "keeps its own window" in t["blocked_reason"]
     # A start_when task naming an ask: its probe reruns, but only after its start_after.
-    ask = _ask(p, handled=1)
+    ask = _refwait_ask(p, handled=1)
     after = time.time() + 7200
     sw = p.db.add_task("later", "s", kind="work", origin="user", not_before=after,
                        labels=["start_when:false", f"start_why:ask #{ask} answered",
