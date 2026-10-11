@@ -1116,7 +1116,7 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
             tasks.append(str(t))
     env = {**command_env(p), "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
            "TTP_PUSH_TARGET": str(m.get("target") or ""), "TTP_PUSH_TASKS": ",".join(tasks),
-           "TTP_PUSH_BATCH": str(marker)}
+           "TTP_PUSH_BATCH" if m.get("kind") == "batch" else "TTP_PUSH_RECEIPT": str(marker)}
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
     try:
         for cmd in cmds:
@@ -1150,6 +1150,43 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     if out["status"] == "ok":
         say("after_push: done")
     return out
+
+
+RECEIPTS = "after_push"   # under the project's state: one receipt per after_push of an ordinary push
+
+
+def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str = "") -> dict | None:
+    """Run `delivery.after_push` after an ordinary or detached `ttp push` that pushed `sha` to
+    `target` (a batch runs its own). A receipt under the project's state records it before it starts
+    and how it ended; the daemon turns it into an event, and an alert when it failed
+    (pushq.tend_receipts). Its failure never changes the push. None when after_push is not set."""
+    if not push.check_list((p.config().get("delivery") or {}).get("after_push")):
+        return None
+    rid = f"p{time.strftime('%Y%m%dT%H%M%S')}-{sha[:10]}-{secrets.token_hex(2)}"
+    folder = p.state / RECEIPTS
+    folder.mkdir(parents=True, exist_ok=True)
+    receipt = folder / f"{rid}.json"
+    task = os.environ.get("TTP_TASK") or ""
+    from .runner import boot_id
+    m = {"v": 1, "kind": "push", "id": rid, "status": "running", "outcome": "pushed", "pushed_sha": sha,
+         "target": target, "tip": tip, "repo": str(repo), "task": task, "pid": os.getpid(), "boot": boot_id(),
+         "started": time.time(), "results": [{"task": task, "status": "pushed"}] if task else []}
+    lock = locks.try_take([_after_lock(p, rid)], f"after_push of {sha[:10]}", "ttp push")
+    write_json(receipt, m)
+    try:
+        try:
+            after = after_push(p, receipt, m)
+        except Exception as e:     # recorded as a failure; the push stands
+            say(f"after_push: {type(e).__name__}: {e}")
+            after = {"status": "failed", "exit": None, "cmd": None, "tail": f"{type(e).__name__}: {e}",
+                     "started": m["started"], "ended": time.time()}
+        m.update(after_push=after, status="finished", ended=time.time())
+        write_json(receipt, m)     # before the lock goes: running with a free lock reads as killed
+    finally:
+        if lock is not None:
+            lock.close()
+    _forget(_after_lock(p, rid))
+    return {**after, "receipt": str(receipt)}
 
 
 def _finish(p: Project, marker: Path, m: dict, after: dict, lock) -> None:

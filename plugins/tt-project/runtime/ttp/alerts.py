@@ -56,7 +56,7 @@ CLEARED_TEXT = {
     "pr-ready": "{arg} is back in draft, closed or approved.",
     "config": "project.json reads again; new work starts again.",
     "push_rejected": "Pushes go through again: a push batch pushed.",
-    "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push or the push queue is off.",
+    "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
     "heal": "Heal check {arg} passes again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
@@ -161,7 +161,7 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
     if key == "after_push_failed":   # also over once no after_push will run (pushq.AFTER_PUSH_OFF)
-        if db.kv("after_push_off"):
+        if db.kv("after_push_off") or float(db.kv("after_push_ok_at") or 0) >= since:
             return False
         return not db.one("SELECT id FROM push_batches WHERE after_push='ok' AND after_finalized>=? LIMIT 1",
                           (since,))

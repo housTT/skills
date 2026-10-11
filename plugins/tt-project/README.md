@@ -443,7 +443,11 @@ and preferences you add later become part of the project's charter and memory.
   (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
   with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION`, `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`,
   `TTP_PUSH_BATCH` and `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never
-  fails the reviews: their change is already on the branch. Off (the default), each review
+  fails the reviews: their change is already on the branch. It also runs, queue on or off, after
+  each `ttp push` or `ttp push --detach` that pushed to the push branch (never after `--own`), with
+  `TTP_PUSH_RECEIPT` instead of `TTP_PUSH_BATCH`: a receipt under the project's state records it,
+  a detached push runs it once its outcome is written and its locks are let go, and the daemon
+  turns a failure, a timeout or a killed run into the same alert; the push stands. Off (the default), each review
   pushes with `ttp push --detach` as above. `ttp status` shows one line about the queue (what
   waits, the running batch, the last push and its deploy), the web app a Push queue card, and
   `ttp push --queue` lists the entries, the last 7 days' conflict counts (conflicted, resolved in

@@ -1923,8 +1923,8 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     lock = hold() if hold else None
     if hold and lock is None:
         return BUSY
-    global last_pushed
-    last_pushed = None
+    global last_pushed, last_tip
+    last_pushed = last_tip = None
     keep = published(repo, remote, branch)
     if keep:
         # The rebase would rewrite a branch the remote already has, and a later `ttp push --own` of
@@ -1944,6 +1944,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 
 
 last_pushed: str | None = None   # the commit the last push() pushed; HEAD may be back on its branch
+last_tip: str | None = None      # the branch's tip that last push() pushed onto
 last_reach: dict | None = None   # reach() of the last run(): whether it is on the branch it is meant to reach
 
 
@@ -2154,7 +2155,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             continue
         # Without --force the remote refuses anything that is not a fast-forward of what we tested on.
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
-            last_pushed = head
+            last_pushed, last_tip = head, tip
             say(f"pushed {head[:10]} to {upstream}")
             return 0
         if _fetch(repo, remote, branch) == tip:
@@ -2165,10 +2166,12 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
     return KEPT_MOVING
 
 
-def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None) -> int:
+def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
     """`ttp push` for a project: target, checks and rounds come from its `delivery` config. `own`
     publishes the task's own branch instead (own_target, publish), with the checks `recorded` (by
-    default those of the run's `ttp checks`) for when every project check is skipped."""
+    default those of the run's `ttp checks`) for when every project check is skipped. A push to the
+    push branch then runs `delivery.after_push` (run_after); with `after` False it is left in
+    `pending_after` for the caller (run_detached runs it once its outcome is written)."""
     d = p.config().get("delivery") or {}
     allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
     if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
@@ -2189,8 +2192,8 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    global last_ff, last_reach
-    last_ff, last_reach = [], None
+    global last_ff, last_reach, last_after, pending_after
+    last_ff, last_reach, last_after, pending_after = [], None, None, None
     if own:   # delivery.push_exclude_paths guards the push branch only
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
         # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
@@ -2210,6 +2213,8 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
             for line in ff_warnings(last_ff):
                 if line.startswith("not mirrored "):
                     run_note(f"ttp push: pushed {last_pushed[:10]} to {remote}/{branch}, but {line}")
+        if rc == 0 and last_pushed:   # a push queue batch runs its own (batch.run_batch), never this
+            pending_after = (last_pushed, f"{remote}/{branch}", last_tip or "")
     if rc == 0 and remote != LOCAL:   # no remote: nothing to fetch the intended branch from
         sha = (None if own else last_pushed) or _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
@@ -2219,10 +2224,40 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
                   f"{type(e).__name__}: {e}", file=sys.stderr)
         if last_reach:
             print(f"ttp push: {landing(sha, f'{remote}/{branch}', last_reach)}", file=sys.stderr)
+    if after and pending_after:
+        last_after = run_after(p, repo)
     return rc
 
 
+def run_after(p: Project, repo: Path) -> dict | None:
+    """`delivery.after_push` for the push run() left in `pending_after` (batch.after_ordinary_push):
+    its outcome, or None when after_push is not set. Its failure is a warning; the push stands."""
+    global pending_after
+    if not pending_after:
+        return None
+    sha, target, tip = pending_after
+    pending_after = None
+    from . import batch
+    try:
+        out = batch.after_ordinary_push(p, repo, sha, target, tip)
+    except Exception as e:   # never changes what the push did
+        out = {"status": "failed", "exit": None, "tail": f"{type(e).__name__}: {e}"}
+        print(f"ttp push: after_push: {type(e).__name__}: {e}", file=sys.stderr)
+    if out and out.get("status") != "ok":
+        print(f"ttp push: warning: {after_words(out)}; the push stands", file=sys.stderr)
+    return out
+
+
 last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff`/`not ff` and `mirror`/`not mirrored` lines
+last_after: dict | None = None   # the after_push outcome of the last run() (batch.after_ordinary_push)
+pending_after: tuple[str, str, str] | None = None   # (sha, target, tip) whose after_push run() left to run
+
+
+def after_words(a: dict) -> str:
+    """An after_push outcome in a few words: `after_push ok`, `after_push failed (exit 2) in <cmd>`."""
+    how = {"failed": f"failed (exit {a.get('exit')})", "timeout": "timed out"}.get(a.get("status"), a.get("status"))
+    return f"after_push {how}" + (f" in `{a['cmd']}`" if a.get("cmd") and a.get("status") != "ok" else "") + (
+        f" (receipt {a['receipt']})" if a.get("receipt") and a.get("status") != "ok" else "")
 
 
 def free(p: Project, repo: Path) -> int:
@@ -2465,7 +2500,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         signal.signal(sig, _stop)
     try:
         rec = m.get("recorded_checks")
-        rc = run(p, repo, own, rec if isinstance(rec, dict) else None)
+        rc = run(p, repo, own, rec if isinstance(rec, dict) else None, after=False)
     except Exception as e:     # recorded as a failure, never left as "running"
         print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
         reason = str(e) if isinstance(e, _Stopped) else None
@@ -2495,13 +2530,31 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
     if rc == 0 and not own and last_ff:
         m["fast_forward"] = last_ff
+    after = rc == 0 and not own and pending_after and after_set(p)
+    if after:
+        m["after_push"] = {"status": "running", "pid": os.getpid(), "started": time.time()}
     if rc == 0 and last_reach:
         m["reach"] = last_reach
     if reason:
         m["reason"] = reason
     write_json(marker, m)
     _forget_lock(marker)       # the outcome is written: a missing lock file reads as finished
+    if after:   # with the push lock and the run lock let go, so upgrades never wait for a deploy
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, signal.SIG_DFL)   # its receipt records a kill (pushq.tend_receipts)
+        a = run_after(p, repo) or {"status": "skipped", "reason": "delivery.after_push is not set"}
+        m = _read(marker) or m
+        m["after_push"] = a
+        write_json(marker, m)
     return rc
+
+
+def after_set(p: Project) -> bool:
+    """Whether `delivery.after_push` names a command (a malformed value counts: it fails loudly)."""
+    try:
+        return bool(check_list((p.config().get("delivery") or {}).get("after_push")))
+    except (TypeError, ValueError):
+        return True
 
 
 def _dead_reason(m: dict) -> str:
@@ -2620,6 +2673,15 @@ def result(marker: Path) -> int:
         print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}{reach_words(m.get('reach'))}")
         for line in m.get("fast_forward") or []:
             print(f"ttp push: {'warning: ' if line in ff_warnings([line]) else ''}{line}")
+        a = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
+        if a.get("status") == "running" and _pid_alive(a.get("pid")):
+            print("ttp push: after_push is still running; the daemon reports how it ends")
+        elif a.get("status") == "running":
+            print("ttp push: warning: after_push stopped before it finished; the push stands")
+        elif a.get("status") == "ok":
+            print("ttp push: after_push ok")
+        elif a.get("status") and a.get("status") != "skipped":
+            print(f"ttp push: warning: {after_words(a)}; the push stands")
     else:
         why = m.get("reason") or f"exit {m.get('exit')}"
         print(f"ttp push: not pushed ({why}); log: {m.get('log')}")
@@ -2627,6 +2689,16 @@ def result(marker: Path) -> int:
         if tail:
             print(tail)
     return 0
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def running(p: Project) -> list[dict]:

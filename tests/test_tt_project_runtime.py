@@ -16305,6 +16305,140 @@ def test_a_push_batch_refuses_every_entry_when_push_exclude_paths_is_a_scalar(en
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
+def _receipts(p):
+    folder = p.state / "after_push"
+    return [json.loads(x.read_text()) for x in sorted(folder.glob("*.json"))] if folder.is_dir() else []
+
+
+def test_an_ordinary_push_runs_after_push_at_the_pushed_commit_and_the_daemon_reports_it(env, monkeypatch):
+    """after_push runs after every guarded `ttp push`, not only push queue batches: in a clean checkout
+    at the pushed commit, with a durable receipt the daemon turns into one event."""
+    from ttp import push, pushq
+    seen = env["tmp"] / "after_push.txt"
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", [f"(env | grep '^TTP_PUSH'; echo head $(git rev-parse HEAD); pwd) > {seen}"])
+    monkeypatch.setenv("TTP_TASK", "7")
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    sha = _git_out(origin, "rev-parse", "proj")
+    lines = seen.read_text().splitlines()
+    for want in (f"TTP_PUSHED_SHA={sha}", "TTP_PUSH_TARGET=origin/proj", "TTP_PUSH_TASKS=7", f"head {sha}"):
+        assert want in lines, (want, lines)
+    assert not any(x.startswith("TTP_PUSH_BATCH=") for x in lines), lines
+    (r,) = _receipts(p)
+    assert f"TTP_PUSH_RECEIPT={p.state / 'after_push' / (r['id'] + '.json')}" in lines, lines
+    assert r["status"] == "finished" and r["after_push"]["status"] == "ok" and r["pushed_sha"] == sha
+    assert push.last_after["status"] == "ok" and not any(p.worktrees.glob("after_push-*"))
+    assert not list((p.state / "locks").glob("after_push:*")), "a finished after_push leaves no lock"
+    alerts = []
+    assert pushq.tend_receipts(p, lambda *a, **k: alerts.append(a)) == [r["id"]] and alerts == []
+    ev = p.db.one("SELECT * FROM events WHERE kind='after_push_ok'")
+    assert ev and sha[:7] in ev["text"] and ev["status"] == "handled"
+    assert pushq.tend_receipts(p, lambda *a, **k: alerts.append(a)) == [], "reported once"
+    assert p.db.kv(pushq.AFTER_PUSH_OK)
+
+
+def test_after_push_does_not_run_on_a_refused_push_an_own_branch_push_or_when_unset(env, monkeypatch):
+    from ttp import push
+    ran = env["tmp"] / "ran"
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["test ! -f bad.txt"])
+    p.set_config("delivery.after_push", [f"touch {ran}"])
+    _commit(repo, "bad.txt", "bad\n")
+    assert push.run(p, repo) == push.CHECKS_FAILED
+    assert not ran.exists() and _receipts(p) == [] and push.last_after is None
+    _git_out(repo, "rm", "-q", "bad.txt")
+    _git_out(repo, "commit", "-qm", "fix")
+    monkeypatch.setenv("TTP_TASK", "40")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t40-feature")
+    _commit(repo, "a.txt", "a\n")
+    assert push.run(p, repo, own=True) == 0 and _git_out(origin, "rev-parse", "ttp/t40-feature")
+    assert not ran.exists() and _receipts(p) == [], "an own-branch push never deploys"
+    _git_out(repo, "checkout", "-q", "-B", "work", "HEAD")
+    for unset in (None, [], ""):
+        p.set_config("delivery.after_push", unset)
+        _commit(repo, "b.txt", f"{unset!r}\n")
+        assert push.run(p, repo) == 0
+        assert not ran.exists() and _receipts(p) == [] and push.last_after is None
+
+
+def test_a_failed_or_timed_out_after_push_keeps_the_push_and_alerts_once(env, monkeypatch, capsys):
+    from ttp import alerts as alerts_mod, push, pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", ["echo deploying; echo deploy-broke; exit 3"])
+    _commit(repo, "mine.txt", "mine\n")
+    capsys.readouterr()
+    assert push.run(p, repo) == 0, "a failed after_push never fails the push"
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert sha == _git_out(repo, "rev-parse", "HEAD")
+    assert "warning: after_push failed (exit 3)" in capsys.readouterr().err
+    (r,) = _receipts(p)
+    assert (r["after_push"]["status"], r["after_push"]["exit"]) == ("failed", 3) and r["pushed_sha"] == sha
+    raised = []
+    pushq.tend_receipts(p, lambda key, text, **k: raised.append((key, text, k)))
+    assert len(raised) == 1 and raised[0][0] == "after_push_failed" and "exit 3" in raised[0][1] \
+        and raised[0][2]["severity"] == "high", raised
+    ev = p.db.one("SELECT * FROM events WHERE kind='after_push_failed'")
+    assert ev["status"] == "queued" and "deploy-broke" in ev["text"] and "The push stands" in ev["text"]
+    pushq.tend_receipts(p, lambda key, text, **k: raised.append((key, text, k)))
+    assert len(raised) == 1, "each receipt is reported once"
+    # The alert lasts until an after_push succeeds.
+    since = time.time() - 1
+    assert alerts_mod.holds(p.db, "after_push_failed", since, time.time())
+    # Timeout: the command is killed at after_push_timeout_s; the push still stands.
+    p.set_config("delivery.after_push", ["sleep 60"])
+    p.set_config("delivery.after_push_timeout_s", 1)
+    _commit(repo, "two.txt", "two\n")
+    t0 = time.time()
+    assert push.run(p, repo) == 0 and time.time() - t0 < 30
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    assert push.last_after["status"] == "timeout"
+    pushq.tend_receipts(p, lambda key, text, **k: raised.append((key, text, k)))
+    assert len(raised) == 2 and "timed out" in raised[1][1]
+    p.set_config("delivery.after_push", ["true"])
+    _commit(repo, "three.txt", "three\n")
+    assert push.run(p, repo) == 0 and push.last_after["status"] == "ok"
+    pushq.tend_receipts(p)
+    assert not alerts_mod.holds(p.db, "after_push_failed", since, time.time()), "a success clears it"
+
+
+def test_an_after_push_whose_process_died_is_reported_as_killed(env, monkeypatch):
+    from ttp import pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    folder = p.state / "after_push"
+    folder.mkdir(parents=True)
+    (folder / "p1.json").write_text(json.dumps({"id": "p1", "status": "running", "pushed_sha": "a" * 40,
+                                                "target": "origin/proj", "started": time.time()}))
+    raised = []
+    assert pushq.tend_receipts(p, lambda key, text, **k: raised.append(text)) == ["p1"]
+    assert len(raised) == 1 and "stopped before it finished" in raised[0]
+    assert json.loads((folder / "p1.json").read_text())["after_push"]["status"] == "killed"
+
+
+def test_a_detached_push_runs_after_push_once_its_outcome_is_written_and_its_locks_are_let_go(env, monkeypatch, capsys):
+    seen = env["tmp"] / "after_push.txt"
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); "
+             f"from ttp import release; from ttp.project import Project; "
+             f"print('in_flight', release.push_in_flight(Project('{p.base}')))\"")
+    p.set_config("delivery.after_push", [f"(echo sha $TTP_PUSHED_SHA; {probe}) > {seen}"])
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, retry = _detach(capsys)
+    assert rc == 0
+    r = _probe_until_done(p, retry)
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert r.returncode == 0 and f"pushed {sha}" in r.stdout, r
+    deadline = time.time() + 60
+    while (json.loads(marker.read_text()).get("after_push") or {}).get("status") == "running" \
+            and time.time() < deadline:
+        time.sleep(0.05)
+    m = json.loads(marker.read_text())
+    assert m["status"] == "pushed" and m["after_push"]["status"] == "ok", m
+    assert seen.read_text().split() == ["sha", sha, "in_flight", "False"], "upgrades never wait for a deploy"
+    (rec,) = _receipts(p)
+    assert rec["after_push"]["status"] == "ok" and m["after_push"]["receipt"].endswith(rec["id"] + ".json")
+    assert "after_push ok" in _probe(p, retry).stdout
+
+
 def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatch):
     from ttp import push
     from ttp import coordinator as coord
@@ -18632,6 +18766,7 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
     assert "push:run-b1.0.lock" not in lines and any(x.startswith("held ['after_push:run-b1: ") for x in lines), lines
     assert not (p.worktrees / "after_push-b1").exists() and "after_push-b1" not in _git_out(repo, "worktree", "list")
     assert not list((p.state / "locks").glob("*run-b1*"))
+    assert not (p.state / "after_push").exists(), "a batch runs its own after_push, never a second one"
 
 
 def test_after_push_failure_and_timeout_are_recorded_without_changing_the_push(env, monkeypatch):
@@ -20153,7 +20288,7 @@ def test_the_daemon_and_the_review_prompt_agree_on_whether_the_push_queue_is_on(
         assert "entries" not in check, check
 
 
-def test_an_after_push_failed_alert_clears_once_after_push_is_unset_or_the_queue_is_off(env, monkeypatch):
+def test_an_after_push_failed_alert_clears_once_after_push_is_unset_not_when_the_queue_is_off(env, monkeypatch):
     from ttp import alerts, pushq
     s = _pq(env, monkeypatch, after_push="./deploy.sh")
     _pq_plan(s, outcome="pushed", sha="ab" * 20, after="failed")
@@ -20173,7 +20308,10 @@ def test_an_after_push_failed_alert_clears_once_after_push_is_unset_or_the_queue
     assert alerts.holds(s.p.db, "after_push_failed", raised, time.time()), "set again, the failure still stands"
     s.p.set_config("delivery.push_queue", False)
     _pq_tend(s)
-    assert not alerts.holds(s.p.db, "after_push_failed", raised, time.time()), "the queue off clears it"
+    assert alerts.holds(s.p.db, "after_push_failed", raised, time.time()), \
+        "with the queue off ordinary pushes still run after_push: the failure still stands"
+    s.p.db.set_kv(pushq.AFTER_PUSH_OK, time.time())   # an ordinary push's after_push succeeded
+    assert not alerts.holds(s.p.db, "after_push_failed", raised, time.time())
 
 
 def test_approvals_ask_the_remote_for_its_default_branch_once_per_hour_not_once_each(env, monkeypatch):

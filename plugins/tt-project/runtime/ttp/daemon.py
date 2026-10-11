@@ -937,6 +937,10 @@ class Daemon:
         except Exception:
             log(self.p, "starting queued detached jobs failed\n" + traceback.format_exc())
         try:
+            pushq.tend_receipts(self.p, self.alert)
+        except Exception:
+            log(self.p, "recording after_push receipts failed\n" + traceback.format_exc())
+        try:
             changed = pushq.tend(self.p, self.cfg, self.alert, may_requeue=self.cfg_status != "unavailable")
         except Exception:
             log(self.p, "push queue: finalize failed\n" + traceback.format_exc())

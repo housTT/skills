@@ -39,7 +39,8 @@ RECOVER_FETCH_S = 20            # ... each fetch bounded, as the tick waits for 
 REFUSAL_TIMEOUT_S = 30          # the approval asks the remote for its default branch; never hang the tick
 DEFAULT_BRANCH_TTL_S = 3600     # ... and remembers the answer per remote this long (one ask, not one per approval)
 DEFAULT_BRANCH_RETRY_S = 300    # an unreachable remote is asked again after this, not on every approval
-AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset or the queue is off (alerts.holds)
+AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset (alerts.holds)
+AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push last succeeded (alerts.holds)
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
@@ -1097,10 +1098,60 @@ def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
 
 def _note_after_push(p: Project, cfg: dict | None) -> None:
     """Keep AFTER_PUSH_OFF current (written only when it changes): an after_push_failed alert also
-    clears once after_push is unset or the queue is off, since no after_push will run to succeed."""
-    off = not (enabled(p, cfg) and _after_push_set(p, cfg))
+    clears once after_push is unset, since no after_push will run to succeed. With the queue off,
+    ordinary pushes still run it (tend_receipts)."""
+    off = not _after_push_set(p, cfg)
     if bool(p.db.kv(AFTER_PUSH_OFF)) != off:
         p.db.set_kv(AFTER_PUSH_OFF, off)
+
+
+def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float | None = None) -> list[str]:
+    """The tick's step for the after_push of ordinary and detached pushes (batch.after_ordinary_push):
+    each receipt that ended, or whose process died in it (its lock is free while it reads running),
+    becomes one event, and a failure also an after_push_failed alert; then it is marked reported.
+    Reported receipts older than push.KEEP_S go. Returns the ids it reported."""
+    from .batch import RECEIPTS, _after_lock
+    now = time.time() if now is None else now
+    folder = p.state / RECEIPTS
+    done = []
+    for receipt in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        m = _read(receipt)
+        if not m:
+            continue
+        if m.get("reported"):
+            if now - float(m.get("reported") or now) > push.KEEP_S:
+                receipt.unlink(missing_ok=True)
+            continue
+        rid = str(m.get("id") or receipt.stem)
+        if m.get("status") == "running":
+            if not locks.any_free([_after_lock(p, rid)]):
+                continue
+            m = _read(receipt)     # read after the lock: the process writes its outcome before letting go
+            if m.get("status") == "running":
+                m.update(status="finished", ended=now, after_push={
+                    "status": "killed", "exit": None, "started": m.get("started"),
+                    "tail": "the process ended before after_push finished (killed, crashed or rebooted)"})
+        ap = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
+        status = str(ap.get("status") or "failed")
+        what = _short(m.get("pushed_sha")) + f" to {m.get('target') or '?'}" + (
+            f" (task #{m['task']})" if m.get("task") else "")
+        if status == "ok":
+            took = float(ap.get("ended") or 0) - float(ap.get("started") or 0)
+            _event(p.db, None, "after_push_ok", f"after_push of {what} succeeded"
+                                                + (f" in {took:.0f} s" if took > 0 else ""), queued=False)
+            p.db.set_kv(AFTER_PUSH_OK, now)
+        elif status != "skipped":
+            how = {"failed": f"failed (exit {ap.get('exit')})", "timeout": "timed out",
+                   "killed": "stopped before it finished"}.get(status, status)
+            if ap.get("cmd") and status != "killed":
+                how += f" in `{ap['cmd']}`"
+            text = f"after_push of {what} {how}. The push stands. Receipt: {receipt}"
+            _event(p.db, None, "after_push_failed", f"{text}\n{_tail_of(m, ap)}", queued=True, severity="high")
+            alert("after_push_failed", text, severity="high")
+        m["reported"] = now
+        write_json(receipt, m)
+        done.append(rid)
+    return done
 
 
 def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
