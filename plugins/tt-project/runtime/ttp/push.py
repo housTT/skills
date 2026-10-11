@@ -88,6 +88,8 @@ def _entries(v: Any) -> list:
             v = text.splitlines()
     if isinstance(v, dict):
         v = [v]
+    if v and not isinstance(v, (list, tuple)):   # a scalar (true, 5): no entries; the *_check helpers refuse it
+        return []
     return [c for c in (v or []) if isinstance(c, dict) or str(c).strip()]
 
 
@@ -366,6 +368,8 @@ def fast_forward_problem(branch: str, push_branch: str) -> str:
 
 def fast_forward_check(v: Any, push_branch: str) -> list[str]:
     """`delivery.fast_forward_also` as config_set takes it; ValueError naming the first bad branch."""
+    if v and not isinstance(v, (str, list, tuple)):
+        raise ValueError(f"delivery.fast_forward_also: {v!r}: not a list of branch names")
     names = fast_forward_list(v)
     for b in names:
         if why := fast_forward_problem(b, push_branch):

@@ -16247,6 +16247,24 @@ def test_push_without_fast_forward_also_moves_nothing_else(env, monkeypatch):
         assert _git_out(origin, "rev-parse", "main") == main and push.last_ff == []
 
 
+def test_fast_forward_also_scalar_is_reported_and_never_raises_after_a_push(env, monkeypatch):
+    from ttp import push
+    from ttp.project import config_problems
+    for bad in (True, 5):
+        with pytest.raises(ValueError):
+            push.fast_forward_check(bad, "origin/proj")
+        assert any("fast_forward_also" in l for l in
+                   config_problems({"delivery": {"push_branch": "origin/proj", "fast_forward_also": bad}})), bad
+        assert push.fast_forward_list(bad) == [] and push.exclude_list(bad) == [] and push.check_problems(bad) == []
+    p, repo, origin, other = _ff_setup(env, monkeypatch, None)
+    main = _git_out(origin, "rev-parse", "main")
+    for bad in (True, 5):
+        p.set_config("delivery.fast_forward_also", bad)
+        _commit(repo, "mine.txt", f"{bad!r}\n")
+        assert push.run(p, repo) == 0
+        assert _git_out(origin, "rev-parse", "main") == main and push.last_ff == []
+
+
 def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatch):
     from ttp import push
     from ttp import coordinator as coord
