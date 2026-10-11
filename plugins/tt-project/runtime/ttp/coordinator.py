@@ -22,7 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -34,7 +34,7 @@ from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "escalate", "noop")
+                "escalate", "sweep", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -82,7 +82,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
-            "waits_on": {"type": "string"}, "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"}},
+            "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
+            "heal": {"type": ["object", "null"]}, "pr_branch": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -176,7 +177,7 @@ RETRY_WAKE_KEY = "rejected_retry_wake"
 EFFORT_EVENT_TRIGGERS = {
     # stuck work
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
-    "dead_dependency": "stuck",
+    "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource",
@@ -475,6 +476,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
+    section("blocker_sweep", sweep.digest_lines(db, event_ids, now))
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")
@@ -1402,6 +1404,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                          a.get("why") or a.get("reason") or a.get("text") or "",
                          escalate_after_h=a.get("escalate_after_h"))
+            elif t == "sweep":
+                sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)))
             elif t in ("noop", "escalate", None):
                 pass   # an escalation is the daemon's (Daemon._finish_coordinator); here it changes nothing
             else:

@@ -202,6 +202,15 @@ and preferences you add later become part of the project's charter and memory.
   (0.7) or above raises the turn the same way, and the same events never raise a second turn. Each
   call is logged with the effort it led to and what the turn did, and reported in the daily review;
   `jev.uses.coord_effort` = `off` turns the check off.
+- Blocker sweep: every `coordinator.blocker_sweep_h` (6; 0 turns it off) hours while anything is
+  stuck, and sooner (never within `coordinator.blocker_sweep_min_gap_h`, 1) when a pause ends, an
+  ask is resolved, a dependency finishes, a provider pause ends or a re-check comes due, a
+  high-effort turn lists every blocked, waiting, in-review, setting-held and deferred task and every
+  paused resource with its age, reason and last re-check. The coordinator records one `sweep`
+  outcome for each; items without one, `still_blocked` ones with no re-checkable condition, and
+  re-block loops (the same reason twice, or a spec addendum while still blocked) are flagged in the
+  next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
+  has not run. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Stall check (model-free): when no worker run has started for `coordinator.stall_wake_h` (3; 0
   turns it off) while a queued task has been one dispatch would start now for that long, one high
   observation lists those tasks and when the last worker run started. It uses dispatch's own checks,

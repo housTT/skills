@@ -61,6 +61,7 @@ from . import runner
 from . import schedule as sched
 from . import service
 from . import settinghold
+from . import sweep
 from . import timefmt
 from . import unblock
 from . import upstream
@@ -655,7 +656,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.blocker_sweep, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2868,6 +2869,8 @@ class Daemon:
         if payload.get("unblock_report", s["name"] == "daily-review"):
             try:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
+                spec += (f"\n\nStuck longer than {sweep.REVIEW_LONG_H:g}h, with the blocker sweep's outcome:\n"
+                         + "\n".join(f"- {line}" for line in sweep.review_lines(db)))
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
@@ -3086,6 +3089,34 @@ class Daemon:
                  (time.time(), "daemon", "retry_wake", "normal",
                   f"A slot is free for an action an earlier turn could not do ({wake.get('why', '')[:600]}). "
                   f"Do it now if it is still needed.", "queued"))
+
+    def blocker_sweep(self) -> None:
+        """Queue a blocker sweep (sweep.py) when one is due: a high-effort turn that re-checks every
+        stuck item. Model-free until then; checked once a minute."""
+        now = time.time()
+        if now - getattr(self, "_sweep_checked", 0.0) < 60:
+            return
+        self._sweep_checked = now
+        db = self.p.db
+        try:
+            why = sweep.due(db, self.cfg, now)
+            if not why:
+                return
+            core = self.cfg.get("core_provider") or "claude"
+            busy = {r["provider"]: r["n"] for r in db.q(
+                "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
+            ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None, "logged_out": {}}
+
+            def hold_of(t: dict) -> str | None:
+                prov = t["provider"] or core
+                if prov not in ctx["logged_out"]:
+                    ctx["logged_out"][prov] = self._logged_out(prov)
+                return self._start_hold(t, prov, ctx)
+            eid = sweep.start(db, self.cfg, why, now, hold_of=hold_of)
+            if eid:
+                log(self.p, f"blocker sweep queued ({why})")
+        except Exception:   # a sweep that cannot start must not stop the tick
+            log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def maybe_coordinate(self) -> None:
         db, c = self.p.db, self.cfg["coordinator"]

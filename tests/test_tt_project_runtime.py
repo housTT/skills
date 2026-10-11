@@ -40383,3 +40383,231 @@ def test_reviews_fixes_and_re_reviews_of_a_pinned_task_keep_its_pin(env, monkeyp
     # An unpinned task's review runs as before: no pin, the core provider.
     _, _, _, (plain,) = _finish_code(env, p, "plain feature", {"b.py": 20})
     assert (plain["provider"], plain["model"], plain["effort"]) == (None, None, None)
+
+
+def _sweep_ev(db, tid, kind, text, ts):
+    db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+         (ts, "t", kind, text, "handled", tid))
+
+
+def test_blocker_sweep_is_due_every_interval_only_while_something_is_stuck(env):
+    """The sweep runs every coordinator.blocker_sweep_h hours while anything is stuck, never twice at
+    once, and not at all when nothing is stuck or the interval is 0."""
+    p = make(env)
+    from ttp import sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    assert sweep.due(db, cfg, now) is None                          # nothing stuck
+    t = db.add_task("stuck one")
+    db.update_task(t, status="blocked", blocked_reason="needs the vendor's key")
+    assert sweep.due(db, cfg, now) == "every 6h"                     # never swept
+    assert sweep.due(db, {"coordinator": {"blocker_sweep_h": 0}}, now) is None
+    eid = sweep.start(db, cfg, "every 6h", now)
+    ev = db.one("SELECT * FROM events WHERE id=?", (eid,))
+    assert ev["kind"] == sweep.SWEEP_KIND and ev["status"] == "queued" and "1 stuck item" in ev["text"]
+    assert sweep.due(db, cfg, now + 7 * 3600) is None                # one is queued already
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.due(db, cfg, now + 3 * 3600) is None
+    assert sweep.due(db, cfg, now + 6 * 3600 + 1) == "every 6h"
+    db.update_task(t, status="done")
+    assert sweep.due(db, cfg, now + 7 * 3600) is None                # nothing stuck: skipped
+
+
+def test_blocker_sweep_comes_early_on_a_signal_but_not_before_the_minimum_gap(env):
+    p = make(env)
+    from ttp import sweep, unblock
+    db, cfg, now = p.db, p.config(), time.time()
+    dep = db.add_task("dependency")
+    t = db.add_task("waits on a resource")
+    db.update_task(t, status="blocked", blocked_reason="resource gone", depends_on=json.dumps([dep]))
+    db.set_kv("paused_resources", {"rig": {"since": now - 60, "by": "coordinator", "reason": "flaky"}})
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.due(db, cfg, now + 2 * 3600) is None                # no signal
+    sweep.signal(db, "health check passed on rig")                   # the hook other modules call
+    assert sweep.due(db, cfg, now + 1800) is None                    # inside the minimum gap
+    assert sweep.due(db, cfg, now + 2 * 3600) == "health check passed on rig"
+    sweep.start(db, cfg, "x", now + 2 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert db.kv(sweep.SIGNAL_KEY) is None                           # a sweep consumes the signals
+    db.set_kv("paused_resources", {})
+    assert sweep.due(db, cfg, now + 4 * 3600) == "pause ended: rig"
+    sweep.start(db, cfg, "x", now + 4 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    _sweep_ev(db, dep, "task_done", "done", now + 4.5 * 3600)
+    assert sweep.due(db, cfg, now + 5.5 * 3600) == f"dependency done: #{dep}"
+    sweep.start(db, cfg, "x", now + 5.5 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    db.set_kv(unblock.RESOLVED_KEY, {"7": {"ts": now + 6 * 3600, "messages": []}})
+    assert sweep.due(db, cfg, now + 7 * 3600) == "ask #7 resolved"
+    sweep.start(db, cfg, "x", now + 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    db.set_kv("limited:claude", {"until": now + 8 * 3600, "note": "limit"})
+    assert sweep.due(db, cfg, now + 9 * 3600) == "provider pause over: claude"
+
+
+def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_check(env):
+    p = make(env)
+    from ttp import coordinator as coord, settinghold, sweep
+    db, now = p.db, time.time()
+    blocked = db.add_task("blocked on a key")
+    db.update_task(blocked, status="blocked", blocked_reason="needs the vendor's key")
+    _sweep_ev(db, blocked, "task_blocked", f"#{blocked} blocked on a key: needs the vendor's key", now - 5 * 3600)
+    waiting = db.add_task("waits on a box")
+    db.update_task(waiting, status="waiting")
+    _sweep_ev(db, waiting, "task_waiting", f"#{waiting} waits on a box: the box is busy", now - 3600)
+    review = db.add_task("in review")
+    db.update_task(review, status="review")
+    _sweep_ev(db, review, "task_review", "x", now - 8 * 3600)
+    held = db.add_task("held on a setting")
+    db.update_task(held, status="blocked", blocked_reason=f"{settinghold.NOTE}{next(iter(settinghold.SETTINGS))} is off")
+    deferred = db.add_task("deferred", labels=[f"start_after:{now + 3600}", f"deferred_since:{now - 600}",
+                                                          "start_why:after the window"])
+    db.update_task(deferred, not_before=now + 3600)
+    db.add_task("ready to run")                                      # queued and not deferred: not stuck
+    db.set_kv("paused_resources", {"rig": {"since": now - 2 * 3600, "by": "coordinator", "reason": "flaky"}})
+    kinds = {i["key"]: (i["kind"], round(i["age_s"] / 3600, 1) if i["age_s"] is not None else None)
+             for i in sweep.items(db, now)}
+    assert kinds == {f"task:{blocked}": ("blocked", 5.0), f"task:{waiting}": ("waiting", 1.0),
+                     f"task:{review}": ("review", 8.0), f"task:{held}": ("setting-held", 0.0),
+                     f"task:{deferred}": ("deferred", 0.2), "resource:rig": ("paused", 2.0)}
+    eid = sweep.start(db, p.config(), "every 6h", now)
+    text = coord.digest(p, {}, [eid], [])
+    assert "## Blocker sweep (high effort): 6 item(s)" in text
+    line = next(ln for ln in text.splitlines() if ln.startswith(f"- #{blocked} "))
+    assert "| blocked 5.0h | needs the vendor's key | never re-checked" in line
+    assert "after the window" in text and "resource rig | paused 2.0h | by coordinator: flaky" in text
+    assert f"#{review} in review | review 8.0h" in text and "review: no review queued" in text
+    assert "## Blocker sweep" not in coord.digest(p, {}, [], [])     # only the sweep's own turn shows it
+
+
+def test_blocker_sweep_turn_runs_at_high_effort(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    assert coord.EFFORT_EVENT_TRIGGERS[sweep.SWEEP_KIND] == "stuck"
+    assert "sweep" in coord.ACTION_TYPES
+    assert coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]["outcome"]["enum"] == list(sweep.OUTCOMES)
+
+
+def test_blocker_sweep_daemon_step_queues_the_sweep_with_a_review_dispatch_diagnosis(env, monkeypatch):
+    p = make(env)
+    from ttp import sweep
+    from ttp.daemon import Daemon
+    db, now = p.db, time.time()
+    code = db.add_task("code change", kind="code")
+    db.update_task(code, status="review")
+    _sweep_ev(db, code, "task_review", "x", now - 9 * 3600)
+    rid = db.add_task(f"Review #{code}: code change", kind="review", depends_on=[code], labels=[f"auto_review:{code}"])
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    monkeypatch.setattr(d, "_start_hold", lambda t, prov, ctx, reserve=False: "gate" if t["id"] == rid else None)
+    d.blocker_sweep()
+    ev = db.one("SELECT * FROM events WHERE kind=?", (sweep.SWEEP_KIND,))
+    assert ev and ev["status"] == "queued"
+    reviews = db.kv(sweep.STATE_KEY)["reviews"]
+    assert reviews[f"task:{code}"].startswith(f"review #{rid} queued") and "dispatch holds it: gate" in reviews[f"task:{code}"]
+    d.blocker_sweep()                                                # checked once a minute, never twice at once
+    assert db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (sweep.SWEEP_KIND,))["n"] == 1
+    db.x("UPDATE runs SET status='ok'")
+    db.x("INSERT INTO runs(task,role,status,started) VALUES(?,?,?,?)", (rid, "review", "running", now))
+    db.x("UPDATE tasks SET status='running' WHERE id=?", (rid,))
+    assert sweep.review_diagnosis(db, code, now).startswith(f"review #{rid} running, started 1x")
+    db.x("UPDATE tasks SET status='failed', result=? WHERE id=?", (json.dumps({"summary": "tests red"}), rid))
+    assert sweep.review_diagnosis(db, code, now) == f"review #{rid} failed, started 1x: tests red"
+
+
+def test_sweep_action_records_one_validated_outcome_per_item(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db = p.db
+    t = db.add_task("blocked")
+    db.update_task(t, status="blocked", blocked_reason="x")
+    probs = coord.apply(p, [
+        {"type": "sweep", "id": t, "outcome": "still_blocked", "until": "Accepted-evidence addendum only; retain blocked status",
+         "start_after": "6h"},
+        {"type": "sweep", "id": t, "outcome": "still_blocked", "until_probe": "test -e /tmp/x"},
+        {"type": "sweep", "id": t, "outcome": "human_indispensable"},
+        {"type": "sweep", "id": t, "outcome": "maybe"},
+        {"type": "sweep", "outcome": "retired"},
+        {"type": "sweep", "id": 9999, "outcome": "retired"}])
+    assert len(probs) == 6 and db.kv(sweep.OUTCOMES_KEY) is None
+    assert "re-checkable condition" in probs[0] and "start_after" in probs[1] and "`why`" in probs[2]
+    assert coord.apply(p, [{"type": "sweep", "id": t, "outcome": "still_blocked",
+                            "until": "the vendor sends the signed key", "start_after": "6h"},
+                           {"type": "sweep", "resource": "rig", "outcome": "human_indispensable",
+                            "why": "only the owner can reseat the card"}]) == []
+    outs = db.kv(sweep.OUTCOMES_KEY)
+    assert outs[f"task:{t}"]["outcome"] == "still_blocked" and outs[f"task:{t}"]["next"] > time.time() + 5 * 3600
+    assert outs["resource:rig"]["why"] == "only the owner can reseat the card"
+
+
+def test_blocker_sweep_carries_and_flags_items_left_without_an_outcome(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    a, b, c = (db.add_task(n) for n in ("no outcome", "answered", "next check passed"))
+    for t in (a, b, c):
+        db.update_task(t, status="blocked", blocked_reason="r")
+    sweep.start(db, cfg, "every 6h", now - 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": b, "outcome": "still_blocked", "until_probe": "test -e /x",
+                            "start_after": "1d"},
+                           {"type": "sweep", "id": c, "outcome": "still_blocked", "until_probe": "test -e /y",
+                            "start_after": "1h"}]) == []
+    eid = sweep.start(db, cfg, "every 6h", now + 2 * 3600)
+    flags = db.kv(sweep.STATE_KEY)["flags"]
+    assert flags == {f"task:{a}": "no outcome at the last sweep", f"task:{c}": "its next check is due"}
+    text = coord.digest(p, {}, [eid], [])
+    lines = [ln for ln in text.splitlines() if ln.startswith("- #")]
+    assert "FLAG: no outcome at the last sweep" in lines[0] or "FLAG: no outcome at the last sweep" in lines[1]
+    assert f"#{b} " in lines[2] and "FLAG" not in lines[2]           # flagged items come first
+    assert "last re-check" in next(ln for ln in lines if ln.startswith(f"- #{b} ")) and "until test -e /x" in text
+
+
+def test_blocker_sweep_flags_a_reblock_loop_and_a_spec_addendum_while_blocked(env):
+    p = make(env)
+    from ttp import sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    a = db.add_task("re-blocked")
+    db.update_task(a, status="blocked", blocked_reason="needs evidence")
+    _sweep_ev(db, a, "task_blocked", f"#{a} re-blocked: needs evidence (run 41, 3 h)", now - 7200)
+    _sweep_ev(db, a, "task_blocked", f"#{a} re-blocked: needs evidence (run 57, 1 h)", now - 600)
+    b = db.add_task("addended", spec="do the thing")
+    db.update_task(b, status="blocked", blocked_reason="waits on a decision")
+    c = db.add_task("moved on")
+    db.update_task(c, status="blocked", blocked_reason="first")
+    _sweep_ev(db, c, "task_blocked", f"#{c} moved on: first", now - 7200)
+    _sweep_ev(db, c, "task_blocked", f"#{c} moved on: second", now - 600)
+    sweep.start(db, cfg, "every 6h", now)
+    loops = db.kv(sweep.STATE_KEY)["loops"]
+    assert list(loops) == [f"task:{a}"] and loops[f"task:{a}"].startswith(sweep.LOOP)
+    db.update_task(b, spec="do the thing\n\nAccepted-evidence addendum only; retain blocked status")
+    db.x("UPDATE events SET status='handled'")
+    sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    loops = db.kv(sweep.STATE_KEY)["loops"]
+    assert loops[f"task:{b}"] == f"{sweep.LOOP} (spec changed while it stayed blocked)" and f"task:{c}" not in loops
+
+
+def test_the_daily_review_lists_items_stuck_over_6h_with_their_sweep_outcome(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    from ttp import daemon as dm
+    db, now = p.db, time.time()
+    old = db.add_task("old block")
+    db.update_task(old, status="blocked", blocked_reason="needs the vendor's key")
+    _sweep_ev(db, old, "task_blocked", f"#{old} old block: needs the vendor's key", now - 10 * 3600)
+    new = db.add_task("new block")
+    db.update_task(new, status="blocked", blocked_reason="fresh")
+    _sweep_ev(db, new, "task_blocked", f"#{new} new block: fresh", now - 3600)
+    assert coord.apply(p, [{"type": "sweep", "id": old, "outcome": "human_indispensable",
+                            "why": "only the vendor can issue it"}]) == []
+    lines = sweep.review_lines(db, now)
+    assert lines == [f"#{old} old block: blocked 10.0h: needs the vendor's key; sweep: human_indispensable 0.0h ago"]
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert f"Stuck longer than 6h, with the blocker sweep's outcome:\n- #{old} old block: blocked 10.0h" in spec
+    db.x("DELETE FROM tasks")
+    assert sweep.review_lines(db, now) == ["nothing stuck longer than 6h"]

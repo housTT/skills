@@ -19,6 +19,8 @@ Assess the last day of this project, then hand off.
    labels: inventory is not a 24 h count, cumulative counters are not daily totals, and an unknown
    is not zero. A handed-back ask should not have been sent: say what rule
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
+   With `Stuck longer than 6h` lines, list each item with its reason and sweep outcome; one with no
+   outcome or a LOOP is a defect: say why the sweep did not resolve it.
 5. Self-efficiency: if this spec ends with `Self-efficiency audit` lines (`ttp audit <name>` prints
    them, `--json` the rows), grade them. Grade every ask, one line each, `human-only` or
    `avoidable`: was it truly blocked on access, funds, spend, review, merge, an irreversible step,

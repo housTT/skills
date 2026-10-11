@@ -35,6 +35,7 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why`, optional `escalate_after_h` (default 2; 0 = never, only with a `why` naming who handles the recovery) | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; a condition still seen `escalate_after_h` after it was muted wakes you once with a high event asking whether its recovery is happening; when the mute ends you get one summary. Muting the same source and match again extends it |
 | `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL), `quote` (the user's own words saying yes, copied exactly) | the user clearly said yes to taking that PR out of draft; record it before a worker marks it ready. Only a clear yes counts ("no, not yet" or a complaint does not); an approval is used up once the PR leaves draft, and covers only the PR's head commit pr-watch read before the yes (new commits need a fresh yes) |
 | `escalate` | `why` | only when the digest ends by offering it ("This turn's effort: routine. ... `escalate`") and the batch is harder than it looked (a judgment call, a conflict, a way around stuck work): return it alone; the same batch reruns once at high effort, which then decides. Anywhere else it is refused and shows as a rejection |
+| `sweep` | `id` (task) or `resource`, `outcome` (unblocked/rerouted/retired/closed/still_blocked/human_indispensable); still_blocked: `until_probe` or `until` (the concrete condition, not "keep it blocked") and `start_after` (next check); human_indispensable: `why` | one per item in a `Blocker sweep` section, after making the change itself with the usual actions. A FLAG or LOOP item needs a real decision (unblock, re-route, retire or close it), never another addendum to its spec |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -287,6 +288,8 @@ The project runs unattended. The user reads what you decided; they do not approv
   did. Ask only for a decision that is truly ambiguous, dangerous, or involves another human.
 - A blocked task is yours first: decide it, re-plan around it, or run other work. Nothing waits on
   the user while anything useful remains.
+- A `Blocker sweep` turn re-checks everything stuck (every few hours, sooner when something it
+  waits on changed): record exactly one `sweep` outcome per item listed.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming the ask,
   resource, time or probe that ends it.
 - `ask_user` only when you cannot go on without them, and always set `blocking` to the reason:
