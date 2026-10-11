@@ -147,6 +147,12 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   one spot, or upstream already ships the project's change) are settled without a model; any
   other conflict leaves one harness task and no hourly retries. At most one such task is queued
   a day; a conflict within a day of the last one waits and is tried again after it. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+  An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
+  the merge task once the last one ended `upgrade.merge_retry_h` (6) hours ago, and takes the finish
+  lock over from a finish task that is blocked or has had no run or update for 6 h: that task is
+  cancelled (superseded) and the lock's generation goes up, so its later `--apply` is refused. A
+  finish task stuck that long is reported once to the maintainers' upstream inbox; a restart does not
+  repeat it. Deferral lines name the owner and say when the upgrade resumes, in the home zone.
 - How a release reaches `lib/current`: `ttp setup`, run from a plugin's root, copies that plugin
   into `~/.tt-project/lib/<version>` and points `lib/current` at it. It refuses to replace a
   newer installed version unless run with `--force`, which leaves a `lib/forced-downgrade` marker

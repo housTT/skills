@@ -101,6 +101,8 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
   `upgrade.auto` takes it on (the daemon retries only a newer version); when nothing does, it exits 1.
   The same conflict deferred past 48 h, or after two harness tasks that did not land it, is
   reported once as a normal observation.
+  A finish task blocked or idle for 6 h no longer holds the harness against a host-side
+  `ttp upgrade <name>`: that cancels and fences it (its `--apply` is then refused) and goes on.
 - Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
   Where the service manager is out of reach (a sandboxed worker), it asks the running daemon to
