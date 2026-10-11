@@ -2282,6 +2282,61 @@ def test_command_watcher_json_lines_keep_their_items_unless_they_say_whole(env, 
     assert status("plain") == {"box-c: fan slow": "open", "box-c: disk full": "open"}
 
 
+def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_wake(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    noisy = lambda: (p.logs / "daemon.log").read_text().count("noisy watcher:") if (p.logs / "daemon.log").exists() else 0
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    reasons = ["ssh refused", "timed out", "no route", "host key changed", "reset by peer"]
+    # Three issues on one subject is the default limit: no warning yet.
+    for why in reasons[:3]:
+        run("hw", {"text": f"box-a: unreachable ({why})", "severity": "high", "whole": True})
+    assert len(issues("hw")) == 3 and noisy() == 0
+    # The fourth goes over it: one log line, no wake of its own (only the new issue's own wake).
+    before = wakes()
+    run("hw", {"text": f"box-a: unreachable ({reasons[3]})", "severity": "high", "whole": True})
+    assert wakes() == before + 1 and noisy() == 1
+    assert "watcher:hw opened 4 issues on subject 'box-a' within 24 h" in (p.logs / "daemon.log").read_text()
+    # A fifth updates the count without a second log line.
+    run("hw", {"text": f"box-a: unreachable ({reasons[4]})", "severity": "high", "whole": True})
+    assert noisy() == 1
+    # The coordinator's digest notes it once, until its next turn; the daily review lists the day's.
+    assert "watcher:hw opened 5 issues on subject 'box-a'" in coord.digest(p, {}, [], [])
+    p.db.set_kv("last_coordinator_turn", time.time() + 1)
+    assert "Noisy command watchers" not in coord.digest(p, {}, [], [])
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    assert d._schedule_llm({"name": "daily-review", "budget_usd_day": None, "last_run": None,
+                            "description": "review"}, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Noisy command watchers" in spec and "watcher:hw opened 5 issues on subject 'box-a'" in spec
+    # The same changing text under a stable key is one issue and no warning.
+    for why in reasons:
+        run("keyed", {"text": f"box-a: unreachable ({why})", "severity": "high", "key": "box-a unreachable"})
+    assert len(issues("keyed")) == 1 and noisy() == 1
+    # Issues opened more than 24 h ago do not count; a limit of 0 turns the warning off.
+    p.db.x("UPDATE issues SET first_seen=first_seen-? WHERE source='watcher:hw'", (watchdup.WINDOW_S + 60,))
+    assert watchdup.counts(p.db, "watcher:hw", time.time()) == []
+    for why in reasons:
+        run("quiet", {"text": f"box-b: unreachable ({why})", "severity": "high", "whole": True})
+    assert noisy() == 2
+    p.db.set_kv(watchdup.KEY, {})
+    assert watchdup.check(p.db, {"screen": {"same_subject_warn": 0}}, ["watcher:quiet"]) == []
+    assert len(watchdup.check(p.db, {}, ["watcher:quiet"])) == 1
+    # Watcher authors are told to key changing text, in the skill and the coordinator's schedule_set notes.
+    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
+    prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert '"whole", "key"}' in skill and "Give every line whose text changes from run to run a key" in skill
+    assert "`screen.same_subject_warn`" in skill
+    assert "also carries `\"key\"`, a short stable name of the condition" in prompt
+    assert "Noisy command watchers" in prompt
+
+
 def test_command_watcher_info_lines_clear_items_and_are_recorded_quietly(env, monkeypatch):
     from ttp import screen as scr
     run, issues, p = _json_watcher(env, monkeypatch)

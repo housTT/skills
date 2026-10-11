@@ -63,6 +63,7 @@ from . import timefmt
 from . import unblock
 from . import upstream
 from . import waitheal
+from . import watchdup
 from . import screen as scr
 from . import shared
 from . import worktree
@@ -2721,6 +2722,21 @@ class Daemon:
             self.p.db, periods, receipts=[f"watcher:{r['name']}" for r in rows if _explicit_clear(r["payload"])])
 
     def _run_command_watcher(self, s: dict, payload: dict) -> str:
+        try:
+            return self._command_watcher(s, payload)
+        finally:
+            self._warn_same_subject(s["name"])
+
+    def _warn_same_subject(self, name: str) -> None:
+        """One log line when this watcher opened many issues on one subject (watchdup); no wake."""
+        source = f"watcher:{name}"
+        try:
+            for line in watchdup.check(self.p.db, self.cfg, [source, scr.error_source(source)]):
+                log(self.p, f"noisy watcher: {line}")
+        except Exception as e:   # a warning must not fail the watcher
+            log(self.p, f"same-subject count failed: {type(e).__name__}: {e}")
+
+    def _command_watcher(self, s: dict, payload: dict) -> str:
         cmd = payload.get("command")
         if not cmd:
             return "no command"
@@ -2831,6 +2847,11 @@ class Daemon:
                          + "\n".join(f"- {line}" for line in audit.lines(db, blocked_h=hours, p=self.p)))
             except Exception as e:   # nor must the audit
                 log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            noisy = watchdup.review_lines(db)
+            if noisy:
+                spec += ("\n\nNoisy command watchers (many issues on one subject in 24 h; fix each watcher's "
+                         "output today):\n" + "\n".join(f"- {line}" for line in noisy))
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 line = responsibilities.line(db)

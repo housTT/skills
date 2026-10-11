@@ -22,7 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, timefmt, unblock, upstream, worktree
+from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -470,6 +470,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     mem = memory_budget_line(p)
     if mem:

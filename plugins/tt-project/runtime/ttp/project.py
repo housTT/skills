@@ -190,7 +190,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": []},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
-    "screen": {"wake_min_severity": "normal", "rewake_after_h": 6},
+    # same_subject_warn: a watcher that opens more issues than this on one subject in 24 h gets a log
+    # line and a digest and daily-review note, no wake (0: off).
+    "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
     "heal": {"escalate": "user"},
