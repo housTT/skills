@@ -22,6 +22,10 @@ AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|authenticat
 
 LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out of credits|"
                       r"insufficient (credits|balance|funds)|spend(ing)? limit)", re.I)
+# The limits only the user can lift (funds or a spend control on the account), unlike a usage or
+# rate limit that resets by itself.
+FUNDS_RE = re.compile(r"(out of credits|insufficient (credits|balance|funds)|spend(ing)? limit|quota exceeded|"
+                      r"credit balance)", re.I)
 
 
 # The API takes at most this many cache_control breakpoints per request; one more fails the whole

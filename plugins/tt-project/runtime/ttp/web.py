@@ -27,6 +27,7 @@ from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependen
                  load_result, task_outcome)
 from .project import Project, durable_write
 from .providers import get_provider
+from .providers.base import FUNDS_RE
 from .runner import stop_runs
 from .service import down_note, installed
 
@@ -69,6 +70,8 @@ def fix_for(provider: str, note: str) -> str:
         except KeyError:
             hint = "log in to the agent CLI there"
         return f"log in once on the project's machine: {hint}"
+    if FUNDS_RE.search(note):
+        return "the account needs more credits or a higher spend limit"
     return "resumes by itself when the limit resets"
 
 
@@ -142,8 +145,38 @@ def window_peaks(db: DB, provider: str, names: tuple[str, ...], now: float, span
     return peaks
 
 
+def holding(db: DB, now: float, core: str = "claude", gates: dict | None = None) -> list[str]:
+    """Each provider that holds ready work now, core or not, as 'codex 7d 93% holding 1 task': a
+    window at or near its line (its fullest window), a red gate, a limit pause or a logout. Ready
+    tasks without a provider run on the core one."""
+    gates = db.kv("gates", {}) if gates is None else gates
+    count: dict[str, int] = {}
+    for t in db.ready_tasks():
+        prov = t["provider"] or core
+        count[prov] = count.get(prov, 0) + 1
+    out = []
+    for prov in sorted(count, key=lambda x: (x != core, x)):
+        g = gates.get(prov) or {}
+        n = g.get("numbers") or {}
+        if alerts.breaker(db, prov):
+            why = "logged out"
+        elif float((db.kv(f"limited:{prov}") or {}).get("until") or 0) > now:
+            why = "limit"
+        elif g.get("level") == "red" or g.get("allow_new_work") is False or n.get("starts") is False:
+            plan = [w for w in n.get("plan") or [] if w.get("utilization") is not None]
+            w = max(plan, key=lambda w: w["utilization"]) if g.get("regime") == "windows" and plan else None
+            label = next((lb for lb, names in (("5h", FIVE_HOUR), ("7d", SEVEN_DAY)) if w and w["window"] in names),
+                         w["window"] if w else "")
+            why = f"{label} {w['utilization']:.0f}%" if w else "red"
+        else:
+            continue
+        k = count[prov]
+        out.append(f"{prov} {why} holding {k} task{'s' if k != 1 else ''}")
+    return out
+
+
 def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: dict | None = None,
-                spent_24h: float | None = None) -> str:
+                spent_24h: float | None = None, gates: dict | None = None) -> str:
     """The budget in one line, for the web app's header and `ttp status`:
     '5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%'.
     The windows and averages are the current account's, from its plan readings (none once the
@@ -151,8 +184,10 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
     dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
     billed by use, which counts only spend whose account was billed by use when it was spent
-    (billing.py), not an earlier plan account's. An item without data is left out. Pacing, targets and caps are in the Budget tab."""
+    (billing.py), not an earlier plan account's. An item without data is left out. Pacing, targets and caps are in the Budget tab.
+    Every provider holding ready work, core or not, is named at the end (holding): '..., codex 7d 93% holding 1 task'."""
     now = now or time.time()
+    held = holding(db, now, core, gates)
     provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
                                          (now - 3 * WEEK,))]
     prov = core if core in provs else provs[0] if provs else ""
@@ -166,7 +201,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
     n = (gate or {}).get("numbers") or {}
     if not plan and ("spent_today" in n or "global_today" in n):
-        return usage_line(n, now)
+        return ", ".join([usage_line(n, now), *held])
     spent = (db.spent_since(now - DAY) if spent_24h is None else spent_24h) if plan else \
         db.spent_since(now - DAY, billed=True)
     parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
@@ -175,7 +210,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
         peaks = window_peaks(db, prov, names, now, span, account) if account is not None else []
         if peaks:
             parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
-    return ", ".join(parts)
+    return ", ".join(parts + held)
 
 
 def usage_line(n: dict, now: float) -> str:
@@ -347,7 +382,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         w["wake"] = run_wake(w.pop("run_note"))
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
-    spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"])
+    spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
     spend["detail"] = gate_detail(g, now, tz) if g else ""
     return {
         "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in

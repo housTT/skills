@@ -80,7 +80,7 @@ from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RA
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, push_allowed, zombie)
 from .providers import get_provider
-from .providers.base import last_json_object, scratch_dir, service_path
+from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds
 from .prompts import RUN_DIR_MARK
@@ -1854,10 +1854,17 @@ class Daemon:
             if usage.limited:
                 until = time.time() + 3600
                 db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
-                self.alert(f"limit:{r['provider']}",
-                           f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
-                           f"hour; the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.",
-                           "high")
+                # Only an account out of funds needs the user; a usage or rate limit lifts by itself,
+                # so it is a self-clearing status line (alerts.STATUS_CONDITIONS), not "needs you".
+                if FUNDS_RE.search(usage.limit_note or ""):
+                    self.alert(f"limit:{r['provider']}",
+                               f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
+                               f"hour; the account ({r['account'] or 'unknown'}) needs more credits or a higher "
+                               f"spend limit.", "high")
+                else:
+                    self.alert(f"limit:{r['provider']}",
+                               f"{r['provider']} hit a limit: {usage.limit_note}. New work on it waits and resumes "
+                               f"by itself when the limit lifts; other providers and running work go on.", "low")
             if usage.auth_failed and not slept_auth:
                 # Logged out is not a task failure and not worth retrying blindly: open the provider's
                 # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
@@ -2659,13 +2666,16 @@ class Daemon:
                 red_sent[prov] = mark
             if first:
                 capped = any("cap reached" in r for r in g.reasons)
-                hint = "New work is paused; running work finishes and replies to you continue. " + (
+                hint = f"New work on {prov} waits; running work finishes and replies to you continue. " + (
                     "It starts again by itself when the budget day resets. "
-                    if any(r.startswith("global daily cap") for r in g.reasons) else "") + (
-                    "You can raise the cap (carefully) by telling me, or in the web app."
-                    if capped else "The web app's Budget tab shows what spent it.")
+                    if any(r.startswith("global daily cap") for r in g.reasons) else
+                    "It starts again by itself once the gate leaves red. ") + (
+                    "The caps are in the web app's Budget tab." if capped
+                    else "The web app's Budget tab shows what spent it.")
+                # Every red gate lifts by itself (a window resets, a cap's day or hour passes): a
+                # status line that clears itself, never "needs you" (alerts.STATUS_CONDITIONS).
                 news.append((f"Budget for {prov} is now red: {'; '.join(g.reasons)}. " + hint,
-                             "high", f"budget:{prov}"))
+                             "low", f"budget:{prov}"))
             gates[prov] = g
         # The global cap counts only for providers billed by usage: a project whose providers are all
         # on plan windows needs no other machines' totals and no scan of local sessions.
@@ -5810,8 +5820,10 @@ class Daemon:
             ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1",
                         (key,)) if tracked else None
             # A logout's reminders come from remind_logouts, on its own cadence.
-            if ep and every_s and (key.startswith("auth:") or now - ep["raised"] < alerts.REMIND_S
-                                   or last >= ep["raised"] + alerts.REMIND_S):
+            # A repeat that raises the severity (a status line that turned out to need the user) is new.
+            raised = SEVERITY_RANK.get(severity, 1) > SEVERITY_RANK.get(ep["severity"] if ep else None, 1)
+            if ep and every_s and not raised and (key.startswith("auth:") or now - ep["raised"] < alerts.REMIND_S
+                                                  or last >= ep["raised"] + alerts.REMIND_S):
                 db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
                 return
             if not ep and not tracked and now - last < every_s:

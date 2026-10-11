@@ -4038,7 +4038,11 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     p.db.post("out", "an alert with no known condition", chat=None, kind="alert", severity="high")
     now = shown()
     assert "fake is logged out" in now and "Only 1.0 GB free" in now, now
-    assert any(t.startswith("Budget for fake is now red") for t in now), now
+    # A red budget gate lifts by itself: a status line in the feed, never "needs you".
+    assert not any(t.startswith("Budget for fake is now red") for t in now), now
+    status = lambda: [m["state"] for m in state_payload(p, p.db)["feed"]  # noqa: E731
+                      if m["text"].startswith("Budget for fake is now red")]
+    assert status() == ["status"]
     p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
     # A lapsed pause only spaces out the probes; the next successful run ends a logout.
     p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('coordinator','fake',?,?,'ok')",
@@ -4048,6 +4052,7 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     d.update_gates()
     now = shown()
     assert now == ["an alert with no known condition"], "a cleared alert still asks for attention"
+    assert status() == ["cleared"]
     d.alert("run-start", "Runs cannot start", "high")
     assert "Runs cannot start" in shown()
     p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time() + 1,))
@@ -4126,9 +4131,9 @@ def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, ca
     # A lapsed pause only spaces out the probes; the next successful run ends a logout.
     p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('coordinator','fake',?,?,'ok')",
            (time.time() + 1, time.time() + 2))
-    p.db.post("out", "Budget for fake is now green: back to normal. ", chat=None, kind="alert",
-              severity="normal", ref="budget:fake")
-    held, follow_up = "Only 1.0 GB free", "Budget for fake is now green: back to normal."
+    p.db.post("out", "fake works again: back to normal. ", chat=None, kind="alert",
+              severity="normal", ref="auth:fake")
+    held, follow_up = "Only 1.0 GB free", "fake works again: back to normal."
 
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -23225,6 +23230,7 @@ def test_a_logged_out_alert_clears_on_the_next_successful_run_and_keeps_its_hist
 
 def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
     p = make(env)
+    from ttp.cli import status_text
     from ttp.daemon import Daemon
     from ttp.web import attention
     d = Daemon(p.base)
@@ -23232,16 +23238,22 @@ def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
     p.db.spend("fake", 150.0, "task:1")
     d.update_gates()
     assert _episodes(p, "budget:fake")[0]["cleared"] is None
-    assert any(m["text"].startswith("Budget for fake is now red") for m in attention(p.db, time.time()))
+    # A red gate lifts by itself: a low status line with an episode, never "needs you" or a chat alert.
+    assert attention(p.db, time.time()) == []
+    assert "needs you" not in status_text(p)
+    red = p.db.one("SELECT severity, text FROM messages WHERE ref='budget:fake' AND kind='alert'")
+    assert red["severity"] == "low" and "starts again by itself" in red["text"], red
+    assert "telling me" not in red["text"]
     p.db.x("DELETE FROM ledger")
     d.update_gates()
     d.sweep_alerts()
     ep = _episodes(p, "budget:fake")
     assert len(ep) == 1 and ep[0]["cleared"], ep
     assert attention(p.db, time.time()) == []
-    said = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind IN ('alert','resolved')")]
-    assert said[-1] == "Cleared: Budget for fake is out of red; new work starts again.", said
-    assert not any("is now green" in t for t in said), "leaving red is said once, by the cleared alert"
+    said = p.db.q("SELECT text, severity FROM messages WHERE kind IN ('alert','resolved')")
+    assert said[-1] == {"text": "Cleared: Budget for fake is out of red; new work starts again.",
+                        "severity": "low"}, said
+    assert not any("is now green" in m["text"] for m in said), "leaving red is said once, by the cleared alert"
 
 
 def test_coordinator_failure_alert_clears_on_a_successful_turn(env):
@@ -42954,3 +42966,83 @@ def test_after_push_uses_the_push_module_the_process_started_with(monkeypatch):
     monkeypatch.setattr(push, "pending_after", ("a" * 40, "origin/b", "b" * 40))
     assert push.run_after(None, pathlib.Path(".")) == {"status": "ok"}
     assert calls and "ttp.batch" not in sys.modules
+
+
+def test_a_provider_limit_needs_the_user_only_when_the_account_is_out_of_funds(env, capsys):
+    """A usage or rate limit lifts by itself: a low status line in the feed that clears itself, never
+    "needs you", a chat alert or the desktop. An account out of credits only the user can fix: high,
+    on top, even after a status line for the same provider."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import alerts
+    from ttp.cli import _listen_loop, status_text
+    from ttp.daemon import Daemon
+    from ttp.web import attention, fix_for, state_payload
+    d = Daemon(p.base)
+    now = time.time()
+    p.db.set_kv("limited:fake", {"until": now + 3600, "note": "usage limit reached"})
+    d.alert("limit:fake", "fake hit a limit: usage limit reached.", "low")
+    assert attention(p.db, now) == [] and "needs you" not in status_text(p)
+    feed = [m for m in state_payload(p, p.db)["feed"] if m["text"].startswith("fake hit a limit")]
+    assert [m["state"] for m in feed] == ["status"], feed
+    assert fix_for("fake", "usage limit reached") == "resumes by itself when the limit resets"
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (now, "t", now))
+    _listen_loop(p, p.db, SimpleNamespace(chat="c1", timeout=3, once=True, ack=None), 0, "low")
+    assert "fake hit a limit" in capsys.readouterr().out, "a live status line reaches a chat that asked for low"
+    # The same provider then refuses for funds: news at once, on top, though its status episode is open.
+    d.alert("limit:fake", "fake refused work: out of credits. The account needs more credits.", "high")
+    assert [m["text"] for m in attention(p.db, now)] == [
+        "fake refused work: out of credits. The account needs more credits."]
+    assert fix_for("fake", "out of credits") == "the account needs more credits or a higher spend limit"
+    assert len(p.db.q("SELECT id FROM alerts WHERE key='limit:fake'")) == 1
+    p.db.set_kv("limited:fake", {"until": now - 1, "note": "out of credits"})
+    d.sweep_alerts()
+    assert attention(p.db, time.time()) == []
+    told = p.db.q("SELECT severity FROM messages WHERE kind='resolved' AND ref='limit:fake'")
+    assert told == [{"severity": "normal"}], told   # a cleared high alert is told as before
+    # A status line that cleared before a chat read it is not delivered late.
+    p.db.set_kv("limited:other", {"until": time.time() - 1, "note": "rate limit"})
+    p.db.post("out", "other hit a limit: rate limit.", chat=None, kind="alert", severity="low", ref="limit:other")
+    _listen_loop(p, p.db, SimpleNamespace(chat="c1", timeout=3, once=True, ack=None), 0, "low")
+    assert "other hit a limit" not in capsys.readouterr().out
+    assert alerts.cleared(p.db, {"kind": "alert", "severity": "low", "ref": "limit:other",
+                                 "ts": time.time()}, time.time())
+
+
+@pytest.mark.parametrize("note, severity", [("usage limit reached", "low"), ("rate limit", "low"),
+                                            ("Insufficient credits", "high"), ("spending limit", "high")])
+def test_a_limited_run_alerts_by_who_can_lift_the_limit(note, severity):
+    from ttp.providers.base import FUNDS_RE, LIMIT_RE
+    assert LIMIT_RE.search(note)
+    assert (severity == "high") == bool(FUNDS_RE.search(note))
+
+
+def test_the_budget_line_names_every_provider_holding_work(env):
+    """Held work waits on a provider that is not the core one: the header line names it, its
+    fullest window and how many tasks it holds; a provider that holds nothing is left out."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line, health, holding
+    now = time.time()
+    bud.record_windows(p.db, [bud.Window("claude", "five_hour", 4, now + 3600),
+                              bud.Window("claude", "seven_day", 21, now + 5 * 86400)])
+    tid = p.db.add_task("needs codex", "spec", provider="codex")
+    p.db.add_task("runs on core", "spec")
+    gates = {"claude": {"level": "green", "regime": "windows", "numbers": {}},
+             "codex": {"level": "red", "regime": "windows", "allow_new_work": False,
+                       "numbers": {"plan": [{"window": "5h", "utilization": 40.0},
+                                            {"window": "7d", "utilization": 93.4}]}}}
+    before = budget_line(p.db, now, "claude")
+    assert "codex" not in before, before
+    line = budget_line(p.db, now, "claude", gates=gates)
+    assert line.startswith("5h 4% - resets in 1.0 h, 7d 21%"), line
+    assert line.endswith(", codex 7d 93% holding 1 task") and "\n" not in line, line
+    p.db.set_kv("gates", gates)
+    assert health(p, p.db)["spend"]["headline"].endswith("codex 7d 93% holding 1 task")
+    # The core provider is named too once it holds work; a logout and a limit pause say so.
+    gates["claude"] = {"level": "red", "regime": "caps", "numbers": {}}
+    p.db.set_kv("limited:codex", {"until": now + 600, "note": "rate limit"})
+    assert holding(p.db, now, "claude", gates) == ["claude red holding 1 task", "codex limit holding 1 task"]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert holding(p.db, now, "claude", gates) == ["claude red holding 1 task"]

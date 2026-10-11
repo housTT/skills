@@ -11,6 +11,11 @@ A condition only the user can clear (USER_BLOCKERS: a lost VPN or network sign-i
 alerted at normal severity yet tracked like a high alert: an episode, the top section, and a clearing
 told as one low feed line.
 
+A provider's budget gate or limit pause that lifts by itself (STATUS_CONDITIONS) is status, not a
+problem for the user: posted below high, it is tracked as an episode and listed in the feed as live
+status until it clears, and never reaches the top section. Only a case only the user can fix (an
+account out of credits or funds) is posted high.
+
 A host reboot is information only: it is posted as kind `info` and never opens an episode.
 
 One condition is one broadcast: while its episode is open a repeat only updates `last`, with one
@@ -67,6 +72,8 @@ CLEARED_TEXT = {
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 USER_BLOCKERS = ("network",)
 CLEARED_SEVERITY = {"network": "low"}
+# Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
+STATUS_CONDITIONS = ("budget", "limit")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -78,9 +85,15 @@ def _top(severity: str | None, ref: str | None) -> bool:
     return _urgent(severity) or bool(ref) and str(ref).partition(":")[0] in USER_BLOCKERS
 
 
+def _status(ref: str | None) -> bool:
+    return bool(ref) and str(ref).partition(":")[0] in STATUS_CONDITIONS
+
+
 def tracked(kind: str, severity: str | None, ref: str | None) -> bool:
-    """Whether a broadcast opens an episode: a top-section alert with a condition key, never a reboot."""
-    return kind == "alert" and bool(ref) and _top(severity, ref) and not str(ref).startswith("reboot:")
+    """Whether a broadcast opens an episode: a top-section alert or a status condition with a
+    condition key, never a reboot."""
+    return (kind == "alert" and bool(ref) and (_top(severity, ref) or _status(ref))
+            and not str(ref).startswith("reboot:"))
 
 
 def open_episode(db: DB, key: str, ts: float, message: int, severity: str, text: str) -> None:
@@ -208,9 +221,9 @@ def _since(ep: dict) -> float:
 
 
 def cleared(db: DB, m: dict, now: float) -> bool:
-    """A high alert whose condition no longer holds: not worth delivering late. Lower-severity
-    messages sharing the key (a budget back to normal) are news whatever the state."""
-    return (m.get("kind") == "alert" and _top(m.get("severity"), m.get("ref")) and bool(m.get("ref"))
+    """A tracked alert (high, or a status condition) whose condition no longer holds: not worth
+    delivering late. Other lower-severity messages sharing the key are news whatever the state."""
+    return (tracked(m.get("kind") or "", m.get("severity"), m.get("ref"))
             and not active(db, m["ref"], m["ts"], now))
 
 
@@ -235,8 +248,10 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
             if kind in CLEARED_TEXT:
                 # A quiet episode clears quietly: the project holding the claim tells the chats.
                 first = db.one("SELECT channel FROM messages WHERE id=?", (ep["message"],)) if ep["message"] else None
+                # A status line clears as quietly as it was raised.
+                sev = CLEARED_SEVERITY.get(kind) or ("normal" if _urgent(ep["severity"]) else "low")
                 db.post("out", "Cleared: " + CLEARED_TEXT[kind].format(arg=arg), chat=None, kind="resolved",
-                        severity=CLEARED_SEVERITY.get(kind, "normal"), ref=ep["key"],
+                        severity=sev, ref=ep["key"],
                         channel=QUIET if first and first["channel"] == QUIET else "chat")
             closed.append({**ep, "cleared": now, "cleared_why": why})
     return closed
@@ -423,7 +438,8 @@ def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
 
 def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
     """Everything below the top section, newest first: FYI notes and decisions, milestones, reboots,
-    cleared alerts (with when they cleared). Open asks and live alerts are in the top section."""
+    live status conditions (state 'status'), cleared alerts (with when they cleared). Open asks and
+    live alerts are in the top section."""
     rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind!='ask' AND ts>? ORDER BY id DESC LIMIT ?", (now - FEED_DAYS * DAY, limit * 3))
     out = []
@@ -436,6 +452,13 @@ def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
             m["state"] = "cleared"
             ep = episode(db, ref, m["ts"]) if ref else None
             m["cleared_at"] = ep["cleared"] if ep else None
+        elif m["kind"] == "alert" and _status(ref):   # a gate or pause that lifts by itself
+            if active(db, ref, m["ts"], now):
+                m["state"] = "status"
+            else:
+                m["state"] = "cleared"
+                ep = episode(db, ref, m["ts"])
+                m["cleared_at"] = ep["cleared"] if ep else None
         out.append(m)
         if len(out) >= limit:
             break
