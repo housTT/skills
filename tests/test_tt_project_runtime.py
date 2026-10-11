@@ -39990,3 +39990,25 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     assert len(cycle(at)) == 1, "clearing posts no new alert"
     assert not alerts.needs_you(p.db, at) and not p.db.kv("network_outage"), "the outage ended after the debounce"
     assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved' AND ref='network:unreachable'")) == 1
+
+
+def test_ssh_pipe_bypasses_controlmaster_so_host_key_is_checked(monkeypatch):
+    # A reused ControlMaster socket skips the host key check, so the strict call must not use one.
+    from ttp import upstream
+    seen = []
+
+    class P:
+        pid, returncode = 0, 0
+
+        def __init__(self, argv, **kw):
+            seen.append(argv)
+
+        def communicate(self, data=None, timeout=None):
+            return b"ok", b""
+
+    monkeypatch.setattr(upstream.subprocess, "Popen", P)
+    upstream.ssh_pipe("box", "status", b"", 5)
+    argv = seen[0]
+    for opt in ("StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
+        assert argv[argv.index(opt) - 1] == "-o"
+    assert argv.index("ControlPath=none") < argv.index("--")

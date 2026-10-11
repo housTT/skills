@@ -643,7 +643,8 @@ def ssh_pipe(target: str, args: str, data: bytes, timeout: float) -> tuple[bytes
     when `timeout` runs out. Shared by the notes forwarder and the global spend push (globalcap)."""
     cmd = f"t=~/.tt-project/lib/current/bin/ttp; [ -x \"$t\" ] || t=ttp; exec \"$t\" {args}"
     try:
-        proc = subprocess.Popen([*SSH, "-o", "StrictHostKeyChecking=yes", "--", target, f"sh -c {shlex.quote(cmd)}"],
+        proc = subprocess.Popen([*SSH, "-o", "StrictHostKeyChecking=yes",
+                                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "--", target, f"sh -c {shlex.quote(cmd)}"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 start_new_session=True)
     except OSError as e:
