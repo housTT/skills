@@ -142,7 +142,11 @@ and preferences you add later become part of the project's charter and memory.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
   findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
-  Any other hand-off leaves the review to the coordinator's turn. `review.auto_notes` is added
+  Any other hand-off leaves the review to the coordinator's turn. A code task still in review
+  with no review `review.sweep_after_s` (default 1800, 0 off) after its last run gets its review
+  from the daemon. The sweep only queues reviews and never closes a task, so a task whose
+  continuation already passed review still gets its own review (one review each, no work lost).
+  `review.auto_notes` is added
   to each such review's spec (for example, what to do after a push). When the task's PR already
   carries the reviewed head (as pr-watch last read it, or as the task's own `ttp push --own`
   pushed it), the work is delivered: the review is review only, with no push to

@@ -31352,6 +31352,82 @@ def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
     assert p.db.task(auto_b["id"])["status"] == "running" and p.db.task(auto_c["id"])["status"] == "cancelled"
 
 
+def _ran(p, tid, ended):
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,'worker','claude',?,?,'ok')",
+           (tid, ended - 60, ended))
+
+
+def _sweep(d):
+    d._review_swept = 0.0
+    d.sweep_reviews()
+
+
+def test_the_daemon_sweeps_a_review_left_to_the_coordinator_once(env):
+    """A hand-off with follow-ups leaves the review to the coordinator; when it queues none, the daemon
+    queues one review once review.sweep_after_s has passed since the task's last run, and never a second."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, branch, _, reviews = _finish_code(env, p, "noted fix", {"app.py": 20}, result={
+        "status": "needs_review", "summary": "noted fix works", "followups": [{"title": "later", "spec": "more"}]})
+    assert p.db.task(tid)["status"] == "review" and not reviews
+    now = time.time()
+    _ran(p, tid, now - 60)
+    d = Daemon(p.base)
+    _sweep(d)
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'"), "swept before review.sweep_after_s"
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (now - 1900, tid))
+    _sweep(d)
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
+    assert rev["title"] == f"Review #{tid}: noted fix" and rev["origin"] == "daemon" and branch in rev["spec"]
+    assert "noted fix works" in rev["spec"]
+    assert p.db.one("SELECT id FROM events WHERE kind='review_swept' AND task=?", (tid,))
+    # Open, passed or failed since the task entered review: that review had its say, none is added.
+    for status in ("queued", "running", "done", "failed"):
+        p.db.update_task(rev["id"], status=status)
+        _sweep(d)
+        assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1, status
+        assert p.db.task(tid)["status"] == "review", status
+    # Within REVIEW_SWEEP_EVERY_S of the last sweep it does not look again.
+    p.db.x("DELETE FROM tasks WHERE kind='review'")
+    d.sweep_reviews()
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    # Switched off, nothing is swept.
+    p.set_config("review.sweep_after_s", 0)
+    _sweep(Daemon(p.base))
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+
+
+def test_the_review_sweep_only_queues_reviews_and_changes_no_task(env):
+    """Each finished code task left in review gets its own review, a continuation's passed review
+    included (a continuation need not carry the task's commits), and the sweep never closes, cancels
+    or otherwise changes a task: one review each, no work lost."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    old, _, _, _ = _finish_code(env, p, "first try", {"a.py": 5}, result={
+        "status": "needs_review", "summary": "first try", "followups": [{"title": "x", "spec": "y"}]})
+    pr, _, _, _ = _finish_code(env, p, "on a pr", {"b.py": 5}, labels=["pr_branch:feature/x"], result={
+        "status": "needs_review", "summary": "on a pr", "followups": [{"title": "x", "spec": "y"}]})
+    fix, _, _, (rev,) = _finish_code(env, p, "second try", {"c.py": 5}, labels=[f"continues:{old}"])
+    _, _, _, (rev2,) = _finish_code(env, p, "same pr", {"d.py": 5}, labels=["pr_branch:feature/x"])
+    for r in (rev, rev2):
+        p.db.update_task(r["id"], status="done")
+    for t in (old, pr, fix):
+        _ran(p, t, time.time() - 1900)
+    before = {t["id"]: (t["status"], t["result"]) for t in p.db.q("SELECT * FROM tasks")}
+    d = Daemon(p.base)
+    _sweep(d)
+    for tid, (status, result) in before.items():
+        t = p.db.task(tid)
+        assert (t["status"], t["result"]) == (status, result), tid
+    assert p.db.task(old)["status"] == "review" and p.db.task(pr)["status"] == "review"
+    titles = [r["title"] for r in p.db.q("SELECT title FROM tasks WHERE kind='review' AND origin='daemon' "
+                                         "AND status='queued'")]
+    assert sorted(titles) == sorted([f"Review #{old}: first try", f"Review #{pr}: on a pr"])
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task IN (?,?)", (old, pr))
+    _sweep(d)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review' AND status='queued'")) == 2, "queued twice"
+
+
 def test_the_daemons_re_review_continues_the_failed_review(env):
     p = make(env)
     from ttp.db import continues_id, dump_result

@@ -174,6 +174,7 @@ KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}}: branches 
 BACKUP_TRIES = 3            # a backup push that fails this often (network, auth) is given up with an observation
 BACKUP_RETRY_S = 900        # times the try count: the wait before a failed backup push is tried again
 KV_DIRTY_MAIN = "dirty_main"   # kv: key of the main checkout's dirty tracked paths last reported
+REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code tasks left in review with no review
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -357,6 +358,7 @@ class Daemon:
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
+        self._review_swept = 0.0     # when sweep_reviews last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
@@ -650,7 +652,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4923,6 +4925,67 @@ class Daemon:
             log(self.p, f"task {task['id']}: review tier {task['tier']} -> {tier} ({why})")
             self.p.db.update_task(task["id"], tier=tier)
         return dict(task, tier=tier), pick
+
+    def sweep_reviews(self) -> None:
+        """Model-free retry of reviews left to the coordinator: a code task in 'review' whose last run
+        ended review.sweep_after_s ago (0 off) and that no review has covered since it entered review
+        gets its review (_auto_review), so a hand-off with notes the coordinator queued no review for
+        does not sit there. It only queues reviews; it never closes or changes a task. Coverage here
+        is direct (pushq._covers without following continues:<id>): a continuation need not carry the
+        task's commits, so a task whose continuation passed review stays in review and gets its own
+        review (known gap: one review each, no work lost)."""
+        now = time.time()
+        if now - self._review_swept < REVIEW_SWEEP_EVERY_S:
+            return
+        self._review_swept = now
+        db = self.p.db
+        try:
+            after = float((self.cfg.get("review") or {}).get("sweep_after_s", 1800) or 0)
+        except (TypeError, ValueError):
+            after = 1800.0
+        if after <= 0:
+            return
+        try:
+            todo = db.q("SELECT * FROM tasks WHERE kind='code' AND status='review' ORDER BY id")
+            if not todo:
+                return
+            since = db.review_since()
+            code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
+                                          "AND branch IS NOT NULL AND branch!=''"))
+            reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id",
+                           (todo[0]["id"],))
+            rows: dict[int, list[dict]] = {}
+            for x in db.q("SELECT * FROM push_queue WHERE task IN (%s)" % ",".join("?" * len(reviews)),
+                          [r["id"] for r in reviews]) if reviews else []:
+                rows.setdefault(x["task"], []).append(x)
+            covers: dict[int, set[int]] = {}
+            for t in todo:
+                ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (t["id"],))["e"]
+                if ended is None or now - float(ended) < after:
+                    continue
+                # A review that ran or still runs since the task entered review had its say: what it
+                # found is the coordinator's (or the push queue's) to act on, not a second review's.
+                start = float(since.get(t["id"]) or 0)
+                seen = False
+                for r in reviews:
+                    if r["id"] not in covers:
+                        covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
+                    if t["id"] in covers[r["id"]] and (r["status"] not in ("done", "failed")
+                                                       or float(r["updated"] or 0) >= start):
+                        seen = True
+                        break
+                if seen:
+                    continue
+                review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
+                if review and review[1]:
+                    log(self.p, f"task {t['id']}: in review {(now - start) / 3600:.1f}h with no review; "
+                                f"queued review #{review[0]}")
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "review_swept", "normal",
+                          f"#{t['id']} {t['title']} sat in review with no review; review #{review[0]} queued "
+                          f"by the daemon.", "handled", t["id"]))
+        except Exception:
+            log(self.p, "review sweep failed\n" + traceback.format_exc())
 
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a

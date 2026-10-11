@@ -878,10 +878,11 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
 
 
 # reviewed code tasks ------------------------------------------------------------------------------
-def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex | None = None) -> set[int]:
+def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex | None = None,
+            follow: bool = True) -> set[int]:
     """The tasks whose work a review's push ships: its parent and dependencies, the task its title or
-    label names, the code tasks whose branch it pushed or (naming no subject) its spec names, and the
-    tasks each of those continues (a fix carries the change it fixes)."""
+    label names, the code tasks whose branch it pushed or (naming no subject) its spec names, and,
+    with `follow`, the tasks each of those continues (a fix carries the change it fixes)."""
     ids = {d for d in dependency_ids(review) if isinstance(d, int)}
     ids |= {i for i in (review.get("parent"), review_subject(review)) if isinstance(i, int)}
     branches = {r["branch"] for r in rows if r["branch"]}
@@ -889,6 +890,8 @@ def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex |
         code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
     index = code if isinstance(code, BranchIndex) else BranchIndex(code)
     ids |= {i for b in branches for i in index.by_branch.get(b, ())} | reviewed_ids(review, index)
+    if not follow:
+        return ids
     out: set[int] = set()
     while ids:
         i = ids.pop()
