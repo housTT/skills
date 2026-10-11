@@ -2262,6 +2262,8 @@ class Daemon:
                     summary = f"push approval invalid again: {why}. {summary}"[:1500]
             else:
                 approval, new = check, "pushing"
+                for note in check.get("notes") or []:
+                    log(self.p, f"task {task['id']}: {note}")
         if ended:
             extra["run_status"] = ended
         if wakes and new != "blocked":

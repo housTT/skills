@@ -31126,12 +31126,41 @@ def test_the_push_queue_refuses_an_approval_of_a_task_with_another_pr_branch(env
     entries = [{"branch": s.branch, "head": s.head}]
     s.p.db.update_task(s.code, labels=["pr_branch:proj"])   # the push branch itself: approved as usual
     assert pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("entries")
+    _git_out(s.p.root, "push", "-q", "origin", "HEAD:refs/heads/feature/x")   # on the remote: its PR's branch
     s.p.db.update_task(s.code, labels=["pr_branch:feature/x"])
     check = pushq.check_approval(s.p, s.p.db.task(s.review), entries)
     assert "pr_branch feature/x" in check.get("invalid", "") and "ttp push --own" in check["invalid"], check
     # The review's run approving it anyway runs again once, told why, and nothing enters the queue.
     task = _pq_hand_off(env, s)
     assert task["status"] == "queued" and not s.p.db.q("SELECT * FROM push_queue")
+
+
+def test_the_push_queue_accepts_an_approval_whose_pr_branch_label_names_a_branch_absent_from_the_remote(
+        env, monkeypatch):
+    """A pr_branch label inherited through `continues` from a failed review may name a branch that
+    exists only locally: no PR to deliver onto, so the approval is a push-branch delivery and the
+    feed says the label was ignored. A remote that cannot be reached still refuses, as before."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _git_out(s.p.root, "branch", "local-only", s.head)
+    s.p.db.update_task(s.code, labels=["pr_branch:local-only"])
+    entries = [{"branch": s.branch, "head": s.head}]
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), entries)
+    assert check.get("entries") and check["target"] == "origin/proj", check
+    [note] = check["notes"]
+    assert f"#{s.code}'s pr_branch label local-only was ignored" in note and "no such branch" in note
+    assert note in pushq.queued_text(s.p.db.task(s.review), check)
+    # Unreachable remote: no answer, so refused as before.
+    absent = pushq._absent
+    monkeypatch.setattr(pushq, "_absent", lambda *a: False)
+    assert "ttp push --own" in pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("invalid", "")
+    monkeypatch.setattr(pushq, "_absent", absent)
+    task = _pq_hand_off(env, s)
+    assert task["status"] == "pushing", task
+    [row] = s.p.db.q("SELECT * FROM push_queue")
+    assert row["head"] == s.head and row["target"] == "origin/proj"
+    [ev] = s.p.db.q("SELECT text FROM events WHERE kind='push_queued'")
+    assert "local-only was ignored" in ev["text"]
 
 
 def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_publishes_onto_it(

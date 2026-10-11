@@ -283,7 +283,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     may name any commit; the commits it adds over the conflicting head are listed for the event. A
     head that carries commits of another task whose latest review failed (see _inherited) is invalid
     unless its entry lists that task under "inherited": the review judged them; "inherited" then
-    names them per head for the event."""
+    names them per head for the event. A reviewed task whose pr_branch (push.pr_elsewhere) the push
+    remote has no branch of is a push-branch delivery: "notes" says its label was ignored and why."""
     from .worktree import fix_branches, named_refs
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
@@ -294,11 +295,16 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
     if push.REVIEW_ONLY_LABEL in push._labels(task):
         return {"ignored": "this review is review only: its change must not reach the push branch"}
+    tgt = target(p) if enabled(p, cfg) else None
+    notes = []
     for t in push._reviewed(p, str(task["id"])):
         if onto := push.pr_elsewhere(p, t, d):
+            if tgt and _absent(p, tgt[0], onto):
+                notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch, "
+                             f"so the review's approval delivers it to the push branch")
+                continue
             return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch: publish it "
                                f"there with `ttp push --own --detach` instead of approving it for the push queue"}
-    tgt = target(p) if enabled(p, cfg) else None
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}
     why = _refusal(p, *tgt, push.allow_protected(d))
@@ -350,7 +356,17 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
                                f"this review and, if they are sound, add \"inherited\": {sorted(left)} to its entry"}
         taken[head] = sorted(by_task)
     return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added,
-            **({"inherited": taken} if taken else {})}
+            **({"inherited": taken} if taken else {}), **({"notes": notes} if notes else {})}
+
+
+def _absent(p: Project, remote: str, branch: str) -> bool:
+    """Whether `remote` answers that it has no branch `branch` (one bounded `git ls-remote`). An
+    unreachable remote is not an answer: False, so the approval is refused as before."""
+    try:
+        ls = _git(p, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout=REFUSAL_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return ls.returncode == 0 and not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
 
 
 def approve(p: Project, task_id: int, run_id: int | None, approval: dict) -> list[int]:
@@ -374,6 +390,8 @@ def queued_text(task: dict, approval: dict) -> str:
     """The feed line of an approval."""
     what = ", ".join(f"{e['branch'] or '?'} at {_short(e['head'])}" for e in approval["entries"])
     text = f"#{task['id']} {task['title']}: approved {what} for {approval['target']}; it goes out with the next batch"
+    for note in approval.get("notes") or []:
+        text += f"\n{note}"
     for head, ids in (approval.get("inherited") or {}).items():
         text += f"\n{_short(head)} carries commits of #{', #'.join(map(str, ids))}, whose review failed; this review accepted them"
     for head, lines in (approval.get("added") or {}).items():
