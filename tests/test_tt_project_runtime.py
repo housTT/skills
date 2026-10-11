@@ -16255,7 +16255,7 @@ def test_fast_forward_also_scalar_is_reported_and_never_raises_after_a_push(env,
             push.fast_forward_check(bad, "origin/proj")
         assert any("fast_forward_also" in l for l in
                    config_problems({"delivery": {"push_branch": "origin/proj", "fast_forward_also": bad}})), bad
-        assert push.fast_forward_list(bad) == [] and push.exclude_list(bad) == [] and push.check_problems(bad) == []
+        assert push.fast_forward_list(bad) == [] and push.exclude_list(bad) == []
     p, repo, origin, other = _ff_setup(env, monkeypatch, None)
     main = _git_out(origin, "rev-parse", "main")
     for bad in (True, 5):
@@ -16263,6 +16263,46 @@ def test_fast_forward_also_scalar_is_reported_and_never_raises_after_a_push(env,
         _commit(repo, "mine.txt", f"{bad!r}\n")
         assert push.run(p, repo) == 0
         assert _git_out(origin, "rev-parse", "main") == main and push.last_ff == []
+
+
+def test_scalar_push_checks_after_push_and_exclude_paths_are_reported_and_refused(env, monkeypatch, capsys):
+    from ttp import push
+    from ttp.coordinator import apply
+    from ttp.project import config_problems
+    p = make(env)
+    for bad in (True, 5, 1.5):
+        for key in ("push_checks", "after_push", "push_exclude_paths"):
+            assert config_problems({"delivery": {key: bad}}) == [f"delivery.{key}: {bad!r}: not a list"], (key, bad)
+        with pytest.raises(ValueError, match="not a list"):
+            push.checks_of(bad)
+        probs = apply(p, [{"type": "config_set", "key": f"delivery.{k}", "value": bad}
+                          for k in ("push_checks", "after_push")])
+        assert len(probs) == 2 and all("not a list" in x for x in probs), probs
+        assert "push_checks" not in (p.config().get("delivery") or {})
+    for ok in (None, False, 0, "", [], "tmp", ["tmp"]):   # off or a list: no problem
+        assert config_problems({"delivery": {"push_exclude_paths": ok}}) == [], ok
+    # A scalar push_exclude_paths would turn the guard off: the push branch refuses, --own does not.
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.push_exclude_paths", 5)
+    (repo / "tmp").mkdir()
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t31-exp")
+    _commit(repo, "tmp/scratch.txt", "x\n")
+    before = _git_out(origin, "rev-parse", "proj")
+    assert _ttp_push() == 2 and "delivery.push_exclude_paths: 5: not a list" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+    monkeypatch.setenv("TTP_TASK", "31")
+    assert _ttp("push", "--own") == 0
+
+
+def test_a_push_batch_refuses_every_entry_when_push_exclude_paths_is_a_scalar(env, monkeypatch):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.push_exclude_paths", True)
+    before = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n", "tmp/notes.md": "n\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["refused"], m
+    assert m["results"][0]["detail"]["message"] == "delivery.push_exclude_paths: True: not a list"
+    assert _git_out(origin, "rev-parse", "proj") == before
 
 
 def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatch):

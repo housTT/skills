@@ -848,6 +848,9 @@ class Batch:
                 self._set(i, "refused", message=f"no checks configured, and this change touches more than "
                                                 f"docs ({', '.join(code[:3])}{more}): " + push.NO_CHECKS)
                 continue
+            if why := push.scalar_problem(self.d.get("push_exclude_paths")):   # never push unguarded
+                self._set(i, "refused", message=f"delivery.push_exclude_paths: {why}")
+                continue
             if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
                 self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
                 continue

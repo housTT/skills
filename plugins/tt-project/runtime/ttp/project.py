@@ -395,7 +395,7 @@ def renice(pid: int, n: int) -> None:
 
 
 def config_problems(raw: dict, root: Path | None = None) -> list[str]:
-    """Unknown keys, non-command push_checks or after_push, a malformed version_bump, push queue
+    """Unknown keys, non-command push_checks or after_push, a scalar push_exclude_paths, a malformed version_bump, push queue
     settings out of range and a push branch that can never be pushed to (push_branch_problem; with
     `root`, the code repo, its remotes are checked too) in a project's own settings, one line each."""
     out: list[str] = []
@@ -409,7 +409,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                 walk(v, path + [str(k)])
     walk(raw, [])
     from .push import (allow_protected, backup_problem, bump_problems, check_problems,   # push imports this module
-                       fast_forward_check, mirror_check, push_branch_problem)
+                       fast_forward_check, mirror_check, push_branch_problem, scalar_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
     out += [why for why in [push_branch_problem(delivery.get("push_branch"), root, allow_protected(delivery))] if why]
@@ -422,6 +422,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     except ValueError as e:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
+    out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     out += bump_problems(delivery.get("version_bump"))
     from .devq import config_problems as runner_problems
     runners = (raw.get("device") or {}).get("runners")

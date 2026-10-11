@@ -88,7 +88,7 @@ def _entries(v: Any) -> list:
             v = text.splitlines()
     if isinstance(v, dict):
         v = [v]
-    if v and not isinstance(v, (list, tuple)):   # a scalar (true, 5): no entries; the *_check helpers refuse it
+    if v and not isinstance(v, (list, tuple)):   # a scalar (true, 5): no entries; scalar_problem names it
         return []
     return [c for c in (v or []) if isinstance(c, dict) or str(c).strip()]
 
@@ -118,6 +118,11 @@ def _if_changed(c: dict) -> tuple[str, ...]:
     v = c.get("if_changed")
     globs = [v] if isinstance(v, str) else v if isinstance(v, list) else []
     return tuple(posixpath.normpath(g.strip()) for g in globs if isinstance(g, str) and g.strip())
+
+
+def scalar_problem(v: Any) -> str:
+    """Why a list setting's value is a scalar (true, 5) that `_entries` reads as no entries, or ""."""
+    return f"{v!r}: not a list" if v and not isinstance(v, (str, list, tuple, dict)) else ""
 
 
 def check_list(v: Any) -> list[Check]:
@@ -721,6 +726,8 @@ def _entry_problem(c: Any) -> str | None:
 
 
 def check_problems(v: Any) -> list[str]:
+    if why := scalar_problem(v):
+        return [why]
     return [p for p in map(_entry_problem, _entries(v)) if p]
 
 
@@ -2177,6 +2184,8 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
         explicit = d.get("push_wait_s")
         wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
         version_bump = bump_of(d.get("version_bump"))
+        if not own and (why := scalar_problem(d.get("push_exclude_paths"))):   # never push unguarded
+            raise ValueError(f"delivery.push_exclude_paths: {why}")
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
