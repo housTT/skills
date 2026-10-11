@@ -178,6 +178,15 @@ and preferences you add later become part of the project's charter and memory.
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.
   Empty (the default) follows the tier. The model names one of `core_provider`'s models.
+  `coordinator.turn_timeouts_s.<provider>.<effort>` sizes the turn after effort is resolved:
+  low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
+  and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.
+  Above 32 KB of prompt text, each additional 8 KB adds 60 seconds. These allowances give slower
+  reasoning turns more time while routine low-effort turns stay short. The legacy
+  `coordinator.turn_timeout_s` is a minimum (default 0), so an existing 600-second setting still
+  allows a high-effort raise. `coordinator.turn_timeout_ceiling_s` defaults to 3600 and can be
+  lowered; the runtime always enforces a one-hour absolute ceiling. Each run records prompt bytes,
+  provider, model, effort and chosen timeout; timeouts also leave a daemon log and diagnostic state.
   A tricky or blocking turn runs at least at `coordinator.unblock_effort` (high; empty turns this
   off), so it looks harder for a non-disruptive way forward. Its triggers, kept in one table
   (`coordinator.effort_triggers`) and recorded per turn in the run's note: a user message (and a
@@ -211,6 +220,11 @@ and preferences you add later become part of the project's charter and memory.
   re-block loops (the same reason twice, or a spec addendum while still blocked) are flagged in the
   next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
   has not run. The daily review lists everything stuck over 6 h with its sweep outcome.
+  Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
+  `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped
+  to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep
+  context while preserving every identity and outcome request, including items beyond the old
+  60-item cutoff. A restart or failed turn retries its batch; remaining batches stay queued.
 - Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
   new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
   than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable

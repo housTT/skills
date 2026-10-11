@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from . import failover, settinghold, unblock
 from .db import DB, deferral, dependency_ids, load_result
+from .coordlimits import positive
 
 SWEEP_KIND = "blocker_sweep"
 STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...],
@@ -44,7 +45,6 @@ MIN_GAP_H = 1.0
 REVIEW_BACKLOG_H = 6.0
 REVIEW_LONG_H = 6.0     # the daily review lists every item stuck longer than this
 LOOP = "loop: resolve, do not re-addend"
-MAX_ITEMS = 60
 REASON_CHARS = 200
 # An `until` that only restates the hold names no condition anyone could re-check.
 SELF_REF = re.compile(r"\b(retain|keep|keeps|remain|remains|stay|stays|leave|still)\s+(it\s+|status\s+)?"
@@ -329,7 +329,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
                    (now, "daemon", SWEEP_KIND, "normal",
                     f"Blocker sweep {n} ({why}): {len(live)} stuck item(s), {len(flagged)} carried, "
                     f"{len(loops)} loop(s). Record one `sweep` outcome for each.",
-                    json.dumps({"sweep": n, "items": [i["key"] for i in live]}), "queued"))
+                    json.dumps({"sweep": n, "items": [i["key"] for i in live], "snapshot": live}), "queued"))
     return eid
 
 
@@ -385,35 +385,82 @@ def _last_check(o: dict | None, now: float) -> str:
     return s
 
 
+def _header(n: int) -> str:
+    return (f"## Blocker sweep (high effort): {n} item(s). Return exactly one `sweep` action per item, "
+            "with `id` (task) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
+            "closed) | still_blocked (`until_probe` or `until`: the concrete condition; `start_after`: the next "
+            "check) | human_indispensable (`why`). Make the change itself with the usual actions in this turn. "
+            "A FLAG or LOOP needs a real decision, not another addendum.")
+
+
+def _line(i: dict, state: dict, outs: dict, now: float) -> str:
+    who = f"#{i['task']} {_clip(i['title'], 70)}" if i["task"] else f"resource {i['resource']}"
+    line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {_clip(i['reason']) or 'no reason given'} | " \
+           f"{_last_check(outs.get(i['key']), now)}"
+    for field, label in (("flags", "FLAG"), ("loops", "LOOP"), ("reviews", "review")):
+        value = (state.get(field) or {}).get(i["key"])
+        if value:
+            line += f" | {label}: {_clip(value)}"
+    return line
+
+
+def _covered(db: DB, data: dict, now: float) -> list[dict]:
+    # Retain an identity even if an earlier batch unblocked it; the next batch can record closed.
+    by_key = {i["key"]: i for i in data.get("snapshot", [])}
+    by_key.update({i["key"]: i for i in items(db, now)})
+    return [by_key[k] for k in data.get("items", []) if k in by_key]
+
+
+def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
+    """Split this event's coverage to fit a bounded sweep section, including events queued before
+    an upgrade. Persist continuations atomically; retries reuse the same first batch."""
+    now = time.time() if now is None else now
+    event = db.one("SELECT * FROM events WHERE id=? AND kind=?", (event_id, SWEEP_KIND))
+    if not event:
+        return
+    data = json.loads(event["data"] or "{}")
+    live = _covered(db, data, now)
+    state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
+    budget = min(16000, max(2048, positive((cfg.get("coordinator") or {}).get("sweep_prompt_chars"), 12000)))
+    flagged, loops = state.get("flags") or {}, state.get("loops") or {}
+    live.sort(key=lambda i: (i["key"] not in flagged and i["key"] not in loops, -(i["age_s"] or 0)))
+    batches, batch = [], []
+    size = len(_header(len(live))) + 32  # room for age counters changing before the digest is built
+    for i in live:
+        cost = len(_line(i, state, outs, now)) + 1
+        if batch and size + cost > budget:
+            batches.append(batch)
+            batch, size = [], len(_header(len(live))) + 32
+        batch.append(i)
+        size += cost
+    batches.append(batch)
+    with db.tx():
+        for n, batch in enumerate(batches):
+            payload = json.dumps({**data, "items": [i["key"] for i in batch], "snapshot": batch})
+            text = (f"Blocker sweep {data.get('sweep', 0)}: {len(batch)} stuck item(s) in this batch. "
+                    "Record one `sweep` outcome for each.")
+            if n == 0:
+                db.x("UPDATE events SET data=?, text=? WHERE id=?", (payload, text, event_id))
+            else:
+                db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                     (event["ts"], "daemon", SWEEP_KIND, "normal", text, payload, "queued"))
+
+
 def digest_lines(db: DB, event_ids: list[int], now: float | None = None) -> list[str]:
-    """The digest's 'Blocker sweep' section, when this turn's events include a sweep."""
-    if not event_ids or not db.one(f"SELECT id FROM events WHERE kind=? AND id IN ({','.join('?' * len(event_ids))})",
-                                   (SWEEP_KIND, *event_ids)):
+    """Only this batch's sweep identities; later batches stay queued for consecutive turns."""
+    if not event_ids:
+        return []
+    events = db.q(f"SELECT data FROM events WHERE kind=? AND id IN ({','.join('?' * len(event_ids))}) ORDER BY id",
+                  (SWEEP_KIND, *event_ids))
+    if not events:
         return []
     now = time.time() if now is None else now
-    state = db.kv(STATE_KEY, {}) or {}
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
-    live = items(db, now)
-    out = [f"## Blocker sweep (high effort): {len(live)} item(s). Return exactly one `sweep` action per item, "
-           f"with `id` (task) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
-           f"closed) | still_blocked (`until_probe` or `until`: the concrete condition; `start_after`: the next "
-           f"check) | human_indispensable (`why`). Make the change itself with the usual actions in this turn. "
-           f"A FLAG or LOOP needs a real decision, not another addendum."]
-    loops, flagged, reviews = state.get("loops") or {}, state.get("flags") or {}, state.get("reviews") or {}
-    for i in sorted(live, key=lambda x: (x["key"] not in flagged and x["key"] not in loops, -(x["age_s"] or 0)))[:MAX_ITEMS]:
-        who = f"#{i['task']} {_clip(i['title'], 70)}" if i["task"] else f"resource {i['resource']}"
-        line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {i['reason'] or 'no reason given'} | " \
-               f"{_last_check(outs.get(i['key']), now)}"
-        if i["key"] in flagged:
-            line += f" | FLAG: {flagged[i['key']]}"
-        if i["key"] in loops:
-            line += f" | LOOP: {loops[i['key']]}"
-        if i["key"] in reviews:
-            line += f" | review: {reviews[i['key']]}"
-        out.append(line)
-    if len(live) > MAX_ITEMS:
-        out.append(f"- and {len(live) - MAX_ITEMS} more (the next sweep shows them)")
-    return out
+    state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
+    live = {i["key"]: i for e in events for i in _covered(db, json.loads(e["data"] or "{}"), now)}
+    flagged, loops = state.get("flags") or {}, state.get("loops") or {}
+    ordered = sorted(live.values(), key=lambda i: (i["key"] not in flagged and i["key"] not in loops,
+                                                   -(i["age_s"] or 0)))
+    return [_header(len(live)), *(_line(i, state, outs, now) for i in ordered)]
 
 
 def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H) -> list[str]:

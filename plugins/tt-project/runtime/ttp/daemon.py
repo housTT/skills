@@ -37,6 +37,7 @@ from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordcheck
+from . import coordlimits
 from . import detach
 from . import effort
 from . import failover
@@ -1155,6 +1156,10 @@ class Daemon:
             if unblock and not str(c.get("effort") or ""):
                 # A tricky or blocking turn thinks harder (raise only); a pinned effort wins.
                 effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
+            prompt_bytes = sum(len(text.encode("utf-8")) for text in (prompt, system or "", context or "", append_system or ""))
+            timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
+            note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
+                    "model": model, "effort": effort, "timeout_s": timeout_s}}
         pin: dict = {}
         if role != "coordinator" and task:
             # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
@@ -1942,6 +1947,10 @@ class Daemon:
 
     def _finish_coordinator(self, r: dict, usage, status: str, note: dict) -> None:
         db = self.p.db
+        if status == "timeout":
+            details = note.get("turn") or {}
+            log(self.p, f"coordinator run {r['id']} timed out: " + json.dumps(details, sort_keys=True))
+            db.set_kv("last_coordinator_timeout", {"run": r["id"], "at": time.time(), **details})
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
         checked = note.get("coord_check") or {}
@@ -3253,6 +3262,9 @@ class Daemon:
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id LIMIT 30")
         queued = db.q("SELECT id, ts, kind, severity FROM events WHERE status='queued' ORDER BY id")
         evs = queued[:int(c.get("max_events_per_turn", 40))]
+        # Each continuation has its own coverage. Never combine sweep batches back into one turn.
+        sweep_event = next((e["id"] for e in evs if e["kind"] == sweep.SWEEP_KIND), None)
+        evs = [e for e in evs if e["kind"] != sweep.SWEEP_KIND or e["id"] == sweep_event]
         wake: dict = {}
         w: dict | None = None
         # A routine turn that found its batch harder than it looked: rerun it now, once, at high effort.
@@ -3294,6 +3306,8 @@ class Daemon:
             return   # logged out: one run at a time checks the login, and this turn is not it
         check = None
         try:
+            if sweep_event is not None:
+                sweep.prepare(db, sweep_event, self.cfg, now)
             due = (w or {}).get("due")
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now,
@@ -3329,7 +3343,6 @@ class Daemon:
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
                            cache_ttl=str(c.get("cache_ttl", "1h") or ""),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
-                           timeout_s=float(c.get("turn_timeout_s", 600)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"wake_due": due} if due else {}),

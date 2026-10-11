@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import DB
+from .coordlimits import TURN_TIMEOUTS_S
 
 FOLDER = "tt-project"                     # lives at the root of the user's project, ignored by it
 HOME_DIR = Path(os.environ.get("TTP_HOME", Path.home() / ".tt-project"))
@@ -134,7 +135,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # hour; a write costs 2x input instead of 1.25x, a read 0.1x or less), "5m", or "off"
                     # (the agent's own choice, and charter and memory stay in the system prompt).
                     "cache_ttl": "1h",
-                    "turn_budget_usd": 1.0, "turn_timeout_s": 600,
+                    "turn_budget_usd": 1.0,
+                    # Legacy timeout is a floor; effort/provider selection can raise it. The ceiling
+                    # can be lowered, but never exceeds the runtime's one-hour hard bound.
+                    "turn_timeout_s": 0, "turn_timeouts_s": TURN_TIMEOUTS_S,
+                    "turn_timeout_ceiling_s": 3600, "sweep_prompt_chars": 12000,
                     "ask_timeout_h": 1,
                     # A task deferred with `start_when` that has not started after this long is raised
                     # to the coordinator once.

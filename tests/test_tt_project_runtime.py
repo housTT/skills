@@ -43145,3 +43145,111 @@ def test_the_budget_line_names_every_provider_holding_work(env):
     assert holding(p.db, now, "claude", gates) == ["claude red holding 1 task", "codex limit holding 1 task"]
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
     assert holding(p.db, now, "claude", gates) == ["claude red holding 1 task"]
+
+
+def test_coordinator_timeout_defaults_ceiling_and_prompt_size():
+    from ttp import coordlimits
+    from ttp.project import DEFAULT_CONFIG
+    cfg = DEFAULT_CONFIG
+    assert coordlimits.turn_timeout(cfg, "codex", "low", 1000) == 300
+    assert coordlimits.turn_timeout(cfg, "codex", "high", 1000) == 1200
+    assert coordlimits.turn_timeout(cfg, "codex", "xhigh", 1000) == 1800
+    assert coordlimits.turn_timeout(cfg, "claude", "high", 1000) == 900
+    assert coordlimits.turn_timeout(cfg, "codex", "xhigh", 49000) > 1800
+    assert coordlimits.turn_timeout(cfg, "unknown", "unknown", 1000) == 600
+    custom = {"coordinator": {"turn_timeout_s": 999999, "turn_timeout_ceiling_s": 999999}}
+    assert coordlimits.turn_timeout(custom, "codex", "xhigh", 99999999) == 3600
+    custom["coordinator"]["turn_timeout_ceiling_s"] = 500
+    assert coordlimits.turn_timeout(custom, "codex", "xhigh", 99999999) == 500
+    custom = {"coordinator": {"turn_timeouts_s": {"codex": {"high": 1350}}}}
+    assert coordlimits.turn_timeout(custom, "codex", "high", 1000) == 1350
+    for bad in (None, "broken", float("nan"), float("inf"), -1):
+        assert coordlimits.turn_timeout({"coordinator": {"turn_timeout_ceiling_s": bad}}, "codex", "xhigh", 0) == 1800
+
+
+def test_blocker_sweep_batches_fit_budget_and_cover_every_item_once(env):
+    from ttp import sweep
+    p = make(env)
+    now = time.time()
+    for n in range(75):
+        t = p.db.add_task(f"Blocked item {n} " + "x" * 150)
+        p.db.update_task(t, status="blocked", blocked_reason="reason " * 200)
+    eid = sweep.start(p.db, p.config(), "every 6h", now)
+    cfg = {"coordinator": {"sweep_prompt_chars": 2048}}
+    seen = []
+    while (event := p.db.one("SELECT * FROM events WHERE kind=? AND status='queued' ORDER BY id", (sweep.SWEEP_KIND,))):
+        sweep.prepare(p.db, event["id"], cfg, now)
+        event = p.db.one("SELECT * FROM events WHERE id=?", (event["id"],))
+        keys = json.loads(event["data"])["items"]
+        assert f"{len(keys)} stuck item(s) in this batch" in event["text"]
+        text = "\n".join(sweep.digest_lines(p.db, [event["id"]], now))
+        assert len(text) <= 2048
+        assert len([line for line in text.splitlines() if line.startswith("- ")]) == len(keys)
+        seen.extend(keys)
+        # A retry must not manufacture another continuation or lose coverage.
+        count = p.db.one("SELECT COUNT(*) n FROM events")["n"]
+        sweep.prepare(p.db, event["id"], cfg, now)
+        assert p.db.one("SELECT COUNT(*) n FROM events")["n"] == count
+        p.db.x("UPDATE events SET status='handled' WHERE id=?", (event["id"],))
+    assert len(seen) == 75 and len(set(seen)) == 75
+    assert eid
+
+
+@pytest.mark.parametrize("pin,expected", [("", "high"), ("xhigh", "xhigh"), ("low", "low")])
+def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkeypatch, pin, expected):
+    from types import SimpleNamespace
+    from ttp import daemon
+    p = make(env)
+    p.set_config("coordinator.model", "reasoning-model")
+    p.set_config("coordinator.effort", pin)
+    p.set_config("coordinator.turn_timeouts_s.fake", {"low": 300, "high": 1200, "xhigh": 1800})
+    d = daemon.Daemon(p.base)
+    d.update_gates()
+    real_popen = daemon.subprocess.Popen
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda argv, **k: SimpleNamespace(pid=123456789)
+                        if argv[1:3] == ["-m", "ttp.runner"] else real_popen(argv, **k))
+    monkeypatch.setattr(daemon.runner, "proc_start", lambda pid: None)
+    logs = []
+    monkeypatch.setattr(daemon, "log", lambda p, text: logs.append(text))
+    rid = d.start_run("coordinator", "digest é", "fake", "light", str(p.base), read_only=True,
+                      system="system", context="context", unblock="blocker_sweep")
+    row = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    spec = json.loads((pathlib.Path(row["dir"]) / "run.json").read_text())
+    details = json.loads(row["note"])["turn"]
+    assert details == {"provider": "fake", "model": "reasoning-model", "effort": expected,
+                       "prompt_bytes": len("digest ésystemcontext".encode()),
+                       "timeout_s": {"low": 300, "high": 1200, "xhigh": 1800}[expected]}
+    assert spec["timeout_s"] == details["timeout_s"] and spec["effort"] == expected
+    d.finish_run(row, {"rc": 1, "stopped": "timeout", "ended": time.time()})
+    finished = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert finished["status"] == "timeout"
+    assert json.loads(finished["note"])["turn"] == details
+    assert p.db.kv("last_coordinator_timeout") == {"run": rid, "at": p.db.kv("last_coordinator_timeout")["at"], **details}
+    assert any("timed out" in line and '"timeout_s"' in line and '"prompt_bytes"' in line for line in logs)
+
+
+def test_coordinator_dispatch_keeps_sweep_continuations_in_separate_turns(env, monkeypatch):
+    from ttp import sweep
+    p, d, clock, calls = _escalate_turn(env, monkeypatch)
+    p.db.x("DELETE FROM events")
+    p.set_config("coordinator.sweep_prompt_chars", 2048)
+    d.cfg = p.config()
+    for n in range(30):
+        tid = p.db.add_task(f"stuck {n}")
+        p.db.update_task(tid, status="blocked", blocked_reason="evidence " * 30)
+    eid = sweep.start(p.db, p.config(), "every 6h", clock[0] - 60)
+    # Also exercise an event queued by an older runtime with no persisted snapshot.
+    data = json.loads(p.db.one("SELECT data FROM events WHERE id=?", (eid,))["data"])
+    data.pop("snapshot")
+    p.db.x("UPDATE events SET data=? WHERE id=?", (json.dumps(data), eid))
+    d.maybe_coordinate()
+    assert len(calls) == 1
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] > 1
+    first = calls[0][1]["note"]["events"]
+    assert first == [eid]
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    clock[0] += 60
+    d.maybe_coordinate()
+    second = calls[1][1]["note"]["events"]
+    assert len(second) == 1 and second != first
+    assert "## Blocker sweep" in calls[1][0][1]
