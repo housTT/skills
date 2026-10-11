@@ -22321,6 +22321,89 @@ def test_task_update_moves_a_task_to_another_resource(env):
     assert json.loads(p.db.task(tid)["labels"]) == ["continues:3", "exclusive:box-b"]
 
 
+def _waiting_on(p, labels, **result):
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user", labels=labels)
+    p.db.update_task(tid, status="queued", not_before=time.time() + 7200, blocked_reason="waiting",
+                     result=json.dumps({"status": "waiting", "waiting_since": time.time(), **result}))
+    return tid
+
+
+def _still_waits(t, probe=None):
+    res = json.loads(t["result"])
+    return t["not_before"] and "waiting_since" in res and (probe is None or res.get("retry_when") == probe)
+
+
+def test_task_update_resources_keeps_waits_that_are_not_on_the_old_resource(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    move = lambda tid, **kw: coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"], **kw}])
+    # Its own probe: the move has nothing to do with it.
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="test -e /tmp/build.done", waiting_for="the build")
+    assert move(tid) == [] and _still_waits(p.db.task(tid), "test -e /tmp/build.done")
+    # A probe that waits on another resource the task never listed, or one it keeps.
+    tid = _waiting_on(p, ["resource:box-a", "resource:box-c"], retry_when="ttp lock --probe box-c")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b", "box-c"]}]) == []
+    assert _still_waits(p.db.task(tid), "ttp lock --probe box-c")
+    # A timer-only wait on something else.
+    tid = _waiting_on(p, ["resource:box-a"], waiting_for="the nightly data drop")
+    assert move(tid) == [] and _still_waits(p.db.task(tid))
+    # A start_when deferral stays, labels and timer alike.
+    tid = p.db.add_task("deferred", "s", kind="work", tier="light", origin="user",
+                        labels=["resource:box-a", "start_when:test -e /tmp/go", "deferred_since:1"])
+    p.db.update_task(tid, not_before=time.time() + 600)
+    assert move(tid) == []
+    t = p.db.task(tid)
+    assert t["not_before"] and "start_when:test -e /tmp/go" in json.loads(t["labels"])
+    # A compound wait keeps its probe part and drops only the step on the old resource.
+    tid = _waiting_on(p, ["exclusive:box-a"], retry_when="ttp lock --probe box-a && test -e '/tmp/a b'")
+    assert move(tid, exclusive=True) == [] and _still_waits(p.db.task(tid), "test -e '/tmp/a b'")
+    # One it cannot split (another shell operator) is kept whole.
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="ttp lock --probe box-a || test -e /tmp/x")
+    assert move(tid) == [] and _still_waits(p.db.task(tid), "ttp lock --probe box-a || test -e /tmp/x")
+
+
+def test_task_update_resources_clears_a_wait_on_the_old_resource_only(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    for probe in ("ttp lock --probe box-a", "ttp lock --probe box-a && /usr/bin/ttp lock --probe box-a"):
+        tid = _waiting_on(p, ["exclusive:box-a"], retry_when=probe, waiting_for="box-a")
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"], "exclusive": True}]) == []
+        t = p.db.task(tid)
+        assert t["not_before"] is None and not t["blocked_reason"] and "waiting_since" not in json.loads(t["result"])
+        assert tid in {x["id"] for x in p.db.ready_tasks()}, probe
+        p.db.update_task(tid, status="cancelled")
+    # Moved onto a paused resource: free of the old wait, held by the pause.
+    p.db.set_kv("paused_resources", {"box-p": {"reason": "maintenance", "since": time.time(), "by": "user"}})
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="ttp lock --probe box-a", waiting_for="box-a paused")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-p"]}]) == []
+    t = p.db.task(tid)
+    assert t["not_before"] is None
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    ctx = {"now": time.time(), "paused": p.db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
+    assert d._start_hold(t, "claude", ctx) == "paused"
+
+
+def test_task_update_resources_with_an_explicit_start_still_applies_it(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="test -e /tmp/build.done")
+    later = time.time() + 3 * 3600
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"],
+                            "start_after": "3h"}]) == []
+    t = p.db.task(tid)
+    assert abs(t["not_before"] - later) < 60 and json.loads(t["labels"])[0] == "resource:box-b"
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="ttp lock --probe box-a")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"],
+                            "start_when": "test -e /tmp/go"}]) == []
+    t = p.db.task(tid)
+    assert coord.deferral(t).get("when") == "test -e /tmp/go"
+    tid = _waiting_on(p, ["resource:box-a"], retry_when="test -e /tmp/build.done")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"], "start_after": "now"}]) == []
+    assert p.db.task(tid)["not_before"] is None
+
+
 def test_the_coordinator_routes_around_failing_resources_and_creation_offers_machines():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "`## Resource trouble`" in text and "route around" in text

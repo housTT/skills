@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1082,13 +1083,28 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["labels"] = keep + [f"{kind_label}:{r}" for r in names]
                     if "needs_device" not in keep and set(names) & locks.device_locks(cfg):
                         upd["labels"].append("needs_device")
+                    prev = load_result(upd.get("result") or task["result"])
                     if upd.get("status", task["status"]) == "queued" and task["not_before"] \
-                            and deferral(task).get("after") != task["not_before"]:
-                        # What it waited on was the old resource: it may start on the new one now.
-                        upd.update(not_before=None, blocked_reason=None)
-                        prev = load_result(upd.get("result") or task["result"])
-                        prev.pop("waiting_since", None)
-                        upd["result"] = dump_result(prev)
+                            and prev.get("status") == "waiting" and not deferral(task):
+                        # Only a wait on a resource the task no longer lists ends with the move: a probe
+                        # of only `ttp lock --probe` steps on them, or no probe and a waiting_for naming
+                        # one. Any other wait (its own probe, a start_after or start_when) still holds.
+                        gone = {locks.canonical(cfg, r) for r in task_resources(task)} \
+                            - {locks.canonical(cfg, r) for r in names}
+                        probe = prev.get("retry_when")
+                        if isinstance(probe, str) and probe.strip():
+                            rest = without_lock_probes(probe, gone, lambda r: locks.canonical(cfg, r))
+                        else:
+                            what = str(prev.get("waiting_for") or "")
+                            rest = "" if any(names_branch(what, r) for r in task_resources(task)
+                                             if locks.canonical(cfg, r) in gone) else None
+                        if rest == "":
+                            upd.update(not_before=None, blocked_reason=None)
+                            prev.pop("waiting_since", None)
+                            upd["result"] = dump_result(prev)
+                        elif rest is not None:
+                            prev["retry_when"] = rest
+                            upd["result"] = dump_result(prev)
                 if a.get("pr_branch") == "":
                     # Carries no branch (its own label or one inherited through `continues`): it delivers
                     # to the push branch.
@@ -2102,6 +2118,39 @@ def _wake_pause_waiters(db, name: str, since: float) -> int:
                        result=dump_result({**prev, "woke": f"the resource {name} was resumed"}))
         woken += 1
     return woken
+
+
+def without_lock_probes(probe: Any, gone: set[str], canon: Any = None) -> str | None:
+    """A retry_when without its `ttp lock --probe <r>` steps for the resources in `gone` (lock names,
+    as `canon` maps a resource to its lock): "" when nothing else is left, None when it probes none
+    of them or is more than steps joined by `&&` (another shell operator, or an `&&` in quotes)."""
+    if not isinstance(probe, str) or not probe.strip() or not gone:
+        return None
+    lex = shlex.shlex(probe, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        toks = list(lex)
+    except ValueError:
+        return None
+    steps: list[list[str]] = [[]]
+    for tok in toks:
+        if tok == "&&":
+            steps.append([])
+        elif tok in ("|", "||", ";", "&", "(", ")", ";;", "|&"):
+            return None
+        else:
+            steps[-1].append(tok)
+    raw = re.split(r"\s*&&\s*", probe.strip())
+    if len(raw) != len(steps) or not all(steps):
+        return None
+
+    def gone_lock(cmd: list[str]) -> bool:
+        at = next((i for i in range(1, len(cmd)) if os.path.basename(cmd[i - 1]) == "ttp"), None)
+        return at is not None and cmd[at:at + 2] == ["lock", "--probe"] and len(cmd) == at + 3 \
+            and (canon(cmd[at + 2]) if canon else cmd[at + 2]) in gone
+
+    keep = [r for r, cmd in zip(raw, steps) if not gone_lock(cmd)]
+    return None if len(keep) == len(raw) else " && ".join(keep)
 
 
 def task_resources(task: dict) -> set[str]:
