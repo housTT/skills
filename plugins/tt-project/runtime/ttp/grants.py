@@ -7,7 +7,9 @@ reflect stalls work behind an ask the user already answered: reviewed pushes wai
 "may I merge?" while the charter lists the repo for auto-merge. `reconcile` compares, model-free:
 
 - auto-merge: the Policies line "Auto-merge repositories: <owner/repo, ...>" against
-  delivery.auto_merge_repos;
+  delivery.auto_merge_repos, report-only: the coordinator can write that line itself, and merging
+  is an irreversible permission only the user grants, so the daemon never writes the setting (the
+  coordinator sets it with config_set in the turn carrying the user's word);
 - push permission: a grant of pushes to the push branch (settinghold.charter_says_no_approval)
   against delivery.push_allowed;
 - protected branch: the same grant, for a push branch only delivery.allow_protected_push_branch lets
@@ -16,16 +18,15 @@ reflect stalls work behind an ask the user already answered: reviewed pushes wai
 The live config is read as it is on disk (uncommitted edits included). A grant the config lacks is
 applied only on the user's own word on record: the Brief, or a Policies entry that CHARTER.history.md
 logs as added in a turn carrying the user's message (checked in the database: inbound, kind user,
-not posted by the harness). Then the daemon sets it, says so in one low-severity alert, and closes
-open asks naming the setting, instead of asking again. Nothing the charter does not grant is ever
-set; the config only gains what the grant names.
+not posted by the harness); auto-merge never. Then the daemon sets it, says so in one low-severity
+alert, and closes open asks naming the setting, instead of asking again. Nothing the charter does
+not grant is ever set; the config only gains what the grant names.
 
-A mismatch it cannot apply (no user word on record, a charter sentence forbidding it, a value it
-cannot parse, config granting more than the charter, a setting or part of one set back after the
-daemon applied it, a failed write) is a harness defect: one keyed event (EVENT, fingerprint per
-setting and state) for the coordinator, never an ask. One exception
-keeps a single question: a protected-branch grant with no user word on record is settinghold's
-setup ask, which this leaves to it.
+A mismatch it cannot apply (any auto-merge mismatch, no user word on record, a charter sentence
+forbidding it, a setting set back after the daemon applied it, a failed write) is a harness defect:
+one keyed event (EVENT, fingerprint per setting and state) for the coordinator, never an ask. One
+exception keeps a single question: a protected-branch grant with no user word on record is
+settinghold's setup ask, which this leaves to it.
 """
 from __future__ import annotations
 
@@ -41,7 +42,7 @@ AUTO_MERGE = "delivery.auto_merge_repos"
 PUSH = "delivery.push_allowed"
 PROTECTED = "delivery.allow_protected_push_branch"
 # What the daemon applied, per setting and charter line ({key: {line: [items]}}): an item it applied and
-# the config lacks later was set back, and is never applied again.
+# the config lacks later was set back, and is never applied again. Push settings only.
 APPLIED_KV = "grants_applied"
 # One physical line: [ \t], never \s, so a bare "Auto-merge repositories:" cannot read the next paragraph.
 _AUTO_MERGE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?\**auto-merge[ \t]+repositor(?:y|ies)\**[ \t]*:[ \t]*(?P<v>[^\n]*)$",
@@ -163,11 +164,10 @@ def checks(cfg: dict, charter: str, repo: Path | None = None) -> list[dict]:
         out.append({"key": AUTO_MERGE, "want": None, "have": have, "line": " / ".join(lines), "lines": lines,
                     "problem": "the Policies line names no owner/repo and is not 'none'"})
     elif repos is not None and repos != have:
-        extra = sorted(set(have) - set(repos))
-        out.append({"key": AUTO_MERGE, "want": sorted(set(have) | set(repos)), "have": have,
+        out.append({"key": AUTO_MERGE, "want": repos, "have": have,
                     "line": " / ".join(lines) or "Auto-merge repositories: none", "lines": lines,
-                    "problem": (f"the config also auto-merges {', '.join(extra)}, which the charter does not "
-                                f"grant: never widened, never narrowed by the daemon") if extra else ""})
+                    "problem": "auto-merge is report-only: the daemon never writes it; the coordinator sets it "
+                               "with config_set in the turn carrying the user's word"})
     branch = str(d.get("push_branch") or "").strip()
     grant = _push_grant(charter, branch) if branch else ""
     if grant:
@@ -207,9 +207,9 @@ def _defect(db, c: dict, why: str, now: float) -> bool:
 
 
 def reconcile(p, db, cfg: dict, now: float, repo: Path | None = None) -> list[str]:
-    """Compare the charter's grants with the live delivery settings and apply each one the user's own
-    word on record grants; raise a keyed defect for each one it cannot apply. Returns what it applied
-    (one line each); a re-run with nothing changed applies and raises nothing."""
+    """Compare the charter's grants with the live delivery settings and apply each push grant the user's
+    own word on record grants (auto-merge is never written); raise a keyed defect for each one it cannot
+    apply. Returns what it applied (one line each); a re-run with nothing changed applies and raises nothing."""
     from .ends import CHARTER_HISTORY
     try:
         charter = p.charter_path.read_text()
@@ -232,17 +232,11 @@ def reconcile(p, db, cfg: dict, now: float, repo: Path | None = None) -> list[st
         missing = _items(c["want"]) - _items(c["have"])
         back = sorted(missing & set(applied))
         if back:
-            # Applied once already and set back since (all or part of it): that later change wins, never
-            # flipped again. What else the grant names and the daemon never applied still goes in.
+            # Applied once already and set back since: that later change wins, never flipped again.
             _defect(db, {**c, "problem": "set back"}, f"it was applied once ({', '.join(back)}) and has been set "
                                                       "back since; the later setting wins and is not changed again",
                     now)
-            if c["key"] != AUTO_MERGE:
-                continue
-            c = {**c, "want": sorted(set(c["have"]) | (set(c["want"]) - set(back)))}
-            if c["want"] == c["have"]:
-                continue
-            missing = _items(c["want"]) - _items(c["have"])
+            continue
         words = [user_word(db, charter, history, line) for line in c["lines"]]
         who = "" if not words or not all(words) else ", ".join(dict.fromkeys(words))
         if not who:
