@@ -11373,6 +11373,38 @@ def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, mo
     assert e.value.code == 75 and harness() == tids and not restarts
 
 
+@pytest.mark.parametrize("argv", [["--auto"], []])
+def test_a_conflict_after_a_merge_task_that_landed_queues_the_next_one_at_once(env, monkeypatch, argv):
+    """A project with local runtime edits conflicts on every release. Its merge task landed the last
+    release, then the next one conflicted again and the daily limit (counted from that task) left it
+    'available, harness on <old> (the merge needs judgment ...)' for most of a day, also for a host-side
+    `ttp upgrade`. A merge task that ended done with the harness on its target is no failed retry: the
+    next conflict queues its own task at once, from the daemon and from the host alike."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    # it landed: done, and the harness runs the release it targeted
+    rt = p.harness / "runtime"
+    landed = f"Target release: tt-project {cli._runtime_version(rt)} ({cli.recorded_commit(rt)})"
+    p.db.x("UPDATE tasks SET status='done', spec=? WHERE id=?", (f"merge it\n\n{landed}\n", first))
+    _next_release(env)
+    if argv:
+        argv += ["--project-dir", str(p.base)]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", *argv])
+    tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    assert (p.db.kv(release.KV_AUTO) or {}).get("outcome") != "deferred" and not restarts
+    # one that ended done without landing (the harness is still older than its target) keeps the limit
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tids[1],))
+    _next_release(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", *argv])
+    assert e.value.code == 75 and len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+
+
 def test_check_release_escalates_a_stuck_finish_task_once_across_restarts(env, monkeypatch):
     """A finish task blocked for days only produced an hourly 'held' log line. After 6 h blocked or
     idle, check_release files ONE upstream note (block reason, what a host upgrade does); the first-seen

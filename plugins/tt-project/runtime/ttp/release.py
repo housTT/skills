@@ -22,7 +22,7 @@ from .project import HOME_DIR, Project, durable_write, fsync_dir
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
 UPGRADE_TASK_TITLE = "Finish the tt-project template upgrade"
-TASK_EVERY_S = 86400    # at most one upgrade task per project this often; a conflict meanwhile waits
+TASK_EVERY_S = 86400    # at most one upgrade task per project this often (unless the last one landed); a conflict meanwhile waits
 STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
 MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
@@ -335,6 +335,15 @@ def recent_upgrade_task(p: Project) -> dict | None:
     t = p.db.one("SELECT id, created FROM tasks WHERE kind='harness' AND title=? AND created > ? "
                  "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE, time.time() - TASK_EVERY_S))
     return dict(t) if t else None
+
+
+def landed(db, tid: int, version: str, commit: str) -> bool:
+    """Finish task `tid` ended done with the harness (`version`, `commit`) on its target release or a newer
+    version: it landed its merge, so a conflict with a later release is new work, not a retry of a merge
+    that failed, and the once-a-day limit does not hold it back."""
+    t = db.one("SELECT status, spec FROM tasks WHERE id=?", (int(tid),))
+    m = t and re.search(r"^Target release: tt-project (\S+) \((\S+)\)\s*$", t["spec"] or "", re.M)
+    return bool(m and t["status"] == "done" and ((version, commit) == m.groups() or is_newer(version, m[1])))
 
 
 def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why: str) -> None:

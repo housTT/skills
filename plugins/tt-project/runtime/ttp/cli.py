@@ -2902,6 +2902,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
         last = None if tid else release.recent_upgrade_task(p)
+        if last and release.landed(p.db, last["id"], old_v, old_c):
+            last = None     # it landed its release: this conflict is the next release's, queued at once
         sooner = None       # an explicit host-side upgrade may queue the merge task this soon
         if last and explicit:
             ended = release.task_ended(p.db, last["id"])

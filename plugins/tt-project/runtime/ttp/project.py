@@ -208,8 +208,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "heal": {"escalate": "user"},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
-    # A conflicting merge queues one harness task a day at most; a host-side `ttp upgrade` queues it once
-    # the last one ended merge_retry_h ago.
+    # A conflicting merge queues one harness task a day at most (at once when the last one landed its
+    # release); a host-side `ttp upgrade` queues it once the last one ended merge_retry_h ago.
     "upgrade": {"auto": True, "merge_retry_h": 6},
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
