@@ -182,10 +182,12 @@ and preferences you add later become part of the project's charter and memory.
   low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
   and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.
   Above 32 KB of prompt text, each additional 8 KB adds 60 seconds. These allowances give slower
-  reasoning turns more time while routine low-effort turns stay short. The legacy
-  `coordinator.turn_timeout_s` is a minimum (default 0), so an existing 600-second setting still
-  allows a high-effort raise. `coordinator.turn_timeout_ceiling_s` defaults to 3600 and can be
-  lowered; the runtime always enforces a one-hour absolute ceiling. Each run records prompt bytes,
+  reasoning turns more time while routine low-effort turns stay short. The base is the first one
+  set: the project's own `turn_timeouts_s` entry for the provider and effort, then a flat
+  `coordinator.turn_timeout_s` (0, the default, is unset; a stored 600, the old flat default, also
+  counts as unset so older projects get effort sizing), then the built-in table. The prompt
+  allowance is added to any base. `coordinator.turn_timeout_ceiling_s` defaults to 3600 and can be
+  lowered; it caps every result, and the runtime always enforces a one-hour absolute ceiling. Each run records prompt bytes,
   provider, model, effort and chosen timeout; timeouts also leave a daemon log and diagnostic state.
   A tricky or blocking turn runs at least at `coordinator.unblock_effort` (high; empty turns this
   off), so it looks harder for a non-disruptive way forward. Its triggers, kept in one table

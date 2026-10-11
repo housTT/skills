@@ -404,11 +404,27 @@ def _line(i: dict, state: dict, outs: dict, now: float) -> str:
     return line
 
 
+def _settled(db: DB, key: str) -> dict:
+    """A covered item that is no longer stuck, rebuilt from its durable identity (an event queued
+    before snapshots existed has keys only), so the turn still records how it ended."""
+    kind, _, ident = key.partition(":")
+    if kind == "task" and ident.isdigit():
+        t = db.task(int(ident))
+        status = t["status"] if t else "gone"
+        return {"key": key, "kind": "resolved", "task": int(ident), "resource": None,
+                "title": t["title"] if t else "(no longer exists)", "age_s": None, "since": None,
+                "reason": f"no longer stuck (now {status}): record closed or unblocked", "status": status,
+                "spec_sha": _spec_sha(t) if t else ""}
+    return {"key": key, "kind": "resumed", "task": None, "resource": ident, "title": ident, "age_s": None,
+            "since": None, "reason": "no longer paused: record closed or unblocked", "status": "resumed",
+            "spec_sha": ""}
+
+
 def _covered(db: DB, data: dict, now: float) -> list[dict]:
     # Retain an identity even if an earlier batch unblocked it; the next batch can record closed.
     by_key = {i["key"]: i for i in data.get("snapshot", [])}
     by_key.update({i["key"]: i for i in items(db, now)})
-    return [by_key[k] for k in data.get("items", []) if k in by_key]
+    return [by_key.get(k) or _settled(db, k) for k in data.get("items", [])]
 
 
 def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:

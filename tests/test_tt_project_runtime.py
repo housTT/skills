@@ -43253,3 +43253,98 @@ def test_coordinator_dispatch_keeps_sweep_continuations_in_separate_turns(env, m
     second = calls[1][1]["note"]["events"]
     assert len(second) == 1 and second != first
     assert "## Blocker sweep" in calls[1][0][1]
+
+
+def test_coordinator_timeout_explicit_overrides_win_over_legacy_and_defaults(env):
+    from ttp import coordlimits
+    p = make(env)
+    tt = coordlimits.turn_timeout
+    # An existing project that stored the old flat default still gets effort sizing.
+    p.set_config("coordinator.turn_timeout_s", 600)
+    cfg = p.config()
+    assert tt(cfg, "codex", "high", 0) == 1200 and tt(cfg, "claude", "low", 0) == 300
+    # Its own table entry wins, shorter or longer than the default, over a stored legacy value.
+    p.set_config("coordinator.turn_timeouts_s.codex.high", 450)
+    p.set_config("coordinator.turn_timeouts_s.codex.low", 700)
+    cfg = p.config()
+    assert tt(cfg, "codex", "high", 0) == 450 and tt(cfg, "codex", "low", 0) == 700
+    assert tt(cfg, "codex", "xhigh", 0) == 1800   # entries not set keep the built-in default
+    # Any other legacy value is a choice: it wins over the built-in table, never over a table entry.
+    p.set_config("coordinator.turn_timeout_s", 90)
+    cfg = p.config()
+    assert tt(cfg, "codex", "xhigh", 0) == 90 and tt(cfg, "claude", "max", 0) == 90
+    assert tt(cfg, "codex", "high", 0) == 450
+    # The prompt allowance is added to every base; the ceilings cap every result.
+    assert tt(cfg, "codex", "xhigh", 32000 + 8001) == 90 + 120
+    assert tt(cfg, "codex", "high", 32000 + 8000) == 450 + 60
+    p.set_config("coordinator.turn_timeout_ceiling_s", 400)
+    cfg = p.config()
+    assert tt(cfg, "codex", "high", 0) == 400 and tt(cfg, "codex", "low", 0) == 400
+    assert tt(cfg, "codex", "xhigh", 10**9) == 400
+    p.set_config("coordinator.turn_timeout_ceiling_s", 10**6)
+    p.set_config("coordinator.turn_timeouts_s.codex.high", 10**6)
+    assert tt(p.config(), "codex", "high", 0) == 3600
+    # Bad explicit values fall through to the next source, never to zero or infinity.
+    for bad in (0, -5, "x", None, float("nan"), float("inf")):
+        cfg = {"coordinator": {"turn_timeouts_s": {"codex": {"high": bad}}, "turn_timeout_s": bad}}
+        assert tt(cfg, "codex", "high", 0) == 1200
+
+
+def _snapshotless_sweep(p, now):
+    from ttp import sweep
+    eid = sweep.start(p.db, p.config(), "every 6h", now)
+    data = json.loads(p.db.one("SELECT data FROM events WHERE id=?", (eid,))["data"])
+    data.pop("snapshot")   # the format an older runtime queued
+    p.db.x("UPDATE events SET data=? WHERE id=?", (json.dumps(data), eid))
+    return eid
+
+
+def test_sweep_upgrade_keeps_items_resolved_before_prepare(env):
+    from ttp import sweep
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("stuck one")
+    p.db.update_task(tid, status="blocked", blocked_reason="needs a fix")
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"box-a": {"since": now - 3600, "by": "user", "reason": "maintenance"}})
+    eid = _snapshotless_sweep(p, now)
+    # Both clear before the upgraded runtime prepares the event.
+    p.db.update_task(tid, status="done")
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    later = p.db.add_task("stuck later")
+    p.db.update_task(later, status="blocked", blocked_reason="new")
+    for _ in range(2):   # a restart retries prepare on the same event
+        sweep.prepare(p.db, eid, {}, now)
+        data = json.loads(p.db.one("SELECT data FROM events WHERE id=?", (eid,))["data"])
+        assert sorted(data["items"]) == sorted([f"task:{tid}", "resource:box-a"])
+        assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (sweep.SWEEP_KIND,))["n"] == 1
+    text = "\n".join(sweep.digest_lines(p.db, [eid], now))
+    assert f"#{tid} stuck one | resolved" in text and "no longer stuck (now done)" in text
+    assert "resource box-a | resumed" in text and f"#{later} " not in text
+    # The turn can record how each ended.
+    assert sweep.record(p.db, {"id": tid, "outcome": "closed"}, None, now) == f"task:{tid}"
+    assert sweep.record(p.db, {"resource": "box-a", "outcome": "unblocked"}, None, now) == "resource:box-a"
+
+
+def test_sweep_upgrade_continuations_stay_disjoint_with_resolved_items(env):
+    from ttp import sweep
+    p = make(env)
+    now = time.time()
+    tids = []
+    for n in range(30):
+        tids.append(p.db.add_task(f"stuck {n} " + "x" * 100))
+        p.db.update_task(tids[-1], status="blocked", blocked_reason="evidence " * 30)
+    eid = _snapshotless_sweep(p, now)
+    for tid in tids[::3]:
+        p.db.update_task(tid, status="done")
+    cfg = {"coordinator": {"sweep_prompt_chars": 2048}}
+    seen = []
+    while (event := p.db.one("SELECT * FROM events WHERE kind=? AND status='queued' ORDER BY id", (sweep.SWEEP_KIND,))):
+        sweep.prepare(p.db, event["id"], cfg, now)
+        sweep.prepare(p.db, event["id"], cfg, now)
+        keys = json.loads(p.db.one("SELECT data FROM events WHERE id=?", (event["id"],))["data"])["items"]
+        text = "\n".join(sweep.digest_lines(p.db, [event["id"]], now))
+        assert len(text) <= 2048 and len([ln for ln in text.splitlines() if ln.startswith("- ")]) == len(keys)
+        seen.extend(keys)
+        p.db.x("UPDATE events SET status='handled' WHERE id=?", (event["id"],))
+    assert sorted(seen) == sorted(f"task:{t}" for t in tids) and eid
