@@ -2,4 +2,4 @@
 "tt-project": patch
 ---
 
-Harness skill: keyed watcher lines must not start with `now`, `still:`, `changed:` or `cleared:` after the subject; such a line is taken as a clear and dropped silently.
+Harness skill: on a keyed watcher line, text after the subject that starts with the word `cleared` (any case, colon optional) is a clear: it closes the open issue under that key and never opens one. Put the state after the item instead (`fleet gate: X cleared`).
