@@ -67,6 +67,7 @@ class Codex(Provider):
     binaries = ("codex",)
     api_host, api_base_env = "api.openai.com", "OPENAI_BASE_URL"
     login_hint = "run `codex login` there"
+    efforts = ("minimal", "low", "medium", "high", "xhigh")
     isolate_read_only = True
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.

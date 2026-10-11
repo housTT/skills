@@ -21,6 +21,7 @@ from .base import Provider, RunUsage
 @register
 class Fake(Provider):
     name = "fake"
+    efforts = ("minimal", "low", "medium", "high", "xhigh", "max")
 
     def credential_files(self) -> list[str]:
         return [f] if (f := os.environ.get("TTP_FAKE_CREDENTIALS")) else []

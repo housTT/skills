@@ -67,6 +67,7 @@ class Claude(Provider):
     # made those later calls fail with a 400 (found 5), losing the turn.
     own_cache_breakpoints = 4
     login_hint = "run `claude` there and use /login"
+    efforts = ("low", "medium", "high", "xhigh", "max")
     steer_hook = True   # worker_settings() routes PostToolUse through ttp.hook
 
     def credential_files(self) -> list[str]:

@@ -61,7 +61,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "chat": {"type": "string"}, "text": {"type": "string"}, "severity": {"type": "string"},
             "title": {"type": "string"}, "spec": {"type": "string"}, "kind": {"type": "string"},
             "tier": {"type": "string"}, "priority": {"type": "integer"}, "provider": {"type": "string"},
-            "model": {"type": "string"}, "effort": {"type": "string"},
+            "model": {"type": "string"}, "effort": {"type": "string"}, "pin_required": {"type": "boolean"},
             "budget_usd": {"type": "number"}, "depends_on": {"type": "array", "items": {"type": "integer"}},
             "reply_chat": {"type": "string"}, "id": {"type": "integer"}, "status": {"type": "string"},
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
@@ -1035,6 +1035,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"task_add rejected: {why}")
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
                 pin = _task_pin(cfg, a, pin_of(old or followup))
+                labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          priority=int(a.get("priority") or 3), **pin,
@@ -1181,6 +1182,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          f"while it is not; cancel it and re-add it with `continues` to change them now")
                     pin = _task_pin(cfg, a, {k: task.get(k) for k in ("provider", "model", "effort")})
                     upd.update({k: v for k, v in pin.items() if v != task.get(k)})
+                if a.get("pin_required") is not None:
+                    labels = upd.get("labels")
+                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+                    kept = [x for x in labels if x not in (failover.REQUIRED_LABEL, failover.PREFERRED_LABEL)]
+                    mark = _pin_mark(db, a["pin_required"], {"provider": upd.get("provider", task["provider"])},
+                                     {**task, "labels": json.dumps(kept)})
+                    if kept + mark != labels:
+                        upd["labels"] = kept + mark
                 if spec:
                     why = prguard.spec_problem(db, spec)
                     if why:
@@ -1633,6 +1642,23 @@ def _task_pin(cfg: dict, a: dict, base: dict) -> dict:
             raise ValueError(f"effort {eff[:30]!r} is not one of {', '.join(EFFORT_ORDER)}")
         out["effort"] = eff or None
     return out
+
+
+def _pin_mark(db, req: Any, pin: dict, origin: dict | None) -> list[str]:
+    """The labels that record whether a task's provider pin is required (failover.py): `pin_required`
+    true only when the user's own words require that provider or model, false for a preference.
+    Unset, a task keeps the mark of the task it continues or follows up while it keeps its provider."""
+    inherited = bool(origin and origin.get("provider") and origin.get("provider") == pin.get("provider")
+                     and failover.required(db, origin))
+    if req is None:
+        return [failover.REQUIRED_LABEL] if inherited else []
+    if req is True or str(req).strip().lower() in ("true", "1", "yes"):
+        if not pin.get("provider"):
+            raise ValueError("pin_required needs a provider pin (`provider`): it marks that the user's own "
+                             "words require that provider or model")
+        return [failover.REQUIRED_LABEL]
+    # A preference: say so only where a task it continues would otherwise pass its mark on.
+    return [failover.PREFERRED_LABEL] if origin and failover.required(db, origin) else []
 
 
 def _continued(db, raw: Any, deps: list[int]) -> dict:

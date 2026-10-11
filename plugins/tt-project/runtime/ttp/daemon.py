@@ -3167,8 +3167,9 @@ class Daemon:
 
     def failover_pinned(self, every_s: float = 60) -> None:
         """Move queued and waiting tasks off a provider that cannot start new work for longer than
-        coordinator.provider_failover_after_h (failover.py), model-free, at most once a minute. Each
-        move is a feed event and one low alert; running tasks are only reported."""
+        coordinator.provider_failover_after_h (failover.py), and a preference pin to a provider other
+        than the core one at once, model-free, at most once a minute. Each move is a feed event and
+        one low alert; running tasks are only reported."""
         now = time.time()
         if now - getattr(self, "_failover_checked", 0.0) < every_s or not failover.after_h(self.cfg):
             return
@@ -3177,17 +3178,19 @@ class Daemon:
         try:
             provs = {r["p"] or core for r in db.q("SELECT DISTINCT provider p FROM tasks "
                                                   "WHERE status IN ('queued','waiting','running')")}
-            stops, windows = {}, bud.plan_windows(db)
+            stops, holds, windows = {}, {}, bud.plan_windows(db)
             for prov in provs:   # update_gates leaves out providers only waiting tasks use
                 gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
-                why = failover.stop(gate, self._provider_pause(prov), self._logged_out(prov), now)
-                if why:
+                pause, out = self._provider_pause(prov), self._logged_out(prov)
+                if why := failover.hold(gate, pause, out, now):
+                    holds[prov] = why
+                if why := failover.stop(gate, pause, out, now):
                     stops[prov] = why
-            if not stops:
+            if not holds:
                 return
             ok = []
             for prov in failover.targets(self.cfg):
-                if prov in stops or self._logged_out(prov) or self.net_held(prov):
+                if prov in holds or self._logged_out(prov) or self.net_held(prov):
                     continue
                 try:
                     if not get_provider(prov).available():
@@ -3196,9 +3199,9 @@ class Daemon:
                     continue
                 gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
                 if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
-                        and not failover.stop(gate, self._provider_pause(prov), False, now):
+                        and not failover.hold(gate, self._provider_pause(prov), False, now):
                     ok.append(prov)
-            moves, running = failover.plan(db, self.cfg, stops, ok, now)
+            moves, running = failover.plan(db, self.cfg, stops, ok, now, holds)
             where = timefmt.home(self.p)
             lines = [failover.apply(db, self.cfg, m, now, where) for m in moves]
             lines += failover.report_running(db, running, now, where)

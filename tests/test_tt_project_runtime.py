@@ -42525,9 +42525,9 @@ def test_failover_moves_a_codex_pinned_task_off_a_red_window_and_maps_its_effort
     d.failover_pinned()
     for i in (tid, waiting):
         t = p.db.task(i)
-        assert (t["provider"], t["model"], t["effort"], t["tier"]) == ("fake", None, None, "deep"), t
-        assert "[provider failover" in t["spec"] and "moved from codex (model research-model-1, effort xhigh) to fake" \
-            in t["spec"].lower() and "until " in t["spec"]
+        assert (t["provider"], t["model"], t["effort"], t["tier"]) == ("fake", None, "xhigh", "deep"), t
+        assert "[provider failover" in t["spec"] and "moved at once from codex (model research-model-1, effort xhigh) " \
+            "to fake" in t["spec"].lower() and "until " in t["spec"]
         assert t["spec"].startswith("Design the thing.\n\n")
     ev = p.db.q("SELECT * FROM events WHERE kind='provider_failover' ORDER BY id")
     assert [e["task"] for e in ev] == [tid, waiting] and all(e["severity"] == "low" for e in ev)
@@ -42543,17 +42543,24 @@ def test_failover_moves_a_codex_pinned_task_off_a_red_window_and_maps_its_effort
 
 
 def test_failover_leaves_tasks_when_the_reset_is_near_or_failover_is_off(env):
+    # Codex is the core provider here: its own tasks wait out a stop shorter than the threshold.
     p, d, now = _failover_setup(env, hours=2)
-    tid = _codex_task(p)
+    p.set_config("core_provider", "codex")
+    p.set_config("providers.fake", {"tiers": {}})
+    p.set_config("coordinator.provider_failover_to", ["fake"])
+    d._load_config()
+    tid = p.db.add_task("on the core provider", "Do it.", kind="work", tier="standard")
     d.update_gates()
     assert d.gates["codex"].level == "red"
     d.failover_pinned()
-    assert p.db.task(tid)["provider"] == "codex", "moved although codex resets within the threshold"
+    assert p.db.task(tid)["provider"] is None, "moved although codex resets within the threshold"
     p.set_config("coordinator.provider_failover_after_h", 1)
     d._load_config()
     d._failover_checked = 0
     d.failover_pinned()
     assert p.db.task(tid)["provider"] == "fake", "a 1 h threshold moves a task whose provider resets in 2 h"
+    p.set_config("core_provider", "fake")
+    d._load_config()
     other = _codex_task(p, "second")
     p.set_config("coordinator.provider_failover_after_h", 0)
     d._load_config()
@@ -42606,7 +42613,7 @@ def test_failover_moves_off_a_logged_out_provider_only_to_a_usable_target(env):
     d._failover_checked = 0
     d.failover_pinned()
     t = p.db.task(tid)
-    assert (t["provider"], t["model"], t["effort"]) == ("fake", None, None)
+    assert (t["provider"], t["model"], t["effort"]) == ("fake", None, "xhigh")
     assert "logged out" in t["spec"] and "no known end" in t["spec"]
 
 
@@ -42623,12 +42630,76 @@ def test_failover_stop_reads_each_reason_for_red_and_its_end(env):
     assert failover.stop({"level": "orange", "allow_new_work": True}, None, False, now) is None
     assert failover.stop(None, {"until": now + 50, "note": "limit"}, False, now) == ("provider limit: limit", now + 50)
     assert failover.stop(None, None, True, now) == ("logged out", None)
+    assert failover.hold(red(["cap reached: $9/day of $5, $9/7d of $50"]), None, False, now) == \
+        ("cap reached: $9/day of $5, $9/7d of $50", None), "a hold with no known end still holds"
+    assert failover.hold({"level": "orange", "allow_new_work": True}, None, False, now) is None
+    assert failover.kept_effort("claude", "xhigh") == "xhigh" and failover.kept_effort("claude", "minimal") == "low"
+    assert failover.kept_effort("codex", "max") == "xhigh" and failover.kept_effort("cursor", "high") is None
+    assert failover.kept_effort("codex", None) is None
     cfg = {"core_provider": "claude", "providers": {"claude": {}, "codex": {"tiers": {"deep": {"effort": "xhigh"}}}},
            "coordinator": {"provider_failover_to": ["codex", "nope"]}}
     assert failover.targets(cfg) == ["codex", "claude"]
     assert failover.mapped_tier(cfg, "codex", {"effort": "xhigh", "tier": "standard"}) == "deep"
     assert failover.mapped_tier(cfg, "claude", {"effort": "low", "tier": "deep"}) == "light"
     assert failover.mapped_tier(cfg, "codex", {"effort": None, "tier": "standard"}) == "standard"
+
+
+def test_failover_moves_an_unmarked_pin_at_once_and_keeps_a_required_one_held(env):
+    # Codex resets in 2 h, well within the 4 h threshold, and its red gate's end may even be unknown:
+    # a pin the user's words do not require is a preference and moves to the core provider at once.
+    p, d, now = _failover_setup(env, hours=2)
+    pref = _codex_task(p, "preference", budget_usd=3.5)
+    req = _codex_task(p, "required", labels=["pin:required"])
+    d.update_gates()
+    d.failover_pinned()
+    t = p.db.task(pref)
+    assert (t["provider"], t["model"], t["effort"], t["tier"], t["budget_usd"]) == \
+        ("fake", None, "xhigh", "deep", 3.5), "an unmarked pin did not fail over at once with its effort and budget"
+    r = p.db.task(req)
+    assert (r["provider"], r["model"], r["effort"], r["status"]) == ("codex", "research-model-1", "xhigh", "queued")
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='provider_failover'")
+    assert ev["task"] == pref and ev["severity"] == "low"
+    assert "moved at once from codex" in ev["text"] and "to fake" in ev["text"] and "preference" in ev["text"]
+    assert not p.db.q("SELECT id FROM events WHERE kind='provider_failover' AND task=?", (req,))
+    from ttp import failover
+    # A red gate with no known end (a rolling cap) holds a preference pin too.
+    red = {"level": "red", "allow_new_work": False, "reasons": ["cap reached: $9/day of $5"], "numbers": {}}
+    held = {"codex": failover.hold(red, None, False, now)}
+    other = _codex_task(p, "rolling cap")
+    moves, _ = failover.plan(p.db, d.cfg, {}, ["fake"], now, held)
+    assert [m["task"]["id"] for m in moves] == [other] and moves[0]["at_once"] and moves[0]["new"] == "fake"
+
+
+def test_pin_required_is_set_by_the_coordinator_and_kept_by_continues(env):
+    from ttp import failover
+    from ttp.coordinator import apply
+    p, d, now = _failover_setup(env)
+    probs = apply(p, [{"type": "task_add", "title": "no pin", "spec": "x", "pin_required": True}])
+    assert any("pin_required needs a provider pin" in x for x in probs), probs
+    assert apply(p, [{"type": "task_add", "title": "user asked for codex", "spec": "The user said: use codex.",
+                      "provider": "codex", "effort": "xhigh", "pin_required": True},
+                     {"type": "task_add", "title": "codex preferred", "spec": "y", "provider": "codex"}]) == []
+    req = p.db.one("SELECT * FROM tasks WHERE title='user asked for codex'")
+    pref = p.db.one("SELECT * FROM tasks WHERE title='codex preferred'")
+    assert failover.required(p.db, req) and not failover.required(p.db, pref), "an unmarked pin is a preference"
+    assert apply(p, [{"type": "task_update", "id": pref["id"], "pin_required": True}]) == []
+    assert failover.required(p.db, p.db.task(pref["id"]))
+    assert apply(p, [{"type": "task_update", "id": pref["id"], "pin_required": False}]) == []
+    assert not failover.required(p.db, p.db.task(pref["id"]))
+    # A continuation keeps the mark with its provider; pin_required false makes it a preference.
+    p.db.update_task(req["id"], status="failed")
+    assert apply(p, [{"type": "task_add", "title": "user asked for codex, again", "spec": "z",
+                      "continues": req["id"]}]) == []
+    cont = p.db.one("SELECT * FROM tasks WHERE title='user asked for codex, again'")
+    assert cont["provider"] == "codex" and failover.required(p.db, cont)
+    p.db.update_task(cont["id"], status="failed")
+    assert apply(p, [{"type": "task_add", "title": "codex only preferred now", "spec": "w",
+                      "continues": cont["id"], "pin_required": False}]) == []
+    later = p.db.one("SELECT * FROM tasks WHERE title='codex only preferred now'")
+    assert later["provider"] == "codex" and not failover.required(p.db, later)
+    d.update_gates()
+    d.failover_pinned()
+    assert p.db.task(later["id"])["provider"] == "fake" and p.db.task(pref["id"])["provider"] == "fake"
 
 
 def test_failover_settings_are_known_keys_and_settable_from_cli_and_chat(env, capsys):

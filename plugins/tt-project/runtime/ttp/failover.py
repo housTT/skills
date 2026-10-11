@@ -10,13 +10,20 @@ limit pause runs, or its budget gate is red (a plan window at the line, a dollar
 guard). Its end is the pause's end, or for a red gate the reset of every window or cap holding it;
 a red gate whose end is unknown moves nothing.
 
+A pin to a provider other than the core one is a preference unless it is marked required (the
+task's `pin_required`, kept as the label REQUIRED_LABEL): such a task moves at once, with no wait,
+whenever its provider cannot start new work, whatever the reason and its end (hold()). Only the
+user's own words mark a pin required; an unmarked pin, old tasks' included, is a preference.
+
 Targets: coordinator.provider_failover_to (provider names, in order of preference) and then the
-core provider. A target must be configured and installed, logged in, not paused, with a gate that
-is not red and allows new work. The move clears the task's model and effort pin (one provider's
-names), maps the pinned effort to the tier that ran it (e.g. Codex xhigh to deep), and adds a spec
-note saying what moved, why and when the old provider resets. Running tasks are never touched: each
-is reported once. A task (or one it continues or reviews) labelled `pin:required` stays put.
-Every move is an event in the feed (kind KIND), listed in the daily review, and one low alert.
+core provider; a preference pin goes to the core provider first. A target must be configured and
+installed, logged in, not paused, with a gate that is not red and allows new work. The move clears
+the task's model pin (one provider's names), keeps its effort where the new provider takes it (else
+the nearest it takes), sets the tier that matches the effort (e.g. Codex xhigh to deep), keeps its
+budget, and adds a spec note saying what moved, why and when the old provider resets. Running tasks
+are never touched: each is reported once. A task (or one it continues or reviews) marked required
+stays put. Every move is an event in the feed (kind KIND), listed in the daily review, and one low
+alert. coordinator.provider_failover_after_h 0 turns every move off.
 """
 from __future__ import annotations
 
@@ -29,7 +36,8 @@ from . import timefmt
 from .db import DB
 
 KIND = "provider_failover"
-REQUIRED_LABEL = "pin:required"
+REQUIRED_LABEL = "pin:required"      # the user's own words require the task's provider or model
+PREFERRED_LABEL = "pin:preferred"    # pin_required set false: overrides a mark on a task it continues
 NOTE_PREFIX = "[provider failover"
 AFTER_H = 4.0
 REPORTED_KEY = "failover_reported"     # kv: {"<task>:<provider>": ts} running tasks already reported
@@ -85,6 +93,13 @@ def stop(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[s
     """Why the provider cannot start new work and when that ends (None: logged out, no known end), or
     None if it can or its red gate has no known end. `gate` is a budget Gate (or its dict), `pause`
     its limited:<provider> record."""
+    got = hold(gate, pause, logged_out, now)
+    return None if got is None or (got[1] is None and not logged_out) else got
+
+
+def hold(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[str, float | None] | None:
+    """Like stop(), but a red gate whose end is unknown holds too (end None): what moves a preference
+    pin at once."""
     if logged_out:
         return "logged out", None
     if pause and float(pause.get("until") or 0) > now:
@@ -107,7 +122,7 @@ def stop(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[s
         elif r.startswith("provider limit"):
             ends.append(float(pause["until"]) if pause and pause.get("until") else None)
     if not ends or any(e is None for e in ends):
-        return None   # no known end: nothing to weigh against provider_failover_after_h
+        return "; ".join(reasons) or "budget gate red", None   # no known end
     return "; ".join(reasons), max(float(e) for e in ends)
 
 
@@ -120,15 +135,21 @@ def _labels(task: dict) -> list:
 
 
 def required(db: DB, task: dict, depth: int = 8) -> bool:
-    """Whether the task's pin is marked required: its own `pin:required` label, or one on a task it
-    continues, reviews or fixes (so a review or fix keeps the pin its origin requires)."""
+    """Whether the task's pin is marked required: its own REQUIRED_LABEL, or one on a task it
+    continues, reviews or fixes (so a review or fix keeps the pin its origin requires), unless its
+    own PREFERRED_LABEL says the pin is only a preference."""
     seen, todo = set(), [task]
     while todo and len(seen) <= depth:
         t = todo.pop()
         if t["id"] in seen:
             continue
         seen.add(t["id"])
-        for lb in _labels(t):
+        labels = _labels(t)
+        if PREFERRED_LABEL in labels:
+            if t is task:
+                return False
+            continue   # an origin marked a preference does not pass a mark further up on
+        for lb in labels:
             if lb == REQUIRED_LABEL:
                 return True
             m = CHAIN_RE.match(lb) if isinstance(lb, str) else None
@@ -150,14 +171,37 @@ def mapped_tier(cfg: dict, provider: str, task: dict) -> str:
     return "light" if rank <= 1 else "standard" if rank <= 3 else "deep"
 
 
+def kept_effort(provider: str, effort: str | None) -> str | None:
+    """The task's effort pin as `provider` takes it: the same level, else the nearest one it takes
+    (None when it pins none or the provider takes no effort levels)."""
+    eff = (effort or "").strip().lower()
+    if not eff:
+        return None
+    try:
+        from .providers import get_provider
+        takes = tuple(get_provider(provider).efforts)
+    except Exception:
+        takes = ()
+    if eff in takes:
+        return eff
+    rank = EFFORT_RANK.index(eff) if eff in EFFORT_RANK else 3
+    ranked = [e for e in takes if e in EFFORT_RANK]
+    return min(ranked, key=lambda e: abs(EFFORT_RANK.index(e) - rank)) if ranked else None
+
+
 def note(move: dict, where) -> str:
     """What moved, why and until when, in plain words (the spec note and feed line say this)."""
     t, old = move["task"], move["old"]
     pin = ", ".join(f"{k} {t[k]}" for k in ("model", "effort") if t.get(k))
     until = f"until {timefmt.long(move['ends'], where)}" if move["ends"] else "with no known end"
-    return (f"moved from {old}" + (f" ({pin})" if pin else "") + f" to {move['new']}, tier {move['tier']}: "
+    kept = f", effort {move['effort']}" if move.get("effort") else ""
+    if move.get("at_once"):
+        return (f"moved at once from {old}" + (f" ({pin})" if pin else "") + f" to {move['new']}, tier "
+                f"{move['tier']}{kept}: {old} cannot start new work ({move['why']}) {until}, and its pin is a "
+                f"preference, not one the user's own words require (pin_required).")
+    return (f"moved from {old}" + (f" ({pin})" if pin else "") + f" to {move['new']}, tier {move['tier']}{kept}: "
             f"{old} cannot start new work ({move['why']}) {until}. Its pin was not marked required "
-            f"(label {REQUIRED_LABEL}).")
+            f"(pin_required).")
 
 
 NOTE_RE = re.compile(r"(?:\n\n|^)" + re.escape(NOTE_PREFIX) + r"[^\n]*")
@@ -169,29 +213,41 @@ def strip_notes(spec: str) -> str:
 
 
 def plan(db: DB, cfg: dict, stops: dict[str, tuple[str, float | None]], ok: list[str],
-         now: float) -> tuple[list[dict], list[dict]]:
-    """The moves to make now and the running tasks to report: ([{task, old, new, tier, why, ends}],
-    [{task, provider, why, ends}]). `stops` maps each provider that cannot start new work to (why, end);
-    `ok` lists the targets that can, best first."""
+         now: float, holds: dict[str, tuple[str, float | None]] | None = None) -> tuple[list[dict], list[dict]]:
+    """The moves to make now and the running tasks to report: ([{task, old, new, tier, effort, why,
+    ends, at_once}], [{task, provider, why, ends}]). `stops` maps each provider that cannot start new
+    work to (why, end); `holds` (stops when not given) adds those whose end is unknown, which move a
+    preference pin at once; `ok` lists the targets that can, best first."""
+    holds = stops if holds is None else holds
     limit = after_h(cfg)
-    if not limit or not stops:
+    if not limit or not holds:
         return [], []
     core = cfg.get("core_provider") or "claude"
     moves, running = [], []
     for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','waiting','running') ORDER BY priority, id"):
         old = t["provider"] or core
-        if old not in stops:
+        if old not in holds:
             continue
-        why, ends = stops[old]
-        if ends is not None and ends - now <= limit * 3600:
-            continue
+        # A pin to another provider than the core one, not marked required, is a preference: it
+        # waits for nothing. Anything else moves only off a stop longer than the threshold.
+        at_once = old != core and t["status"] != "running" and not required(db, t)
+        if not at_once:
+            if old not in stops:
+                continue
+            why, ends = stops[old]
+            if ends is not None and ends - now <= limit * 3600:
+                continue
+        else:
+            why, ends = holds[old]
         if t["status"] == "running":
             running.append({"task": t, "provider": old, "why": why, "ends": ends})
             continue
-        new = next((p for p in ok if p != old), None)
-        if not new or required(db, t):
+        order = ([core] if at_once and core in ok else []) + ok
+        new = next((p for p in order if p != old), None)
+        if not new or (not at_once and required(db, t)):
             continue
-        moves.append({"task": t, "old": old, "new": new, "tier": mapped_tier(cfg, old, t), "why": why, "ends": ends})
+        moves.append({"task": t, "old": old, "new": new, "tier": mapped_tier(cfg, old, t),
+                      "effort": kept_effort(new, t.get("effort")), "why": why, "ends": ends, "at_once": at_once})
     return moves, running
 
 
@@ -201,7 +257,7 @@ def apply(db: DB, cfg: dict, move: dict, now: float, where) -> str:
     text = f"{NOTE_PREFIX} {timefmt.long(now, where)}] {body[0].upper()}{body[1:]}"
     line = f"#{t['id']} {t['title'][:80]}: {body}"
     with db.tx():
-        db.update_task(t["id"], provider=move["new"], model=None, effort=None, tier=move["tier"],
+        db.update_task(t["id"], provider=move["new"], model=None, effort=move.get("effort"), tier=move["tier"],
                        spec=f"{t['spec']}\n\n{text}" if t["spec"] else text)
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (now, "daemon", KIND, "low", line[:500], "handled", t["id"]))

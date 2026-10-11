@@ -109,6 +109,7 @@ class Provider:
     api_host = ""
     api_base_env = ""
     login_hint = "log in to the agent CLI there"   # how the user fixes "logged out" on this provider
+    efforts: tuple[str, ...] = ()    # effort levels the CLI takes, lowest first (failover keeps a pin in them)
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
