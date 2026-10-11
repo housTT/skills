@@ -29154,6 +29154,53 @@ def test_sandboxed_checks_are_queued_and_finish_model_free(env, tmp_path, monkey
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+def test_queued_checks_survive_the_launching_process_exit(env, tmp_path, monkeypatch):
+    from ttp import cli, detach
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    launcher = subprocess.run(
+        [sys.executable, "-c", "from ttp import cli, push; push._boxed = lambda: True; "
+         "cli.main(['checks', '--detach', '--', 'true'])"],
+        cwd=repo, env={**os.environ, "PYTHONPATH": str(RUNTIME)}, capture_output=True, text=True, timeout=30)
+    assert launcher.returncode == 0 and "queued" in launcher.stdout, launcher.stderr
+    assert not (run / cli.CHECKS_PID).exists(), "the disposable launcher must start no checks"
+    detach.tend(p)   # the launcher has exited before the durable executor starts the checks
+    info = cli._read_checks_pid(run)
+    assert info["started"] == proc_start(info["pid"])
+    assert _wait_precheck(run) == "0"
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert cli._checks_result(run) == 0
+
+
+def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started = tmp_path / "started"
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", "sh", "-c", f"touch {started}; sleep 60"])
+    detach.tend(p)
+    info = cli._read_checks_pid(run)
+    try:
+        assert _wait_for(started.exists)
+        os.killpg(info["pid"], signal.SIGKILL)
+        assert _wait_for(lambda: _gone_pid(info["pid"]))
+        assert not (run / cli.CHECKS_RC).exists()
+        # Simulate the dead child's pid being reused by a live, unrelated process.
+        info.update(pid=os.getpid(), started="previous process incarnation")
+        assert proc_start(info["pid"]) != info["started"]
+        (run / cli.CHECKS_PID).write_text(json.dumps(info))
+        assert cli._checks_result(run) == 0, "a pid collision must not leave the task asleep"
+        assert (run / cli.CHECKS_RC).read_text().strip() == "killed"
+        os.kill(os.getpid(), 0)   # the unrelated process remains alive
+    finally:
+        if info["pid"] != os.getpid():
+            try:
+                os.killpg(info["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, detach, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
