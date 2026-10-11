@@ -23,7 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, credits, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -124,7 +124,10 @@ def _repo_list(v: Any) -> list[str]:
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.max_parallel_workers": int,
+    "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
+    "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str,
     "coordinator.unblock_effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
@@ -449,8 +452,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 money += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
                           f"${float(n.get('global_cap') or 0):.0f} today ({n.get('global_includes') or 'this account'}"
                           f"{stale})")
+        path = credits.unblock_path(db, p.config(), prov, now)
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
-                     f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
+                     f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}"
+                     + (f" · unblock path: {path}" if path else ""))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     section("budget", lines)
     lines = []
@@ -504,7 +509,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
-    section("blocker_sweep", sweep.digest_lines(db, event_ids, now))
+    section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")
@@ -653,11 +658,13 @@ def _norm_severity(s: str | None) -> str:
 # reserve; code_tasks_may_push lets work land without a separate review. Turning that flag off is the
 # safe direction and needs no one's word. Everything else the coordinator decides on its own.
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
-              "budget.global_daily_usd": "spend",
+              "budget.global_daily_usd": "spend", "budget.reset_credits_auto": "spend",
+              "budget.reset_credit_min_hours": "spend", "budget.reset_credit_expiry_hours": "spend",
+              "budget.reset_credit_expiry_use_pct": "spend",
               "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
               "delivery.fast_forward_also": "restriction", "delivery.mirror_remotes": "restriction",
               "delivery.allow_protected_push_branch": "restriction", MERGE_KEY: "merge"}
-SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also",
+SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch"}
 

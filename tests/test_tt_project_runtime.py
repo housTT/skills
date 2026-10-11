@@ -43797,3 +43797,370 @@ def test_sweep_upgrade_continuations_stay_disjoint_with_resolved_items(env):
         seen.extend(keys)
         p.db.x("UPDATE events SET status='handled' WHERE id=?", (event["id"],))
     assert sorted(seen) == sorted(f"task:{t}" for t in tids) and eid
+
+# Provider credits and free window resets (credits.py) ------------------------------------------------
+def _credit_answer(**over):
+    """A rate-limit answer shaped like the Codex app-server's: windows, paid credits, free resets."""
+    ans = {"rateLimits": {"primary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": 1700000000},
+                          "secondary": {"usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1700500000},
+                          "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                          "spendControlReached": False, "planType": "plus", "rateLimitReachedType": None},
+           "rateLimitResetCredits": {"availableCount": 2, "credits": [
+               {"id": "late", "resetType": "codexRateLimits", "status": "available", "expiresAt": 1800000000},
+               {"id": "early", "resetType": "codexRateLimits", "status": "available", "expiresAt": 1790000000},
+               {"id": "gone", "status": "consumed", "expiresAt": 1700000000}]}}
+    ans.update(over)
+    return ans
+
+
+def test_credits_parse_reads_every_field_and_takes_missing_or_malformed_as_unknown():
+    from ttp import credits
+    r = credits.parse(_credit_answer())
+    assert r == {"paid": {"has_credits": False, "unlimited": False, "balance": 0.0},
+                 "spend_control_reached": False, "reached_type": None, "free_resets": 2,
+                 "resets": [{"id": "early", "expires_at": 1790000000.0}, {"id": "late", "expires_at": 1800000000.0}]}, r
+    assert not credits.paid_open(r) and credits.summary(r) == "2 free resets"
+    # Absent: every field unknown, never "has credits"; no resets to consume.
+    for empty in ({}, None, "x", {"rateLimits": {}}):
+        r = credits.parse(empty)
+        assert r["paid"] == {"has_credits": None, "unlimited": None, "balance": None}, r
+        assert r["free_resets"] is None and r["resets"] == [] and r["spend_control_reached"] is None
+        assert not credits.paid_open(r) and credits.summary(r) == ""
+    # Malformed: strings for booleans, a list for the credits, bad ids and times.
+    r = credits.parse({"rateLimits": {"credits": {"hasCredits": "true", "unlimited": 1, "balance": "lots"},
+                                      "spendControlReached": "no"},
+                       "rateLimitResetCredits": {"availableCount": "2", "credits": [
+                           {"id": 7}, "x", {"id": "", "expiresAt": 5}, {"id": "ok", "expiresAt": "soon"},
+                           {"id": "ms", "expiresAt": 1790000000000}, {"id": "iso", "expiresAt": "2026-10-22T00:00:00Z"}]}})
+    assert r["paid"] == {"has_credits": None, "unlimited": None, "balance": None} and r["spend_control_reached"] is None
+    assert [c["id"] for c in r["resets"]] == ["ms", "iso", "ok"] and r["resets"][0]["expires_at"] == 1790000000.0
+    assert r["resets"][2]["expires_at"] is None and r["free_resets"] == 3, "count falls back on the list"
+    assert not credits.paid_open(r)
+    # Paid credits open the window unless the spend control is reached.
+    paid = credits.parse({"credits": {"hasCredits": True}, "spendControlReached": False})
+    assert credits.paid_open(paid) and credits.summary(paid) == "paid credits"
+    assert credits.paid_open(credits.parse({"credits": {"unlimited": True}}))
+    stop = credits.parse({"credits": {"hasCredits": True}, "spendControlReached": True})
+    assert not credits.paid_open(stop) and credits.summary(stop) == "spend limit reached"
+
+
+def _held(p, util=95.0, resets_in_h=40.0, now=None, window="7d"):
+    from ttp.budget import Window
+    now = now or time.time()
+    return [Window("codex", window, util, now + resets_in_h * 3600, "acct")]
+
+
+def test_reset_credit_choice_earliest_expiry_min_hours_expiry_rule_one_per_window_and_off(env):
+    from ttp import credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    far = {"id": "far", "expires_at": now + 30 * 86400}
+    near = {"id": "near", "expires_at": now + 10 * 86400}
+    reading = {"resets": [near, far], "free_resets": 2}
+    # Held at the line (90) with the reset 40 h away: the earliest-expiring credit, against that window.
+    pick = credits.decide(p.db, cfg, "codex", _held(p, now=now), reading, now)
+    assert pick["credit"] == "near" and pick["why"] == "held" and pick["window"] == "7d", pick
+    # The reset is under budget.reset_credit_min_hours (12) away: the window just waits.
+    assert credits.decide(p.db, cfg, "codex", _held(p, resets_in_h=11, now=now), reading, now) is None
+    cfg["budget"]["reset_credit_min_hours"] = 8
+    assert credits.decide(p.db, cfg, "codex", _held(p, resets_in_h=11, now=now), reading, now)["credit"] == "near"
+    cfg["budget"]["reset_credit_min_hours"] = 12
+    # Below the line nothing is held: no consume, unless the credit is about to lapse.
+    assert credits.decide(p.db, cfg, "codex", _held(p, util=60, now=now), reading, now) is None
+    soon = {"resets": [{"id": "soon", "expires_at": now + 47 * 3600}], "free_resets": 1}
+    pick = credits.decide(p.db, cfg, "codex", _held(p, util=60, resets_in_h=5, now=now), soon, now)
+    assert pick["credit"] == "soon" and pick["why"] == "expiring", pick
+    # ... but not on a window under budget.reset_credit_expiry_use_pct (50) % used: that would waste it.
+    assert credits.decide(p.db, cfg, "codex", _held(p, util=40, now=now), soon, now) is None
+    cfg["budget"]["reset_credit_expiry_use_pct"] = 30
+    assert credits.decide(p.db, cfg, "codex", _held(p, util=40, now=now), soon, now)["why"] == "expiring"
+    cfg["budget"]["reset_credit_expiry_hours"] = 24
+    assert credits.decide(p.db, cfg, "codex", _held(p, util=40, now=now), soon, now) is None
+    # One per window: once a reset was spent against this window's reset time, not again.
+    wins = _held(p, now=now)
+    credits._finish(p.db, "codex", {"credit": "x", "window": "7d", "against": wins[0].resets_at + 30}, "reset", now)
+    assert credits.decide(p.db, cfg, "codex", wins, reading, now) is None
+    nxt = _held(p, resets_in_h=40 + 7 * 24, now=now)
+    assert credits.decide(p.db, cfg, "codex", nxt, reading, now)["credit"] == "near", "the next window may"
+    # Off: nothing is consumed, and the sweep says so.
+    cfg["budget"]["reset_credits_auto"] = False
+    assert credits.decide(p.db, cfg, "codex", nxt, reading, now) is None
+    assert credits.decide(p.db, p.config(), "codex", nxt, {"resets": []}, now) is None
+    assert credits.decide(p.db, p.config(), "codex", nxt, None, now) is None
+
+
+class _ResetProvider:
+    """Stands in for a provider's consume endpoint (never the real one): records each call."""
+
+    def __init__(self, answers):
+        self.answers, self.calls, self.last_credits = list(answers), [], None
+
+    def consume_reset(self, credit, key):
+        self.calls.append((credit, key))
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+def test_reset_consume_saves_its_key_first_reuses_it_after_a_crash_and_never_spends_twice(env):
+    from ttp import credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    reading = {"resets": [{"id": "c1", "expires_at": now + 86400 * 9}, {"id": "c2", "expires_at": now + 86400 * 20}],
+               "free_resets": 2}
+    seen = {}
+
+    class Crash(BaseException):
+        pass
+
+    class Dies(_ResetProvider):
+        def consume_reset(self, credit, key):
+            seen["pending"] = p.db.kv(credits.PENDING + "codex")
+            super().consume_reset(credit, key)
+            raise Crash()   # the daemon dies mid-call: no answer, nothing recorded after
+    prov = Dies([None])
+    with pytest.raises(Crash):
+        credits.consume(p.db, cfg, "codex", prov, wins, reading, now)
+    key = prov.calls[0][1]
+    assert prov.calls == [("c1", key)] and len(key) >= 16
+    assert seen["pending"]["key"] == key and seen["pending"]["credit"] == "c1", "saved before the call"
+    # After the restart: no retry before RETRY_S; then the same credit with the same key.
+    again = _ResetProvider([{"ok": True, "outcome": "reset"}])
+    assert credits.consume(p.db, cfg, "codex", again, wins, reading, now + 60) is None and again.calls == []
+    done = credits.consume(p.db, cfg, "codex", again, wins, reading, now + credits.RETRY_S + 1)
+    assert again.calls == [("c1", key)] and done["outcome"] == "reset" and done["credit"] == "c1", done
+    assert p.db.kv(credits.PENDING + "codex") is None
+    # The window had its reset: a later reading still at the line consumes nothing more.
+    later = _ResetProvider([{"ok": True, "outcome": "reset"}])
+    assert credits.consume(p.db, cfg, "codex", later, wins, reading, now + 3600) is None and later.calls == []
+    assert [u["credit"] for u in credits.used(p.db, "codex")] == ["c1"]
+
+
+def test_reset_consume_confirmed_by_the_next_reading_gives_up_after_tries_and_skips_unsupported(env):
+    from ttp import credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, now=now)
+    reading = {"resets": [{"id": "c1", "expires_at": now + 86400 * 9}], "free_resets": 1}
+    # A lost answer: the next reading no longer lists the credit, so the consume went through.
+    lost = _ResetProvider([{"ok": False, "error": "no answer from `codex app-server`"}])
+    assert credits.consume(p.db, cfg, "codex", lost, wins, reading, now) == {
+        "error": "no answer from `codex app-server`", "attempts": 1}
+    done = credits.consume(p.db, cfg, "codex", lost, wins, {"resets": [], "free_resets": 0}, now + 5)
+    assert done["outcome"] == "reset (confirmed by the next reading)" and len(lost.calls) == 1
+    # Errors with the credit still listed: retried with one key up to MAX_TRIES, then given up.
+    p.db.x("DELETE FROM kv WHERE key=?", (credits.USED + "codex",))
+    bad = _ResetProvider([{"ok": False, "error": "e1"}, RuntimeError("e2"), {"ok": False, "outcome": "denied"}])
+    t = now
+    for i in range(credits.MAX_TRIES):
+        out = credits.consume(p.db, cfg, "codex", bad, wins, reading, t)
+        t += credits.RETRY_S + 1
+    assert len({k for _, k in bad.calls}) == 1 and len(bad.calls) == credits.MAX_TRIES
+    assert out["outcome"] == "failed: denied", out
+    text = credits.report_text("codex", out)
+    assert text.startswith("Could not use a free codex window reset") and "denied" in text
+    assert credits.consume(p.db, cfg, "codex", bad, wins, reading, t + 3600) is None, "that window gets no more tries"
+    # A provider without a consume endpoint: nothing kept pending.
+    p.db.x("DELETE FROM kv WHERE key=?", (credits.USED + "codex",))
+    assert credits.consume(p.db, cfg, "codex", _ResetProvider([None]), wins, reading, now) is None
+    assert p.db.kv(credits.PENDING + "codex") is None
+
+
+def test_codex_meter_reads_credits_and_consume_sends_the_key(env, monkeypatch, tmp_path):
+    from ttp.providers import codex
+    exe = tmp_path / "codex"
+    exe.write_text(FAKE_CLI.format(python=sys.executable))
+    exe.chmod(0o755)
+    monkeypatch.setattr(codex.Codex, "binary", lambda self: str(exe))
+    monkeypatch.setenv("FAKE_CLI_LOG", str(tmp_path / "log"))
+    monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps(_credit_answer()))
+    c = codex.Codex()
+    wins = c.meter()
+    assert [(w.window, w.utilization) for w in wins] == [("5h", 20.0), ("7d", 93.0)]
+    assert c.last_credits["free_resets"] == 2 and c.last_credits["resets"][0]["id"] == "early"
+    # The consume call goes to the stand-in CLI only (its answer echoes FAKE_CLI_SESSION).
+    monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"outcome": "reset"}))
+    assert c.consume_reset("early", "k1") == {"ok": True, "outcome": "reset"}
+    reqs = [json.loads(x)["request"] for x in (tmp_path / "log" / "app_server.jsonl").read_text().splitlines()
+            if "request" in json.loads(x)]
+    assert reqs[-1]["method"] == "account/rateLimitResetCredit/consume"
+    assert reqs[-1]["params"] == {"creditId": "early", "idempotencyKey": "k1"}
+    monkeypatch.setenv("FAKE_CLI_SESSION", json.dumps({"outcome": "alreadyConsumed"}))
+    assert c.consume_reset("early", "k1") == {"ok": False, "outcome": "alreadyConsumed"}
+
+
+def test_paid_credits_open_a_full_window_but_the_dollar_and_spend_limits_still_hold(env):
+    from ttp import budget as bud, credits
+    p = make(env)
+    cfg = p.config()
+    now = time.time()
+    wins = _held(p, util=95, now=now)
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3600, "codex", "acct", "7d", 95.0, wins[0].resets_at))
+    g = bud.evaluate(p.db, cfg, "codex", wins, now)
+    assert g.level == "red" and not g.allow_new_work, "without credits the line holds"
+    credits.record(p.db, "codex", credits.parse({"credits": {"hasCredits": True, "balance": "20"}}), "acct", now)
+    g = bud.evaluate(p.db, cfg, "codex", wins, now)
+    assert g.level != "red" and g.allow_new_work, (g.level, g.reasons)
+    assert any("paid credits" in r for r in g.reasons), g.reasons
+    assert g.numbers["paid_credits"]["usd"] == 0.0
+    # Spend past the line is real money: it counts toward the project's daily cap (100).
+    p.db.spend("codex", 60.0, "task:1", ts=now - 1800)
+    p.db.spend("codex", 45.0, "task:2", ts=now - 600)
+    p.db.spend("codex", 500.0, "task:0", ts=now - 7200)   # before the window reached the line: plan spend
+    g = bud.evaluate(p.db, cfg, "codex", wins, now)
+    assert g.numbers["paid_credits"]["usd"] == 105.0 and g.level == "red" and not g.allow_new_work, g.numbers
+    assert any(r.startswith("cap reached") for r in g.reasons), g.reasons
+    # The account's spend limit closes it whatever the credits say.
+    credits.record(p.db, "codex", credits.parse({"credits": {"unlimited": True}, "spendControlReached": True}), "acct", now)
+    g = bud.evaluate(p.db, cfg, "codex", wins, now)
+    assert g.level == "red" and any("spend limit reached" in r for r in g.reasons), g.reasons
+    # A stale reading says nothing about now.
+    credits.record(p.db, "codex", credits.parse({"credits": {"hasCredits": True}}), "acct", now - credits.FRESH_S - 5)
+    assert bud.evaluate(p.db, cfg, "codex", wins, now).level == "red"
+
+
+class _MeterProvider(_ResetProvider):
+    """A metered provider (no model call) whose window empties once a reset is consumed."""
+
+    def __init__(self, util, answers=(), resets=None):
+        super().__init__(answers)
+        self.util, self.reads, self.resets = util, 0, resets or []
+
+    def account(self):
+        return "acct"
+
+    def meter(self):
+        from ttp.budget import Window
+        self.reads += 1
+        self.last_credits = {"paid": {}, "free_resets": len(self.resets), "resets": list(self.resets)}
+        return [Window("codex", "7d", self.util, self.at, "acct")]
+
+    def consume_reset(self, credit, key):
+        out = super().consume_reset(credit, key)
+        if out and out.get("ok"):
+            self.util, self.resets = 0.0, [r for r in self.resets if r["id"] != credit]
+        return out
+
+
+def test_a_red_provider_is_remetered_every_10_min_and_starts_on_the_first_reading_under_the_line(env, monkeypatch):
+    import threading
+    from ttp import budget as bud, daemon as dm
+    p = make(env)
+    p.db.add_task("codex work", "x", kind="work", tier="light", origin="coordinator", provider="codex")
+    d = dm.Daemon(p.base)
+    now = time.time()
+    prov = _MeterProvider(95.0)
+    prov.at = now + 3 * 3600   # resets in 3 h: no free reset would be used anyway
+    monkeypatch.setattr(dm, "get_provider", lambda name: prov)
+
+    class Sync:
+        def __init__(self, target, daemon=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+    monkeypatch.setattr(threading, "Thread", Sync)
+    clock = {"t": now}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    d._refresh_meters()
+    d.update_gates()
+    assert d.gates["codex"].level == "red" and prov.reads == 1
+    clock["t"] = now + 300
+    d._refresh_meters()
+    assert prov.reads == 1, "not before 10 min"
+    p.db.x("UPDATE tasks SET status='waiting' WHERE provider='codex'")   # held: only the red gate wants it
+    prov.util = 40.0
+    clock["t"] = now + dm.METER_EVERY_S + 1
+    d._refresh_meters()
+    assert prov.reads == 2, "a red provider is read every 10 min even with nothing queued"
+    p.db.x("UPDATE tasks SET status='queued' WHERE provider='codex'")
+    d.update_gates()
+    assert d.gates["codex"].level != "red" and d.gates["codex"].allow_new_work
+    assert [w.utilization for w in bud.plan_windows(p.db, clock["t"]) if w.provider == "codex"] == [40.0]
+
+
+def test_a_consumed_reset_remeters_at_once_and_is_reported_once_at_low_severity(env, monkeypatch):
+    from ttp import credits, daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    now = time.time()
+    prov = _MeterProvider(95.0, [{"ok": True, "outcome": "reset"}],
+                          resets=[{"id": "r2", "expires_at": now + 20 * 86400}, {"id": "r1", "expires_at": now + 9 * 86400}])
+    prov.resets.sort(key=lambda r: r["expires_at"])
+    prov.at = now + 60 * 3600
+    monkeypatch.setattr(dm, "get_provider", lambda name: prov)
+    sent = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", every_s=0: sent.append((key, text, severity)))
+    d._meter_providers(p.db, ["codex"])
+    assert prov.calls and prov.calls[0][0] == "r1" and prov.reads == 2, "consumed the earliest, then read again"
+    assert credits.latest(p.db, "codex")["free_resets"] == 1
+    d._report_resets()
+    d._report_resets()
+    assert len(sent) == 1 and sent[0][2] == "low" and sent[0][0] == "reset-credit:codex:r1", sent
+    assert "Used one free codex window reset" in sent[0][1] and "95%" in sent[0][1] and "Held work starts again" in sent[0][1]
+    assert credits.unreported(p.db, "codex") == []
+    # Read again at the line in the same window: no second consume.
+    prov.util = 95.0
+    d._meter_providers(p.db, ["codex"])
+    assert len(prov.calls) == 1
+
+
+def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):
+    from ttp import credits
+    from ttp.web import budget_line
+    p = make(env)
+    now = time.time()
+    snap = lambda prov, win, util, resets: p.db.x(  # noqa: E731
+        "INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+        (now - 60, prov, "", win, util, resets))
+    snap("claude", "five_hour", 4.4, now + 3.94 * 3600)
+    snap("codex", "5h", 10.0, now + 3600)
+    snap("codex", "7d", 93.0, now + 2 * 86400)
+    base = budget_line(p.db, now)
+    assert "free reset" not in base and "credits" not in base
+    credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now)
+    line = budget_line(p.db, now)
+    assert line == base + ", codex 7d 93%, 2 free resets", line
+    credits.record(p.db, "claude", credits.parse({"credits": {"hasCredits": True}}), "", now)
+    line = budget_line(p.db, now)
+    assert line == base + ", paid credits, codex 7d 93%, 2 free resets", line
+    assert "\n" not in line
+    credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now - credits.FRESH_S - 1)
+    assert budget_line(p.db, now) == base + ", paid credits", "a stale reading is left out"
+
+
+def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock_path(env):
+    from ttp import credits, sweep
+    from ttp import coordinator as coord
+    from ttp.budget import Gate
+    p = make(env)
+    now = time.time()
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                (now, "daemon", sweep.SWEEP_KIND, "normal", "Blocker sweep", "{}", "queued"))
+    p.db.set_kv("gates", {"codex": {"level": "red", "reasons": ["7d window at 95% (line 90%)"]}})
+    lines = sweep.digest_lines(p.db, [ev], now, p.config())
+    assert lines[-1] == ("- provider codex held (no sweep action; 7d window at 95% (line 90%)) | unblock path: "
+                         "none reported (no free resets or paid credits)"), lines[-1]
+    credits.record(p.db, "codex", credits.parse(_credit_answer(**{"rateLimits": {
+        "credits": {"hasCredits": True}}})), "", now)
+    credits._finish(p.db, "codex", {"credit": "x", "window": "7d", "against": now + 9}, "reset", now - 7200)
+    line = sweep.digest_lines(p.db, [ev], now, p.config())[-1]
+    assert line.endswith("unblock path: 2 free window reset(s) (consumed automatically when held); paid credits "
+                         "(the window does not hold; the dollar caps apply); last free reset 2.0 h ago: reset"), line
+    cfg = p.config()
+    cfg["budget"]["reset_credits_auto"] = False
+    assert "(auto-consume off)" in sweep.digest_lines(p.db, [ev], now, cfg)[-1]
+    g = Gate(provider="codex", level="red", reasons=["held"])
+    text = coord.digest(p, {"codex": g.as_dict()}, [], [])
+    assert "unblock path: 2 free window reset(s)" in text, text[:2000]
+    src = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "free window resets and paid credits are an unblock path" in " ".join(src.split())

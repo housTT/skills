@@ -34,6 +34,7 @@ from . import anchors
 from . import audit
 from . import awake
 from . import budget as bud
+from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordcheck
@@ -87,6 +88,8 @@ from .providers.jev import Jev, JevOutOfFunds
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
+# Free plan-window meters (and credit readings) are read this often; a red provider's on every pass.
+METER_EVERY_S = 600
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
@@ -2521,31 +2524,68 @@ class Daemon:
                   "handled" if id(f) in folded else "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
-    def _refresh_meters(self, every_s: float = 600) -> None:
+    def _refresh_meters(self, every_s: float = METER_EVERY_S) -> None:
         """Providers that expose plan windows for free (no model call) are read in the background,
-        so headroom stays current between runs. Claude's windows arrive with every run instead."""
+        so headroom stays current between runs. Claude's windows arrive with every run instead. A
+        provider whose gate is red is always read, every `every_s` (10 min), so held work starts on
+        the first reading under the line. Each read also takes the provider's credits and free
+        window resets, and may consume one (credits.consume)."""
+        self._report_resets()
         now = time.time()
         if now - getattr(self, "_last_meter", 0) < every_s or getattr(self, "_metering", False):
             return
         self._last_meter, self._metering = now, True
         wanted = {self.cfg.get("core_provider", "claude")} | {t["provider"] for t in self.p.db.q(
-            "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")}
+            "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")} | {
+            p for p, g in self.gates.items() if g.level == "red"}
 
         def work() -> None:
             from .db import DB
             db = DB(self.p.state / "project.db")        # this thread's own connection
             try:
-                for name in wanted - {"claude", "fake"}:
-                    try:
-                        wins = get_provider(name).meter()
-                    except Exception:
-                        wins = []
-                    if wins:
-                        bud.record_windows(db, wins)
+                self._meter_providers(db, sorted(wanted - {"claude", "fake"}))
             finally:
                 db.close()
                 self._metering = False
         threading.Thread(target=work, daemon=True).start()
+
+    def _meter_providers(self, db, names: list[str]) -> None:
+        """Read each provider's windows and credits; when a free reset is due, consume it and read
+        again at once, so held work starts on the next tick."""
+        for name in names:
+            try:
+                prov = get_provider(name)
+                wins = self._meter_one(db, name, prov)
+                if wins and credits.consume(db, self.cfg, name, prov, wins, prov.last_credits):
+                    self._meter_one(db, name, prov)
+            except Exception:
+                log(self.p, f"meter {name} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
+
+    @staticmethod
+    def _meter_one(db, name: str, prov) -> list:
+        prov.last_credits = None
+        try:
+            wins = prov.meter()
+        except Exception:
+            wins = []
+        if wins:
+            bud.record_windows(db, wins)
+        if prov.last_credits is not None:
+            credits.record(db, name, prov.last_credits, wins[0].account if wins else "")
+        return wins
+
+    def _report_resets(self) -> None:
+        """Log each free reset consumed (or given up on) and report it once at low severity. Kept in
+        the state until reported, so a restart between the consume and its report loses neither."""
+        for r in self.p.db.q("SELECT key FROM kv WHERE key LIKE ?", (credits.USED + "%",)):
+            prov = r["key"][len(credits.USED):]
+            news = credits.unreported(self.p.db, prov)
+            for u in news:
+                text = credits.report_text(prov, u, lambda t: timefmt.long(t, self.p))
+                log(self.p, text)
+                self.alert(f"reset-credit:{prov}:{u.get('credit')}", text, severity="low", every_s=0)
+            if news:
+                credits.mark_reported(self.p.db, prov, news)
 
     def _provider_pause(self, prov: str) -> dict | None:
         """The provider's pause, or None once a logged-out pause is over because a login changed its

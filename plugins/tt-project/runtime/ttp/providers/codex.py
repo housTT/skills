@@ -259,10 +259,12 @@ class Codex(Provider):
         if not exe:
             return []
         from ..budget import Window
+        from ..credits import parse
         msg = app_server_call([exe, "app-server"], "account/rateLimits/read")
         if msg is None:
             return []
         res = msg.get("result") or {}
+        self.last_credits = parse(res)
         rl, allowed = res.get("rateLimits") or {}, res.get("ordinaryUsageAllowed", True)
         wins = []
         for key in ("primary", "secondary"):
@@ -275,6 +277,21 @@ class Codex(Provider):
             # Keyed like the readings its runs report, so the gate matches them to the account.
             wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), self.account()))
         return wins
+
+    def consume_reset(self, credit_id: str, key: str) -> dict | None:
+        """`account/rateLimitResetCredit/consume`: resets the plan windows at once. Outcome 'reset'
+        is success; the idempotency key makes a retry of the same consume a no-op."""
+        exe = self.binary()
+        if not exe:
+            return {"ok": False, "error": "codex not found"}
+        msg = app_server_call([exe, "app-server"], "account/rateLimitResetCredit/consume",
+                              {"creditId": credit_id, "idempotencyKey": key})
+        if msg is None:
+            return {"ok": False, "error": "no answer from `codex app-server`"}
+        if "error" in msg:
+            return {"ok": False, "error": json.dumps(msg["error"])[:300]}
+        outcome = str((msg.get("result") or {}).get("outcome") or "")
+        return {"ok": outcome == "reset", "outcome": outcome or "no outcome"}
 
     def resolved_session(self, argv, cwd, env=None):
         # The app-server's `thread/start` answers with the model and reasoning effort the session

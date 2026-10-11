@@ -302,7 +302,10 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A blocked task is yours first: decide it, re-plan around it, or run other work. Nothing waits on
   the user while anything useful remains.
 - A `Blocker sweep` turn re-checks everything stuck (every few hours, sooner when something it
-  waits on changed): record exactly one `sweep` outcome per item listed.
+  waits on changed): record exactly one `sweep` outcome per item listed. A provider held by its
+  plan window is not out of options: free window resets and paid credits are an unblock path. The
+  daemon consumes a free reset itself when a window holds work for hours, and paid credits keep
+  work going under the dollar caps; the budget line and the sweep show which exist and what was used.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming the ask,
   resource, time or probe that ends it.
 - `ask_user` only when you cannot go on without them, and always set `blocking` to the reason:

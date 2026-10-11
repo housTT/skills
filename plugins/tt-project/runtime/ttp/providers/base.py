@@ -266,8 +266,16 @@ class Provider:
         return ""
 
     def meter(self) -> list:
-        """Plan-window utilization for the whole account, when the provider exposes it."""
+        """Plan-window utilization for the whole account, when the provider exposes it. A meter that
+        also reads credits and free window resets leaves them in `last_credits` (credits.parse)."""
         return []
+
+    last_credits: dict | None = None
+
+    def consume_reset(self, credit_id: str, key: str) -> dict | None:
+        """Consume one free window reset: {"ok", "outcome", "error"}; None when the provider has none.
+        `key` is the idempotency key: the same key never consumes twice."""
+        return None
 
 
 _CLI_OUTPUT: dict[tuple, str] = {}

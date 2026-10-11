@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import heal, identity, pushq, release, responsibilities, timefmt, waits
+from . import credits, heal, identity, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
 from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -184,8 +184,11 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
     dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
     billed by use, which counts only spend whose account was billed by use when it was spent
-    (billing.py), not an earlier plan account's. An item without data is left out. Pacing, targets and caps are in the Budget tab.
-    Every provider holding ready work, core or not, is named at the end (holding): '..., codex 7d 93% holding 1 task'."""
+    (billing.py), not an earlier plan account's. Free window resets and paid credits follow
+    ('2 free resets', 'paid credits'; another provider's with its fullest window: 'codex 7d 93%, 2 free
+    resets'). Every provider holding ready work, core or not, is named at the end (holding):
+    '..., codex 7d 93% holding 1 task'. An item without data is left out. Pacing, targets and caps
+    are in the Budget tab."""
     now = now or time.time()
     held = holding(db, now, core, gates)
     provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
@@ -210,7 +213,28 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
         peaks = window_peaks(db, prov, names, now, span, account) if account is not None else []
         if peaks:
             parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
-    return ", ".join(parts + held)
+    return ", ".join(parts + credit_parts(db, prov, now) + held)
+
+
+def credit_parts(db: DB, shown: str, now: float) -> list[str]:
+    """Credits and free window resets for the budget line: '2 free resets' for the provider the
+    line shows, 'codex 7d 93%, 2 free resets' (its fullest window) for any other that reports some."""
+    out = []
+    windows = bud.plan_windows(db, now)
+    for r in db.q("SELECT key FROM kv WHERE key LIKE ? ORDER BY key", (credits.KV + "%",)):
+        prov = r["key"][len(credits.KV):]
+        text = credits.summary(credits.latest(db, prov, now))
+        if not text:
+            continue
+        if prov != shown:
+            w = max((w for w in windows if w.provider == prov), key=lambda w: w.utilization, default=None)
+            text = f"{prov} {_label(w.window)} {w.utilization:.0f}%, {text}" if w else f"{prov} {text}"
+        out.append(text)
+    return out
+
+
+def _label(window: str) -> str:
+    return "5h" if window in FIVE_HOUR else "7d" if window in SEVEN_DAY else window
 
 
 def usage_line(n: dict, now: float) -> str:

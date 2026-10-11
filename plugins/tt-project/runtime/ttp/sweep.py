@@ -30,7 +30,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import failover, settinghold, unblock
+from . import credits, failover, settinghold, unblock
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -462,8 +462,10 @@ def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
                      (event["ts"], "daemon", SWEEP_KIND, "normal", text, payload, "queued"))
 
 
-def digest_lines(db: DB, event_ids: list[int], now: float | None = None) -> list[str]:
-    """Only this batch's sweep identities; later batches stay queued for consecutive turns."""
+def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: dict | None = None) -> list[str]:
+    """Only this batch's sweep identities; later batches stay queued for consecutive turns. A provider
+    held red by its budget gate gets a line with its unblock path (free window resets, paid credits,
+    the last reset used), though it is not a sweep item: the daemon consumes resets itself."""
     if not event_ids:
         return []
     events = db.q(f"SELECT data FROM events WHERE kind=? AND id IN ({','.join('?' * len(event_ids))}) ORDER BY id",
@@ -476,7 +478,13 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None) -> list
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
     ordered = sorted(live.values(), key=lambda i: (i["key"] not in flagged and i["key"] not in loops,
                                                    -(i["age_s"] or 0)))
-    return [_header(len(live)), *(_line(i, state, outs, now) for i in ordered)]
+    out = [_header(len(live)), *(_line(i, state, outs, now) for i in ordered)]
+    for prov, g in sorted((db.kv("gates", {}) or {}).items()):
+        if isinstance(g, dict) and g.get("level") == "red":
+            path = credits.unblock_path(db, cfg or {}, prov, now)
+            out.append(f"- provider {prov} held (no sweep action; {_clip('; '.join(g.get('reasons') or []), 160)}) | "
+                       f"unblock path: {path or 'none reported (no free resets or paid credits)'}")
+    return out
 
 
 def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H) -> list[str]:

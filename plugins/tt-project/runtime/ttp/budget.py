@@ -23,6 +23,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import credits
 from . import globalcap as gcap
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
 from .billing import PLAN_LAPSE_RUNS, billed_by_account
@@ -166,41 +167,23 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                          f"the dollar caps")
     elif provider in lapsed:
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
+    reading = credits.latest(db, provider, now) if plan else None
+    paid = credits.paid_open(reading)
     if plan:
         g.regime = "windows"
-        _plan(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now)
+        _plan(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now, paid=paid)
+        if reading and reading.get("spend_control_reached") is True:
+            _raise(g, "red", f"{provider} reports its spend limit reached; new work waits until it lifts")
+        at_line = [r for r in g.numbers.get("plan") or [] if r["utilization"] >= limit]
+        if paid and at_line:
+            # Past the line the account runs on paid credits: real money, so this provider's spend
+            # since the first reading at the line counts toward the dollar caps and the global cap.
+            since = _paid_since(db, provider, at_line, limit, now)
+            extra = db.spent_since(since, provider) + in_flight(db, provider)
+            g.numbers["paid_credits"] = {"since": since, "usd": round(extra, 2)}
+            _caps(db, g, b, provider, windows, last, now, extra=extra)
     else:
-        # The caps bound the project's dollars, whichever provider spends them. Providers on plan
-        # windows are bounded by their windows instead, so their spend does not count here.
-        day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
-        # Only spend whose account was billed by use when it was spent counts (billing.py): spend of
-        # an account then on a plan stays plan spend after a switch drops its windows, and spend of
-        # a usage-billed account stays billed whenever it was. Windows passed in without a recorded
-        # reading cover their provider's spend up to now.
-        windowed = {w.provider: now for w in windows if w.provider not in last}
-        live = in_flight(db, exclude={p for p, until in windowed.items() if until >= now}, billed_at=now)
-        d = db.spent_since(now - DAY, exclude=windowed, billed=True) + live
-        w7 = db.spent_since(now - WEEK, exclude=windowed, billed=True) + live
-        g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2), "in_flight": round(live, 2),
-                          "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True,
-                                                                billed=True), 2),
-                          "daily_cap": day_cap, "weekly_cap": week_cap})
-        # The daily cap counts the fixed budget day (budget.day_start in budget.timezone) once one is
-        # set; without one, the last 24 h. The weekly cap stays rolling.
-        day = gcap.day_bounds(b, now)
-        today, label = d, "24h"
-        if day:
-            today, label = db.spent_since(day[0], exclude=windowed, billed=True) + live, "today"
-            g.numbers.update({"spent_today": round(today, 2), "day_start": day[0], "day_end": day[1]})
-        ratio = max(today / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
-        g.numbers["cap_ratio"] = round(ratio, 3)
-        if ratio >= 1.0:
-            _raise(g, "red", f"cap reached: ${today:.2f}/{label} of ${day_cap:.0f}, ${w7:.2f}/7d of ${week_cap:.0f}")
-        elif ratio >= 0.85:
-            _raise(g, "orange", f"{ratio:.0%} of cap used")
-        elif ratio >= 0.6:
-            _raise(g, "yellow", f"{ratio:.0%} of cap used")
-        _global(db, g, b, provider, day, now)
+        _caps(db, g, b, provider, windows, last, now)
 
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
     # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
@@ -252,7 +235,58 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     return g
 
 
-def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | None, now: float) -> None:
+def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: dict, now: float,
+          extra: float = 0.0) -> None:
+    """The dollar caps: the project's daily (or budget-day) and rolling 7 d spend billed by use, plus
+    `extra` (paid-credit spend past a plan window), against budget.daily_usd and weekly_usd, then the
+    global cap."""
+    # The caps bound the project's dollars, whichever provider spends them. Providers on plan
+    # windows are bounded by their windows instead, so their spend does not count here.
+    day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
+    # Only spend whose account was billed by use when it was spent counts (billing.py): spend of
+    # an account then on a plan stays plan spend after a switch drops its windows, and spend of
+    # a usage-billed account stays billed whenever it was. Windows passed in without a recorded
+    # reading cover their provider's spend up to now.
+    windowed = {w.provider: now for w in windows if w.provider not in last}
+    live = in_flight(db, exclude={p for p, until in windowed.items() if until >= now}, billed_at=now) + extra
+    d = db.spent_since(now - DAY, exclude=windowed, billed=True) + live
+    w7 = db.spent_since(now - WEEK, exclude=windowed, billed=True) + live
+    g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2), "in_flight": round(live, 2),
+                      "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True,
+                                                            billed=True), 2),
+                      "daily_cap": day_cap, "weekly_cap": week_cap})
+    # The daily cap counts the fixed budget day (budget.day_start in budget.timezone) once one is
+    # set; without one, the last 24 h. The weekly cap stays rolling.
+    day = gcap.day_bounds(b, now)
+    today, label = d, "24h"
+    if day:
+        today, label = db.spent_since(day[0], exclude=windowed, billed=True) + live, "today"
+        g.numbers.update({"spent_today": round(today, 2), "day_start": day[0], "day_end": day[1]})
+    ratio = max(today / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
+    g.numbers["cap_ratio"] = round(ratio, 3)
+    if ratio >= 1.0:
+        _raise(g, "red", f"cap reached: ${today:.2f}/{label} of ${day_cap:.0f}, ${w7:.2f}/7d of ${week_cap:.0f}")
+    elif ratio >= 0.85:
+        _raise(g, "orange", f"{ratio:.0%} of cap used")
+    elif ratio >= 0.6:
+        _raise(g, "yellow", f"{ratio:.0%} of cap used")
+    _global(db, g, b, provider, day, now, extra)
+
+
+def _paid_since(db: DB, provider: str, rows: list[dict], line: float, now: float) -> float:
+    """When the account first read at the line in the current period of the windows `rows`: its
+    spend from then on is paid-credit spend."""
+    first = now
+    for r in rows:
+        got = db.one("SELECT MIN(ts) t FROM snapshots WHERE provider=? AND window=? AND utilization>=? "
+                     "AND ABS(COALESCE(resets_at,0)-?)<600", (provider, r["window"], line, r["resets_at"] or 0))
+        if got and got["t"] is not None:
+            first = min(first, float(got["t"]))
+    return first
+
+
+def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | None, now: float,
+            extra: float = 0.0) -> None:
     """Red once the account's spend today on `provider`, across every project tt-project can see
     (globalcap.total), reaches budget.global_daily_usd (0 = off). It only ever closes the gate: a
     total that cannot be worked out leaves the project caps alone in charge. Red ends at the day's
@@ -266,6 +300,7 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     except Exception as e:
         g.reasons.append(f"global daily total unavailable ({type(e).__name__}); the project caps still apply")
         return
+    t = {**t, "usd": t["usd"] + extra}   # paid-credit spend past a plan window counts too
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
                       "global_includes": t["includes"], "global_resets_at": end if day else None})
     if t["usd"] >= cap:
@@ -275,7 +310,8 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
                          f"account{stale}{when}")
 
 
-def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float) -> None:
+def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float,
+          paid: bool = False) -> None:
     """Run all `most` workers below `line`; hold back only where running work would reach it.
 
     Unused capacity is lost at each reset, so nothing spreads use evenly over a window. Running work
@@ -311,7 +347,14 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
                "per_worker_per_h": None if per is None else round(per, 2), "horizon_h": round(span, 2),
                "running_add": None if add is None else round(running * add, 1), "allowed": fit}
         rows.append(row)
-        if w.utilization >= line:
+        if paid:
+            # Paid credits carry the account past the window, so it holds nothing back; the dollar
+            # caps bound the spend past the line instead (evaluate).
+            if w.utilization >= line:
+                g.reasons.append(f"{w.window} window at {w.utilization:.0f}%, past the {line:.0f}% line: paid "
+                                 f"credits let the account go on; the dollar caps apply")
+            row["allowed"] = most
+        elif w.utilization >= line:
             _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {line:.0f}% "
                              f"until it resets")
             row["allowed"] = 0
