@@ -1234,19 +1234,52 @@ def pr_branch_of(p: Project, task: dict | None) -> str:
     when it rebases one (`rebases:<branch>`: a rebase cannot fast-forward the old branch), or that of
     the task it continues (a fix of a failed review's findings builds on that task's work), or "".
     A task labelled worktree.NO_PR_BRANCH carries none, whatever the tasks it continues carry."""
+    return pr_branch_source(p, task)[1]
+
+
+def pr_branch_source(p: Project, task: dict | None) -> tuple[dict | None, str]:
+    """(the task whose label gives `task` its branch, that branch) as pr_branch_of finds them: `task`
+    itself or one it continues; (None, "") when it carries none."""
     from .db import continues_id
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
         if worktree.NO_PR_BRANCH in _labels(task):
-            return ""
+            return None, ""
         if onto := worktree.carried_branch(task):
-            return onto
+            return task, onto
         if worktree.rebased_branch(task) and (onto := str(task.get("branch") or "")):
-            return onto
+            return task, onto
         c = continues_id(task)
         task = p.db.task(c) if c is not None else None
-    return ""
+    return None, ""
+
+
+def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bool:
+    """Whether `branch` exists neither as a local branch of `repo` nor on the remote of
+    `delivery.push_branch` (`d`; else origin), so `ttp push --own` cannot publish onto it (own_target
+    never creates a carried branch). False whenever git cannot tell (not a repo, remote unreachable)."""
+    def git(*args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
+                                  timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        except (OSError, subprocess.SubprocessError):
+            return None
+    if not worktree.valid_branch(branch):
+        return False
+    r = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if r is None or r.returncode not in (0, 1) or r.stdout.strip():
+        return False
+    remotes = git("remote")
+    if remotes is None or remotes.returncode != 0:
+        return False
+    if not remotes.stdout.split():
+        return True   # no remote: the local branch is the only place it could be
+    ref = str(d.get("push_branch") or "").strip()
+    remote = _split_target(ref, remotes.stdout.split())[0] if ref else "origin"
+    ls = git("ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    return ls is not None and ls.returncode == 0 and not any(
+        ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
 
 
 def pr_elsewhere(p: Project, task: dict | None, d: dict) -> str:
@@ -1284,9 +1317,14 @@ def pr_branch_guard(p: Project, branch: str, task: str | None, d: dict) -> str:
     for t in rows:
         onto = pr_elsewhere(p, t, d)
         if onto and (m or onto == branch):
-            return (f"task #{t['id']} delivers onto its pr_branch {onto}, not {d['push_branch']}: a plain "
-                    f"`ttp push` would rebase it onto {d['push_branch']}. Publish it with "
-                    f"`ttp push --own --detach`")
+            src = pr_branch_source(p, t)[0] or t
+            whose = "its own label" if src["id"] == t["id"] else f"the label of #{src['id']}, which it continues"
+            return (f"task #{t['id']} delivers onto pr_branch {onto} ({whose}), not {d['push_branch']}: a "
+                    f"plain `ttp push` would rebase it onto {d['push_branch']}. Publish it with "
+                    f"`ttp push --own --detach`. If it should land on {d['push_branch']} instead, the label "
+                    f"is wrong: hand off blocked saying so; the coordinator clears it with task_update "
+                    f"pr_branch \"\" on a task not yet started, or a redo: task_add with continues #{t['id']} "
+                    f"and pr_branch \"\"")
     return ""
 
 

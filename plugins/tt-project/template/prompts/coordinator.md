@@ -160,8 +160,8 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   A follow-up (`continues` on a done task) carries a branch only through its own `pr_branch:`
   line: naming a branch alone leaves it on `delivery.push_branch`. A task that `continues` a
   failed or cancelled one carries the branch that one carried, unless its spec names only the
-  push branch or you set `pr_branch` to `""` (task_add, or task_update before it starts): then it
-  lands on the push branch.
+  push branch, that branch was never published (and its spec does not name it), or you set
+  `pr_branch` to `""` (task_add, or task_update before it starts): then it lands on the push branch.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
   out, once the failures are the machine's, not the task's own. A line marked "waits only" is

@@ -29907,7 +29907,8 @@ def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
     assert coord.apply(p, [{"type": "task_add", "title": "Fix the loader PR", "kind": "code", "continues": rev,
                             "spec": f"pr_branch: `{b}`\nFix the PR's CI."}]) == []
     assert labels("Fix the loader PR") == [f"pr_branch:{b}"]
-    # A continuation of a failed task keeps the branch that task carried.
+    # A continuation of a failed task keeps the branch that task carried (it exists).
+    subprocess.run(["git", "-C", str(p.root), "branch", "feature/x"], check=True, capture_output=True)
     gone = p.db.add_task("Fix the feature PR", "s", kind="code", labels=["pr_branch:feature/x"])
     p.db.update_task(gone, status="failed", branch=f"ttp/t{gone}-fix-the-feature-pr")
     assert coord.apply(p, [{"type": "task_add", "title": "Feature PR again", "kind": "code", "continues": gone,
@@ -29923,6 +29924,18 @@ def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
     assert labels("Land the entry, redo") == [f"continues:{bad}", "no_pr_branch"]
     assert push.pr_branch_of(p, redo) == "" and push.pr_elsewhere(p, redo, p.config()["delivery"]) == ""
     assert any(f"#{redo['id']} continues #{bad} but not its branch {b}" in n for n in p.db.kv(coord.NOTES_KEY))
+    # A branch never published (neither here nor on a remote) cannot be delivered onto: a redo that
+    # does not name it carries none; one that names it keeps it.
+    lost = p.db.add_task("Land the table", "s", kind="code", labels=["pr_branch:feature/never-made"])
+    p.db.update_task(lost, status="cancelled")
+    assert coord.apply(p, [{"type": "task_add", "title": "Land the table, redo", "kind": "code", "continues": lost,
+                            "spec": "Land the table."},
+                           {"type": "task_add", "title": "Make the table PR", "kind": "code", "continues": lost,
+                            "spec": "Create feature/never-made with the table."}]) == []
+    assert labels("Land the table, redo") == [f"continues:{lost}", "no_pr_branch"]
+    assert any(f"#{task('Land the table, redo')['id']} continues #{lost} but not its branch feature/never-made "
+               f"(never published)" in n for n in p.db.kv(coord.NOTES_KEY))
+    assert labels("Make the table PR") == [f"continues:{lost}"]
     # Or the coordinator says so: pr_branch "" on task_add ...
     bad2 = p.db.add_task("Land the docs", "s", kind="code", labels=["pr_branch:feature/x"])
     p.db.update_task(bad2, status="cancelled")
@@ -30994,7 +31007,8 @@ def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_pu
     _git_out(repo, "checkout", "-q", "-B", branch)
     for runner in (str(code), str(task([f"auto_review:{code}"], kind="review", depends_on=[code])[0])):
         monkeypatch.setenv("TTP_TASK", runner)
-        with pytest.raises(ValueError, match=r"pr_branch feature/x, not origin/proj.*ttp push --own --detach"):
+        with pytest.raises(ValueError, match=r"pr_branch feature/x \(its own label\), not origin/proj.*"
+                                             r"ttp push --own --detach"):
             push.resolve(p, repo)
         assert push.resolve(p, repo, own=True) == ("origin", "feature/x", True), runner
     # The review's run in the PR branch's own worktree (the task worked on it directly).
@@ -31005,8 +31019,19 @@ def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_pu
     fix, fbranch = task([f"continues:{code}"])
     _git_out(repo, "checkout", "-q", "-B", fbranch)
     monkeypatch.setenv("TTP_TASK", str(fix))
-    with pytest.raises(ValueError, match="pr_branch feature/x"):
+    # It names the task whose label it inherits and how the coordinator clears it.
+    with pytest.raises(ValueError, match=rf"pr_branch feature/x \(the label of #{code}, which it continues\).*"
+                                         rf"task_update pr_branch \"\".*task_add with continues #{fix} and "
+                                         rf"pr_branch \"\""):
         push.resolve(p, repo)
+    # A branch on the remote or here is published; one in neither place never was.
+    d = p.config()["delivery"]
+    assert not push.never_published(repo, d, "feature/x") and not push.never_published(repo, d, fbranch)
+    assert push.never_published(repo, d, "feature/never-made")
+    # A remote that cannot be read cannot tell.
+    _git_out(repo, "remote", "add", "dead", str(env["tmp"] / "no-such-remote.git"))
+    assert not push.never_published(repo, {"push_branch": "dead/proj"}, "feature/never-made")
+    _git_out(repo, "remote", "remove", "dead")
     # pr_branch is the push branch: the usual target.
     same, sbranch = task(["pr_branch:proj"])
     _git_out(repo, "checkout", "-q", "-B", sbranch)

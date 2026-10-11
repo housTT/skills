@@ -967,9 +967,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if old:
                     labels.append(f"continues:{old['id']}")
                 # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
-                # it says it carries none (`pr_branch: ""`) or names only the push branch to land on.
+                # it says it carries none (`pr_branch: ""`), names only the push branch to land on, or
+                # that branch was never published (`ttp push --own` cannot create it) and it does not
+                # name it.
                 inherited = push.pr_branch_of(p, old) if old and not onto else ""
-                if inherited and (a.get("pr_branch") == "" or _lands_on_push_branch(cfg, spec_text, inherited)):
+                unpublished = False
+                if inherited and not (a.get("pr_branch") == "" or _lands_on_push_branch(cfg, spec_text, inherited)):
+                    unpublished = not names_branch(spec_text, inherited) and push.never_published(
+                        p.root, cfg.get("delivery") or {}, inherited)
+                if inherited and (a.get("pr_branch") == "" or unpublished
+                                  or _lands_on_push_branch(cfg, spec_text, inherited)):
                     labels.append(worktree.NO_PR_BRANCH)
                 after, when = _start_args(a, {}, p)
                 labels += defer_labels(after, when, start_why(a, {}, when))
@@ -1004,8 +1011,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
                                  f"so `ttp push --own` publishes onto it")
                 if worktree.NO_PR_BRANCH in labels:
-                    notes.append(f"task_add: #{new_id} continues #{old['id']} but not its branch {inherited}: "
-                                 f"it delivers to the push branch with `ttp push`")
+                    notes.append(f"task_add: #{new_id} continues #{old['id']} but not its branch {inherited}"
+                                 f"{' (never published)' if unpublished else ''}: it delivers to the push "
+                                 f"branch with `ttp push`")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if pr_ask:
