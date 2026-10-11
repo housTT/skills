@@ -272,8 +272,11 @@ _SUBJECT_STOP = frozenset("""
     very want wants were what when where which while will with would your yours ask asks question
     recommendation recommend approve decide decision answer reply task tasks project""".split())
 # A bare reply: an answer word or a hand-back phrase in a short message.
-_BARE = re.compile(r"^\W*(yes|yeah|yep|yup|no|nope|ok|okay|sure|agreed?|approved?|go( ahead)?|do it|"
-                   r"proceed|fine|lgtm|ship it|option\s+\w+|[a-e1-9])\b", re.I)
+# A lone option letter or digit counts only as the whole reply or before punctuation ('b', 'B.', '2)'),
+# never before more words: 'A typo in ...' or '2 more people ...' is not an answer.
+_BARE = re.compile(r"^\W*((yes|yeah|yep|yup|no|nope|ok|okay|sure|agreed?|approved?|go( ahead)?|do it|"
+                   r"proceed|fine|lgtm|ship it|option\s+([a-e1-9]|one|two|three|four|five))\b"
+                   r"|[a-e1-9](?=\s*([^\w\s]|$)))", re.I)
 BARE_MAX_WORDS = 8
 
 
@@ -286,7 +289,7 @@ def about_ask(text: str, ask_id: int, ask_text: str | None) -> bool:
     subject word of the ask, or it is a bare reply (yes/no/ok or a hand-back phrase in a few words).
     Anything else is a message about something else, not that ask's answer."""
     text = text or ""
-    if re.search(rf"(?<![\w.]){ask_id}(?![\w.])", text):
+    if re.search(rf"(?:#|\b(?:re|ask|question)\s*#?){ask_id}(?![\w.])", text, re.I):   # not a bare count
         return True
     if len(text.split()) <= BARE_MAX_WORDS and (_BARE.search(text) or handback(text)):
         return True

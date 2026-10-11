@@ -1363,7 +1363,13 @@ def test_unblock_only_open_links_a_reply_only_when_it_is_about_the_ask(env):
     assert row["answered"] and row["how"] == "only_open" and row["answer"].startswith("the benchmark")
     for text, linked in ((f"re {a}: hold off", True), ("yes", True), ("No, not now.", True),
                          ("up to you", True), ("fix the docs typo in the readme", False),
-                         ("yes and while you are at it rewrite the whole docs section today", False)):
+                         ("yes and while you are at it rewrite the whole docs section today", False),
+                         ("A typo in the readme needs fixing", False),
+                         ("A quick question about the dashboard", False),
+                         ("2 more people joined today", False), ("Option to add a dashboard?", False),
+                         ("b", True), ("B.", True), ("2)", True), ("option 2", True), ("option b", True),
+                         (f"#{a} hold off", True), (f"ask {a}: no", True),
+                         (f"we shipped {a} more fixes to the parser this week", False)):
         assert unblock.about_ask(text, a, "Should the nightly benchmark run on the spare board?") is linked, text
 
 
