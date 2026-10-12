@@ -8,15 +8,15 @@ import pathlib
 # A run analyses one source implementation on one profile and, optionally, projects its kernel ops
 # onto destinations. A destination is a profile running the same code, or `quasar-bf16`: the code
 # with block-float dtypes turned into bfloat16 and mainline calls routed to Quasar forks.
-PROFILES = ("p100", "p150", "n150", "n300", "quasar")
+PROFILES = ("p100", "p150", "n150", "n300-1chip", "quasar")
 TARGET_LABELS = {
-    "p100": "P100", "p150": "P150", "n150": "N150", "n300": "N300 (one chip)", "quasar": "Quasar",
+    "p100": "P100", "p150": "P150", "n150": "N150", "n300-1chip": "N300, one chip", "quasar": "Quasar",
     "quasar-bf16": "Quasar, BF16 projection",
 }
 TARGETS = tuple(TARGET_LABELS)
 SOURCE_TARGETS = PROFILES
 # Destinations whose launches are traced: profiles that run the same code with their own grid.
-LAUNCH_PROFILES = ("p100", "p150", "n150", "n300")
+LAUNCH_PROFILES = ("p100", "p150", "n150", "n300-1chip")
 TARGET_PROFILE = {t: t for t in PROFILES} | {"quasar-bf16": "quasar"}
 
 STATUS_VALUES = ("✅", "⚠️", "❌", "n/a")

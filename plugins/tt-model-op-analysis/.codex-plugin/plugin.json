@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "Tenstorrent Model Op Analysis",
     "shortDescription": "List every kernel op one implementation of a tt-metal model runs and how each ports to other architectures, statically and with Tracy and TTsim measurements.",
-    "longDescription": "One skill analyses the kernel ops of one implementation of a model on its source profile (P100, P150, N150, N300 or Quasar) at a pinned tt-metal commit: every ttnn call of the entry test traced to its device op and program factory, with support decided per kernel op. Destinations (another profile running the same code, or a Quasar BF16 projection) are added to the same run without re-tracing. Measurements are resumable items: a Tracy run of the entry test on the source device and TTsim runs of Quasar kernel-op tests, on the run's commit. Output is CSV with a per-kernel-op summary and an optional Google Drive upload.",
+    "longDescription": "One skill analyses the kernel ops of one implementation of a model on its source profile (P100, P150, N150, one chip of an N300, or Quasar) at a pinned tt-metal commit: every ttnn call of the entry test traced to its device op and program factory, with support decided per kernel op. Destinations (another profile running the same code, or a Quasar BF16 projection) are added to the same run without re-tracing. Measurements are resumable items: a Tracy run of the entry test on the source device and TTsim runs of Quasar kernel-op tests, on the run's commit. Output is CSV with a per-kernel-op summary and an optional Google Drive upload.",
     "developerName": "Tenstorrent",
     "category": "Developer Tools",
     "capabilities": [

@@ -1,6 +1,6 @@
 ---
 name: model-op-analysis
-description: Analyse the kernel ops one implementation of a tt-metal model runs on its architecture (P100, P150, N150, N300 or Quasar) and how they would port to other architectures. Traces every ttnn call to its device op and program factory at a pinned commit, decides support per kernel op, optionally adds destinations (same code on another profile, or a Quasar BF16 projection) without re-tracing, and resumes measurements item by item - a Tracy run of the entry test on the source device and TTsim runs of Quasar kernel-op tests. Use for "op table", "which kernel ops does model X use", "can model X run on Quasar", or kernel-op support and porting analysis.
+description: Analyse the kernel ops one implementation of a tt-metal model runs on its architecture (P100, P150, N150, one chip of an N300, or Quasar) and how they would port to other architectures. Traces every ttnn call to its device op and program factory at a pinned commit, decides support per kernel op, optionally adds destinations (same code on another profile, or a Quasar BF16 projection) without re-tracing, and resumes measurements item by item - a Tracy run of the entry test on the source device and TTsim runs of Quasar kernel-op tests. Use for "op table", "which kernel ops does model X use", "can model X run on Quasar", or kernel-op support and porting analysis.
 ---
 
 # Model op analysis

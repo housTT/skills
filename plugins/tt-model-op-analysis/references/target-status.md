@@ -19,7 +19,7 @@ Apply the definitions as written. Absence of a test is never evidence of failure
 Quasar targets the definitions are made concrete per kernel op in "Quasar status by kernel op"
 below.
 
-## p100, p150, n150, n300
+## p100, p150, n150, n300-1chip
 
 The code runs as written on that profile, as source or as a destination.
 

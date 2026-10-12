@@ -13,8 +13,8 @@ profile and a pinned tt-metal commit, stored in `op-analysis/<model>/<impl-slug>
 with a `run.json`. A session starts by listing the model's existing runs; it continues one of them
 or starts a new one, and never repeats work a run already has.
 
-- **Source profiles:** `p100`, `p150` (Blackhole), `n150`, `n300` (one Wormhole chip; single-device
-  tests only) and `quasar` (TTsim).
+- **Source profiles:** `p100`, `p150` (Blackhole), `n150`, `n300-1chip` (one of the two
+  Wormhole chips of an N300 card; single-device tests only) and `quasar` (TTsim).
 - **Static analysis**, once per run: every ttnn call of the entry test traced to its device op and
   program factory, with support decided per kernel op. No device.
 - **Destinations**, optional and added any time without re-tracing: another profile running the

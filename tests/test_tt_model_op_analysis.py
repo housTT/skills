@@ -572,7 +572,7 @@ def test_skill_flow_and_gates():
 
 def test_targets_reference_lists_wormhole_and_quasar_sources():
     text = (PLUGIN / "references" / "targets.md").read_text(encoding="utf-8")
-    for profile in ("`n150`", "`n300`", "`quasar`", "`quasar-bf16`"):
+    for profile in ("`n150`", "`n300-1chip`", "`quasar`", "`quasar-bf16`"):
         assert profile in text
     assert "quasar-port" not in text
 
@@ -916,7 +916,7 @@ def test_two_destinations_validate(tmp_path):
 
 
 def test_wormhole_and_quasar_sources_allowed(tmp_path):
-    for source in ("n150", "n300", "quasar"):
+    for source in ("n150", "n300-1chip", "quasar"):
         run = tmp_path / source
         run.mkdir()
         (run / "run.json").write_text(json.dumps({"source": source, "destinations": [], "stage_blocks": ["x"]}))
@@ -1195,7 +1195,7 @@ def test_probe_device_names_wormhole_profiles(monkeypatch):
     monkeypatch.syspath_prepend(str(SCRIPTS))
     probe = importlib.import_module("probe_device")
     assert probe._profile("wormhole_b0", {"x": 12, "y": 1}, {"x": 8, "y": 8}) == "n150"
-    assert probe._profile("wormhole_b0", {"x": 12, "y": 1}, {"x": 8, "y": 7}) == "n300"
+    assert probe._profile("wormhole_b0", {"x": 12, "y": 1}, {"x": 8, "y": 7}) == "n300-1chip"
     assert probe._profile("blackhole", {"x": 7, "y": 1}, {"x": 11, "y": 10}) == "p100"
     assert probe._profile("wormhole_b0", {"x": 12, "y": 1}, {"x": 7, "y": 7}) == "custom"
 
@@ -1203,3 +1203,12 @@ def test_probe_device_names_wormhole_profiles(monkeypatch):
 def test_run_setup_lets_a_continued_run_be_read():
     text = (PLUGIN / "references" / "run-setup.md").read_text(encoding="utf-8")
     assert "the run being continued is the input" in text
+
+
+def test_n300_is_named_as_one_chip():
+    import importlib
+    sys.path.insert(0, str(SCRIPTS))
+    schema = importlib.import_module("opa_schema")
+    assert "n300" not in schema.PROFILES and "n300-1chip" in schema.LAUNCH_PROFILES
+    text = (PLUGIN / "references" / "targets.md").read_text(encoding="utf-8")
+    assert "`n300`" not in text

@@ -29,7 +29,7 @@ Then, for the source and then each destination in `run.json` order, the columns 
 
 | Column | Targets | Content |
 |---|---|---|
-| `<t>:shapes` | the source; p100, p150, n150, n300 as destinations | input and output shapes, dtype, layout and sharding on that profile; `not traced` on a destination for a measured-only row |
+| `<t>:shapes` | the source; p100, p150, n150, n300-1chip as destinations | input and output shapes, dtype, layout and sharding on that profile; `not traced` on a destination for a measured-only row |
 | `<t>:launches` | as `<t>:shapes` | launches per inference on that profile; empty on a destination for a measured-only row |
 | `<t>:tests` | quasar, quasar-bf16 | pytest node ids of the Quasar kernel-op tests that decide the status, `; `-separated |
 | `<t>:test_result` | quasar, quasar-bf16 | `not run` until `kernel_tests.py` runs them; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
@@ -47,7 +47,7 @@ every target status match; otherwise use stable substage names so
 ## call_trace.csv (static, execution order)
 
 `id`, `profile`, `stage`, `ops` (device ops in order), `repeats`, `launches_per_repeat`, `notes`.
-`profile` is each run target that has launches: the source and every p100, p150, n150 or n300
+`profile` is each run target that has launches: the source and every p100, p150, n150 or n300-1chip
 destination. For each, the sum of
 `repeats * launches_per_repeat` must equal the sum of `<t>:launches` in `op_table.csv`.
 

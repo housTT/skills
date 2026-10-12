@@ -22,12 +22,12 @@ def _profile(arch, dram_grid, compute_grid):
             return "p100"
     if "wormhole" in arch_lower:
         # Row-dispatch compute grids in core_descriptors/wormhole_b0_80_arch.yaml: nebula_x1 (N150)
-        # 8x8, nebula_x2 (N300, per chip) 8x7.
+        # 8x8, nebula_x2 (N300, per chip) 8x7. A single-device test on an N300 opens one of its two chips.
         size = (compute_grid["x"], compute_grid["y"])
         if size == (8, 8):
             return "n150"
         if size == (8, 7):
-            return "n300"
+            return "n300-1chip"
     return "custom"
 
 
