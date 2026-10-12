@@ -949,8 +949,12 @@ class Daemon:
     def _machine_page(self, page: dict, now: float) -> bool:
         """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
         target, text = page["target"], page["text"]
+        severity = page.get("severity") or "high"
         if target == machine_ledger.USER:
             self.alert(page["key"], f"Outage: {text} Nobody else could act on it.", severity="high")
+        elif target == self.p.name and severity == "low":   # a held page's note: a feed line, no coordinator turn
+            if not self.p.db.one("SELECT id FROM messages WHERE ref=? AND text=?", (page.get("id"), text)):
+                self.p.db.post("out", text, chat=None, kind="info", severity="low", ref=page.get("id"))
         elif target == self.p.name:
             fp = page.get("id") or page["key"]
             with self.p.db.tx():
@@ -958,7 +962,7 @@ class Daemon:
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
                                 "VALUES(?,?,?,?,?,?,?)", (now, "daemon", page["kind"], fp, "high", text, "queued"))
         else:
-            got = upstream.send(self.p.name, None, target, text, "high", now=now, sender="daemon")
+            got = upstream.send(self.p.name, None, target, text, severity, now=now, sender="daemon")
             if got not in ("sent", "duplicate"):
                 log(self.p, f"page for {page['key']} to {target}: {got}; retried on a later tick")
                 return False

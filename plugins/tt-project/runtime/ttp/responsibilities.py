@@ -224,6 +224,19 @@ def _owner_checks(p, rec: dict, needles: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def healthy_checks(who: str, alias: str, now: float | None = None) -> list[str]:
+    """Project `who`'s enabled heal checks naming machine `alias` whose last run was healthy and fresh
+    (machine_ledger: an owner's own healthy check holds a page about the machine). Read-only; [] when
+    `who` is not on this machine or cannot be read."""
+    now = time.time() if now is None else now
+    base = dict(_projects(project.hostname())).get(who)
+    if base is None:
+        return []
+    rec = machines.load().get(alias) or {}
+    needles = [alias] + ([str(rec["hostname"])] if rec.get("hostname") else [])
+    return _heal_checks(base, needles, fresh_at=now)
+
+
 def _cotenant_checks(p, needles: list[str], now: float) -> tuple[str, list[str]]:
     """('<project> heal check', ['<project>/<check>', ...]): the first other project on this machine with an
     enabled heal check naming the machine that ran healthy within its interval; ("", []) when none has."""

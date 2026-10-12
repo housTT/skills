@@ -31,7 +31,10 @@ Known faults and outages: `known_fault` (why repair is not ours) keeps a single 
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
 nothing for 60 min (or past its grace_s, if shorter) it escalates as above whatever `known_fault`
 says. Its check staying unknown (75, 255 or a broken check: an unreachable box looks like that) for as
-long escalates the same way, without running the fix; the next healthy result clears it. Observation
+long escalates the same way, without running the fix; the next healthy result clears it. When every
+unknown run of that stretch was only its route failing (ssh exit 255, or output saying the connection
+was refused or timed out, or the host or network unreachable: ROUTE_RE), the box may well be up: it
+escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
@@ -58,8 +61,8 @@ Shared machines: a check that watches one of the user's machines (`machine: "<al
 `resource` naming a known alias on an `outage` or broker check) reports what it sees to the machine
 ledger (machine_ledger.report), so the machine's recovery owner is paged once the condition outlasts
 the check's grace: `held` while a broker's hold field is set, otherwise `down` (`condition` overrides
-it); an unknown result counts only once an outage check escalates on it, and a single known fault
-never does. The next healthy result reports it cleared.
+it); an unknown result counts only once an outage check escalates on it, and never when only its route
+failed (above); a single known fault never does. The next healthy result reports it cleared.
 
 State lives in the database (kv `heal:<name>`), so a daemon restart, even in the middle of a fix,
 picks up where it was: a fix that started counts toward the cap, and the next run is its recheck,
@@ -69,6 +72,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -92,6 +96,12 @@ LOCK_WAIT_S = 30                # how long a fix waits for its resource lock bef
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
 FINDING = "ttp-heal: not-outage"   # a check output line: unhealthy, but the box is up (module doc)
+# An unknown check result that is only its route failing (module doc): ssh's own exit code, or its words.
+ROUTE_RC = 255
+ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out|no route to host|"
+                      r"(host|network) is unreachable|could not resolve host(name)?|name or service not known|"
+                      r"temporary failure in name resolution|kex_exchange_identification|"
+                      r"ssh: connect to host|connection closed by .* port", re.I)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
@@ -299,6 +309,11 @@ def finding(rc: int, out: str) -> bool:
     return rc != 0 and any(line.strip() == FINDING for line in (out or "").splitlines())
 
 
+def route_failed(rc: int, out: str) -> bool:
+    """An unknown check result that only says its route (ssh, a tunnel) failed: ROUTE_RC, or ROUTE_RE in its output."""
+    return rc not in (0, 1) and (rc == ROUTE_RC or ROUTE_RE.search(out or "") is not None)
+
+
 def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
     """Run the fix in its project's `env` (project.command_env), under `ttp lock <resource>` when it
     names one. 75 only from the lock (busy or paused): `ttp lock` passes its command's exit code on,
@@ -403,7 +418,8 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
         # Unknown tells nothing until an outage check escalates on it, once its window has passed.
         if not spec.get("outage") or now - float(st["unknown_since"]) < min(spec["grace_s"] or OUTAGE_S, OUTAGE_S):
             return
-        want, grace = [alias, spec.get("condition") or "down"] if alias else None, 0
+        # Only the route failed: this project's own problem, so nothing is reported (an earlier report clears).
+        want, grace = [alias, spec.get("condition") or "down"] if alias and not st.get("route_only") else None, 0
     elif st.get("finding"):
         pass   # the box is up: nothing to report, and an earlier down report clears
     elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not spec.get("known_fault")):
@@ -466,6 +482,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             return f"fixed ({n} today)", None
         return "ok (healthy)", None
     if rc != 1:
+        # route_only: every unknown run since unknown_since was only its route failing.
+        st["route_only"] = route_failed(rc, out) and bool(st.get("route_only", "unknown_since" not in st))
         st["unknown_since"] = st.get("unknown_since") or now
         again = None
         if spec.get("outage"):
@@ -478,6 +496,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                 st.setdefault("since", st["unknown_since"])
                 if st.get("task") or st.get("escalated"):
                     return _escalated(host, name, spec, st, now)
+                if st["route_only"]:
+                    return _escalate(host, name, spec, st, now, f"its route to the box or resource failed for "
+                                     f"{dark / 60:.0f} min (exit {rc}): this project's own route problem, so the "
+                                     f"machine is not reported down")
                 return _escalate(host, name, spec, st, now, f"its check could not tell for {dark / 60:.0f} min "
                                                             f"(exit {rc}): the box or resource may be unreachable")
             again = float(st["unknown_since"]) + window
@@ -486,6 +508,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             return f"ok (unknown, rc {rc})", again
         return f"error: heal check exited {rc}: {out[-150:]}", again
     st.pop("unknown_since", None)
+    st.pop("route_only", None)
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
     down = now - float(since)
@@ -560,6 +583,8 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
                if st.get("fix_rc") is not None else "")
             + f"Unhealthy since {timefmt.long(float(st['since']), host.p)}.\n"
             + ("The check reports a non-outage finding: the box or resource is up.\n" if st.get("finding") else "")
+            + ("Only the check's own route (ssh, a tunnel) failed: repair this project's route to the box; "
+               "the machine was not reported down to the shared machine ledger.\n" if st.get("route_only") else "")
             + "\n"
             "Find the cause and repair it within the charter's restrictions, then make sure the check "
             f"passes (`ttp heal test {name}`). If the fix command itself is wrong, correct the heal block "
@@ -598,7 +623,7 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
         return f"unhealthy ({how}; coordinator told)", None
     if not st.get("alerted"):
         st["alerted"] = now
-        host.alert(STATE_KEY + name, ("Heal check" if st.get("finding") else "Outage: heal check")
+        host.alert(STATE_KEY + name, ("Heal check" if st.get("finding") or st.get("route_only") else "Outage: heal check")
                    + f" {name} still fails and its {how}. Last check: {last}", "high")
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
@@ -649,10 +674,12 @@ def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
 
 
 def is_outage(db: DB, name: str) -> bool:
-    """The check watches a whole box or resource (`outage`) and its failure is not a non-outage finding."""
+    """The check watches a whole box or resource (`outage`) and its failure is not a non-outage finding
+    nor only its own route failing."""
     row = db.one("SELECT payload FROM schedules WHERE name=? AND enabled=1", (name,))
     spec = of(json.loads(row["payload"] or "{}")) if row else None
-    return bool(spec and spec.get("outage") and not state(db, name).get("finding"))
+    st = state(db, name)
+    return bool(spec and spec.get("outage") and not st.get("finding") and not st.get("route_only"))
 
 
 def holds(db: DB, name: str, now: float | None = None) -> bool:

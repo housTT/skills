@@ -43747,6 +43747,115 @@ def test_heal_check_reports_its_machine_down_or_held_to_the_ledger_and_clears_it
     assert ml.conditions()["box-a:down"]["grace_s"] == 0
 
 
+def test_an_outage_check_whose_only_route_failed_for_an_hour_reports_no_machine_down(env):
+    """Replay: an outage check unknown for over 60 min only because its ssh route failed paged the
+    machine's recovery owner for nothing. Now it escalates as its own route problem and reports nothing."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    assert heal.route_failed(255, "") and heal.route_failed(75, "ssh: connect to host x port 22: Connection refused")
+    assert heal.route_failed(124, "No route to host") and heal.route_failed(75, "Network is unreachable")
+    assert not heal.route_failed(75, "broker status: no answer") and not heal.route_failed(1, "Connection refused")
+    assert not heal.route_failed(0, "Connection timed out")
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha")
+    p, d, _ = _heal_setup(env)
+    dark = heal.validate({"check": "echo 'ssh: connect to host box-a port 22: Connection timed out' >&2; exit 255",
+                          "machine": "box-a", "outage": True, "grace_s": 0})
+    t0 = time.time()
+    for dt in (0, 1800, 3700, 7200):
+        heal.run(d, "svc", dark, t0 + dt)
+        assert ml.conditions() == {}, dt
+    assert ml.route(t0 + 7200, able=lambda n: (True, ""), healthy=lambda *a: []) == []
+    st = heal.state(p.db, "svc")
+    assert st["route_only"] and st["status"] == "unhealthy" and "machine_reported" not in st
+    task = p.db.one("SELECT * FROM tasks WHERE labels LIKE '%heal:svc%'")
+    assert "own route problem" in st["why"] and "route (ssh, a tunnel) failed" in task["spec"]
+    # One unknown run that is not a route failure ends route_only: past the window the machine is down.
+    other = heal.validate({"check": "echo 'status: no answer'; exit 75", "machine": "box-a", "outage": True,
+                           "grace_s": 0})
+    heal.run(d, "svc", other, t0 + 7300)
+    assert not heal.state(p.db, "svc")["route_only"] and list(ml.conditions()) == ["box-a:down"]
+    # A run that is a route failure again does not make the stretch route-only, so the report stays.
+    heal.run(d, "svc", dark, t0 + 7400)
+    assert list(ml.conditions()) == ["box-a:down"]
+    # A route-only stretch after a down report clears it.
+    p.root.joinpath("svc-up").touch()
+    heal.run(d, "svc", heal.validate({"check": f"test -e {p.root / 'svc-up'}", "machine": "box-a"}), t0 + 7500)
+    assert ml.conditions() == {}
+    for dt in (7600, 7600 + 3700):
+        heal.run(d, "svc", dark, t0 + dt)
+    assert ml.conditions() == {} and heal.state(p.db, "svc")["route_only"]
+
+
+def test_a_route_only_outage_check_is_not_an_outage_alert(env):
+    from ttp import heal
+    from ttp import schedule as sched
+    p, d, _ = _heal_setup(env)
+    block = {"check": "exit 255", "machine": "box-a", "outage": True, "grace_s": 0}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": block})
+    spec = _heal_spec(p)
+    t0 = time.time()
+    heal.run(d, "svc", spec, t0)
+    heal.run(d, "svc", spec, t0 + 3700)
+    assert heal.state(p.db, "svc")["route_only"] and not heal.is_outage(p.db, "svc")
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": {**block, "check": "exit 75"}})
+    heal.run(d, "svc", _heal_spec(p), t0 + 3800)
+    assert heal.is_outage(p.db, "svc")
+
+
+def test_the_owners_own_healthy_heal_check_holds_a_machine_page_and_sends_one_low_note(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha", fallback="beta")
+    me, alpha = make(env), _second_project(env, "alpha")
+    sched.upsert(alpha.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    t0 = time.time()
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": t0 - 60, "last_rc": 0})
+    mtime = (alpha.base / "state" / "project.db").stat().st_mtime_ns
+    able = lambda n: (True, "")
+    ml.report("gamma", "box-a", "down", "heal check up: unknown", grace_s=0, now=t0)
+    pages = ml.route(t0 + 1, able=able)
+    assert [(x["target"], x["kind"], x["severity"]) for x in pages] == [("alpha", "machine_condition_held", "low")]
+    assert "by gamma" in pages[0]["text"] and "alpha/box-a-up" not in pages[0]["text"]
+    assert "box-a-up" in pages[0]["text"] and "No recovery page" in pages[0]["text"]
+    assert (alpha.base / "state" / "project.db").stat().st_mtime_ns == mtime, "the owner is only read"
+    assert ml.delivered(pages[0])
+    assert ml.route(t0 + 300, able=able) == [], "one note per episode, and no recovery page while held"
+    assert ml.conditions()["box-a:down"]["page"]["held"]["by"] == "alpha"
+    _resources(me, "Machines: box-a")
+    assert "page held: alpha's heal check sees it healthy" in "\n".join(ml.digest_lines(me, t0 + 300))
+    # The owner's check going stale (or unhealthy) lifts the hold: the usual recovery page goes out.
+    ml.report("gamma", "box-a", "down", now=t0 + 1000)
+    pages = ml.route(t0 + 1000, able=able)
+    assert [(x["target"], x["kind"]) for x in pages] == [("alpha", "machine_condition")]
+    assert "severity" not in pages[0] and "held" not in ml.conditions()["box-a:down"]["page"]
+    # The owner reporting the condition itself is never held by its own other check.
+    ml.report("gamma", "box-a", "down", cleared=True)
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": t0 + 1990, "last_rc": 0})
+    ml.report("alpha", "box-a", "down", grace_s=0, now=t0 + 2000)
+    assert [x["kind"] for x in ml.route(t0 + 2000, able=able)] == ["machine_condition"]
+    # The fallback's healthy check holds it when the owner has none.
+    ml.report("alpha", "box-a", "down", cleared=True)
+    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2100)
+    got = ml.route(t0 + 2100, able=able, healthy=lambda who, alias, now: ["up"] if who == "beta" else [])
+    assert [(x["target"], x["kind"]) for x in got] == [("beta", "machine_condition_held")]
+    # Delivery: a low inbox note to another project; a low feed line, no coordinator event, at home.
+    d = Daemon(me.base)
+    assert d._machine_page({**got[0], "target": "alpha"}, t0)
+    note = [json.loads(ln) for ln in upstream.path().read_text().splitlines()][-1]
+    assert (note["to"], note["severity"]) == ("alpha", "low")
+    home = {**got[0], "target": me.name}
+    assert d._machine_page(home, t0) and d._machine_page(home, t0)
+    assert me.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (home["id"],))["n"] == 1
+    assert me.db.one("SELECT id FROM events WHERE kind='machine_condition_held'") is None
+
+
 def test_heal_broker_check_reports_held_and_not_a_missing_auto_recovery(env, tmp_path):
     from ttp import heal
     from ttp import machine_ledger as ml
