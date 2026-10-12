@@ -186,10 +186,14 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
 def record_superseded(p, tid: int, sha: str) -> str:
     """Record that done task `tid`'s work landed on the push branch as `sha` (re-landed under another
     commit, e.g. after a push conflict), so the local-only check stops flagging its branch at the
-    head it has now. Refused unless `sha` is on the push branch; ValueError says why."""
+    head it has now. Refused unless the task is done and `sha` is on the push branch, came after the
+    branch left it (not the branch's base or an older commit) and changes a file the branch changes;
+    ValueError says why."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
+    if task.get("status") != "done":
+        raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not done")
     branch = task.get("branch") or ""
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
     if not head:
@@ -200,6 +204,17 @@ def record_superseded(p, tid: int, sha: str) -> str:
     rc, words = check(p, p.root, full)
     if rc != 0:
         raise ValueError(f"not recorded: {words}")
+    if _git(p.root, "merge-base", "--is-ancestor", full, head).returncode == 0:
+        raise ValueError(f"not recorded: {full[:10]} is already in branch {branch}, so it predates the work")
+    tip = _tip(p.root, _push_ref(p, p.root), False)[0]
+    base = _git(p.root, "merge-base", head, tip).stdout.strip() if tip else ""
+    if not base:
+        raise ValueError(f"not recorded: branch {branch} shares no history with the push branch")
+    theirs = set(_git(p.root, "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", "-m",
+                      "--first-parent", "-z", full).stdout.split("\0")) - {""}
+    mine = set(_git(p.root, "diff", "--name-only", "--no-renames", "-z", base, head).stdout.split("\0")) - {""}
+    if not theirs & mine:
+        raise ValueError(f"not recorded: {full[:10]} changes none of the files branch {branch} changes")
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
            (tid, head, full, time.time()))
     return f"task #{tid}: branch {branch} at {head[:10]} recorded as superseded by {full[:10]} ({words})"

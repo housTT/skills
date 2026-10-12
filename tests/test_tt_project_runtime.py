@@ -13586,6 +13586,44 @@ def test_local_only_clears_a_branch_recorded_as_superseded_by_a_commit_on_the_pu
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "work past the recorded head is flagged again"
 
 
+def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, monkeypatch, capsys):
+    """A record hides the branch for good at its head, so it must name a commit that can hold the
+    work: not the branch's base or another commit the branch already has, not a later push-branch
+    commit that changes none of the branch's files, and only for a done task."""
+    from ttp import cli, landed
+    from ttp import daemon as dm
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _commit(path, "more.txt", "a\nb\n")
+    _commit(path, "more.txt", "a\nb\nc\n")
+    _commit(other, "unrelated.txt", "other work\n")
+    unrelated = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    base = _git_out(repo, "merge-base", branch, "origin/proj")
+    d = _local_only_daemon(p)
+    _check_local_only(d)
+    assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    assert ttp_task("superseded", str(tid), base) not in (0, None)
+    assert "predates the work" in capsys.readouterr().err
+    assert ttp_task("superseded", str(tid), unrelated) not in (0, None)
+    assert "changes none of the files" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="not done"):
+        p.db.update_task(tid, status="running")
+        landed.record_superseded(p, tid, unrelated)
+    p.db.update_task(tid, status="done")
+    assert p.db.q("SELECT * FROM task_superseded") == []
+    d._local_only_due = 0
+    _check_local_only(d)
+    assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "the undelivered work stays flagged"
+
+
 def _done_code_task_on(p, branch):
     tid = p.db.add_task("example work", "s", kind="code", tier="light", origin="user")
     p.db.update_task(tid, status="done", branch=branch)

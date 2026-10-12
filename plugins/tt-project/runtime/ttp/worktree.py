@@ -975,11 +975,13 @@ def _delivered(repo: Path, head: str, ref: str) -> bool:
     mine = _git(repo, "log", "--no-merges", fmt, f"{base}..{head}", check=False).splitlines()
     if mine and set(mine) <= set(_git(repo, "log", "--no-merges", fmt, f"{base}..{ref}", check=False).splitlines()):
         return True
-    if len(mine) > 1 and (whole := _patch_ids(repo, ["diff", base, head])) and whole <= _patch_ids(
-            repo, ["log", "-p", "--no-merges", "--format=commit %H", f"{base}..{ref}"]):
-        return True
     files = _git(repo, "diff", "--no-renames", "--name-only", "-z", base, head, check=False).split("\0")
     files = [f for f in files if f]
+    # A squash of exactly this change touches only these files: scan only them, not the whole range.
+    if len(mine) > 1 and files and (whole := _patch_ids(repo, ["diff", "--no-renames", base, head])) and (
+            whole <= _patch_ids(repo, ["log", "-p", "--no-renames", "--no-merges", "--format=commit %H",
+                                       f"{base}..{ref}", "--", *files])):
+        return True
     if not files or not _git(repo, "diff", "--no-renames", "--name-only", ref, head, "--", *files, check=False):
         return True
     theirs = set(_git(repo, "diff", "--no-renames", "--name-only", "-z", base, ref, check=False).split("\0"))
