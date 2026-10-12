@@ -432,7 +432,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "schedules_waiting": sched.waiting_line(db),
         "health": heal.line(db, now),
         "coverage": responsibilities.line(db),
-        "obligations": obligations.lines(db, now=now, where=cfg),
+        "obligations": obligations.lines(db, now=now, where=cfg, open_only=True),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),

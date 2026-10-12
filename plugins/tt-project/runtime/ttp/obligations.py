@@ -468,11 +468,13 @@ def check(p, now: float | None = None) -> list[str]:
     return raised
 
 
-def lines(db, now: float | None = None, where=None) -> list[str]:
+def lines(db, now: float | None = None, where=None, open_only: bool = False) -> list[str]:
     from . import timefmt
     now = time.time() if now is None else now
     out = []
     for o in items(db):
+        if open_only and (o["receipt"] or o.get("dropped")):
+            continue
         if o["receipt"]:
             state = f"received ({o['receipt']['evidence'][:80]})"
         elif o.get("dropped"):

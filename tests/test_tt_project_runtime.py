@@ -43756,6 +43756,24 @@ def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(e
     assert ob.get(p.db, o2)["dropped"]["by"] == "coordinator"
 
 
+def test_closed_obligations_leave_status_and_web_but_stay_listed(env, monkeypatch):
+    import time
+    from ttp import obligations as ob
+    from ttp.web import health
+    from ttp.cli import status_text
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    a = ob.add(p, "first deliverable", [tid], now=now)
+    b = ob.add(p, "second deliverable", [tid], now=now)
+    ob.record(p, a, "receipt", "commit abc", None, now=now)
+    ob.drop(p, b, "not wanted", now=now)
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert health(p, p.db, now=now)["obligations"] == []
+    text = status_text(p)
+    assert "first deliverable" not in text and "second deliverable" not in text
+    listed = "\n".join(ob.lines(p.db))
+    assert "first deliverable" in listed and "second deliverable" in listed
+
+
 def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob
