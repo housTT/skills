@@ -23985,6 +23985,53 @@ def _episodes(p, key):
     return p.db.q("SELECT * FROM alerts WHERE key=? ORDER BY id", (key,))
 
 
+@pytest.mark.parametrize("ack_reminder", [False, True])
+def test_alerts_ack_closes_the_displayed_message_episode_once_and_keeps_history(env, capsys, ack_reminder):
+    from ttp import cli, notifier
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    p = make(env)
+    p.db.post("out", "unrelated", kind="info")  # message and episode ids differ
+    d = Daemon(p.base)
+    d.alert("custom:repair", "Repair needed", "high", every_s=0)
+    first = p.db.one("SELECT id FROM messages WHERE text='Repair needed'")["id"]
+    d.alert("custom:repair", "Repair still needed", "high", every_s=0)
+    cli.main(["alerts", "demo"])
+    assert "Repair still needed" in capsys.readouterr().out
+    target = p.db.one("SELECT id FROM messages WHERE text='Repair still needed'")["id"] if ack_reminder else first
+    cli.main(["alerts", "demo", "--ack", str(target), "--why", "handled by the coordinator", "--json"])
+    ep = _episodes(p, "custom:repair")[0]
+    assert json.loads(capsys.readouterr().out) == ep
+    assert ep["cleared"] and ep["cleared_why"] == "handled by the coordinator"
+    assert attention(p.db, time.time()) == []
+    assert all(r["cleared"] for r in notifier.alerts_since(p, 0))
+    assert p.db.one("SELECT text FROM messages WHERE id=?", (first,))["text"] == "Repair needed"
+    assert "custom:repair" not in p.db.kv("alerts_sent", {})
+    # Acknowledging an old message never closes a new episode of the same condition.
+    d.alert("custom:repair", "A new failure", "high", every_s=0)
+    cli.main(["alerts", "demo", "--ack", str(first), "--why", "retry"])
+    assert _episodes(p, "custom:repair")[0] == ep
+    assert _episodes(p, "custom:repair")[1]["cleared"] is None
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved'")) == 1
+
+
+@pytest.mark.parametrize("case", ["unknown", "unkeyed", "info", "missing_why", "blank_why", "why_only"])
+def test_alerts_ack_refuses_invalid_requests_without_mutation(env, case):
+    from ttp import cli
+    p = make(env)
+    mid = p.db.post("out", "Not a keyed alert", kind="info" if case == "info" else "alert",
+                    severity="high", ref="custom:info" if case == "info" else None)
+    args = ["alerts", "demo"]
+    if case != "why_only":
+        args += ["--ack", str(mid + 1000 if case == "unknown" else mid)]
+    if case != "missing_why":
+        args += ["--why", "  " if case == "blank_why" else "handled"]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(args)
+    assert exc.value.code != 0
+    assert not p.db.q("SELECT id FROM messages WHERE kind='resolved'")
+
+
 def test_a_logged_out_alert_clears_on_the_next_successful_run_and_keeps_its_history(env):
     p = make(env)
     from ttp.daemon import Daemon
@@ -41167,6 +41214,78 @@ def test_heal_escalate_user_alerts_and_coordinator_observes_once_per_episode(env
     fps = [e["fingerprint"] for e in p.db.q("SELECT fingerprint FROM events WHERE fingerprint LIKE 'heal:%' ORDER BY id")]
     assert fps == [f"heal:svc:{t0:.0f}", f"heal:svc:{t1:.0f}"]
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+
+
+@pytest.mark.parametrize("change", ["coordinator", "project_default", "known_fault", "finding_known_fault"])
+@pytest.mark.parametrize("run_check", [False, True])
+def test_heal_config_change_closes_an_existing_user_alert(env, change, run_check):
+    from ttp import alerts, heal
+    from ttp.web import attention
+    finding = change == "finding_known_fault"
+    p, d, up = _heal_setup(env, fix=None, outage=finding,
+                          check="echo 'ttp-heal: not-outage'; exit 1" if finding else "exit 1")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    heal.run(d, "svc", spec, now + 1)
+    assert len(attention(p.db, now + 1)) == 1
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    if change == "project_default":
+        p.set_config("heal.escalate", "coordinator")
+        d.cfg = p.config()
+    else:
+        payload["heal"]["escalate" if change == "coordinator" else "known_fault"] = (
+            "coordinator" if change == "coordinator" else "vendor bug")
+        p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    # Readers hide it immediately, even before the next scheduled check or daemon sweep.
+    assert attention(p.db, now + 2) == []
+    if run_check:
+        heal.run(d, "svc", _heal_spec(p), now + 2)
+    alerts.sweep(p.db, now + 3)
+    ep = _episodes(p, "heal:svc")[0]
+    assert ep["cleared"] and ("coordinator" if change in ("coordinator", "project_default") else "known_fault") in ep["cleared_why"]
+    assert heal.state(p.db, "svc")["status"] == "unhealthy", "closing a user alert does not repair the check"
+    resolved = p.db.q("SELECT text FROM messages WHERE kind='resolved'")
+    assert len(resolved) == 1 and "passes again" not in resolved[0]["text"]
+    for dt in (4, 5):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        alerts.sweep(p.db, now + dt)
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved'")) == 1
+    assert len(_episodes(p, "heal:svc")) == 1
+    if change in ("coordinator", "project_default"):
+        assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")) == 1
+    else:
+        assert not {"task", "escalated", "alerted", "observed"} & set(heal.state(p.db, "svc"))
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_heal_known_fault_does_not_close_a_real_outage_alert(env, unknown):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, fix=None, outage=True, check="exit 255" if unknown else "exit 1")
+    spec, now = _heal_spec(p), time.time()
+    heal.run(d, "svc", spec, now)
+    heal.run(d, "svc", spec, now + heal.OUTAGE_S)
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    heal.run(d, "svc", spec, now + heal.OUTAGE_S + 1)
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["known_fault"] = "vendor bug"
+    p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    assert alerts.holds(p.db, "heal:svc", now, now + heal.OUTAGE_S + 2)
+    assert alerts.sweep(p.db, now + heal.OUTAGE_S + 2) == []
+    assert _episodes(p, "heal:svc")[0]["cleared"] is None
+
+
+def test_heal_user_override_keeps_its_alert_when_the_project_default_changes(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, fix=None, escalate="user")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    heal.run(d, "svc", spec, now + 1)
+    p.set_config("heal.escalate", "coordinator")
+    d.cfg = p.config()
+    heal.run(d, "svc", spec, now + 2)
+    assert alerts.sweep(p.db, now + 3) == []
+    assert _episodes(p, "heal:svc")[0]["cleared"] is None
 
 
 def test_heal_escalate_project_default_and_validation(env):

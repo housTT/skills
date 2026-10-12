@@ -170,9 +170,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "deploy":
         from . import deploy
         return deploy.holds(db, arg, now)
-    if kind == "heal":   # an outage from a heal check lasts until the check passes (heal.holds)
+    if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
-        return heal.holds(db, arg)
+        return heal.holds(db, arg, now)
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
@@ -230,6 +230,44 @@ def cleared(db: DB, m: dict, now: float) -> bool:
             and not active(db, m["ref"], m["ts"], now))
 
 
+def _close(db: DB, ep: dict, now: float, why: str, text: str | None = None,
+           severity: str | None = None) -> dict:
+    """Close an episode within the caller's transaction, retaining its messages and reason."""
+    db.x("UPDATE alerts SET cleared=?, cleared_why=? WHERE id=?", (now, why, ep["id"]))
+    sent = db.kv("alerts_sent", {}) or {}
+    if ep["key"] in sent:
+        sent.pop(ep["key"])
+        db.set_kv("alerts_sent", sent)
+    if text:
+        first = db.one("SELECT channel FROM messages WHERE id=?", (ep["message"],)) if ep["message"] else None
+        db.post("out", text, chat=None, kind="resolved", severity=severity or "low", ref=ep["key"],
+                channel=QUIET if first and first["channel"] == QUIET else "chat")
+    return {**ep, "cleared": now, "cleared_why": why}
+
+
+def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
+    """Acknowledge the episode of a message id printed by `ttp alerts`; retries preserve the receipt."""
+    if not why or not why.strip():
+        raise ValueError("acknowledging an alert requires a non-empty --why")
+    now = time.time() if now is None else now
+    with db.tx():
+        m = db.one("SELECT * FROM messages WHERE id=? AND direction='out' AND chat IS NULL", (message,))
+        ep = episode(db, m["ref"], m["ts"]) if m and tracked(m["kind"], m["severity"], m["ref"]) else None
+        if not ep:
+            raise ValueError(f"no keyed alert with message id #{message}")
+        if ep["cleared"] is not None:
+            return ep
+        return _close(db, ep, now, why.strip(), f"Acknowledged alert #{message}: {why.strip()}")
+
+
+def close_key(db: DB, key: str, why: str, now: float | None = None) -> list[dict]:
+    """Retire open episodes when a check no longer requires user escalation."""
+    now = time.time() if now is None else now
+    with db.tx():
+        return [_close(db, ep, now, why, f"Cleared: {key} user alert: {why}.")
+                for ep in db.q("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id", (key,))]
+
+
 def sweep(db: DB, now: float | None = None) -> list[dict]:
     """Close every open episode whose condition cleared: store when and why, let the same condition
     alert again at once, and tell the chats once. Returns the episodes closed."""
@@ -239,24 +277,23 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
         return closed   # the usual tick: no write lock taken
     with db.tx():
         for ep in db.q("SELECT * FROM alerts WHERE cleared IS NULL ORDER BY id"):
-            if holds(db, ep["key"], _since(ep), now):
-                continue
             kind, _, arg = ep["key"].partition(":")
             why = "no longer reported" if not _checkable(ep["key"]) else "condition cleared"
-            db.x("UPDATE alerts SET cleared=?, cleared_why=? WHERE id=?", (now, why, ep["id"]))
-            sent = db.kv("alerts_sent", {}) or {}
-            if ep["key"] in sent:
-                sent.pop(ep["key"])
-                db.set_kv("alerts_sent", sent)
+            if kind == "heal":
+                from . import heal
+                why = heal.cleared_why(db, arg, now)
+                if why is None:
+                    continue
+            elif holds(db, ep["key"], _since(ep), now):
+                continue
+            text, sev = None, None
             if kind in CLEARED_TEXT:
-                # A quiet episode clears quietly: the project holding the claim tells the chats.
-                first = db.one("SELECT channel FROM messages WHERE id=?", (ep["message"],)) if ep["message"] else None
                 # A status line clears as quietly as it was raised.
                 sev = CLEARED_SEVERITY.get(kind) or ("normal" if _urgent(ep["severity"]) else "low")
-                db.post("out", "Cleared: " + CLEARED_TEXT[kind].format(arg=arg), chat=None, kind="resolved",
-                        severity=sev, ref=ep["key"],
-                        channel=QUIET if first and first["channel"] == QUIET else "chat")
-            closed.append({**ep, "cleared": now, "cleared_why": why})
+                text = "Cleared: " + CLEARED_TEXT[kind].format(arg=arg)
+            if kind == "heal" and why != "condition cleared":
+                text, sev = f"Cleared: {ep['key']} user alert: {why}.", "low"
+            closed.append(_close(db, ep, now, why, text, sev))
     return closed
 
 

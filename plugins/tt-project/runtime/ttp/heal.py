@@ -24,6 +24,8 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   `escalate` picks who gets that last step: "user" (default; the project's `heal.escalate` config
   sets it for every check) sends the alert; "coordinator" sends no alert and instead queues one high
   observation for the coordinator per unhealthy episode (fingerprint `heal:<name>:<since>`).
+  Moving escalation to the coordinator closes an earlier user alert with its reason. Adding a
+  known fault that covers the current confirmed failure does the same, without claiming recovery.
 
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
@@ -74,6 +76,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 
 from . import timefmt
@@ -430,6 +433,10 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
 def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | None]:
     p, db = host.p, host.p.db
     st = state(db, name)
+    if escalate_to(host, spec) == "coordinator":
+        from . import alerts
+        alerts.close_key(db, STATE_KEY + name, "escalation moved to coordinator", now)
+        st.pop("alerted", None)
     cwd, env = str(p.root), command_env(p)
     if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
         # A restart cut the fix short: its recheck still waits for settle_s.
@@ -482,11 +489,12 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
     down = now - float(since)
-    outage = bool(spec.get("outage")) and down >= min(OUTAGE_S, spec["grace_s"] or OUTAGE_S)
-    if st.get("finding") and spec.get("known_fault"):
+    if _known_fault(spec, st, now):
         # A self-fix may identify a known fault while its task is still open.
-        st.pop("task", None)
-        st.pop("escalated", None)
+        from . import alerts
+        alerts.close_key(db, STATE_KEY + name, f"known_fault applies to current failure: {spec['known_fault']}", now)
+        for key in ("task", "escalated", "alerted", "observed"):
+            st.pop(key, None)
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
     if st.get("task") or st.get("escalated"):
@@ -494,9 +502,6 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if pending:
         st["phase"] = None
         return _escalate(host, name, spec, st, now, f"the fix ran but the check still fails {down / 60:.0f} min on")
-    if spec.get("known_fault") and not outage:
-        _save(db, name, st)
-        return "unhealthy (known fault: kept quiet)", None
     grace = min(spec["grace_s"], OUTAGE_S) if spec.get("outage") else spec["grace_s"]   # a whole box waits no longer
     if down < grace:
         _save(db, name, st)
@@ -606,12 +611,46 @@ def escalate_to(host: Any, spec: dict) -> str:
     return v if v in ESCALATE else "user"
 
 
-def holds(db: DB, name: str) -> bool:
-    """The outage alert heal:<name> stays while the check has not passed since (alerts.holds)."""
+def _known_fault(spec: dict, st: dict, now: float) -> bool:
+    """A known fault matches a confirmed failure, never a prolonged outage or an unknown check."""
+    return bool(spec.get("known_fault") and st.get("status") == "unhealthy"
+                and "unknown_since" not in st and (st.get("finding") or st.get("last_rc") == 1)
+                and (st.get("finding") or not spec.get("outage")
+                     or now - float(st.get("since", now)) < min(OUTAGE_S, spec["grace_s"] or OUTAGE_S)))
+
+
+def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
+    """Live reason the check's user alert ended; None while it still needs the user."""
+    now = time.time() if now is None else now
     row = db.one("SELECT payload FROM schedules WHERE name=? AND enabled=1", (name,))
-    if not row or not of(json.loads(row["payload"] or "{}")):
-        return False
-    return state(db, name).get("status") != "healthy"
+    spec = of(json.loads(row["payload"] or "{}")) if row else None
+    st = state(db, name)
+    if not spec or st.get("status") == "healthy":
+        return "condition cleared"
+    escalation = spec.get("escalate")
+    if not escalation:
+        # Readers use the project's current config without writing a last-good copy.
+        from .project import layered
+        base = Path(db.path).parent.parent
+        for path in (base / "harness" / "project.json", base / "state" / "project.last-good.json"):
+            try:
+                cfg = json.loads(path.read_text())
+                if not isinstance(cfg, dict):
+                    continue
+                escalation = (layered(cfg).get("heal") or {}).get("escalate")
+                break
+            except (OSError, ValueError):
+                continue
+    if escalation == "coordinator":
+        return "escalation moved to coordinator"
+    if _known_fault(spec, st, now):
+        return f"known_fault applies to current failure: {spec['known_fault']}"
+    return None
+
+
+def holds(db: DB, name: str, now: float | None = None) -> bool:
+    """A heal alert stays only while the check still requires user escalation."""
+    return cleared_why(db, name, now) is None
 
 
 # Views --------------------------------------------------------------------------------------------

@@ -3635,7 +3635,17 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
 
 
 def cmd_alerts(a) -> None:
+    if (a.ack is not None) != (a.why is not None) or a.why is not None and not a.why.strip():
+        die("ttp alerts: --ack <message id> requires a non-empty --why <text>")
     p = need(a.name, sys.argv[1:])
+    if a.ack is not None:
+        from . import alerts
+        try:
+            ep = alerts.ack(p.db, a.ack, a.why)
+        except ValueError as e:
+            die(f"ttp alerts: {e}")
+        print(json.dumps(ep) if a.json else f"Acknowledged alert #{a.ack}: {ep['cleared_why']}")
+        return
     from .notifier import alerts_since
     rows = alerts_since(p, a.after, a.floor)
     if a.json:
@@ -4160,11 +4170,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--project-dir", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_upgrade)
 
-    s = sub.add_parser("alerts", help="broadcast alerts after a message id")
+    s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge a keyed alert")
     s.add_argument("name")
     s.add_argument("--after", type=int, default=0)
     s.add_argument("--floor", default="high")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--ack", type=int, metavar="ID", help="close the keyed alert episode for this message id")
+    s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)
 
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")

@@ -64,6 +64,13 @@ and preferences you add later become part of the project's charter and memory.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
   With Jev enabled, new observations are screened by a cheap decision model first.
 
+Keyed alerts keep their history when closed. `ttp alerts <project>` shows their message IDs;
+`ttp alerts <project> --ack <id> --why "<reason>"` closes that message's episode and records the
+reason. Retrying preserves the original receipt, and an unknown ID is refused. A heal check's
+user alert also clears when escalation moves to the coordinator or a known fault covers its
+current failure; the check remains unhealthy until it passes. Known faults never silence a
+prolonged whole-box outage.
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the
