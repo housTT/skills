@@ -51635,6 +51635,101 @@ def test_a_task_run_without_a_device_gets_ttp_no_device(env, monkeypatch):
     assert run_env(labels=["resource:build-dir"])["TTP_NO_DEVICE"] == "1"
 
 
+def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, monkeypatch):
+    """On the machine whose entry is tagged `device`, every run the daemon starts (device task or not),
+    its probes and the checks it relaunches get TT_VISIBLE_DEVICES empty (tt-umd then enumerates no
+    device), with the originals recorded so a device lock or queue can restore them. An untagged
+    machine, or none in the list, gets no mask."""
+    from ttp import machines as mm
+    from ttp.providers import claude
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.delenv(mm.MASK_RECORD, raising=False)   # this run's own record, if any, is not the test's
+    before = json.dumps({"TT_VISIBLE_DEVICES": os.environ.get("TT_VISIBLE_DEVICES")}, sort_keys=True)
+    p = make(env)
+    d = Daemon(p.base)
+
+    def run_env(role="worker", **kw):
+        tid = p.db.add_task("t", "s", kind="review" if role == "reviewer" else "work", tier="light",
+                            origin="user", **kw)
+        rid = d.start_run(role, "go", "claude", "light", str(p.root), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    def unmasked(e):
+        return mm.MASK_RECORD not in e and e.get("TT_VISIBLE_DEVICES") == os.environ.get("TT_VISIBLE_DEVICES")
+
+    assert unmasked(run_env()) and unmasked(d._probe_env()), "no machines entry for this host: no mask"
+    mm.add("testhost", tags="n300")
+    assert unmasked(run_env()) and unmasked(d._probe_env()), "an untagged host: no mask"
+    mm.add("elsewhere", tags="device")
+    assert unmasked(run_env()), "a device machine that is not this one: no mask"
+    mm.add("testhost", tags="device, n300")
+    for e in (run_env(), run_env("reviewer"), run_env(labels=["needs_device"]), d._probe_env()):
+        assert e["TT_VISIBLE_DEVICES"] == "" and e[mm.MASK_RECORD] == before
+    assert mm.mask_devices(mm.mask_devices({"TT_VISIBLE_DEVICES": "2"}))[mm.MASK_RECORD] == '{"TT_VISIBLE_DEVICES": "2"}'
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def fake_run(argv, **kw):
+        seen.update(kw["env"])
+        raise Done
+
+    monkeypatch.setattr("ttp.daemon.subprocess.run", fake_run)
+    with pytest.raises(Done):
+        d._start_checks(p.root, p.runs / "checks-x", "x", 1, [])
+    assert seen["TT_VISIBLE_DEVICES"] == "" and seen[mm.MASK_RECORD] == before
+
+
+def test_device_mask_round_trips_and_never_reaches_a_broker_job(monkeypatch):
+    """A device lock or queue gets back exactly what the mask replaced; the mask's variables are none
+    the broker CLI forwards to a job (its documented allowlist; the job runs in the broker's own
+    environment), so a broker-run command is never masked."""
+    from ttp import machines as mm
+    from ttp.devq import unmask_devices
+    monkeypatch.setenv("TTP_HOST", "testhost")
+    for orig in ({}, {"TT_VISIBLE_DEVICES": "0,1"}, {"TT_VISIBLE_DEVICES": ""}):
+        masked = mm.mask_devices({"A": "1", **orig}, {"testhost": {"tags": ["device"]}})
+        assert masked["TT_VISIBLE_DEVICES"] == ""
+        assert unmask_devices(masked) == {"A": "1", **orig}
+    assert mm.mask_devices({"A": "1"}, {"testhost": {"tags": ["n300"]}}) == {"A": "1"}
+    assert unmask_devices({"A": "1"}) == {"A": "1"}
+    forwarded = re.compile(r"TT_METAL_.*|PYTHONPATH|PYTHON_ENV_DIR|VIRTUAL_ENV|MESH_DEVICE|HF_HUB_CACHE|TT_CACHE_PATH|VLLM_.*")
+    assert not [k for k in (*mm.DEVICE_MASK, mm.MASK_RECORD) if forwarded.fullmatch(k)]
+
+
+def test_lock_of_a_device_resource_restores_what_the_device_mask_hid(env):
+    """`ttp lock` on a device resource runs its command with the devices the run's mask hid; any other
+    lock keeps the mask."""
+    from ttp import machines as mm
+    p = _device_project(env)
+    show = [sys.executable, "-c", "import os; print(repr(os.environ.get('TT_VISIBLE_DEVICES')), "
+                                  f"repr(os.environ.get('{mm.MASK_RECORD}')))"]
+    for orig, want in ((None, "None None"), ("3", "'3' None")):
+        mask = {"TT_VISIBLE_DEVICES": "", mm.MASK_RECORD: json.dumps({"TT_VISIBLE_DEVICES": orig})}
+        for res, expect in (("device-b", want), ("box-device", want), ("build-dir", f"'' {mask[mm.MASK_RECORD]!r}")):
+            r = _ttp_run(p, "lock", res, "--", *show, env=mask)
+            assert r.returncode == 0, r.stderr
+            assert r.stdout.strip() == expect, (res, orig)
+
+
+def test_devq_runner_and_its_jobs_never_inherit_the_device_mask(devq_dir, tmp_path):
+    """A devq runner started from a masked run is the device path: its health check and jobs see the
+    devices the mask hid."""
+    d, seen = devq_dir, tmp_path / "seen"
+    cfg = {**DEVQ_FAST, "health": f'echo "health=${{TT_VISIBLE_DEVICES-unset}}" >> {seen}'}
+    r = subprocess.run([sys.executable, str(DEVQ), "submit", str(d), json.dumps(cfg),
+                        json.dumps({"id": "j1", "cmd": f'echo "job=${{TT_VISIBLE_DEVICES-unset}}${{TTP_DEVICE_MASK-}}" >> {seen}'})],
+                       capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "TT_VISIBLE_DEVICES": "", "TTP_DEVICE_MASK": '{"TT_VISIBLE_DEVICES": null}'})
+    assert r.returncode == 0, r.stderr
+    assert _devq_marker(d, "j1")["status"] == "done"
+    lines = seen.read_text().split()
+    assert "job=unset" in lines and "health=unset" in lines, lines
+
+
 def test_the_daemons_review_spec_reuses_the_tasks_test_selection(env):
     p = make(env)
     _, _, _, (review,) = _finish_code(env, p, "change", {"a.py": 5})

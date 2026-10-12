@@ -848,10 +848,40 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     return 0 if rc == 3 else rc
 
 
+# A run on a machine tagged `device` sees no device when it opens one directly: tt-umd (docs/
+# TT_VISIBLE_DEVICES.md) enumerates no device when TT_VISIBLE_DEVICES is set and empty. The broker
+# documents no per-process switch of its own (TTDEV_LOCK=1 locks a whole host at install).
+DEVICE_MASK = {"TT_VISIBLE_DEVICES": ""}
+# Names the variables the mask set, with what they held before (null: unset), so a command run through
+# a device lock or this queue gets them back. The broker needs nothing: its CLI forwards only
+# TT_METAL_*, PYTHONPATH, PYTHON_ENV_DIR, VIRTUAL_ENV, MESH_DEVICE, HF_HUB_CACHE, TT_CACHE_PATH and
+# VLLM_* to a job, which runs in the broker's own environment.
+MASK_RECORD = "TTP_DEVICE_MASK"
+
+
+def unmask_devices(env: dict) -> dict:
+    """`env` with the device mask taken off (each variable back as it was), for a command run through
+    a device lock or queue, the sanctioned ways to a device."""
+    if MASK_RECORD not in env:
+        return env
+    out = dict(env)
+    try:
+        before = json.loads(out.pop(MASK_RECORD))
+    except ValueError:
+        before = None
+    before = before if isinstance(before, dict) else {}
+    for k in DEVICE_MASK:
+        if isinstance(before.get(k), str):
+            out[k] = before[k]
+        else:
+            out.pop(k, None)
+    return out
+
+
 def _env(**extra: str) -> dict:
-    """The environment for the runner and its jobs: never a submitting run's `TTP_NO_DEVICE` (the
-    runner is the device path, and outlives that run)."""
-    return {**{k: v for k, v in os.environ.items() if k != "TTP_NO_DEVICE"}, **extra}
+    """The environment for the runner and its jobs: never a submitting run's `TTP_NO_DEVICE` or device
+    mask (the runner is the device path, and outlives that run)."""
+    return {**unmask_devices({k: v for k, v in os.environ.items() if k != "TTP_NO_DEVICE"}), **extra}
 
 
 def start(d: Path, cfg: dict) -> int:

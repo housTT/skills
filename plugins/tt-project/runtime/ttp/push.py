@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkdirs, landed, locks, prguard, runner, worktree
+from . import checkdirs, landed, locks, machines, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
@@ -2645,6 +2645,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
     levels below this process, write the marker as running, then give the go. Returns the pid."""
     log = Path(m["log"])
     env = {k: v for k, v in env.items() if k not in ("TTP_RUN_DIR", "TTP_PIDNS", "TTP_CGROUP")}   # the run ends first
+    env = machines.mask_devices(env)   # its checks run as the worker's would: no direct device opens
     output = checkdirs.restore(p.state, m.get("check_run_dir"))
     guard = checkdirs.take(output)
     if guard is None:

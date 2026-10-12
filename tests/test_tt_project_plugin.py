@@ -782,6 +782,16 @@ def test_self_reboot_recipe_never_waits_on_drain_probe_while_paused():
         assert "ttp resume <name>" in " ".join(text.split())
 
 
+def test_worker_prompt_says_device_hosts_hide_devices_from_direct_opens():
+    """On device hosts devices are hidden from direct opens, device work goes only through the broker,
+    and a worker never unsets or overrides the masking variables."""
+    worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    assert "On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES`" in worker
+    assert ("Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource."
+            in worker)
+    assert "Never unset or override the masking variables to work around this." in worker
+
+
 def test_runs_without_a_device_never_open_one_through_tests():
     """A worker or reviewer that holds no device runs only the task's own test selection, and checks a
     marker exists before deselecting by it; the harness skill ships the opt-in pytest guard."""

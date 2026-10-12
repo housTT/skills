@@ -37,7 +37,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import locks
+from . import locks, machines
 from .project import Project, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
@@ -230,7 +230,7 @@ def tend(p: Project) -> None:
                 c = m["checks"]
                 lost(rc).unlink(missing_ok=True)
                 pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"]), rc.parent, c["worktree"],
-                                    c["head"], {**os.environ, **(m.get("env") or {})}, rid or "")
+                                    c["head"], machines.mask_devices({**os.environ, **(m.get("env") or {})}), rid or "")
                 renice(pid, nice_level(p.config().get("runner"))[0])
             except (OSError, ValueError, TypeError, KeyError) as e:
                 why = f"the daemon could not start the checks: {e}"
@@ -238,7 +238,7 @@ def tend(p: Project) -> None:
             lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
             if lock is not None:   # else it already runs
                 try:
-                    pid = start(rc, log, list(m["command"]), m["cwd"], {**os.environ, **(m.get("env") or {})}, lock)
+                    pid = start(rc, log, list(m["command"]), m["cwd"], machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
                     renice(pid, nice_level(p.config().get("runner"))[0])
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"

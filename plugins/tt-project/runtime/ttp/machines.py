@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from . import project
+from .devq import DEVICE_MASK, MASK_RECORD, unmask_devices  # noqa: F401  (re-exported)
 
 ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")   # an alias is also a resource name
 TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,39}")
@@ -271,6 +272,24 @@ def here(known: dict[str, dict] | None = None) -> tuple[str, dict] | None:
         if me in (alias.lower(), str(m.get("hostname") or "").lower()):
             return alias, m
     return None
+
+
+def device_host(known: dict[str, dict] | None = None) -> bool:
+    """Whether this machine's entry is tagged `device`."""
+    hit = here(known)
+    return bool(hit) and "device" in tag_list(hit[1].get("tags"))
+
+
+def mask_devices(env: dict, known: dict[str, dict] | None = None) -> dict:
+    """`env` with devices hidden from direct opens on a machine tagged `device`, else as it is.
+    Masking an already masked environment keeps the first record of the originals."""
+    if not device_host(known):
+        return env
+    out = dict(env)
+    if MASK_RECORD not in out:
+        out[MASK_RECORD] = json.dumps({k: env.get(k) for k in DEVICE_MASK}, sort_keys=True)
+    out.update(DEVICE_MASK)
+    return out
 
 
 def disk_min_free_gb(known: dict[str, dict] | None = None) -> tuple[str, float] | None:

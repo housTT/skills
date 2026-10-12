@@ -64,6 +64,9 @@ Other workers run at the same time as you, on other tasks of this project.
   test fixture. Run only the exact test ids or `-k` expression your change (or the reviewed task)
   used. Deselect by marker (`-m 'not device'`) only after `pytest --markers` shows the repo
   defines it: an unknown marker deselects nothing.
+- On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
+  empty). Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device
+  resource. Never unset or override the masking variables to work around this.
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)

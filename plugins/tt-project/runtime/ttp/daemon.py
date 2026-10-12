@@ -1380,6 +1380,11 @@ class Daemon:
             # inherited "1" (the runner adds its own environment under this one).
             if task and role != "coordinator":
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
+            # On a machine tagged `device` a direct open sees no device, whatever the task: `ttp lock` on
+            # a device, devq and the broker (whose jobs never get the mask) are the ways to one.
+            if machines.device_host():
+                masked = machines.mask_devices({**os.environ, **env})
+                env.update({k: masked[k] for k in (*machines.DEVICE_MASK, machines.MASK_RECORD)})
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
@@ -5160,6 +5165,7 @@ class Daemon:
         env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
                "TTP_RUN_ID": run_id, "TTP_TASK": str(tid), "PYTHONPATH": runtime_dir,
                "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
+        env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
         level = nice_level(self.cfg.get("runner"))[0]
         argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", *extra]
         try:
@@ -5724,8 +5730,9 @@ class Daemon:
         return "pass", r, run_dir, full["on_pass"], head
 
     def _probe_env(self) -> dict:
-        """Probes run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would."""
-        return command_env(self.p)
+        """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,
+        devices masked as in its run."""
+        return machines.mask_devices(command_env(self.p))
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,

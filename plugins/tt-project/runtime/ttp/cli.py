@@ -26,6 +26,7 @@ from pathlib import Path
 from . import __version__, poll_s
 from .db import chat_floor, task_outcome
 from . import outbox
+from .devq import unmask_devices
 from . import timefmt
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -1973,6 +1974,7 @@ def cmd_lock(a) -> None:
     child_env = {**os.environ, "TTP_LOCKS_HELD": ",".join(held_locks + [res])}
     if res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device"):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
+        child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
     detached = bool(os.environ.get("TTP_DETACHED"))
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     try:
