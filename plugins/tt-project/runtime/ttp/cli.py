@@ -1299,6 +1299,12 @@ def cmd_checks(a) -> None:
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
     killed outright. Starting it again stops the run's earlier detached checks."""
     from . import prguard, push
+    if getattr(a, "gap", None):
+        from . import checkgaps
+        p = here()
+        if not p:
+            die("no project found for the check gap probe")
+        sys.exit(0 if checkgaps.ready(p, a.gap) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
     run_dir = os.environ.get("TTP_RUN_DIR")
@@ -1339,14 +1345,16 @@ def cmd_checks(a) -> None:
         _checks_detach(a, Path(run_dir), p, top, head)
         return
     log = Path(run_dir) / "checks.log"
-    passed, failed = True, None
+    passed, failed, failure, rc = True, None, None, None
+    base = _checks_base(p, Path(top), cmds)
+    (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
         out.write(f"ttp checks: in {top} on {head[:12]}\n")
         try:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
-                                            _checks_base(p, Path(top), cmds))
+                                            base)
         except push.ScopeError as e:
             out.write(f"{e}\n")
             todo, skipped, passed, failed = [], [], False, str(e.check)
@@ -1365,6 +1373,7 @@ def cmd_checks(a) -> None:
         for c in [] if hit else todo:
             out.write(f"$ {c}\n")
             out.flush()
+            check_start = out.tell()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
             proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
@@ -1385,6 +1394,14 @@ def cmd_checks(a) -> None:
             text = f.read().decode("utf-8", errors="replace")
         env_problem = push.env_problem(text, top) if failed in todo else None
         also = bool(env_problem) and push.test_failures(text)
+        if failed in todo and rc is not None:
+            with open(log, "rb") as f:
+                f.seek(check_start)
+                output = f.read().decode("utf-8", errors="replace")
+            failure = push.target_missing(Path(top), head, push.Check(failed) if not isinstance(failed, push.Check)
+                                          else failed, rc, output, base)
+            if failure:
+                write_json(Path(run_dir) / "check_failure.json", failure)
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"env_problem": env_problem} if env_problem else {})})
@@ -1412,7 +1429,7 @@ def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
     """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched, or ""
     (no project, no push target or no copy of it here), and then those checks run."""
     from . import push
-    if not (p and any(getattr(c, "if_changed", ()) for c in cmds)):
+    if not p:
         return ""
     try:
         remote, branch = push.target(p, top)
@@ -3782,6 +3799,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
+    s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--detach", action="store_true",

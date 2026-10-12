@@ -16,6 +16,7 @@ bump happens under the lock, so parallel pushes never race for one version."""
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import posixpath
@@ -155,7 +156,15 @@ def skip_reason(repo: Path, head: str, check: Check, base: str = "") -> str | No
     """Why `check` does not apply to `head`, or None: it runs. `if_changed` is looked up in the diff
     from `base` (the push target) to `head`; without a base it is not applied, and a diff git cannot
     give raises ScopeError. `if_exists` is looked up in `head`'s files."""
-    return _changed_reason(repo, head, check, base) or _exists_reason(repo, head, check)
+    changed = _changed_reason(repo, head, check, base)
+    return changed or _scoped_exists_reason(repo, head, check, base)
+
+
+def _scoped_exists_reason(repo: Path, head: str, check: Check, base: str) -> str | None:
+    missing = _exists_reason(repo, head, check)
+    if missing and check.if_changed and base:
+        raise ScopeError(check, f"change is inside the check's scope but {missing}")
+    return missing
 
 
 def _changed_reason(repo: Path, head: str, check: Check, base: str) -> str | None:
@@ -608,7 +617,7 @@ def applicable(repo: Path, head: str, checks: list[Check], say: Callable[[str], 
     todo, skipped = [], []
     for c in checks:
         changed = _changed_reason(repo, head, c, base)
-        why = changed or _exists_reason(repo, head, c)
+        why = changed or _scoped_exists_reason(repo, head, c, base)
         if why:
             line = Skipped(skipped_line(c, why))
             line.scoped = bool(changed)
@@ -734,6 +743,61 @@ def check_problems(v: Any) -> list[str]:
     return [p for p in map(_entry_problem, _entries(v)) if p]
 
 
+def check_sig(check: Check) -> str:
+    return hashlib.sha256(json.dumps(check.config(), sort_keys=True).encode()).hexdigest()[:20]
+
+
+def applicability_problems(v: Any, repo: Path | None = None, head: str = "HEAD") -> list[str]:
+    """Advisory lint only: these warnings never grant permission to skip a check."""
+    out = []
+    files = _git(repo, "ls-tree", "-r", "--name-only", head) if repo else None
+    for check in check_list(v):
+        reasons = []
+        if re.search(r"\b[0-9a-fA-F]{40}\b", check):
+            reasons.append("pins a SHA")
+        if re.search(r"/(?:tmp|var/tmp|private/tmp)/[^\s'\"]+", check):
+            reasons.append("uses an absolute temp path")
+        if not check.if_exists and files and files.returncode == 0:
+            missing = [p for p in path_args(check) if not matches(files.stdout.splitlines(), p)]
+            if missing:
+                reasons.append("missing target at the tip: " + ", ".join(missing))
+        if reasons:
+            out.append(f"{check!r}: {'; '.join(reasons)}; use if_exists/if_changed to declare applicability")
+    return out
+
+
+def target_missing(repo: Path, head: str, check: Check, rc: int, output: str, base: str = "") -> dict | None:
+    """Classify only a missing named target verified against the tested tree. No pass or skip.
+    Without a declared scope, nested component targets cover that component; repository-wide
+    tests cover all code. An unknown diff is related, so it cannot turn a code failure into a wait.
+    """
+    if not (rc and ("can't open file" in output and "No such file" in output
+                   or rc == 4 and "file or directory not found" in output
+                   or rc == 5 and re.search(r"no tests (?:collected|ran)", output, re.I))):
+        return None
+    files = _git(repo, "ls-tree", "-r", "--name-only", head)
+    if files.returncode:
+        return None
+    targets = [p for p in path_args(check) if not matches(files.stdout.splitlines(), p)]
+    if not targets:
+        return None
+    diff = _git(repo, "diff", "--name-only", "--no-renames", f"{base}...{head}") if base else None
+    unrelated = False
+    if diff is not None and diff.returncode == 0:
+        changed = diff.stdout.splitlines()
+        scopes = check.if_changed
+        if not scopes:
+            components = {p.split("/")[0] for p in targets}
+            scopes = tuple(components) if all("/" in p for p in targets) and not components & {"tests", "test"} else ()
+        unrelated = not any(matches(changed, g) for g in scopes) if scopes else not any(
+            not is_doc(p) for p in changed)
+        # Deleting or changing the test itself always belongs to the check.
+        unrelated = unrelated and not any(matches(changed, p) for p in targets)
+    return {"kind": "target_missing", "sig": check_sig(check), "check": check.config(),
+            "targets": targets, "head": head, "base": base, "worktree": str(repo),
+            "rc": rc, "output": output[-8000:], "unrelated": unrelated}
+
+
 def checks_of(v: Any) -> list[str | dict]:
     """The config value of `v`'s checks, rejecting entries that are not commands (e.g. a sentence
     describing the checks) or malformed check objects."""
@@ -745,7 +809,7 @@ def checks_of(v: Any) -> list[str | dict]:
 _GLOB = re.compile(r"[*?\[]")
 _REDIRECT = re.compile(r"^[0-9&]*(>>?|<)")
 # Options whose value is the next word (an output file or setting, not a check target).
-VALUE_OPTS = {"--junitxml", "--junit-xml", "--rootdir", "--basetemp", "--confcutdir", "-c", "-o",
+VALUE_OPTS = {"--junitxml", "--junit-xml", "--rootdir", "--basetemp", "--confcutdir", "-c", "-o", "-k", "-m",
               "--override-ini", "--cov", "--cov-report", "--cov-config", "--log-file", "--result-log",
               "--html", "--output", "--report", "-p", "--ignore", "--deselect"}
 
@@ -789,7 +853,8 @@ def path_args(cmd: str) -> list[str]:
             continue
         w = w.split("::", 1)[0]
         w = re.sub(r"(\.py)\[[^\]]*\]$", r"\1", w)
-        if cwd is None or not w or w.startswith(("/", "~")) or not ("/" in w or _GLOB.search(w)):
+        if cwd is None or not w or w.startswith(("/", "~")) or not ("/" in w or _GLOB.search(w)
+                                                                                or w.endswith(".py")):
             continue
         w = posixpath.normpath(posixpath.join(cwd, w))
         if w != "." and w != ".." and not w.startswith("../"):

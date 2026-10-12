@@ -436,7 +436,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
             elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
                 walk(v, path + [str(k)])
     walk(raw, [])
-    from .push import (allow_protected, backup_problem, bump_problems, check_problems,   # push imports this module
+    from .push import (allow_protected, applicability_problems, backup_problem, bump_problems, check_problems,   # push imports this module
                        fast_forward_check, mirror_check, push_branch_problem, scalar_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
@@ -450,6 +450,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     except ValueError as e:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
+    out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     out += bump_problems(delivery.get("version_bump"))
     from .devq import config_problems as runner_problems

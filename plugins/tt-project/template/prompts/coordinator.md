@@ -77,7 +77,11 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   review's dependents move to the re-review. Do not add these again: steer them with `task_update`.
   `upstream:` notes and deferred follow-ups are not folded into the fix; they stay yours to relay
   and schedule. After two failed rounds on a stack, or a failure without fix follow-ups, it is
-  yours as before. So is an area whose reviews keep failing across stacks: at `review.area_fail_cap`
+  yours as before. Missing-target check-only failures on unrelated changes instead wait on
+  `check:<sig>` with one daemon-created harness repair owner. Reuse that owner; never add a code
+  fix or disable all checks to unblock them. A push-check config change reruns the waiting checks
+  without a model, and a change inside the check's scope still fails if its target is missing.
+  An area whose reviews keep failing across stacks also stays yours: at `review.area_fail_cap`
   (3) failed reviews within 48 h in one lineage (linked by `continues`, follow-ups, `depends_on` and
   `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the daemon queues no
   fix and a `review_area_cap` event (repeated review failures in one area) names its tasks and

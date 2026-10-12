@@ -45106,3 +45106,201 @@ def test_invalid_clear_operations_are_rejected_without_schedule_mutation(env, ac
     before = p.db.q('SELECT * FROM schedules')
     assert 'clear_fields' in coord.apply(p, [action])[0]
     assert p.db.q('SELECT * FROM schedules') == before
+# Missing check targets are owned configuration gaps, never an unchecked pass. ----------------------
+
+def test_push_check_applicability_lint(env):
+    from ttp.project import config_problems
+    p = make(env)
+    checks = ["git diff --check " + "a" * 40, "/tmp/check-env/bin/python -m pytest tests/test_absent.py",
+              "python3 -m pytest tests/test_absent.py"]
+    problems = config_problems({"delivery": {"push_checks": checks}}, p.root)
+    assert any("SHA" in x for x in problems)
+    assert any("absolute temp" in x for x in problems)
+    assert any("tests/test_absent.py" in x and "missing" in x for x in problems)
+    assert all("if_exists" in x and "if_changed" in x for x in problems)
+    assert not config_problems({"delivery": {"push_checks": [
+        {"run": checks[-1], "if_exists": "tests/test_absent.py"}]}}, p.root)
+
+
+@pytest.mark.parametrize("rc,output", [(2, "python3: can't open file 'tests/test_absent.py': [Errno 2] No such file or directory"),
+                                     (4, "ERROR: file or directory not found: tests/test_absent.py"),
+                                     (5, "no tests collected in 0.01s")])
+def test_missing_check_target_requires_tree_evidence_and_preserves_related_failure(env, rc, output):
+    from ttp import push
+    p = make(env)
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    (p.root / "README.md").write_text("updated docs\n")
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "docs")
+    check = push.Check("python3 -m pytest tests/test_absent.py")
+    failure = push.target_missing(p.root, "HEAD", check, rc, output, base)
+    assert failure and failure["kind"] == "target_missing" and failure["unrelated"] is True
+    # Untracked files and files in another commit must not make a missing tree target present.
+    (p.root / "tests").mkdir(exist_ok=True)
+    (p.root / "tests/test_absent.py").write_text("def test_ok(): pass\n")
+    assert push.target_missing(p.root, "HEAD", check, rc, output, base)
+    _git_out(p.root, "add", ".")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "test added")
+    assert push.target_missing(p.root, "HEAD", check, rc, output, base) is None
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    _git_out(p.root, "rm", "tests/test_absent.py")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "test deleted")
+    assert push.target_missing(p.root, "HEAD", check, rc, output, base)["unrelated"] is False
+    assert push.target_missing(p.root, "HEAD", check, 1, "FAILED test_assertion", base) is None
+
+
+def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, monkeypatch):
+    from ttp import checkgaps, push
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    command = "python3 -m pytest tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command])
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    reviews, consumers = [], []
+    for i in range(3):
+        code, branch, _, (rev,) = _finish_code(env, p, f"docs {i}", {f"docs/{i}.md": 1})
+        consumer = p.db.add_task(f"consumer {i}", depends_on=[rev["id"]])
+        run = env["tmp"] / f"missing-{i}"
+        run.mkdir()
+        path = p.worktrees / f"t{code}"
+        head = _git_out(path, "rev-parse", "HEAD").strip()
+        failure = push.target_missing(path, head, push.Check(command), 4,
+                                      "ERROR: file or directory not found: tests/test_absent.py", base)
+        (run / "check_failure.json").write_text(json.dumps(failure))
+        (run / "checks.json").write_text(json.dumps({"commands": [command, "git diff --check"]}))
+        (run / "result.json").write_text(json.dumps({"status": "failed", "review_failure": "check_only",
+                                                   "summary": "only the check target is missing",
+                                                   "on_pass": {"status": "done", "summary": "review complete; checks passed"}}))
+        # A real run row permits normal model-free check settlement after the config repair.
+        p.db.x("INSERT INTO runs(task,role,status,dir) VALUES(?,?,?,?)", (rev["id"], "worker", "ok", str(run)))
+        d = Daemon(p.base)
+        d._finish_worker({"task": rev["id"], "note": "{}"}, RunUsage(), "ok", run)
+        d.reconcile_tasks()
+        reviews.append(rev["id"])
+        consumers.append(consumer)
+    gaps = p.db.kv(checkgaps.KEY)
+    assert len(gaps) == 1
+    gap = next(iter(gaps.values()))
+    owners = p.db.q("SELECT * FROM tasks WHERE kind='harness' AND origin='daemon'")
+    assert len(owners) == 1 and gap["owner"] == owners[0]["id"]
+    assert set(gap["tasks"]) == set(map(str, reviews))
+    for tid in reviews:
+        task = p.db.task(tid)
+        prev = json.loads(task["result"])
+        assert task["status"] == "queued" and prev["status"] == "waiting"
+        assert "checks --gap" in prev["retry_when"] and task["attempts"] == 0
+    assert all(p.db.task(t)["status"] == "queued" for t in consumers)
+    started = []
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, name, tid, extra: started.append((tid, extra)) or True)
+    d.reconcile_tasks()
+    assert not started
+    p.set_config("delivery.push_checks", ["true"])
+    d._load_config()
+    d.reconcile_tasks()
+    assert {tid for tid, _ in started} == set(reviews)
+    assert all(extra == ["--fresh", "--", "git diff --check"] for _, extra in started)
+    assert all("checks --result" in json.loads(p.db.task(t)["result"])["retry_when"] for t in reviews)
+    d.reconcile_tasks()
+    assert len(started) == 3, "a restart or another tick must not start the same rerun again"
+
+    # Explicit review verdicts settle only after a passing record for each clean, unchanged tree.
+    for tid in reviews:
+        member = gap["tasks"][str(tid)]
+        out = pathlib.Path(member["run_dir"])
+        (out / "checks.rc").write_text("0\n")
+        (out / "checks.json").write_text(json.dumps({"passed": True, "head": member["head"],
+                                                    "worktree": member["worktree"], "commands": ["true"]}))
+        d._probe_passed(p.db.task(tid), time.time())
+        assert p.db.task(tid)["status"] == "done"
+    assert all(p.db.task(t)["status"] == "queued" for t in consumers)
+
+
+def test_checks_record_missing_target_and_probe_config_change(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, checkgaps
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "work")
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    _git_out(p.root, "update-ref", "refs/remotes/origin/work", base)
+    (p.root / "docs").mkdir(exist_ok=True)
+    _commit_files(p.root, {"docs/new.md": "docs\n"}, "docs")
+    run = tmp_path / "missing-run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    command = "python3 tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks"])
+    assert exc.value.code == 1
+    receipt = json.loads((run / "check_failure.json").read_text())
+    assert receipt["unrelated"] is True and receipt["base"] == base
+    assert receipt["check"] == command and receipt["rc"] == 2
+    key = "check:" + receipt["sig"]
+    p.db.set_kv(checkgaps.KEY, {key: {"config": checkgaps.config_sig(p.config())}})
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--gap", receipt["sig"]])
+    assert exc.value.code == 1
+    p.set_config("delivery.push_checks", ["true"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--gap", receipt["sig"]])
+    assert exc.value.code == 0
+    cli.main(["checks"])
+    assert not (run / "check_failure.json").exists(), "a subsequent pass must erase the failed receipt"
+
+
+def test_missing_check_target_infers_component_scope_without_skipping(env):
+    from ttp import push
+    p = make(env)
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    check = push.Check("python3 -m pytest component/tests/test_absent.py")
+    output = "ERROR: file or directory not found: component/tests/test_absent.py"
+    (p.root / "other").mkdir()
+    (p.root / "component").mkdir()
+    _commit_files(p.root, {"other/app.py": "other\n"}, "other")
+    assert push.target_missing(p.root, "HEAD", check, 4, output, base)["unrelated"] is True
+    _commit_files(p.root, {"component/app.py": "related\n"}, "related")
+    assert push.target_missing(p.root, "HEAD", check, 4, output, base)["unrelated"] is False
+    assert push.applicable(p.root, "HEAD", [check], lambda _: None, base)[0] == [check]
+
+
+def test_scoped_check_cannot_skip_a_missing_target_on_related_changes(env):
+    from ttp import push
+    p = make(env)
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    checks = push.check_list([{"run": "python3 -m pytest tests/test_absent.py",
+                              "if_exists": "tests/test_absent.py", "if_changed": ["src/**", "tests/**"]}])
+    _commit_files(p.root, {"README.md": "docs\n"}, "docs")
+    assert not push.applicable(p.root, "HEAD", checks, lambda _: None, base)[0]
+    (p.root / "src").mkdir()
+    _commit_files(p.root, {"src/app.py": "code\n"}, "code")
+    with pytest.raises(push.ScopeError, match="inside the check's scope"):
+        push.applicable(p.root, "HEAD", checks, lambda _: None, base)
+    with pytest.raises(push.ScopeError):
+        push.skip_reason(p.root, "HEAD", checks[0], base)
+
+
+@pytest.mark.parametrize("finding,related", [("check_only", True), ("mixed", False), ("substantive", False)])
+def test_related_or_substantive_missing_check_failure_still_fails(env, finding, related):
+    from ttp import checkgaps, push
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    command = "python3 -m pytest tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command])
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    code, _, _, (rev,) = _finish_code(env, p, "change", {"app.py" if related else "NOTES.md": 1})
+    path = p.worktrees / f"t{code}"
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    run = env["tmp"] / "failed-check-review"
+    run.mkdir()
+    failure = push.target_missing(path, head, push.Check(command), 4,
+                                  "ERROR: file or directory not found: tests/test_absent.py", base)
+    (run / "check_failure.json").write_text(json.dumps(failure))
+    (run / "result.json").write_text(json.dumps({"status": "failed", "review_failure": finding,
+                                               "summary": "review failed"}))
+    Daemon(p.base)._finish_worker({"task": rev["id"], "note": "{}"}, RunUsage(), "ok", run)
+    assert p.db.task(rev["id"])["status"] == "failed"
+    assert not p.db.kv(checkgaps.KEY, {})

@@ -24,7 +24,13 @@
 - When it must not proceed, say what failed in `review_failure`: `check_only` when the only blocker
   is a check or gate that is missing or does not apply and the change has no blocking code finding,
   `substantive` for code findings, `mixed` for both. A `check_only` failure gets no fix task or
-  re-review: the coordinator routes the check to its owner. Left out, it counts as `substantive`.
+  re-review of code findings. For a missing target, run `ttp checks` so it records
+  `check_failure.json` with the tested tree and failing command. The daemon verifies that receipt,
+  creates one harness repair owner per check signature, and keeps unrelated reviews waiting on a
+  `ttp checks --gap <sig>` probe. A config change reruns their checks without a model; related
+  changes still fail. Other check-only failures go to the coordinator. Left out, it counts as
+  `substantive`. Include `on_pass` only when the review verdict is complete and a check pass is the
+  sole remaining condition; preserve any required push approval in that hand-off.
 - A head the spec says is already delivered as a PR, or a change it says must not reach the push
   branch, is review only: a pass is `done`, with no push and no approval for the push queue,
   whatever the sections below say.

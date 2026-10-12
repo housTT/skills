@@ -385,7 +385,19 @@ and preferences you add later become part of the project's charter and memory.
   every check is skipped this way touches nothing any check covers, so it goes unchecked, as a
   docs-only change does without checks: a notes-only branch passes `ttp push --own` without a
   catch-all check. If any of the skips came from `if_exists` instead, nothing checked the head and
-  it fails as above. A check may set both keys; it then runs only where both say it applies.
+  it fails as above. A check may set both keys; outside its declared scope it skips, but inside
+  that scope a missing `if_exists` target fails rather than leaving the change unchecked.
+- Config warnings flag checks that pin a full commit SHA, use an absolute temporary environment,
+  or name a target missing from the branch tip without `if_exists`. Declare applicability with
+  `if_exists`/`if_changed` and retain coverage for the code the check protects. Warnings do not skip
+  commands. `ttp checks` records a missing-target failure only when the target is absent from the
+  tested Git tree (Python cannot open it, pytest cannot find it, or collects no tests). A check-only
+  review failure on an unrelated change becomes a wait with one harness repair task per check
+  signature, rather than blocking its dependents. Changing `delivery.push_checks` reruns those
+  checks without a model. Related changes still fail; missing scope or unreadable history is treated
+  conservatively. Without explicit scope, a nested component test covers its component and root
+  `tests/` covers all code. A retry never approves code unless the reviewer supplied an `on_pass`
+  verdict and the unchanged, clean commit passes its checks.
 - Checks run with `TTP_PUSH_MODE` set to `target` (`ttp push` or the push queue, to
   `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and

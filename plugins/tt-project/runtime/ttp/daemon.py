@@ -1575,6 +1575,8 @@ class Daemon:
         A queued task whose dependency failed, was cancelled or does not exist is blocked with the
         reason instead of waiting forever. That event does not start a turn: the dependency's own
         event already does, and a turn per block could ping-pong with a requeue."""
+        from . import checkgaps
+        checkgaps.rerun(self)
         db, now = self.p.db, time.time()
         for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
                       "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
@@ -2242,6 +2244,12 @@ class Daemon:
                 status, rstatus = "ok", "waiting"
             result = {**result, "retry_when": locks.job_probe([j["rc"] for j in jobs], push._own_ttp(self.p)),
                       "waiting_for": result.get("waiting_for") or f"detached jobs: {listing}"[:300]}
+        if status == "ok" and rstatus in ("failed", "blocked"):
+            from . import checkgaps
+            gap_wait = checkgaps.wait(self.p, task, result, run_dir, self.cfg)
+            if gap_wait:
+                result, rstatus = gap_wait, "waiting"
+                summary = result["summary"]
         waiting = status == "ok" and rstatus == "waiting"
         # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
         # the run the host went down under.
