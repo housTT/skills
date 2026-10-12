@@ -2218,6 +2218,73 @@ def test_a_coordinator_turn_logs_what_it_decided_and_its_rejections(env):
     data = json.loads(p.db.one("SELECT data FROM events WHERE kind='rejected_actions'")["data"])
     assert len(data) == 1 and data[0].startswith("ask_user:")
 
+def test_a_batch_a_noop_turn_already_met_is_skipped_without_a_model_run(env, monkeypatch):
+    """Turns that decided nothing were mostly woken by notices (a branch only on this machine, a task
+    done). A batch whose material content a no-op turn already met, against the same state, is settled
+    model-free and counted in the daily review; messages, urgent events, sweeps and changed state run."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import audit, sweep, turngate
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    task = p.db.add_task("feature", "s", origin="user")
+    p.db.update_task(task, status="done")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    notes = []
+
+    def start_run(role, prompt, *a, **k):
+        notes.append(k["note"])
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def event(ahead, severity="normal", kind="local_only"):
+        clock[0] += 600
+        eid = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (clock[0], f"task:{task}", kind, severity,
+                      f"task #{task}'s branch b exists only on this machine, {ahead} commits ahead", "queued", task))
+        clock[0] += 60
+        n = len(notes)
+        d.maybe_coordinate()
+        ran = len(notes) > n
+        if ran:
+            rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+            usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="",
+                                    final_text="", cost_usd=0.2)
+            d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
+        assert p.db.one("SELECT status FROM events WHERE id=?", (eid,))["status"] == "handled"
+        return ran
+
+    assert event(2), "the first notice runs a turn"
+    assert notes[-1]["gate"]["keys"] and p.db.kv(turngate.SEEN_KEY)
+    assert not event(3), "the same notice, numbers aside, against the same state is skipped"
+    assert turngate.skipped(p.db, 0) == {"n": 1, "usd": pytest.approx(0.2)}
+    assert "skipped as repeats of a turn that decided nothing: 1, ~$0.20 saved" in "\n".join(audit.lines(p.db, clock[0]))
+    assert audit.report(p.db, clock[0])["turns_skipped"]["n"] == 1
+    assert event(3, severity="high"), "a high event is never skipped"
+    assert event(3, kind=sweep.SWEEP_KIND), "a blocker sweep is never skipped"
+    p.db.add_task("new work", "s", origin="user")   # the state the turn decides against changed
+    assert event(3), "a changed state runs the turn"
+    assert not event(4)
+    # A user message always runs the turn, and a turn with a message records nothing.
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert event(4)
+    assert not turngate.record(p.db, d.cfg, {"messages": [1], "gate": {"bg": "x", "keys": ["k"]}}, 1, 0.1)
+    # An escalated batch reruns; window 0 turns the gate off.
+    gate = {"bg": "x", "keys": ["k"]}
+    evs = [{"id": 1, "kind": "local_only", "severity": "normal"}]
+    p.db.set_kv(turngate.SEEN_KEY, [{"ts": clock[0], "run": 1, "usd": 0.1, "bg": "x", "keys": ["k"]}])
+    assert turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0], sweep.SWEEP_KIND, False)
+    assert not turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0], sweep.SWEEP_KIND, True)
+    off = {"coordinator": {"skip_repeat_window_s": 0}}
+    assert not turngate.repeat(p.db, off, evs, [], gate, clock[0], sweep.SWEEP_KIND, False)
+    assert not turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0] + 86400, sweep.SWEEP_KIND, False), "records expire"
+    assert not turngate.repeat(p.db, d.cfg, evs, [], {"bg": "y", "keys": ["k"]}, clock[0], sweep.SWEEP_KIND, False)
+
+
 def test_the_daily_review_never_lifts_a_pause_the_user_set():
     review = " ".join((RUNTIME.parent / "template" / "prompts" / "daily-review.md").read_text().split())
     assert "A resource pause the user set is never lifted without the user's word" in review

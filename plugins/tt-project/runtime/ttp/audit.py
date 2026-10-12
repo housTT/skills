@@ -9,7 +9,8 @@ the project could have saved. Model-free; the review grades it.
   to those causes apart, tasks run again after a failed attempt, and tasks that continue an
   earlier one (`continues:<id>`), with the spend of each;
 - coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
-  starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost;
+  starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
+  and turns the daemon skipped as repeats of one that decided nothing (turngate.py), with the saving;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
@@ -27,7 +28,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, ends, unblock
+from . import budget, ends, turngate, unblock
 from .db import DB, continues_id
 from .project import Project
 
@@ -298,6 +299,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f}; {noop}{part}; "
                    f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f}), "
                    f"{turns['starve']} starve wakes (${turns['starve_usd']:.2f})")
+    skips = turngate.skipped(db, since)
+    if skips["n"]:
+        out.append(f"coordinator turns skipped as repeats of a turn that decided nothing: {skips['n']}, "
+                   f"~${skips['usd']:.2f} saved")
     done = finished(db, since)
     if done:
         work = sum(float(t["spent_usd"] or 0) for t in done)
@@ -337,6 +342,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
     return {"window_h": window_s / 3600, "asks": asks(db, since, now), "asks_refused": rejected_asks(db, since),
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
-            "coordinator_turns": coordinator_turns(db, since), "finished": done, "per_outcome": per_outcome(done),
+            "coordinator_turns": coordinator_turns(db, since), "turns_skipped": turngate.skipped(db, since),
+            "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "overrides": overrides(p, db, now, blocked_h)}

@@ -128,6 +128,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
+                    # An event batch that a turn which decided nothing already met, against the same
+                    # state, is settled without a model run for this long after it (turngate.py; 0: off).
+                    "skip_repeat_window_s": 86400,
                     # No worker run started for this long while dispatch would start a queued task:
                     # one high observation per stall lists those tasks (Daemon.check_stall; 0: off).
                     "stall_wake_h": 3,

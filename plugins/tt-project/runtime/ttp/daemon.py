@@ -71,6 +71,7 @@ from . import service
 from . import settinghold
 from . import sweep
 from . import timefmt
+from . import turngate
 from . import unblock
 from . import upstream
 from . import waitheal
@@ -2032,7 +2033,14 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         problems = refused + list(problems)
-        self._log_decided(r, note, len(_decisions(actions)))
+        decided = len(_decisions(actions))
+        self._log_decided(r, note, decided)
+        if not decided:
+            try:
+                turngate.record(db, self.cfg, note, r.get("id"), float(getattr(usage, "cost_usd", 0) or 0))
+            except Exception:   # bookkeeping: the turn is settled either way
+                log(self.p, "coordinator turn gate record failed: "
+                    + traceback.format_exc().replace("\n", " | ")[:1000])
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
@@ -3376,6 +3384,22 @@ class Daemon:
                 return
             if not msgs and self._batch_hold(queued, now):
                 return
+        seen_now: dict = {}
+        if evs and not msgs and not esc:
+            try:
+                # A batch a turn that decided nothing already met, against the same state, is settled
+                # without a model run (turngate.py).
+                seen_now = turngate.material(db, wake_fingerprint(self.p, {k: g.as_dict() for k, g in self.gates.items()}),
+                                         [e["id"] for e in evs])
+                match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND, bool(esc))
+                if match:
+                    turngate.skip(db, evs, match, now)
+                    log(self.p, f"coordinator turn skipped: events {[e['id'] for e in evs]} repeat what "
+                        f"turn(s) {match['runs']} met and decided nothing on (~${match['usd']:.2f} saved)")
+                    return
+            except Exception:   # the gate only saves money: a failure runs the turn
+                log(self.p, "coordinator turn gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+                seen_now = {}
         hour_turns = db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>?", (now - 3600,))["n"]
         if hour_turns >= int(c.get("max_turns_per_hour", 30)) and not msgs:
             return
@@ -3434,7 +3458,7 @@ class Daemon:
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"wake_due": due} if due else {}),
                                  **({"escalated": True} if esc else {}), **checked,
-                                 "digest": coord.digest_size(parts)},
+                                 "digest": coord.digest_size(parts), **({"gate": seen_now} if seen_now else {})},
                            unblock=unblock)
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
