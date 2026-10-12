@@ -3671,10 +3671,9 @@ class Daemon:
                 if check else {}
             unblock = ", ".join(triggers)
             raised = bool(unblock) and can_raise
-            # A routine turn sees background sections the previous turn saw as one line each; a
-            # turn with any effort trigger sees everything.
+            # Every turn, at any effort, sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
-                                              None if unblock else (db.kv(coord.DIGEST_SEEN_KEY) or {}))
+                                              db.kv(coord.DIGEST_SEEN_KEY) or {})
             prompt = "\n".join(text for _, text in parts)
             # `escalate` is offered only where the daemon would take it: a routine turn that a raise
             # would change, not a rerun, over a batch not escalated before (Daemon._escalate_refusal).

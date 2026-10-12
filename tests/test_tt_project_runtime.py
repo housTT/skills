@@ -5672,7 +5672,67 @@ def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(e
     assert "## Recurring (as last turn)" in prompt, "an unchanged section was repeated on a routine turn"
     assert k["note"]["digest"]["sections"]["recurring"] < 200
     prompt, k = turn("task_failed")
-    assert k["unblock"] and "## Recurring\n" in prompt, "a raised turn must see everything"
+    assert k["unblock"] and "## Recurring (as last turn)" in prompt, "a raised turn repeated an unchanged section"
+    p.db.x("UPDATE schedules SET enabled=0 WHERE name='daily-review'")
+    prompt, k = turn("task_failed")
+    assert k["unblock"] and "## Recurring\n" in prompt, "a raised turn must see a changed section whole"
+
+
+def test_an_unchanged_machine_ledger_is_one_line_on_a_raised_turn_unless_an_event_names_a_machine(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-c", tags="device")
+    _resources(p, "- box-c")
+    ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "other", expires="6h")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def turn(kind, text="x"):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", kind, "normal", text, "queued"))
+        clock[0] += 600
+        d.maybe_coordinate()
+        p.db.x("UPDATE events SET status='handled'")
+        return calls[-1]
+
+    prompt, _ = turn("task_failed")
+    assert "disabled auto power cycle" in prompt
+    prompt, k = turn("task_failed")
+    assert k["unblock"], "the turn was not raised"
+    assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
+    assert "zzzz" not in prompt and k["note"]["digest"]["sections"]["machine_ledger"] < 200
+    prompt, k = turn("task_failed", "the run on box-c lost its device")
+    assert k["unblock"] and "disabled auto power cycle" in prompt, "an event names a machine: show the ledger"
+    prompt, _ = turn("machine_condition", "a condition opened")
+    assert "disabled auto power cycle" in prompt, "a machine event shows the ledger"
+    ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
+    prompt, _ = turn("task_failed")
+    assert "a second change" in prompt, "a changed ledger is shown whole"
+
+
+def test_the_host_line_counts_a_lock_held_at_several_reboots_once_with_the_latest(env):
+    p = make(env)
+    from ttp import coordinator as coord, timefmt
+    t0 = time.time() - 4 * 3600
+    boots = [{"ts": t0, "held": []},
+             {"ts": t0 + 3600, "held": ["push:origin: push batch b-1 since 01:02", "push:run-b-101: batch b-1"]},
+             {"ts": t0 + 7200, "held": ["push:origin: push batch b-2 since 02:02", "push:run-b-202: batch b-2"]},
+             {"ts": t0 + 9000, "held": ["board: task #7"]},
+             {"ts": t0 + 10800, "held": ["push:origin: push batch b-3 since 03:02", "push:run-b-303: batch b-3"]}]
+    line = coord.held_at_reboots(boots, p)
+    at = [timefmt.short(b["ts"], p) for b in boots]
+    assert line == (f"{at[0]} nothing; {at[3]} board: task #7; "
+                    f"3x, latest {at[4]} push:origin: push batch b-3 since 03:02; "
+                    f"3x, latest {at[4]} push:run-b-303: batch b-3"), line
+    assert "b-1" not in line and "b-2" not in line
 
 
 def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block(monkeypatch):

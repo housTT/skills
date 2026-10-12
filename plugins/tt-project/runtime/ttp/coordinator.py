@@ -270,9 +270,10 @@ TITLE_CHARS = 120
 SENT_CHARS = 100
 MUTE_CHARS = 200
 # Every coordinator turn is a fresh session whose digest the provider writes to its cache whole.
-# A routine turn sees these background sections as one line while they are as the previous turn
-# saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused resources and
-# memory changes are always shown whole; so is everything on a turn at raised effort.
+# Every turn, at any effort, sees these background sections as one line while they are as the
+# previous turn saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused
+# resources and memory changes are always shown whole; so is the machine ledger on a turn whose
+# events concern a machine.
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger")
 EVENT_CHARS = 1500
@@ -422,15 +423,39 @@ def clip(text: Any, n: int) -> str:
     return cut.rstrip(" ,;:") + "…"
 
 
+def held_at_reboots(boots: list[dict], where=None) -> str:
+    """What each reboot of `boots` interrupted, oldest first. A lock held at several reboots (its
+    name alike but for numbers, such as one push batch after another) is one entry: its count and
+    the latest; so are the reboots that interrupted nothing."""
+    groups: dict[str, list] = {}
+    for b in boots:
+        at = timefmt.short(float(b["ts"]), where)
+        for item in b.get("held") or ["nothing"]:
+            key = re.sub(r"\d+", "#", str(item).split(": ", 1)[0])
+            g = groups.pop(key, [0, "", ""])   # re-inserted: the order follows each one's latest
+            groups[key] = [g[0] + 1, at, item]
+    return "; ".join(f"{at} {item}" if n == 1 else f"{n}x, latest {at} {item}" for n, at, item in groups.values())
+
+
+def events_name_machine(db, event_ids: list[int], aliases: list[str]) -> bool:
+    """Whether any of the events is about a machine: a machine_* event, or one naming one of `aliases`."""
+    if not event_ids:
+        return False
+    rows = db.q(f"SELECT kind, text FROM events WHERE id IN ({','.join('?' * len(event_ids))})", list(event_ids))
+    named = re.compile("|".join(rf"(?<![\w.-]){re.escape(a)}(?![\w-])" for a in aliases)) if aliases else None
+    return any(str(r["kind"]).startswith("machine") or (named and named.search(str(r["text"] or "")))
+               for r in rows)
+
+
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
     return "\n".join(text for _, text in digest_parts(p, gates, event_ids, msg_ids, seen)[0])
 
 
 def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
                  seen: dict | None = None) -> tuple[list[tuple[str, str]], dict[str, str]]:
-    """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section
-    shown in full, to store as `seen` for the next turn. With `seen` (a routine turn), a collapsible
-    section whose hash is unchanged is shown as one line."""
+    """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section,
+    to store as `seen` for the next turn. With `seen`, a collapsible section whose hash is unchanged
+    is shown as one line."""
     db = p.db
     now = time.time()
     home = timefmt.home(p)
@@ -487,8 +512,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     boots = db.boots(now - 86400)
     if boots:
-        at_each = "; ".join(f"{timefmt.short(float(x['ts']), p)} "
-                            f"{', '.join(x.get('held') or []) or 'nothing'}" for x in boots)
+        at_each = held_at_reboots(boots, p)
         lines.append(f"## Host: {host_line(boots, p)[len('host: '):]}; held at each: {clip(at_each, 600)}")
     disk = db.kv("disk")
     if disk:
@@ -528,6 +552,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         kept = [ln for ln in lines if not ln.startswith("No recovery owner")]   # named once: not a change
         section("machine_ledger", ["## Shared machines in your Resources: open changes (`ttp machines change`), "
                                    "conditions, owners"] + [f"- {ln}" for ln in lines], "\n".join(kept),
+                None if events_name_machine(db, event_ids, machine_ledger.resource_machines(p)) else
                 f"## Shared machines in your Resources: {len(kept)} open (as last turn)")
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
