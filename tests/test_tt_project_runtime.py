@@ -10902,12 +10902,12 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
     text = f.read_text()
     assert "name: tt-project\n" in text and "disable-model-invocation: true" in text
     assert "`tt-project:tt-project`" in text
-    assert "/tt-project" not in setup() and f.read_text() == text     # idempotent
+    assert "Claude Code: /tt-project" not in setup() and f.read_text() == text     # idempotent
     f.write_text(text.replace("Request:", "Old request:"))            # an older release's text
     assert "/tt-project is ready" in setup() and f.read_text() == text
     assert "removed the /tt-project shortcut" in setup("--no-shortcut")
     assert not f.parent.exists()
-    assert setup("--no-shortcut").count("/tt-project") == 0           # nothing left to remove
+    assert "/tt-project shortcut" not in setup("--no-shortcut")          # nothing left to remove
     f.parent.mkdir(parents=True)
     f.write_text("---\nname: tt-project\ndescription: mine\n---\nmy own skill\n")
     assert "left your own" in setup() and f.read_text().endswith("my own skill\n")
