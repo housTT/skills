@@ -3221,8 +3221,9 @@ class Daemon:
         except Exception:
             log(self.p, "idle capacity check failed\n" + traceback.format_exc())
             return
+        declined = self._idle_declines(now)
         may_fire = free > 0 and not self.settling() and now - self._started >= STALL_SETTLE_S
-        new, fired = idlecap.step(st, idle, now, grace, rearm, may_fire)
+        new, fired = idlecap.step(st, idle, now, grace, rearm, may_fire, declined)
         if new != st:
             db.set_kv(idlecap.STATE_KEY, new)
         if not fired:
@@ -3237,26 +3238,61 @@ class Daemon:
         when = (f"#{nxt['id']} at {timefmt.short(float(nxt['not_before']), self.p, now)} "
                 f"(in {(float(nxt['not_before']) - now) / 3600:.1f} h)" if nxt else "")
         text = idlecap.text(new, fired, now, free, running, when, rearm)
-        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
              (now, "daemon", idlecap.KIND, f"{idlecap.KIND}:{','.join(fired)}:{int(now)}", "normal",
-              text[:4000], "queued"))
+              text[:4000], json.dumps({"fired": {n: new[n]["n"] for n in fired}}), "queued"))
         log(self.p, f"idle capacity: {', '.join(fired)} idle, {free} slot(s) free; coordinator told")
+
+    def _idle_declines(self, now: float) -> dict:
+        """The per-resource declines (idlecap.judge), kept in the database: each idle_capacity event the
+        coordinator has handled since is judged once against the tasks created after it; a resource an
+        open task names is cleared."""
+        db = self.p.db
+        dec = dict(db.kv(idlecap.DECLINED_KEY) or {})
+        start = dec
+        for e in db.q("SELECT id, ts, data FROM events WHERE kind=? AND status='handled' AND ts>? ORDER BY id",
+                      (idlecap.KIND, now - idlecap.REARM_MAX_S * 2)):
+            try:
+                data = json.loads(e["data"] or "{}")
+            except ValueError:
+                data = {}
+            if not isinstance(data, dict) or data.get("judged") or not isinstance(data.get("fired"), dict):
+                continue
+            named = {n for t in db.q("SELECT labels FROM tasks WHERE created>=?", (float(e["ts"]),))
+                     for n in idlecap.task_names(t, self.cfg)}
+            dec = idlecap.judge(dec, data["fired"], named, float(e["ts"]))
+            db.x("UPDATE events SET data=? WHERE id=?", (json.dumps({**data, "judged": True}), e["id"]))
+        open_names = {n for t in db.q("SELECT labels FROM tasks WHERE status IN ('queued','running','waiting')")
+                      for n in idlecap.task_names(t, self.cfg)}
+        dec = {r: v for r, v in dec.items() if not any(idlecap.uses(n, r) for n in open_names)}
+        if dec != start:
+            db.set_kv(idlecap.DECLINED_KEY, dec)
+        return dec
 
     def _idle_devices(self, now: float) -> tuple[set[str], int]:
         """(the project's device resources idle now, worker slots free for new work). Free slots are 0
         while the core provider's gate is orange or red or holds new work, or a ready task would start
-        now. Paused resources, resources in trouble and machines with an open ledger condition are
-        never idle: they are out of use on purpose or broken."""
+        now. Paused resources, resources in trouble, machines with an open ledger condition or a change
+        entry that holds their device work are never idle: they are out of use on purpose or broken. Nor
+        is a device no open task names and no task run in the last idle_capacity_use_days named."""
         db, core = self.p.db, self.cfg.get("core_provider") or "claude"
         open_tasks = db.q("SELECT labels FROM tasks WHERE status IN ('queued','running')")
         recent = db.q("SELECT labels FROM tasks WHERE created>?", (now - idlecap.LABEL_LOOKBACK_S,))
         named = {n for t in recent for n in idlecap.task_names(t, self.cfg)}
         known = machines.load()
         cands = idlecap.candidates(self.cfg, named, machine_ledger.resource_machines(self.p), known)
+        days = idlecap.use_days(self.cfg)
+        if days > 0:
+            wanted = {n for t in db.q(
+                "SELECT labels FROM tasks WHERE status IN ('queued','running','waiting') "
+                "OR id IN (SELECT task FROM runs WHERE started>?)", (now - days * 86400,))
+                for n in idlecap.task_names(t, self.cfg)}
+            cands = {c for c in cands if any(idlecap.uses(n, c) for n in wanted)}
         paused = db.paused_resources()
         out = {locks.canonical(self.cfg, str(n)) for n in (
             *paused, *(db.kv("resource_trouble") or {}),
-            *(c.get("alias") or "" for c in machine_ledger.conditions().values() if isinstance(c, dict)))}
+            *(c.get("alias") or "" for c in machine_ledger.conditions().values() if isinstance(c, dict)),
+            *(c.get("alias") or "" for c in machine_ledger.changes() if idlecap.holds_work(c)))}
         used = {n for t in open_tasks for n in idlecap.task_names(t, self.cfg)}
         used |= {locks.canonical(self.cfg, str(r.get("resource"))) for h in hold.holding(self.p.state / "holds")
                  for r in h.get("resources") or []}

@@ -15634,6 +15634,11 @@ def _idle_setup(env, monkeypatch):
     d.cfg["resources"] = {"rig-device": 1}
     prov = d.cfg.get("core_provider", "claude")
     d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2)}
+    used = p.db.add_task("ran on the rig", "s", kind="work", tier="light", origin="coordinator",
+                         labels=["resource:rig-device"])
+    p.db.update_task(used, status="done")
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,'worker',?,?,?,'ok')",
+           (used, prov, now - 7200, now - 3600))
 
     def check(at):
         d._idle_cap_checked = at - 60
@@ -15720,6 +15725,80 @@ def test_idle_capacity_stays_quiet_when_paused_gated_full_in_trouble_or_work_is_
     assert check(t + 5 * 3600) == [] and check(t + 6 * 3600) == []
     d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2, level="yellow")}
     assert len(check(t + 6 * 3600 + 60)) == 1, "a yellow gate with a free slot raises the idle stretch"
+
+
+def test_idle_capacity_skips_devices_held_by_a_machine_change_or_not_used_by_the_project(env, monkeypatch):
+    from ttp import idlecap
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p, d, now, prov, check = _idle_setup(env, monkeypatch)
+    mm.add("rig", tags="device")
+    held = ml.add_change("rig", "holds the broker for a firmware update", "release-hold", "other", expires="2d")
+    assert check(now) == [] and check(now + 3600) == [], "a change entry holding its device work: not idle"
+    ml.close_change(held["id"], "done")
+    power = ml.add_change("rig", "disabled auto power cycle", "enable it", "other", expires="2d")
+    assert check(now + 2 * 3600) == [] and len(check(now + 3 * 3600)) == 1, \
+        "a change that does not hold device work leaves the device idle capacity"
+    ml.close_change(power["id"], "done")
+    assert idlecap.holds_work({"what": "paused the job queue"}) and idlecap.holds_work({"what": "drained the box"})
+    assert idlecap.holds_work({"what": "disabled the broker service"})
+    assert not idlecap.holds_work({"what": "added a log rotation drop-in"})
+    # A device no task of the project named lately is not the project's to fill.
+    p.db.x("UPDATE runs SET started=? WHERE status='ok'", (now - 8 * 86400,))
+    t = now + 10 * 3600
+    assert len(check(t)) == 1 and len(check(t + 3600)) == 1 and not p.db.kv("idle_capacity"), \
+        "a device no recent run or open task names raises nothing"
+    d.cfg["coordinator"]["idle_capacity_use_days"] = 0
+    assert len(check(t + 2 * 3600)) == 1 and len(check(t + 3 * 3600)) == 2, "use_days 0 turns that filter off"
+    d.cfg["coordinator"]["idle_capacity_use_days"] = 30
+    assert len(check(t + 4 * 3600)) == 2, "a longer window counts the older run"
+
+
+def test_idle_capacity_backs_off_per_resource_after_a_declined_event_and_survives_a_restart(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import idlecap
+    from ttp.daemon import Daemon
+    p, d, now, prov, check = _idle_setup(env, monkeypatch)
+    d.cfg["resources"] = {"rig-device": 1, "box-device": 1}
+    other = p.db.add_task("ran on the box", "s", kind="work", tier="light", origin="coordinator",
+                          labels=["resource:box-device"])
+    p.db.update_task(other, status="done")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker',?,?,'ok')", (other, prov, now))
+    assert check(now) == []
+    evs = check(now + 26 * 60)
+    assert len(evs) == 1 and json.loads(evs[0]["data"])["fired"] == {"box-device": 1, "rig-device": 1}
+    # The coordinator answers with work for one device and nothing for the other.
+    p.db.add_task("soak on the box", "s", kind="work", tier="light", origin="coordinator",
+                  labels=["resource:box-device"], not_before=now + 86400)
+    p.db.x("UPDATE events SET status='handled' WHERE kind='idle_capacity'")
+    assert len(check(now + 30 * 60)) == 1
+    assert set(p.db.kv(idlecap.DECLINED_KEY)) == {"rig-device"}, "only the device without a task is declined"
+    assert json.loads(p.db.one("SELECT data FROM events WHERE kind='idle_capacity'")["data"])["judged"]
+    # A pause ends the stretch; the next one resumes the backoff instead of the 25 min grace.
+    coord.pause_resource(p, "rig-device", True, reason="maintenance", by="user")
+    assert len(check(now + 3600)) == 1 and "rig-device" not in (p.db.kv("idle_capacity") or {})
+    coord.pause_resource(p, "rig-device", False)
+    d2 = Daemon(p.base)   # a restart reads the declines back from the database
+    d2._started, d2.gates, d2.cfg["resources"] = now - 86400, d.gates, d.cfg["resources"]
+
+    def check2(at):
+        d2._idle_cap_checked = at - 60
+        monkeypatch.setattr(time, "time", lambda: at)
+        d2.check_idle_capacity()
+        return p.db.q("SELECT * FROM events WHERE kind='idle_capacity' ORDER BY id")
+    assert len(check2(now + 2 * 3600)) == 1 and len(check2(now + 5 * 3600)) == 1, \
+        "a declined device waits out the rearm across a new stretch and a restart"
+    evs = check2(now + 26 * 60 + 6 * 3600)
+    assert len(evs) == 2 and "rig-device" in evs[1]["text"] and "box-device" not in evs[1]["text"]
+    p.db.x("UPDATE events SET status='handled' WHERE kind='idle_capacity'")
+    check2(now + 7 * 3600)
+    assert p.db.kv(idlecap.DECLINED_KEY)["rig-device"]["n"] == 2, "a second decline doubles the next wait"
+    # An open task naming the device clears its decline.
+    p.db.add_task("uses the rig", "s", kind="work", tier="light", origin="coordinator",
+                        labels=["exclusive:rig-device"], not_before=now + 86400)
+    check2(now + 8 * 3600)
+    assert "rig-device" not in (p.db.kv(idlecap.DECLINED_KEY) or {})
+    assert idlecap.judge({}, {"rig-device": 2}, {"rig"}, 5.0) == {}, "a task naming the machine counts"
 
 
 def test_idle_capacity_device_candidates():

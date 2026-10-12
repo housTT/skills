@@ -283,9 +283,14 @@ prolonged whole-box outage.
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`
   (1500; 0 turns it off), while a worker slot is free, the gate is green or yellow and dispatch would
   start nothing, raises one `idle_capacity` event naming it, the running work and the next scheduled
-  check. Paused resources, resources in trouble and machines with an open ledger condition never
-  count. One event per idle stretch; one still idle is raised again only after
-  `coordinator.idle_capacity_rearm_s` (6 h), doubling each time up to 48 h.
+  check. Paused resources, resources in trouble, machines with an open ledger condition or an open
+  change entry that holds their device work (a held, paused or drained broker or queue), and devices
+  no open task names and no task run in the last `coordinator.idle_capacity_use_days` (7; 0: no
+  filter) named never count. One event per idle stretch; one still idle is raised again only after
+  `coordinator.idle_capacity_rearm_s` (6 h), doubling each time up to 48 h. When the coordinator
+  handles an event without a task naming the device, that decline is kept per device in the
+  database: its next idle stretch resumes the doubling rearm instead of the short grace, until a task
+  names the device again.
 - Network outage (model-free): when every task that could start waits on a probe saying this
   machine cannot reach its host (ssh exit 255), no worker runs and nothing else can start, for
   `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect

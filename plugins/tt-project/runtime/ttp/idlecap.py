@@ -5,7 +5,10 @@
 A device resource of the project (candidates) is idle while no open task names it, no `ttp lock` slot
 of it is taken or reserved and no detached-job hold keeps it. Paused resources (the user's, the
 project's own or a shared one), resources in trouble and machines with an open ledger condition are
-never candidates. Once one has been idle for `coordinator.idle_capacity_s` (1500 s; 0: off) while a
+never candidates, nor is a machine an open change ledger entry holds (holds_work: its broker or
+queue held, paused, drained or its device work disabled), nor a device no queued, running or waiting
+(deferred included) task names and no task run in the last `coordinator.idle_capacity_use_days` (7;
+0: no such filter) named: the project does not use it. Once one has been idle for `coordinator.idle_capacity_s` (1500 s; 0: off) while a
 worker slot is free, the budget gate is green or yellow and dispatch would start nothing queued, one
 normal `idle_capacity` event asks the coordinator to fill it with charter work or say once that
 nothing useful remains.
@@ -15,10 +18,16 @@ trouble again; the next one counts its grace afresh. A stretch still idle after 
 only after `coordinator.idle_capacity_rearm_s` (6 h), doubling each time up to REARM_MAX_S, so a
 project with nothing for its device costs a few turns a day at most. The state is kept in the
 database, so a restart never raises a stretch twice.
+
+Declines (judge): once the coordinator handled an event, a resource no task created since names was
+declined. Its fire count and time are kept per resource (DECLINED_KEY, in the database), so a new
+stretch of it (after a pause or a trouble spell) resumes the doubling rearm instead of the short
+grace. An open task naming the resource, or a task created after an event naming it, clears that.
 """
 from __future__ import annotations
 
 import json
+import re
 
 from . import locks
 
@@ -29,6 +38,11 @@ REARM_S = 6 * 3600.0
 REARM_MAX_S = 48 * 3600.0
 SUFFIX = "-device"
 LABEL_LOOKBACK_S = 14 * 86400   # task labels this recent name the project's device resources
+USE_DAYS = 7.0
+DECLINED_KEY = "idle_capacity_declined"   # kv: {resource: {"n", "at"}} the coordinator answered with no task
+_HOLD = re.compile(r"\b(hold|holds|holding|held|paus\w*|drain\w*|stop|stops|stopped|block|blocks|blocked|offline"
+                   r"|maintenance|reserv\w*|quiesc\w*|cordon\w*|fenc\w*|mask|masked)\b"
+                   r"|\bdisabl\w*\b.*\b(broker|device|jobs?|work|queue|dispatch|scheduler|service)\b", re.I)
 
 
 def settings(cfg: dict) -> tuple[float, float]:
@@ -36,6 +50,29 @@ def settings(cfg: dict) -> tuple[float, float]:
     c = cfg.get("coordinator") or {}
     grace, rearm = c.get("idle_capacity_s", GRACE_S), c.get("idle_capacity_rearm_s", REARM_S)
     return float(GRACE_S if grace is None else grace), float(REARM_S if rearm is None else rearm)
+
+
+def use_days(cfg: dict) -> float:
+    """`coordinator.idle_capacity_use_days`: a device no task named this recently is not the project's."""
+    v = (cfg.get("coordinator") or {}).get("idle_capacity_use_days", USE_DAYS)
+    return float(USE_DAYS if v is None else v)
+
+
+def holds_work(change: dict) -> bool:
+    """Whether an open change ledger entry holds or disables device work on its machine."""
+    return bool(_HOLD.search(str(change.get("what") or "")))
+
+
+def judge(declined: dict, fired: dict, named: set[str], at: float) -> dict:
+    """The declines after the coordinator handled one event raised at `at` for `fired` ({resource: fire
+    count}); `named`: what the tasks created since name. A named resource is cleared, the rest declined."""
+    out = dict(declined or {})
+    for res, n in (fired or {}).items():
+        if any(uses(x, res) for x in named):
+            out.pop(res, None)
+        else:
+            out[res] = {"n": max(int(n or 0), int((out.get(res) or {}).get("n") or 0)), "at": float(at)}
+    return out
 
 
 def labels(task: dict) -> list[str]:
@@ -80,16 +117,19 @@ def candidates(cfg: dict, named: set[str], resource_machines: list[str], machine
 
 
 def step(st: dict | None, idle: set[str], now: float, grace: float, rearm: float,
-         may_fire: bool) -> tuple[dict, list[str]]:
+         may_fire: bool, declined: dict | None = None) -> tuple[dict, list[str]]:
     """The idle stretches after one check, and the resources to raise now.
 
     `idle`: the device resources idle right now. One that is not ends its stretch. `may_fire`: a slot
     is free, the gate allows new work and nothing queued would start; when false no event is raised,
-    but the stretches go on (a busy slot does not make the device any less idle)."""
-    old = st or {}
+    but the stretches go on (a busy slot does not make the device any less idle). `declined`: a new
+    stretch of a declined resource starts where its last event left the rearm."""
+    old, declined = st or {}, declined or {}
     new, fired = {}, []
     for name in sorted(idle):
-        rec = dict(old.get(name) or {"since": now})
+        dec = declined.get(name) or {}
+        rec = dict(old.get(name) or ({"since": now, "fired": float(dec["at"]), "n": int(dec.get("n") or 1)}
+                                     if dec.get("at") else {"since": now}))
         if may_fire and grace > 0:
             n = int(rec.get("n") or 0)
             wait = grace if not rec.get("fired") else min(rearm * 2 ** max(n - 1, 0), REARM_MAX_S)

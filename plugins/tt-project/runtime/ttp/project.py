@@ -143,7 +143,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # A device resource of the project idle this long while a slot is free, the gate is
                     # green or yellow and nothing queued would start: one idle_capacity event (idlecap.py;
                     # 0: off). Still idle after it: raised again after the rearm, doubling up to 48 h.
-                    "idle_capacity_s": 1500, "idle_capacity_rearm_s": 21600,
+                    # Only devices a task named in the last idle_capacity_use_days count (0: all).
+                    "idle_capacity_s": 1500, "idle_capacity_rearm_s": 21600, "idle_capacity_use_days": 7,
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
