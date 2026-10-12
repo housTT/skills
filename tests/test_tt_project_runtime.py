@@ -29180,6 +29180,7 @@ def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkey
     monkeypatch.setattr(push, "_boxed", lambda: True)
     cli.main(["checks", "--detach", "--", "sh", "-c", f"touch {started}; sleep 60"])
     detach.tend(p)
+    monkeypatch.setattr(push, "_boxed", lambda: False)   # the daemon's probe, on the host, judges pids
     info = cli._read_checks_pid(run)
     try:
         assert _wait_for(started.exists)
@@ -29247,6 +29248,186 @@ def test_queued_checks_that_cannot_start_end_the_wait(env, tmp_path, monkeypatch
     assert (run / cli.CHECKS_RC).read_text().strip() == "killed"
     assert "not started" in capsys.readouterr().out
     assert not q.exists() and not (run / cli.CHECKS_PID).exists()
+
+
+def test_a_request_queued_while_the_daemon_starts_an_older_one_is_kept_and_runs_last(env, tmp_path, monkeypatch):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", "true"])
+    real, seen = cli._checks_start, []
+
+    def start(a, *args):
+        seen.append(a.cmd)
+        if len(seen) == 1:   # a newer request arrives while the daemon cancels and starts the older one
+            cli.main(["checks", "--detach", "--", "false"])
+        return real(a, *args)
+
+    monkeypatch.setattr(cli, "_checks_start", start)
+    detach.tend(p)
+    assert seen == [["--", "true"]]
+    assert len(list((p.state / detach.QUEUE).glob("*.json"))) == 1, "the newer request was deleted"
+    assert detach.queued(run / cli.CHECKS_RC).exists()
+    assert _wait_precheck(run) == "0"   # the older checks finish meanwhile ...
+    assert cli._checks_result(run) == 1, "... and must not settle the wait while the newer one is queued"
+    detach.tend(p)
+    assert seen[-1] == ["--", "false"] and cli._read_checks_pid(run)["cmd"] == ["--", "false"]
+    assert not list((p.state / detach.QUEUE).glob("*.json")) and not detach.queued(run / cli.CHECKS_RC).exists()
+    assert _wait_precheck(run) == "1"
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    assert cli._checks_result(run) == 0 and (run / cli.CHECKS_RC).read_text().strip() == "1"
+
+
+def test_a_daemon_tick_between_the_queue_writes_leaves_no_orphan_marker(env, tmp_path, monkeypatch):
+    import threading
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    starting = threading.Event()
+    monkeypatch.setattr(cli, "_checks_start", lambda *args: starting.set() or os.getpid())
+    monkeypatch.setattr(detach, "renice", lambda *args: None)
+    real_write, ticks = detach.write_json, []
+
+    def publish(path, data, **kwargs):
+        real_write(path, data, **kwargs)
+        # The daemon's own tick takes the request before enqueue writes its .queued marker.
+        tick = threading.Thread(target=detach.tend, args=(p,))
+        tick.start()
+        ticks.append(tick)
+        assert starting.wait(10)
+        tick.join(2)   # it finishes here unless enqueue's lock holds its cleanup back until the marker is written
+
+    monkeypatch.setattr(detach, "write_json", publish)
+    cli.main(["checks", "--detach", "--", "true"])
+    ticks[0].join(10)
+    assert not ticks[0].is_alive()
+    assert not list((p.state / detach.QUEUE).glob("*.json"))
+    assert not detach.queued(run / cli.CHECKS_RC).exists(), "an orphan marker was left"
+    (run / cli.CHECKS_RC).write_text("0\n")
+    assert cli._checks_result(run) == 0, "a completed check must end the wait"
+
+
+def test_an_orphan_queued_marker_is_cleared_by_the_probe_and_after_a_restart_or_reboot(env, tmp_path, monkeypatch):
+    from ttp import cli, detach
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, wt = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    run = pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
+    orphan = detach.queued(run / cli.CHECKS_RC)
+    orphan.write_text(f"{p.state / detach.QUEUE / 'consumed.json'}\nsome-id\n")   # its request is gone
+    d = Daemon(p.base)   # a daemon restart on the same boot: the probe settles it, model-free
+    _settle_probe(d, tid)
+    assert not orphan.exists()
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["run_status"] == "model-free"
+    # After a reboot killed the checks the daemon had started: started again, asleep, no model wake.
+    tid, wt = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=None)
+    run = pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
+    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": 999999, "started": "1", "boot": "an-earlier-boot", "req": "x",
+                                                  "worktree": str(wt), "head": head, "cmd": ["--", "true"]}))
+    detach.queued(run / cli.CHECKS_RC).write_text(f"{p.state / detach.QUEUE / 'consumed.json'}\nx\n")
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 30
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["not_before"] and "woke" not in json.loads(t["result"]), "the task was woken for a model run"
+    assert not detach.queued(run / cli.CHECKS_RC).exists()
+    assert _wait_precheck(run) == "0"
+
+
+def test_a_sandboxed_probe_never_calls_live_host_checks_killed(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push, runner
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    started = tmp_path / "started"
+    cli.main(["checks", "--detach", "--", "sh", "-c", f"touch {started}; sleep 30"])
+    detach.tend(p)
+    info = cli._read_checks_pid(run)
+    try:
+        assert _wait_for(started.exists) and cli._checks_alive(info) and info["pidns"] == push.pid_ns()
+        with monkeypatch.context() as box:   # boxed: the host pid is not visible from here
+            box.setattr(runner, "proc_start", lambda pid: None)
+            assert cli._checks_result(run) == 1, "live host checks were declared killed from the sandbox"
+        with monkeypatch.context() as box:   # another PID namespace, where the same pid is another process
+            box.setattr(push, "_boxed", lambda: False)
+            box.setattr(push, "pid_ns", lambda: "pid:[another]")
+            box.setattr(runner, "proc_start", lambda pid: "another process's start")
+            assert cli._checks_result(run) == 1
+        assert not (run / cli.CHECKS_RC).exists(), "the executor's exit marker was overwritten"
+        monkeypatch.setattr(push, "_boxed", lambda: False)
+        assert cli._checks_result(run) == 1, "the host probe sees them running"
+        os.killpg(info["pid"], signal.SIGTERM)
+        assert _wait_precheck(run) == "143"
+        monkeypatch.setattr(push, "_boxed", lambda: True)
+        assert cli._checks_result(run) == 0, "a real exit code is reported from the sandbox too"
+        assert "exit code 143" in capsys.readouterr().out
+    finally:
+        try:
+            os.killpg(info["pid"], signal.SIGKILL)
+        except OSError:
+            pass
+
+
+_CRASHING_LAUNCHER = """
+import argparse, os, sys
+from pathlib import Path
+from ttp import cli
+real = cli.write_json
+def crash(path, data, **kw):
+    Path(os.environ['ORPHAN_PID']).write_text(str(data['pid']))
+    if sys.argv[1] == 'after':
+        real(path, data, **kw)
+    os._exit(37)
+cli.write_json = crash
+cli._checks_start(argparse.Namespace(fresh=True, cmd=['--', 'touch ' + os.environ['CHECK_MARKER']]),
+                  Path(os.environ['TTP_RUN_DIR']), os.getcwd(), 'head', dict(os.environ))
+"""
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_a_launcher_dying_around_the_identity_write_never_runs_unrecorded_checks(env, tmp_path, monkeypatch, when):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    marker, orphan = tmp_path / "ran", tmp_path / "orphan.pid"
+    launch = subprocess.run([sys.executable, "-c", _CRASHING_LAUNCHER, when], cwd=repo, capture_output=True, text=True,
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "ORPHAN_PID": str(orphan),
+                                 "CHECK_MARKER": str(marker)}, timeout=30)
+    assert launch.returncode == 37, launch.stderr
+    pid = int(orphan.read_text())
+    try:
+        if when == "before":
+            assert _wait_for(lambda: _gone_pid(pid)), "the unreleased child must end by itself"
+            assert not marker.exists(), "EOF from a dead launcher released unrecorded checks"
+            assert not (run / cli.CHECKS_RC).exists() and not (run / cli.CHECKS_PID).exists()
+            assert "not started" in (run / cli.CHECKS_OUT).read_text()
+        else:   # its identity was durable: it runs, and the probe can follow it
+            assert cli._read_checks_pid(run)["pid"] == pid
+            assert _wait_precheck(run) == "0" and marker.exists()
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_a_failed_identity_write_ends_the_new_child_and_the_queued_wait(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    marker, children = tmp_path / "ran", []
+
+    def full(path, data, **kw):
+        children.append(data["pid"])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "write_json", full)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", f"touch {marker}"])
+    detach.tend(p)
+    assert children and _wait_for(lambda: _gone_pid(children[0])), "the child this launch made must end"
+    assert not marker.exists() and not (run / cli.CHECKS_PID).exists()
+    assert not list((p.state / detach.QUEUE).glob("*.json"))
+    assert cli._checks_result(run) == 0 and "No space left" in capsys.readouterr().out
 
 
 def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(env, tmp_path):
