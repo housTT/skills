@@ -27,7 +27,7 @@ def inventory(root: pathlib.Path, model: str) -> list[dict]:
         except Exception as exc:  # one broken run must not hide the others
             out.append({"path": str(run_dir), "format": "unreadable", "error": f"{type(exc).__name__}: {exc}",
                         "implementation": "", "source": "", "commit": "", "date": "", "destinations": [],
-                        "static": "", "measurements": []})
+                        "static": "", "measurements": [], "drive_url": ""})
     return out
 
 
@@ -35,7 +35,7 @@ def _entry(run_dir: pathlib.Path, run: dict) -> dict:
     entry = {"path": str(run_dir), "implementation": "", "source": run.get("source", ""),
              "commit": run.get("tt_metal_commit", "")[:7], "date": run.get("date", ""),
              "destinations": run.get("destinations") if isinstance(run.get("destinations"), list) else [],
-             "static": "", "measurements": []}
+             "static": "", "measurements": [], "drive_url": run.get("drive_url") or ""}
     # Runs from plugin 0.3.0 and older (a `targets` list or a single `destination`) are listed
     # but cannot be extended.
     if "source" not in run or "destination" in run:
@@ -74,7 +74,8 @@ def main() -> int:
         pending = [m["item"] for m in r["measurements"] if m["state"] != "done"]
         print(f"{n}. {r['implementation']} on {r['source']} @ {r['commit']} ({r['date']}): static {r['static']}; "
               f"destinations {', '.join(r['destinations']) or 'none'}; "
-              f"measurements pending: {', '.join(pending) or 'none'}")
+              f"measurements pending: {', '.join(pending) or 'none'}; "
+              f"{'uploaded: ' + r['drive_url'] if r['drive_url'] else 'not uploaded'}")
     return 0
 
 

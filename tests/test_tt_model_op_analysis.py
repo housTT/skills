@@ -12,11 +12,11 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = REPO / "plugins" / "tt-model-op-analysis"
 SCRIPTS = PLUGIN / "scripts"
-SKILL_NAMES = ("model-op-analysis",)
+SKILL_NAMES = ("model-op-analysis", "upload-op-analysis")
 PHASES = ("static-phase.md", "measured-source.md", "measured-destination.md")
 
 
-def test_plugin_has_one_skill_and_phase_references():
+def test_plugin_skills_and_phase_references():
     assert sorted(p.name for p in (PLUGIN / "skills").iterdir()) == list(SKILL_NAMES)
     for name in PHASES:
         assert (PLUGIN / "references" / name).is_file()
@@ -1212,3 +1212,38 @@ def test_n300_is_named_as_one_chip():
     assert "n300" not in schema.PROFILES and "n300-1chip" in schema.LAUNCH_PROFILES
     text = (PLUGIN / "references" / "targets.md").read_text(encoding="utf-8")
     assert "`n300`" not in text
+
+
+def test_upload_skill_asks_root_then_run_then_drive_folder():
+    text = (PLUGIN / "skills" / "upload-op-analysis" / "SKILL.md").read_text(encoding="utf-8")
+    assert len(text.splitlines()) <= 80
+    assert "`<plugin-root>` is the `tt-model-op-analysis` plugin directory" in text
+    order = ["**Output root.**", "<plugin-root>/scripts/runs.py list", "<plugin-root>/scripts/validate_static.py",
+             "**Drive folder.**", "<plugin-root>/references/drive-upload.md"]
+    positions = [text.index(o) for o in order]
+    assert positions == sorted(positions)
+    assert "drive_url" in text
+
+
+def test_analysis_skill_hands_upload_to_upload_skill():
+    text = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text(encoding="utf-8")
+    assert "drive-upload.md" not in text
+    assert "`upload-op-analysis`" in text
+
+
+def test_drive_upload_reference_asks_folder_only_without_drive_url():
+    text = (PLUGIN / "references" / "drive-upload.md").read_text(encoding="utf-8")
+    assert "Ask for the Drive folder only when" in text
+
+
+def test_runs_list_reports_drive_url(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["drive_url"] = "https://docs.google.com/spreadsheets/d/x"
+    (run / "run.json").write_text(json.dumps(data))
+    target = tmp_path / "op-analysis" / "m" / "impl" / "p150" / "abc1234"
+    target.parent.mkdir(parents=True)
+    run.rename(target)
+    runs = json.loads(run_script("runs.py", "list", str(tmp_path), "m", "--json").stdout)
+    assert runs[0]["drive_url"] == "https://docs.google.com/spreadsheets/d/x"
+    assert "uploaded: https://docs.google.com/spreadsheets/d/x" in run_script("runs.py", "list", str(tmp_path), "m").stdout

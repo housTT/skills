@@ -39,8 +39,8 @@ resolve every `<plugin-root>/...` path against it.
    `<plugin-root>/references/measured-destination.md` (`python3 <plugin-root>/scripts/kernel_tests.py`).
    Unpicked items stay pending for a later session.
 7. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
-   `summary.md` with the per-kernel-op table first. Ask about upload; if yes, follow
-   `<plugin-root>/references/drive-upload.md`.
+   `summary.md` with the per-kernel-op table first. Say where the results are; uploading them to
+   Google Drive is the `upload-op-analysis` skill, which the user starts when they want it.
 
 ## Rules
 

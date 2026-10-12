@@ -1,10 +1,12 @@
 # Google Drive upload
 
-Only when the host lists Google Drive and Google Sheets connector tools and the user says yes.
-Otherwise say the CSVs are in `<run dir>` and stop.
+Used by the `upload-op-analysis` skill for one run that `validate_static.py` passes. Only when the
+host lists Google Drive and Google Sheets connector tools; otherwise say the CSVs are in
+`<run dir>` and stop.
 
-1. Ask for the Drive folder (link or name). Create a subfolder named after the model if the user
-   wants one.
+1. Ask for the Drive folder only when `run.json` has no `drive_url` (link or name). Create a
+   subfolder named after the model if the user wants one. With a `drive_url`, say which
+   spreadsheet will be refreshed and skip the folder.
 2. One spreadsheet per run. Without a `drive_url` in `run.json`, create one named
    `<Model> kernel op analysis (<impl-slug> on <source>, <sha7>)`. With a `drive_url` (a
    destination or measurement was added since the last upload), reuse that spreadsheet: delete
