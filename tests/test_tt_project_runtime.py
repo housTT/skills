@@ -24067,6 +24067,34 @@ def test_alerts_ack_of_a_live_condition_keeps_it_quiet_in_the_feed_until_it_clea
     assert [m["text"] for m in attention(p.db, time.time())] == ["The coordinator fails again"]
 
 
+def test_alerts_ack_covers_only_its_severity_and_a_raise_surfaces_again(env, monkeypatch):
+    # An ack of a high alert must not hide the same episode once it escalates to critical.
+    from ttp import alerts, cli
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    p = make(env)
+    d = Daemon(p.base)
+    p.db.set_kv("coordinator_failures", 3)
+    d.alert("coordinator", "x", "high")
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert'")["id"]
+    cli.main(["alerts", "demo", "--ack", str(mid), "--why", "known"])
+    assert alerts.acked(p.db, _episodes(p, "coordinator")[0])["severity"] == "high"
+    d.alert("coordinator", "DOWN", "critical")
+    assert [m["text"] for m in attention(p.db, time.time())] == ["DOWN"]
+    assert alerts.acked(p.db, _episodes(p, "coordinator")[0]) is None
+    down = p.db.one("SELECT id FROM messages WHERE kind='alert' AND text='DOWN'")["id"]
+    assert [m["state"] for m in alerts.feed(p.db, time.time()) if m["id"] == down] != ["acked"]
+    d.alert("coordinator", "DOWN", "critical")   # a repeat dedups as usual, nothing quietly dropped
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 2
+    later = time.time() + alerts.REMIND_S + 60
+    monkeypatch.setattr(time, "time", lambda: later)
+    d.alert("coordinator", "DOWN", "critical")   # and reminds once REMIND_S has passed
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 3
+    cli.main(["alerts", "demo", "--ack", str(down), "--why", "on it"])   # a fresh ack covers the raise
+    assert alerts.acked(p.db, _episodes(p, "coordinator")[0])["severity"] == "critical"
+    assert attention(p.db, later) == []
+
+
 @pytest.mark.parametrize("outage", ["auth", "network", "disk", "heal"])
 def test_alerts_ack_refuses_a_live_outage_without_mutation(env, outage):
     from ttp import alerts, cli, heal, netwait

@@ -251,15 +251,19 @@ def _close(db: DB, ep: dict, now: float, why: str, text: str | None = None,
     return {**ep, "cleared": now, "cleared_why": why}
 
 
-ACKS = "alert_acks"   # kv: open episode id -> its acknowledgement {why, ts, message} (ack)
+ACKS = "alert_acks"   # kv: open episode id -> its acknowledgement {why, ts, message, severity} (ack)
 # Outages: acknowledging one never hides it while it holds, nor skips the release of its machine-wide claim.
 OUTAGE_KINDS = ("auth", "network", "disk", "machine")
 
 
 def acked(db: DB, ep: dict | None) -> dict | None:
     """The acknowledgement of an open episode: it leaves the top section for the feed and its
-    repeats stay quiet (Daemon.alert) until the condition clears."""
-    return (db.kv(ACKS, {}) or {}).get(str(ep["id"])) if ep and not ep["cleared"] else None
+    repeats stay quiet (Daemon.alert) until the condition clears. It covers only the severity it
+    acknowledged: once the episode is raised above it, the alert is back in the top section."""
+    rec = (db.kv(ACKS, {}) or {}).get(str(ep["id"])) if ep and not ep["cleared"] else None
+    if rec and SEVERITY_RANK.get(ep["severity"], 1) > SEVERITY_RANK.get(rec.get("severity"), 1):
+        return None
+    return rec
 
 
 def _outage(db: DB, key: str, now: float) -> bool:
@@ -303,7 +307,7 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
                              f"condition is over, and cannot be acknowledged away")
         if not live:
             return _close(db, ep, now, why, f"Acknowledged alert #{message}: {why}")
-        rec = {"why": why, "ts": now, "message": message}
+        rec = {"why": why, "ts": now, "message": message, "severity": ep["severity"]}
         db.set_kv(ACKS, {**(db.kv(ACKS, {}) or {}), str(ep["id"]): rec})
         db.post("out", f"Acknowledged alert #{message} ({ep['key']}): {why}. It stays in the feed until "
                 f"the condition clears.", chat=None, kind="info", severity="low", ref=ep["key"])
