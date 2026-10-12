@@ -2687,6 +2687,71 @@ def test_watcher_issues_close_when_quiet_for_a_day_or_after_a_clean_run(env, mon
     assert not p.db.q("SELECT id FROM alerts")
 
 
+def test_keyed_issue_a_quiet_run_closed_only_counts_when_resent_within_the_window(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def line(text, severity, key="gate"):
+        return json.dumps({"text": text, "severity": severity, "key": key})
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    def issue(key="gate"):
+        return p.db.one("SELECT id, status, count, severity, cleared_why FROM issues WHERE fingerprint=?",
+                        (scr.key_fingerprint("watcher:hw", key),))
+
+    def run(stdout):
+        out["stdout"] = stdout
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    run(line("fleet gate: closed for 0.5h", "critical"))
+    assert wakes() == 1
+    first = issue()["id"]
+    # A wake that re-sends the known line after a quiet run closed it: counted, still closed, no wake.
+    for n in range(5):
+        run("")
+        run(line(f"fleet gate: closed for {n + 1}.5h", "critical"))
+    assert wakes() == 1
+    i = issue()
+    assert i["id"] == first and i["count"] == 6 and i["status"] == "fixed"
+    assert i["cleared_why"] == scr.CLEAN_RUN_WHY and len(p.db.q("SELECT id FROM issues")) == 1
+    # A lower severity is the same story; a higher one reopens and wakes.
+    run(line("fleet gate: closed", "high", key="lower"))
+    run("")
+    run(line("fleet gate: closed", "normal", key="lower"))
+    assert wakes() == 2 and issue("lower")["status"] == "fixed"
+    run(line("fleet gate: closed", "critical", key="lower"))
+    assert wakes() == 3 and issue("lower")["status"] == "open" and issue("lower")["severity"] == "critical"
+    # Past the window it reopens and wakes as before.
+    p.db.x("UPDATE issues SET closed=? WHERE id=?", (time.time() - 7 * 3600, first))
+    run(line("fleet gate: closed for 9h", "critical"))
+    assert wakes() == 4 and issue()["status"] == "open"
+    # Only a quiet run's close counts: a cleared or a 24 h-quiet close reopens and wakes at once.
+    for why in (scr.CLEARED_WHY, scr.QUIET_WHY):
+        p.db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE id=?", (time.time(), why, first))
+        before = wakes()
+        run(line("fleet gate: closed", "critical"))
+        assert wakes() == before + 1 and issue()["status"] == "open"
+    # Lines without a key keep the old rule: a recurrence after a quiet run wakes.
+    run(json.dumps({"text": "box-b: fan failed", "severity": "high"}))
+    run("")
+    before = wakes()
+    run(json.dumps({"text": "box-b: fan failed", "severity": "high"}))
+    assert wakes() == before + 1
+    # Off (0 or null) restores the old rule for keyed lines too.
+    for off in (0, None):
+        d.cfg["screen"]["reraise_window_h"] = off
+        run("")
+        before = wakes()
+        run(line("fleet gate: closed", "critical"))
+        assert wakes() == before + 1
+
+
 def test_migration_closes_old_watcher_issues_once(env, tmp_path):
     import sqlite3
     from ttp.db import DB, WATCHER_ISSUES_MIGRATION

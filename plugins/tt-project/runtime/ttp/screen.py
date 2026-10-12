@@ -81,7 +81,10 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
-    "key" field) is the issue's identity instead of its text: the text may change without a new issue."""
+    "key" field) is the issue's identity instead of its text: the text may change without a new issue.
+    A keyed issue a run that reported nothing closed, raised again under the same key within
+    `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
+    closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes."""
     v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key)
     m = count_muted(db, source, text, v.severity, whole=whole, key=key)
     if m and v.wake:
@@ -108,7 +111,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
         if cleared:
             return _clear(db, key_fingerprint(source, key), now)
         v = _issue(db, key_fingerprint(source, key), source, title, title, hint, judge, floor, now,
-                   rewake_after_s, repeat, lifecycle, normalize(subject))
+                   rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg))
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
         return v
     conditions = watcher_conditions(source, text, whole)
@@ -136,7 +139,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 
 def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: str | None, judge, floor: int,
            now: float, rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None,
-           subject: str | None = None) -> Verdict:
+           subject: str | None = None, reraise_s: float = 0) -> Verdict:
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
         db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title), lifecycle=?, subject=? "
@@ -146,6 +149,11 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         if row["status"] == "fixed":
             # Seen again after it was fixed or closed: it wakes when this sighting is at or above the floor.
             sev = hint if seen_at >= 0 else row["severity"]
+            if reraise_s > 0 and row.get("cleared_why") == CLEAN_RUN_WHY and row.get("closed") is not None \
+                    and now - float(row["closed"]) <= reraise_s and SEVERITY_RANK.get(sev, 1) <= rank:
+                # Closed by a quiet run moments ago and sent again unchanged: counted, not reopened.
+                return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a quiet run",
+                               fp, row["id"], "dedupe")
             db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=? WHERE id=?",
                  ("open" if sev != "info" else "ignored", sev, now, row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
@@ -295,6 +303,18 @@ EXPLICIT_CLEAR = "explicit_clear"
 RECEIPT, ERROR = "receipt", "error"
 REPAIRED_WHY = "a successful watcher run no longer reported it"
 REPLACED_WHY = "a newer outcome for the same subject replaced it"
+
+
+RERAISE_WINDOW_H = 6
+
+
+def reraise_window_s(cfg: dict) -> float:
+    """screen.reraise_window_h in seconds (default RERAISE_WINDOW_H; null, 0 or junk: off)."""
+    hours = (cfg.get("screen") or {}).get("reraise_window_h", RERAISE_WINDOW_H)
+    try:
+        return max(0.0, float(hours) * 3600) if hours is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def error_source(source: str) -> str:
