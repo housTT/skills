@@ -6,7 +6,8 @@ A temp dir under the project's state is long, and tests add more to it (pytest's
 pytest-of-<user>/pytest-N/<test>0): an AF_UNIX socket there passes the 108-byte limit (104 on
 macOS) and fails with "AF_UNIX path too long". So each allocation gets a dir of its own under a
 per-user 0700 root in the system temp root, which its owner records (owner.json, a detach job's
-record, run.json) so finishing and recovery remove it. The root is refused when it is a link, not a
+record, run.json) so finishing and recovery remove it. The root is named without links in its
+base (/private/tmp on macOS) and is refused when it is a link, not a
 directory or not this user's; callers then keep their old path under the state. A fenced worker
 may write the whole root, as it may write the whole project state: it starts checks and detached
 jobs itself.
@@ -24,8 +25,11 @@ _NAME = re.compile(r'[0-9a-f]{8}')
 
 
 def root() -> Path:
+    # The base without links (macOS /tmp is a link to /private/tmp): checks validate a recorded dir
+    # component by component without following links. ttp-<uid> itself is still refused as a link.
     # Tests point it at a short folder of their own.
-    return Path(os.environ.get('TTP_TEST_SHORT_TMP') or BASE) / f'ttp-{os.getuid()}'
+    base = os.path.realpath(os.environ.get('TTP_TEST_SHORT_TMP') or BASE)
+    return Path(base) / f'ttp-{os.getuid()}'
 
 
 def _open_root(create: bool) -> int:

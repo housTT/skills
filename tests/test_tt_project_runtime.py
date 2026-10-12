@@ -50980,10 +50980,10 @@ def _check_output_paths_command():
             "out=pathlib.Path(os.environ['TTP_RUN_DIR']); "
             "tmp=pathlib.Path(tempfile.gettempdir()); "
             "assert out.is_absolute() and out.parent.name == 'check-reports', out; "
-            # A short dir its owner.json names (shorttmp), else checks-tmp inside the allocation.
-            "short = tmp.parent.name.startswith('ttp-') and len(tmp.name) == 8; "
-            "assert short or tmp.parent.parent.name == 'check-runs', tmp; "
-            "assert short or (out.name == tmp.parent.name and out.parent.parent == tmp.parent.parent.parent); "
+            # The short dir its owner.json names (shorttmp); checks-tmp only when no record names one.
+            "alloc = out.parent.parent/'check-runs'/out.name; "
+            "owner = json.loads((alloc/'owner.json').read_text()) if (alloc/'owner.json').exists() else {}; "
+            "assert str(tmp) == (owner.get('tmp') or str(alloc/'checks-tmp')), (tmp, owner); "
             "assert all(os.environ[k] == str(tmp) for k in ('TMPDIR','TMP','TEMP')); "
             "assert not os.environ.get('TTP_PIDNS') and not os.environ.get('TTP_CGROUP'); "
             "(out/'pre-commit-cache').mkdir(); "
@@ -51473,8 +51473,34 @@ def _bind_deep_socket(tmp):
 def test_short_tmp_root_is_short_in_production(env, monkeypatch):
     from ttp import shorttmp
     monkeypatch.delenv('TTP_TEST_SHORT_TMP')
-    assert shorttmp.root() == pathlib.Path('/tmp') / f'ttp-{os.getuid()}'
+    assert shorttmp.root() == pathlib.Path(os.path.realpath('/tmp')) / f'ttp-{os.getuid()}'
     assert len(str(shorttmp.root() / 'abcdef12')) <= 40
+    assert len('/private/tmp/ttp-4294967295/abcdef12') <= 40, 'macOS, where /tmp is a link'
+
+
+def test_check_scratch_is_short_when_the_temp_base_is_a_link(env, tmp_path, monkeypatch):
+    """macOS /tmp is a link to /private/tmp. Checks validate the recorded dir without following
+    links, so a root named through the link made every check fall back to the long checks-tmp."""
+    from ttp import checkdirs, shorttmp
+    real = pathlib.Path(os.environ['TTP_TEST_SHORT_TMP']) / 'real'
+    real.mkdir()
+    link = tmp_path / 'linked-tmp'
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv('TTP_TEST_SHORT_TMP', str(link))
+    assert shorttmp.root() == real / f'ttp-{os.getuid()}', 'named without the link'
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    with checkdirs.take(output) as guard:
+        child = checkdirs.for_check({'TTP_CHECKS_TMP_FD': str(guard.fileno()),
+                                     'TTP_CHECK_OUTPUT_DIR': str(checkdirs.reports(output))})
+        tmp = pathlib.Path(child['TMPDIR'])
+        assert json.loads((output / checkdirs.OWNER).read_text())['tmp'] == str(tmp)
+        assert shorttmp.owned(tmp) and tmp.parent == real / f'ttp-{os.getuid()}', tmp
+        assert checkdirs.SCRATCH not in tmp.parts, 'no silent fall back to the long path'
+        _bind_deep_socket(tmp)
+    checkdirs.finish(output)
+    assert not output.exists() and not tmp.exists()
 
 
 @pytest.mark.parametrize('end', ['finish', 'crash', 'reboot'])
