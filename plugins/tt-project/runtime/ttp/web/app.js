@@ -261,7 +261,7 @@ async function refresh() {
   const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "ask " + m.id : "problem"}</span><div>${esc(m.text)}</div></div>` }));
   R.rows($("#attention"), attn.length ? attn : muted("Nothing needs you right now."));
   const feed = (st.feed || []).map((m) => ({ key: m.id != null ? `id:${m.id}` : `${m.kind}:${m.ts}:${m.text}`, html: `<div class="row"><span class="when">${agoH(m.ts)} ago</span>` +
-    `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : m.state === "status" ? "status, clears itself" : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +
+    `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : m.state === "status" ? "status, clears itself" : m.state === "acked" ? "acknowledged" + (m.acked_why ? ": " + esc(m.acked_why) : "") : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +
     `<span class="title">${esc(m.text)}</span></div>` }));
   R.rows($("#feed"), feed.length ? feed : muted("Nothing yet."));
   put($("#gates2"), gateHtml(st.gates));

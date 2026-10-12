@@ -24032,6 +24032,88 @@ def test_alerts_ack_refuses_invalid_requests_without_mutation(env, case):
     assert not p.db.q("SELECT id FROM messages WHERE kind='resolved'")
 
 
+def test_alerts_ack_of_a_live_condition_keeps_it_quiet_in_the_feed_until_it_clears(env, capsys):
+    # Acking a condition that still holds must not close it: callers re-report every tick, and a
+    # closed episode would page the user again at once.
+    from ttp import alerts, cli
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    p = make(env)
+    d = Daemon(p.base)
+    p.db.set_kv("coordinator_failures", 3)
+    d.alert("coordinator", "The coordinator keeps failing", "high")
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert'")["id"]
+    cli.main(["alerts", "demo", "--ack", str(mid), "--why", "known; fixing the provider"])
+    assert "kept in the feed" in capsys.readouterr().out
+    ep = _episodes(p, "coordinator")[0]
+    assert ep["cleared"] is None and alerts.acked(p.db, ep)["why"] == "known; fixing the provider"
+    for every_s in (6 * 3600, 0):
+        d.alert("coordinator", "The coordinator keeps failing", "high", every_s=every_s)
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 1, "the ack paged the user again"
+    assert attention(p.db, time.time()) == []
+    feed = [m for m in alerts.feed(p.db, time.time()) if m["id"] == mid]
+    assert feed and feed[0]["state"] == "acked" and feed[0]["acked_why"] == "known; fixing the provider"
+    cli.main(["alerts", "demo", "--ack", str(mid), "--why", "a retry"])   # keeps the first receipt
+    assert alerts.acked(p.db, _episodes(p, "coordinator")[0])["why"] == "known; fixing the provider"
+    d.alert("coordinator", "The coordinator is down", "critical")   # a raised severity is new
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 2
+    p.db.set_kv("coordinator_failures", 0)
+    [closed] = alerts.sweep(p.db)
+    assert closed["cleared"] and "acknowledged: known; fixing the provider" in closed["cleared_why"]
+    assert p.db.kv(alerts.ACKS) == {}
+    p.db.set_kv("coordinator_failures", 1)
+    d.alert("coordinator", "The coordinator fails again", "high")
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 3, "a new occurrence alerts again"
+    assert [m["text"] for m in attention(p.db, time.time())] == ["The coordinator fails again"]
+
+
+@pytest.mark.parametrize("outage", ["auth", "network", "disk", "heal"])
+def test_alerts_ack_refuses_a_live_outage_without_mutation(env, outage):
+    from ttp import alerts, cli, heal, netwait
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    if outage == "heal":
+        p, d, up = _heal_setup(env, fix=None, outage=True)
+        spec, now = _heal_spec(p), time.time()
+        heal.run(d, "svc", spec, now)
+        heal.run(d, "svc", spec, now + heal.OUTAGE_S)
+        p.db.update_task(heal.state(p.db, "svc")["task"], status="failed")
+        heal.run(d, "svc", spec, now + heal.OUTAGE_S + 1)
+        key = "heal:svc"
+    else:
+        p = make(env)
+        key = {"auth": "auth:fake", "network": netwait.KEY, "disk": "disk"}[outage]
+        if outage == "auth":
+            p.db.set_kv(alerts.BREAKER + "fake", {"open": True, "ts": time.time()})
+        p.db.set_kv("network_outage" if outage == "network" else "disk_low",
+                    {"alerted": True} if outage == "network" else {"free_gb": 1})
+        Daemon(p.base).alert(key, f"{key} is down", "high")
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert' AND ref=? ORDER BY id DESC", (key,))["id"]
+    before = p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["alerts", "demo", "--ack", str(mid), "--why", "known"])
+    assert exc.value.code != 0
+    assert _episodes(p, key)[-1]["cleared"] is None and not p.db.kv(alerts.ACKS)
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == before
+    assert [m["id"] for m in attention(p.db, time.time())] == [mid], "the outage left the top section"
+
+
+def test_alerts_ack_of_an_outage_that_is_over_closes_it_and_releases_its_claim(env):
+    from ttp import alerts, cli
+    from ttp.daemon import Daemon
+    from ttp.project import hostname
+    p = make(env)
+    Daemon(p.base).alert("auth:fake", "fake is logged out", "high")
+    claim = f"{hostname()}|auth:fake"
+    assert claim in json.loads(alerts.claims_path().read_text())
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 1))   # logged in again, before any sweep
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert'")["id"]
+    cli.main(["alerts", "demo", "--ack", str(mid), "--why", "logged back in"])
+    assert _episodes(p, "auth:fake")[0]["cleared"]
+    assert claim not in json.loads(alerts.claims_path().read_text()), "the ack leaked the machine-wide claim"
+
+
 def test_a_logged_out_alert_clears_on_the_next_successful_run_and_keeps_its_history(env):
     p = make(env)
     from ttp.daemon import Daemon

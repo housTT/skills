@@ -339,6 +339,27 @@ def _decisions(actions: list) -> list:
     return [a for a in actions if not (isinstance(a, dict) and a.get("type") == "noop")]
 
 
+def cleared_claims(p: Project, key: str) -> list[str]:
+    """The claim keys a cleared machine-wide episode ends: the CLI's, or each filesystem this
+    project's disk guard watches (the low one is no longer recorded once it cleared)."""
+    if key.startswith("auth:") or key == netwait.KEY:
+        return [f"{hostname()}|{key}"]
+    out = []
+    for path in (p.base, p.worktrees):
+        try:
+            out.append(f"{hostname()}|disk|{os.stat(path).st_dev}")
+        except OSError:
+            pass
+    return out
+
+
+def release_claims(p: Project, ep: dict) -> None:
+    """A closed machine-wide episode (swept, or acknowledged once over) releases its claim:
+    whoever holds it, the next project to see the condition again broadcasts it."""
+    if ep.get("cleared") and (ep["key"].startswith("auth:") or ep["key"] in ("disk", netwait.KEY)):
+        alerts.release(cleared_claims(p, ep["key"]), ep["cleared"])
+
+
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
@@ -6008,6 +6029,9 @@ class Daemon:
             # A logout's reminders come from remind_logouts, on its own cadence.
             # A repeat that raises the severity (a status line that turned out to need the user) is new.
             raised = SEVERITY_RANK.get(severity, 1) > SEVERITY_RANK.get(ep["severity"] if ep else None, 1)
+            if ep and not raised and alerts.acked(db, ep):   # the user knows: quiet until it clears
+                db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
+                return
             if ep and every_s and not raised and (key.startswith("auth:") or now - ep["raised"] < alerts.REMIND_S
                                                   or last >= ep["raised"] + alerts.REMIND_S):
                 db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
@@ -6143,18 +6167,8 @@ class Daemon:
                 return None
         return None
 
-    def _cleared_claims(self, key: str) -> list[str]:
-        """The claim keys a cleared machine-wide episode ends: the CLI's, or each filesystem this
-        project's disk guard watches (the low one is no longer recorded once it cleared)."""
-        if key.startswith("auth:") or key == netwait.KEY:
-            return [f"{hostname()}|{key}"]
-        out = []
-        for path in (self.p.base, self.p.worktrees):
-            try:
-                out.append(f"{hostname()}|disk|{os.stat(path).st_dev}")
-            except OSError:
-                pass
-        return out
+    def release_claims(self, ep: dict) -> None:
+        release_claims(self.p, ep)
 
     def sweep_alerts(self) -> None:
         """Close alert episodes whose condition cleared (stored with the time; the chats hear it once).
@@ -6162,9 +6176,7 @@ class Daemon:
         self.check_logins()
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
-            if ep["key"].startswith("auth:") or ep["key"] in ("disk", netwait.KEY):
-                # Whoever holds the claim: the next project to see the condition again broadcasts it.
-                alerts.release(self._cleared_claims(ep["key"]), ep["cleared"])
+            self.release_claims(ep)
             kind, _, prov = ep["key"].partition(":")
             if kind == "auth":
                 # Tasks dispatch skips for another reason (the disk guard) would keep a stale note.

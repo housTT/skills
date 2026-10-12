@@ -65,8 +65,11 @@ and preferences you add later become part of the project's charter and memory.
   With Jev enabled, new observations are screened by a cheap decision model first.
 
 Keyed alerts keep their history when closed. `ttp alerts <project>` shows their message IDs;
-`ttp alerts <project> --ack <id> --why "<reason>"` closes that message's episode and records the
-reason. Retrying preserves the original receipt, and an unknown ID is refused. A heal check's
+`ttp alerts <project> --ack <id> --why "<reason>"` acknowledges that message's episode with the
+reason. One whose condition is over closes; one that still holds moves to the feed and stays quiet
+until it clears, so a new occurrence alerts again. A live outage (logout, unreachable hosts, full
+disk, machine or whole-box heal outage) cannot be acknowledged away. Retrying preserves the
+original receipt, and an unknown ID is refused. A heal check's
 user alert also clears when escalation moves to the coordinator or a known fault covers its
 current failure; the check remains unhealthy until it passes. Known faults never silence a
 prolonged whole-box outage.

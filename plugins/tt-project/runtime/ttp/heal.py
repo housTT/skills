@@ -648,6 +648,13 @@ def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
     return None
 
 
+def is_outage(db: DB, name: str) -> bool:
+    """The check watches a whole box or resource (`outage`) and its failure is not a non-outage finding."""
+    row = db.one("SELECT payload FROM schedules WHERE name=? AND enabled=1", (name,))
+    spec = of(json.loads(row["payload"] or "{}")) if row else None
+    return bool(spec and spec.get("outage") and not state(db, name).get("finding"))
+
+
 def holds(db: DB, name: str, now: float | None = None) -> bool:
     """A heal alert stays only while the check still requires user escalation."""
     return cleared_why(db, name, now) is None

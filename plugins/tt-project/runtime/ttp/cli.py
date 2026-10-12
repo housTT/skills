@@ -3644,7 +3644,10 @@ def cmd_alerts(a) -> None:
             ep = alerts.ack(p.db, a.ack, a.why)
         except ValueError as e:
             die(f"ttp alerts: {e}")
-        print(json.dumps(ep) if a.json else f"Acknowledged alert #{a.ack}: {ep['cleared_why']}")
+        from .daemon import release_claims
+        release_claims(p, ep)   # closed now: a machine-wide claim goes as it would at the sweep
+        print(json.dumps(ep) if a.json else f"Acknowledged alert #{a.ack}: " + (
+            ep["cleared_why"] if ep["cleared"] else f"{ep['acked']['why']} (kept in the feed until it clears)"))
         return
     from .notifier import alerts_since
     rows = alerts_since(p, a.after, a.floor)
@@ -4175,7 +4178,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--after", type=int, default=0)
     s.add_argument("--floor", default="high")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--ack", type=int, metavar="ID", help="close the keyed alert episode for this message id")
+    s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the keyed alert of this message id: it closes, or moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)
 
