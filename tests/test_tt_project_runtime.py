@@ -46246,3 +46246,184 @@ def test_after_push_deploy_recovered_daemon_returns_to_owned_pending(env, tmp_pa
     assert not pages
     deploy.tick(again, page, due + 1)
     assert len(pages) == 1 and 'missed takeover' in pages[0][1]
+
+
+# ---- budget kind changes (budgetkind.py) -------------------------------------------------------
+
+ACCT_PLAN, ACCT_BILLED, ACCT_PLAN2 = "a@example.org | Org | plan", "a@example.org | Org | usage-billed", "b@example.org"
+
+
+def _fake_plan(p, account, now, util=95.0):
+    """The fake provider on a plan account: a finished run and readings of two windows, 7d at `util`."""
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',1)",
+           (account, now - 900, now - 600))
+    for window, u, resets in (("five_hour", 10.0, now + 3600), ("seven_day", util, now + 3 * 86400)):
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - 300, "fake", account, window, u, resets))
+    return now + 3 * 86400
+
+
+def _bk_events(p):
+    from ttp import budgetkind
+    return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (budgetkind.KIND,))
+
+
+def _bk_deferral(task):
+    from ttp import db as dbm
+    return dbm.deferral(task)
+
+
+def _bk_tick(d, monkeypatch, n=2):
+    """Gate updates enough for a new fingerprint to pass its debounce (zeroed in these tests)."""
+    for _ in range(n):
+        d.update_gates()
+
+
+def test_a_plan_to_billed_switch_releases_old_holds_and_wakes_the_coordinator_once(env, monkeypatch):
+    """The dogfooding case: the login switched from a plan account to a usage-billed one while the
+    coordinator held work until the 7d window resets. The daemon notices, releases the limit pause,
+    the schedule held for budget and the 'until reset' deferrals at once, and queues one high-effort
+    event listing what it released and the waits that are the coordinator's to re-point."""
+    from ttp import budget as bud, budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    resets = _fake_plan(p, ACCT_PLAN, now)
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    p.db.set_kv("limited:fake", {"until": now + 86400, "note": "usage limit"})
+    p.db.x("UPDATE schedules SET enabled=1, next_run=?, last_status=? WHERE name='daily-review'",
+           (now + 1800, "skipped: budget red"))
+    by_why = p.db.add_task("reindex the docs", "x", labels=coord.defer_labels(resets, "true", "until the 7d window resets"),
+                           not_before=resets)
+    by_time = p.db.add_task("weekly sweep", "x", labels=coord.defer_labels(resets + 60, None), not_before=resets + 60)
+    other = p.db.add_task("after the release", "x", labels=coord.defer_labels(now + 2 * 86400, "true", "after the tag is cut"),
+                          not_before=now + 2 * 86400)
+    waits = p.db.add_task("long job", "x", status="waiting")
+    p.db.update_task(waits, result=json.dumps({"waiting_for": "the 5h window to reset"}))
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert d.gates["fake"].regime == "windows" and d.gates["fake"].level == "red"
+    assert _bk_events(p) == [], "the first fingerprint is the baseline"
+
+    bud.note_account(p.db, "fake", ACCT_BILLED)   # the login switched
+    d.update_gates()
+    assert _bk_events(p) == [], "a new fingerprint waits out its debounce"
+    d.update_gates()
+    ev = _bk_events(p)
+    assert len(ev) == 1 and ev[0]["status"] == "queued", ev
+    text = ev[0]["text"]
+    assert "account switched" in text and "budget kind plan -> billed" in text, text
+    assert "was plan windows (five_hour, seven_day)" in text and "dollar caps daily $100" in text, text
+    assert "schedule daily-review" in text and "limit pause" in text, text
+    assert f"#{by_why} reindex the docs: deferral" in text and f"#{by_time} weekly sweep: deferral" in text, text
+    assert f"#{waits} long job: waiting" in text and f"#{other}" not in text, text
+    # released model-free, re-evaluated against the new gate on this same update
+    assert float(p.db.kv("limited:fake")["until"]) == 0
+    assert d.gates["fake"].regime == "caps" and d.gates["fake"].allow_new_work, d.gates["fake"].reasons
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='daily-review'")["next_run"] <= time.time()
+    assert _bk_deferral(p.db.task(by_why)) == {} and p.db.task(by_why)["not_before"] is None
+    assert _bk_deferral(p.db.task(by_time)) == {}
+    assert _bk_deferral(p.db.task(other)).get("why") == "after the tag is cut", "a deferral for something else stays"
+    # one high-effort turn, one feed line that never needs the user
+    assert budgetkind.KIND in coord.effort_triggers(p.db, p.config(), [ev[0]["id"]], None)[0]
+    feed = [m for m in p.db.q("SELECT * FROM messages WHERE direction='out'") if "budget changed" in m["text"]]
+    assert len(feed) == 1 and feed[0]["kind"] == "info" and feed[0]["severity"] == "low", feed
+    assert any("budget changed" in s.get("why", "") for s in p.db.kv("blocker_sweep_signals", []))
+    for _ in range(3):
+        d.update_gates()
+    assert len(_bk_events(p)) == 1, "the same budget wakes nobody again"
+
+
+def test_the_budget_fingerprint_survives_a_restart(env, monkeypatch):
+    """A restart with the same budget is no change; a change made while the daemon was down is
+    caught on its first updates, and raises one event across further restarts."""
+    from ttp import budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    _fake_plan(p, ACCT_PLAN, now, util=40.0)
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    _bk_tick(Daemon(p.base), monkeypatch)
+    _bk_tick(Daemon(p.base), monkeypatch, 3)   # restarted, same budget
+    assert _bk_events(p) == []
+    bud.note_account(p.db, "fake", ACCT_BILLED)   # switched while the daemon was down
+    d = Daemon(p.base)
+    d.update_gates()
+    _bk_tick(Daemon(p.base), monkeypatch, 3)   # and restarted again mid-debounce and after
+    assert len(_bk_events(p)) == 1
+
+
+def test_a_billed_to_plan_switch_wakes_the_coordinator(env, monkeypatch):
+    from ttp import budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',2)",
+           (ACCT_BILLED, now - 900, now - 600))
+    bud.note_account(p.db, "fake", ACCT_BILLED)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert d.gates["fake"].regime == "caps" and _bk_events(p) == []
+    bud.note_account(p.db, "fake", ACCT_PLAN2)
+    _fake_plan(p, ACCT_PLAN2, time.time(), util=20.0)
+    _bk_tick(d, monkeypatch)
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "budget kind billed -> plan" in ev[0]["text"], ev
+    assert "now plan windows (five_hour, seven_day)" in ev[0]["text"]
+
+
+def test_budget_fingerprint_debounces_flapping_readings():
+    """A reading that falls back before the debounce wakes nobody; a lasting one wakes once, and a
+    provider raises at most one event per MIN_GAP_S; an unknown part is no change."""
+    from ttp import budgetkind as bk
+    from ttp.db import DB
+    import tempfile
+    from pathlib import Path
+    db = DB(Path(tempfile.mkdtemp()) / "t.db")
+    a = {"account": "h1", "kind": "plan", "windows": ["five_hour", "seven_day"]}
+    b = {"account": "h1", "kind": "billed", "windows": [], "caps": {"daily_usd": 100.0}}
+    t = 100000.0
+    assert bk.observe(db, "claude", a, t) is None   # baseline
+    for i in range(5):   # flapping a <-> b every minute
+        assert bk.observe(db, "claude", b, t + 120 * i + 60) is None
+        assert bk.observe(db, "claude", a, t + 120 * i + 120) is None
+    t = 200000.0
+    assert bk.observe(db, "claude", b, t) is None
+    assert bk.observe(db, "claude", b, t + bk.DEBOUNCE_S - 1) is None
+    got = bk.observe(db, "claude", b, t + bk.DEBOUNCE_S)
+    assert got and got["old"]["kind"] == "plan" and got["new"]["kind"] == "billed"
+    assert bk.observe(db, "claude", b, t + bk.DEBOUNCE_S + 5) is None, "once per change"
+    # back to the plan within the minimum gap: no second wake until the gap has passed
+    t2 = t + bk.DEBOUNCE_S + 10
+    assert bk.observe(db, "claude", a, t2) is None
+    assert bk.observe(db, "claude", a, t2 + bk.DEBOUNCE_S) is None
+    assert bk.observe(db, "claude", a, t + bk.DEBOUNCE_S + bk.MIN_GAP_S)["new"]["kind"] == "plan"
+    # an unknown account or kind takes the known one: no change
+    assert bk.observe(db, "claude", {"account": "", "kind": "unknown", "windows": []}, t + 2 * bk.MIN_GAP_S) is None
+    assert bk.observe(db, "claude", {"account": "", "kind": "unknown", "windows": []}, t + 3 * bk.MIN_GAP_S) is None
+
+
+def test_budget_change_never_shows_the_account_in_clear(env, monkeypatch):
+    """The account label (an email, an organization) is only ever kept as a hash: not in the state,
+    the event, the feed or the daemon log."""
+    from ttp import budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    _fake_plan(p, ACCT_PLAN, time.time())
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    bud.note_account(p.db, "fake", ACCT_BILLED)
+    _bk_tick(d, monkeypatch)
+    assert len(_bk_events(p)) == 1
+    log_text = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    assert "budget changed" in log_text
+    stored = json.dumps([p.db.kv(budgetkind.KV + "fake"), [dict(e) for e in _bk_events(p)],
+                         p.db.q("SELECT text FROM messages")]) + log_text
+    for secret in ("a@example.org", "example.org", "Org |", "usage-billed |"):
+        assert secret not in stored, secret
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash(ACCT_BILLED)

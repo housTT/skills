@@ -34,6 +34,7 @@ from . import anchors
 from . import audit
 from . import awake
 from . import budget as bud
+from . import budgetkind
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -2728,8 +2729,10 @@ class Daemon:
         gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
+        accounts = bud.current_accounts(self.p.db)
         for prov in provs:
             g = bud.evaluate(self.p.db, self.cfg, prov, windows)
+            self._budget_changed(prov, g, accounts.get(prov) or "")   # before the pause: it may release it
             lim = self._provider_pause(prov)
             if lim and lim.get("until", 0) > time.time():
                 bud._raise(g, "red", f"provider limit: {lim.get('note')}")
@@ -2772,6 +2775,21 @@ class Daemon:
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
+
+    def _budget_changed(self, prov: str, g: bud.Gate, account: str) -> None:
+        """A change of the provider's account or budget kind (budgetkind.py) releases the holds the old
+        limits made and wakes the coordinator, once per change, to re-plan."""
+        try:
+            with self.p.db.tx():
+                change = budgetkind.observe(self.p.db, prov, budgetkind.parts(self.p.db, self.cfg, prov, g, account),
+                                            resets=budgetkind.plan_resets(g))
+                done = budgetkind.apply(self.p.db, self.cfg, prov, change) if change else None
+        except Exception:
+            log(self.p, f"budget change check {prov} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
+            return
+        if done:
+            log(self.p, f"{prov} budget changed: {'; '.join(budgetkind.what_changed(change['old'], change['new']))}; "
+                        f"released {len(done['released'])}, {len(done['tasks'])} tied task(s) for the coordinator")
 
     def _first_red_in_window(self, prov: str, g: bud.Gate) -> tuple[bool, dict | None]:
         """Whether a red gate at a plan line is the first in that plan window, and the provider's

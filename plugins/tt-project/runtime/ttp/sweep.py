@@ -14,7 +14,8 @@ needs a `why`. An item the next sweep finds without an outcome since the last on
 
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
-a provider's limit or logout pause ended, a `still_blocked` next check came due, or another module
+a provider's limit or logout pause ended, a provider's account or budget kind changed (budgetkind),
+a `still_blocked` next check came due, or another module
 called signal() (the hook for later checks, such as a broker's health lifting a pause).
 
 Loops: a task handed off stuck twice in a row with the same normalized reason, or whose spec changed

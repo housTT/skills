@@ -23,7 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, credits, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, budgetkind, credits, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -234,6 +234,8 @@ EFFORT_EVENT_TRIGGERS = {
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
     "charter_conflict": "conflict", "charter_retry": "conflict", "grant_mismatch": "conflict",
+    # the limits the plan was made against changed: re-plan (budgetkind.py)
+    budgetkind.KIND: "budget",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
@@ -267,7 +269,8 @@ DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
-EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
+EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
+                       budgetkind.KIND: 2000}
 HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
