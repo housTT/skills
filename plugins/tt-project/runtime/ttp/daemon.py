@@ -2626,8 +2626,10 @@ class Daemon:
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text,
+            # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
+            data = json.dumps({"plain": True}) if outcome == "review" and plain else None
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text, data,
                   "handled" if quiet or routine else "queued", task["id"]))
         if area:
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
@@ -3655,9 +3657,10 @@ class Daemon:
             if sweep_event is not None:
                 sweep.prepare(db, sweep_event, self.cfg, now)
             due = (w or {}).get("due")
+            lowered: list[str] = []
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now,
-                                                   coord.charter_conflicts(self.p))
+                                                   coord.charter_conflicts(self.p), lowered)
             if esc:
                 triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
             can_raise = coord.can_raise_effort(self.cfg, c.get("tier", "light"))
@@ -3690,7 +3693,8 @@ class Daemon:
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
-                                 "triggers": triggers, **({"wake_due": due} if due else {}),
+                                 "triggers": triggers, **({"lowered": lowered} if lowered else {}),
+                                 **({"wake_due": due} if due else {}),
                                  **({"escalated": True} if esc else {}), **checked,
                                  "digest": coord.digest_size(parts), **({"gate": seen_now} if seen_now else {})},
                            unblock=unblock)

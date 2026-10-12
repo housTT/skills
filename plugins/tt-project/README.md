@@ -235,7 +235,12 @@ prolonged whole-box outage.
   resource or deferred on purpose (`start_after`, `start_when`), at least one of them held (planned
   deferrals alone are routine); a high or critical event or alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
   or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
-  blocked tasks or open asks. Routine bookkeeping stays at the base effort; such a turn that finds
+  blocked tasks or open asks. Lowering rules keep known or routine events at the base effort, each
+  logged in the turn's note (`lowered`): a needs-review hand-off with no follow-ups, findings or notes
+  whose review the daemon queues itself; a high or critical event whose fingerprint is a known case
+  (an issue open before the last turn, a deploy pending on an owned merge before its takeover, a
+  machine with an open change in the shared ledger); and a review's failed hand-off counts once, as
+  "failed review". Routine bookkeeping stays at the base effort; such a turn that finds
   its batch harder than it looked returns `escalate`, and the same batch reruns once at high
   effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned
   `coordinator.effort` wins over all of this. `coordinator.effort_skip_triggers` (none by default)

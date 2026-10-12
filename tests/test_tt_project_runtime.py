@@ -28396,7 +28396,7 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
         assert trig([ev(kind)]) == [kind], kind
     # A failed review, a high or critical event.
     rev = db.add_task("review it", "s", kind="review", origin="user")
-    assert trig([ev("task_failed", task=rev)]) == ["task_failed", "failed review"]
+    assert trig([ev("task_failed", task=rev)]) == ["failed review"], "one hand-off, one trigger"
     db.update_task(rev, status="failed")
     assert trig([ev("observation", "high")]) == ["high severity event"]
     assert trig([ev("observation", "critical")]) == ["high severity event"]
@@ -28549,6 +28549,112 @@ def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(
     d.tick()
     evs = [r["id"] for r in db.q("SELECT id FROM events WHERE kind='dead_dependency' AND task=?", (child,))]
     assert evs and "dead_dependency" in coord.effort_triggers(db, cfg, evs, None)[0]
+
+
+def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, monkeypatch):
+    """Lowering rules: a failed review's hand-off is one trigger; a high event that is a known case
+    (an issue open before the last turn, a deploy pending on an owned merge before its deadline, a
+    machine with an open change) stays routine. Each logs its rule; anything else still raises."""
+    p = make(env)
+    from ttp import coordinator as coord, deploy, machine_ledger
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    now = time.time()
+    db.set_kv("last_coordinator_turn", now - 60)
+
+    def ev(kind, severity="normal", fp=None, task=None, data=None):
+        return db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", (now, "daemon", kind, fp, severity, "x", data, "queued", task))
+
+    def trig(evs):
+        low: list = []
+        return coord.effort_triggers(db, cfg, list(evs), None, [], None, now, None, low)[0], low
+    # 3) task_failed or task_changes_needed of a review: one trigger, the fold logged.
+    rev = db.add_task("review it", "s", kind="review", origin="user")
+    for kind in ("task_failed", "task_changes_needed"):
+        e = ev(kind, task=rev)
+        assert trig([e]) == (["failed review"], [f"{kind}: {coord.LOWERED_FAILED_REVIEW}: event {e}"]), kind
+    code = db.add_task("code it", "s", kind="code", origin="user")
+    assert trig([ev("task_failed", task=code)])[0] == ["task_failed"], "a failed code task is unchanged"
+    # 2) A high event with no fingerprint, or a new issue's, raises.
+    assert trig([ev("observation", "high")]) == (["high severity event"], [])
+    db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,severity,status,subject,opened) "
+         "VALUES('fp-new','w',?,?,'t','high','open','box m9',?)", (now, now, now))
+    assert trig([ev("observation", "high", "fp-new")])[0] == ["high severity event"], "opened by this sighting"
+    # An issue open since before the last turn is a known case, critical too; a fixed one is not.
+    db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,severity,status,subject,opened) "
+         "VALUES('fp-old','w',?,?,'t','critical','open','box m9',?)", (now - 7200, now, now - 7200))
+    e = ev("observation", "critical", "fp-old")
+    got, low = trig([e])
+    assert got == [] and len(low) == 1 and low[0].startswith(f"{coord.LOWERED_KNOWN}: event {e} (issue #")
+    db.x("UPDATE issues SET status='fixed' WHERE fingerprint='fp-old'")
+    assert trig([ev("observation", "critical", "fp-old")])[0] == ["high severity event"]
+    # A deploy pending on an owned merge before its deadline; past it, or unowned, it raises.
+    key = deploy.condition_key("alpha", "0.5.0")
+    db.set_kv(deploy.CHECKS, {key: {"outcome": "pending", "owner": "beta", "due": now + 600}})
+    e = ev("after_push_failed", "high", key)
+    assert trig([e]) == (["after_push_failed"], [f"{coord.LOWERED_KNOWN}: event {e} (deploy pending on beta's merge)"])
+    db.set_kv(deploy.CHECKS, {key: {"outcome": "pending", "owner": "beta", "due": now - 1}})
+    assert trig([ev("observation", "high", key)]) == (["high severity event"], [])
+    # A machine with an open, not overdue change in the shared ledger (named by data or the issue subject).
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
+        {"id": 7, "alias": "m9", "by": "other", "expires": now + 3600}])
+    db.x("UPDATE issues SET status='fixed' WHERE fingerprint='fp-new'")
+    e = ev("observation", "high", "fp-new")
+    assert trig([e]) == ([], [f"{coord.LOWERED_KNOWN}: event {e} (machine change #7 on m9 by other)"])
+    assert trig([ev("observation", "high", "fp-x", data=json.dumps({"machine": "m9"}))])[0] == []
+    assert trig([ev("observation", "high", "fp-y", data=json.dumps({"machine": "m90"}))])[0] == \
+        ["high severity event"], "the alias matches whole names only"
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
+        {"id": 7, "alias": "m9", "by": "other", "expires": now - 1}])
+    assert trig([ev("observation", "high", "fp-x", data=json.dumps({"machine": "m9"}))])[0] == \
+        ["high severity event"], "an overdue change is no known case"
+    # Unchanged: user messages, rejected actions, blocked tasks and the blocker sweep still raise.
+    m = db.post("in", "status?", chat="c1", kind="user")
+    assert coord.effort_triggers(db, cfg, [], None, [m], None, now)[0] == ["user message"]
+    for kind in ("task_blocked", "blocker_sweep"):
+        assert trig([ev(kind, "high", "fp-old")])[0][0] == kind
+
+
+def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, monkeypatch):
+    """1) A code task's needs_review hand-off with nothing else to decide is marked plain, and since the
+    daemon reviews it (a review it queued, or its sweep), it raises no trigger and logs the rule. One
+    with follow-ups, or with auto review off, still raises task_review."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    tid, _, _, _ = _finish_code(env, p, "plain", {"a.py": 5}, result={"status": "needs_review", "summary": "ok"})
+    plain = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_review'", (tid,))
+    assert json.loads(plain["data"]) == {"plain": True}
+    # The turn it starts runs routine, with the lowering rule in its note next to the outcome.
+    d = Daemon(p.base)
+    d.update_gates()
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append((a, k)) or len(calls))
+    later = time.time() + 600
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: later)
+        d.maybe_coordinate()
+    (_, k), = calls
+    assert k["unblock"] == "" and k["note"]["triggers"] == [] and plain["id"] in k["note"]["events"]
+    assert k["note"]["lowered"] == [f"{coord.LOWERED_REVIEW}: event {plain['id']} "
+                                    "(the daemon's review sweep queues its review)"]
+    low: list = []
+    assert coord.effort_triggers(p.db, p.config(), [plain["id"]], None, lowered=low)[0] == []
+    assert low == [f"{coord.LOWERED_REVIEW}: event {plain['id']} (the daemon's review sweep queues its review)"]
+    p.set_config("review.sweep_after_s", 0)
+    assert coord.effort_triggers(p.db, p.config(), [plain["id"]], None)[0] == ["task_review"]
+    rid = p.db.add_task(f"Review #{tid}: plain", "s", kind="review", origin="daemon", labels=[f"auto_review:{tid}"])
+    low = []
+    assert coord.effort_triggers(p.db, p.config(), [plain["id"]], None, lowered=low)[0] == []
+    assert low == [f"{coord.LOWERED_REVIEW}: event {plain['id']} (review #{rid} queued by the daemon)"]
+    tid2, _, _, _ = _finish_code(env, p, "noted", {"b.py": 5}, result={
+        "status": "needs_review", "summary": "ok", "followups": [{"title": "later", "spec": "more"}]})
+    noted = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_review'", (tid2,))
+    assert noted["data"] is None
+    assert coord.effort_triggers(p.db, p.config(), [noted["id"]], None)[0] == ["task_review"]
 
 
 def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkeypatch):

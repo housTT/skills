@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -246,7 +246,11 @@ EFFORT_EVENT_TRIGGERS = {
     budgetkind.KIND: "budget",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
-EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
+EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is not routine, unless a known case
+# Lowering rules (effort_triggers): each event one keeps routine is logged in the turn's note ("lowered").
+LOWERED_REVIEW = "task_review: plain hand-off, daemon reviews"
+LOWERED_KNOWN = "high severity event: known case"
+LOWERED_FAILED_REVIEW = "counted as failed review"
 RESOURCE_WAITS_ONLY = "waits only"   # a resource_trouble line that only counts waits is not trouble
 # A user message naming a change of plan may contradict the charter or memory.
 CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w*|scrap (that|this|it)|"
@@ -1980,32 +1984,42 @@ TOOL_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,199}\*?$")
 
 def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
                     msg_ids: list[int] | None = None, gates: dict | None = None,
-                    now: float | None = None, conflicts: list[dict] | None = None) -> tuple[list[str], dict]:
+                    now: float | None = None, conflicts: list[dict] | None = None,
+                    lowered: list[str] | None = None) -> tuple[list[str], dict]:
     """Why the coming coordinator turn is tricky or blocking, as trigger labels ([] for a routine
     one), and the state-based triggers' state for EFFORT_SEEN_KEY, saved once the turn starts so a
     lasting state raises one turn, not every turn. All the rules live here; each label names its
     rule, so turns can be counted by trigger. `conflicts`: the charter's contradicting Restrictions
-    pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it."""
+    pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it.
+    `lowered`, when given, gets one line per event a lowering rule kept routine (LOWERED_*), for the
+    turn's note next to its outcome; `escalate` stays the way back to high effort."""
     now = now or time.time()
     c = cfg.get("coordinator") or {}
     out: list[str] = []
     seen_before = db.kv(EFFORT_SEEN_KEY, {}) or {}
     seen: dict = {}
+    low = lowered if lowered is not None else []
+    last = float(db.kv("last_coordinator_turn", 0) or 0)
 
     def add(label: str) -> None:
         if label not in out:
             out.append(label)
-    rows = db.q(f"SELECT kind, severity, text, task FROM events WHERE id IN ({','.join('?' * len(event_ids))})",
-                list(event_ids)) if event_ids else []
+    rows = db.q("SELECT id, ts, kind, fingerprint, severity, text, data, task FROM events "
+                f"WHERE id IN ({','.join('?' * len(event_ids))})", list(event_ids)) if event_ids else []
     for r in sorted(rows, key=lambda r: r["kind"]):
         if r["kind"] == "resource_trouble" and RESOURCE_WAITS_ONLY in (r["text"] or ""):
             continue
+        if r["kind"] == "task_review" and (why := _routine_review(db, cfg, r)):
+            low.append(f"{LOWERED_REVIEW}: event {r['id']} ({why})")
+            continue
+        # A failed or changes-needed review is one trigger, "failed review", not two from one hand-off.
+        if r["kind"] in ("task_failed", "task_changes_needed") and r["task"] \
+                and (db.task(r["task"]) or {}).get("kind") == "review":
+            add("failed review")
+            low.append(f"{r['kind']}: {LOWERED_FAILED_REVIEW}: event {r['id']}")
+            continue
         if r["kind"] in EFFORT_EVENT_TRIGGERS:
             add(r["kind"])
-    # A review that asked for changes is not a failure, but what to do with its findings is a decision.
-    if any(r["kind"] in ("task_failed", "task_changes_needed") and r["task"]
-           and (db.task(r["task"]) or {}).get("kind") == "review" for r in rows):
-        add("failed review")
     # An area whose reviews keep failing across stacks needs a re-plan, not another fix round.
     if any(r["kind"] == reviewcap.REVIEW_AREA_EVENT for r in rows):
         add(reviewcap.TRIGGER)
@@ -2015,8 +2029,14 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # A muted condition that outlasted its mute's escalate_after_h: is its recovery happening?
     if any(r["kind"] == "observation" and scr.MUTE_PERSISTS in (r["text"] or "") for r in rows):
         add("muted condition persists")
-    if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
-        add("high severity event")
+    for r in rows:
+        if r["severity"] not in EFFORT_SEVERITIES:
+            continue
+        why = _known_case(db, r, last, now)
+        if why:
+            low.append(f"{LOWERED_KNOWN}: event {r['id']} ({why})")
+        else:
+            add("high severity event")
     if msg_ids:
         add("user message")
         texts = db.q(f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids))
@@ -2027,7 +2047,6 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
         add("retry after a rejected ask_user")
     elif rejected:
         add("rejected action")
-    last = float(db.kv("last_coordinator_turn", 0) or 0)
     if db.one("SELECT 1 FROM messages WHERE direction='out' AND kind='alert' AND ts>? AND severity IN (%s)"
               % ",".join("?" * len(EFFORT_SEVERITIES)), (last, *EFFORT_SEVERITIES)):
         add("high severity alert")
@@ -2095,6 +2114,65 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     skip = c.get("effort_skip_triggers") or []
     skip = {str(x) for x in skip} if isinstance(skip, list) else set()
     return [x for x in out if x not in skip], seen
+
+
+def _routine_review(db, cfg: dict, r) -> str:
+    """Why a task_review event is routine ("" when it is not): a code task's needs_review hand-off
+    with nothing else to decide (the daemon marked it plain: no follow-ups, findings or notes) whose
+    review the daemon queues itself (one it already queued, or its review sweep will)."""
+    try:
+        data = json.loads(r["data"] or "{}")
+    except (TypeError, ValueError):
+        return ""
+    if not (isinstance(data, dict) and data.get("plain")) or r["severity"] in EFFORT_SEVERITIES or not r["task"]:
+        return ""
+    if (db.task(r["task"]) or {}).get("kind") != "code":
+        return ""
+    if (got := _auto_reviews(db, {int(r["task"])}).get(int(r["task"]))):
+        return f"review #{got['id']} queued by the daemon"
+    d, rules = cfg.get("delivery") or {}, cfg.get("review") or {}
+    try:
+        after = float(rules.get("sweep_after_s", 1800) or 0)
+    except (TypeError, ValueError):
+        after = 1800.0
+    if rules.get("auto", True) and (d.get("review_before_pr", True) or d.get("push_branch")) and after > 0:
+        return "the daemon's review sweep queues its review"
+    return ""
+
+
+def _known_case(db, r, last: float, now: float) -> str:
+    """Why a high or critical event is a known case ("" when it is new): its fingerprint names an
+    issue already open before the last coordinator turn, a deploy pending on an owned merge before
+    its takeover deadline (deploy.py), or a machine with an open, not overdue change in the shared
+    ledger (machine_ledger.py)."""
+    fp = str(r["fingerprint"] or "")
+    if not fp:
+        return ""
+    issue = db.one("SELECT id, status, subject, COALESCE(opened, first_seen) since FROM issues WHERE fingerprint=?",
+                   (fp,))
+    if issue and issue["status"] == "open" and last and float(issue["since"] or now) <= last:
+        return f"issue #{issue['id']} open since before the last turn"
+    if fp.startswith("deploy:"):
+        rec = (db.kv(deploy.CHECKS) or {}).get(fp) or {}
+        if not rec.get("closed") and rec.get("outcome") == "pending" and rec.get("owner") \
+                and float(rec.get("due") or 0) > now:
+            return f"deploy pending on {rec['owner']}'s merge"
+    try:
+        data = json.loads(r["data"] or "{}")
+    except (TypeError, ValueError):
+        data = {}
+    names = " ".join(str(x) for x in ((data or {}).get("machine") if isinstance(data, dict) else None,
+                                      issue["subject"] if issue else None) if x)
+    if names:
+        try:
+            for ch in machine_ledger.changes():
+                alias = str(ch.get("alias") or "")
+                if alias and not machine_ledger.overdue(ch, now) and \
+                        re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w.-])", names):
+                    return f"machine change #{ch.get('id')} on {alias} by {ch.get('by', '?')}"
+        except Exception:   # an unreadable ledger knows no case: the event raises the turn
+            return ""
+    return ""
 
 
 def live_max(cfg: dict) -> int:
