@@ -17,6 +17,8 @@
   When only the verdict and its push (or approval) are left once they pass, put that final hand-off
   in `on_pass`: a pass on the same head records it without a model run, and a failure wakes the
   review at its tier with the output.
+- A `ttp checks --purpose harness` pass only qualifies a harness-preparation head; it is never
+  candidate evidence. Fail a change that whitelists its own harness commit's SHA in a publication gate.
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->

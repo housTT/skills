@@ -1308,10 +1308,11 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
-def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:
-    """The recorded pass of exactly these commands, in this order, on this tree, or None. A pass of
-    more commands that start with these is one of these too: they ran first, in order, and passed (the
-    daemon's pre-started checks run the project's checks alone; a worker ran them with its own after `--`)."""
+def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate") -> dict | None:
+    """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
+    None. A pass of more commands that start with these is one of these too: they ran first, in order,
+    and passed (the daemon's pre-started checks run the project's checks alone; a worker ran them with
+    its own after `--`). A pass for the other purpose never counts (a record without one is candidate)."""
     if not p or not tree:
         return None
     try:
@@ -1320,13 +1321,13 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:
         return None
     key = _commands_hash(cmds)
     for e in reversed(passes if isinstance(passes, list) else []):
-        if isinstance(e, dict) and e.get("tree") == tree and (e.get("commands") == key
-                                                               or key in (e.get("prefixes") or ())):
+        if isinstance(e, dict) and e.get("tree") == tree and e.get("purpose", "candidate") == purpose and (
+                e.get("commands") == key or key in (e.get("prefixes") or ())):
             return e
     return None
 
 
-def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
+def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate") -> None:
     """Only passes are recorded. A failed write is said and never fails the checks."""
     if not p or not tree:
         return
@@ -1343,7 +1344,8 @@ def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
             passes = [e for e in passes if isinstance(e, dict)] if isinstance(passes, list) else []
             passes.append({"tree": tree, "commands": _commands_hash(cmds),
                            "prefixes": [_commands_hash(cmds[:n]) for n in range(1, len(cmds))],
-                           "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time()})
+                           "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time(),
+                           **({"purpose": purpose} if purpose != "candidate" else {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
         print(f"ttp checks: could not record the pass in {path}: {e}", file=sys.stderr)
@@ -1426,7 +1428,12 @@ def cmd_checks(a) -> None:
 
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
-    killed outright. Starting it again stops the run's earlier detached checks."""
+    killed outright. Starting it again stops the run's earlier detached checks.
+
+    `--purpose harness` qualifies a harness-preparation head: it runs the harness-tagged and untagged
+    project checks plus the commands after `--`, lists candidate-tagged ones as not run, and fails
+    when no harness-tagged check is set. Its pass is recorded as such and never counts for a PR,
+    an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
     from . import checkdirs, prguard, push
     if getattr(a, "gap", None):
         from . import checkgaps
@@ -1446,7 +1453,19 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
+    purpose = getattr(a, "purpose", None) or "candidate"
     own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
+    not_run: list[str] = []
+    if purpose == "harness":
+        if bad := push.check_problems((cfg.get("delivery") or {}).get("push_checks")):
+            die("ttp checks --purpose harness: delivery.push_checks is malformed, so nothing is qualified: "
+                + "; ".join(bad), 1)
+        if not any(c.purpose == "harness" for c in own):
+            die("ttp checks --purpose harness: delivery.push_checks has no purpose harness check, so nothing "
+                "qualifies this head; add a reviewed `ttp check-plan --purpose harness --definition-commit "
+                "<full commit ID> --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
+        not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
+        own = [c for c in own if c.purpose != "candidate"]
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own)
     if dropped:
         print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
@@ -1487,7 +1506,11 @@ def cmd_checks(a) -> None:
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
-        out.write(f"ttp checks: in {top} on {head[:12]}\n")
+        out.write(f"ttp checks: in {top} on {head[:12]}" + (" (purpose harness)" if purpose == "harness" else "")
+                  + "\n")
+        for line in not_run:
+            print(f"ttp checks: {line}")
+            out.write(f"{line}\n")
         try:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
@@ -1495,7 +1518,7 @@ def cmd_checks(a) -> None:
         except push.ScopeError as e:
             out.write(f"{e}\n")
             todo, skipped, passed, failed = [], [], False, str(e.check)
-        hit = _recorded_pass(p, tree, todo) if todo and not a.fresh else None
+        hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
         if not todo and passed and push.outside_scope(cmds, skipped):
             out.write(f"{push.OUT_OF_SCOPE}\n")
             print(f"ttp checks: {push.OUT_OF_SCOPE}")
@@ -1533,7 +1556,7 @@ def cmd_checks(a) -> None:
             text = f.read().decode("utf-8", errors="replace")
         env_problem = push.env_problem(text, top) if failed in todo else None
         also = bool(env_problem) and push.test_failures(text)
-        if failed in todo and rc is not None:
+        if failed in todo and rc is not None and purpose == "candidate":   # a harness run opens no check gap
             with open(log, "rb") as f:
                 f.seek(check_start)
                 output = f.read().decode("utf-8", errors="replace")
@@ -1543,6 +1566,7 @@ def cmd_checks(a) -> None:
                 write_json(Path(run_dir) / "check_failure.json", failure)
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                     "purpose": purpose, **({"not_run": not_run} if not_run else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -1559,9 +1583,18 @@ def cmd_checks(a) -> None:
     if hit:
         print(said)
         return
-    _record_pass(p, tree, todo)
+    _record_pass(p, tree, todo, purpose)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
-    print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
+    more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
+    print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
+          + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
+             if purpose == "harness" else "recorded for the draft PR"))
+
+
+def _harness_purpose(a) -> dict:
+    """What a detached or relaunched `ttp checks` keeps of `--purpose`: only harness, so a restart
+    after a reboot qualifies the head for the same purpose."""
+    return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
@@ -1654,7 +1687,8 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
         if not p:
             die("ttp checks: sandboxed detached checks need a project daemon; set TTP_PROJECT")
         detach.enqueue(p.state, rc, run_dir / CHECKS_OUT, [], top or os.getcwd(), env,
-                       checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh)})
+                       checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh),
+                               **_harness_purpose(a)})
         print("ttp checks: queued; the daemon starts them outside this command's sandbox")
     else:
         detach.withdraw(rc)   # a marker left without a request (no daemon to take it)
@@ -1715,13 +1749,14 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
-                                      *(["--fresh"] if a.fresh else []), *a.cmd],
+                                      *(["--fresh"] if a.fresh else []),
+                                      *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
         try:
             write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
                                               "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
-                                              "fresh": bool(a.fresh), "req": req, "pidns": pid_ns(),
+                                              "fresh": bool(a.fresh), **_harness_purpose(a), "req": req, "pidns": pid_ns(),
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
             try:
@@ -4174,6 +4209,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --gap: the push_checks fingerprint the waiter failed under")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
+    s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
+                   help="harness: qualify a harness-preparation head with the purpose harness and untagged checks; "
+                        "candidate gates are not run and the pass never counts for a PR or a push")
     s.add_argument("--detach", action="store_true",
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
     s.add_argument("--result", metavar="RUN_DIR",

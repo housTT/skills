@@ -52104,3 +52104,162 @@ def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
     coord.system_prompt(p, now=start + 3)
     rule.write_text(rule.read_text().replace('shared branches.', 'shared state.'))
     assert 'Never change shared state.' in coord.system_prompt(p, now=start + 4)
+
+
+HARNESS_PLAN = "ttp check-plan --purpose harness --definition-commit " + "a" * 40 + " --definition-path checks/harness.json"
+
+
+def _fake_ttp(tmp_path, monkeypatch, log, rc=0):
+    """A `ttp` on PATH that only logs its call: the harness entry's check-plan command."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "ttp").write_text(f"#!/bin/sh\necho plan >> {log}\nexit {rc}\n")
+    (bin_dir / "ttp").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_check_purpose_tag_is_validated_and_kept(tmp_path, monkeypatch):
+    from ttp import push
+    _fake_ttp(tmp_path, monkeypatch, tmp_path / "log")
+    harness = {"run": HARNESS_PLAN, "purpose": "harness"}
+    gate = {"run": "true", "purpose": "candidate"}
+    assert push.check_problems([harness, gate, "true"]) == []
+    checks = push.check_list([harness, gate, "true"])
+    assert [c.purpose for c in checks] == ["harness", "candidate", ""]
+    assert [c.config() for c in checks] == [harness, gate, "true"]
+    assert push.check_sig(checks[1]) != push.check_sig(push.Check("true")), "purpose is part of the signature"
+    # An unknown purpose is a config error, never a silent skip.
+    bad = push.check_problems([{"run": "true", "purpose": "publish"}])
+    assert len(bad) == 1 and "purpose must be one of candidate, harness" in bad[0]
+    with pytest.raises(ValueError):
+        push.checks_of([{"run": "true", "purpose": ""}])
+    # A harness entry is only a full-hex, exact check-plan harness command.
+    for cmd in ("true", HARNESS_PLAN.replace("harness --def", "candidate --def"),
+                HARNESS_PLAN.replace("a" * 40, "a" * 12), HARNESS_PLAN.replace("checks/harness.json", "/abs.json"),
+                HARNESS_PLAN + " --extra", HARNESS_PLAN.replace(" --definition-path checks/harness.json", ""),
+                HARNESS_PLAN + " --purpose harness"):
+        assert any("purpose harness check must be" in b for b in push.check_problems([{"run": cmd, "purpose": "harness"}])), cmd
+    assert push.check_problems([{"run": HARNESS_PLAN.replace("--definition-commit ", "--definition-commit="),
+                                 "purpose": "harness"}]) == []
+
+
+def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, prguard, push
+    from ttp import daemon as daemon_mod
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_ttp(tmp_path, monkeypatch, log)
+    selector = ("sh -c 'echo \"mandatory check selector: no case for HEAD $(git rev-parse HEAD)\"; "
+                "echo gate >> " + str(log) + "; exit 1'")
+    p.set_config("delivery.push_checks", [{"run": selector, "purpose": "candidate"},
+                                          {"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    cli.main(["checks", "--purpose", "harness", "--", f"echo extra >> {log}"])
+    out = capsys.readouterr().out
+    assert log.read_text().split() == ["plan", "consumer", "extra"], "a candidate gate ran or a consumer was dropped"
+    assert f"not run: candidate publication gate: {selector}" in out and "harness qualification only" in out
+    rec = json.loads((run / "checks.json").read_text())
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert rec["passed"] is True and rec["purpose"] == "harness" and rec["head"] == head
+    assert rec["not_run"] == [f"not run: candidate publication gate: {selector}"]
+    assert selector not in rec["commands"]
+    assert not (run / "check_failure.json").exists()
+    # The PR gate, the on_pass head, `ttp push --own`'s reuse and the task's other runs ignore it.
+    assert "harness qualification" in prguard._checks_problem(str(repo))
+    assert daemon_mod._checked_head(run, {"kind": "code", "branch": ""}) == ""
+    assert push.recorded_checks(run) is None
+    monkeypatch.setenv("TTP_TASK", "1")
+    assert prguard._task_pass(head, str(repo)) is None
+    # The candidate default runs every entry: no harness pass is reused, the gate fails it.
+    log.unlink()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks"])
+    assert exc.value.code == 1 and log.read_text().split() == ["gate"]
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["purpose"] == "candidate"
+    assert json.loads((run / "check_failure.json").read_text())["kind"] == "selector_missing"
+    # A record from before purposes existed still counts as candidate evidence.
+    (run / "checks.json").write_text(json.dumps({"head": head, "worktree": str(repo), "passed": True,
+                                                 "commands": ["true"], "skipped": [], "ts": 0}))
+    assert prguard._checks_problem(str(repo)) is None and push.recorded_checks(run)["head"] == head
+
+
+def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
+    cli.main(["checks"])
+    assert ran() == 2
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 4, "a candidate pass was reused for a harness qualification"
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 4 and "(recorded)" in capsys.readouterr().out
+    cli.main(["checks"])
+    assert ran() == 4, "the candidate pass on the same tree was not reused"
+    assert json.loads((run / "checks.json").read_text())["purpose"] == "candidate"
+    assert cli._recorded_pass(p, subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True,
+                                                text=True).stdout.strip(), [], "other") is None
+
+
+def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_ttp(tmp_path, monkeypatch, log)
+    # No harness entry: nothing qualifies the head, even with untagged checks and extras.
+    p.set_config("delivery.push_checks", ["true", {"run": "true", "purpose": "candidate"}])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--purpose", "harness", "--", "true"])
+    assert exc.value.code == 1 and "no purpose harness check" in capsys.readouterr().err
+    assert not (run / "checks.json").exists()
+    # An unknown purpose fails it too, never skipping the entry.
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, {"run": "true", "purpose": "x"}])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--purpose", "harness"])
+    assert exc.value.code == 1 and "purpose must be one of" in capsys.readouterr().err
+    # A failing consumer fails the run, and a selector-shaped failure opens no check gap.
+    selector = "sh -c 'echo \"mandatory check selector: no case for HEAD $(git rev-parse HEAD)\"; exit 1'"
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, selector])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--purpose", "harness"])
+    assert exc.value.code == 1
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["purpose"] == "harness"
+    assert not (run / "check_failure.json").exists(), "a harness run opened a check gap"
+    # A failing harness plan fails it as well.
+    _fake_ttp(tmp_path, monkeypatch, log, rc=65)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--purpose", "harness"])
+    assert exc.value.code == 1 and json.loads((run / "checks.json").read_text())["passed"] is False
+
+
+def test_detached_and_relaunched_checks_keep_the_harness_purpose(env, tmp_path, monkeypatch):
+    from argparse import Namespace
+    from ttp import cli
+    assert cli._harness_purpose(Namespace(purpose="harness")) == {"purpose": "harness"}
+    assert cli._harness_purpose(Namespace(purpose="candidate")) == {}
+    assert cli._harness_purpose(Namespace()) == {}
+
+
+def test_push_runs_every_check_whatever_its_purpose(env, monkeypatch, tmp_path):
+    log = tmp_path / "log"
+    _fake_ttp(tmp_path, monkeypatch, log)
+    p, repo, origin, other = _push_setup(env, monkeypatch, [{"run": f"echo gate >> {log}", "purpose": "candidate"},
+                                                           {"run": HARNESS_PLAN, "purpose": "harness"},
+                                                           f"echo consumer >> {log}"])
+    _commit(repo, "x.txt", "x\n")
+    assert _ttp_push() == 0
+    assert log.read_text().split() == ["gate", "plan", "consumer"]
+
+
+def test_selector_repair_spec_forbids_whitelisting_a_harness_head(env):
+    from ttp import checkgaps
+    p = make(env)
+    gap = {"check": "python3 scripts/select.py", "detail": "selector_missing: " + "b" * 40, "tasks": {}}
+    owner = checkgaps._queue_owner(p, "check:sig", gap, p.config())
+    spec = " ".join(p.db.task(owner)["spec"].split())
+    assert "Never add a harness-preparation head to a publication whitelist; qualify it with " \
+           "`ttp checks --purpose harness` through a reviewed harness definition." in spec

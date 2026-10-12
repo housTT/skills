@@ -5144,7 +5144,8 @@ class Daemon:
         if why:
             log(self.p, f"task {tid}: the reboot killed its checks, not started again: {why}")
             return False, 0
-        argv = (["--fresh"] if info.get("fresh") else []) + [str(c) for c in cmd]
+        argv = (["--fresh"] if info.get("fresh") else []) + (["--purpose", "harness"] if info.get("purpose") == "harness"
+                                                              else []) + [str(c) for c in cmd]
         r = self._start_checks(Path(wt), out, f"relaunch-t{tid}", tid, argv)
         if not r:
             return False, 0
@@ -5726,7 +5727,8 @@ class Daemon:
             return "unclear", problem
         head = _checked_head(run_dir, task)
         if not head:
-            return "unclear", "the checked commit is no longer the head of its worktree and branch, or it is not clean"
+            return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
+                               "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, full["on_pass"], head
 
     def _probe_env(self) -> dict:
@@ -7150,7 +7152,7 @@ def _checked_head(run_dir: Path, task: dict) -> str:
         rec = json.loads((run_dir / prguard.CHECKS_FILE).read_text())
     except (OSError, ValueError):
         return ""
-    if not isinstance(rec, dict):
+    if not prguard.candidate_record(rec):   # a harness qualification never stands for a checked candidate
         return ""
     head, top = rec.get("head"), rec.get("worktree")
     if rec.get("passed") is not True or not isinstance(head, str) or len(head) < 40 or not isinstance(top, str) \

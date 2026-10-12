@@ -229,7 +229,7 @@ def tend(p: Project) -> None:
             try:
                 c = m["checks"]
                 lost(rc).unlink(missing_ok=True)
-                pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"]), rc.parent, c["worktree"],
+                pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"], purpose=c.get("purpose")), rc.parent, c["worktree"],
                                     c["head"], machines.mask_devices({**os.environ, **(m.get("env") or {})}), rid or "")
                 renice(pid, nice_level(p.config().get("runner"))[0])
             except (OSError, ValueError, TypeError, KeyError) as e:

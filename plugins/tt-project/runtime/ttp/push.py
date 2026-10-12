@@ -62,23 +62,28 @@ class Check(str):
     applicable, which is reported and never counted as passed. `"if_changed": "<glob>"` (or a list
     of globs) scopes a check by what it covers: it is skipped on a head whose diff since the push
     target touches no matching path, and a head where every check is skipped that way changes
-    nothing any check covers (`outside_scope`)."""
+    nothing any check covers (`outside_scope`). `"purpose": "candidate"` or `"harness"` says which
+    `ttp checks --purpose` runs it (untagged: both); `ttp push` and the push queue run every entry."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
+    purpose = ""
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
-        if not (self.if_exists or self.if_changed):
+        if not (self.if_exists or self.if_changed or self.purpose):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
             out["if_exists"] = self.if_exists
         if self.if_changed:
             out["if_changed"] = self.if_changed[0] if len(self.if_changed) == 1 else list(self.if_changed)
+        if self.purpose:
+            out["purpose"] = self.purpose
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose"}
+PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
 def _entries(v: Any) -> list:
@@ -107,7 +112,38 @@ def _check(c: Any) -> Check | None:
     if not _form_problem(c):
         out.if_exists = _if_exists(c)
         out.if_changed = _if_changed(c)
+        out.purpose = c.get("purpose") or ""
     return out
+
+
+def harness_plan_problem(cmd: str) -> str | None:
+    """Why a `purpose: harness` check is not exactly `ttp check-plan --purpose harness
+    --definition-commit <full hex> --definition-path <repo path>`: its coverage must come from a
+    committed, reviewed definition, never from a selector that lists the harness head itself."""
+    want = (f"{cmd!r}: a purpose harness check must be `ttp check-plan --purpose harness "
+            "--definition-commit <full commit ID> --definition-path <repo path>`")
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return want
+    if len(words) < 2 or posixpath.basename(words[0]) != "ttp" or words[1] != "check-plan":
+        return want
+    opts: dict[str, str] = {}
+    rest = words[2:]
+    while rest:
+        flag, eq, value = rest.pop(0).partition("=")
+        if not eq:
+            if not rest:
+                return want
+            value = rest.pop(0)
+        if flag not in ("--purpose", "--definition-commit", "--definition-path") or flag in opts:
+            return want
+        opts[flag] = value
+    if (opts.get("--purpose") != "harness" or len(opts) != 3
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", opts["--definition-commit"])
+            or not _inside(opts["--definition-path"])):
+        return want
+    return None
 
 
 def _if_exists(c: dict) -> str:
@@ -589,13 +625,13 @@ RECORDED = "checks.json"   # in a run's directory, as `ttp checks` writes it (pr
 
 
 def recorded_checks(run_dir: str | Path | None) -> dict | None:
-    """What `ttp checks` last recorded in the run's directory when it passed: {"head", "commands"}, or None
-    (no run, no record, a failed or malformed one)."""
+    """What `ttp checks` last recorded in the run's directory when it passed for the candidate purpose:
+    {"head", "commands"}, or None (no run, no record, a failed, harness or malformed one)."""
     try:
         rec = json.loads((Path(run_dir) / RECORDED).read_text()) if run_dir else None
     except (OSError, ValueError):
         return None
-    if not (isinstance(rec, dict) and rec.get("passed") is True and isinstance(rec.get("head"), str)
+    if not (prguard.candidate_record(rec) and rec.get("passed") is True and isinstance(rec.get("head"), str)
             and isinstance(rec.get("commands"), list)):
         return None
     return {"head": rec["head"], "commands": [str(c) for c in rec["commands"] if str(c).strip()]}
@@ -708,20 +744,25 @@ def check_problem(cmd: str) -> str | None:
 
 
 def _form_problem(c: dict) -> str | None:
-    """Why a check object is malformed: it takes "run", "if_exists" (a repo-relative path or glob)
-    and "if_changed" (one such glob or a non-empty list of them) and nothing else."""
+    """Why a check object is malformed: it takes "run", "if_exists" (a repo-relative path or glob),
+    "if_changed" (one such glob or a non-empty list of them) and "purpose" (PURPOSES) and nothing else."""
     cmd = c.get("run")
     if not isinstance(cmd, str) or not cmd.strip():
         return f"{c!r}: a check object needs \"run\": the command"
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
-        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists and if_changed"
+        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed and purpose"
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
     cond = c.get("if_changed")
     if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
         return f"{c!r}: if_changed must be a path or glob inside the repository, or a list of them"
+    purpose = c.get("purpose")
+    if purpose is not None and purpose not in PURPOSES:
+        return f"{c!r}: purpose must be one of {', '.join(PURPOSES)} (leave it out to run it for both)"
+    if purpose == "harness":
+        return harness_plan_problem(cmd.strip())
     return None
 
 

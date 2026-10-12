@@ -588,6 +588,12 @@ def _git_out(cwd: str | None, *args: str) -> str:
         return ""
 
 
+def candidate_record(rec: object) -> bool:
+    """A `ttp checks` record that can be candidate or publication evidence: one written for the
+    candidate purpose (or before purposes existed), never a `--purpose harness` qualification."""
+    return isinstance(rec, dict) and rec.get("purpose", "candidate") == "candidate"
+
+
 def _task_pass(head: str, cwd: str | None) -> dict | None:
     """A pass that `ttp checks` recorded in another run of this run's task on exactly `head` in this
     worktree, while the worktree has no uncommitted changes to tracked files; else None. A wake run may
@@ -611,8 +617,8 @@ def _task_pass(head: str, cwd: str | None) -> dict | None:
             rec = json.loads((p.runs / str(r["id"]) / CHECKS_FILE).read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(rec, dict) and rec.get("head") == head:
-            # The latest record on this head decides: a later failure there is not covered by an earlier pass.
+        if isinstance(rec, dict) and rec.get("head") == head and candidate_record(rec):
+            # A harness qualification is never candidate evidence. The latest candidate record on this head decides: a later failure there is not covered by an earlier pass.
             if rec.get("passed") is True and isinstance(rec.get("worktree"), str) \
                     and os.path.realpath(rec["worktree"]) == os.path.realpath(top):
                 return rec
@@ -634,12 +640,15 @@ def _checks_problem(cwd: str | None = None) -> str | None:
     except (OSError, ValueError):
         rec = None
     head = _git_out(cwd, "rev-parse", "HEAD")
-    if isinstance(rec, dict) and rec.get("passed") and head and rec.get("head") == head:
+    if candidate_record(rec) and rec.get("passed") and head and rec.get("head") == head:
         return None
     if _task_pass(head, cwd):
         return None
     if not isinstance(rec, dict):
         return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
+    if not candidate_record(rec):
+        return ("refused: the checks recorded for this run are a harness qualification (`ttp checks --purpose "
+                "harness`), which never counts for a PR. " + CHECKS_HOW)
     if not rec.get("passed"):
         return "refused: the local checks recorded for this run failed. " + CHECKS_HOW
     return (f"refused: the local checks passed on {str(rec.get('head'))[:12]}, not on this worktree's HEAD "
