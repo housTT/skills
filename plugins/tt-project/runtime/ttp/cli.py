@@ -2267,6 +2267,14 @@ def cmd_task(a) -> None:
             print(set_when(p.db, int(a.title), a.probe, p))
         except ValueError as e:
             die(str(e))
+    elif a.action == "superseded":
+        from .landed import record_superseded
+        if not a.title.strip().isdigit() or not a.probe:
+            die("superseded needs a task id and the commit on the push branch that carries its work")
+        try:
+            print(record_superseded(p, int(a.title), a.probe.strip()))
+        except ValueError as e:
+            die(str(e))
 
 
 def add_task(p, a) -> tuple[int, str]:
@@ -3983,11 +3991,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_adopt)
 
     s = sub.add_parser("task", help="add (deferred with --start-when/--start-after)/list/cancel tasks "
-                                       "by hand, or re-point a not-yet-started task's probe")
+                                       "by hand, re-point a not-yet-started task's probe, "
+                                       "or record a done task's work as re-landed under another commit")
     s.add_argument("name")
-    s.add_argument("action", choices=["add", "list", "cancel", "set-when"])
-    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/set-when: the task id")
-    s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it)")
+    s.add_argument("action", choices=["add", "list", "cancel", "set-when", "superseded"])
+    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/set-when/superseded: the task id")
+    s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
+                   "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")

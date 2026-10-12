@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS task_landings (
   marker TEXT PRIMARY KEY, task INTEGER NOT NULL, sha TEXT NOT NULL, target TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
 
+-- A task's work that landed on the push branch as another commit (a re-land after a push conflict):
+-- its branch head when recorded and the commit that carries it (`ttp task superseded`, landed.py).
+CREATE TABLE IF NOT EXISTS task_superseded (
+  task INTEGER NOT NULL, head TEXT NOT NULL, sha TEXT NOT NULL, ts REAL NOT NULL, PRIMARY KEY(task, head, sha));
+
 -- One row per Jev call: its use, decision, cost, estimated cost avoided, whether it changed the rules'
 -- decision (NULL: not known) and later outcome (jevuse.py).
 CREATE TABLE IF NOT EXISTS jev_calls (

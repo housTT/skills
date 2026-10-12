@@ -5,8 +5,9 @@ shas. The push queue (and `ttp push`) rebase each approved head onto the branch 
 `git merge-base --is-ancestor <reviewed sha> origin/<branch>` never passes once they did.
 
 - `landed:#<id>` (a start_when or retry_when) passes once task <id>'s landing is on the branch: the
-  commit the push queue recorded for it (push_queue.landed_sha), a successful detached push, else
-  (once it is done and committed something) its branch's commits by patch.
+  commit the push queue recorded for it (push_queue.landed_sha), a successful detached push, the
+  commit a task recorded as superseding it (`ttp task <project> superseded <id> <sha>`), else (once
+  it is done and committed something) its branch's commits by patch.
 - `git merge-base --is-ancestor <sha> <ref>`, as a whole probe, also passes when every commit of
   <sha> has an equivalent on <ref>: the same `git patch-id --stable` (git cherry), the same author,
   author date and subject (a rebase keeps them; a settled conflict changes the patch), or a commit
@@ -19,6 +20,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 from . import push
@@ -166,6 +168,9 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
                              or review_subject({"labels": r["labels"], "title": r["title"]}) == tid))
     if shas:
         return shas, "its detached push landing"
+    shas = [r["sha"] for r in db.q("SELECT sha FROM task_superseded WHERE task=? ORDER BY ts", (tid,))]
+    if shas:
+        return shas, "the commit recorded as superseding it"
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
     if not head:
         return [], f"#{tid} has no landing recorded and no branch"
@@ -176,6 +181,39 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     if head == _start(p.root, branch):
         return [], f"#{tid} has no landing recorded and no commits on its branch {branch}"
     return [head], f"its branch {branch}"
+
+
+def record_superseded(p, tid: int, sha: str) -> str:
+    """Record that done task `tid`'s work landed on the push branch as `sha` (re-landed under another
+    commit, e.g. after a push conflict), so the local-only check stops flagging its branch at the
+    head it has now. Refused unless `sha` is on the push branch; ValueError says why."""
+    task = p.db.task(tid)
+    if not task:
+        raise ValueError(f"no task #{tid}")
+    branch = task.get("branch") or ""
+    head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
+    if not head:
+        raise ValueError(f"task #{tid} has no branch here to record")
+    full = _commit(p.root, sha)
+    if not full:
+        raise ValueError(f"no commit {sha} in {p.root}")
+    rc, words = check(p, p.root, full)
+    if rc != 0:
+        raise ValueError(f"not recorded: {words}")
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
+           (tid, head, full, time.time()))
+    return f"task #{tid}: branch {branch} at {head[:10]} recorded as superseded by {full[:10]} ({words})"
+
+
+def superseded(db, tids) -> dict[int, list[tuple[str, str]]]:
+    """{task: [(recorded head, sha)]} of record_superseded for tasks `tids`."""
+    tids = [int(t) for t in tids]
+    out: dict[int, list[tuple[str, str]]] = {}
+    if tids:
+        for r in db.q("SELECT task, head, sha FROM task_superseded WHERE task IN (%s)" % ",".join("?" * len(tids)),
+                      tids):
+            out.setdefault(r["task"], []).append((r["head"], r["sha"]))
+    return out
 
 
 def _start(repo: Path, branch: str) -> str:

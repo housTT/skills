@@ -850,7 +850,8 @@ def checkout_state(repo: Path, timeout_s: float = 30) -> dict | None:
 
 
 def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: set = frozenset(),
-               timeout_s: float = FETCH_TIMEOUT_S, pushed: set | frozenset = frozenset()) -> tuple[dict, bool, dict] | None:
+               timeout_s: float = FETCH_TIMEOUT_S, pushed: set | frozenset = frozenset(),
+               superseded: dict | None = None) -> tuple[dict, bool, dict] | None:
     """Which of `branches` hold finished work whose only copy is on this machine. Returns ({branch:
     (head, commits on no remote)}, whether the fetch of every remote worked, {branch: head} of the
     others), after that fetch; with a failed fetch the remote refs may be old, so a branch may be
@@ -859,8 +860,9 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
     `origin/<name>` or `<name>`, and each remote's default branch) although its head is not: a
     reviewer rebased, amended, squashed or batched it (see delivered). A (branch, head) in `known`
     was found on a remote before and is not looked at again. So is a branch whose head the push
-    queue pushed or landed (`pushed`, see pushq.pushed_heads), or an ancestor of one. A branch that
-    no longer exists is left out. None when `repo` is not a git repository or has no remote: there
+    queue pushed or landed (`pushed`, see pushq.pushed_heads), or an ancestor of one, and a branch
+    a task recorded as superseded (`superseded`, {branch: [(head, sha)]}, see is_superseded). A
+    branch that no longer exists is left out. None when `repo` is not a git repository or has no remote: there
     is nothing to compare with. Pushes nothing."""
     try:
         if not _git(repo, "remote", check=False).split():
@@ -886,6 +888,7 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
         if not head:
             continue
         if ((b, head) in known or queue_pushed(repo, head, pushed)
+                or is_superseded(repo, head, (superseded or {}).get(b, ()))
                 or _git(repo, "branch", "-r", "--contains", head, check=False)
                 or any(delivered(repo, head, ref) for ref in refs)):
             clean[b] = head
@@ -893,6 +896,19 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
         ahead = _git(repo, "rev-list", "--count", head, "--not", "--remotes", check=False)
         out[b] = (head, int(ahead) if ahead.isdigit() else 0)
     return out, fetched, clean
+
+
+def is_superseded(repo: Path, head: str, records) -> bool:
+    """Whether a task recorded `head`'s work as superseded by a commit a remote has: a record
+    (recorded head, sha) whose head is `head` or contains it, and whose sha a remote-tracking branch
+    contains. A branch that moved past its recorded head has work the record does not cover."""
+    for rec_head, sha in records:
+        if rec_head != head and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head, rec_head],
+                                               capture_output=True, timeout=120).returncode != 0:
+            continue
+        if _git(repo, "branch", "-r", "--contains", sha, check=False):
+            return True
+    return False
 
 
 def queue_pushed(repo: Path, head: str, pushed: set | frozenset) -> bool:
@@ -915,9 +931,10 @@ _DELIVERED_MAX = 4096
 def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozenset()) -> bool:
     """Whether the changes of `head` since it left `ref` are already in `ref`: the push queue pushed
     or landed it (`pushed`, see queue_pushed), every commit has a patch-equivalent one there (`git
-    cherry`: rebased or cherry-picked) or one with the same subject (at least 20 characters: rebased
-    with conflicts, or amended), every file it changed is the same there (amended or squashed, maybe
-    with other work), or its whole diff reverts cleanly from `ref`'s tree (batched, and later work
+    cherry`: rebased or cherry-picked) or one with the same author, author date and subject (a rebase
+    with conflicts, or an amend, keeps them; a subject alone is not enough), its whole change has the
+    patch-id of one commit there (squashed into one), every file it changed is the same there
+    (amended or squashed, maybe with other work), or its whole diff reverts cleanly from `ref`'s tree (batched, and later work
     touched the same files elsewhere). Remembered per (repo, head, commit of `ref`). The revert is only
     tried when `ref` changed every file `head` did since they parted (else it cannot apply): against
     a far-behind branch of a large repository the binary diff can take minutes. A git call that times
@@ -938,6 +955,14 @@ def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozens
     return _DELIVERED[key]
 
 
+def _patch_ids(repo: Path, cmd: list[str]) -> set[str]:
+    """The `git patch-id --stable` ids of the patches git `cmd` prints."""
+    out = subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True, timeout=120).stdout
+    ids = subprocess.run(["git", "-C", str(repo), "patch-id", "--stable"], input=out, capture_output=True,
+                         timeout=120).stdout.decode(errors="replace")
+    return {ln.split()[0] for ln in ids.splitlines() if ln.split()}
+
+
 def _delivered(repo: Path, head: str, ref: str) -> bool:
     import tempfile
     base = _git(repo, "merge-base", ref, head, check=False)
@@ -946,9 +971,12 @@ def _delivered(repo: Path, head: str, ref: str) -> bool:
     cherry = subprocess.run(["git", "-C", str(repo), "cherry", ref, head], capture_output=True, text=True, timeout=120)
     if cherry.returncode == 0 and not any(line.startswith("+") for line in cherry.stdout.splitlines()):
         return True
-    mine = _git(repo, "log", "--no-merges", "--format=%s", f"{base}..{head}", check=False).splitlines()
-    if mine and all(len(m) >= 20 for m in mine) and set(mine) <= set(
-            _git(repo, "log", "--no-merges", "--format=%s", f"{base}..{ref}", check=False).splitlines()):
+    fmt = "--format=%an%x00%ae%x00%at%x00%s"
+    mine = _git(repo, "log", "--no-merges", fmt, f"{base}..{head}", check=False).splitlines()
+    if mine and set(mine) <= set(_git(repo, "log", "--no-merges", fmt, f"{base}..{ref}", check=False).splitlines()):
+        return True
+    if len(mine) > 1 and (whole := _patch_ids(repo, ["diff", base, head])) and whole <= _patch_ids(
+            repo, ["log", "-p", "--no-merges", "--format=commit %H", f"{base}..{ref}"]):
         return True
     files = _git(repo, "diff", "--no-renames", "--name-only", "-z", base, head, check=False).split("\0")
     files = [f for f in files if f]

@@ -3961,7 +3961,8 @@ class Daemon:
         """A done code task may leave the only copy of its work on a local branch. Hourly, and in the
         tick a code task hands off done, fetch and look for the branches of code tasks done in the
         last LOCAL_ONLY_DAYS that hold work no remote has (worktree.local_only: neither the head nor,
-        rebased, amended or batched by a reviewer, its changes are on a remote). Left alone: a task
+        rebased, amended or batched by a reviewer, its changes are on a remote, and no task recorded
+        it as superseded by a commit a remote has, landed.record_superseded). Left alone: a task
         an unfinished task still needs (a queued review or a fix, see worktree.needed_by), one a done
         review names (its id, branch or head commit), and one that finished before this check first
         ran (KV_LOCAL_ONLY_FROM), so an upgrade posts no burst for old work. Each newly found one
@@ -4009,13 +4010,16 @@ class Daemon:
         try:
             branches, targets, known = [t["branch"] for t in tasks], [worktree.base_ref(self.p)], set(self._local_only_ok.items())
             pushed = pushq.pushed_heads(self.p.db)
+            recorded = landed.superseded(db, [t["id"] for t in tasks])
+            superseded = {t["branch"]: recorded[t["id"]] for t in tasks if t["id"] in recorded}
         except Exception:
             log(self.p, "local-only branch check: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return
 
         def work() -> None:
             try:
-                job["found"] = worktree.local_only(self.p.root, branches, targets=targets, known=known, pushed=pushed)
+                job["found"] = worktree.local_only(self.p.root, branches, targets=targets, known=known, pushed=pushed,
+                                                   superseded=superseded)
             except Exception:
                 job["error"] = traceback.format_exc().replace("\n", " | ")[:1000]
             finally:
@@ -4053,7 +4057,8 @@ class Daemon:
                           f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
                           f"{'' if ahead == 1 else 's'} ahead of every remote ({t['title']}). Nothing pushes it "
                           f"automatically: deliver it as the charter allows, or cancel the task if the work is "
-                          f"not wanted.", "queued", t["id"]))
+                          f"not wanted. If it already landed as another commit (re-landed), a task records that "
+                          f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.", "queued", t["id"]))
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
 

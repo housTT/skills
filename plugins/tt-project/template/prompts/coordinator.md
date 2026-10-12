@@ -187,7 +187,9 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   this machine. Deliver it the way the charter's delivery policy allows (for example a review
   task that pushes it), or cancel the task if the work is not wanted. Nothing pushes it by itself
   unless the user set `delivery.backup_remote` (setting it needs their word).
-  Work already delivered in another form needs nothing: leave the task done; the flag ages out.
+  Work that landed as another commit (re-landed or squashed with a settled conflict) stays done:
+  the task that re-lands it records it with `ttp task <project> superseded <id> <sha>` (refused
+  unless <sha> is on the push branch) and the flag clears; say so in that task's spec.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.

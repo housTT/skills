@@ -13499,6 +13499,93 @@ def test_delivered_counts_a_git_call_that_times_out_as_not_delivered(env, monkey
     assert worktree.delivered(repo, head, "main") is False
 
 
+def _dated_commit(repo, files, msg, date):
+    """A commit with a fixed author date (a rebase or an amend keeps the original one)."""
+    for name, text in files.items():
+        (repo / name).write_text(text)
+    _git_out(repo, "add", "-A")
+    subprocess.run(["git", "-C", str(repo), *_IDENT, "commit", "-qm", msg], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_DATE": date})
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_delivered_needs_more_than_a_subject_and_finds_a_squashed_reland(env):
+    """A commit on the ref with the same subject but another author date and patch is other work;
+    the same author, date and subject is a rebase that settled a conflict; one commit whose patch-id
+    is the branch's whole change is a squashed re-land."""
+    from ttp import worktree
+    repo, _ = _delivered_repo(env)
+    _git_out(repo, "checkout", "-qb", "feat")
+    _dated_commit(repo, {"a": "1\n2\nFIRST\n4\n5\n6\n7\n8\n"}, "first part of the feature work", "1700000000 +0000")
+    head = _dated_commit(repo, {"a": "1\n2\nFIRST\n4\n5\nSECOND\n7\n8\n"}, "second part of the feature work",
+                         "1700000100 +0000")
+    _git_out(repo, "checkout", "-q", "main")
+    _dated_commit(repo, {"a": "1\n2\nOTHER\n4\n5\n6\n7\n8\n"}, "first part of the feature work", "1700000500 +0000")
+    _dated_commit(repo, {"a": "1\n2\nOTHER\n4\n5\nMORE\n7\n8\n"}, "second part of the feature work",
+                  "1700000600 +0000")
+    assert worktree.delivered(repo, head, "main") is False, "the same subjects alone are not the same work"
+    _git_out(repo, "checkout", "-q", "-B", "settled", f"{head}~2")
+    _dated_commit(repo, {"a": "1\n2\nFIRST!\n4\n5\n6\n7\n8\n"}, "first part of the feature work", "1700000000 +0000")
+    _dated_commit(repo, {"a": "1\n2\nFIRST!\n4\n5\nSECOND!\n7\n8\n"}, "second part of the feature work",
+                  "1700000100 +0000")
+    assert worktree.delivered(repo, head, "settled") is True, "same author, date and subject: rebased"
+    _git_out(repo, "checkout", "-q", "-B", "squashed", f"{head}~2")
+    _dated_commit(repo, {"b": "y\n"}, "other work", "1700000700 +0000")
+    _dated_commit(repo, {"a": "1\n2\nFIRST\n4\n5\nSECOND\n7\n8\n"}, "re-land: the feature as one commit",
+                  "1700000800 +0000")
+    _dated_commit(repo, {"a": "1\n2\nFIRST later\n4\n5\nSECOND later\n7\n8\n"}, "later work", "1700000900 +0000")
+    assert worktree.delivered(repo, head, "squashed") is True, "the whole change's patch-id is one commit there"
+    _git_out(repo, "checkout", "-q", "-B", "settled-squash", f"{head}~2")
+    _dated_commit(repo, {"a": "1\n2\nFIRST\n4\n5\nSECOND, settled\n7\n8\n"}, "re-land: the feature as one commit",
+                  "1700000800 +0000")
+    _dated_commit(repo, {"a": "1\n2\nFIRST later\n4\n5\nSECOND later\n7\n8\n"}, "later work", "1700000900 +0000")
+    assert worktree.delivered(repo, head, "settled-squash") is False, "a settled squash needs a record"
+
+
+def test_local_only_clears_a_branch_recorded_as_superseded_by_a_commit_on_the_push_branch(env, monkeypatch, capsys):
+    """A re-land after a push conflict puts a task's work on the push branch as one new commit with
+    another patch and subject: the check flags it until a task records the commit that carries it.
+    The record needs that commit on the push branch, covers the branch head it was made at, and also
+    answers `landed:#<id>`."""
+    from ttp import cli, landed
+    from ttp import daemon as dm
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _commit(path, "more.txt", "a\nb\n")
+    _commit(path, "more.txt", "a\nb\nc\n")
+    mine = _git_out(path, "rev-parse", "HEAD")
+    (other / "more.txt").write_text("a\nb, settled\nc\n")
+    _git_out(other, "add", "more.txt")
+    _git_out(other, "commit", "-qm", "re-land of the more work after a push conflict")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    d = _local_only_daemon(p)
+    _check_local_only(d)
+    assert [e["task"] for e in _local_only_events(p)] == [tid]
+    assert f"ttp task {p.name} superseded {tid} <sha>" in _local_only_events(p)[0]["text"]
+    assert landed.check(p, repo, tid=tid)[0] == 1
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    assert ttp_task("superseded", str(tid), mine) not in (0, None), "the branch's own head is not on the push branch"
+    assert ttp_task("superseded", str(tid)) not in (0, None)
+    assert p.db.q("SELECT * FROM task_superseded") == []
+    assert ttp_task("superseded", str(tid), relanded[:12]) == 0
+    assert f"recorded as superseded by {relanded[:10]}" in capsys.readouterr().out
+    assert landed.superseded(p.db, [tid]) == {tid: [(mine, relanded)]}
+    assert landed.check(p, repo, tid=tid)[0] == 0
+    d._local_only_due = 0
+    _check_local_only(d)
+    assert p.db.kv(dm.KV_LOCAL_ONLY) is None
+    _commit(path, "after.txt", "new work after the record\n")
+    d._local_only_due = 0
+    _check_local_only(d)
+    assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "work past the recorded head is flagged again"
+
+
 def _done_code_task_on(p, branch):
     tid = p.db.add_task("example work", "s", kind="code", tier="light", origin="user")
     p.db.update_task(tid, status="done", branch=branch)
@@ -13512,7 +13599,7 @@ def test_local_only_check_runs_off_the_tick_and_a_later_tick_applies_it(env, mon
     d = _local_only_daemon(p)
     go, calls, on_tick = threading.Event(), [], []
 
-    def slow(repo, branches, targets=(), known=frozenset(), timeout_s=0, pushed=frozenset()):
+    def slow(repo, branches, targets=(), known=frozenset(), timeout_s=0, pushed=frozenset(), superseded=None):
         calls.append(branches)
         on_tick.append(threading.current_thread() is threading.main_thread())
         go.wait(10)

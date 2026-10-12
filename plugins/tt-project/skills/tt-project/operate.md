@@ -27,6 +27,7 @@
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks: to defer a new task, give `--start-when` to `add` instead |
+| `ttp task <name> superseded <id> <sha>` | record that done task <id>'s work landed on the push branch as commit <sha> (re-landed after a push conflict), so the local-only check and `landed:#<id>` count it. Refused unless <sha> is on the push branch; covers the branch head at the time |
 | `ttp landed <sha>` / `ttp landed --task <id>` | probe: exit 0 once the commit, or the task's landing, is on the push branch, also after a rebase gave it a new sha (same patch-id, or same author, date and subject); 1 not yet. `start_when` `landed:#<id>` runs it |
 | `ttp doctor <name>` / `ttp doctor --scheduler` | providers, accounts, Jev, notifications, web / the installed runtime's command-watcher lifecycle (reports at exit 1, an `"error": true` line repaired and reopening, a clean run closing all) in a scratch project, each tick in a fresh process: no model, $0, exit 1 on a failed step; run it after an upgrade instead of the repository's tests, which are not installed |
 | `ttp alerts <name> --after N` | alerts since a message id |
@@ -107,7 +108,11 @@
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
   last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
   remote: a remote-tracking branch contains its head, or its changes are already on the delivery
-  branch or the remote's default branch (rebased, cherry-picked, amended or batched by a reviewer).
+  branch or the remote's default branch (rebased, cherry-picked, amended or batched by a reviewer:
+  the same patch-id, the same author, date and subject, never a subject alone, or the whole change
+  as one commit), or a task recorded the commit that carries it after a re-land with
+  `ttp task <project> superseded <id> <sha>` (refused unless that commit is on the push branch;
+  work committed on the branch after the record is flagged again).
   Tasks an unfinished task still needs (a queued review or fix), tasks a done review names, and work
   done before the check first ran are left alone. Otherwise one coordinator event says so, and
   status and the web app count it until the work reaches a remote, the task is cancelled or it is
