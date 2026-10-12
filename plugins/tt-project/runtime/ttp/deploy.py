@@ -12,7 +12,9 @@ import time
 from . import overview, project, timefmt
 
 CHECKS = "deploy_checks"
+ALERTED = "deploy_alerted"   # the last deploy alert record() sent: pushq sends no after_push alert of its own
 GRACE_S = 300
+RESTART_WAIT_S = 900         # default delivery.deploy_restart_wait_s
 PROBE_S = 60
 HISTORY = 20
 
@@ -21,19 +23,38 @@ def condition_key(name: str, version: str) -> str:
     return f"deploy:{name}:{version}"
 
 
+def release_key(version: str) -> str:
+    """The one alert of a release's deploy, listing every project still behind."""
+    return f"deploy:{version}"
+
+
+def restart_wait(p) -> float:
+    """delivery.deploy_restart_wait_s of the reporting project: how long a daemon may take to restart onto
+    files already at the release before that counts as failed."""
+    try:
+        return float(project.push_queue_number("deploy_restart_wait_s",
+                                               (p.config().get("delivery") or {}).get("deploy_restart_wait_s",
+                                                                                      RESTART_WAIT_S)))
+    except (ValueError, AttributeError, TypeError):
+        return RESTART_WAIT_S
+
+
 def _probe(rec: dict, now: float) -> dict:
     return overview.deploy_status(rec["name"], rec["entry"], rec["target"], rec.get("commit"), now,
                                   project.hostname(), allow_newer=True)
 
 
 def _owned(row: dict) -> bool:
-    return bool(row.get("merge_pending") and row.get("merge_owner"))
+    """A step with a known owner: a merge held by a harness task, or a live daemon that restarts onto the
+    new files (or completes its first tick on them) by itself."""
+    return bool((row.get("merge_pending") and row.get("merge_owner")) or row.get("settling"))
 
 
 def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]:
     """(outcome, kind, reason) of one probe: done; pending (an accepted owned merge before its deadline);
-    or failed, kind "fault" (a daemon that is down outside an upgrade, or a current upgrade error: at once,
-    whatever the deadline), "missed" (an accepted merge past its deadline) or "unowned" (never accepted).
+    or failed, kind "down" (a daemon that is down outside an upgrade) or "fault" (a current upgrade error):
+    at once, whatever the deadline; "missed" (an accepted step past its deadline: a merge's takeover plus
+    GRACE_S, a pending restart's bounded wait) or "unowned" (never accepted).
     Shared by record, tick and holds, so the alert clears exactly when its condition does. Times are
     shown in the zone of `where` (the reporting project)."""
     if row["state"] == overview.OK:
@@ -42,36 +63,51 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
     if row.get("upgrade_error"):
         return "failed", "fault", f"{row['upgrade_error']}; {reason}"
     if not row.get("daemon_alive") and not row.get("upgrading"):
-        return "failed", "fault", f"daemon {row.get('daemon_state') or 'unverified'}; {reason}"
+        return "failed", "down", f"daemon {row.get('daemon_state') or 'unverified'}; {reason}"
     takeover = rec.get("takeover_at")
     if (_owned(row) and takeover) or rec.get("accepted"):
         # Accepted once, later steps of the same merge (files landed, a restart) wait for the same deadline.
         if now < rec["due"]:
             return "pending", "", reason
         at = timefmt.long(takeover, where) if takeover else "unknown"
-        return "failed", "missed", f"missed takeover {at} (owner {rec.get('owner') or 'unknown'}); {reason}"
+        what = "still behind at its re-check" if rec.get("restart") else "missed takeover"
+        return "failed", "missed", f"{what} {at} (owner {rec.get('owner') or 'unknown'}); {reason}"
     if row.get("merge_owner") and not takeover:
         reason += "; no known takeover time"
     return "failed", "unowned", reason
 
 
 def holds(db, arg: str, now: float) -> bool:
-    rec = (db.kv(CHECKS) or {}).get("deploy:" + arg)
-    return bool(rec and not rec.get("closed") and assess(rec, _probe(rec, now), now)[0] == "failed")
+    """The alert `deploy:<arg>` holds: for a release (`deploy:<version>`) while any project's check of it
+    still fails; `deploy:<name>:<version>` (one project, as alerts before releases had one) while that does."""
+    checks = db.kv(CHECKS) or {}
+    recs = [checks.get("deploy:" + arg)] if ":" in arg else [r for r in checks.values() if r.get("target") == arg]
+    return any(rec and not rec.get("closed") and assess(rec, _probe(rec, now), now)[0] == "failed" for rec in recs)
 
 
-def _alert(p, key: str, rec: dict, kind: str, reason: str, now: float, alert=None) -> None:
-    """At most one alert per condition: deduplicated by the stored kind, which a resolved condition
-    resets (`_settle`); the history of what was sent is kept."""
+def _mark(rec: dict, kind: str, now: float) -> bool:
+    """Whether this failure is new news (deduplicated by the stored kind, which a resolved condition
+    resets in `_settle`); records it and its history if so."""
     if rec.get("alerted") and rec.get("alerted_kind") == kind:
-        return
-    text = f"Deploy failed: {rec['name']} is not running tt-project {rec['target']}: {reason}."
-    if alert:
-        alert(key, text, severity="normal")
-    elif not p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
-        p.db.post("out", text, kind="alert", severity="normal", ref=key)
+        return False
     rec.update(alerted=now, alerted_kind=kind)
     rec["history"] = (rec.get("history") or [])[-(HISTORY - 1):] + [{"at": now, "kind": kind, "commit": rec.get("commit")}]
+    return True
+
+
+def _alert(p, target: str, failed: list[tuple[dict, str, str]], alert=None) -> str:
+    """One alert for a release's deploy, listing every project still behind (`failed`: (rec, kind, reason)).
+    High only when a daemon is down; normal otherwise. Returns its key."""
+    key = release_key(target)
+    sev = "high" if any(kind == "down" for _, kind, _ in failed) else "normal"
+    names = ", ".join(rec["name"] for rec, _, _ in failed)
+    text = (f"Deploy failed: {names} {'is' if len(failed) == 1 else 'are'} not running tt-project {target}: "
+            + "; ".join(f"{rec['name']}: {reason}" for rec, _, reason in failed) + ".")
+    if alert:
+        alert(key, text, severity=sev, every_s=0)
+    elif not p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
+        p.db.post("out", text, kind="alert", severity=sev, ref=key)
+    return key
 
 
 def _settle(rec: dict, outcome: str, now: float) -> None:
@@ -95,19 +131,24 @@ def record(p, report: dict, now: float | None = None) -> dict:
     """
     now = time.time() if now is None else now
     registry = project.load_registry().get("projects") or {}
-    pending, rows = [], []
+    wait = restart_wait(p)
+    pending, rows, failed = [], [], []
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
         for row in report["projects"]:
             row = dict(row)
             key = condition_key(row["name"], report["target"])
             old = checks.get(key) or {}
+            owner = row.get("owner") if row.get("settling") else row.get("merge_owner")
             same = (old and not old.get("closed") and old.get("commit") == report.get("commit")
-                    and (not row.get("merge_owner") or old.get("owner") in (None, row.get("merge_owner"))))
+                    and (not owner or old.get("owner") in (None, owner)))
             rec = dict(old) if same else {k: old[k] for k in ("history",) if k in old}
             rec.update(name=row["name"], target=report["target"], commit=report.get("commit"),
                        entry=registry.get(row["name"]) or {})
-            if not rec.get("takeover_at"):
+            if not rec.get("takeover_at") and row.get("settling"):
+                # Its daemon restarts onto the files (or ticks on them) by itself: re-checked after the wait.
+                rec.update(owner=owner, takeover_at=now + wait, due=now + wait, restart=True)
+            elif not rec.get("takeover_at"):
                 rec.update(owner=row.get("merge_owner"), takeover_at=row.get("takeover_at"))
                 rec["due"] = rec["takeover_at"] + GRACE_S if rec["takeover_at"] else now
             outcome, kind, reason = assess(rec, row, now, p)
@@ -119,18 +160,23 @@ def record(p, report: dict, now: float | None = None) -> dict:
             _settle(rec, outcome, now)
             if outcome == "failed":
                 rec.pop("closed", None)
-                # Persist before posting: condition readers can immediately verify the alert.
-                checks[key] = rec
-                p.db.set_kv(CHECKS, checks)
-                _alert(p, key, rec, kind, reason, now)
+                failed.append((rec, kind, reason, _mark(rec, kind, now)))
             elif outcome == "pending" and not was_pending:
-                pending.append(f"{row['name']}: owner {rec['owner']}, takeover {timefmt.long(rec['takeover_at'], p)}")
+                at = timefmt.long(rec["takeover_at"], p)
+                pending.append(f"{row['name']}: restart onto the new files pending, owner {rec['owner']}, "
+                               f"re-checked {at}" if rec.get("restart") else
+                               f"{row['name']}: owner {rec['owner']}, takeover {at}")
             checks[key] = rec
             rows.append(row)
-        p.db.set_kv(CHECKS, checks)
+        p.db.set_kv(CHECKS, checks)   # before the alert: condition readers can verify it at once
+        if failed:   # already alerted (still open), or alerted now: after_push's failure is this alert
+            key = _alert(p, report["target"], [f[:3] for f in failed]) if any(new for *_, new in failed) \
+                else release_key(report["target"])
+            p.db.set_kv(ALERTED, {"key": key, "target": report["target"], "commit": report.get("commit"), "at": now})
         if pending:
             p.db.post("out", f"tt-project {report['target']} deploy pending: " + "; ".join(pending)
-                      + ". Follow-up checks run after takeover with a 5 min grace.", kind="info", severity="low")
+                      + ". Follow-up checks run after takeover with a 5 min grace, and after a pending "
+                        "restart's wait.", kind="info", severity="low")
     failed = any(r["outcome"] == "failed" for r in rows) or (not rows and report["rc"] != 0)
     return {**report, "projects": rows, "rc": int(failed)}
 
@@ -139,11 +185,13 @@ def tick(p, alert, now: float | None = None) -> None:
     """Called even while paused, once a minute per check. Close caught-up projects quietly; alert a
     daemon that stops or fails to come up, or a current upgrade error, at the next probe; alert a merge
     that missed its takeover only after its deadline. A resolved condition resets its deduplication,
-    and its alert clears through holds."""
+    and its alert clears through holds. One alert per release a probe finds newly failing, listing every
+    project of that release still behind."""
     now = time.time() if now is None else now
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
         changed = False
+        failing: dict[str, list] = {}
         for key, rec in checks.items():
             if rec.get("closed") or now < float(rec.get("next_probe") or 0):
                 continue
@@ -152,6 +200,9 @@ def tick(p, alert, now: float | None = None) -> None:
             outcome, kind, reason = assess(rec, _probe(rec, now), now, p)
             _settle(rec, outcome, now)
             if outcome == "failed":
-                _alert(p, key, rec, kind, reason, now, alert)
+                failing.setdefault(rec["target"], []).append((rec, kind, reason, _mark(rec, kind, now)))
         if changed:
             p.db.set_kv(CHECKS, checks)
+        for target, failed in failing.items():
+            if any(new for *_, new in failed):
+                _alert(p, target, [f[:3] for f in failed], alert)

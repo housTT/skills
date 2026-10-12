@@ -49314,7 +49314,7 @@ def test_after_push_deploy_pending_without_owner_or_takeover_fails(env, tmp_path
     result = deploy.record(p, report)
     assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
     alert = p.db.one("SELECT * FROM messages WHERE kind='alert'")
-    assert alert['severity'] == 'normal' and alert['ref'] == 'deploy:alpha:0.5.0'
+    assert alert['severity'] == 'normal' and alert['ref'] == 'deploy:0.5.0'
     assert _tree(base) == before, 'verification never writes another project'
 
 
@@ -49328,7 +49328,7 @@ def test_after_push_deploy_daemon_not_coming_up_fails(env, tmp_path, files):
     db.set_kv('daemon', {'pid': 0, 'host': 'testhost'})
     result = deploy.record(p, overview.deployed(names=['alpha']))
     assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
-    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:alpha:0.5.0'
+    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:0.5.0'
 
 
 @pytest.mark.parametrize('caught_up', [False, '0.5.0', '0.5.1'])
@@ -49345,7 +49345,7 @@ def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
     assert deploy.record(p, report, now)['rc'] == 0
     due = now + 1 + deploy.GRACE_S
     pages = []
-    def page(key, text, severity):
+    def page(key, text, severity, **_):
         pages.append((key, text, severity))
         p.db.post('out', text, kind='alert', ref=key, severity=severity)
     deploy.tick(p, page, due - 1)
@@ -49362,7 +49362,7 @@ def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
     if caught_up:
         assert rec['closed'] and not pages
     else:
-        assert len(pages) == 1 and pages[0][0] == 'deploy:alpha:0.5.0' and pages[0][2] == 'normal'
+        assert len(pages) == 1 and pages[0][0] == 'deploy:0.5.0' and pages[0][2] == 'normal'
         assert 'missed takeover' in pages[0][1] and 'PDT' in pages[0][1]
         assert alerts.holds(p.db, pages[0][0], now, due)
         hb = base / 'state' / 'heartbeat'
@@ -49370,7 +49370,7 @@ def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
         data['receipt']['version'] = '0.5.0'
         hb.write_text(json.dumps(data))
         os.utime(base / 'state' / 'tick_done', (due, due))
-        assert [e['key'] for e in alerts.sweep(p.db, now=due)] == ['deploy:alpha:0.5.0']
+        assert [e['key'] for e in alerts.sweep(p.db, now=due)] == ['deploy:0.5.0']
         assert not alerts.active(p.db, pages[0][0], now, due)
 
 
@@ -49388,14 +49388,129 @@ def test_after_push_deploy_unknown_upgrade_error_fails(env, tmp_path, held):
     assert 'runtime import failed' in p.db.one("SELECT text FROM messages WHERE kind='alert'")['text']
 
 
-def test_after_push_deploy_old_daemon_after_files_applied_fails(env, tmp_path):
-    from ttp import deploy, overview, release
+@pytest.mark.parametrize('caught_up', [True, False])
+@pytest.mark.parametrize('merge_task', [False, True])
+def test_after_push_deploy_restart_pending_is_owned_and_rechecked_after_its_wait(env, tmp_path, caught_up, merge_task):
+    """Files at the release, daemon still on the old one: its own daemon restarts onto them, so it is
+    pending (one low note) until delivery.deploy_restart_wait_s, then alerts once if still behind."""
+    from ttp import alerts, deploy, overview, release
     p = make(env)
+    p.set_config('home_timezone', 'America/Los_Angeles')
+    p.set_config('delivery.deploy_restart_wait_s', 600)
     _deploy_lib('0.5.0')
-    _, db = _deploy_project(tmp_path, 'alpha', '0.5.0', running='0.4.9')
-    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
-    result = deploy.record(p, overview.deployed(names=['alpha']))
-    assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
+    base, db = _deploy_project(tmp_path, 'alpha', '0.5.0', running='0.4.9')
+    if merge_task:   # a harness task still open from the merge: the restart is still the daemon's step
+        db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    now = time.time()
+    result = deploy.record(p, overview.deployed(names=['alpha']), now)
+    assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending'
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    assert rec['owner'] == "this project's daemon" and rec['due'] == now + 600
+    notes = p.db.q("SELECT severity,text FROM messages WHERE direction='out'")
+    assert [n['severity'] for n in notes] == ['low'] and 'alpha: restart onto the new files pending' in notes[0]['text']
+    assert not p.db.q('SELECT * FROM alerts')
+    pages, page = _deploy_pager(p)
+    deploy.tick(p, page, now + 599)
+    assert not pages
+    if caught_up:
+        hb = base / 'state' / 'heartbeat'
+        data = json.loads(hb.read_text())
+        data['receipt']['version'] = '0.5.0'
+        hb.write_text(json.dumps(data))
+        os.utime(base / 'state' / 'tick_done', (now + 590, now + 590))
+    for t in (now + 601, now + 601 + deploy.PROBE_S, now + 601 + deploy.PROBE_S * 2):
+        deploy.tick(p, page, t)
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    if caught_up:
+        assert rec['closed'] and not pages
+    else:
+        assert len(pages) == 1 and pages[0][0] == 'deploy:0.5.0' and pages[0][2] == 'normal'
+        assert 'still behind at its re-check' in pages[0][1] and 'PDT' in pages[0][1]
+        assert alerts.holds(p.db, 'deploy:0.5.0', now, now + 700)
+
+
+def _deploy_release_with_every_pending_state(tmp_path):
+    """A release whose lagging projects are each pending with a known owner: two merges held by harness
+    tasks, one held while that project pushes (a harness task too), one daemon restart pending."""
+    from ttp import release
+    _deploy_lib('0.5.0')
+    dbs = {'self': _deploy_project(tmp_path, 'self', '0.5.0')[1]}   # the reporting project, upgraded
+    for name in ('alpha', 'gamma', 'delta'):
+        _, dbs[name] = _deploy_project(tmp_path, name, '0.4.9')
+        dbs[name].add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    _, dbs['beta'] = _deploy_project(tmp_path, 'beta', '0.5.0', running='0.4.9')   # restart pending
+    return dbs
+
+
+def test_after_push_with_every_lagging_project_owned_pending_exits_0_with_one_low_note(env, tmp_path, monkeypatch, capsys):
+    """Replays a deploy where every project behind is pending with an owner (merges held by harness
+    tasks, a restart pending): `ttp deployed --after-push` exits 0, one low note, no alert, no page."""
+    from ttp import pushq
+    from ttp.cli import main
+    p = make(env)
+    names = list(_deploy_release_with_every_pending_state(tmp_path))
+    monkeypatch.setenv('TTP_PROJECT', str(p.base))
+    started = time.time()
+    with pytest.raises(SystemExit) as e:
+        main(['deployed', '0.5.0', '--commit', DEPLOY_C, '--projects', ','.join(names), '--after-push', '--json'])
+    data = json.loads(capsys.readouterr().out)
+    assert e.value.code == 0
+    assert {r['name']: r['outcome'] for r in data['projects']} == {
+        'self': 'done', 'alpha': 'pending', 'beta': 'pending', 'gamma': 'pending', 'delta': 'pending'}
+    out = p.db.q("SELECT kind,severity,text FROM messages WHERE direction='out'")
+    assert [(m['kind'], m['severity']) for m in out] == [('info', 'low')]
+    assert all(n in out[0]['text'] for n in ('alpha', 'beta', 'gamma', 'delta'))
+    assert not p.db.q('SELECT * FROM alerts')
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
+           ('batch-test', 'marker', 'origin/topic', started))
+    pages = []
+    pushq._after(p, {'id': 'batch-test'}, {'pushed_sha': DEPLOY_C, 'version': '0.5.0', 'after_push': {
+        'exit': e.value.code, 'started': started, 'ended': time.time()}}, 'ok', lambda *a, **k: pages.append(a), time.time())
+    assert not pages
+
+
+@pytest.mark.parametrize('down', [['beta'], ['alpha', 'beta']])
+def test_after_push_deploy_real_failure_sends_exactly_one_alert(env, tmp_path, monkeypatch, capsys, down):
+    """A daemon that is down still fails the deploy, but the release's deploy sends one alert (high,
+    naming every project behind), and the push queue sends no after_push alert of its own."""
+    from ttp import deploy, pushq
+    from ttp.cli import main
+    p = make(env)
+    dbs = _deploy_release_with_every_pending_state(tmp_path)
+    names = list(dbs)
+    for name in down:
+        dbs[name].set_kv('daemon', {'pid': 0, 'host': 'testhost'})
+    monkeypatch.setenv('TTP_PROJECT', str(p.base))
+    started = time.time() - 60
+    with pytest.raises(SystemExit) as e:
+        main(['deployed', '0.5.0', '--commit', DEPLOY_C, '--projects', ','.join(names), '--after-push', '--json'])
+    capsys.readouterr()
+    assert e.value.code == 1
+    alerts_out = p.db.q("SELECT severity,ref,text FROM messages WHERE kind='alert'")
+    assert len(alerts_out) == 1 and alerts_out[0]['severity'] == 'high' and alerts_out[0]['ref'] == 'deploy:0.5.0'
+    assert all(n in alerts_out[0]['text'] for n in down)
+    assert [a['key'] for a in p.db.q('SELECT key FROM alerts')] == ['deploy:0.5.0']
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
+           ('batch-test', 'marker', 'origin/topic', started))
+    pages = []
+    pushq._after(p, {'id': 'batch-test'}, {'pushed_sha': DEPLOY_C, 'version': '0.5.0', 'after_push': {
+        'exit': 1, 'started': started, 'ended': time.time()}}, 'failed', lambda *a, **k: pages.append(a), time.time())
+    assert not pages, 'one deploy outcome, one alert'
+    assert p.db.one("SELECT id FROM events WHERE kind='after_push_failed'"), 'the coordinator still hears of it'
+    pages = []
+    deploy.tick(p, lambda *a, **k: pages.append(a), time.time() + deploy.PROBE_S)
+    assert not pages, 'the probe after it does not repeat the alert'
+    # An after_push failing for another reason (no deploy alert for that commit) still pages.
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
+           ('batch-other', 'marker', 'origin/topic', started))
+    pushq._after(p, {'id': 'batch-other'}, {'pushed_sha': '1234567890abcdef', 'after_push': {
+        'exit': 1, 'started': started, 'ended': time.time()}}, 'failed', lambda *a, **k: pages.append(a), time.time())
+    assert [a[0] for a in pages] == ['after_push_failed']
+
+
+def test_deploy_alerted_key_is_shared_by_deploy_and_the_push_queue():
+    from ttp import deploy, pushq
+    assert pushq.DEPLOY_ALERTED == deploy.ALERTED
 
 
 def test_after_push_deploy_deadline_is_not_extended_by_retries_or_restart(env, tmp_path):
@@ -49456,7 +49571,7 @@ def test_after_push_deploy_followup_runs_while_reporting_project_paused(env, tmp
     p.db.set_kv('paused', True)
     daemon = Daemon(p.base)
     daemon.tend_pushes()
-    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:alpha:0.5.0'
+    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:0.5.0'
 
 
 def _deploy_catch_up(base, db, version, commit, now):
@@ -49478,7 +49593,7 @@ def _deploy_pager(p, pages=None):
     """A daemon.alert stand-in posting through `p` (the project whose tick holds the transaction)."""
     pages = [] if pages is None else pages
 
-    def page(key, text, severity):
+    def page(key, text, severity, **_):
         pages.append((key, text, severity))
         p.db.post('out', text, kind='alert', ref=key, severity=severity)
     return pages, page
@@ -49507,21 +49622,21 @@ def test_after_push_deploy_fault_while_pending_alerts_at_next_probe(env, tmp_pat
     p = Project(p.base)                          # the reporting daemon restarted meanwhile
     pages, page = _deploy_pager(p, pages)
     deploy.tick(p, page, t)
-    assert t < due and len(pages) == 1 and pages[0][0] == 'deploy:alpha:0.5.0'
+    assert t < due and len(pages) == 1 and pages[0][0] == 'deploy:0.5.0'
     assert ('daemon stopped' if fault == 'stopped' else 'runtime import failed') in pages[0][1]
     p = Project(p.base)
     pages, page = _deploy_pager(p, pages)
     for i in (2, 3):
         deploy.tick(p, page, now + 1 + deploy.PROBE_S * i)
     assert len(pages) == 1, 'one alert per condition, also across restarts'
-    assert alerts.holds(p.db, 'deploy:alpha:0.5.0', now, t)
+    assert alerts.holds(p.db, 'deploy:0.5.0', now, t)
     if fault == 'stopped':
         db.set_kv('daemon', {'pid': os.getpid(), 'host': 'testhost'})
     else:
         db.set_kv(release.KV_AUTO, {})
     t = now + 1 + deploy.PROBE_S * 4
     deploy.tick(p, page, t)
-    assert [e['key'] for e in alerts.sweep(p.db, now=t)] == ['deploy:alpha:0.5.0']
+    assert [e['key'] for e in alerts.sweep(p.db, now=t)] == ['deploy:0.5.0']
     rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
     assert rec['due'] == due and rec['outcome'] == 'pending' and len(rec['history']) == 1
     deploy.tick(p, page, due + 1)
@@ -49612,7 +49727,7 @@ def test_after_push_deploy_recovered_daemon_returns_to_owned_pending(env, tmp_pa
         result = deploy.record(again, overview.deployed(names=['alpha']), t)
         assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending'
     assert len(p.db.q("SELECT * FROM messages WHERE kind='alert'")) == 1
-    assert [e['key'] for e in alerts.sweep(p.db, now=now + 120)] == ['deploy:alpha:0.5.0']
+    assert [e['key'] for e in alerts.sweep(p.db, now=now + 120)] == ['deploy:0.5.0']
     rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
     assert rec['due'] == due and len(rec['history']) == 1 and not rec.get('alerted')
     pages, page = _deploy_pager(again)

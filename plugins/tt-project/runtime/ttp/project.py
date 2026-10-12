@@ -280,10 +280,11 @@ EXTRA_KEYS = {
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
     # mirror_remotes: {remote, branch} tables each push also sends the pushed commit to, fast-forward only.
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
+    # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push"},
+                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s"},
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -353,11 +354,11 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # but not before push_min_gap_s passed since the last batch ended unless it is full or priority 1)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "push_min_gap_s": 1800,
-                       "after_push_timeout_s": 1800}
+                       "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
                       "push_min_gap_s": (0, True, False),
-                      "after_push_timeout_s": (0, False, False)}
+                      "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
 
 
 def push_queue_number(key: str, v: Any) -> float | int:

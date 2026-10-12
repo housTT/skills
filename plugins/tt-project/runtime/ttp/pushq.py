@@ -37,6 +37,7 @@ BAD_TIP_ALERT = "push_tip_failing"   # the keyed alert while the push branch tip
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
+DEPLOY_ALERTED = "deploy_alerted"   # deploy.ALERTED: the last deploy alert, by commit
 MAX_RESUMES = 1                 # respawns of an after_push that died (a reboot killed the deploy)
 RECOVER_S = 1800                # a batch that died mid-push: how long its remote may stay unreadable
 RECOVER_GAP_S = 120             # ... asked at most this often meanwhile
@@ -1132,9 +1133,20 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
                 how += f" in `{ap['cmd']}`"
             text = f"after_push of {what} (batch {b['id']}) {how}. The reviews stay done.\n{tail}"
             _event(db, None, "after_push_failed", text, queued=True, severity="high")
+    if status == "failed" and _deploy_alerted(p, m, ap):
+        return   # its deploy verdict already sent the one alert, naming each project behind
     if status in ("failed", "timeout", "killed"):
         alert("after_push_failed", f"after_push of {what} (batch {b['id']}) {how}. Log: {m.get('log') or '?'}",
               severity="high")
+
+
+def _deploy_alerted(p: Project, m: dict, ap: dict) -> bool:
+    """A failed after_push whose deploy verdict (`ttp deployed --after-push`, deploy.record) already alerted
+    for this commit: one deploy outcome sends one alert, so the push queue sends none of its own."""
+    rec = p.db.kv(DEPLOY_ALERTED) or {}
+    a, b = str(rec.get("commit") or ""), str(m.get("pushed_sha") or "")
+    return (len(min(a, b, key=len)) >= 7 and (a.startswith(b) or b.startswith(a))
+            and float(rec.get("at") or 0) >= float(ap.get("started") or 0))
 
 
 def _after_push_set(p: Project, cfg: dict | None) -> bool:
@@ -1223,7 +1235,8 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
                 how += f" in `{ap['cmd']}`"
             text = f"after_push of {what} {how}. The push stands. Receipt: {receipt}"
             _event(p.db, None, "after_push_failed", f"{text}\n{_tail_of(m, ap)}", queued=True, severity="high")
-            alert("after_push_failed", text, severity="high")
+            if not (status == "failed" and _deploy_alerted(p, m, ap)):
+                alert("after_push_failed", text, severity="high")
         m["reported"] = now
         write_json(receipt, m)
         done.append(rid)

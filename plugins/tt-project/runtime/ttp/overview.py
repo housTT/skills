@@ -369,6 +369,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             if not at_target:
                 reason, owner, resumes = _behind(name, db, state, files, now, where)
                 return done(PENDING, f"{reason}; daemon runs {running}", owner, resumes)
+            row["settling"] = True   # its own daemon finishes it: deploy.assess gives it a bounded deadline
             return done(PENDING, f"files at {files}, daemon still runs {running}: restart pending",
                         "this project's daemon", "when it restarts onto the new files")
         tick = identity.tick_done(state, r)
@@ -379,6 +380,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         except ValueError:
             installed_at = 0.0
         row["tick_done"] = tick
+        row["settling"] = not tick or tick < installed_at
         if not tick:
             return done(PENDING, f"daemon runs {target} but has not completed a tick yet", "this project's daemon",
                         "at its first completed tick")
