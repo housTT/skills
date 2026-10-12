@@ -17,6 +17,11 @@ Each request carries an id, which <name>.queued names too. The queue folder's .l
 publishing a request (enqueue), settling one (_settle) and telling whether one is pending (pending):
 a newer request that arrives while the daemon starts an older one is never deleted with it, and a
 marker whose request is gone (a crash between the two writes) is cleared instead of hiding the result.
+
+A job gets a temp dir of its own (scratch), with TMPDIR, TMP and TEMP pointing at it: the run's own
+tmp dir, which a fenced run's environment names, goes when that run ends, while the job still runs
+(a compiler then loses its scratch partway through). The wrapper removes it when the job ends; tend
+sweeps those of jobs gone without doing so (killed, or the host restarted).
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -35,13 +41,15 @@ from . import locks
 from .project import Project, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
+SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
 _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
-WRAPPER = ('o="$1" r="$2" s="$3"; shift 3; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
-           'echo $c >"$r.tmp"; mv "$r.tmp" "$r"')
+WRAPPER = ('o="$1" r="$2" s="$3" t="$4"; shift 4; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
+           'rm -rf "$t"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"')
+_TMP_VARS = ("TMPDIR", "TMP", "TEMP")
 
 
 def started(rc: Path) -> Path:
@@ -56,11 +64,25 @@ def lost(rc: Path) -> Path:
     return Path(rc).with_suffix(".lost")
 
 
+def scratch(rc: Path) -> Path:
+    """The job's own temp dir, under the project's state for a job of a run (keyed by run and job
+    name, so tend can tell whose it is), else next to its .rc."""
+    rc = Path(rc)
+    if rc.parent.parent.name == "runs":
+        return rc.parent.parent.parent / SCRATCH / f"{rc.parent.name}-{rc.stem}"
+    return rc.with_suffix(".tmp")
+
+
 def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
     """Start the job's wrapper in a session of its own, holding `lock` (its job lock, which the
-    caller took and closes after). Returns its pid."""
-    proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), *cmd],
-                            cwd=cwd, env={**env, "TTP_DETACHED": "1"}, stdin=subprocess.DEVNULL,
+    caller took and closes after), with a fresh temp dir of its own. Returns its pid."""
+    tmp = scratch(rc)
+    if tmp.exists() and not tmp.is_symlink():   # left by an earlier start of it that never ran
+        shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(mode=0o700, parents=True)
+    env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_DETACHED": "1"}
+    proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp), *cmd],
+                            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                             pass_fds=(lock.fileno(),))
     return proc.pid
@@ -178,6 +200,7 @@ def tend(p: Project) -> None:
     # The inherited lifetime lock protects live checks across daemon restarts and pid namespaces.
     from . import checkdirs
     checkdirs.recover(p.state, p.runs)
+    sweep(p.state)
     folder = p.state / QUEUE
     for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
@@ -222,6 +245,19 @@ def tend(p: Project) -> None:
                 finally:
                     lock.close()
         _settle(q, rc, rid, why)
+
+
+def sweep(state: Path) -> None:
+    """Remove the temp dirs of jobs that ended or are gone: the wrapper removes its own when the job
+    ends, but not when it is killed or the host restarts. A job that still runs holds its lock."""
+    folder = Path(state) / SCRATCH
+    for d in sorted(folder.iterdir()) if folder.is_dir() else []:
+        m = re.fullmatch(r"([0-9]+)-([A-Za-z0-9._-]{1,64})", d.name)
+        if not m or d.is_symlink() or not d.is_dir():
+            continue
+        rc = Path(state) / "runs" / m[1] / f"{m[2]}.rc"
+        if rc.exists() or lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _entry(rc: Path) -> dict:

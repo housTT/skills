@@ -38833,6 +38833,56 @@ def test_detach_writes_rc_log_and_a_durable_registry(env):
     assert again.returncode != 0, "a name is used once per run"
 
 
+def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_when_the_job_ends(env, tmp_path):
+    """The reported failure: a fenced run's TMPDIR is its run's tmp dir, removed when the run ends,
+    while its detached build still runs (a compiler lost its scratch partway through). The job gets
+    a temp dir of its own under the project's state, kept until the job ends, then removed."""
+    from ttp import detach, runner
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    (run_dir / "tmp").mkdir(parents=True)
+    go, seen = tmp_path / "go", tmp_path / "seen"
+    script = (f'while [ ! -e {go} ]; do sleep 0.05; done; echo "$TMPDIR $TMP $TEMP" >{seen}; '
+              'echo scratch >"$TMPDIR/x.s" && cat "$TMPDIR/x.s"')
+    tmp_env = {var: str(run_dir / "tmp") for var in ("TMPDIR", "TMP", "TEMP")}
+    r = _ttp_run(p, "detach", "build", "--", "sh", "-c", script, env={"TTP_RUN_DIR": str(run_dir), **tmp_env})
+    assert r.returncode == 0, r.stderr
+    rc = run_dir / "build.rc"
+    own = detach.scratch(rc)
+    assert own.parent == p.state / detach.SCRATCH and own.is_dir()
+    runner.remove_tmp(run_dir, {"tmp_dir": str(run_dir / "tmp")})   # the run that started it ends
+    assert not (run_dir / "tmp").exists()
+    detach.tend(p)   # the sweep leaves a running job's dir alone
+    assert own.is_dir()
+    go.touch()
+    assert _wait_for_path(rc)
+    assert rc.read_text().strip() == "0", (run_dir / "build.log").read_text()
+    assert seen.read_text().split() == [str(own)] * 3
+    assert (run_dir / "build.log").read_text().strip() == "scratch"
+    assert not own.exists(), "removed once the job ended"
+
+
+def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could_remove_it(env):
+    from ttp import detach
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "long", "--", "sh", "-c", 'touch "$TMPDIR/in"; sleep 60',
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    own = detach.scratch(run_dir / "long.rc")
+    assert _wait_for_path(own / "in")
+    stray = p.state / detach.SCRATCH / "not-a-job"
+    stray.mkdir()
+    detach.sweep(p.state)
+    assert own.is_dir() and stray.is_dir(), "a running job's dir, and what is not a job's, stay"
+    pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
+    os.killpg(pid, signal.SIGKILL)
+    assert _check_until_ended(p, run_dir / "long.rc").returncode == 0
+    detach.tend(p)
+    assert not own.exists() and stray.is_dir()
+
+
 def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     p = _device_project(env, device=False)
     run_dir = p.runs / "9"
