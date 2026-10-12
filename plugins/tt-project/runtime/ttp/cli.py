@@ -3252,7 +3252,8 @@ def cmd_upgrade(a) -> None:
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
         took = False
         if tid and not mine and a.apply is None and not a.auto and not own:
-            took = _take_over_finish(p, holder)     # a blocked or idle task cannot hold off a host-side upgrade
+            took = _take_over_finish(p, holder,     # a blocked or idle task cannot hold off a host-side upgrade
+                                     overdue=getattr(a, "take_over_from", None) == tid)
             if took:
                 holder, tid = None, None
         if tid and not mine and a.apply is None:    # the open task takes this release on: one merge, not two
@@ -3293,13 +3294,14 @@ def _own_run(p: Project) -> bool:
         return False
 
 
-def _take_over_finish(p: Project, holder: dict) -> bool:
+def _take_over_finish(p: Project, holder: dict, overdue: bool = False) -> bool:
     """An explicit host-side upgrade while finish task holder["task"] is blocked or idle past
-    release.STALE_S: fence that task (cancelled, superseded; its `--apply` refused from now on) so this
-    upgrade proceeds. True when it took the lock over."""
+    release.STALE_S, or (`overdue`: `--take-over-from` names it) past the takeover deadline a deploy gave
+    it: fence that task (cancelled, superseded; its `--apply` refused from now on) so this upgrade
+    proceeds. True when it took the lock over."""
     from . import release, sweep
     from .project import HOME_DIR
-    why = release.stale_holder(p.db, holder)
+    why = release.stale_holder(p.db, holder) or ("past its deploy takeover deadline" if overdue else "")
     src = HOME_DIR / "lib" / "current" / "runtime"
     if not why or not src.is_dir():
         return False
@@ -4538,6 +4540,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--apply", metavar="COMMIT",
                    help="an upgrade task's last step: fast-forward main to its checked merge and restart")
     s.add_argument("--project-dir", help=argparse.SUPPRESS)
+    s.add_argument("--take-over-from", metavar="TASK", type=int,
+                   help="host-side takeover: harness task TASK missed its takeover deadline, so this upgrade "
+                        "takes the template merge over from it even while it still shows activity")
     s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge a keyed alert")

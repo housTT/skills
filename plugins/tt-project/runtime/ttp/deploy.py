@@ -7,6 +7,11 @@ receipts, never changed by verification. Ordinary `ttp deployed` remains a stric
 """
 from __future__ import annotations
 
+import os
+import re
+import signal
+import subprocess
+import sys
 import time
 
 from . import overview, project, timefmt
@@ -17,6 +22,11 @@ GRACE_S = 300
 RESTART_WAIT_S = 900         # default delivery.deploy_restart_wait_s
 PROBE_S = 60
 HISTORY = 20
+TAKEOVERS = "deploy_takeovers"   # project name -> the host-side takeover attempts of its overdue merge
+TAKEOVER_TRIES = 3
+TAKEOVER_SETTLE_S = 300          # after an attempt ends, its daemon has this long to report the release
+TAKEOVER_TIMEOUT_S = 900         # an attempt running this long is over (stopped, when this daemon started it)
+_children: dict[str, subprocess.Popen] = {}   # this daemon's own attempts, by project name
 
 
 def condition_key(name: str, version: str) -> str:
@@ -81,8 +91,90 @@ def holds(db, arg: str, now: float) -> bool:
     """The alert `deploy:<arg>` holds: for a release (`deploy:<version>`) while any project's check of it
     still fails; `deploy:<name>:<version>` (one project, as alerts before releases had one) while that does."""
     checks = db.kv(CHECKS) or {}
+    takeovers = db.kv(TAKEOVERS) or {}
     recs = [checks.get("deploy:" + arg)] if ":" in arg else [r for r in checks.values() if r.get("target") == arg]
-    return any(rec and not rec.get("closed") and assess(rec, _probe(rec, now), now)[0] == "failed" for rec in recs)
+    return any(rec and not rec.get("closed") and _takeover(None, rec, *assess(rec, _probe(rec, now), now),
+                                                           dict(takeovers.get(rec["name"]) or {}), now)[0] == "failed"
+               for rec in recs)
+
+
+def _owner_task(rec: dict) -> int | None:
+    m = re.fullmatch(r"harness task #(\d+)", str(rec.get("owner") or ""))
+    return int(m[1]) if m else None
+
+
+def launch_takeover(p, name: str, task: int | None) -> subprocess.Popen:
+    """Start the installed release's host-side `ttp upgrade <name>`, taking the merge over from harness task
+    `task` (past its deadline), in a session of its own: a restart of this daemon leaves it running. Its
+    output goes to this project's logs/takeover.log."""
+    from .release import installed
+    ttp = installed() / "bin" / "ttp"
+    if not ttp.is_file():
+        raise FileNotFoundError(f"no installed release at {ttp}")
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PROJECT", "TTP_TASK", "TTP_RUN_DIR")}
+    argv = [sys.executable, str(ttp), "upgrade", name] + (["--take-over-from", str(task)] if task else [])
+    p.logs.mkdir(parents=True, exist_ok=True)
+    with open(p.logs / "takeover.log", "a") as log:
+        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {' '.join(argv[3:])}\n")
+        log.flush()
+        return subprocess.Popen(argv, cwd=str(p.base), env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _reap(name: str, t: dict, now: float) -> None:
+    """Record the end of `name`'s running attempt: its exit code when this daemon started it, else once its
+    process is gone (a restart or a reboot in between). An attempt past TAKEOVER_TIMEOUT_S is over."""
+    pid = int(t.get("pid") or 0)
+    if not pid:
+        return
+    child = _children.get(name)
+    late = now - float(t.get("started") or 0) > TAKEOVER_TIMEOUT_S
+    if child is not None and child.pid == pid:
+        rc = child.poll()
+        if rc is None and late:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            rc = "timed out"
+        if rc is None:
+            return
+        _children.pop(name, None)
+    else:
+        from .locks import _alive
+        if _alive(pid) and not late:
+            return
+        rc = "timed out" if late else "unknown (it ended while this daemon was down)"
+    t.update(pid=None, ended=now, rc=rc if isinstance(rc, str) else f"exit {rc}")
+
+
+def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: float,
+              start: bool = False) -> tuple[str, str, str]:
+    """A merge past its takeover deadline is taken over, not only reported: a host-side `ttp upgrade` runs
+    (`start`, by the daemon's tick; started from the first probe past the deadline, also after a restart or
+    a reboot), up to TAKEOVER_TRIES times, TAKEOVER_SETTLE_S apart. Meanwhile it is pending; it fails (and
+    pages) only once every try ended and the project's own daemon still does not report the release.
+    `t` is the project's attempt record, updated in place."""
+    if outcome != "failed" or kind != "missed" or rec.get("restart"):
+        return outcome, kind, reason
+    tries = int(t.get("tries") or 0)
+    if t.get("pid"):
+        return "pending", "", f"host-side takeover running (try {tries} of {TAKEOVER_TRIES}); {reason}"
+    if tries and now < float(t.get("ended") or 0) + TAKEOVER_SETTLE_S:
+        return "pending", "", f"host-side takeover ended ({t.get('rc')}); its daemon is checked again; {reason}"
+    if tries >= TAKEOVER_TRIES:
+        return "failed", kind, (f"{reason}; host-side takeover tried {tries} time{'s' if tries > 1 else ''}, "
+                                f"last {t.get('rc')} (see logs/takeover.log)")
+    if not start:
+        return "pending", "", f"host-side takeover due now; {reason}"
+    try:
+        child = launch_takeover(p, rec["name"], _owner_task(rec))
+    except OSError as e:
+        t.update(tries=TAKEOVER_TRIES, ended=None, rc=f"could not start ({e})")   # a new release tries again
+        return "failed", kind, f"{reason}; host-side takeover could not start: {e}"
+    _children[rec["name"]] = child
+    t.update(tries=tries + 1, pid=child.pid, started=now, ended=None, rc=None)
+    return "pending", "", f"host-side takeover started (try {tries + 1} of {TAKEOVER_TRIES}); {reason}"
 
 
 def _mark(rec: dict, kind: str, now: float) -> bool:
@@ -135,6 +227,7 @@ def record(p, report: dict, now: float | None = None) -> dict:
     pending, rows, failed = [], [], []
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
+        takeovers = p.db.kv(TAKEOVERS) or {}
         for row in report["projects"]:
             row = dict(row)
             key = condition_key(row["name"], report["target"])
@@ -149,9 +242,18 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 # Its daemon restarts onto the files (or ticks on them) by itself: re-checked after the wait.
                 rec.update(owner=owner, takeover_at=now + wait, due=now + wait, restart=True)
             elif not rec.get("takeover_at"):
-                rec.update(owner=row.get("merge_owner"), takeover_at=row.get("takeover_at"))
+                # The same owner still holding the merge of an earlier release keeps that release's deadline:
+                # a task that holds every release in turn cannot push its takeover back with each one.
+                earlier = [float(c["takeover_at"]) for c in checks.values() if c.get("name") == row["name"]
+                           and not c.get("closed") and not c.get("restart") and c.get("takeover_at")
+                           and owner and c.get("owner") == owner]
+                at = row.get("takeover_at")
+                rec.update(owner=row.get("merge_owner"), takeover_at=min([at] + earlier) if at else at)
                 rec["due"] = rec["takeover_at"] + GRACE_S if rec["takeover_at"] else now
-            outcome, kind, reason = assess(rec, row, now, p)
+            if not same and not rec.get("restart"):
+                takeovers.setdefault(row["name"], {})["tries"] = 0     # a new release gets its own tries
+            outcome, kind, reason = _takeover(p, rec, *assess(rec, row, now, p),
+                                              takeovers.setdefault(row["name"], {}), now)
             row["outcome"] = outcome
             if outcome == "done" and not old:
                 rows.append(row)
@@ -162,13 +264,14 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 rec.pop("closed", None)
                 failed.append((rec, kind, reason, _mark(rec, kind, now)))
             elif outcome == "pending" and not was_pending:
-                at = timefmt.long(rec["takeover_at"], p)
+                at = timefmt.long(max(rec["takeover_at"], now), p)
                 pending.append(f"{row['name']}: restart onto the new files pending, owner {rec['owner']}, "
                                f"re-checked {at}" if rec.get("restart") else
                                f"{row['name']}: owner {rec['owner']}, takeover {at}")
             checks[key] = rec
             rows.append(row)
         p.db.set_kv(CHECKS, checks)   # before the alert: condition readers can verify it at once
+        p.db.set_kv(TAKEOVERS, takeovers)
         if failed:   # already alerted (still open), or alerted now: after_push's failure is this alert
             key = _alert(p, report["target"], [f[:3] for f in failed]) if any(new for *_, new in failed) \
                 else release_key(report["target"])
@@ -190,6 +293,9 @@ def tick(p, alert, now: float | None = None) -> None:
     now = time.time() if now is None else now
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
+        takeovers = p.db.kv(TAKEOVERS) or {}
+        for name, t in takeovers.items():
+            _reap(name, t, now)
         changed = False
         failing: dict[str, list] = {}
         for key, rec in checks.items():
@@ -197,12 +303,16 @@ def tick(p, alert, now: float | None = None) -> None:
                 continue
             rec["next_probe"] = now + PROBE_S
             changed = True
-            outcome, kind, reason = assess(rec, _probe(rec, now), now, p)
+            outcome, kind, reason = _takeover(p, rec, *assess(rec, _probe(rec, now), now, p),
+                                              takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)
             if outcome == "failed":
                 failing.setdefault(rec["target"], []).append((rec, kind, reason, _mark(rec, kind, now)))
-        if changed:
+        live = {rec["name"] for rec in checks.values() if not rec.get("closed")}
+        takeovers = {n: t for n, t in takeovers.items() if n in live or t.get("pid")}
+        if changed or takeovers != (p.db.kv(TAKEOVERS) or {}):
             p.db.set_kv(CHECKS, checks)
+            p.db.set_kv(TAKEOVERS, takeovers)
         for target, failed in failing.items():
             if any(new for *_, new in failed):
                 _alert(p, target, [f[:3] for f in failed], alert)

@@ -12522,6 +12522,26 @@ def test_only_an_explicit_host_upgrade_takes_over_and_only_a_stuck_finish_task(e
         assert p.db.task(tid)["status"] == "cancelled" and restarts == [1]
 
 
+def test_a_host_upgrade_takes_over_from_the_named_task_past_its_deploy_deadline(env, monkeypatch, capsys):
+    """A finish task that still shows activity holds a host-side upgrade for 6 h, and kept doing so release
+    after release. Past the deadline a deploy gave it, `--take-over-from <task>` takes the merge over from
+    that task (and only that one) even while it moves."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    p.db.x("UPDATE tasks SET status='waiting', updated=? WHERE id=?", (time.time() - 60, tid))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--take-over-from", str(tid + 1)])     # another task's deadline
+    assert e.value.code == 75 and p.db.task(tid)["status"] == "waiting" and not restarts
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--take-over-from", str(tid)])
+    assert "past its deploy takeover deadline" in capsys.readouterr().out
+    assert p.db.task(tid)["status"] == "cancelled" and release.fenced(p, tid) and restarts == [1]
+
+
 def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
     """The once-a-day merge task limit counted from the last task's creation, also for a host-side
     upgrade: a project with local edits trailed each release by up to a day. Now a host-side upgrade
@@ -49939,6 +49959,121 @@ def test_after_push_deploy_fault_while_pending_alerts_at_next_probe(env, tmp_pat
     assert rec['due'] == due and rec['outcome'] == 'pending' and len(rec['history']) == 1
     deploy.tick(p, page, due + 1)
     assert len(pages) == 2 and 'missed takeover' in pages[1][1], 'the merge deadline is still watched'
+
+
+def _fake_takeovers(monkeypatch, deploy, catch_up=None):
+    """deploy.launch_takeover stand-in: records (name, task) and runs a process that exits at once;
+    `catch_up(name)` is called as the takeover's upgrade when given."""
+    launched = []
+    def launch(p, name, task):
+        launched.append((name, task))
+        if catch_up:
+            catch_up(name)
+        return subprocess.Popen([sys.executable, "-c", "pass"])
+    monkeypatch.setattr(deploy, "launch_takeover", launch)
+    return launched
+
+
+def _restart_reporting_daemon(p, deploy):
+    """The reporting daemon restarts (or the host reboots): a new Project and none of the old children."""
+    from ttp.project import Project
+    for child in deploy._children.values():
+        child.wait()
+    deploy._children.clear()
+    return Project(p.base)
+
+
+def test_a_missed_takeover_is_taken_over_by_the_host_after_a_restart(env, tmp_path, monkeypatch):
+    """Replays a missed takeover: a project's upgrade was pending on a merge held by a harness task that
+    stayed open and active; the takeover time passed with a daemon restart in between, and the deploy
+    check only paged 'missed takeover': nothing ran the host-side takeover. Now the first probe past the
+    deadline runs `ttp upgrade <name> --take-over-from <task>` and the check closes once the project's own
+    daemon reports the release, with no page."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.update_task(tid, status='waiting')            # still open, and active: never stale on its own
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    assert deploy.record(p, report, now)['rc'] == 0
+    due = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['due']
+    def upgraded(name):
+        _deploy_catch_up(base, db, '0.5.0', DEPLOY_C, due + 30)
+    launched = _fake_takeovers(monkeypatch, deploy, upgraded)
+    p = _restart_reporting_daemon(p, deploy)
+    pages, page = _deploy_pager(p)
+    deploy.tick(p, page, due + 1)                   # overdue on the first tick after the restart
+    assert launched == [('alpha', tid)] and not pages
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    assert rec['outcome'] == 'pending' and not rec.get('closed')
+    p = _restart_reporting_daemon(p, deploy)        # restarted again while the takeover ran
+    pages, page = _deploy_pager(p, pages)
+    deploy.tick(p, page, due + 1 + deploy.PROBE_S)
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    assert rec['closed'] and not pages and launched == [('alpha', tid)]
+    assert p.db.kv(deploy.TAKEOVERS) == {}
+
+
+def test_a_takeover_that_does_not_bring_the_daemon_up_is_retried_then_paged_once(env, tmp_path, monkeypatch):
+    """The takeover is verified by the project's own daemon receipt, retried a bounded number of times,
+    and paged only once every try ended with the project still behind."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    p.set_config('home_timezone', 'America/Los_Angeles')
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    deploy.record(p, report, now)
+    due = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['due']
+    launched = _fake_takeovers(monkeypatch, deploy)
+    pages, page = _deploy_pager(p)
+    t = due + 1
+    while len(launched) < deploy.TAKEOVER_TRIES or not pages:
+        deploy.tick(p, page, t)
+        for child in deploy._children.values():
+            child.wait()
+        t += deploy.PROBE_S
+        assert t < due + deploy.TAKEOVER_TRIES * (deploy.TAKEOVER_SETTLE_S + 3 * deploy.PROBE_S), 'bounded'
+    assert launched == [('alpha', tid)] * deploy.TAKEOVER_TRIES
+    assert len(pages) == 1 and 'missed takeover' in pages[0][1] and 'takeover tried 3 times' in pages[0][1]
+    for i in range(3):
+        deploy.tick(p, page, t + i * deploy.PROBE_S)
+    assert len(launched) == deploy.TAKEOVER_TRIES and len(pages) == 1
+
+
+def test_a_repeat_merge_owner_keeps_its_first_takeover_deadline(env, tmp_path):
+    """The same harness task held the merge of release after release; each deploy set a new deadline from
+    its latest activity, so the takeover kept moving. A later release held by the same owner keeps the
+    earliest open deadline; another owner gets its own."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 600
+    deploy.record(p, report, now)
+    first = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['takeover_at']
+    _deploy_lib('0.5.1')
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 6 * 3600
+    deploy.record(p, report, now + 60)
+    assert p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.1']['takeover_at'] == first
+    db.update_task(tid, status='done')
+    other = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    _deploy_lib('0.5.2')
+    report = overview.deployed(names=['alpha'])
+    assert report['projects'][0]['merge_owner'] == f'harness task #{other}'
+    report['projects'][0]['takeover_at'] = now + 6 * 3600
+    deploy.record(p, report, now + 120)
+    assert p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.2']['takeover_at'] == now + 6 * 3600
 
 
 def test_after_push_deploy_daemon_down_during_its_own_upgrade_is_not_a_fault(env, tmp_path):

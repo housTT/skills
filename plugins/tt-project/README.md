@@ -616,13 +616,19 @@ prolonged whole-box outage.
   failed. A pending merge needs a live daemon, a harness task owner and a known takeover
   time; it emits one low note and records a model-free check in the deploying project's
   state, due five minutes after takeover. The original deadline survives retries and
-  restarts; a new commit of the same version is a new merge with its own. A live daemon
+  restarts; a new commit of the same version is a new merge with its own, except that a
+  harness task already holding an earlier release's merge keeps that earlier deadline. Once
+  the deadline passes (also when it is already past after a restart or a reboot), the
+  deploying project's daemon runs the host-side takeover itself, `ttp upgrade <name>
+  --take-over-from <task>`, which fences that task even while it still shows activity. It
+  tries up to three times, five minutes apart, and the check closes only when that project's
+  own daemon reports the release (output in `logs/takeover.log`). A live daemon
   whose files are already at the release but that has not restarted onto them (or not yet
   ticked on them) is pending too, owned by that daemon, and is re-checked after
   `delivery.deploy_restart_wait_s` (default 900). A daemon that
   stops or fails to come up (high), or an upgrade error for this release, alerts at the next
-  probe (about a minute), not at takeover. A missed takeover or a restart still behind at
-  its re-check alerts at normal severity. A release's deploy sends one alert, listing every
+  probe (about a minute), not at takeover. A takeover still behind after its last try, or a
+  restart still behind at its re-check, alerts at normal severity. A release's deploy sends one alert, listing every
   project still behind; the push queue then sends no after_push alert of its own for that
   failure. Each alert clears quietly once its condition does, and a recovered
   daemon returns to pending. Missing ownership/deadlines, current upgrade errors and daemons
