@@ -238,8 +238,9 @@ prolonged whole-box outage.
   blocked tasks or open asks. Lowering rules keep known or routine events at the base effort, each
   logged in the turn's note (`lowered`): a needs-review hand-off with no follow-ups, findings or notes
   whose review the daemon queues itself; a high or critical event whose fingerprint is a known case
-  (an issue open before the last turn, a deploy pending on an owned merge before its takeover, a
-  machine with an open change in the shared ledger); and a review's failed hand-off counts once, as
+  (an open issue an earlier turn already saw at this severity or higher, a deploy pending on an owned
+  merge before its takeover, an open change in the shared machine ledger that expects it: `ttp machines
+  change add ... --expect <fingerprint|down|held>`); and a review's failed hand-off counts once, as
   "failed review". Routine bookkeeping stays at the base effort; such a turn that finds
   its batch harder than it looked returns `escalate`, and the same batch reruns once at high
   effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned

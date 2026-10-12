@@ -103,8 +103,10 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 # ledger -------------------------------------------------------------------------------------------
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
-               task: int | None = None, now: float | None = None) -> dict:
-    """Record a live change to machine `alias` made by project `by`; returns the entry."""
+               task: int | None = None, now: float | None = None, expects=None) -> dict:
+    """Record a live change to machine `alias` made by project `by`; returns the entry. `expects`: the
+    event fingerprints or machine conditions (down, held) the change is known to cause, which then
+    keep the coordinator's turn routine (coordinator._known_case)."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -119,6 +121,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         n = int(doc.get("next") or 1)
         entry = {"id": n, "alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now,
                  "expires": end, "probe": probe or None}
+        if expects:
+            entry["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
         doc["next"] = n + 1
         doc["changes"] = [c for c in doc.get("changes", []) if not c.get("closed")
                           or now - float(c["closed"]) < CLOSED_KEPT_S] + [entry]
@@ -161,6 +165,7 @@ def change_line(c: dict, now: float | None = None) -> str:
     end = f"until-probe `{c['probe']}`, at the latest {ends.stamp(c['expires'])}" if c.get("probe") \
         else f"ends {ends.stamp(c['expires'])}"
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
+    end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     return (f"#{c['id']} {c['alias']}: {c['what']} (by {by}; undo: `{c['undo']}`; {end})"
             + (f" OVERDUE: {late}" if late else ""))
 

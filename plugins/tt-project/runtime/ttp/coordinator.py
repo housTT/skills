@@ -2142,16 +2142,22 @@ def _routine_review(db, cfg: dict, r) -> str:
 
 def _known_case(db, r, last: float, now: float) -> str:
     """Why a high or critical event is a known case ("" when it is new): its fingerprint names an
-    issue already open before the last coordinator turn, a deploy pending on an owned merge before
-    its takeover deadline (deploy.py), or a machine with an open, not overdue change in the shared
-    ledger (machine_ledger.py)."""
+    open issue that a turn before the last one already saw at this severity or higher (an event of
+    the same fingerprint since the issue opened; an issue that escalated or woke again is new), a
+    deploy pending on an owned merge before its takeover deadline (deploy.py), or an open, not
+    overdue change in the shared ledger (machine_ledger.py) that expects this event: it lists its
+    fingerprint, or its condition on the change's machine."""
     fp = str(r["fingerprint"] or "")
     if not fp:
         return ""
     issue = db.one("SELECT id, status, subject, COALESCE(opened, first_seen) since FROM issues WHERE fingerprint=?",
                    (fp,))
     if issue and issue["status"] == "open" and last and float(issue["since"] or now) <= last:
-        return f"issue #{issue['id']} open since before the last turn"
+        rank = SEVERITY_RANK.get(r["severity"], 1)
+        seen = db.q("SELECT severity FROM events WHERE fingerprint=? AND id<>? AND ts>=? AND ts<=?",
+                    (fp, r["id"], float(issue["since"] or 0), last))
+        if any(SEVERITY_RANK.get(e["severity"], 1) >= rank for e in seen):
+            return f"issue #{issue['id']} seen at {r['severity']} before the last turn"
     if fp.startswith("deploy:"):
         rec = (db.kv(deploy.CHECKS) or {}).get(fp) or {}
         if not rec.get("closed") and rec.get("outcome") == "pending" and rec.get("owner") \
@@ -2161,17 +2167,19 @@ def _known_case(db, r, last: float, now: float) -> str:
         data = json.loads(r["data"] or "{}")
     except (TypeError, ValueError):
         data = {}
-    names = " ".join(str(x) for x in ((data or {}).get("machine") if isinstance(data, dict) else None,
-                                      issue["subject"] if issue else None) if x)
-    if names:
-        try:
-            for ch in machine_ledger.changes():
-                alias = str(ch.get("alias") or "")
-                if alias and not machine_ledger.overdue(ch, now) and \
-                        re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w.-])", names):
-                    return f"machine change #{ch.get('id')} on {alias} by {ch.get('by', '?')}"
-        except Exception:   # an unreadable ledger knows no case: the event raises the turn
-            return ""
+    data = data if isinstance(data, dict) else {}
+    names = " ".join(str(x) for x in (data.get("machine"), issue["subject"] if issue else None) if x)
+    cond = str(data.get("condition") or "")
+    try:
+        for ch in machine_ledger.changes():
+            alias, expects = str(ch.get("alias") or ""), [str(x) for x in ch.get("expects") or []]
+            if not alias or machine_ledger.overdue(ch, now):
+                continue
+            on_it = bool(names) and re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w.-])", names)
+            if fp in expects or (cond and cond in expects and on_it):
+                return f"machine change #{ch.get('id')} on {alias} by {ch.get('by', '?')} expects it"
+    except Exception:   # an unreadable ledger knows no case: the event raises the turn
+        return ""
     return ""
 
 

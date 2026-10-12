@@ -28554,18 +28554,19 @@ def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(
 def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, monkeypatch):
     """Lowering rules: a failed review's hand-off is one trigger; a high event that is a known case
     (an issue open before the last turn, a deploy pending on an owned merge before its deadline, a
-    machine with an open change) stays routine. Each logs its rule; anything else still raises."""
+    ledger change that expects it) stays routine. Each logs its rule; anything else still raises."""
     p = make(env)
-    from ttp import coordinator as coord, deploy, machine_ledger
+    from ttp import coordinator as coord, deploy, machine_ledger, screen as scr
     db, cfg = p.db, p.config()
     db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     db.x("DELETE FROM messages WHERE direction='out'")
     now = time.time()
     db.set_kv("last_coordinator_turn", now - 60)
 
-    def ev(kind, severity="normal", fp=None, task=None, data=None):
+    def ev(kind, severity="normal", fp=None, task=None, data=None, ts=None):
         return db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)", (now, "daemon", kind, fp, severity, "x", data, "queued", task))
+                    "VALUES(?,?,?,?,?,?,?,?,?)", (now if ts is None else ts, "daemon", kind, fp, severity, "x", data,
+                                                  "queued", task))
 
     def trig(evs):
         low: list = []
@@ -28582,14 +28583,25 @@ def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, mon
     db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,severity,status,subject,opened) "
          "VALUES('fp-new','w',?,?,'t','high','open','box m9',?)", (now, now, now))
     assert trig([ev("observation", "high", "fp-new")])[0] == ["high severity event"], "opened by this sighting"
-    # An issue open since before the last turn is a known case, critical too; a fixed one is not.
+    # An open issue an earlier turn already saw at critical is a known case; a fixed one is not.
     db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,severity,status,subject,opened) "
          "VALUES('fp-old','w',?,?,'t','critical','open','box m9',?)", (now - 7200, now, now - 7200))
+    assert trig([ev("observation", "critical", "fp-old")])[0] == ["high severity event"], \
+        "open before the last turn, but no turn saw it yet"
+    ev("observation", "critical", "fp-old", ts=now - 7000)
     e = ev("observation", "critical", "fp-old")
     got, low = trig([e])
     assert got == [] and len(low) == 1 and low[0].startswith(f"{coord.LOWERED_KNOWN}: event {e} (issue #")
     db.x("UPDATE issues SET status='fixed' WHERE fingerprint='fp-old'")
     assert trig([ev("observation", "critical", "fp-old")])[0] == ["high severity event"]
+    # An issue the last turns saw only at normal that escalates to critical (screen._issue keeps its
+    # `opened`) is new at critical: it raises, nothing lowered.
+    db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,severity,status,subject,opened) "
+         "VALUES('fp-esc','w',?,?,'t','normal','open','box',?)", (now - 7200, now - 7200, now - 7200))
+    ev("observation", "normal", "fp-esc", ts=now - 7200)
+    v = scr._issue(db, "fp-esc", "w", "t", None, "critical", lambda: None, 2, now, None, False)
+    assert v.wake and v.severity == "critical" and v.reason == "now critical", v
+    assert trig([ev("observation", v.severity, "fp-esc")]) == (["high severity event"], [])
     # A deploy pending on an owned merge before its deadline; past it, or unowned, it raises.
     key = deploy.condition_key("alpha", "0.5.0")
     db.set_kv(deploy.CHECKS, {key: {"outcome": "pending", "owner": "beta", "due": now + 600}})
@@ -28597,18 +28609,28 @@ def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, mon
     assert trig([e]) == (["after_push_failed"], [f"{coord.LOWERED_KNOWN}: event {e} (deploy pending on beta's merge)"])
     db.set_kv(deploy.CHECKS, {key: {"outcome": "pending", "owner": "beta", "due": now - 1}})
     assert trig([ev("observation", "high", key)]) == (["high severity event"], [])
-    # A machine with an open, not overdue change in the shared ledger (named by data or the issue subject).
-    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
-        {"id": 7, "alias": "m9", "by": "other", "expires": now + 3600}])
+    # An open, not overdue change in the shared ledger that expects the event: its fingerprint, or
+    # its condition on the change's machine (named by data or the issue subject).
     db.x("UPDATE issues SET status='fixed' WHERE fingerprint='fp-new'")
-    e = ev("observation", "high", "fp-new")
-    assert trig([e]) == ([], [f"{coord.LOWERED_KNOWN}: event {e} (machine change #7 on m9 by other)"])
-    assert trig([ev("observation", "high", "fp-x", data=json.dumps({"machine": "m9"}))])[0] == []
-    assert trig([ev("observation", "high", "fp-y", data=json.dumps({"machine": "m90"}))])[0] == \
-        ["high severity event"], "the alias matches whole names only"
+    down = json.dumps({"machine": "m9", "condition": "down"})
     monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
-        {"id": 7, "alias": "m9", "by": "other", "expires": now - 1}])
-    assert trig([ev("observation", "high", "fp-x", data=json.dumps({"machine": "m9"}))])[0] == \
+        {"id": 6, "alias": "m9", "by": "other", "expires": now + 3600}])
+    assert trig([ev("observation", "critical", "fp-new")]) == (["high severity event"], []), \
+        "an unrelated open change on the same machine is no known case"
+    assert trig([ev("observation", "critical", "fp-x", data=down)]) == (["high severity event"], [])
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
+        {"id": 6, "alias": "m9", "by": "other", "expires": now + 3600, "expects": ["fp-other", "held"]},
+        {"id": 7, "alias": "m9", "by": "other", "expires": now + 3600, "expects": ["fp-new", "down"]}])
+    e = ev("observation", "high", "fp-new")
+    assert trig([e]) == ([], [f"{coord.LOWERED_KNOWN}: event {e} (machine change #7 on m9 by other expects it)"])
+    assert trig([ev("observation", "high", "fp-x", data=down)])[0] == []
+    assert trig([ev("observation", "high", "fp-x", data=json.dumps({"machine": "m9", "condition": "gone"}))])[0] \
+        == ["high severity event"], "a condition the change does not expect"
+    assert trig([ev("observation", "high", "fp-y", data=json.dumps({"machine": "m90", "condition": "down"}))])[0] \
+        == ["high severity event"], "the alias matches whole names only"
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **k: [
+        {"id": 7, "alias": "m9", "by": "other", "expires": now - 1, "expects": ["fp-new", "down"]}])
+    assert trig([ev("observation", "high", "fp-x", data=down)])[0] == \
         ["high severity event"], "an overdue change is no known case"
     # Unchanged: user messages, rejected actions, blocked tasks and the blocker sweep still raise.
     m = db.post("in", "status?", chat="c1", kind="user")
@@ -43828,6 +43850,11 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
     main(["machines", "change", "list"])
     out = capsys.readouterr().out
     assert "#1 box-a" in out and "#2 box-a: paused the queue" in out and "OVERDUE" not in out
+    main(["machines", "change", "add", "box-a", "power-cycled the tray", "--undo", "none", "--expires", "1h",
+          "--by", "demo", "--expect", "down", "--expect", "fp-tray"])
+    assert "expects down, fp-tray)" in capsys.readouterr().out and ml.changes()[2]["expects"] == ["down", "fp-tray"]
+    assert "expects" not in ml.changes()[0], "no --expect, no expects: the change explains no alert"
+    ml.close_change(3, "test", "demo")
     first = ml.changes()[0]
     assert ml.overdue(first, now + 3 * 3600).startswith("expired") and not ml.overdue(first, now)
     assert ml.overdue(probe, now + ml.PROBE_END_S + 1).startswith("expired")

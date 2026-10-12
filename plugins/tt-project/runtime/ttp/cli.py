@@ -2803,7 +2803,7 @@ def _machine_change(a) -> None:
     task = os.environ.get("TTP_TASK")
     try:
         c = ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe,
-                          int(task) if task and task.isdigit() else None)
+                          int(task) if task and task.isdigit() else None, expects=a.expect)
     except ValueError as e:
         die(str(e))
     print(f"recorded {ml.change_line(c)}")
@@ -4400,6 +4400,9 @@ def main(argv: list[str] | None = None) -> None:
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
     c.add_argument("--by", help="the project that owns the change (default: the project you are in)")
+    c.add_argument("--expect", action="append", metavar="FINGERPRINT|CONDITION",
+                   help="an alert the change is known to cause (an event fingerprint, or down/held on this "
+                        "machine): it keeps the coordinator's turn routine while the change is open; repeatable")
     c = cs.add_parser("list", help="the open changes")
     c.add_argument("alias", nargs="?")
     c.add_argument("--all", action="store_true", help="closed ones too")
