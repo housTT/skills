@@ -86,3 +86,42 @@ Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
 [cu-params]: https://cursor.com/docs/cli/reference/parameters
 [cu-output]: https://cursor.com/docs/cli/reference/output-format
 [cu-using]: https://cursor.com/docs/cli/using
+
+## Coordinator prompt cache evidence
+
+The status miss threshold is **strictly below 50%** of prompt tokens read from cache.
+The token-hit denominator is fresh input + cache writes + cache reads; output tokens do not
+contribute. Rates aggregate token counters, rather than averaging each turn's percentage.
+Zero means 0% read, partial means between 0% and 100%, and full means 100% read. Missing
+cache counters, legacy runs without completeness metadata, and zero prompt denominators are
+unknown, never misses. Raw counters remain available in `coordinator_cache.raw_tokens` in the
+status API and audit JSON. Missing HTTP request counts also stay unknown: CLI turn counts
+and assistant-message IDs do not prove how many transport retries occurred.
+
+A local API-stub capture with Claude Code 2.1.296 observed three CLI breakpoints on eight
+requests, including tool results and structured-output follow-up calls. Adding the harness's
+stable-context mark produced four on each request. CLI 2.1.285 previously used four itself
+on later requests and rejected an extra mark with HTTP 400. The adapter enables the extra
+mark only for the captured build; other builds keep charter and memory in the system prompt
+without constructing or logging a mark destined to be dropped. This is a compatibility check,
+not an installation pin. Capture a new build's first and later requests before extending it.
+These captures verify request shape, not cache retention or savings at the real provider.
+
+Ordinary memory additions, edits and retirements stay in the live digest until the snapshot's
+`memory_refresh_s` interval has elapsed. Bursts do not refresh the snapshot repeatedly.
+Restriction-memory edits rebuild it immediately, as do changes to the charter or role.
+Neither this interval nor `coordinator.cache_ttl` proves the provider's retention lifetime.
+
+An earlier seven-day comparison found a token-hit increase from about 57% to 68.5%, but
+cost per turn rose from $0.073–0.083 to $0.127 as prompts grew and effort changed. Its
+"cold" threshold was below 30%, distinct from the existing status miss threshold of 50%.
+A better hit rate alone therefore does not demonstrate savings.
+
+Evaluate this change using three days before and three days after deployment, selecting
+turns with a 5–60 minute gap since the previous coordinator turn ended. The status API's
+`coordinator_cache["3d"].gap_5_60m` reports token hit and cost per turn for that cohort,
+with raw counters and known/missing counts. Compare the same provider, model and effort,
+report prompt sizes and sample counts, and retain the change only if both token hit and
+cost per turn improve. If the sample or telemetry is insufficient, report unknown and
+extend observation; do not infer a miss or savings. Revert the tuning if the comparison
+shows no improvement while retaining the telemetry needed to diagnose it.

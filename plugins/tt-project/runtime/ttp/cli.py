@@ -890,6 +890,10 @@ def status_text(p: Project) -> str:
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
+    from . import budget
+    cache = budget.coordinator_cache(db, now)["24h"]
+    if cache["turns"]:
+        lines.append(budget.coordinator_cache_line(cache))
     from . import pushq
     pq = pushq.status_line(p, now)
     if pq:

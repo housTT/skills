@@ -299,6 +299,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f}; {noop}{part}; "
                    f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f}), "
                    f"{turns['starve']} starve wakes (${turns['starve_usd']:.2f})")
+    cache = budget.coordinator_cache(db, now, window_s)["window"]
+    if cache["turns"]:
+        out.append(budget.coordinator_cache_line(cache))
     skips = turngate.skipped(db, since)
     if skips["n"]:
         out.append(f"coordinator turns skipped as repeats of a turn that decided nothing: {skips['n']}, "
@@ -342,7 +345,8 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
     return {"window_h": window_s / 3600, "asks": asks(db, since, now), "asks_refused": rejected_asks(db, since),
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
-            "coordinator_turns": coordinator_turns(db, since), "turns_skipped": turngate.skipped(db, since),
+            "coordinator_turns": coordinator_turns(db, since),
+            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since),
             "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "overrides": overrides(p, db, now, blocked_h)}

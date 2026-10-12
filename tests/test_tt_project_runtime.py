@@ -5738,6 +5738,7 @@ def test_the_host_line_counts_a_lock_held_at_several_reboots_once_with_the_lates
 def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block(monkeypatch):
     from ttp.providers import claude, get_provider
     prov = get_provider("claude")
+    monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 4)
     assert prov.cache_env("1h") == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
     assert prov.cache_env("off") == {} and prov.cache_env("") == {}
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
@@ -5972,13 +5973,14 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
 
 def test_claude_leaves_its_own_breakpoints_room_on_later_calls(monkeypatch):
     from ttp.providers import base, claude
-    assert claude.Claude.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, \
-        "measured: the CLI marks four blocks on every call after a run's first"
+    monkeypatch.setattr(claude, "cli_output", lambda *args: "2.1.285 (Claude Code)")
+    assert claude.Claude().own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, \
+        "unverified builds reserve all four"
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
     logged: list[str] = []
     monkeypatch.setattr(base, "_TRIM_LOGGED", set())
     assert claude.Claude().cached_input("STABLE", "EVENTS", "1h", log=logged.append) is None
-    assert len(logged) == 1 and "claude cached input" in logged[0]
+    assert logged == [], "do not construct a mark that will always be dropped"
 
 
 def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
@@ -6001,7 +6003,10 @@ def test_coordinator_cache_hit_rate_and_cost_per_turn(env):
             (now - 7200, 0.15, 100, 1000, 8900),         # missed: the charter changed
             (now - 3 * 86400, 0.04, 100, 9800, 100)]     # older than a day
     for k, (started, cost, fresh, read, write) in enumerate(rows):
-        note = json.dumps({"digest": {"chars": 4000, "tokens": 1000}} if k == 0 else {})
+        note = {"cache_telemetry": {"complete": True, "requests": None}}
+        if k == 0:
+            note["digest"] = {"chars": 4000, "tokens": 1000}
+        note = json.dumps(note)
         p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
                "cache_write_tokens,note) VALUES('coordinator','claude',?,?,'done',?,?,?,?,?)",
                (started, started + 60, cost, fresh, read, write, note))
@@ -6009,8 +6014,10 @@ def test_coordinator_cache_hit_rate_and_cost_per_turn(env):
            "VALUES('worker','claude',?,?,'done',1,10,0)", (now - 60, now))
     c = bud.coordinator_cache(p.db, now)
     # Cache writes per turn are kept apart from the miss rate; the digest size only where recorded.
-    assert c["24h"] == {"turns": 2, "hit_pct": 50, "miss_turns": 1, "usd_per_turn": 0.1, "write_per_turn": 4900,
-                        "digest_tokens": 1000}
+    assert {k: c["24h"][k] for k in ("turns", "hit_pct", "miss_turns", "usd_per_turn", "write_per_turn",
+                                    "digest_tokens")} == {"turns": 2, "hit_pct": 50, "miss_turns": 1,
+                                                          "usd_per_turn": 0.1, "write_per_turn": 4900,
+                                                          "digest_tokens": 1000}
     assert c["7d"]["turns"] == 3 and c["7d"]["hit_pct"] == 66 and c["7d"]["miss_turns"] == 1
     assert bud.history(p.db)["coordinator_cache"]["24h"]["turns"] == 2
 
@@ -8788,6 +8795,7 @@ def test_runs_without_a_result_line_count_their_estimated_cost(env, tmp_path, mo
     first = stalled_run(1)
     assert first["cost_estimated"] == 1 and first["cost_usd"] == pytest.approx(4 * 107_510 * 15 / 1e6)
     assert first["cache_read_tokens"] == 4 * 800_000, "one message's usage was counted more than once"
+    assert json.loads(first["note"])["cache_telemetry"] == {"complete": True, "requests": None, "source": "messages"}
     assert p.db.one("SELECT estimated FROM ledger")["estimated"] == 1
     assert p.db.task(tid)["spent_usd"] == pytest.approx(first["cost_usd"])
     started = {}
@@ -17834,13 +17842,13 @@ def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_pro
     before = coord.system_prompt(p)
     assert "Box A is ours." in before and _memory_section(coord.digest(p, {}, [], [])) == []
     assert coord.apply(p, [{"type": "memory_add", "text": "The nightly build takes 40 minutes."},
-                           {"type": "memory_add", "text": "Never reboot host03.", "memory_kind": "restriction"}],
+                           {"type": "memory_add", "text": "Builds need a quiet window.", "memory_kind": "fact"}],
                        turn=1) == []
     digest = coord.digest(p, {}, [], [])
     assert coord.system_prompt(p) == before, "a memory change missed the prompt cache"
     added = _memory_section(digest)
     assert len(added) == 2 and "The nightly build takes 40 minutes." in added[0]
-    assert added[1].startswith("[restriction-") and "Never reboot host03." in added[1]
+    assert added[1].startswith("[fact-") and "Builds need a quiet window." in added[1]
 
 
 def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_system_prompt(env):
@@ -17856,7 +17864,7 @@ def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_syste
     assert "host01 is booked until Friday." not in digest
 
 
-def test_a_cold_cache_or_a_large_change_refreshes_the_memory_snapshot(env):
+def test_memory_refresh_interval_batches_even_large_changes(env):
     p = make(env)
     from ttp import coordinator as coord
     start = time.time()
@@ -17865,13 +17873,14 @@ def test_a_cold_cache_or_a_large_change_refreshes_the_memory_snapshot(env):
     p.add_memory("Small fact.", kind="fact")
     assert coord.system_prompt(p, now=start + 3000) == before, "refreshed while the cache is warm"
     assert _memory_section(coord.digest(p, {}, [], []))
-    cold = coord.system_prompt(p, now=start + 3400)   # no turn for longer than memory_refresh_s
+    cold = coord.system_prompt(p, now=start + 3400)   # local batching interval elapsed
     assert cold != before and "Small fact." in cold
     assert _memory_section(coord.digest(p, {}, [], [])) == []
     p.db.set_kv("last_coordinator_turn", time.time())
-    p.add_memory("Big fact. " + "z" * 3100, kind="fact")   # over memory_delta_chars
-    digest = coord.digest(p, {}, [], [])
-    assert _memory_section(digest) == [] and "z" * 3100 in coord.system_prompt(p)
+    p.add_memory("Big fact. " + "z" * 3100, kind="fact")
+    assert coord.system_prompt(p, now=start + 3401) == cold
+    assert "z" * 3100 in coord.memory_digest_lines(coord.memory_view(p, now=start + 3401))[1]
+    assert "z" * 3100 in coord.system_prompt(p, now=start + 6700)
 
 
 def test_a_charter_change_refreshes_the_memory_snapshot(env):
@@ -51744,3 +51753,130 @@ def test_a_task_already_waiting_on_a_missing_task_is_flagged_once_and_shown_brok
     assert f"  #{tid} broken: waits on #0, which does not exist: ghost wait" in out, out
     assert "starts when #0 lands" not in out
     assert "broken: waits on #0, which does not exist (start_when: landed:#0)" in coord.digest(p, {}, [], [])
+
+
+def test_claude_verified_cache_capacity_and_unknown_builds(monkeypatch):
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, '_FLAGS', {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude, 'cli_output', lambda *args: '2.1.296 (Claude Code)')
+    prov = claude.Claude()
+    assert prov.own_cache_breakpoints == 3
+    assert prov.cached_input('STABLE', 'EVENTS', '1h') is not None
+    for version in ('2.1.285 (Claude Code)', '2.1.297 (Claude Code)', ''):
+        monkeypatch.setattr(claude, 'cli_output', lambda *args: version)
+        logged = []
+        assert prov.own_cache_breakpoints == 4
+        assert prov.cached_input('STABLE', 'EVENTS', '1h', log=logged.append) is None
+        assert logged == [], 'no doomed mark should be constructed or logged'
+
+
+def test_memory_bursts_refresh_once_per_interval_and_restrictions_immediately(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    start = time.time()
+    before = coord.system_prompt(p, now=start)
+    p.add_memory('Large memory burst. ' + 'x' * 3200, kind='fact')
+    assert coord.system_prompt(p, now=start + 1) == before
+    refreshed = coord.system_prompt(p, now=start + 3300)
+    assert refreshed != before
+    p.add_memory('Another burst. ' + 'y' * 3200, kind='fact')
+    assert coord.system_prompt(p, now=start + 3301) == refreshed
+    rule = p.add_memory('Never change a shared checkout.', kind='restriction')
+    restricted = coord.system_prompt(p, now=start + 3302)
+    assert restricted != refreshed and 'Never change a shared checkout.' in restricted
+    p.forget_memory(rule.stem)
+    assert 'Never change a shared checkout.' not in coord.system_prompt(p, now=start + 3303)
+
+
+def test_coordinator_cache_distinguishes_zero_partial_full_and_unknown(env):
+    from ttp import budget as bud, audit
+    from ttp.cli import status_text
+    p = make(env)
+    now = time.time()
+    for fresh, read, write, metadata in (
+        (100, 0, 0, {'complete': True, 'requests': 1}),
+        (50, 50, 0, {'complete': True, 'requests': 1}),
+        (0, 100, 0, {'complete': True, 'requests': 1}),
+        (100, 0, 0, {'complete': False, 'requests': None}),
+        (0, 0, 0, {'complete': True, 'requests': 1}),
+        (100, 0, 0, None),
+    ):
+        note = {'cache_telemetry': metadata} if metadata is not None else {}
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
+               "cache_write_tokens,note) VALUES('coordinator','claude',?,?,'ok',0.1,?,?,?,?)",
+               (now - 60, now, fresh, read, write, json.dumps(note)))
+    s = bud.coordinator_cache(p.db, now)['24h']
+    assert s['turns'] == 6 and s['known_turns'] == 3
+    assert s['states'] == {'zero': 1, 'partial': 1, 'full': 1, 'missing': 3}
+    assert s['miss_turns'] == 1 and s['hit_pct'] == 50
+    assert s['raw_tokens'] == {'input_tokens': 350, 'cache_read_tokens': 150, 'cache_write_tokens': 0}
+    assert s['requests_unknown_turns'] == 2
+    for text in (status_text(p), '\n'.join(audit.lines(p.db, now, p=p))):
+        assert 'zero 1' in text and 'partial 1' in text and 'full 1' in text
+        assert 'missing 3 (unknown)' in text
+
+
+def test_claude_cache_metadata_requires_explicit_counters(tmp_path):
+    from ttp.providers.claude import Claude
+    log = tmp_path / 'stream.jsonl'
+    for usage, complete in (
+        ({'input_tokens': 10, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}, True),
+        ({'input_tokens': 10}, False),
+        ({}, False),
+    ):
+        log.write_text(json.dumps({'type': 'result', 'usage': usage, 'num_turns': 1}) + '\n')
+        meta = Claude().parse(log).extra['cache_telemetry']
+        assert meta['complete'] is complete and meta['requests'] is None
+
+
+def test_cache_gap_cohort_keeps_the_previous_turn_outside_the_window(env):
+    from ttp import budget as bud
+    p = make(env)
+    now = time.time()
+    note = json.dumps({'cache_telemetry': {'complete': True, 'requests': None}})
+    for started, ended in ((now - 3 * 86400 - 300, now - 3 * 86400 - 200),
+                           (now - 3 * 86400 + 100, now - 3 * 86400 + 110)):
+        p.db.x("INSERT INTO runs(role,started,ended,status,input_tokens,cache_read_tokens,note) "
+               "VALUES('coordinator',?,?,'ok',10,90,?)", (started, ended, note))
+    cohort = bud.coordinator_cache(p.db, now)['3d']['gap_5_60m']
+    assert cohort['turns'] == 1 and cohort['hit_pct'] == 90
+
+
+def test_streamed_and_codex_cache_telemetry_preserve_missing_metadata(tmp_path):
+    from ttp.providers import claude, codex
+    log = tmp_path / 'stream.jsonl'
+    for provider, event, usage, complete in (
+        (claude.Claude(), 'assistant', {'input_tokens': 10, 'cache_read_input_tokens': 0,
+                                      'cache_creation_input_tokens': 0}, True),
+        (claude.Claude(), 'assistant', {'input_tokens': 10}, False),
+        (codex.Codex(), 'turn.completed', {'input_tokens': 10, 'cached_input_tokens': 5}, True),
+        (codex.Codex(), 'turn.completed', {'input_tokens': 10}, False),
+        (codex.Codex(), 'turn.completed', {'input_tokens': 10, 'cached_input_tokens': 20}, False),
+    ):
+        payload = {'type': event, 'usage': usage}
+        if event == 'assistant':
+            payload = {'type': event, 'message': {'id': 'm1', 'usage': usage, 'content': []}}
+        log.write_text(json.dumps(payload) + '\n')
+        assert provider.parse(log).extra['cache_telemetry']['complete'] is complete
+    log.write_text('')
+    assert not codex.Codex().parse(log).extra['cache_telemetry']['complete']
+
+
+def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    start = time.time()
+    fact = p.add_memory('Old build duration.', kind='fact')
+    before = coord.system_prompt(p, now=start)
+    fact.write_text(fact.read_text().replace('Old build duration.', 'New build duration.'))
+    view = coord.memory_view(p, now=start + 1)
+    assert coord.system_prompt(p, now=start + 1) == before
+    assert 'New build duration.' in '\n'.join(coord.memory_digest_lines(view))
+    p.forget_memory(fact.stem)
+    view = coord.memory_view(p, now=start + 2)
+    assert coord.system_prompt(p, now=start + 2) == before
+    assert view['retired'] == [fact.stem]
+    rule = p.add_memory('Never change shared branches.', kind='restriction')
+    coord.system_prompt(p, now=start + 3)
+    rule.write_text(rule.read_text().replace('shared branches.', 'shared state.'))
+    assert 'Never change shared state.' in coord.system_prompt(p, now=start + 4)

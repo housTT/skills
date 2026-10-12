@@ -774,28 +774,67 @@ def cache_hit(read: float, write: float, fresh: float) -> float | None:
     return read / total if total > 0 else None
 
 
-def coordinator_cache(db: DB, now: float | None = None) -> dict:
-    """Prompt cache use of coordinator turns over the last 24 h and 7 d: `hit_pct` is cache reads
-    over all prompt tokens, `miss_turns` the turns that read under half their prompt from it.
-    Apart from misses, `write_per_turn` is the mean of cache-write tokens per turn, which a warm
-    turn spends on its digest, and `digest_tokens` the mean estimated digest size of the turns that
-    recorded one."""
-    now = now or time.time()
+CACHE_MISS_THRESHOLD = 0.5   # existing status metric; measurement reports may use another threshold
+CACHE_TOKEN_KEYS = ("input_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+def _cache_summary(rows: list[dict]) -> dict:
+    """Only explicit cache telemetry contributes to hits/misses; retain all raw counters."""
+    states = dict.fromkeys(("zero", "partial", "full", "missing"), 0)
+    known, hits = [], []
+    requests_unknown = 0
+    for r in rows:
+        meta = _note(r["note"]).get("cache_telemetry") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if not isinstance(meta.get("requests"), int):
+            requests_unknown += 1
+        hit = cache_hit(*(r[k] or 0 for k in ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
+        if meta.get("complete") is not True or hit is None or not 0 <= hit <= 1:
+            states["missing"] += 1
+            continue
+        states["zero" if hit == 0 else "full" if hit == 1 else "partial"] += 1
+        known.append(r)
+        hits.append(hit)
+    tokens = lambda rs: {k: sum(r[k] or 0 for r in rs) for k in CACHE_TOKEN_KEYS}
+    raw, measured = tokens(rows), tokens(known)
+    total = cache_hit(*(measured[k] for k in ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
+    sizes = [d["tokens"] for d in (_note(r["note"]).get("digest") for r in rows)
+             if isinstance(d, dict) and isinstance(d.get("tokens"), int)]
+    return {"turns": len(rows), "known_turns": len(known), "states": states,
+            "raw_tokens": raw, "measured_tokens": measured, "requests_unknown_turns": requests_unknown,
+            "hit_pct": round(100 * total) if total is not None else None,
+            "miss_turns": sum(h < CACHE_MISS_THRESHOLD for h in hits),
+            "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None,
+            "write_per_turn": round(measured["cache_write_tokens"] / len(known)) if known else None,
+            "digest_tokens": round(sum(sizes) / len(sizes)) if sizes else None}
+
+
+def coordinator_cache(db: DB, now: float | None = None, window_s: float | None = None) -> dict:
+    """Token hit denominator = fresh input + cache writes + cache reads (no output tokens).
+    A miss is strictly below 50% read; missing metadata or a zero denominator is unknown.
+    Zero/partial/full describe reads of 0%, between 0 and 100%, and 100%. Rates are
+    token-weighted, not a mean of turn percentages. Raw counters include unknown turns.
+    Gaps use the previous completed coordinator turn's end; configured TTL proves nothing
+    about retention. `window_s` selects the daily review's own window."""
+    now = time.time() if now is None else now
+    spans = (("window", window_s),) if window_s is not None else (("24h", DAY), ("3d", 3 * DAY), ("7d", WEEK))
     out = {}
-    for label, span in (("24h", DAY), ("7d", WEEK)):
-        rows = db.q("SELECT cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note FROM runs "
-                    "WHERE role='coordinator' AND started>=? AND status!='running' "
-                    "AND input_tokens + cache_read_tokens + cache_write_tokens > 0", (now - span,))
-        hits = [cache_hit(r["cache_read_tokens"] or 0, r["cache_write_tokens"] or 0, r["input_tokens"] or 0)
-                for r in rows]
-        total = cache_hit(*(sum(r[k] or 0 for r in rows) for k in
-                            ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
-        out[label] = {"turns": len(rows), "hit_pct": round(100 * total) if total is not None else None,
-                      "miss_turns": sum(h < 0.5 for h in hits),
-                      "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None,
-                      "write_per_turn": round(sum(r["cache_write_tokens"] or 0 for r in rows) / len(rows))
-                      if rows else None}
-        sizes = [d["tokens"] for d in (_note(r["note"]).get("digest") for r in rows)
-                 if isinstance(d, dict) and isinstance(d.get("tokens"), int)]
-        out[label]["digest_tokens"] = round(sum(sizes) / len(sizes)) if sizes else None
+    for label, span in spans:
+        rows = db.q("SELECT * FROM (SELECT provider, cost_usd, input_tokens, cache_read_tokens, "
+                    "cache_write_tokens, note, started, LAG(COALESCE(ended,started)) OVER "
+                    "(ORDER BY started,id) previous_end FROM runs WHERE role='coordinator' "
+                    "AND status!='running') WHERE started>=?", (now - span,))
+        out[label] = _cache_summary(rows)
+        out[label]["gap_5_60m"] = _cache_summary([r for r in rows if r["previous_end"] is not None
+                                               and 300 <= r["started"] - r["previous_end"] <= 3600])
     return out
+
+
+def coordinator_cache_line(s: dict) -> str:
+    """Shared status/daily-review wording, including the metric's existing threshold."""
+    states = s["states"]
+    hit = f"{s['hit_pct']}%" if s["hit_pct"] is not None else "unknown"
+    return (f"coordinator cache: {hit} token hit; zero {states['zero']}, partial {states['partial']}, "
+            f"full {states['full']}, missing {states['missing']} (unknown); "
+            f"{s['miss_turns']} misses (<50% read); request count unknown for {s['requests_unknown_turns']} turns")

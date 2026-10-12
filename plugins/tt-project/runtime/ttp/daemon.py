@@ -1936,6 +1936,7 @@ class Daemon:
         if isinstance(session, dict):
             note["session"] = {k: session[k] for k in ("model", "effort", "error", "verification", "pin_verify", "checked")
                                if k in session}
+        note["cache_telemetry"] = usage.extra.get("cache_telemetry", {"complete": False, "requests": None})
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a

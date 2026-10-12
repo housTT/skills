@@ -221,14 +221,21 @@ class Codex(Provider):
                      estimated=True)
         u.cost_usd = self._price(inp, cached, out)
         events, errors = 0, []
+        cache_reports = []
         for ev in self._events(output_path):
             events += 1
             if ev.get("type") == "thread.started":
                 u.session_id = str(ev.get("thread_id") or "")   # what `codex exec resume` takes
             elif ev.get("type") == "turn.completed":
+                report = ev.get("usage") or {}
+                cache_reports.append(all(isinstance(report.get(k), int) and report[k] >= 0
+                                         for k in ("input_tokens", "cached_input_tokens"))
+                                     and report.get("cached_input_tokens", 0) <= report.get("input_tokens", 0))
                 errors = []   # transient errors Codex retried are reported as "error" events too
             elif ev.get("type") in ("turn.failed", "error"):
                 errors.append(ev)
+        u.extra["cache_telemetry"] = {"complete": bool(cache_reports) and all(cache_reports),
+                                      "requests": None, "source": "turns"}
         err = HOOK_DENIAL_RE.sub("", stderr_tail(stderr_path))
         if errors:
             u.error = json.dumps(errors[-1])[:400]

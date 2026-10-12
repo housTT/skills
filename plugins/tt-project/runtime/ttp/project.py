@@ -151,9 +151,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
                     # The memory in the coordinator's cached system prompt is a snapshot, rebuilt
-                    # after this long without a turn (the cache is cold by then) or once the entries
-                    # added or retired since outgrow memory_delta_chars; until then they go in the digest.
-                    "memory_refresh_s": 3300, "memory_delta_chars": 3000,
+                    # at most once per interval; pending changes stay in the digest. Restrictions
+                    # refresh immediately. This policy does not imply a provider cache lifetime.
+                    "memory_refresh_s": 3300,
                     # Prompt cache lifetime of coordinator turns: "auto" (1h, a write at 2x input
                     # instead of 1.25x, unless a 1h turn with the same prompt, schema, model, effort
                     # and agent CLI started under cache_warm_min minutes ago: then 5m, which still

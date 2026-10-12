@@ -340,12 +340,11 @@ def memory_view(p: Project, now: float | None = None) -> dict:
     """The memory snapshot the system prompt carries (`text`), plus the entries `added` (or
     changed) and the names `retired` since it was taken, which the digest lists instead.
 
-    Any change to the system prompt misses the provider's prompt cache, and a miss costs about
-    three hits. So a memory change waits in the digest until the snapshot is rebuilt: when no
-    turn ran for `memory_refresh_s` (the cache is cold anyway), when the restrictions, role or
-    charter changed (the prompt changes anyway), or when the waiting changes outgrow
-    `memory_delta_chars`. The snapshot is taken by the same rules as before (pinned kinds first,
-    COORDINATOR_MEMORY_CHARS)."""
+    Ordinary memory changes stay in the digest and are folded into the snapshot at
+    most once per `memory_refresh_s`, even when a burst exceeds the old size threshold.
+    Restriction edits take effect immediately. A changed role or charter also rebuilds
+    the snapshot because the prompt already changed. This interval is a local batching
+    policy, not evidence that the provider retains its cache for that long."""
     now = time.time() if now is None else now
     c = p.config()["coordinator"]
     entries = p._memory_entries()
@@ -355,12 +354,12 @@ def memory_view(p: Project, now: float | None = None) -> dict:
     taken = snap.get("entries") or {}
     added = [e for e in entries if taken.get(e["name"]) != live[e["name"]]]
     retired = [n for n in snap.get("shown") or [] if n not in live]
-    waiting = sum(len(e["line"]) + 1 for e in added) + sum(len(n) + 20 for n in retired)
-    last = max(float(p.db.kv("last_coordinator_turn", 0) or 0), float(snap.get("at") or 0))
-    if (not snap or snap.get("basis") != basis or now - last > float(c.get("memory_refresh_s", 3300))
-            or waiting > int(c.get("memory_delta_chars", 3000))):
+    restrictions = {e["name"]: live[e["name"]] for e in entries if e["kind"] == "restriction"}
+    if (not snap or snap.get("basis") != basis or snap.get("restrictions") != restrictions
+            or ((added or retired) and now - float(snap.get("at") or 0) >= float(c.get("memory_refresh_s", 3300)))):
         chosen = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
-        snap = {"at": now, "basis": basis, "entries": live, "shown": [e["name"] for e in chosen],
+        snap = {"at": now, "basis": basis, "entries": live, "restrictions": restrictions,
+                "shown": [e["name"] for e in chosen],
                 "text": "\n".join(e["line"] for e in chosen)}
         p.db.set_kv(MEMORY_SNAPSHOT_KEY, snap)
         added, retired = [], []

@@ -65,7 +65,18 @@ class Claude(Provider):
     # Measured (CLI 2.1.285, its system prompt and latest messages): three on a run's first call and
     # four on every later one (after a tool result or a schema retry). A user block's own mark on top
     # made those later calls fail with a 400 (found 5), losing the turn.
-    own_cache_breakpoints = 4
+    @property
+    def own_cache_breakpoints(self) -> int:
+        # Captured with CLI 2.1.296 against a local API stub: three marks on eight
+        # requests, including tool results and schema retries; four with our mark.
+        # 2.1.285 used four itself. This is evidence for this build, not an install
+        # pin or an assumption about future builds. Unmeasured builds reserve all
+        # four until their request shape is checked, avoiding a turn-losing 400.
+        # Resolve a versioned executable symlink so an auto-update changes the probe key.
+        binary = self.binary()
+        version = cli_output(str(Path(binary).resolve()) if binary else "claude", "--version").strip()
+        return 3 if version == "2.1.296 (Claude Code)" else MAX_CACHE_BREAKPOINTS
+
     login_hint = "run `claude` there and use /login"
     efforts = ("low", "medium", "high", "xhigh", "max")
     steer_hook = True   # worker_settings() routes PostToolUse through ttp.hook
@@ -149,7 +160,8 @@ class Claude(Provider):
         # call that changed only the last block read the first from the cache; without the mark it
         # missed). Its lifetime must match the CLI's (a longer one may not follow a shorter one), so it
         # is only set together with cache_env(ttl). The mark counts against own_cache_breakpoints.
-        if ttl not in CACHE_TTLS or not self.supports(INPUT_FORMAT):
+        if (ttl not in CACHE_TTLS or self.own_cache_breakpoints >= MAX_CACHE_BREAKPOINTS
+                or not self.supports(INPUT_FORMAT)):
             return None
         blocks = cap_cache_breakpoints(
             [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral", "ttl": ttl}},
@@ -255,6 +267,9 @@ class Claude(Provider):
         # One API message streams as several events (one per content block), each repeating its
         # usage: count every message id once, at its highest reading.
         per_msg: dict[str, dict[str, int]] = {}
+        reported: dict[str, set[str]] = {}
+        cache_keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        cache_complete = False
         for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
             if t == "rate_limit_event":
@@ -265,7 +280,10 @@ class Claude(Provider):
             elif t == "assistant":
                 msg = ev.get("message") or {}
                 us = msg.get("usage") or {}
-                seen = per_msg.setdefault(str(msg.get("id") or f"event-{n}"), {})
+                ident = str(msg.get("id") or f"event-{n}")
+                seen = per_msg.setdefault(ident, {})
+                reported.setdefault(ident, set()).update(k for k in cache_keys
+                                                        if isinstance(us.get(k), int) and us[k] >= 0)
                 for k in USAGE_KEYS:
                     seen[k] = max(seen.get(k, 0), int(us.get(k) or 0))
                 for block in msg.get("content") or []:
@@ -277,6 +295,7 @@ class Claude(Provider):
             elif t == "result":
                 saw_result = True
                 usage = ev.get("usage") or {}
+                cache_complete = all(isinstance(usage.get(k), int) and usage[k] >= 0 for k in cache_keys)
                 u.cost_usd = float(ev.get("total_cost_usd") or 0.0)
                 u.input_tokens = int(usage.get("input_tokens") or 0)
                 u.output_tokens = int(usage.get("output_tokens") or 0)
@@ -295,6 +314,11 @@ class Claude(Provider):
             u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens = (
                 sum(m[k] for m in per_msg.values()) for k in USAGE_KEYS)
             u.estimated = True
+            cache_complete = bool(per_msg) and all(set(cache_keys) <= keys for keys in reported.values())
+        # CLI turns/message IDs are not HTTP request counts (retries can be hidden).
+        # Keep missing request metadata unknown rather than inventing a denominator.
+        u.extra["cache_telemetry"] = {"complete": cache_complete, "requests": None,
+                                      "source": "result" if saw_result else "messages"}
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
                 u.auth_failed = True
