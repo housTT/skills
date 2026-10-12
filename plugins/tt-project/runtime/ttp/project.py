@@ -101,14 +101,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # once no probe has said unreachable for the debounce (netwait.py)
                 "unreachable_alert_s": 900, "unreachable_debounce_s": 600,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
-                "on_pass_timeout_s": 600},
+                "on_pass_timeout_s": 600,
+                # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores
+                # used under under_frac of the request, or an unused device, over window_s is under-use
+                # (one job_underuse event; the next check comes within check_cap_s)
+                "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800}},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.
     # runners: serial device-job runners by name, each {"host", "dir", "health", "drop_check", ...}
     # (devq.RUNNER_DEFAULTS); tasks queue device jobs on one with `ttp devq submit` instead of each
     # running its own detached driver. Empty: none, and workers keep the detached-driver path.
-    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6},
+    # nodes: globs of the device files a job opens to use the device (Linux), so a detached job of a
+    # task holding the device that opens none of them counts as leaving it unused (jobuse.py).
+    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": []},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);

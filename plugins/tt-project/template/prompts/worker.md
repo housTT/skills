@@ -227,7 +227,9 @@ never write to a run folder named in earlier context):
   `retry_after_s` that fits it.
 - Anything still running when you stop must be detached from your session
   (`ttp detach <name> -- <cmd>`, which writes `<name>.log` and `<name>.rc` in your run folder and
-  prints the `retry_when`), or it is killed with you. Use `ttp detach` on this host, not `setsid`
+  prints the `retry_when`), or it is killed with you. Add `--cores N` / `--devices N` when the command
+  does not show them (`-j N`): a job that leaves most of them idle is flagged and checked early.
+  Use `ttp detach` on this host, not `setsid`
   (some hosts, such as macOS, have none); `setsid nohup` is only for remote Linux hosts over ssh.
   Your own background tasks do not outlive the run.
 - Keep runs short: a run re-reads its whole context on every call. When the work is more than one

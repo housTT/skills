@@ -48793,3 +48793,206 @@ def test_live_after_push_keeps_ordinary_temp_after_batch_supervisor_dies(env, tm
                 os.kill(after_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+# ---- detached jobs: requested vs used (jobuse.py) ----
+
+_JOB_USE = {"sample_s": 60.0, "window_s": 900.0, "under_frac": 0.25, "check_cap_s": 1800.0}
+
+
+def test_a_detached_jobs_request_is_read_from_its_flags_command_and_environment():
+    from ttp import jobuse
+    assert jobuse.requested(["make", "-j8", "all"], {}) == {"cores": 8}
+    assert jobuse.requested(["sh", "-c", "build --threads 4 && run --jobs=6"], {}) == {"cores": 6}
+    assert jobuse.requested(["python", "x.py"], {"OMP_NUM_THREADS": "12"}) == {"cores": 12}
+    assert jobuse.requested(["make"], {"MAKEFLAGS": "-j 3"}) == {"cores": 3}
+    assert jobuse.requested(["make", "-j8"], {}, cores=2, devices=1, mem_gb=16) == \
+        {"cores": 2, "devices": 1, "mem_gb": 16.0}
+    assert jobuse.requested(["sleep", "60"], {}) == {}
+
+
+def _feed(jobuse, req, cores_used, minutes, start=0.0, st=None, dev=None):
+    """Samples every minute of a job using `cores_used` cores; returns the state and how many fired."""
+    fired, cpu = 0, 0.0
+    for i in range(minutes + 1):
+        now = start + 60.0 * i
+        st, fire = jobuse.assess(st, {"cpu": cpu, "start": "S", "dev": dev}, req, now, _JOB_USE)
+        fired += fire
+        cpu += 60.0 * cores_used
+    return st, fired
+
+
+def test_an_under_used_job_fires_once_per_stretch_and_normal_use_never():
+    from ttp import jobuse
+    st, fired = _feed(jobuse, {"cores": 8}, 1.0, 40)
+    assert fired == 1 and st["under"] and "asked for 8 cores, used 1" in st["why"]
+    assert "UNDER-USED" in jobuse.line({"cores": 8}, st) and "used 1 cores" in jobuse.line({"cores": 8}, st)
+    _, fired = _feed(jobuse, {"cores": 8}, 1.0, 14)
+    assert fired == 0, "under-use must last the whole window before it counts"
+    st, fired = _feed(jobuse, {"cores": 8}, 7.0, 40)
+    assert fired == 0 and "under" not in st and st["used"] == 7
+    _, fired = _feed(jobuse, {"cores": 1}, 0.0, 40)
+    assert fired == 0, "a single-core request is never judged"
+    _, fired = _feed(jobuse, {}, 0.0, 40)
+    assert fired == 0
+
+
+def test_an_under_use_stretch_that_ends_lets_the_next_one_fire_again():
+    from ttp import jobuse
+    st, fired = _feed(jobuse, {"cores": 8}, 1.0, 20)
+    assert fired == 1
+    # Busy for a while: the window average climbs back over the line and the stretch ends.
+    cpu, now = st["ring"][-1][1], st["ring"][-1][0]
+    for _ in range(20):
+        now, cpu = now + 60, cpu + 60 * 8
+        st, fire = jobuse.assess(st, {"cpu": cpu, "start": "S", "dev": None}, {"cores": 8}, now, _JOB_USE)
+        assert not fire
+    assert "under" not in st
+    for _ in range(20):
+        now, cpu = now + 60, cpu + 30
+        st, fire = jobuse.assess(st, {"cpu": cpu, "start": "S", "dev": None}, {"cores": 8}, now, _JOB_USE)
+        fired += fire
+    assert fired == 2
+
+
+def test_a_held_device_no_job_process_opens_is_under_use_and_unmeasured_devices_never_fire():
+    from ttp import jobuse
+    st, fired = _feed(jobuse, {"devices": 1}, 0.0, 20, dev=0)
+    assert fired == 1 and "no process of it opened one" in st["why"] and "no device open" in jobuse.line({"devices": 1}, st)
+    st, fired = _feed(jobuse, {"devices": 1}, 0.0, 20, dev=1)
+    assert fired == 0 and "device in use" in jobuse.line({"devices": 1}, st)
+    st, fired = _feed(jobuse, {"devices": 1}, 0.0, 20, dev=None)
+    assert fired == 0 and "device unmeasured" in jobuse.line({"devices": 1}, st)
+
+
+def test_a_job_that_cannot_be_sampled_shows_unmeasured_and_never_fires():
+    from ttp import jobuse
+    st = None
+    for i in range(30):
+        st, fire = jobuse.assess(st, None, {"cores": 8}, 60.0 * i, _JOB_USE)
+        assert not fire
+    assert jobuse.line({"cores": 8}, st) == "asked 8 cores; use unmeasured (cannot sample here)"
+    assert jobuse.sample(2 ** 22 + 12345) is None, "a pid that is gone samples as unmeasured"
+    # A reused pid (another start) or a long gap starts the window over instead of judging across it.
+    st, _ = _feed(jobuse, {"cores": 8}, 1.0, 10)
+    st2, fire = jobuse.assess(st, {"cpu": 0.0, "start": "T", "dev": None}, {"cores": 8}, 11 * 60.0, _JOB_USE)
+    assert not fire and len(st2["ring"]) == 1
+
+
+def test_ps_cputime_parses():
+    from ttp import jobuse
+    assert jobuse._clock("0:01.50") == 1.5
+    assert jobuse._clock("75:00.00") == 4500
+    assert jobuse._clock("1-02:00:00") == 86400 + 7200
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_sampling_reads_the_cpu_time_of_the_jobs_own_process_tree():
+    from ttp import jobuse
+    proc = subprocess.Popen([sys.executable, "-c", "import time\nt=time.time()\nwhile time.time()-t<0.5: pass\n"
+                             "time.sleep(30)"], start_new_session=True)
+    try:
+        time.sleep(0.8)
+        got = jobuse.sample(proc.pid)
+        assert got and got["cpu"] >= 0.3 and got["start"] and got["dev"] is None
+        assert jobuse.sample(proc.pid, ["/nonexistent/dev*"])["dev"] == 0
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _job_of_waiting_task(p, tid, requested, next_in=3.7 * 3600):
+    """Task tid waits on a detached job of its run that looks alive (its job lock held)."""
+    from ttp import locks
+    run_dir = p.runs / f"job-{tid}"
+    run_dir.mkdir(parents=True)
+    rc = run_dir / "build.rc"
+    (run_dir / "build.started").write_text(f"{os.getpid()}\n")
+    (run_dir / "detached.json").write_text(json.dumps([{"name": "build", "rc": str(rc), "log": str(run_dir / "build.log"),
+                                                        "requested": requested}]))
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 1200, time.time() - 1100, "ok", str(run_dir)))
+    now = time.time()
+    p.db.update_task(tid, not_before=now + next_in, result=json.dumps(
+        {"status": "waiting", "summary": "building", "retry_after_s": next_in, "retry_when": "exit 1",
+         "waiting_since": now - 1100}))
+    lock = locks.try_take([locks.job_lock(rc)], "detached job build", "make -j8")
+    assert lock is not None
+    return rc, lock
+
+
+def test_the_daemon_flags_an_under_used_job_once_and_pulls_its_next_check_in(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    from ttp.cli import status_text
+    from ttp.prompts import worker_task
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        now = time.time()
+        cpu = {"v": 100.0}
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": cpu["v"], "start": "S", "dev": None})
+        # Sampled from 16 min ago at 0 CPU-seconds: 100 s since is about 0.1 of 8 cores.
+        p.db.set_kv(jobuse.KV, {str(rc): {"task": tid, "name": "build", "req": {"cores": 8},
+                                          "st": {"ring": [[now - 960, 0.0], [now - 60, 95.0]], "start": "S",
+                                                 "since": now - 960}}})
+        d = dmod.Daemon(p.base)
+        d.sample_jobs()
+        ev = p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))
+        assert len(ev) == 1 and "asked for 8 cores" in ev[0]["text"] and ev[0]["status"] == "queued"
+        t = p.db.task(tid)
+        assert t["not_before"] <= time.time() + 1800 + 1, "the long check was not pulled in"
+        assert json.loads(t["result"])["underuse_wake"]
+        assert "job build: asked 8 cores; used 0.1 cores (UNDER-USED)" in status_text(p)
+        # Later samples in the same stretch raise nothing more and leave the check alone.
+        p.db.update_task(tid, not_before=time.time() + 3 * 3600)
+        cpu["v"] = 130.0
+        d._jobs_sampled = 0
+        d.sample_jobs()
+        assert len(p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))) == 1
+        assert p.db.task(tid)["not_before"] > time.time() + 2 * 3600
+        # The pulled-in check wakes a worker even though the job's probe still says not yet.
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        assert _ready(p, tid)
+        assert "under-uses what it asked for" in worker_task(p, p.db.task(tid), str(p.root), None)
+    finally:
+        lock.close()
+
+
+def test_the_daemon_leaves_a_job_using_its_request_alone(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        now = time.time()
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 960.0 * 7, "start": "S", "dev": None})
+        p.db.set_kv(jobuse.KV, {str(rc): {"st": {"ring": [[now - 960, 0.0], [now - 60, 900.0 * 7]], "start": "S",
+                                                  "since": now - 960}}})
+        before = p.db.task(tid)["not_before"]
+        dmod.Daemon(p.base).sample_jobs()
+        assert not p.db.q("SELECT * FROM events WHERE kind='job_underuse'")
+        assert p.db.task(tid)["not_before"] == before
+        assert "used 7 cores" in p.db.kv(jobuse.KV)[str(rc)]["line"]
+    finally:
+        lock.close()
+    # Once the job ended, its entry goes.
+    rc.write_text("0\n")
+    d = dmod.Daemon(p.base)
+    d.sample_jobs()
+    assert p.db.kv(jobuse.KV) == {}
+
+
+def test_ttp_detach_records_what_the_job_asked_for(env, tmp_path):
+    p = make(env)
+    run_dir = tmp_path / "runs" / "7"
+    run_dir.mkdir(parents=True)
+    r = subprocess.run([sys.executable, str(TTP), "detach", "--cores", "8", "--mem-gb", "4", "job", "--",
+                        "sleep", "30"], env={**os.environ, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(p.base)},
+                       cwd=str(p.root), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    job = json.loads((run_dir / "detached.json").read_text())[0]
+    assert job["requested"] == {"cores": 8, "mem_gb": 4.0}
+    if job["pid"]:
+        os.killpg(job["pid"], signal.SIGKILL)

@@ -960,6 +960,7 @@ def status_text(p: Project) -> str:
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now, tz)}: {t['title']}" + (f" — {why}" if why else ""))
+        lines += [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]]
     for t in h["deferred"][:5]:
         lines.append(f"  #{t['id']} deferred, {t['starts']}: {t['title']}")
     if h["undelivered"]:
@@ -2089,7 +2090,7 @@ def cmd_detach(a) -> None:
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py)."""
-    from . import detach
+    from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
     from .runner import boot_id
@@ -2147,7 +2148,9 @@ def cmd_detach(a) -> None:
         jobs = []
     jobs = jobs if isinstance(jobs, list) else []
     jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
-                 "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300]})
+                 "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
+                 "requested": jobuse.requested(cmd, os.environ, getattr(a, "cores", None),
+                                               getattr(a, "devices", None), getattr(a, "mem_gb", None))})
     durable_write(reg, json.dumps(jobs, indent=1))
     how = (f"(pid {pid})" if pid else
            "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
@@ -4155,6 +4158,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
+    s.add_argument("--cores", type=int, help="cores the job is meant to keep busy (default: read from -j N, "
+                   "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
+    s.add_argument("--devices", type=int, help="devices the job is meant to use")
+    s.add_argument("--mem-gb", type=float, help="memory the job asked for (recorded only)")
     s.add_argument("name", nargs="?")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_detach)

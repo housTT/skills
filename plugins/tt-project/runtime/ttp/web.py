@@ -530,7 +530,9 @@ def state_payload(p: Project, db: DB) -> dict:
     # The dependency graph and start/retry conditions, so outside tools need not infer them.
     unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
     asks = waits.open_asks(db)
+    job_use = db.kv("job_use", {}) or {}
     for t in tasks:
+        t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])

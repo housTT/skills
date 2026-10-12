@@ -1,0 +1,223 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Whether a detached job (`ttp detach`) uses what it asked for.
+
+`ttp detach` records the job's request in detached.json: cores (`--cores`, else read from the command:
+-j N, --jobs N, --threads N, --workers N, OMP_NUM_THREADS), devices (`--devices`) and memory
+(`--mem-gb`, recorded only). A task holding a device lock (`device.locks`) asks for the device too.
+
+The daemon samples each running job of a live task, model-free, every `sample_s`: the CPU time of
+the job's own process tree (its wrapper's pid in <name>.started and that pid's descendants; Linux
+/proc, macOS ps over the wrapper's process group) and, with `device.nodes` globs set (Linux), the
+device nodes the tree holds open. Nothing outside the job's tree is measured. Averaged over
+`window_s`, cores used under `under_frac` of the request, or a requested device that no process of
+the job held open for the whole window, is under-use: the stretch is recorded on the task (kv
+`job_use`, shown by `ttp status` and the web app), raises one `job_underuse` event per stretch, and
+pulls the task's next check in to at most `check_cap_s` away (one worker check per stretch). Where
+sampling is unavailable the job shows as unmeasured and nothing fires.
+"""
+from __future__ import annotations
+
+import glob
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+KV = "job_use"
+DEFAULTS = {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800}
+MIN_CORES = 2   # a single-core request is never judged: an idle wait on one core is no waste
+
+_CORES = [re.compile(r"(?:^|\s)-j\s*(\d+)\b"), re.compile(r"--(?:jobs|threads|workers|parallel)[= ](\d+)\b")]
+
+
+def settings(cfg: dict) -> dict:
+    got = ((cfg.get("waiting") or {}).get("job_use") or {})
+    return {k: float(got.get(k, v)) for k, v in DEFAULTS.items()}
+
+
+def requested(cmd: list, env: dict, cores: int | None = None, devices: int | None = None,
+              mem_gb: float | None = None) -> dict:
+    """What a job asks for: explicit values win; cores are else read from its command or environment."""
+    if cores is None:
+        text = " ".join(map(str, cmd))
+        found = [int(m) for rx in _CORES for m in rx.findall(text)]
+        for var in ("OMP_NUM_THREADS",):
+            if str(env.get(var) or "").isdigit():
+                found.append(int(env[var]))
+        mk = re.search(r"-j\s*(\d+)", str(env.get("MAKEFLAGS") or ""))
+        if mk:
+            found.append(int(mk.group(1)))
+        cores = max(found) if found else None
+    out = {}
+    if cores:
+        out["cores"] = int(cores)
+    if devices:
+        out["devices"] = int(devices)
+    if mem_gb:
+        out["mem_gb"] = float(mem_gb)
+    return out
+
+
+def root_pid(job: dict) -> int | None:
+    """The job's wrapper pid: <name>.started, which the wrapper writes as it starts, else the launcher's record."""
+    try:
+        return int(Path(job["rc"]).with_suffix(".started").read_text().strip())
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        return int(job.get("pid") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _stat(pid: int) -> list[str] | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def _children(pid: int) -> list[int] | None:
+    kids = []
+    try:
+        for t in Path(f"/proc/{pid}/task").iterdir():
+            kids += [int(x) for x in (t / "children").read_text().split()]
+    except (OSError, ValueError):
+        return None
+    return kids
+
+
+def _tree(pid: int) -> list[int] | None:
+    seen, todo = [], [pid]
+    while todo:
+        cur = todo.pop()
+        if cur in seen:
+            continue
+        kids = _children(cur)
+        if kids is None:
+            if cur == pid:
+                return None
+            continue   # ended meanwhile
+        seen.append(cur)
+        todo += kids
+    return seen
+
+
+def _clock(s: str) -> float:
+    """ps's cputime, [dd-][hh:]mm:ss[.ss], in seconds."""
+    days, _, rest = s.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part)
+    return total + (int(days) * 86400 if days else 0)
+
+
+def sample(pid: int, nodes: list | None = None) -> dict | None:
+    """The job tree's CPU seconds so far (`cpu`), its root's start (`start`, to tell a reused pid) and,
+    with device globs on Linux, how many device nodes it holds open (`dev`, else None). None when
+    this platform cannot be sampled or the root is gone."""
+    if Path("/proc/self/stat").exists():
+        st = _stat(pid)
+        pids = _tree(pid) if st else None
+        if not st or not pids:
+            return None
+        cpu, dev = 0.0, set() if nodes else None
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        wanted = {os.path.realpath(x) for g in nodes or [] for x in glob.glob(g)}
+        for q in pids:
+            f = _stat(q)
+            if f:   # utime, stime, cutime, cstime: reaped children count in their parent
+                cpu += sum(int(x) for x in f[11:15]) / hz
+            if dev is not None:
+                try:
+                    for fd in Path(f"/proc/{q}/fd").iterdir():
+                        try:
+                            target = os.readlink(fd)
+                        except OSError:
+                            continue
+                        if target in wanted:
+                            dev.add(target)
+                except OSError:
+                    pass
+        return {"cpu": cpu, "start": st[19], "dev": None if dev is None else len(dev)}
+    if sys.platform == "darwin":
+        try:   # -S counts each process's exited children in its time
+            out = subprocess.run(["ps", "-A", "-S", "-o", "pgid=,lstart=,pid=,time="], capture_output=True,
+                                 text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        cpu, start = 0.0, None
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 8 or f[0] != str(pid):
+                continue
+            try:
+                cpu += _clock(f[-1])
+            except ValueError:
+                continue
+            if f[-2] == str(pid):
+                start = "_".join(f[1:6])
+        return {"cpu": cpu, "start": start, "dev": None} if start else None
+    return None
+
+
+def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict) -> tuple[dict, bool]:
+    """Fold one sample into a job's state; True when an under-use stretch begins (fire once).
+
+    state: `ring` of [t, cpu] over the last window, `start` (root's start), `used` (cores, window
+    average), `dev_seen` (last time a device node was open), `since` (first sample), `under`
+    (the stretch's start or absent), `why`, `unmeasured`."""
+    st = dict(state or {})
+    if got is None:
+        st.update(unmeasured=True, ring=[])
+        st.pop("under", None)
+        return st, False
+    win = s["window_s"]
+    ring = st.get("ring") or []
+    if st.get("start") != got["start"] or (ring and (now - ring[-1][0] > win or got["cpu"] < ring[-1][1])):
+        ring, st = [], {}   # a new process under that pid, a long gap (host asleep) or a lost tree: start over
+    st.pop("unmeasured", None)
+    st.setdefault("since", now)
+    st["start"] = got["start"]
+    ring = [r for r in ring if now - r[0] <= win + 2 * s["sample_s"]] + [[now, got["cpu"]]]
+    st["ring"] = ring
+    full = [r for r in ring if now - r[0] >= win]
+    base = full[-1] if full else None
+    if base and now > base[0]:
+        st["used"] = round((got["cpu"] - base[1]) / (now - base[0]), 2)
+    if got.get("dev"):
+        st["dev_seen"] = now
+    if got.get("dev") is not None:
+        st["dev_measured"] = True
+    why = []
+    cores = req.get("cores") or 0
+    if base and cores >= MIN_CORES and st.get("used") is not None and st["used"] < s["under_frac"] * cores:
+        why.append(f"asked for {cores} cores, used {st['used']:g} on average over {win / 60:g} min")
+    if req.get("devices") and got.get("dev") is not None and now - max(st.get("dev_seen") or 0, st["since"]) >= win:
+        why.append(f"holds {req['devices']} device(s) but no process of it opened one in {win / 60:g} min")
+    if not why:
+        st.pop("under", None)
+        st.pop("why", None)
+        return st, False
+    st["why"] = "; ".join(why)
+    if "under" in st:
+        return st, False
+    st["under"] = now
+    return st, True
+
+
+def line(req: dict, st: dict | None) -> str:
+    """One short line: requested vs used."""
+    asked = ", ".join(x for x in (f"{req['cores']} cores" if req.get("cores") else "",
+                                  f"{req['devices']} device(s)" if req.get("devices") else "",
+                                  f"{req['mem_gb']:g} GB" if req.get("mem_gb") else "") if x) or "nothing stated"
+    st = st or {}
+    if st.get("unmeasured"):
+        return f"asked {asked}; use unmeasured (cannot sample here)"
+    used = [f"{st['used']:g} cores" if st.get("used") is not None else "cores: measuring"]
+    if req.get("devices"):
+        used.append("device in use" if st.get("dev_seen") else
+                    "no device open" if st.get("dev_measured") else "device unmeasured")
+    return f"asked {asked}; used {', '.join(used)}" + (" (UNDER-USED)" if st.get("under") else "")

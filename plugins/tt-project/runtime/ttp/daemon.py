@@ -52,6 +52,7 @@ from . import identity
 from . import idlecap
 from . import integrity
 from . import jevuse
+from . import jobuse
 from . import landed
 from . import localspend
 from . import locks
@@ -409,6 +410,7 @@ class Daemon:
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
+        self._jobs_sampled = 0.0   # sample_jobs' last pass
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
         self._mute_ends = pauseends.MuteEnds(self.p, log=lambda m: log(self.p, m))   # observation mutes' end_when
@@ -702,7 +704,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -5202,6 +5204,9 @@ class Daemon:
         """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
         "not yet". True when a probe must run before that can be decided."""
         tid = task["id"]
+        if prev.get("underuse_wake"):   # sample_jobs pulled this check in: a worker looks at the job
+            self._wake_waiting(task, f"its detached job under-uses what it asked for: {prev['underuse_wake']}", now)
+            return False
         max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
         since = float(prev["waiting_since"])
         rc, at, _ = self._probe_rc.get(tid, (None, 0.0, ""))
@@ -5234,6 +5239,67 @@ class Daemon:
             self.p.db.update_task(tid, not_before=now + PROBE_TIMEOUT_S)
             return tid not in self._probes
         return False
+
+    def sample_jobs(self) -> None:
+        """Detached jobs of live tasks: what each asked for against what it uses (jobuse.py), model-free,
+        every `waiting.job_use.sample_s`. An under-use stretch is recorded (kv job_use), raises one
+        `job_underuse` event and pulls its waiting task's next check in to `check_cap_s` away."""
+        s, now = jobuse.settings(self.cfg), time.time()
+        if now - self._jobs_sampled < s["sample_s"]:
+            return
+        self._jobs_sampled = now
+        db = self.p.db
+        nodes = [str(x) for x in (self.cfg.get("device") or {}).get("nodes") or []]
+        old, new = db.kv(jobuse.KV, {}) or {}, {}
+        for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running')"):
+            for r in db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL AND started>? ORDER BY id DESC",
+                          (t["id"], now - 7 * 86400)):
+                for j in _detached_jobs(Path(r["dir"])):
+                    rc = Path(j["rc"])
+                    if rc.exists() or locks.any_free([locks.job_lock(rc)]):
+                        continue   # ended, or not started yet
+                    req = dict(j.get("requested") or {})
+                    if not req.get("devices") and needs_device(t, self.cfg):
+                        req["devices"] = 1   # the task holds the device while the job runs
+                    pid = jobuse.root_pid(j)
+                    was = old.get(str(rc)) or {}
+                    st, fire = jobuse.assess(was.get("st"), jobuse.sample(pid, nodes) if pid else None, req, now, s)
+                    entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
+                    if was.get("pulled") and was.get("pulled") == st.get("under"):
+                        entry["pulled"] = was["pulled"]
+                    new[str(rc)] = entry
+                    if fire:
+                        self._underuse_event(t, entry, now, s)
+                    if st.get("under") and "pulled" not in entry and self._pull_check(t["id"], st["why"], now, s):
+                        entry["pulled"] = st["under"]
+        if new or old:
+            db.set_kv(jobuse.KV, new)
+
+    def _underuse_event(self, task: dict, entry: dict, now: float, s: dict) -> None:
+        db, st = self.p.db, entry["st"]
+        fp = f"job_underuse:{task['id']}:{entry['name']}:{st['under']:.0f}"
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now, "daemon", "job_underuse", fp, "normal",
+              f"#{task['id']} {task['title']}: its detached job {entry['name']} {st['why']} ({entry['line']}). "
+              f"Its next check comes within {s['check_cap_s'] / 60:g} min. Decide: let it run, or have it "
+              f"restarted with what it really uses so the cores or device go to other work.", "queued", task["id"]))
+        log(self.p, f"task {task['id']} job {entry['name']} under-used: {st['why']}")
+
+    def _pull_check(self, tid: int, why: str, now: float, s: dict) -> bool:
+        """Bring a waiting task's next check to at most check_cap_s away; that check wakes a worker.
+        False while the task is not waiting on a timer (running: its hand-off is still to come)."""
+        db = self.p.db
+        with db.tx():
+            t = db.task(tid) or {}
+            prev = load_result(t.get("result"))
+            if t.get("status") != "queued" or prev.get("status") != "waiting" or (t.get("not_before") or 0) <= now:
+                return False
+            nb = min(float(t["not_before"]), now + s["check_cap_s"])
+            db.update_task(tid, not_before=nb, result=dump_result({**prev, "underuse_wake": why[:300]}))
+        log(self.p, f"task {tid} next check pulled in to {timefmt.short(nb, self.p)}: its job under-uses its request")
+        return True
 
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
         """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""

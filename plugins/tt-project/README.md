@@ -328,7 +328,12 @@ prolonged whole-box outage.
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
   without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote its
-  exit code or its process is gone. `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
+  exit code or its process is gone. `ttp detach` records what the job asks for (`--cores`, `--devices`,
+  `--mem-gb`, else `-j N`-style flags in its command); the daemon samples the CPU time of the job's own
+  process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux), and a job using under
+  a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
+  `job_underuse` event and brings its task's next check within `check_cap_s`. `ttp status` and the web
+  app show requested vs used per job ("unmeasured" where it cannot sample). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc exists or the driver is gone (pid dead, or that host's boot id changed), 1 while it
