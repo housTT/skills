@@ -46406,6 +46406,54 @@ def test_budget_fingerprint_debounces_flapping_readings():
     assert bk.observe(db, "claude", {"account": "", "kind": "unknown", "windows": []}, t + 3 * bk.MIN_GAP_S) is None
 
 
+def test_budget_fingerprint_adopts_a_first_known_account_or_kind_silently():
+    """A baseline taken before the provider's first run (kind unknown, no account label) is
+    completed by the first known reading: no pending change, no event."""
+    from ttp import budgetkind as bk
+    from ttp.db import DB
+    import tempfile
+    from pathlib import Path
+    db = DB(Path(tempfile.mkdtemp()) / "t.db")
+    t = 1.8e9
+    plan = {"account": "h1", "kind": "plan", "windows": ["five_hour", "seven_day"]}
+    assert bk.observe(db, "claude", {"account": "", "kind": "unknown", "windows": []}, t) is None
+    for dt in (0, bk.DEBOUNCE_S + 1, bk.MIN_GAP_S + bk.DEBOUNCE_S + 2):
+        assert bk.observe(db, "claude", plan, t + 10 + dt) is None
+    st = db.kv(bk.KV + "claude")
+    assert st["parts"] == plan and not st.get("pending"), st
+    # an empty account becomes known, same kind
+    billed = {"account": "", "kind": "billed", "windows": [], "caps": {"daily_usd": 100.0}}
+    assert bk.observe(db, "codex", billed, t) is None
+    for dt in (0, bk.DEBOUNCE_S + 1, bk.MIN_GAP_S + bk.DEBOUNCE_S + 2):
+        assert bk.observe(db, "codex", {**billed, "account": "h1"}, t + 10 + dt) is None
+    st = db.kv(bk.KV + "codex")
+    assert st["parts"]["account"] == "h1" and not st.get("pending"), st
+    # a known part that differs after that is still a change
+    assert bk.observe(db, "codex", {**billed, "account": "h2"}, t + 2 * bk.MIN_GAP_S) is None
+    assert bk.observe(db, "codex", {**billed, "account": "h2"}, t + 2 * bk.MIN_GAP_S + bk.DEBOUNCE_S)
+    assert not bk._switched({"account": "", "kind": "unknown"}, {"account": "h1", "kind": "plan"})
+
+
+def test_a_new_providers_first_run_is_no_budget_change(env, monkeypatch):
+    """A new project's provider starts with an unknown budget; its first finished run makes the
+    kind known. That wakes nobody and keeps a real usage-limit pause."""
+    from ttp import budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["kind"] == "unknown"
+    now = time.time()
+    p.db.set_kv("limited:fake", {"until": now + 3600, "note": "usage limit"})
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',1)",
+           (ACCT_BILLED, now - 900, now - 600))
+    _bk_tick(d, monkeypatch)
+    assert _bk_events(p) == []
+    assert float(p.db.kv("limited:fake")["until"]) > now and p.db.kv("limited:fake")["note"] == "usage limit"
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["kind"] == "billed"
+
+
 def test_budget_change_never_shows_the_account_in_clear(env, monkeypatch):
     """The account label (an email, an organization) is only ever kept as a hash: not in the state,
     the event, the feed or the daemon log."""

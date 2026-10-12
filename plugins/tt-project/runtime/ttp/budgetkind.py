@@ -12,7 +12,9 @@ fingerprint of:
   either a window reading or a finished run;
 - the plan's window set (a tier change reports other windows);
 - the dollar caps in force (billed only: on a plan they hold nothing).
-An unknown part (no account label yet, kind unknown) is no change: it takes the known one.
+An unknown part (no account label yet, kind unknown) is no change, in either direction: a new
+reading's unknown part takes the stored one, and a stored unknown part adopts the first known one
+silently (a new project's provider before its first run).
 
 The fingerprint is kept per provider in the state (KV), so a restart is no change and a change
 while the daemon was down is caught on the first update after it. The first fingerprint ever seen
@@ -93,6 +95,25 @@ def _merge(old: dict, new: dict) -> dict:
     return out
 
 
+def _adopt(old: dict, new: dict) -> dict:
+    """`old` with its unknown parts taken from `new`: the first known account or kind completes the
+    baseline, it is no change."""
+    out = dict(old)
+    if not out.get("account") and new.get("account"):
+        out["account"] = new["account"]
+    if out.get("kind") in (None, "unknown") and new.get("kind") not in (None, "unknown"):
+        out.pop("caps", None)
+        out.update({k: new[k] for k in ("kind", "windows", "caps") if k in new})
+    return out
+
+
+def _switched(old: dict, new: dict) -> bool:
+    """Another account or budget kind, both known before and after."""
+    return bool(old.get("account") and new.get("account") and old["account"] != new["account"]) or (
+        old.get("kind") not in (None, "unknown") and new.get("kind") not in (None, "unknown")
+        and old["kind"] != new["kind"])
+
+
 def plan_resets(gate: Any) -> list[float]:
     """When the gate's plan windows reset: a deferral to one of these waits for the old plan."""
     return sorted(float(r["resets_at"]) for r in gate.numbers.get("plan") or [] if r.get("resets_at"))
@@ -110,6 +131,11 @@ def observe(db: DB, provider: str, new: dict, now: float | None = None, resets: 
         db.set_kv(KV + provider, {"parts": new, "ts": now, "emitted": 0, "resets": mine})   # the baseline
         return None
     new = _merge(old, new)
+    base = _adopt(old, new)
+    if base != old:   # the baseline's unknown parts became known: adopt them silently
+        old = base
+        st = {**st, "parts": base, "resets": mine or st.get("resets") or []}
+        db.set_kv(KV + provider, st)
     if new == old:   # the current budget: keep its windows' resets; a pending change fell back (a flap)
         if st.get("pending") or (mine and st.get("resets") != mine):
             db.set_kv(KV + provider, {**st, "pending": None, "resets": mine or st.get("resets") or []})
@@ -188,7 +214,7 @@ def release(db: DB, cfg: dict, provider: str, old: dict, new: dict, now: float,
     from .db import without_deferral
     from .schedule import budget_skipped
     released = []
-    switched = old.get("account") != new.get("account") or old.get("kind") != new.get("kind")
+    switched = _switched(old, new)
     if switched:
         lim = db.kv(f"limited:{provider}") or {}
         if float(lim.get("until") or 0) > now and lim.get("note") != "logged out":
