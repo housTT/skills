@@ -26,11 +26,12 @@ attached after an earlier owner ended) opens the next episode, and once no owner
 Milestones have stable keys, absolute due times and evidence_required. The coordinator adds them on
 its obligation action; an owner records a checked milestone with `ttp obligation receipt <id>
 "<evidence>" --milestone <key>`, leaving the obligation open. A missing milestone receipt at its due
-time raises one durable high episode, even with fresh owner progress or a healthy heartbeat. Each
-open obligation also needs an owner able to advance it (coverage: running, queued and startable by
-dispatch, or in review or pushing with a linked review, fix or push approval that advances); an uncovered
-episode ends once one is unblocked or attached. An episode that ends (coverage back, a receipt, a drop,
-no owner late) retires its still-queued event, so the coordinator is not woken for it. Status and the web app show the next deadline in the project's home time zone.
+time raises one durable high episode, even with fresh owner progress or a healthy heartbeat. A milestone
+episode that ends (its receipt, the obligation's receipt, a drop) retires its still-queued event, so the
+coordinator is not woken for it. Status and the web app show the next deadline in the project's home time zone.
+Known gap: nothing checks whether an owner can advance the obligation, so one whose owners all wait or
+stall is caught only by the 2 h progress rule (or a milestone falling due). A daemon-side coverage check
+was dropped: it took ordinary waits, backoffs and review stacks for stuck owners and woke the coordinator.
 
 A mistaken or no longer wanted obligation is withdrawn with `ttp obligation drop <id> "<why>"`.
 """
@@ -175,7 +176,7 @@ def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> s
         if o.get("dropped"):
             return f"{oid} was already dropped"
         o["dropped"] = {"at": now, "by": by, "why": why}
-        _retire(p.db, now, "obligation dropped", prefix=f"obligation:{oid}:")
+        _retire(p.db, now, "obligation dropped", prefix=f"obligation:{oid}:milestone:")
         p.db.set_kv(KV, st)
     return f"{oid} dropped; it is no longer owed"
 
@@ -292,7 +293,7 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             msg = f"progress on {oid} recorded for #{task}"
         else:
             o["receipt"] = {"at": now, "task": task, "evidence": evidence}
-            _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:")
+            _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
             msg = f"{oid} has its receipt; it is no longer owed"
         p.db.set_kv(KV, st)
     return msg
@@ -371,70 +372,6 @@ def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str])
               f"have the owner record progress or its receipt.")
 
 
-def _eligible(db, t: dict, now: float, cfg: dict, paused: dict) -> bool:
-    """Whether dispatch may start this queued task: due, deferred by no probe, its dependencies met, and
-    no active hold (project or resource pause, closed gate, logged out, a daemon-managed `held:` note).
-    Any other blocked_reason on a queued task (a retry, an interrupted run, a finished wait) is a note."""
-    from . import alerts
-    from .coordinator import task_resources
-    from .db import deferral
-    from .refwaits import HELD_NOTES
-    if db.kv("paused") or float(t.get("not_before") or 0) > now or deferral(t).get("when"):
-        return False
-    if str(t.get("blocked_reason") or "").startswith(HELD_NOTES) or db.unmet_dependencies([t])[t["id"]]:
-        return False
-    provider = t.get("provider") or cfg.get("core_provider") or "claude"
-    gate = (db.kv("gates", {}) or {}).get(provider) or {}
-    return gate.get("allow_new_work", True) and not task_resources(t) & paused.keys() \
-        and alerts.breaker(db, provider) is None
-
-
-def _pushing(db, t: dict, paused: dict) -> bool:
-    """Whether a task waiting as 'pushing' has an approval the push queue can still push: a row approved
-    or in a batch, on a push resource not paused, and not held for a tip that failed its checks."""
-    from . import pushq
-    from .push import lock_name
-    rows = db.q("SELECT id, target FROM push_queue WHERE task=? AND status IN ('approved','batched')", (t["id"],))
-    held = set((db.kv(pushq.KV) or {}).get("hold", {}).get("rows") or [])
-    return any(r["id"] not in held and "push" not in paused and lock_name(*r["target"].split("/", 1)) not in paused
-               for r in rows if "/" in r["target"])
-
-
-def _advancing(db, t: dict, now: float, cfg: dict, paused: dict, seen: set) -> bool:
-    """Whether a task can advance its work now: it runs, it is a queued task dispatch may start, it waits
-    as 'pushing' on a live approval, or it waits in 'review' on a linked review or fix that advances."""
-    from .db import continues_id, dependency_ids, reviews_task
-    if t["id"] in seen:
-        return False
-    seen.add(t["id"])
-    if t["status"] == "running":
-        return True
-    if t["status"] == "queued":
-        return _eligible(db, t, now, cfg, paused)
-    if t["status"] == "pushing":
-        return _pushing(db, t, paused)
-    if t["status"] != "review":
-        return False
-    linked = [r for r in db.q("SELECT * FROM tasks WHERE id>? AND status IN ('queued','running','pushing') "
-                              "ORDER BY id", (t["id"],))
-              if continues_id(r) == t["id"] or (r["kind"] == "review" and (
-                  t["id"] in dependency_ids(r) or reviews_task(r, t)))]
-    return any(_advancing(db, r, now, cfg, paused, seen) for r in linked)
-
-
-def coverage(db, o: dict, now: float, cfg: dict | None = None) -> list[int]:
-    """Owners that can advance it, using stored task, gate, hold and push-queue facts; no probes or
-    dispatch mutations."""
-    cfg = cfg or {}
-    paused = db.paused_resources()
-    available = []
-    for tid in o["owners"]:
-        t = db.task(int(tid))
-        if t and _advancing(db, t, now, cfg, paused, set()):
-            available.append(int(tid))
-    return available
-
-
 def _evidence(o: dict) -> str:
     parts = []
     for tid, own in o["owners"].items():
@@ -462,30 +399,10 @@ def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None) -> b
     return True
 
 
-def _check_deadlines_and_coverage(p, o: dict, now: float, raised: list[str]) -> bool:
+def _check_milestones(p, o: dict, now: float, raised: list[str]) -> bool:
     from . import timefmt
     changed = False
     closed = o["receipt"] or o.get("dropped")
-    cov = o.setdefault("coverage", {"episode": 0, "raised": None})
-    if closed or coverage(p.db, o, now, p.config()):
-        if cov["raised"] is not None:
-            _retire(p.db, now, "covered again" if not closed else "obligation closed",
-                    f"obligation:{o['id']}:uncovered:{cov['episode']}")
-            cov["raised"] = None
-            changed = True
-    elif cov["raised"] is None:
-        cov["episode"] += 1
-        cov["raised"] = now
-        changed = True
-        fp = f"obligation:{o['id']}:uncovered:{cov['episode']}"
-        statuses = "; ".join(f"#{tid} ({(p.db.task(int(tid)) or {}).get('status', 'gone')})"
-                             for tid in o["owners"]) or "no owner task is attached"
-        text = (f"Obligation {o['id']} is uncovered: {o['text']}\nOwners: {statuses}. "
-                f"Every owner is stuck or held. Last evidence: {_evidence(o)}. "
-                "Unblock or attach an owner that can advance the deliverable.")
-        task = int(next(iter(o["owners"]))) if o["owners"] else None
-        if _raise(p.db, now, fp, "obligation_uncovered", text, task):
-            raised.append(fp)
     for m in (o.get("milestones") or {}).values():
         if closed or m["receipt"]:
             if m["raised"] is not None:
@@ -519,14 +436,12 @@ def check(p, now: float | None = None) -> list[str]:
         st = _load(db)
         changed = False
         for o in st["items"].values():
-            changed = _check_deadlines_and_coverage(p, o, now, raised) or changed
+            changed = _check_milestones(p, o, now, raised) or changed
             late = overdue(o, now)
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
             if not late:
                 if o.get("raised") or o.get("covered"):
-                    if o.get("raised"):
-                        _retire(p.db, now, "no owner is late", f"obligation:{o['id']}:{o['episode']}")
                     o["raised"], o["covered"] = None, []   # the stall is over: a later one is a new episode
                     changed = True
                 continue
@@ -568,9 +483,6 @@ def lines(db, now: float | None = None, where=None) -> list[str]:
                 f"#{t} {(now - _last(w)) / 3600:.1f} h"
                 + (" OVERDUE" if t in late else "") for t, w in sorted(o["owners"].items(), key=lambda kv: int(kv[0])))
             state = "owed; " + (f"owners: {owners}" if owners else "no owner attached" + (" OVERDUE" if late else ""))
-            cfg = where if isinstance(where, dict) else where.config() if where is not None else {}
-            active = coverage(db, o, now, cfg)
-            state += "; " + ("covered by " + ", ".join(f"#{t}" for t in active) if active else "uncovered")
             pending = [m for m in (o.get("milestones") or {}).values() if not m["receipt"]]
             if pending:
                 m = min(pending, key=lambda m: (m["due"], m["key"]))

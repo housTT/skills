@@ -179,7 +179,7 @@ function healthHtml(h) {
     (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +
     (h.health ? `<div class="row"><span class="${/ [1-9]\d* failing/.test(h.health) ? "pill lv-red" : "meta"}">${esc(h.health)}</span></div>` : "") +
     (h.coverage ? `<div class="row"><span class="${/missing:/.test(h.coverage) ? "pill lv-yellow" : "meta"}">${esc(h.coverage)}</span></div>` : "") +
-    (h.obligations || []).map((line) => `<div class="row"><span class="${/uncovered|OVERDUE/.test(line) ? "pill lv-yellow" : "meta"}">${esc(line)}</span></div>`).join("") +
+    (h.obligations || []).map((line) => `<div class="row"><span class="${/OVERDUE/.test(line) ? "pill lv-yellow" : "meta"}">${esc(line)}</span></div>`).join("") +
     (h.upstream ? `<div class="row"><span class="meta">${esc(h.upstream)}</span></div>` : "") +
     (h.resources_paused || []).map((r) =>
     `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");

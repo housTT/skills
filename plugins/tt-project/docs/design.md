@@ -96,6 +96,12 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
   raises one `wait_stale` event. A daemon-side version was dropped: it moved the end on every
   re-wait, sent the note again each time and matched project names too loosely.
 
+- Obligations have no owner-coverage check: one whose owners all wait or stall (a waiting hand-off,
+  a resource backoff, a review or fix stack that stopped moving) is caught only by the 2 h
+  durable-progress rule, or by a milestone falling due. A daemon-side check of whether some owner
+  could advance it was dropped: it took ordinary waits, backoffs and review and fix stacks for stuck
+  owners and raised high events that woke the coordinator.
+
 ## Why the coordinator is tool-less
 
 A default headless Claude Code run carries tens of thousands of tokens of built-in context. A
