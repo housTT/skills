@@ -11,6 +11,14 @@ Each line starts with the message id: `[#<id> coordinator] <text>`.
   connection that dropped comes back on the next listen.
 - A message can therefore arrive twice. Skip ids you have already shown.
 
+## Remote projects and dropped connections
+
+- For a project on another machine the listener runs there over ssh. A dropped connection is
+  retried (5 s, doubling to 2 min) until it is back; each message prints once per listener.
+- With `--once`, a batch that arrived before a drop ends the listener normally (exit 0).
+- Exit codes: `0` messages shown or `--timeout` reached; `2` the project refused it (unknown chat
+  or project); `75` still unreachable when `--timeout` ran out (nothing is lost: start it again).
+
 ## Claude Code
 
 - Run in the background: `ttp listen <name> --chat <id> --once --ack <last id shown>`.

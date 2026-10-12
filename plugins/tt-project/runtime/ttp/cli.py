@@ -70,13 +70,58 @@ def remote_hosts() -> list[str]:
                    if isinstance(e, dict) and e.get("host") and e["host"] != here})
 
 
+LISTEN_GAVE_UP = 75   # `ttp listen --timeout` on another machine: still unreachable when the timeout ran out
+_MSG_LINE = re.compile(r"\[#(\d+) ")
+
+
+def _dropped(rc: int) -> bool:
+    """True if a forwarded command ended because the connection did, not by its own exit.
+
+    ssh exits 255 when it fails. A status of 128 or more is a signal ending the session (the far
+    side's shell, a shared ssh connection, the network stack): `ttp listen` itself exits only
+    0, 1 or 2. Below 0, ssh here was killed by a signal."""
+    return rc == 255 or rc >= 128 or rc < 0
+
+
+def _listen_timeout(argv: list[str]) -> float:
+    for i, a in enumerate(argv):
+        v = a.split("=", 1)[1] if a.startswith("--timeout=") else (argv[i + 1] if a == "--timeout" and i + 1 < len(argv) else None)
+        if v is not None:
+            try:
+                return float(v)
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _with_timeout(argv: list[str], left: float) -> list[str]:
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--timeout":
+            skip = True
+        elif not a.startswith("--timeout="):
+            out.append(a)
+    return out + [f"--timeout={max(left, 1.0):.0f}"]
+
+
 def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int:
     """A remote listener outlives network drops: a laptop changes networks, sleeps and wakes.
 
-    ssh failing (255) means this machine lost the path, not that the project stopped, so wait and
-    reconnect. The listener left on the far side exits on its own once its session is gone, and
-    the new one replaces it if it has not yet. Each (re)connect first sends what is queued here.
+    A dropped connection (see _dropped) means this machine lost the path, not that the project
+    stopped, so wait (5 s, doubling to 2 min) and reconnect. The listener left on the far side
+    exits on its own once its session is gone, and the new one replaces it if it has not yet.
+    Each (re)connect first sends what is queued here. A message is printed once per listener:
+    one shown before a drop is not shown again after the reconnect, and with --once, a batch that
+    arrived before the drop ends the listener (exit 0) like a clean finish. Acknowledging stays
+    with --ack, so nothing a reader missed is lost. With --timeout, it stops retrying once the
+    timeout has run out and exits LISTEN_GAVE_UP; every other exit is the far side's own.
     """
+    once = "--once" in argv
+    limit = _listen_timeout(argv)
+    deadline = time.time() + limit if limit > 0 else None
+    shown: set[int] = set()
     delay, told, held = 5.0, False, False
     while True:
         failed = flush_outbox(name, entry, quiet=held) if name else None
@@ -86,35 +131,73 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
                 _unreachable(entry, failed.stderr)
             rc = 255
         else:
-            rc = forward(entry, argv, quiet=told)
-        if rc != 255:
+            left = deadline - time.time() if deadline else 0
+            rc = forward(entry, _with_timeout(argv, left) if deadline and told else argv, quiet=told, shown=shown)
+            if _dropped(rc) and rc != 255 and not told:     # forward() already explained a 255
+                _unreachable(entry, None, rc)
+        if not _dropped(rc):
             return rc
+        if once and shown:
+            return 0        # the batch got here before the drop; --ack picks up from it
+        if deadline and time.time() + delay >= deadline:
+            print(f"ttp: still cannot reach {entry.get('ssh') or entry['host']} and --timeout ran out; "
+                  f"stopping (exit {LISTEN_GAVE_UP}). Nothing is lost: unacknowledged messages come "
+                  f"back on the next listen", file=sys.stderr)
+            return LISTEN_GAVE_UP
         if not told:
-            print("ttp: will keep retrying and deliver messages once the connection is back", file=sys.stderr)
+            until = " until --timeout runs out" if deadline else ""
+            print(f"ttp: will keep retrying{until} and deliver messages once the connection is back",
+                  file=sys.stderr)
             told = True
         time.sleep(delay)
         delay = min(delay * 2, 120.0)
 
 
-def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+def _ssh_cmd(entry: dict, argv: list[str]) -> list[str]:
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     cmd = " ".join(shlex.quote(a) for a in [remote_ttp, *argv])
     host = entry.get("ssh") or entry["host"]
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd],
-                          stdin=subprocess.DEVNULL if capture else None,
+    # Keepalives: a connection that died quietly (a laptop asleep, a changed network) ends within
+    # about a minute instead of hanging until TCP gives up.
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4", host, cmd]
+
+
+def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(_ssh_cmd(entry, argv), stdin=subprocess.DEVNULL if capture else None,
                           stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE, text=True)
 
 
-def _unreachable(entry: dict, stderr: str | None) -> None:
+def _ssh_relay(entry: dict, argv: list[str], shown: set[int]) -> subprocess.CompletedProcess:
+    """Run argv there, passing its output through line by line, minus messages already in `shown`
+    (a message line starts `[#<id> `; the lines after it belong to it)."""
+    with tempfile.TemporaryFile("w+") as err:
+        proc = subprocess.Popen(_ssh_cmd(entry, argv), stdout=subprocess.PIPE, stderr=err, text=True)
+        skip = False
+        for line in proc.stdout:
+            m = _MSG_LINE.match(line)
+            if m:
+                skip = int(m.group(1)) in shown
+                shown.add(int(m.group(1)))
+            if not skip:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        rc = proc.wait()
+        err.seek(0)
+        return subprocess.CompletedProcess(proc.args, rc, None, err.read())
+
+
+def _unreachable(entry: dict, stderr: str | None, rc: int = 255) -> None:
     host = entry.get("ssh") or entry["host"]
-    why = ((stderr or "").strip().splitlines() or ["unknown ssh error"])[-1]
+    why = ((stderr or "").strip().splitlines() or [f"ssh exit {rc}" if rc != 255 else "unknown ssh error"])[-1]
     print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
           f"try again once this machine is back on that network.", file=sys.stderr)
 
 
-def forward(entry: dict, argv: list[str], quiet: bool = False) -> int:
-    """Run this same command on the project's machine, streaming its output."""
-    r = _ssh(entry, argv)
+def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] | None = None) -> int:
+    """Run this same command on the project's machine, streaming its output. With `shown` (a
+    listener), message lines already printed are not printed again."""
+    r = _ssh(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
     if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
         if not quiet:
             _unreachable(entry, r.stderr)
@@ -3894,11 +3977,18 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--client-id", help=argparse.SUPPRESS)   # set by a forwarding machine; resends are skipped
     s.set_defaults(fn=cmd_say)
 
-    s = sub.add_parser("listen", help="print messages for a chat as they arrive")
+    s = sub.add_parser("listen", help="print messages for a chat as they arrive", description=(
+        "Print messages for a chat as they arrive. For a project on another machine the listen runs "
+        "there over ssh; a dropped connection (ssh exit 255, or a signal ending the session) is "
+        "retried after 5 s, doubling to 2 min, and each message is printed once per listener. "
+        "Exit codes: 0 messages shown (--once) or --timeout reached; 2 the project refused it "
+        "(unknown chat or project); 75 the project stayed unreachable until --timeout ran out; "
+        "any other code is the project's own ttp failing."))
     s.add_argument("name")
     s.add_argument("--chat", required=True)
     s.add_argument("--once", action="store_true", help="exit after the first batch")
-    s.add_argument("--timeout", type=float, default=0)
+    s.add_argument("--timeout", type=float, default=0,
+                   help="stop after this many seconds (0: never); also bounds reconnecting")
     s.add_argument("--ack", type=int, metavar="ID",
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
     s.set_defaults(fn=cmd_listen)

@@ -8689,11 +8689,125 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli
     results = iter([255, 255, 0])
     calls, naps = [], []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: calls.append(quiet) or next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(quiet) or next(results))
     monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
     assert calls == [False, True, True], "the unreachable message should print once, not on every retry"
     assert naps == [5.0, 10.0]
+
+
+class _Session:
+    """A fake `ssh HOST CMD` for a listener: prints `lines`, writes `err` to its stderr, exits `rc`."""
+    def __init__(self, args, lines, rc, err, kw):
+        self.args, self.stdout, self.returncode = args, iter(lines), rc
+        kw["stderr"].write(err)
+
+    def wait(self):
+        return self.returncode
+
+
+def _ssh_sessions(monkeypatch, cwd, sessions, calls):
+    """Each ssh call takes the next of `sessions`: (lines, rc, stderr) is a fake session; "real"
+    (or none left) runs CMD here in `cwd`, as the project's machine would."""
+    real = subprocess.Popen
+
+    def popen(args, **kw):
+        if args[0] != "ssh":
+            return real(args, **kw)
+        calls.append(args[-1])
+        s = sessions.pop(0) if sessions else "real"
+        if s == "real":
+            return real(["bash", "-c", args[-1]], cwd=cwd, **kw)
+        return _Session(args, *s, kw)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+
+_BROKEN_PIPE = "client_loop: send disconnect: Broken pipe\n"
+
+
+def test_remote_listen_once_ack_reconnects_after_an_ssh_drop_and_acks_once(env, monkeypatch, capsys):
+    """The reported bug: `ttp listen --once --ack N` forwarded over ssh said "will keep retrying"
+    after a broken pipe and then exited. It reconnects, shows the new reply once and acks only N."""
+    from ttp import cli
+    from ttp.project import register
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    old = p.db.post("out", "already shown", chat="c1", kind="reply")
+    new = p.db.post("out", "fresh reply", chat="c1", kind="reply")
+    entry = {"host": "far", "dir": str(env["repo"])}
+    register("demo", entry)
+    monkeypatch.chdir(env["tmp"])
+    calls, naps = [], []
+    _ssh_sessions(monkeypatch, env["repo"], [([], 255, _BROKEN_PIPE)], calls)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
+    argv = ["listen", "demo", "--chat", "c1", "--once", "--ack", str(old), "--timeout", "20"]
+    assert cli.forward_listen(entry, argv, "demo") == 0
+    out, err = capsys.readouterr()
+    assert len(calls) == 2 and naps == [5.0], (calls, naps)
+    assert "Broken pipe" in err and err.count("will keep retrying until --timeout runs out") == 1, err
+    assert out.count(f"[#{new} ") == 1 and "fresh reply" in out and "already shown" not in out, out
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == old, \
+        "only --ack marks messages read; the reconnect neither lost nor acknowledged the new reply"
+
+
+@pytest.mark.parametrize("rc", [255, 144, -13])
+def test_remote_listen_once_that_got_its_batch_before_the_drop_ends_cleanly(env, monkeypatch, capsys, rc):
+    """A batch printed before the connection dropped is delivered: no reconnect, no second copy."""
+    from ttp import cli
+    calls = []
+    _ssh_sessions(monkeypatch, env["tmp"], [(["[#7 coordinator] hi\n", "second line\n"], rc, _BROKEN_PIPE)], calls)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: pytest.fail("reconnected after the batch arrived"))
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
+    assert capsys.readouterr().out == "[#7 coordinator] hi\nsecond line\n" and len(calls) == 1
+
+
+@pytest.mark.parametrize("rc", [255, 144, -15])
+def test_streaming_remote_listener_reconnects_on_any_dropped_session_and_shows_each_message_once(env, monkeypatch, capsys, rc):
+    from ttp import cli
+    calls, naps = [], []
+    _ssh_sessions(monkeypatch, env["tmp"], [
+        (["[#7 coordinator] hi\n", "more of 7\n"], rc, _BROKEN_PIPE),
+        (["[#7 coordinator] hi\n", "more of 7\n", "[#8 demo (alert, high)] x\n"], 0, ""),
+    ], calls)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    out, err = capsys.readouterr()
+    assert out == "[#7 coordinator] hi\nmore of 7\n[#8 demo (alert, high)] x\n", out
+    assert len(calls) == 2 and naps == [5.0] and err.count("will keep retrying and deliver") == 1, err
+
+
+def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, monkeypatch, capsys):
+    """`--timeout` bounds a forwarded listen: it stops retrying with the documented exit code and
+    says so, instead of promising a retry. A reconnect asks only for the time that is left."""
+    from ttp import cli
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "time", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    calls = []
+    _ssh_sessions(monkeypatch, env["tmp"], [([], 255, _BROKEN_PIPE)] * 3, calls)
+    entry = {"host": "far", "dir": "/x"}
+    assert cli.LISTEN_GAVE_UP == 75
+    assert cli.forward_listen(entry, ["listen", "demo", "--chat", "c1", "--once", "--timeout", "1"]) == 75
+    err = capsys.readouterr().err
+    assert "will keep retrying" not in err and "--timeout ran out; stopping (exit 75)" in err, err
+    assert len(calls) == 1
+    calls.clear()
+    assert cli.forward_listen(entry, ["listen", "demo", "--chat", "c1", "--timeout=12"]) == 75
+    err = capsys.readouterr().err
+    assert err.count("will keep retrying until --timeout runs out") == 1 and "(exit 75)" in err, err
+    assert calls[0].endswith("--timeout=12") and calls[1].endswith("--timeout=7"), calls
+    assert len(calls) == 2
+
+
+def test_remote_listen_exit_of_its_own_is_passed_through_not_retried(env, monkeypatch, capsys):
+    from ttp import cli
+    calls = []
+    _ssh_sessions(monkeypatch, env["tmp"], [([], 2, "ttp: unknown chat c9; run `ttp connect demo` first\n")], calls)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: pytest.fail("retried the far side's own refusal"))
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c9"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown chat c9" in err and "retrying" not in err and len(calls) == 1
 
 
 def _flaky_ssh(monkeypatch, cwd, codes, calls):
@@ -8799,7 +8913,7 @@ def test_remote_listener_sends_the_outbox_on_every_reconnect(env, monkeypatch):
     flushes = iter([failed, None])
     calls = []
     monkeypatch.setattr(cli, "flush_outbox", lambda name, entry, quiet=False: calls.append(("flush", name)) or next(flushes))
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: calls.append(("listen", quiet)) or 0)
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(("listen", quiet)) or 0)
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
     assert calls == [("flush", "demo"), ("flush", "demo"), ("listen", True)]
@@ -8834,7 +8948,7 @@ def test_a_stuck_queued_message_does_not_keep_the_listener_away(env, monkeypatch
     from ttp import cli, outbox
     _stuck_outbox(cli, outbox, monkeypatch, 127)
     results, naps = iter([255, 0]), []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: next(results))
     def nap(s):
         naps.append(s)
         assert len(naps) < 3, "the listener backs off on the stuck message instead of connecting"
