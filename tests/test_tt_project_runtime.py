@@ -6613,8 +6613,8 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
 
 def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_stance(env):
     """One coarse rule (_overlaps) for the guard and the lint: two rules overlap when they share what
-    they do and what to. Actor, condition, negation, scope and clause order are not read, so a new
-    ban, a lift said as no objection, a lift after a ban word in the same sentence and an allowance
+    they do and what to. Actor, condition, scope and clause order are not read (a negated permit,
+    "can't", is read as a ban), so a new ban said with a permit word, a lift said as no objection, a lift after a ban word in the same sentence and an allowance
     for another actor are all flagged (one resend with `both_hold` settles a false hit). Rules about
     another action or another target are not."""
     p = make(env)
@@ -6643,7 +6643,7 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
              "No objection to workers pushing to their own branch, but never to main.")
     cases = ([(b, t) for b in (short, long) for t in lifts]
              + [(short, t) for t in ("No worker may push to main.", "Nobody may push to main.",
-                                     "Workers can't push to main.", "No problem if workers never push to main.")]
+                                     "No problem if workers never push to main.")]
              + [("Workers must not push.", "The coordinator may push to the work branch."),
                 ("Never tell workers to push.", "The coordinator may push to the work branch."),
                 ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."),
@@ -6655,6 +6655,10 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
         if coord._PERMIT_RE.search(text):   # the lint pairs the sentence that permits
             assert [(f, a in text) for f, a in lint(ban, text)] == [(ban, True)], (ban, text)
+    # A negated permit is a ban ("can't", "can never"): a new ban lifts nothing, so it goes in on the
+    # user's word alongside the item, with a note naming it.
+    err = guard(short, "Workers can't push to main.", 79)
+    assert err == [] and "Workers can't push to main." in p.charter_path.read_text()
     # Clearly unrelated rules pass and pair with nothing.
     for k, text in enumerate(("Allow the web app to show spend per task.", "Never delete release tags.",
                               "Workers may run the tests on their own branch.", "No problem if workers run the tests.",
@@ -7104,13 +7108,20 @@ def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(e
     line = next(x for x in d.splitlines() if x.startswith("## Charter sections"))
     assert line.endswith("1. Restrictions (binding on every task) · 2. Goals · 3. Restrictions (added 2026-10-01, "
                          "turn 3.0) · 4. Restrictions (added 2026-10-02, turn 5.0)"), line
+    # Every form the digest's line shows works, its "N. Heading" entry too (a replayed refusal matched 0).
     for k, name in enumerate(("## Restrictions (added 2026-10-02, turn 5.0)", "`restrictions (added 2026-10-02, "
-                              "turn 5.0)`", "4.")):
+                              "turn 5.0)`", "4.", "4", "4. Restrictions (added 2026-10-02, turn 5.0)")):
         p.charter_path.write_text(RESTR_CHARTER)
         assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "replaces": name,
                                 "text": "Never delete tags."}], turn=30 + k, user_turn=True) == [], name
         charter = p.charter_path.read_text()
         assert "Never delete release tags." not in charter and "Never delete tags." in charter
+    # A number whose heading disagrees names no section by number.
+    p.charter_path.write_text(RESTR_CHARTER)
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "replaces":
+                           "3. Restrictions (added 2026-10-02, turn 5.0)", "text": "Never delete tags."}],
+                      turn=40, user_turn=True)
+    assert len(err) == 1 and "matches 0 charter sections" in err[0], err
 
 
 def test_lifting_a_restriction_merges_the_restrictions_sections_into_one_block(env):

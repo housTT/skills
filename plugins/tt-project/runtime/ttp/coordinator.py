@@ -3614,13 +3614,17 @@ def _merge_restrictions(sections: list[tuple[str, list[str]]], log: list[str],
 
 def _replaces_hits(sections: list[tuple[str, list[str]]], replaces: str) -> list[int]:
     """The sections `replaces` names: its number, its full heading (as the charter or the digest's
-    heading line shows it, with or without `## ` or quotes), else every heading it starts."""
+    heading line shows it, with or without `## ` or quotes, or as that line lists it: "7. Heading"),
+    else every heading it starts."""
     want = " ".join(replaces.strip().strip("\"'`").lstrip("#").split()).lower()
     names = [" ".join(h[3:].split()) for h, _ in sections]
     headed = [i for i, n in enumerate(names) if n]
     if want.rstrip(".").isdigit():
         k = int(want.rstrip("."))
         return [headed[k - 1]] if 0 < k <= len(headed) else []
+    listed = re.match(r"(\d+)[.)]\s+(.+)", want)
+    if listed and 0 < int(listed[1]) <= len(headed) and names[headed[int(listed[1]) - 1]].lower() == listed[2]:
+        return [headed[int(listed[1]) - 1]]   # the number and heading agree, as the digest lists them
     return ([i for i in headed if names[i].lower() == want]
             or [i for i in headed if want and names[i].lower().startswith(want)])
 
