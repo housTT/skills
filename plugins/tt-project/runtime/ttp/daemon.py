@@ -5186,9 +5186,10 @@ class Daemon:
 
     def _poll_on_pass(self, now: float) -> None:
         """Settle finished (or overdue) on_pass commands. Exit 0 with a result.json at $TTP_RESULT that
-        says done with a summary is the task's hand-off, recorded through the normal finish (review and
-        push queue as usual) without a model run. Anything else wakes the task as any passed probe
-        does, with the command's exit and the end of its output."""
+        says done or needs_review with a summary is the task's hand-off, recorded through the normal
+        finish (review and push queue as usual) without a model run. A non-zero exit or a timeout wakes
+        the task at once at its own tier; anything else wakes it as any passed probe does. Either way
+        the wake carries the command's exit and the end of its output."""
         db = self.p.db
         for tid, (proc, started, timeout, out, run_id, cmd) in list(self._on_pass.items()):
             rc = proc.poll()
@@ -5218,8 +5219,8 @@ class Daemon:
                 why = f"exit {rc}"
             elif not isinstance(result, dict):
                 why = "exit 0 but no result.json at $TTP_RESULT"
-            elif result.get("status") != "done":
-                why = f"its result.json says {str(result.get('status'))[:40]!r}, not done"
+            elif result.get("status") not in ("done", "needs_review"):
+                why = f"its result.json says {str(result.get('status'))[:40]!r}, not done or needs_review"
             else:
                 why = on_pass_problem(result)
             if not why and r:
@@ -5227,11 +5228,16 @@ class Daemon:
                 self._probe_rc.pop(tid, None)
                 with db.tx():
                     self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
-                log(self.p, f"task {tid} on_pass_cmd recorded done model-free")
+                log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")
                 continue
             log(self.p, f"task {tid} on_pass_cmd did not record done: {why or 'its run is gone'}")
+            # A command that failed or overran is a real failure a light wake could only pass on:
+            # wake at the task's own tier, as failed checks do.
+            failed = rc is None or rc != 0
+            tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
             self._wake_waiting(task, f"probe passed; its on_pass_cmd did not record done "
-                                     f"({why or 'its run is gone'}); the end of its output:\n{tail}", now)
+                                     f"({why or 'its run is gone'}); the end of its output:\n{tail}", now,
+                               extra={"wake_tier": tier, "escalated_wake": True} if failed else None)
 
     def _sweep_on_pass_notes(self, now: float) -> None:
         """File the notes an on_pass_cmd queued that no settle filed (a daemon restarted while it ran,

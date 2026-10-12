@@ -21906,7 +21906,6 @@ _TO_RESULT = ' > "$TTP_RESULT"'
     ("""printf '{"status":"done","summary":"s"}'""" + _TO_RESULT + "; echo boom; exit 3", "exit 3"),
     ("echo nothing written", "no result.json"),
     ("""printf '{"status":"waiting","summary":"s"}'""" + _TO_RESULT, "not done"),
-    ("""printf '{"status":"needs_review","summary":"s"}'""" + _TO_RESULT, "not done"),
     ("""printf '{"status":"done"}'""" + _TO_RESULT, "no summary"),
     ("""printf '{"status":"done","summary":"s","retry_when":"true"}'""" + _TO_RESULT, "cannot carry"),
     ("""printf 'not json'""" + _TO_RESULT, "no result.json"),
@@ -21931,7 +21930,43 @@ def test_an_on_pass_cmd_that_does_not_record_done_wakes_the_task(env, monkeypatc
     assert "its on_pass_cmd did not record done" in res["woke"] and why in res["woke"], res["woke"]
     if "boom" in cmd:
         assert "boom" in worker_task(p, task, str(p.root), None)
+    from ttp import budget as bud
+    failed = why in ("exit 3", "timed out")
+    assert bool(res.get("escalated_wake")) == failed and res.get("wake_tier") == ("standard" if failed else None), res
+    assert bud.wake_tier(task["tier"], res) == ("standard" if failed else "light")
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+@pytest.mark.parametrize("tier, wake", [("deep", "deep"), ("light", "light"), ("bogus", "standard")])
+def test_a_failed_on_pass_cmd_wakes_the_task_at_its_own_tier(env, monkeypatch, tmp_path, tier, wake):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, "echo tests failed; exit 1")
+    p.db.x("UPDATE tasks SET tier=? WHERE id=?", (tier, tid))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], res)
+    assert "exit 1" in res["woke"] and "tests failed" in res["woke"], res["woke"]
+    assert res["wake_tier"] == wake and res["escalated_wake"] is True, res
+
+
+def test_an_on_pass_cmd_that_records_needs_review_is_the_hand_off_without_a_model_run(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, "printf '{\"status\":\"needs_review\",\"summary\":\"job verified, "
+                                             "please review\"}' > \"$TTP_RESULT\"")
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert res.get("run_status") == "model-free" and res["summary"] == "job verified, please review", res
+    assert "woke" not in res and task["status"] != "queued", (task["status"], res)
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+    assert "on_pass_cmd recorded needs_review model-free" in (p.logs / "daemon.log").read_text()
 
 
 def test_an_on_pass_cmd_runs_only_for_the_hand_off_the_task_waits_on(env, monkeypatch, tmp_path):
