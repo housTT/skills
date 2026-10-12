@@ -71,7 +71,7 @@ def asks_for(task_id: int, open_asks: list[dict]) -> list[dict]:
 def _from_reason(reason: str) -> tuple[str, str]:
     """(kind, detail) from a blocked_reason the daemon writes; a worker's own words go to the
     coordinator, which decides or asks the user."""
-    from .daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE
+    from .daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE, WORKSPACE_RETRY_NOTE
     r = reason.strip()
     if r.startswith(PAUSED_NOTE):
         what = r[len(PAUSED_NOTE):].split("; it starts once resumed")[0].strip()
@@ -91,6 +91,8 @@ def _from_reason(reason: str) -> tuple[str, str]:
         return "budget", "its budget is above the dollar cap"
     if r.startswith("interrupted by"):
         return "time", "the restart to finish (it resumes)"
+    if r.startswith(WORKSPACE_RETRY_NOTE):
+        return "time", "a retry of its workspace (it retries by itself)"
     if r.startswith("workspace:"):
         return "coordinator", "a workspace fix: " + r[len("workspace:"):].strip()
     # A dead dependency, a host-reboot loop, a refused push, a worker's question: the coordinator's.

@@ -16633,8 +16633,115 @@ def test_a_task_blocked_on_its_workspace_drops_its_reservation(env, monkeypatch)
         raise RuntimeError("worktree add failed")
     monkeypatch.setattr(d, "_workdir_for", broken)
     d.dispatch()
-    assert p.db.task(task["id"])["status"] == "blocked"
-    assert locks.reserved_by(mark) is None, "a task blocked on its workspace still held its reservation"
+    assert p.db.task(task["id"])["status"] == "queued" and p.db.task(task["id"])["not_before"] > time.time()
+    assert locks.reserved_by(mark) is None, "a task waiting to retry its workspace still held its reservation"
+
+
+def _timed_out_add(monkeypatch, worktree, after):
+    """Replay `git worktree add` timing out on a loaded host: the first add runs, `after(path)` leaves
+    what the killed git left behind, then it raises TimeoutExpired; later adds run normally."""
+    from pathlib import Path
+    real, calls = worktree._git, []
+
+    def git(cwd, *args, **kw):
+        out = real(cwd, *args, **kw)
+        if args[:2] == ("worktree", "add"):
+            calls.append(args)
+            if len(calls) == 1:
+                after(Path(args[-2]))
+                raise subprocess.TimeoutExpired(["git", *args], 120)
+        return out
+    monkeypatch.setattr(worktree, "_git", git)
+    return calls
+
+
+def _half_made(path):
+    """What a `git worktree add` killed during its checkout leaves: locked "initializing", no index."""
+    from pathlib import Path
+    _git_out(path, "worktree", "lock", "--reason", "initializing", str(path))
+    Path(_git_out(path, "rev-parse", "--absolute-git-dir"), "index").unlink()
+
+
+def test_a_timed_out_workspace_add_that_made_a_whole_worktree_is_reused(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("slow add", "s", kind="code", tier="light", origin="user"))
+    lock = lambda path: _git_out(path, "worktree", "lock", "--reason", "initializing", str(path))  # noqa: E731
+    calls = _timed_out_add(monkeypatch, worktree, lock)
+    path, branch = worktree.ensure(p, task)
+    assert len(calls) == 1, "a whole worktree a timed-out add left was made again"
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert _git_out(path, "rev-parse", "HEAD") == _git_out(p.root, "rev-parse", worktree.resolve_base(p))
+    assert "locked" not in _git_out(p.root, "worktree", "list", "--porcelain"), "the reused worktree stayed locked"
+    assert worktree.ensure(p, task) == (path, branch)
+
+
+def test_a_half_made_workspace_is_removed_and_made_again(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("slow checkout", "s", kind="code", tier="light", origin="user"))
+    calls = _timed_out_add(monkeypatch, worktree, _half_made)
+    path, branch = worktree.ensure(p, task)
+    assert len(calls) == 2 and calls[1][2] == "-B", "the branch left with nothing of its own was not remade"
+    assert _git_out(path, "status", "--porcelain") == "" and _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert "locked" not in _git_out(p.root, "worktree", "list", "--porcelain")
+
+
+def test_a_half_made_workspace_never_deletes_a_branch_with_its_own_commits(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("retried", "s", kind="code", tier="light", origin="user"))
+    path, branch = worktree.ensure(p, task)
+    (path / "work.txt").write_text("step 1")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "step 1")
+    head = _git_out(path, "rev-parse", "HEAD")
+    _git_out(p.root, "worktree", "remove", str(path))
+    calls = _timed_out_add(monkeypatch, worktree, _half_made)
+    assert worktree.ensure(p, task) == (path, branch)
+    assert [c[2] for c in calls] == [str(path), str(path)], "a branch with its own commits was reset"
+    assert _git_out(path, "rev-parse", "HEAD") == head and (path / "work.txt").read_text() == "step 1"
+
+
+def test_the_workspace_git_timeout_grows_with_the_hosts_load(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    monkeypatch.setattr(worktree.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(worktree.os, "getloadavg", lambda: (2.0, 0, 0))
+    assert worktree.git_timeout(p) == 120
+    monkeypatch.setattr(worktree.os, "getloadavg", lambda: (12.0, 0, 0))
+    assert worktree.git_timeout(p) == 360
+    monkeypatch.setattr(worktree.os, "getloadavg", lambda: (400.0, 0, 0))
+    assert worktree.git_timeout(p) == 900
+    p.set_config("worktree.git_timeout_max_s", 600)
+    assert worktree.git_timeout(p) == 600
+
+
+def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run_out(env, monkeypatch):
+    p = make(env)
+    from ttp import waits
+    from ttp.daemon import Daemon
+    p.set_config("worktree.create_retries", 2)
+    # Blocked by an older daemon on the first failure: queued again on start, with no coordinator turn.
+    tid = p.db.add_task("stuck", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason="workspace: Command 'git worktree add' timed out after 120 seconds")
+    d = Daemon(p.base)
+    d.retry_workspaces()
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["blocked_reason"].startswith("workspace retry")
+    assert waits.wait_kind(t, [])["kind"] != "coordinator"
+    # Still failing: queued after a growing backoff, then blocked for the coordinator once they run out.
+    for n in (1, 2):
+        d._workspace_failed(p.db.task(tid), TimeoutError("timed out"))
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and t["not_before"] > time.time() + 100 * 2 ** (n - 1)
+    d._workspace_failed(p.db.task(tid), TimeoutError("timed out"))
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and t["blocked_reason"].startswith("workspace: timed out")
+    d.retry_workspaces()
+    assert p.db.task(tid)["status"] == "blocked", "a failure that outlasted its retries was queued again"
+    d._workspace_tries(tid, clear=True)
+    assert d._workspace_tries(tid) == 0
 
 
 def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):

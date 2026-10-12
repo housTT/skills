@@ -110,6 +110,13 @@
   paths and existing files are never touched; the link is git-ignored (info/exclude if needed), and
   removing the worktree deletes only the link. `[]` turns it off. Check commands can also use
   `"$VIRTUAL_ENV"/bin/python`: workers and reviewers run with the project venv active.
+- Making a task's worktree recovers by itself. Each git command gets `worktree.git_timeout_s`
+  (default 120 s), scaled by the host's load per CPU up to `worktree.git_timeout_max_s` (900 s). After
+  a timeout or a failure left behind by one, a whole worktree is reused and a half-made one is removed
+  and made again (`worktree.create_attempts`, default 2). A branch with its own commits is never
+  reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
+  after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
+  coordinator. Tasks an older daemon blocked this way are queued again on their own.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
   last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
   remote: a remote-tracking branch contains its head, or its changes are already on the delivery

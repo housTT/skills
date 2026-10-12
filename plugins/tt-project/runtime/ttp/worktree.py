@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from .db import continues_id
 from .project import Project, durable_write
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
-    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=120)
+def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout)
     if check and out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:300]}")
     return out.stdout.strip()
@@ -88,30 +89,131 @@ def named_base(p: Project) -> str:
     return _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
 
 
+def git_timeout(p: Project) -> float:
+    """The timeout for the git commands that make a task's workspace: `worktree.git_timeout_s`
+    (default 120 s) scaled by the host's load per CPU when above 1 (a loaded host checks out
+    slower), at most `worktree.git_timeout_max_s` (default 900 s)."""
+    w = p.config().get("worktree") or {}
+    base = float(w.get("git_timeout_s") or 120)
+    try:
+        load = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (OSError, AttributeError):
+        load = 0.0
+    return min(float(w.get("git_timeout_max_s") or 900), base * max(1.0, load))
+
+
+def _registered(p: Project, path: Path) -> dict | None:
+    """`git worktree list --porcelain`'s record of the worktree at `path` ({"branch": ..., "locked":
+    reason or None, "prunable": bool}), or None when git has none there."""
+    want = str(path.resolve()) if path.exists() else str(path)
+    rec: dict | None = None
+    for line in _git(p.root, "worktree", "list", "--porcelain", check=False).splitlines() + [""]:
+        key, _, val = line.partition(" ")
+        if key == "worktree":
+            rec = {"path": val, "branch": "", "locked": None, "prunable": False}
+        elif rec is not None and key == "branch":
+            rec["branch"] = val.removeprefix("refs/heads/")
+        elif rec is not None and key == "locked":
+            rec["locked"] = val
+        elif rec is not None and key == "prunable":
+            rec["prunable"] = True
+        elif not line and rec is not None:
+            if rec["path"] in (want, str(path)):
+                return rec
+            rec = None
+    return None
+
+
+def _complete(p: Project, path: Path) -> bool:
+    """Whether the worktree at `path` is whole: git registers it, no `git worktree add` left it locked
+    "initializing" half way (its checkout never finished), or it did but the checkout finished anyway
+    (an index, HEAD resolves, nothing changed). A whole worktree left locked is unlocked. A worktree
+    with changes that no add left half way is the task's own work and counts as whole."""
+    rec = _registered(p, path)
+    if not rec or rec["prunable"] or not path.is_dir() or not is_git(path):
+        return False
+    try:
+        index = path / _git(path, "rev-parse", "--git-path", "index")
+        head = _git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
+        if not head or not index.exists():
+            return False
+        if rec["locked"] is None or not rec["locked"].startswith("initializing"):
+            return True
+        if _git(path, "status", "--porcelain", "--untracked-files=no", timeout=git_timeout(p)):
+            return False
+        _git(p.root, "worktree", "unlock", str(path), check=False)
+        return True
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def _clear_partial(p: Project, path: Path) -> None:
+    """Remove a half-made worktree at `path` (git's record of it too) so it can be made again. A
+    directory git does not know holding more than a `.git` file is never deleted: it is not ours."""
+    if _registered(p, path):
+        _git(p.root, "worktree", "remove", "--force", "--force", str(path), check=False, timeout=git_timeout(p))
+    _git(p.root, "worktree", "prune", check=False)
+    if path.is_dir() and not _registered(p, path):
+        if any(c.name != ".git" for c in path.iterdir()):
+            raise RuntimeError(f"{path} exists, is no worktree of this repository and is not empty")
+        shutil.rmtree(path)
+
+
 def ensure(p: Project, task: dict) -> tuple[Path, str]:
     """Create (or reuse) the task's worktree. A retried task continues on its own branch. A task
     carrying a branch (`pr_branch:<branch>`) works on that branch when it may (on_carried), else on
-    its own branch from that branch's head."""
+    its own branch from that branch's head. A git command that times out (git_timeout) or fails
+    because an earlier, timed-out attempt left the branch or worktree behind is recovered here: a
+    whole worktree is reused, a half-made one removed and made again, up to `worktree.create_attempts`
+    (default 2) attempts, each with a longer timeout. A branch is never deleted: one with commits
+    beyond where it would start is checked out as it is; one without is reset to that start."""
     carried = on_carried(p, task) if not task.get("branch") else ""
     branch = task.get("branch") or carried or f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
-    if path.exists() and is_git(path):
-        prepare(p, path)
-        return path, branch
-    p.worktrees.mkdir(parents=True, exist_ok=True)
-    exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
-    if exists:
-        _git(p.root, "worktree", "add", str(path), branch)
-        if carried:   # a local copy left behind by the remote's catches up, fast-forward only
-            _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False)
-    else:
-        _git(p.root, "fetch", "--quiet", "origin", check=False)
-        # A rebase starts from the branch it rebases, even when it also continues a review.
-        start = carried_head(p, task) if carried or rebased_branch(task) else None
-        start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
-        _git(p.root, "worktree", "add", "-b", branch, str(path), start or resolve_base(p))
+    attempts = max(1, int((p.config().get("worktree") or {}).get("create_attempts") or 2))
+    for n in range(attempts):
+        if path.exists() and _complete(p, path):
+            prepare(p, path)
+            return path, branch
+        try:
+            if path.exists() or _registered(p, path):
+                _clear_partial(p, path)
+            _create(p, task, path, branch, carried, git_timeout(p) * (1 + n / 2))
+            break
+        except (RuntimeError, subprocess.SubprocessError):
+            if path.exists() and _complete(p, path):
+                break
+            if n + 1 == attempts:
+                raise
     prepare(p, path)
     return path, branch
+
+
+def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeout: float) -> None:
+    p.worktrees.mkdir(parents=True, exist_ok=True)
+    exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
+    if exists and carried:
+        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout)
+        # A local copy left behind by the remote's catches up, fast-forward only.
+        _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False, timeout=timeout)
+        return
+    if not exists:
+        _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
+    # A rebase starts from the branch it rebases, even when it also continues a review.
+    start = carried_head(p, task) if carried or rebased_branch(task) else None
+    start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
+    try:
+        start = start or resolve_base(p)
+    except RuntimeError:
+        if not exists:
+            raise
+    if exists and (not start or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", branch,
+                                                start], capture_output=True, timeout=timeout).returncode != 0):
+        # Commits beyond its start (a retried task's own work): checked out as it is, never reset.
+        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout)
+        return
+    # New, or left behind with nothing of its own by an attempt that timed out: (re)made at its start.
+    _git(p.root, "worktree", "add", "-B" if exists else "-b", branch, str(path), start, timeout=timeout)
 
 
 _VALID_BRANCHES: dict[str, bool] = {}

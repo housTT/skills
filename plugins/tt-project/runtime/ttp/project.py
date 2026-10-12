@@ -223,8 +223,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # link_paths entry (relative to the project root) that exists and is git-ignored there and is
     # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off. Code tasks
     # always run in a worktree of their own; `kinds` adds other task kinds (say ["work"]) so they
-    # do not edit the project root's checkout (never review or harness).
-    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": []},
+    # do not edit the project root's checkout (never review or harness). Making a task's worktree:
+    # each git command gets git_timeout_s, scaled by the host's load per CPU (at most
+    # git_timeout_max_s); create_attempts tries in one go (a whole worktree a timed-out one left is
+    # reused, a half-made one remade); then the task is queued again create_retries times, after
+    # retry_backoff_s (doubling), before it is blocked for the coordinator.
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "git_timeout_s": 120,
+                 "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     # same_subject_warn: a watcher that opens more issues than this on one subject in 24 h gets a log

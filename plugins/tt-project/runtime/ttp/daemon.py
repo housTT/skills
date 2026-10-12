@@ -166,6 +166,8 @@ STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a 
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
+WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
+WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
 SLEPT_LONG_S = 600      # a sleep this long is recorded as a `host_slept` event and tells the user once a day
@@ -683,7 +685,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
-        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity,
@@ -3710,9 +3712,10 @@ class Daemon:
             try:
                 cwd, branch = self._workdir_for(task)
             except Exception as e:
-                db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400])
+                self._workspace_failed(task, e)
                 self._unreserve(task)
                 continue
+            self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
             try:
                 system = worker_system(self.p)
@@ -6228,6 +6231,55 @@ class Daemon:
                 return tid
             todo.append(continues_id(t))
         return None
+
+    def _workspace_tries(self, task_id: int, clear: bool = False) -> int:
+        """How often making task `task_id`'s workspace failed in a row (WORKSPACE_TRIES_KEY); `clear`
+        forgets it once one was made."""
+        tries = self.p.db.kv(WORKSPACE_TRIES_KEY, {}) or {}
+        if clear and str(task_id) in tries:
+            tries.pop(str(task_id))
+            self.p.db.set_kv(WORKSPACE_TRIES_KEY, tries)
+        return int(tries.get(str(task_id), 0))
+
+    def _workspace_failed(self, task: dict, e: Exception) -> None:
+        """Making the task's workspace failed (a git command timed out on a loaded host, the disk was
+        full...; worktree.ensure already recovered what an earlier attempt left behind). It goes back
+        to the queue after a backoff (`worktree.retry_backoff_s`, doubling) up to
+        `worktree.create_retries` times without a model run; only a failure that outlasts them is
+        blocked as `workspace:`, for the coordinator."""
+        db = self.p.db
+        w = self.cfg.get("worktree") or {}
+        limit = int(w.get("create_retries", 3) or 0)
+        with db.tx():
+            tries = db.kv(WORKSPACE_TRIES_KEY, {}) or {}
+            n = int(tries.get(str(task["id"]), 0)) + 1
+            tries[str(task["id"])] = n
+            db.set_kv(WORKSPACE_TRIES_KEY, tries)
+            if n <= limit:
+                delay = float(w.get("retry_backoff_s", 120) or 0) * 2 ** (n - 1)
+                db.update_task(task["id"], status="queued", not_before=time.time() + delay,
+                               blocked_reason=f"{WORKSPACE_RETRY_NOTE} ({n}/{limit}): {e}"[:400])
+            else:
+                db.update_task(task["id"], status="blocked",
+                               blocked_reason=f"workspace: {e} (after {n} tries)"[:400])
+        log(self.p, f"task {task['id']} workspace failed ({n}/{limit + 1}): {e}")
+
+    def retry_workspaces(self) -> None:
+        """A task blocked on its workspace (`workspace:`) with retries left goes back to the queue on its
+        own, on daemon start and every pass (an older daemon blocked it on the first failure);
+        worktree.ensure then reuses or remakes what the failed attempt left behind. One with an anchor
+        (waits:) is the coordinator's hold and stays."""
+        db = self.p.db
+        limit = int((self.cfg.get("worktree") or {}).get("create_retries", 3) or 0)
+        for t in db.q("SELECT * FROM tasks WHERE status='blocked' AND blocked_reason LIKE 'workspace:%'"):
+            if anchors.anchor(t) or self._workspace_tries(t["id"]) >= limit:
+                continue
+            with db.tx():
+                if (db.task(t["id"]) or {}).get("status") != "blocked":
+                    continue
+                db.update_task(t["id"], status="queued", not_before=None,
+                               blocked_reason=f"{WORKSPACE_RETRY_NOTE}: {t['blocked_reason'][10:].strip()}"[:400])
+            log(self.p, f"task {t['id']} queued again: its workspace is retried ({t['blocked_reason'][:200]})")
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":
