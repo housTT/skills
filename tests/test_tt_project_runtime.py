@@ -30090,6 +30090,59 @@ def test_landed_task_counts_a_done_tasks_own_commits_once_they_are_on_the_branch
     assert landed.check(p, repo, tid=tid) == (0, f"#{tid} (its branch {branch}) is on origin/proj")
 
 
+@pytest.mark.parametrize("chain", ["rebase", "review_fix"])
+def test_landed_task_follows_a_successor_that_landed_its_work_under_other_patches(env, monkeypatch, chain):
+    """A done task's change landed through a successor on a branch of its own with other patches
+    (a rebase task that settled a conflict, or a review fix and its re-review): landed:#<orig> passes
+    once the successor's push queue entry lands, and a task deferred on it starts."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    review = p.db.add_task(f"Review #{tid}: feature", "r", kind="review", status="done")
+    unrelated, upath, ubranch = _code_task(p, "unrelated")
+    if chain == "rebase":
+        succ, spath, sbranch = _code_task(p, f"rebase #{tid} onto the tip")
+        p.db.update_task(succ, labels=json.dumps([f"rebases:{branch}", f"continues:{review}"]))
+        lander = p.db.add_task(f"Review #{succ}: rebased #{tid} on the tip", "r", kind="review", status="done")
+    else:
+        succ, spath, sbranch = _code_task(p, f"Fix review #{review}")
+        p.db.update_task(succ, labels=json.dumps([f"continues:{tid}", f"review_fix:{review}"]))
+        lander = p.db.add_task(f"Re-review #{review}: feature", "r", kind="review", status="done",
+                               labels=[f"auto_review:{succ}", f"continues:{review}"])
+    (spath / "feature.txt").write_text("feature, settled\n")   # not the original's patch
+    (spath / "fix.txt").write_text("fix\n")
+    _git_out(spath, "add", "-A")
+    _git_out(spath, "commit", "-qm", "the change, settled on the tip")
+    assert landed.check(p, repo, tid=tid)[0] == 1, "the original's own branch is not on the branch"
+    assert coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s",
+                            "start_when": f"landed:#{tid}"}]) == []
+    after = _added(p, "after it")
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, after)
+    assert not _ready(p, after)
+
+    def land(task, br, path):
+        _git_out(path, "fetch", "-q", "origin")
+        _git_out(path, "rebase", "-q", "origin/proj")
+        _git_out(path, "push", "-q", "origin", "HEAD:proj")
+        sha, now = _git_out(path, "rev-parse", "HEAD"), time.time()
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+               "VALUES(?, ?, ?, 'origin/proj', 'pushed', ?, ?, ?, ?)", (task, br, sha, now, now, sha, sha))
+        return sha
+    _commit(upath, "unrelated.txt", "unrelated\n")
+    land(unrelated, ubranch, upath)
+    assert landed.check(p, repo, tid=tid)[0] == 1, "another task's landing is not this one's"
+    land(lander, sbranch, spath)
+    assert landed.check(p, repo, tid=tid) == (0, f"#{tid} (its push queue landing through #{lander}) is on origin/proj")
+    assert landed.check(p, repo, tid=unrelated)[0] == 0 and set(landed.carriers(p.db, unrelated)) == {unrelated}
+    _settle_deferred(d, after, until=lambda: _ready(p, after))
+    assert _ready(p, after) and not _events(p, after, "deferral_probe_broken")
+
+
 @pytest.mark.parametrize("result_status", ["waiting", "blocked", "failed", "needs_review"])
 def test_a_detached_push_records_a_landing_even_with_a_non_done_handoff(env, monkeypatch, result_status):
     from ttp import landed, push
