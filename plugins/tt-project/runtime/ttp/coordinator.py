@@ -99,7 +99,12 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
-            "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"}},
+            "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
+            "milestone": {"type": "string"},
+            "milestones": {"type": "array", "items": {"type": "object", "properties": {
+                "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
+                "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
+                "required": ["key", "due", "evidence_required"]}}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
