@@ -16760,6 +16760,31 @@ def test_a_workspace_on_another_branch_is_left_alone(env):
     assert (path / "work.txt").read_text() == "mine"
 
 
+def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    from ttp import worktree
+    _git_out(repo, "branch", "fix-loader")
+    task = p.db.task(p.db.add_task("Fix PR findings", "s", kind="code", labels=["pr_branch:fix-loader"]))
+    path, branch = worktree.ensure(p, task)
+    assert branch == "fix-loader"
+    (path / "work.txt").write_text("mine")
+    # The first attempt failed after making the worktree, so the task row never got its branch.
+    assert worktree.ensure(p, task) == (path, "fix-loader")
+    assert (path / "work.txt").read_text() == "mine"
+    # Another task's worktree on the branch still keeps it from this one.
+    other_task = p.db.task(p.db.add_task("Also fix", "s", kind="code", labels=["pr_branch:fix-loader"]))
+    assert worktree.on_carried(p, other_task) == ""
+    # A worktree an earlier attempt made on the task's own branch (the carried one was held then)
+    # stays on it once the carried branch is free.
+    opath, obranch = worktree.ensure(p, other_task)
+    assert obranch.startswith(f"ttp/t{other_task['id']}-")
+    _git_out(repo, "worktree", "remove", "--force", str(path))
+    assert worktree.ensure(p, other_task) == (opath, obranch)
+    _git_out(opath, "checkout", "-q", "-b", "elsewhere")
+    with pytest.raises(RuntimeError, match="elsewhere"):
+        worktree.ensure(p, other_task)
+
+
 def test_the_workspace_git_timeout_grows_with_the_hosts_load(env, monkeypatch):
     p = make(env)
     from ttp import worktree

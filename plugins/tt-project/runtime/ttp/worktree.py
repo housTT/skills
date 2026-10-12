@@ -193,8 +193,13 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     deleted: one with commits beyond where it would start is checked out as it is; one without is
     reset to that start."""
     carried = on_carried(p, task) if not task.get("branch") else ""
-    branch = task.get("branch") or carried or f"ttp/t{task['id']}-{slug(task['title'])}"
+    own = f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
+    if carried and path.exists() and (_registered(p, path) or {}).get("branch") == own:
+        # An earlier attempt, when the carried branch was held elsewhere, made it on the task's own
+        # branch and failed before the branch was stored: it stays there.
+        carried = ""
+    branch = task.get("branch") or carried or own
     attempts = max(1, int((p.config().get("worktree") or {}).get("create_attempts") or 2))
     for n in range(attempts):
         whole, rec = _reusable(p, path, branch)
@@ -285,8 +290,9 @@ def rebased_branch(task: dict) -> str:
 
 def on_carried(p: Project, task: dict) -> str:
     """The task's carried branch when its worktree may check it out: it exists here or on origin,
-    no other worktree holds it, and it is no shared branch (main/master, the push branch or the
-    base work starts from). "" otherwise: the task then works on its own branch."""
+    no other worktree holds it (the task's own, which an earlier attempt made on it, does not
+    count), and it is no shared branch (main/master, the push branch or the base work starts from).
+    "" otherwise: the task then works on its own branch."""
     branch = carried_branch(task)
     if not branch:
         return ""
@@ -296,8 +302,12 @@ def on_carried(p: Project, task: dict) -> str:
         shared |= {ref, ref.partition("/")[2]} if ref else set()
     if branch in shared:
         return ""
-    if f"branch refs/heads/{branch}" in _git(p.root, "worktree", "list", "--porcelain", check=False).splitlines():
-        return ""
+    own, path = p.worktrees / f"t{task['id']}", ""
+    for line in _git(p.root, "worktree", "list", "--porcelain", check=False).splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line == f"branch refs/heads/{branch}" and path not in (str(own), str(own.resolve())):
+            return ""
     _git(p.root, "fetch", "--quiet", "origin", check=False)
     return branch if carried_head(p, task) else ""
 
