@@ -52,10 +52,8 @@ def install() -> str:
         return f"left your own {f} as it is: /tt-project runs it; the plugin skill stays /tt-project:tt-project"
     if f.exists() and f.read_text(errors="replace") == TEXT:
         return ""
-    f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_name(f.name + ".tmp")
-    tmp.write_text(TEXT)
-    tmp.replace(f)
+    from .project import durable_write
+    durable_write(f, TEXT)
     return f"Claude Code: /tt-project is ready ({f})"
 
 
