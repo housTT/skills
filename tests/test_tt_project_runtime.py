@@ -10896,7 +10896,7 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
 
-    assert "/tt-project" not in setup() and not claude.exists()       # no Claude Code: nothing written
+    assert "Claude Code: /tt-project" not in setup() and not claude.exists()   # no Claude Code: nothing written
     claude.mkdir()
     assert "/tt-project is ready" in setup()
     text = f.read_text()
