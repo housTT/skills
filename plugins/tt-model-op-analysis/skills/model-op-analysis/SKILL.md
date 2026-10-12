@@ -14,8 +14,8 @@ resolve every `<plugin-root>/...` path against it.
 
 ## Flow
 
-1. **Model and inventory.** Ask for the model, then run
-   `python3 <plugin-root>/scripts/runs.py list <root> <model>` and show its runs: implementation,
+1. **Model and inventory.** Ask for the model, then for the output root (state it instead when the
+   user's instructions fix it), then run `python3 <plugin-root>/scripts/runs.py list <root> <model>` and show its runs: implementation,
    source, commit, static state, destinations, pending measurements. Ask: continue a run, or start
    a new one. A run in an older format (plugin 0.3.0 or earlier) cannot be extended; offer a new
    run.
@@ -23,16 +23,21 @@ resolve every `<plugin-root>/...` path against it.
    on them: a local device of each candidate source architecture (through `tt-device-mcp`) and
    TTsim readiness for Quasar (`<plugin-root>/references/ttsim.md`). Report what is available.
 3. **New run.** Follow `<plugin-root>/references/run-setup.md`: ref, source profile,
-   implementation, entry test, output root. If the same identity exists, say so and continue that
+   implementation, entry test. If the same identity exists, say so and continue that
    run instead of tracing again.
 4. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
    `python3 <plugin-root>/scripts/validate_static.py <run dir>` prints `OK`. Skipped for a run whose
    static analysis is done.
-5. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Each one is
-   added to the same run from the existing source trace (static-phase.md, "Adding a destination").
+5. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Ask for the
+   profile (any but the source), and when it is Quasar and the source is not, whether the code is
+   unchanged (`quasar`) or a BF16 projection (`quasar-bf16`). Each one is added to the same run
+   from the existing source trace (static-phase.md, "Adding a destination").
 6. **Measurements.** Run `python3 <plugin-root>/scripts/measurements.py list <run dir> --pending`,
    show only those items (never ones already done) with their state and estimate, and let the user
-   pick one or more. Source items follow
+   pick one or more. Before offering `source:tracy`, probe the source device again; if it is
+   missing or reports another profile, say so and offer to leave the item pending or record it with
+   `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:tracy failed --note "<reason>"`.
+   Source items follow
    `<plugin-root>/references/measured-source.md`
    (`python3 <plugin-root>/scripts/same_commit.py` first, then Tracy and
    `python3 <plugin-root>/scripts/merge_measured.py`); Quasar test items follow

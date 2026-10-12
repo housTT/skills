@@ -1247,3 +1247,27 @@ def test_runs_list_reports_drive_url(tmp_path):
     runs = json.loads(run_script("runs.py", "list", str(tmp_path), "m", "--json").stdout)
     assert runs[0]["drive_url"] == "https://docs.google.com/spreadsheets/d/x"
     assert "uploaded: https://docs.google.com/spreadsheets/d/x" in run_script("runs.py", "list", str(tmp_path), "m").stdout
+
+
+def _skill_step(n):
+    text = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text(encoding="utf-8")
+    start = text.index(f"\n{n}. **")
+    end = text.index(f"\n{n + 1}. **") if f"\n{n + 1}. **" in text else text.index("\n## Rules")
+    return text[start:end]
+
+
+def test_skill_asks_output_root_before_listing_runs():
+    first = _skill_step(1)
+    assert first.index("output root") < first.index("runs.py list")
+    assert "output root" not in _skill_step(3)
+
+
+def test_skill_reprobes_device_before_offering_tracy():
+    step = _skill_step(6)
+    assert "probe the source device again" in step
+    assert "measurements.py mark <run dir> source:tracy failed" in step
+
+
+def test_skill_destination_step_names_quasar_code_modes():
+    step = _skill_step(5)
+    assert "`quasar`" in step and "`quasar-bf16`" in step
