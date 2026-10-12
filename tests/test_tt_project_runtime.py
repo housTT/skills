@@ -32218,6 +32218,19 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     assert "With the push queue on" not in role and "came in on Slack" not in role
     assert "`landed:#<id>`" not in role and "Shared clusters" not in role
     assert "A PR leaves draft ONLY on the user's explicit yes" in role
+    # The coordinator's own pause in a turn where the user asks to pause something else stays its
+    # own: coordinator._users_pause makes an unset `user_asked` the user's in such a turn.
+    assert "`false` for your\n  own pause in a turn where the user's words ask to pause something else" in role
+    # Every fence names a feature coordinator_features can turn on, and each opens and closes once.
+    import inspect, re as _re
+    from ttp import prompts
+    src = (p.harness / "prompts" / "coordinator.md").read_text()
+    known = set(_re.findall(r'on\.add\("(\w+)"\)|\{"(\w+)"\}', inspect.getsource(prompts.coordinator_features)))
+    known = {a or b for a, b in known}
+    opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
+    closes = _re.findall(r"<!-- /ttp:if (!?)(\w+) -->", src)
+    assert opens and sorted(opens) == sorted(closes)
+    assert {n for _, n in opens} <= known, {n for _, n in opens} - known
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_queue", True)
     p.set_config("notify.slack", True)
