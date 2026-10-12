@@ -29889,6 +29889,7 @@ DURABLE_EXEMPT = {
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
     ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
     ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
+    ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("locks.py", 'open(path, "a")'): "the lock file itself: its content only describes the holder",
