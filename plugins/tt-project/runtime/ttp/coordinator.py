@@ -93,7 +93,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
-            "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
+            "escalate_after_h": {"type": "number"}, "end_when": {"type": "string"}, "below": {"type": "string"}, "why": {"type": "string"},
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
