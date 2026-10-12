@@ -20782,6 +20782,7 @@ def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_
     assert runs == m["checks"]["runs"] and runs - 1 <= 3, runs
     if bad == 1:
         assert rc == 0 and m["outcome"] == "nothing" and m["pushed_sha"] is None and _bump_commits(origin) == []
+        assert m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
         return
     assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
     more = f"; +{bad - 2} more" if bad > 2 else ""
@@ -20806,6 +20807,9 @@ def test_a_push_batch_whose_target_fails_its_checks_alone_pushes_nothing(env, mo
 
 @pytest.mark.parametrize("names, fresh, want, runs", [
     (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4),   # fixing prefix passes; search above it
+    (["fix", "e2", "bad"], 3, ["pushed", "pushed", "check_failed"], 4),   # all untried: search the whole batch
+    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "requeued"], 3),  # the breaker is in the untried prefix
+    (["e1", "e2"], 2, ["requeued", "requeued"], 2),                       # all untried, none fixes it
     (["e1", "fix"], 2, ["pushed", "pushed"], 1),                          # tip with the batch passes: it goes
     (["e1", "e2"], 1, ["requeued", "requeued"], 2),                       # the fresh prefix does not fix it
     (["e1", "e2"], 0, ["requeued", "requeued"], 1),                       # nothing new: one check, no tip alone
@@ -20829,7 +20833,7 @@ def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_
     rc, m = _run_batch(p, marker, monkeypatch)
     assert _statuses(m) == want, m
     assert m["checks"]["runs"] == runs == len(log.read_text().split()), m
-    assert "checking the tip" not in capsys.readouterr().out
+    assert "checking the tip" not in capsys.readouterr().out and "tip_passed" not in m
     if want[0] == "requeued":
         assert rc == 4 and m["outcome"] == "tip_failed" and _git_out(origin, "rev-parse", "proj") == tip
         assert m["tip_check"]["cmd"] == "make test" and "not checked alone" in m["message"]
@@ -21063,6 +21067,7 @@ if m.get("outcome") is None:
     write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
           version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
           **({"tip_check": plan["tip_check"]} if "tip_check" in plan else {}),
+          **({"tip_passed": True} if plan.get("tip_passed") else {}),
           **({"fast_forward": plan["ff"]} if "ff" in plan else {}),
           **({"reach": plan["reach"]} if "reach" in plan else {}),
           results=[{"id": e["id"], "status": rows.get(e["branch"], plan.get("row", "pushed")),
@@ -22070,6 +22075,33 @@ def test_a_failing_push_tip_is_forgotten_once_the_branch_moves(env, monkeypatch)
     pushq.schedule(s.p)
     assert "bad_tip" not in s.p.db.kv("push_queue")
     assert not alerts.holds(s.p.db, pushq.BAD_TIP_ALERT, time.time(), time.time())
+
+
+@pytest.mark.parametrize("outcome, row, detail, passed, cleared", [
+    ("nothing", "landed", {}, False, False),                             # its only entry is already on the tip
+    ("landed", "landed", {}, False, False),
+    ("nothing", "check_failed", {"cmd": "(stale plugin version)"}, False, False),   # the version guard
+    ("nothing", "check_failed", {"cmd": "make test"}, True, True),       # the tip passed alone; the entry failed
+    ("pushed", "pushed", {}, False, True),
+])
+def test_a_known_failing_push_tip_is_kept_until_a_batch_shows_it_passing(env, monkeypatch, outcome, row, detail,
+                                                                       passed, cleared):
+    """A batch on the known-bad tip that never checked it (nothing carried, or the version guard blamed
+    the first entry) keeps the tip known bad and its alert up; the next batches do not check it alone."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    tip = _git_out(s.repo, "rev-parse", "refs/remotes/origin/proj")
+    s.p.db.set_kv("push_queue", {"bad_tip": {"tip": tip, "fails": 2, "tried": [], "at": time.time(), "alerted": True}})
+    _pq_plan(s, outcome=outcome, tip=tip, row=row, detail=detail, tip_passed=passed,
+             sha="ab" * 20 if outcome == "pushed" else None)
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    st = s.p.db.kv("push_queue")
+    assert ("bad_tip" not in st) == cleared, st
+    assert alerts.holds(s.p.db, pushq.BAD_TIP_ALERT, time.time(), time.time()) != cleared
+    if not cleared:
+        assert st["bad_tip"]["tip"] == tip and st["bad_tip"]["fails"] == 2
 
 
 @pytest.mark.parametrize("outcome, tries", [("moved", 1), ("busy", 0)])

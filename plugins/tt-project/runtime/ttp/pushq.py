@@ -1076,8 +1076,11 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                                              f"that tip alone: it tries approvals not yet tried on it first, and "
                                              f"pushes them if the tip with them passes. This clears once the tip "
                                              f"changes or passes.", "high"))
-        elif bad.get("tip") and (outcome in ("pushed", "landed", "nothing") or (tip and tip != bad["tip"])):
-            st.pop("bad_tip", None)   # the tip passed, or moved: its alert clears (alerts.holds)
+        elif bad.get("tip") and (outcome == "pushed" or (outcome in ("landed", "nothing") and m.get("tip_passed"))
+                                 or (tip and tip != bad["tip"])):
+            # The tip passed (with what was pushed, or alone), or moved: its alert clears (alerts.holds).
+            # A batch that carried nothing, or that the version guard stopped, never showed it passing.
+            st.pop("bad_tip", None)
         if outcome in ("pushed", "landed", "nothing"):
             st.pop("backoff_until", None)
         if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):

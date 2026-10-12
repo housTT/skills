@@ -607,6 +607,7 @@ class Batch:
         self.cfg: dict | None = None
         self.target_lock = None
         self.detail_tip: dict | None = None     # the tip's own failing check, for tip_failed
+        self.tip_passed = False                 # the tip passed its checks alone this round
         self.info: dict[int, dict] = {}
         self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
@@ -724,6 +725,7 @@ class Batch:
 
     def _round(self, tip: str, checks: list[str]) -> str:
         """One round on `tip`: replay, bump, check, push. "moved" when the tip moved meanwhile."""
+        self.tip_passed = False
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -1041,9 +1043,10 @@ class Batch:
         was flaky: the full head goes.
 
         A tip the queue knows fails on its own (the marker's "bad_tip", pushq._known_bad) is never
-        checked alone again: no prefix passes unless it fixes the tip, so only the full head and the
-        prefix of entries not yet tried on that tip ("fresh") are checked. When that prefix passes,
-        it fixed the tip, and the search above it runs as usual."""
+        checked alone again: no prefix passes unless it fixes the tip. The prefix of entries not yet
+        tried on that tip ("fresh") is checked first; when it passes, it fixed the tip and the search
+        runs above it, else inside it, as a fix may come before an entry that breaks the checks. A
+        search that ends at prefix 1 failing means no entry fixed the tip (tip_failed)."""
         m = len(carried)
         fail = self._check(heads[m], checks)
         if fail is None:
@@ -1054,13 +1057,15 @@ class Batch:
         bad = known.get("tip") == tip
         if bad and fail[0] != STALE:
             fresh = sum(1 for i, _ in carried if i < int(known.get("fresh") or 0))
-            if not 0 < fresh < m:
+            if not fresh:
                 return self._tip_red(tip, known)
-            say(f"checking the {fresh} entr{'y' if fresh == 1 else 'ies'} not yet tried on the failing tip {tip[:10]}")
-            heads[fresh] = self._head(tip, carried, fresh)
-            if self._check(heads[fresh], checks) is not None:
-                return self._tip_red(tip, known)
-            lo = fresh
+            if fresh < m:
+                say(f"checking the {fresh} entr{'y' if fresh == 1 else 'ies'} not yet tried on the failing tip {tip[:10]}")
+                heads[fresh] = self._head(tip, carried, fresh)
+                if (f := self._check(heads[fresh], checks)) is None:
+                    lo = fresh
+                else:
+                    hi, fails[fresh] = fresh, f
         while hi - lo > 1:
             mid = (lo + hi) // 2
             heads[mid] = self._head(tip, carried, mid)
@@ -1080,6 +1085,7 @@ class Batch:
                 say(self.message)
                 self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
                 return 0, None, None
+            self.tip_passed = True
             return 0, None, fails[1]
         if hi == m and fails[m][0] != STALE:
             say(f"every prefix passed; checking {heads[m][:10]} again")
@@ -1305,6 +1311,8 @@ def run_batch(p: Project, marker: Path) -> int:
             f"{conflicts['sent_back']} sent back")
     if outcome == "tip_failed":
         m["tip_check"] = b.detail_tip
+    if b.tip_passed:
+        m["tip_passed"] = True
     write_json(marker, m)
     say(f"batch {bid}: {outcome}" + (f" ({b.message})" if b.message and outcome != "pushed" else ""))
     # Hand over: the deploy runs under its own lock, so upgrades no longer wait (push_in_flight).
