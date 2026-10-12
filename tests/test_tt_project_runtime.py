@@ -43616,6 +43616,68 @@ def test_the_coordinator_may_turn_own_pushes_off_but_only_the_user_turns_them_on
     assert p.config()["delivery"]["own_push"] == "off"
 
 
+
+def test_own_push_off_keeps_own_out_of_the_code_prompt_and_pr_fix_specs(env):
+    """With own pushes off, a code task's prompt (kind-code.md) never advises `ttp push --own`: the PR
+    section's publishing bullet is dropped and the based-on-another-branch refusal says hand off
+    blocked. The daemon's PR-fix spec asks for no own push either, free branch or held."""
+    from ttp.daemon import Daemon
+    from ttp.prompts import own_off, worker_task
+    p = make(env)
+    t = p.db.task(p.db.add_task("Speed up the loader", "Make it faster.", kind="code"))
+    assert "--own" in worker_task(p, t, str(p.root), "ttp/t1-x")
+    p.set_config("delivery.own_push", "off")
+    prompt = worker_task(p, t, str(p.root), "ttp/t1-x")
+    assert "--own" not in prompt and "## Pull requests" in prompt, prompt
+    assert "else hand off `blocked` with its message (own pushes are off" in prompt
+    # A warning against it stays; another sentence of the same item asking for one is cut.
+    assert own_off("- Do not `ttp push --own` it.\n") == "- Do not `ttp push --own` it.\n"
+    assert own_off("- NEVER run `git push`. The exception: run `ttp push --own`.\n- Next.\n") \
+        == "- NEVER run `git push`.\n- Next.\n"
+    url = "https://github.com/acme/widgets/pull/7"
+    src = p.db.add_task("Tune the cache", "s", kind="code")
+    pr_branch = f"ttp/t{src}-tune-the-cache"
+    subprocess.run(["git", "-C", str(p.root), "branch", pr_branch], check=True)
+    p.db.update_task(src, status="done", pr_url=url, branch=pr_branch)
+    d = Daemon(p.base)
+    rec = {"task": src, "branch": pr_branch, "url": url}
+    fix, made = d.pr_findings_owner("acme/widgets#7", rec, "CI failing: tests")
+    assert made and "--own" not in fix["spec"] and "do not push anywhere yourself" in fix["spec"], fix["spec"]
+    assert "--own" not in worker_task(p, fix, str(p.root), pr_branch)
+    p.db.update_task(fix["id"], status="done")
+    held = env["tmp"] / "held"
+    subprocess.run(["git", "-C", str(p.root), "worktree", "add", "-q", str(held), pr_branch], check=True)
+    fix, made = d.pr_findings_owner("acme/widgets#7", rec, "CI failing: tests")
+    assert made and fix["branch"] is None and "--own" not in fix["spec"], fix["spec"]
+
+
+def test_own_push_existing_only_reviews_a_branch_the_remote_lacks_only_when_no_queue_takes_it(env, monkeypatch):
+    """delivery.own_push existing_only with the push queue off: a pr_branch the push remote has no
+    branch of cannot be created with `ttp push --own`, so its review is review only, not an own push.
+    One the remote has keeps the --own step; a rebase onto its own new branch is review only too."""
+    from ttp import push, pushq
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.own_push", "existing_only")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    monkeypatch.setattr(Daemon, "_precheck", lambda *a: None)
+    _, _, _, (gone,) = _finish_code(env, p, "gone", {"g.py": 3}, labels=["pr_branch:feature/x"])
+    assert "--own" not in gone["spec"] and "Review only" in gone["spec"], gone["spec"]
+    assert "origin has no branch feature/x" in gone["spec"] and "existing_only" in gone["spec"]
+    assert "the pushed commit" not in gone["spec"] and push.REVIEW_ONLY_LABEL in json.loads(gone["labels"])
+    # With the queue on, a rebase still has no queue path (it never lands on the push branch): review only.
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: True)
+    _git_out(p.root, "branch", "feature/y")
+    _, _, _, (reb,) = _finish_code(env, p, "rebase y", {"y.py": 3}, labels=["rebases:feature/y"])
+    assert "--own" not in reb["spec"] and "Review only" in reb["spec"], reb["spec"]
+    # A pr_branch the remote has: its PR's branch, --own as before.
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    monkeypatch.setattr(pushq, "_absent", lambda *a: False)
+    _, _, _, (there,) = _finish_code(env, p, "there", {"t.py": 3}, labels=["pr_branch:feature/x"])
+    assert "`ttp push --own --detach`" in there["spec"] and "Review only" not in there["spec"], there["spec"]
+
 # One alert per network outage (netwait, Daemon.check_unreachable) -----------------------------------
 NET_PROBE = "ssh -o ConnectTimeout=5 jump.example true"
 NET_OUT = "ssh: connect to host jump.example port 22: Connection timed out"

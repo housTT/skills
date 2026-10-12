@@ -5641,12 +5641,18 @@ class Daemon:
         elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)
         # Unless it means to create that branch (its spec asks for `ttp push --own`), a pr_branch the push
         # remote has no branch of is ignored, as the push queue's check_approval ignores it.
-        # Under delivery.own_push existing_only `ttp push --own` cannot create it either, whatever the spec asks.
-        ignored, own_mode = "", own_push(cfg)
-        if elsewhere and not worktree.rebased_branch(task) and pushq.enabled(self.p, cfg) \
-                and (own_mode == "existing_only" or not settinghold.asks_own(task)) \
+        # Under delivery.own_push existing_only `ttp push --own` cannot create it either, whatever the spec asks:
+        # with no queue to take it instead (or a rebase, which never lands on the push branch) it is review only.
+        ignored, own_mode, uncreatable = "", own_push(cfg), ""
+        queued = elsewhere and not worktree.rebased_branch(task) and pushq.enabled(self.p, cfg) \
+            and (own_mode == "existing_only" or not settinghold.asks_own(task))
+        if (queued or (elsewhere and own_mode == "existing_only")) \
                 and (tgt := pushq.target(self.p)) and pushq._absent(self.p, tgt[0], elsewhere):
-            ignored, elsewhere = f"Its pr_branch label {elsewhere} was ignored: {tgt[0]} has no such branch.", ""
+            if queued:
+                ignored, elsewhere = f"Its pr_branch label {elsewhere} was ignored: {tgt[0]} has no such branch.", ""
+            else:
+                uncreatable = (f"{tgt[0]} has no branch {elsewhere}, and own pushes publish only onto a branch the "
+                               f"remote already has (delivery.own_push = existing_only)")
         # Own pushes off: a pr_branch or rebases: task lands on the push branch like any other (pr_elsewhere).
         if own_mode == "off" and not delivered and (onto := push.labelled_elsewhere(self.p, task, d)):
             ignored = (f"Its branch label {onto} was ignored: own pushes are off in this project "
@@ -5665,6 +5671,10 @@ class Daemon:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
                          f"the PR as they are.")
+        elif uncreatable:
+            lines.append(f"It delivers onto branch {elsewhere}, not {d['push_branch']}, but {uncreatable}. Review "
+                         f"only: if it passes, hand off `done`; do not run `ttp push` or approve it for the push "
+                         f"queue. Leave the branch" + (" and the PR" if pr else "") + " as they are.")
         elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True):
             lines.append(f"It rebases {old} and delivers onto its own branch {elsewhere}, not {old} (a rebase "
                          f"cannot fast-forward it) and not {d['push_branch']}. If it passes, publish it with "
@@ -5699,7 +5709,7 @@ class Daemon:
         if notes := own_free(str(rules.get("auto_notes") or ""), own_mode):
             lines.append(notes)
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or (
-            elsewhere and d.get("push_allowed", True)) else "."))
+            elsewhere and not uncreatable and d.get("push_allowed", True)) else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",

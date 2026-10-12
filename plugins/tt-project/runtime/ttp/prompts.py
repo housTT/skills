@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from . import budget as bud
 from . import settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_queue_on
+from .project import OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_queue_on
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
 
 
@@ -39,9 +40,45 @@ OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp p
 
 def _sections(text: str, cfg: dict) -> str:
     """A kind prompt without the push section that does not apply: the plain push's or the queue's,
-    and the `ttp push --own` one while own pushes are off (delivery.own_push)."""
+    and the `ttp push --own` advice while own pushes are off (delivery.own_push)."""
     text = drop_section(text, REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1])
-    return drop_section(text, OWN_SECTION) if own_push(cfg) == "off" else text
+    return own_off(drop_section(text, OWN_SECTION)) if own_push(cfg) == "off" else text
+
+
+# kind-code.md's advice for a push refused as based on another branch, and its stand-in with own pushes off.
+OWN_REFUSAL = re.compile(r"else publish it with\s+`ttp push --own --detach`\.")
+OWN_REFUSAL_OFF = "else hand off `blocked` with its message (own pushes are off: delivery.own_push)."
+NEGATED_OWN = re.compile(r"\b(?:not|never|no)\b[^.;]*--own", re.I)
+SENTENCE_END = re.compile(r"(?<=[.;!?])(\s+)")
+
+
+def _asks_own(sentence: str) -> bool:
+    return bool(OWN_FLAG.search(sentence)) and not NEGATED_OWN.search(sentence)
+
+
+def own_off(text: str) -> str:
+    """A kind prompt with own pushes off: the refusal advice says hand off `blocked`, a list item whose
+    first sentence tells the worker to run `ttp push --own` (kind-code.md's PR publishing bullet) is
+    dropped, and any other sentence asking for one is cut, so no worker spends a run on a push the
+    harness refuses. A warning against it (do not, never) stays."""
+    out, item = [], []
+
+    def flush():
+        x = "".join(item)
+        item.clear()
+        if not OWN_FLAG.search(x):
+            return out.append(x)
+        parts = SENTENCE_END.split(x)   # sentence, separator, sentence, ...
+        if _asks_own(parts[0]):
+            return None
+        kept = parts[0] + "".join(sep + sen for sep, sen in zip(parts[1::2], parts[2::2]) if not _asks_own(sen))
+        out.append(kept.rstrip() + "\n" if x.endswith("\n") else kept.rstrip())
+    for line in OWN_REFUSAL.sub(OWN_REFUSAL_OFF, text).splitlines(keepends=True):
+        if not (item and item[0].startswith("- ") and line[:1] in (" ", "\t")):
+            flush()
+        item.append(line)
+    flush()
+    return "".join(out)
 
 
 def drop_section(text: str, heading: str) -> str:
@@ -262,8 +299,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     own_off = own_push(cfg) == "off"
     if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):
         history += (f"\nThis task builds on branch {onto}, but own pushes are off in this project "
-                    f"(delivery.own_push): it lands on the push branch like any other change. Never run "
-                    f"`ttp push --own` or `git push` to {onto} or any other branch.\n")
+                    f"(delivery.own_push): it lands on the push branch like any other change. Never push to "
+                    f"{onto} or any other branch yourself (no own-branch push, no `git push`).\n")
     elif (onto := carried_branch(task)) and branch:
         history += (f"\nThis task delivers onto branch {onto} (`ttp push --own --detach`, fast-forward only)"
                     + (": its worktree is on it.\n" if branch == onto else
@@ -300,9 +337,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + (f", code tasks may land on {delivery['push_branch']} with ttp push=True"
            if kind == "code" and code_tasks_may_push(cfg) else "")
         + (", push queue=True" if kind == "review" and push_queue_on(cfg) else "")
-        + (f", own pushes={own_push(cfg)} (delivery.own_push: `ttp push --own` "
-           + ("refuses; never push any branch but the push branch)" if own_off else
-              "publishes only onto a branch the remote already has)") if own_push(cfg) != "on" else "") + "\n"
+        + (f", own pushes={own_push(cfg)} (delivery.own_push: "
+           + ("refused; never push any branch but the push branch)" if own_off else
+              "`ttp push --own` publishes only onto a branch the remote already has)")
+           if own_push(cfg) != "on" else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
