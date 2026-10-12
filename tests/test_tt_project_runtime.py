@@ -49107,7 +49107,10 @@ def test_after_push_and_git_hooks_receive_no_managed_scratch(env, tmp_path, monk
     for path in (seen, hook_seen):
         recorded = json.loads(path.read_text())
         assert all(recorded.get(k) == str(normal) for k in ('TMPDIR', 'TMP', 'TEMP')), recorded
-        assert not any('/check-runs/' in value for value in recorded.values()), recorded
+        # Ancestors may belong to the outer check running this test suite. Only this
+        # project's managed allocation is forbidden in its non-check subprocesses.
+        prefix = str(p.state / 'check-runs') + os.sep
+        assert not any(prefix in value for value in recorded.values()), recorded
     assert 'TTP_CHECKS_TMP_FD' not in json.loads(seen.read_text())
     assert 'TTP_CHECK_OUTPUT_DIR' not in json.loads(seen.read_text())
 
