@@ -150,10 +150,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
-                    # The memory in the coordinator's cached system prompt is a snapshot, rebuilt
-                    # at most once per interval; pending changes stay in the digest. Restrictions
-                    # refresh immediately. This policy does not imply a provider cache lifetime.
-                    "memory_refresh_s": 3300,
+                    # The coordinator's system prompt (role, charter, STANDING, standing memory) is a
+                    # snapshot, re-rendered when no turn ran for cache_ttl (the cache is cold anyway),
+                    # once it is this old, or at once for a restrictions change or a charter edit on
+                    # the user's word; until then the digest carries what changed.
+                    "prompt_max_age_s": 14400,
                     # Prompt cache lifetime of coordinator turns: "auto" (1h, a write at 2x input
                     # instead of 1.25x, unless a 1h turn with the same prompt, schema, model, effort
                     # and agent CLI started under cache_warm_min minutes ago: then 5m, which still

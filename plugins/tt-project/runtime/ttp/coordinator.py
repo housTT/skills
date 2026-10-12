@@ -31,7 +31,7 @@ from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, task_outcome,
                  without_deferral)
-from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
+from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
                       own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -315,8 +315,17 @@ _NOT_UNDOABLE_RE = re.compile(r"\birreversib|\bpermanent|\bone-way\b|\bno (way b
 _RETIRE_RE = re.compile(r"\bstale restriction|\bretir(e|es|ing)\b|\bno longer appl(y|ies)\b", re.I)
 
 
-MEMORY_SNAPSHOT_KEY = "memory_snapshot"   # kv: the memory the coordinator's system prompt carries
+# The coordinator's system prompt (restrictions, role, charter, STANDING and standing memory) is a
+# snapshot, re-rendered only when the provider's cache is cold anyway, when it is older than
+# coordinator.prompt_max_age_s, or at once for a restrictions change or a charter edit on the user's
+# word. Every other change waits in the digest as a delta (prompt_delta_lines), so deploys, memory
+# and charter edits between refreshes leave the cached prefix byte-identical.
+PROMPT_SNAPSHOT_KEY = "prompt_snapshot"   # kv: the rendered prompt and what it was rendered from
+MEMORY_SNAPSHOT_KEY = PROMPT_SNAPSHOT_KEY
+PROMPT_REFRESH_KEY = "prompt_refresh"     # kv: a charter edit on the user's word: the next turn re-renders
 MEMORY_DIGEST_HEADER = "## Memory added since the snapshot"
+RECENT_MEMORY_HEADER = "## Recent decisions and facts (newest last; older ones stay in memory/)"
+PROMPT_MAX_AGE_S = 4 * 3600
 
 
 def _prompt_head(p: Project) -> tuple[str, str, str]:
@@ -336,34 +345,123 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def memory_view(p: Project, now: float | None = None) -> dict:
-    """The memory snapshot the system prompt carries (`text`), plus the entries `added` (or
-    changed) and the names `retired` since it was taken, which the digest lists instead.
+def _standing_entry(e: dict) -> bool:
+    return e["kind"] in PINNED_MEMORY_KINDS or bool(e.get("standing"))
 
-    Ordinary memory changes stay in the digest and are folded into the snapshot at
-    most once per `memory_refresh_s`, even when a burst exceeds the old size threshold.
-    Restriction edits take effect immediately. A changed role or charter also rebuilds
-    the snapshot because the prompt already changed. This interval is a local batching
-    policy, not evidence that the provider retains its cache for that long."""
-    now = time.time() if now is None else now
+
+def cache_ttl_s(c: dict) -> float:
+    """How long the provider keeps the coordinator's prompt cache between turns (coordinator.cache_ttl):
+    "auto" and "1h" write 1h entries; "5m", "off" (the agent's own default) and anything else 5 min."""
+    return 3600.0 if str(c.get("cache_ttl", "auto") or "").lower() in ("auto", "1h") else 300.0
+
+
+def _last_turn(p: Project) -> float:
+    """When the coordinator last used the cache: the later of its last turn's start and end."""
+    row = p.db.one("SELECT MAX(COALESCE(ended, started)) t FROM runs WHERE role='coordinator'")
+    return max(float(p.db.kv("last_coordinator_turn", 0) or 0), float(row["t"] or 0) if row else 0.0)
+
+
+def _refresh_why(p: Project, snap: dict, rules: str, restrictions: dict, now: float) -> str:
+    """Why the snapshot is re-rendered now, or "" to keep it."""
     c = p.config()["coordinator"]
-    entries = p._memory_entries()
-    live = {e["name"]: _sha(e["line"]) for e in entries}
-    basis = _sha("\0".join(_prompt_head(p)))
-    snap = p.db.kv(MEMORY_SNAPSHOT_KEY) or {}
+    if not snap.get("head") or "context" not in snap:
+        return "first"
+    if snap.get("rules") != _sha(rules) or snap.get("restrictions") != restrictions:
+        return "restrictions changed"
+    if p.db.kv(PROMPT_REFRESH_KEY):
+        return "charter edited on the user's word"
+    if now - max(_last_turn(p), float(snap.get("at") or 0)) > cache_ttl_s(c):
+        return "cache cold"
+    if now - float(snap.get("at") or 0) >= float(c.get("prompt_max_age_s", PROMPT_MAX_AGE_S)):
+        return "max age"
+    return ""
+
+
+def prompt_state(p: Project, now: float | None = None) -> tuple[dict, dict]:
+    """(snapshot, live): the system prompt as last rendered, re-rendered first when _refresh_why
+    says so, and what it would be rendered from now, for the digest's delta."""
+    now = time.time() if now is None else now
+    rules, role, charter = _prompt_head(p)
+    entries = [e for e in p._memory_entries() if _standing_entry(e)]
+    live = {"rules": _sha(rules), "role": _sha(role), "charter": charter,
+            "standing": "\n".join(standing_lines(p)), "entries": entries,
+            "shas": {e["name"]: _sha(e["line"]) for e in entries}}
+    restrictions = {e["name"]: live["shas"][e["name"]] for e in entries if e["kind"] == "restriction"}
+    snap = p.db.kv(PROMPT_SNAPSHOT_KEY) or {}
+    why = _refresh_why(p, snap, rules, restrictions, now)
+    if why:
+        from .release import runtime_version
+        standing = f"# STANDING\n{live['standing']}\n\n" if live["standing"] else ""
+        memory = "\n".join(e["line"] for e in entries) or "(no standing memories yet)"
+        snap = {"at": now, "why": why, "head": f"{rules}{role}",
+                "context": f"# CHARTER\n{charter}\n\n{standing}# MEMORY\n{memory}\n",
+                "rules": live["rules"], "restrictions": restrictions, "role": live["role"],
+                "version": runtime_version(p.harness / "runtime"), "charter": charter,
+                "standing": live["standing"], "entries": live["shas"]}
+        p.db.set_kv(PROMPT_SNAPSHOT_KEY, snap)
+        p.db.x("DELETE FROM kv WHERE key IN (?, 'memory_snapshot')", (PROMPT_REFRESH_KEY,))
+    return snap, live
+
+
+def memory_view(p: Project, now: float | None = None) -> dict:
+    """The standing memory the snapshot carries (`text`), plus the standing entries `added` (or
+    changed) and the names `retired` since it was taken, which the digest lists instead.
+    Decisions and facts are never in the snapshot: the digest shows the recent ones live."""
+    snap, live = prompt_state(p, now)
     taken = snap.get("entries") or {}
-    added = [e for e in entries if taken.get(e["name"]) != live[e["name"]]]
-    retired = [n for n in snap.get("shown") or [] if n not in live]
-    restrictions = {e["name"]: live[e["name"]] for e in entries if e["kind"] == "restriction"}
-    if (not snap or snap.get("basis") != basis or snap.get("restrictions") != restrictions
-            or ((added or retired) and now - float(snap.get("at") or 0) >= float(c.get("memory_refresh_s", 3300)))):
-        chosen = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
-        snap = {"at": now, "basis": basis, "entries": live, "restrictions": restrictions,
-                "shown": [e["name"] for e in chosen],
-                "text": "\n".join(e["line"] for e in chosen)}
-        p.db.set_kv(MEMORY_SNAPSHOT_KEY, snap)
-        added, retired = [], []
-    return {"text": snap["text"], "added": added, "retired": retired}
+    return {"text": "\n".join(e["line"] for e in live["entries"] if e["name"] in taken),
+            "added": [e for e in live["entries"] if taken.get(e["name"]) != live["shas"][e["name"]]],
+            "retired": [n for n in taken if n not in live["shas"]]}
+
+
+def recent_memory_lines(p: Project) -> list[str]:
+    """The newest decisions and facts the coordinator's memory budget leaves room for after the
+    standing entries, shown live in the digest so a new one never changes the cached prompt."""
+    rest = [e["line"] for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0] if not _standing_entry(e)]
+    return [RECENT_MEMORY_HEADER] + rest if rest else []
+
+
+def _charter_delta(old: str, new: str) -> list[str]:
+    """The charter sections that differ from the snapshot's, whole, and the ones gone."""
+    from .prompts import charter_sections
+
+    def keyed(text: str) -> dict:
+        out, seen = {}, {}
+        for head, body in charter_sections(text):
+            seen[head] = seen.get(head, 0) + 1
+            out[(head, seen[head])] = "\n".join(body).strip()
+        return out
+    before, after = keyed(old), keyed(new)
+    lines = []
+    for (head, _), body in after.items():
+        if before.get((head, _)) != body:
+            lines += [head or "(text above the first heading)", *([body] if body else [])]
+    lines += [f"{head or '(text above the first heading)'} (removed)" for head, n in before if (head, n) not in after]
+    return lines
+
+
+def prompt_delta_lines(p: Project, now: float | None = None) -> list[str]:
+    """What changed since the snapshot besides memory: charter sections, the STANDING block and the
+    role (a release installed), so the turn acts on them before the next refresh renders them."""
+    now = time.time() if now is None else now
+    snap, live = prompt_state(p, now)
+    by = timefmt.short(float(snap.get("at") or now) + float(p.config()["coordinator"].get(
+        "prompt_max_age_s", PROMPT_MAX_AGE_S)), p, now)
+    lines = []
+    if snap.get("role") != live["role"]:
+        from .release import runtime_version
+        v, was = runtime_version(p.harness / "runtime"), snap.get("version") or "unknown"
+        lines.append(f"## Release {v} installed (the cached prompt is from {was}); new rules apply at the "
+                     f"next refresh, by {by} at the latest" if v != was else
+                     f"## Coordinator rules changed with a setting; they apply at the next refresh, by {by} "
+                     f"at the latest")
+    changed = _charter_delta(snap.get("charter") or "", live["charter"])
+    if changed:
+        lines += [f"## Charter changed since the cached prompt: these sections replace the CHARTER's "
+                  f"(re-rendered at the next refresh, by {by} at the latest)", *changed]
+    if (snap.get("standing") or "") != live["standing"]:
+        lines += ["## STANDING changed since the cached prompt; it now reads:", live["standing"] or "(empty)"]
+    return lines
 
 
 def memory_digest_lines(view: dict) -> list[str]:
@@ -393,16 +491,12 @@ def standing_lines(p: Project) -> list[str]:
 
 
 def prompt_parts(p: Project, now: float | None = None) -> tuple[str, str]:
-    """The stable prompt as (head, context), most stable first so a change misses the cache only
-    from where it is: the restrictions and role change on upgrades and restriction edits; the
-    charter, the standing settings and the memory snapshot (`context`) more often. A provider that
-    can mark a cache breakpoint after `context` sends it as its own block after the system prompt
-    (`head`)."""
-    rules, role, charter = _prompt_head(p)
-    standing = "\n".join(standing_lines(p))
-    standing = f"# STANDING\n{standing}\n\n" if standing else ""
-    memory = memory_view(p, now)["text"] or "(no memories yet)"
-    return f"{rules}{role}", f"# CHARTER\n{charter}\n\n{standing}# MEMORY\n{memory}\n"
+    """The stable prompt as (head, context), from the snapshot (prompt_state), most stable first so
+    a change misses the cache only from where it is: the restrictions and role in `head`; the
+    charter, the standing settings and the standing memory in `context`. A provider that can mark a
+    cache breakpoint after `context` sends it as its own block after the system prompt (`head`)."""
+    snap = prompt_state(p, now)[0]
+    return snap["head"], snap["context"]
 
 
 def system_prompt(p: Project, now: float | None = None) -> str:
@@ -558,7 +652,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                                    "conditions, owners"] + [f"- {ln}" for ln in lines], "\n".join(kept),
                 None if events_name_machine(db, event_ids, machine_ledger.resource_machines(p)) else
                 f"## Shared machines in your Resources: {len(kept)} open (as last turn)")
+    section("prompt_delta", prompt_delta_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))
+    section("memory_recent", recent_memory_lines(p))
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
@@ -1481,6 +1577,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if user_turn:
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
+                    if user_turn or ok is not None:   # the user's word: the next turn's prompt shows it
+                        db.set_kv(PROMPT_REFRESH_KEY, {"at": time.time(), "section": target})
                     if user_turn and text and not quote and _may_lift(text):
                         _record_applied_lift(p, messages or [], target, text, key)
                     if ok is not None:

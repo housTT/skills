@@ -111,10 +111,16 @@ answers a marked coordinator turn with the too-many-cache_control 400, that buil
 the mark for the rest of the daemon's life and the turn's retry goes without it.
 These captures verify request shape, not cache retention or savings at the real provider.
 
-Ordinary memory additions, edits and retirements stay in the live digest until the snapshot's
-`memory_refresh_s` interval has elapsed. Bursts do not refresh the snapshot repeatedly.
-Restriction-memory edits rebuild it immediately, as do changes to the charter or role.
-Neither this interval nor `coordinator.cache_ttl` proves the provider's retention lifetime.
+The whole coordinator system prompt (rules, role, charter, STANDING and MEMORY) is a snapshot.
+It is re-rendered only when the gap since the last turn exceeds `coordinator.cache_ttl` (the
+cache is cold anyway), when it is older than `coordinator.prompt_max_age_s` (default 4 h), or at
+once when the Restrictions (charter or restriction memory) change or a charter edit is made on
+the user's word. Between refreshes, memory, deploys and other charter edits leave it
+byte-identical: the digest carries memory added or retired, charter sections changed since the
+snapshot, and a line naming a newly installed release whose rules apply at the next refresh.
+The system MEMORY block holds only standing entries (restrictions, preferences, resources and
+entries marked standing) in stable order; recent decisions and facts are listed in the digest.
+Neither interval proves the provider's retention lifetime.
 
 An earlier seven-day comparison found a token-hit increase from about 57% to 68.5%, but
 cost per turn rose from $0.073–0.083 to $0.127 as prompts grew and effort changed. Its

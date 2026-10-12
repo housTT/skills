@@ -5552,7 +5552,7 @@ def test_claude_workers_keep_the_system_prompt_cacheable_when_the_cli_can(env, m
 def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_events(env):
     p = make(env)
     from ttp import coordinator as coord
-    p.add_memory("the build takes ten minutes", kind="fact")
+    p.add_memory("builds run on box-a", kind="resource")
     head, context = coord.prompt_parts(p)
     first = coord.digest(p, {}, [], [])
     p.db.add_task("new work", "do it", kind="work", tier="light", origin="user")
@@ -5561,7 +5561,7 @@ def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_ev
     assert coord.prompt_parts(p) == (head, context), "events changed the cached prefix"
     assert coord.system_prompt(p) == coord.join_prompt(head, context)
     assert "# Role" in head and "# CHARTER" not in head, "the charter churns more than the rules"
-    assert context.startswith("# CHARTER") and "the build takes ten minutes" in context
+    assert context.startswith("# CHARTER") and "builds run on box-a" in context
 
 
 def test_the_standing_sections_lead_the_cached_prompt_in_a_fixed_order_and_leave_the_digest(env):
@@ -17842,59 +17842,127 @@ def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_pro
     p.add_memory("Box A is ours.", kind="resource")
     before = coord.system_prompt(p)
     assert "Box A is ours." in before and _memory_section(coord.digest(p, {}, [], [])) == []
-    assert coord.apply(p, [{"type": "memory_add", "text": "The nightly build takes 40 minutes."},
+    assert coord.apply(p, [{"type": "memory_add", "text": "Box B is shared.", "memory_kind": "resource"},
                            {"type": "memory_add", "text": "Builds need a quiet window.", "memory_kind": "fact"}],
                        turn=1) == []
     digest = coord.digest(p, {}, [], [])
     assert coord.system_prompt(p) == before, "a memory change missed the prompt cache"
     added = _memory_section(digest)
-    assert len(added) == 2 and "The nightly build takes 40 minutes." in added[0]
-    assert added[1].startswith("[fact-") and "Builds need a quiet window." in added[1]
+    assert len(added) == 1 and added[0].startswith("[resource-") and "Box B is shared." in added[0]
+    recent = digest.split(coord.RECENT_MEMORY_HEADER, 1)[1]
+    assert "[fact-" in recent and "Builds need a quiet window." in recent and "Builds need" not in before
 
 
 def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_system_prompt(env):
     p = make(env)
     from ttp import coordinator as coord
-    stale = p.add_memory("host01 is booked until Friday.", kind="fact")
+    stale = p.add_memory("host01 is ours until Friday.", kind="resource")
     before = coord.system_prompt(p)
-    assert "host01 is booked until Friday." in before
+    assert "host01 is ours until Friday." in before
     assert coord.apply(p, [{"type": "memory_forget", "name": f"[{stale.stem}]"}], turn=1) == []
     digest = coord.digest(p, {}, [], [])
     assert coord.system_prompt(p) == before
     assert _memory_section(digest) == [f"[{stale.stem}] retired, ignore"]
-    assert "host01 is booked until Friday." not in digest
+    assert "host01 is ours until Friday." not in digest
 
 
-def test_memory_refresh_interval_batches_even_large_changes(env):
+def test_the_system_memory_block_carries_only_standing_entries_in_stable_order(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    rule = p.add_memory("Never push to main.", kind="restriction")
+    pref = p.add_memory("Keep replies short.", kind="preference")
+    box = p.add_memory("Box A is ours.", kind="resource")
+    p.add_memory("Picked the cheaper runner.", kind="decision")
+    p.add_memory("The build takes 40 minutes.", kind="fact")
+    p.add_memory("Answer within a day.", kind="decision", standing=True)
+    memory = coord.prompt_parts(p)[1].split("# MEMORY\n", 1)[1]
+    names = [ln.split("]", 1)[0][1:] for ln in memory.splitlines()]
+    assert names[:3] == [rule.stem, pref.stem, box.stem] and len(names) == 4 and names[3].startswith("preference-")
+    assert "cheaper runner" not in memory and "40 minutes" not in memory
+    recent = coord.digest(p, {}, [], []).split(coord.RECENT_MEMORY_HEADER, 1)[1]
+    assert "Picked the cheaper runner." in recent and "The build takes 40 minutes." in recent
+    assert "Keep replies short." not in recent
+
+
+def _deploy(p, version: str) -> None:
+    """A release installed into the project: new role rules and a new runtime version."""
+    role = p.harness / "prompts" / "coordinator.md"
+    role.write_text(role.read_text() + f"\nA rule new in {version}.\n")
+    init = p.harness / "runtime" / "ttp" / "__init__.py"
+    init.parent.mkdir(parents=True, exist_ok=True)
+    init.write_text(f'__version__ = "{version}"\n')
+
+
+def test_memory_deploys_and_charter_edits_keep_the_prompt_byte_identical_within_the_cache_window(env):
     p = make(env)
     from ttp import coordinator as coord
     start = time.time()
     p.db.set_kv("last_coordinator_turn", start)
     before = coord.system_prompt(p, now=start)
-    p.add_memory("Small fact.", kind="fact")
-    assert coord.system_prompt(p, now=start + 3000) == before, "refreshed while the cache is warm"
-    assert _memory_section(coord.digest(p, {}, [], []))
-    cold = coord.system_prompt(p, now=start + 3400)   # local batching interval elapsed
-    assert cold != before and "Small fact." in cold
-    assert _memory_section(coord.digest(p, {}, [], [])) == []
-    p.db.set_kv("last_coordinator_turn", time.time())
-    p.add_memory("Big fact. " + "z" * 3100, kind="fact")
-    assert coord.system_prompt(p, now=start + 3401) == cold
-    assert "z" * 3100 in coord.memory_digest_lines(coord.memory_view(p, now=start + 3401))[1]
-    assert "z" * 3100 in coord.system_prompt(p, now=start + 6700)
-
-
-def test_a_charter_change_refreshes_the_memory_snapshot(env):
-    p = make(env)
-    from ttp import coordinator as coord
-    coord.system_prompt(p)
-    p.add_memory("Use host01 for builds.", kind="decision")
-    assert _memory_section(coord.digest(p, {}, [], []))
+    p.add_memory("Box C joined the pool.", kind="resource")
+    p.add_memory("Chose the nightly window.", kind="decision")
+    _deploy(p, "9.9.9")
     assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Ship the cache fix."}],
                        turn=1) == []
-    digest = coord.digest(p, {}, [], [])
-    system = coord.system_prompt(p)
-    assert _memory_section(digest) == [] and "Use host01 for builds." in system and "Ship the cache fix." in system
+    p.db.set_kv("last_coordinator_turn", start + 3000)
+    assert coord.system_prompt(p, now=start + 3000) == before, "a change inside the window missed the cache"
+    delta = coord.prompt_delta_lines(p, now=start + 3000)
+    assert any(ln.startswith("## Release 9.9.9 installed") and "new rules apply at the next refresh" in ln
+               for ln in delta), delta
+    assert any(ln.startswith("## Charter changed since the cached prompt") for ln in delta)
+    assert "Ship the cache fix." in "\n".join(delta)
+    p.db.set_kv("last_coordinator_turn", start + 14400 - 600)   # turns kept the cache warm since
+    # Still warm (the last turn was under an hour ago) but the snapshot is past its maximum age.
+    aged = coord.system_prompt(p, now=start + 14400)
+    assert p.db.kv(coord.PROMPT_SNAPSHOT_KEY)["why"] == "max age"
+    assert aged != before and "A rule new in 9.9.9." in aged and "Ship the cache fix." in aged
+    assert "Box C joined the pool." in aged and "Chose the nightly window." not in aged
+    assert coord.prompt_delta_lines(p, now=start + 14401) == []
+
+
+def test_a_gap_longer_than_the_cache_lifetime_re_renders_the_prompt(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    start = time.time()
+    p.db.set_kv("last_coordinator_turn", start)
+    before = coord.system_prompt(p, now=start)
+    p.add_memory("Box D joined the pool.", kind="resource")
+    assert coord.system_prompt(p, now=start + 3500) == before
+    cold = coord.system_prompt(p, now=start + 3700)   # no turn for over an hour: the cache is cold anyway
+    assert cold != before and "Box D joined the pool." in cold
+    assert p.db.kv(coord.PROMPT_SNAPSHOT_KEY)["why"] == "cache cold"
+    p.set_config("coordinator.cache_ttl", "5m")
+    p.add_memory("Box E joined the pool.", kind="resource")
+    p.db.set_kv("last_coordinator_turn", start + 3700)
+    assert coord.system_prompt(p, now=start + 3900) == cold
+    assert "Box E joined the pool." in coord.system_prompt(p, now=start + 4100)
+
+
+def test_a_restrictions_change_or_a_users_charter_edit_re_renders_the_prompt_at_once(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text(RESTR_CHARTER)
+    start = time.time()
+    p.db.set_kv("last_coordinator_turn", start)
+    before = coord.system_prompt(p, now=start)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
+                            "text": "Never delete branches."}], turn=20, user_turn=True) == []
+    restricted = coord.system_prompt(p, now=start + 1)
+    assert restricted != before and "Never delete branches." in restricted.split("# Role", 1)[0]
+    rule = p.add_memory("Never touch the shared checkout.", kind="restriction")
+    assert "Never touch the shared checkout." in coord.system_prompt(p, now=start + 2)
+    p.forget_memory(rule.stem)
+    edited = coord.system_prompt(p, now=start + 3)
+    assert "Never touch the shared checkout." not in edited
+    # A Goals edit on the user's word shows at once; the same edit by the coordinator waits.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Measure first."}],
+                       turn=21) == []
+    assert coord.system_prompt(p, now=start + 4) == edited
+    assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Then ship."}],
+                       turn=22, user_turn=True) == []
+    users = coord.system_prompt(p, now=start + 5)
+    assert "Then ship." in users and "Measure first." in users
+    assert coord.system_prompt(p, now=start + 6) == users and p.db.kv(coord.PROMPT_REFRESH_KEY) is None
 
 
 def test_memory_order_follows_created_not_mtime(env):
@@ -19279,6 +19347,9 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     on = prompt()
     assert policy().endswith("push allowed=True, push queue=True") and "push queue" not in policy(code)
     assert "## Approving into the push queue" in on and "ttp push --detach" not in on
+    # Within the cache window the digest carries it; the next refresh renders it into STANDING.
+    assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.digest(p, {}, [], [])
+    p.db.set_kv(coord.PROMPT_SNAPSHOT_KEY, None)
     assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.system_prompt(p)
 
 
@@ -25252,6 +25323,7 @@ def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
     other = p.db.add_task("build", "s", kind="work", tier="light", origin="user", labels=["resource:box-c"])
     _bad_runs(p, tid, 1)
     _bad_runs(p, other, 1, status="lost", ago=2 * 86400)   # older than a day: not counted
+    p.db.set_kv(coord.PROMPT_SNAPSHOT_KEY, None)   # the next refresh renders the machines into STANDING
     dig, system = coord.digest(p, {}, [], []), coord.system_prompt(p)
     assert "## Machines" in system and "- box-a [device]: main board" in system and "- box-c [cpu]" in system
     assert "## Machines" not in dig, "the stable list is written to the cache again every turn"
@@ -51940,24 +52012,6 @@ def test_coordinator_turn_refused_for_its_cache_mark_retries_without_it(env, mon
     assert turn()[1] is False, "the retry goes without the mark that was refused"
 
 
-def test_memory_bursts_refresh_once_per_interval_and_restrictions_immediately(env):
-    from ttp import coordinator as coord
-    p = make(env)
-    start = time.time()
-    before = coord.system_prompt(p, now=start)
-    p.add_memory('Large memory burst. ' + 'x' * 3200, kind='fact')
-    assert coord.system_prompt(p, now=start + 1) == before
-    refreshed = coord.system_prompt(p, now=start + 3300)
-    assert refreshed != before
-    p.add_memory('Another burst. ' + 'y' * 3200, kind='fact')
-    assert coord.system_prompt(p, now=start + 3301) == refreshed
-    rule = p.add_memory('Never change a shared checkout.', kind='restriction')
-    restricted = coord.system_prompt(p, now=start + 3302)
-    assert restricted != refreshed and 'Never change a shared checkout.' in restricted
-    p.forget_memory(rule.stem)
-    assert 'Never change a shared checkout.' not in coord.system_prompt(p, now=start + 3303)
-
-
 def test_coordinator_cache_distinguishes_zero_partial_full_and_unknown(env):
     from ttp import budget as bud, audit
     from ttp.cli import status_text
@@ -52036,12 +52090,12 @@ def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
     from ttp import coordinator as coord
     p = make(env)
     start = time.time()
-    fact = p.add_memory('Old build duration.', kind='fact')
+    fact = p.add_memory('Old build host.', kind='resource')
     before = coord.system_prompt(p, now=start)
-    fact.write_text(fact.read_text().replace('Old build duration.', 'New build duration.'))
+    fact.write_text(fact.read_text().replace('Old build host.', 'New build host.'))
     view = coord.memory_view(p, now=start + 1)
     assert coord.system_prompt(p, now=start + 1) == before
-    assert 'New build duration.' in '\n'.join(coord.memory_digest_lines(view))
+    assert 'New build host.' in '\n'.join(coord.memory_digest_lines(view))
     p.forget_memory(fact.stem)
     view = coord.memory_view(p, now=start + 2)
     assert coord.system_prompt(p, now=start + 2) == before
