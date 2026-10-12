@@ -268,6 +268,18 @@ def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> t
             f"at {at(seen + CHECK_S)} (its next release check)" if seen else "at its next release check (hourly)")
 
 
+def _concerns(auto: dict, target: str, commit: str | None) -> bool:
+    """An automatic upgrade record (its key is "version commit") concerns the `target` deploy: a try of
+    that release (the same commit, when one is given) or of a newer one. An older release's failure, or
+    another commit of the same version, is history; a record without a key cannot be placed, so counts."""
+    v, _, c = str(auto.get("key") or "").partition(" ")
+    if not v:
+        return True
+    if v != target:
+        return is_newer(v, target)
+    return not commit or not c or _same_commit(c, commit)
+
+
 def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
                   fresh_s: float = DEPLOY_FRESH_S, allow_newer: bool = False) -> dict:
     """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
@@ -303,8 +315,11 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         tid = _holder(db, state)
         row["merge_pending"] = bool(tid and not at_target)
         auto, _ = db.kv(KV_AUTO)
-        if auto.get("outcome") == "failed":
+        if auto.get("outcome") == "failed" and _concerns(auto, target, commit):
             row["upgrade_error"] = auto.get("why") or "the last upgrade failed"
+        # Its own upgrade restarts the daemon: down meanwhile is a step, not a fault (as release.line).
+        row["upgrading"] = (auto.get("outcome") == "running" and bool(auto.get("key")) and
+                            _concerns(auto, target, commit) and now - float(auto.get("ts") or 0) < 900)
         if tid:
             from .release import STALE_S, task_activity
             task, last = task_activity(db, tid)
