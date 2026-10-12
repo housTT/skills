@@ -51064,3 +51064,18 @@ def test_the_daemons_review_spec_reuses_the_tasks_test_selection(env):
     assert "never a marker the repo may not define" in spec
     assert ("With `TTP_NO_DEVICE=1` open a device only through the device broker, `ttp devq` or `ttp lock` "
             "on a device resource, never directly." in spec)
+
+
+def test_ssh_auth_failed_gets_a_reboot_home_hint_and_other_failures_do_not(capsys):
+    from ttp import cli, machines
+    denied = "user@host: Permission denied (publickey).\n"
+    assert machines.auth_failed_hint("ssh: connect to host x port 22: Connection timed out") == ""
+    assert machines.auth_failed_hint(None) == ""
+    hint = machines.auth_failed_hint(denied)
+    assert "If the host rebooted" in hint and "authorized_keys" in hint and "console" in hint
+    assert "rebooted 1.0 h ago" in machines.auth_failed_hint(denied, booted_at=1000.0, now=1000.0 + 3600)
+    assert "If the host rebooted" in machines.auth_failed_hint(denied, booted_at=1.0, now=1.0 + 86400)
+    cli._unreachable({"host": "box"}, denied)
+    assert "authorized_keys" in capsys.readouterr().err
+    cli._unreachable({"host": "box"}, "Connection refused")
+    assert "authorized_keys" not in capsys.readouterr().err

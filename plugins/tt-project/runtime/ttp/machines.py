@@ -202,6 +202,26 @@ def merge(mine: dict, theirs: dict) -> dict:
 
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+# ssh's own words for a key it offered being refused (auth_failed), as opposed to a route failure.
+AUTH_FAILED_RE = re.compile(r"permission denied \(|too many authentication failures|"
+                            r"no more authentication methods", re.I)
+REBOOT_RECENT_S = 6 * 3600   # a boot this close before an auth failure makes the reboot its likely cause
+
+
+def auth_failed_hint(stderr: str | None, booted_at: float | None = None, now: float | None = None) -> str:
+    """A hint for an ssh auth_failed (empty for any other failure). A host that rebooted may bring the
+    account's home back empty or owned by another user (e.g. a container on local disk), so its
+    authorized_keys is gone. `booted_at` (the host's last known boot, e.g. from `uptime -s`) narrows it."""
+    if not AUTH_FAILED_RE.search(stderr or ""):
+        return ""
+    now = time.time() if now is None else now
+    if booted_at and 0 <= now - booted_at <= REBOOT_RECENT_S:
+        lead = f"The host rebooted {(now - booted_at) / 3600:.1f} h ago: its"
+    else:
+        lead = "If the host rebooted shortly before this, its"
+    return (f"{lead} account home may have come back empty or owned by another user, so authorized_keys "
+            "is missing. Restore the home's ownership and authorized_keys through the provider's own "
+            "console or connect path.")
 REMOTE = "~/.tt-project/machines.json"
 # Replaces the remote list only if it is still the one read (sha256 of its text), mode 0600.
 _WRITE = ("import hashlib,json,os,sys;h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True);"

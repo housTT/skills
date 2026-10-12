@@ -196,6 +196,9 @@ def _unreachable(entry: dict, stderr: str | None, rc: int = 255) -> None:
     why = ((stderr or "").strip().splitlines() or [f"ssh exit {rc}" if rc != 255 else "unknown ssh error"])[-1]
     print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
           f"try again once this machine is back on that network.", file=sys.stderr)
+    from . import machines as mm
+    if hint := mm.auth_failed_hint(stderr):
+        print(f"ttp: {hint}", file=sys.stderr)
 
 
 def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] | None = None) -> int:
