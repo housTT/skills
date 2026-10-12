@@ -5973,7 +5973,8 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
 
 def test_claude_leaves_its_own_breakpoints_room_on_later_calls(monkeypatch):
     from ttp.providers import base, claude
-    monkeypatch.setattr(claude, "cli_output", lambda *args: "2.1.285 (Claude Code)")
+    monkeypatch.setattr(claude, "_VERSIONS", {})
+    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.285 (Claude Code)")
     assert claude.Claude().own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, \
         "unverified builds reserve all four"
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
@@ -51758,16 +51759,90 @@ def test_a_task_already_waiting_on_a_missing_task_is_flagged_once_and_shown_brok
 def test_claude_verified_cache_capacity_and_unknown_builds(monkeypatch):
     from ttp.providers import claude
     monkeypatch.setattr(claude, '_FLAGS', {claude.INPUT_FORMAT: True})
-    monkeypatch.setattr(claude, 'cli_output', lambda *args: '2.1.296 (Claude Code)')
+    monkeypatch.setattr(claude, "_VERSIONS", {})
+    monkeypatch.setattr(claude, '_probe_version', lambda path: '2.1.296 (Claude Code)')
     prov = claude.Claude()
     assert prov.own_cache_breakpoints == 3
     assert prov.cached_input('STABLE', 'EVENTS', '1h') is not None
     for version in ('2.1.285 (Claude Code)', '2.1.297 (Claude Code)', ''):
-        monkeypatch.setattr(claude, 'cli_output', lambda *args: version)
+        monkeypatch.setattr(claude, '_probe_version', lambda path: version)
+        monkeypatch.setattr(claude, '_VERSIONS', {})
         logged = []
         assert prov.own_cache_breakpoints == 4
         assert prov.cached_input('STABLE', 'EVENTS', '1h', log=logged.append) is None
         assert logged == [], 'no doomed mark should be constructed or logged'
+
+
+def test_claude_cache_capacity_follows_an_in_place_cli_update(monkeypatch, tmp_path):
+    # A long-running daemon must not keep a verified build's capacity after the CLI is replaced
+    # at the same path (npm and similar update in place): a stale answer means a 400 every turn.
+    from ttp.providers import base, claude
+    cli = tmp_path / "claude"
+    cli.write_text("build one")
+    versions = {"build one": "2.1.296 (Claude Code)", "build two, longer": "2.1.297 (Claude Code)"}
+    probes = []
+    monkeypatch.setattr(claude, "_VERSIONS", {})
+    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
+    monkeypatch.setattr(claude, "_probe_version", lambda path: probes.append(path) or versions[open(path).read()])
+    prov = claude.Claude()
+    assert prov.own_cache_breakpoints == 3 and prov.own_cache_breakpoints == 3
+    assert len(probes) == 1, "an unchanged build is probed once"
+    cli.write_text("build two, longer")
+    os.utime(cli, ns=(cli.stat().st_atime_ns, cli.stat().st_mtime_ns + 10**9))
+    assert prov.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, "same path, new build: probed again"
+    assert len(probes) == 2
+
+
+def test_claude_cache_mark_refused_reserves_every_breakpoint_for_that_build(monkeypatch, tmp_path):
+    from ttp.providers import base, claude
+    cli = tmp_path / "claude"
+    cli.write_text("build")
+    monkeypatch.setattr(claude, "_VERSIONS", {})
+    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
+    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.296 (Claude Code)")
+    prov = claude.Claude()
+    assert not prov.cache_mark_refused("error_during_execution: API Error: 529 overloaded")
+    assert prov.cached_input("STABLE", "EVENTS", "1h") is not None
+    assert prov.cache_mark_refused('success: API Error: 400 {"type":"error","error":{"type":'
+                                   '"invalid_request_error","message":"A maximum of 4 blocks with '
+                                   'cache_control may be provided. Found 5."}}')
+    assert prov.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS
+    assert prov.cached_input("STABLE", "EVENTS", "1h") is None
+    assert not base.Provider.cache_mark_refused(prov, "blocks with cache_control"), "agents without the mark"
+
+
+def test_coordinator_turn_refused_for_its_cache_mark_retries_without_it(env, monkeypatch, tmp_path):
+    from ttp.providers import claude
+    from ttp.providers.base import RunUsage
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    cli = tmp_path / "claude-cli"
+    cli.write_text("build")
+    monkeypatch.setattr(claude, "_VERSIONS", {})
+    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
+    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.296 (Claude Code)")
+    p = make(env)
+    head, context = coord.prompt_parts(p)
+    d = Daemon(p.base)
+
+    def turn():
+        rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
+                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl="1h")
+        (p.runs / str(rid) / "STOP").touch()
+        return rid, (p.runs / str(rid) / "input.jsonl").exists()
+
+    rid, marked = turn()
+    assert marked, "a verified build gets the stable-context mark"
+    row = dict(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
+    d._finish_coordinator(row, RunUsage(error="success: API Error: 400 A maximum of 4 blocks with "
+                                              "cache_control may be provided. Found 5."), "failed", {})
+    assert int(p.db.kv("coordinator_failures", 0)) == 1, "still a failed turn; its messages stay queued"
+    assert turn()[1] is False, "the retry goes without the mark that was refused"
 
 
 def test_memory_bursts_refresh_once_per_interval_and_restrictions_immediately(env):

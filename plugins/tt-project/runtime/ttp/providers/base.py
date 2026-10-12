@@ -318,6 +318,12 @@ class Provider:
         such switch or `ttl` is not one it takes."""
         return {}
 
+    def cache_mark_refused(self, error: str) -> bool:
+        """Whether a failed turn's `error` is the API refusing cached_input's breakpoint (one
+        cache_control block too many). Then this agent build stops adding it for the daemon's life,
+        so the turn's retry runs without it."""
+        return False
+
     def cached_input(self, stable: str, rest: str, ttl: str, log=None) -> tuple[list[str], str] | None:
         """Arguments and stdin for a prompt sent as two blocks with a cache breakpoint after
         `stable`, so a change in `rest` alone re-reads `stable` from the cache; None when the agent

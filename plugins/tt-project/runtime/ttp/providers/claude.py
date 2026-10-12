@@ -41,6 +41,20 @@ INPUT_FORMAT = "--input-format"
 # plan within its limits and 5 min otherwise (API key, or a plan past its limits).
 CACHE_TTLS = ("5m", "1h")
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
+_VERSIONS: dict[tuple, str] = {}   # `claude --version` per CLI build on disk (Claude._build)
+_MARK_REFUSED: set[tuple] = set()   # builds whose API answer refused cached_input's extra breakpoint
+# The API's 400 for one cache_control block too many ("A maximum of 4 blocks with cache_control may
+# be provided. Found 5.").
+CACHE_MARK_400 = re.compile(r"blocks with cache_control", re.I)
+
+
+def _probe_version(path: str) -> str:
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                             timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (out.stdout + out.stderr).strip()
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 # Claude Code's bundled skills, which workers have never used: listed by name only (still callable),
 # which saves ~2.1k tokens a call. "off" and disableBundledSkills both add tokens instead.
@@ -72,10 +86,33 @@ class Claude(Provider):
         # 2.1.285 used four itself. This is evidence for this build, not an install
         # pin or an assumption about future builds. Unmeasured builds reserve all
         # four until their request shape is checked, avoiding a turn-losing 400.
-        # Resolve a versioned executable symlink so an auto-update changes the probe key.
-        binary = self.binary()
-        version = cli_output(str(Path(binary).resolve()) if binary else "claude", "--version").strip()
+        build = self._build()
+        if build in _MARK_REFUSED:
+            return MAX_CACHE_BREAKPOINTS   # the API refused our mark on this build (cache_mark_refused)
+        version = _VERSIONS.get(build)
+        if version is None:
+            version = _probe_version(build[0])
+            if len(build) > 1:
+                _VERSIONS[build] = version
         return 3 if version == "2.1.296 (Claude Code)" else MAX_CACHE_BREAKPOINTS
+
+    def _build(self) -> tuple:
+        """The CLI build on disk: its resolved path (a versioned symlink target) plus inode, size and
+        mtime. An in-place update keeps the path but not the rest, so it is a new key and its version
+        is probed again, unlike cli_output's per-path cache for the daemon's life."""
+        binary = self.binary()
+        path = str(Path(binary).resolve()) if binary else "claude"
+        try:
+            st = os.stat(path)
+        except OSError:
+            return (path,)
+        return (path, st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def cache_mark_refused(self, error: str) -> bool:
+        if not CACHE_MARK_400.search(error or ""):
+            return False
+        _MARK_REFUSED.add(self._build())
+        return True
 
     login_hint = "run `claude` there and use /login"
     efforts = ("low", "medium", "high", "xhigh", "max")

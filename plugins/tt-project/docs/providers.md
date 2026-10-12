@@ -105,6 +105,10 @@ on later requests and rejected an extra mark with HTTP 400. The adapter enables 
 mark only for the captured build; other builds keep charter and memory in the system prompt
 without constructing or logging a mark destined to be dropped. This is a compatibility check,
 not an installation pin. Capture a new build's first and later requests before extending it.
+The build check is keyed by the executable's resolved path, inode, size and modification
+time, so an in-place CLI update is probed again without a daemon restart. If the API still
+answers a marked coordinator turn with the too-many-cache_control 400, that build stops getting
+the mark for the rest of the daemon's life and the turn's retry goes without it.
 These captures verify request shape, not cache retention or savings at the real provider.
 
 Ordinary memory additions, edits and retirements stay in the live digest until the snapshot's

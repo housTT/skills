@@ -2104,6 +2104,10 @@ class Daemon:
             return   # its breaker holds the next turn until the login is back; the messages stay queued
         if status != "ok" or not isinstance(actions, list):
             self._settle_coord_check(checked, status, None, [])
+            if (self._run_dir(r) / "input.jsonl").exists() and get_provider(r["provider"]).cache_mark_refused(
+                    f"{usage.error} {usage.final_text or ''}"):
+                log(self.p, f"coordinator run {r['id']}: the API refused the extra cache breakpoint; "
+                            f"later turns on this {r['provider']} build go without it")
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
