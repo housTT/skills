@@ -529,9 +529,12 @@ and preferences you add later become part of the project's charter and memory.
   failed. A pending merge needs a live daemon, a harness task owner and a known takeover
   time; it emits one low note and records a model-free check in the deploying project's
   state, due five minutes after takeover. The original deadline survives retries and
-  restarts. A missed takeover raises one normal alert per project and release; it clears
-  quietly when that project's own daemon reports the release or a newer version. Missing
-  ownership/deadlines, upgrade errors and daemons that fail to start remain failures.
+  restarts; a new commit of the same version is a new merge with its own. A daemon that
+  stops or fails to come up, or an upgrade error for this release, alerts at the next
+  probe (about a minute), not at takeover. A missed takeover raises one normal alert per
+  project and release. Each alert clears quietly once its condition does, and a recovered
+  daemon returns to pending. Missing ownership/deadlines, current upgrade errors and daemons
+  that fail to start remain failures; an older release's upgrade error does not count.
   Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred,
   and needs this final verification. Ordinary `ttp deployed` remains a strict read-only
   probe for `retry_when`. It also runs, queue on or off, after
