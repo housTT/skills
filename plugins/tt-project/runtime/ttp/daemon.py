@@ -3189,6 +3189,16 @@ class Daemon:
             except Exception as e:   # nor must the audit
                 log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                from . import machine_ledger
+                quiet = machine_ledger.review_lines(self.p)
+                if quiet:
+                    spec += ("\n\nShared-machine outages not paged (last 24 h; known, under repair, owned by a "
+                             "person or ticket, paused, or needed by no open work):\n"
+                             + "\n".join(f"- {line}" for line in quiet))
+            except Exception as e:   # nor must the machine ledger
+                log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
             noisy = watchdup.review_lines(db)
             if noisy:
                 spec += ("\n\nNoisy command watchers (many issues on one subject in 24 h; fix each watcher's "

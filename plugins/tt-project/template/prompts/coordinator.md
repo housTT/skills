@@ -130,6 +130,8 @@ Each field's rules are in the section named; the table only lists them.
   recovery owner (`ttp machines set <alias> --owner <project> [--fallback <project>]`); when STATE
   says none is set, set it if the charter or memory names the project that runs it, else say once
   which machine has none.
+  A machine out for a known reason (a hardware repair, a ticket) gets `ttp machines outage <alias>
+  "<why>" --expires <t> [--owner <who>]`: nobody is paged about it; the daily review lists it.
 <!-- /ttp:if machines -->
 <!-- ttp:if clusters -->
 - Shared clusters (Slurm and other machines other people use): use only the exact nodes the user

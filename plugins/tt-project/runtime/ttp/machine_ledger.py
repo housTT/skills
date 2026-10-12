@@ -19,6 +19,16 @@ and that project does not itself report the condition, the page is held, and tha
 note per episode naming the reporting projects (for `down`, likely their own route problem).
 A condition no co-tenant reported for CONDITION_GONE_S, or reported cleared, is over. With no owner set nothing is routed: each co-tenant's digest names the gap once.
 
+Quiet outages (quiet_reason). Nobody is paged about a condition the harness already knows: a known outage
+recorded with `ttp machines outage <alias> "<why>" [--owner <who>] --expires <t>` (a hardware repair, often
+owned by a human or an external ticket), or an open change that expects the condition (`--expect down`).
+The owner's first page still goes, but nothing escalates to the fallback or the user, while: the user paused
+a resource on the machine, a reporting heal check carries a `known_fault`, or no open task of any project on
+this machine uses it (a task's resource on it that its project paused does not count). A reporter this
+machine cannot read counts as needing it. Each such outage is recorded once per machine (`quiet`), for the
+daily review (review_lines), never alerted; its user alert clears. Once the reason ends, the steps resume
+from that moment.
+
 Change ledger. Every live change to a shared machine (a drop-in, a disabled recovery switch, a pause) is
 recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expires <t> | --until-probe
 "<cmd>")`: who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
@@ -64,6 +74,8 @@ PROBE_END_S = 7 * 86400      # an entry with only an until-probe is overdue afte
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
+QUIET_KEPT_S = 2 * 86400     # a quiet outage's daily-review record is kept this long after it was last seen
+REVIEW_S = 86400             # the daily review lists the quiet outages seen within this
 GAP_KV = "machine_owner_gap_named"
 USER = "the user"
 
@@ -173,8 +185,11 @@ def change_line(c: dict, now: float | None = None) -> str:
 # conditions ---------------------------------------------------------------------------------------
 
 def report(by: str, alias: str, condition: str, text: str = "", grace_s: float | None = None,
-           cleared: bool = False, now: float | None = None) -> bool:
-    """A co-tenant `by` sees `alias` `condition` (down or held), or no longer does (`cleared`).
+           cleared: bool = False, now: float | None = None, known: str | None = None,
+           escalate: str | None = None) -> bool:
+    """A co-tenant `by` sees `alias` `condition` (down or held), or no longer does (`cleared`). `known`: why
+    the reporter knows the fault (its heal check's known_fault); "" says it does not, None keeps it.
+    `escalate`: who the reporting heal check escalates to ("coordinator" takes the user's page).
     Returns whether the alias is a known machine."""
     now = time.time() if now is None else now
     if condition not in CONDITIONS or alias not in machines.load():
@@ -192,12 +207,138 @@ def report(by: str, alias: str, condition: str, text: str = "", grace_s: float |
                      grace_s=float(grace_s if grace_s is not None else c.get("grace_s", GRACE_S)))
             if by not in c["seen_by"]:
                 c["seen_by"].append(by)
+            if known is not None:
+                kb = c.setdefault("known_by", {})
+                if _one_line(known):
+                    kb[by] = _one_line(known)
+                else:
+                    kb.pop(by, None)
+            if escalate is not None:
+                eb = c.setdefault("escalate_by", {})
+                if escalate == "coordinator":
+                    eb[by] = escalate
+                else:
+                    eb.pop(by, None)
         _write(ROUTES, doc)
     return True
 
 
 def conditions() -> dict[str, dict]:
     return _read(ROUTES, {"conditions": {}}).get("conditions", {})
+
+
+# known outages ------------------------------------------------------------------------------------
+
+def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None) -> dict:
+    """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
+    about it meanwhile. `owner`: who has the repair, often a human or an external ticket."""
+    now = time.time() if now is None else now
+    if alias not in machines.load():
+        raise ValueError(f"no machine {alias!r} in `ttp machines list`")
+    why = _one_line(why)
+    if not why:
+        raise ValueError("say why the machine is out")
+    if not expires:
+        raise ValueError("give an end: --expires <delay or time>")
+    rec = {"why": why, "owner": _one_line(owner, 120), "by": by, "since": now,
+           "until": ends.parse_expires(expires, now)}
+    with _locked():
+        doc = _read(ROUTES, {"conditions": {}})
+        doc.setdefault("outages", {})[alias] = rec
+        _write(ROUTES, doc)
+    return rec
+
+
+def clear_outage(alias: str) -> bool:
+    with _locked():
+        doc = _read(ROUTES, {"conditions": {}})
+        if (doc.get("outages") or {}).pop(alias, None) is None:
+            return False
+        _write(ROUTES, doc)
+    return True
+
+
+def outages(now: float | None = None, doc: dict | None = None) -> dict[str, dict]:
+    """{alias: record} of the known outages not yet past their end."""
+    now = time.time() if now is None else now
+    got = (doc if doc is not None else _read(ROUTES, {"conditions": {}})).get("outages") or {}
+    return {a: o for a, o in got.items() if isinstance(o, dict) and float(o.get("until") or 0) > now}
+
+
+def outage_line(alias: str, o: dict) -> str:
+    owner = f"; owner: {o['owner']}" if o.get("owner") else ""
+    return f"{alias}: known outage until {ends.stamp(o['until'])} (by {o.get('by') or '?'}{owner}): {o['why']}"
+
+
+def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
+    """Read-only, from every project on this machine: the open tasks that use a resource on `alias`
+    ("need"), and the pauses of resources on it ("paused", "user": set by the user). A reporter that
+    cannot be read from here counts as needing it."""
+    from . import globalcap, shared
+    from . import responsibilities as rs
+    from .coordinator import task_resources
+    from .db import PAUSED_RESOURCES_KEY
+    rec = machines.load().get(alias) or {}
+    needles = [alias] + ([str(rec["hostname"])] if rec.get("hostname") else [])
+
+    def on(res: str) -> bool:
+        return any(rs._names(n, res) for n in needles)
+
+    out: dict[str, list[str]] = {"need": [], "paused": [], "user": [], "shared": []}
+    seen = set()
+    for name, base in rs._projects(project.hostname()):
+        seen.add(name)
+        if not (base / "state" / "project.db").is_file():
+            continue
+        try:
+            db = rs.ReadOnly(globalcap.connect_ro(base / "state" / "project.db"))
+        except Exception:
+            out["need"].append(f"{name} (its state cannot be read)")
+            continue
+        try:
+            pz = db.kv(PAUSED_RESOURCES_KEY, {}) or {}
+            pz = pz if isinstance(pz, dict) else {}
+            for res, v in sorted(pz.items()):
+                if on(res):
+                    out["user" if isinstance(v, dict) and v.get("by") == "user" else "paused"].append(f"{name} {res}")
+            for t in db.q("SELECT id, labels FROM tasks WHERE status NOT IN ('done','failed','cancelled')"):
+                for res in sorted(task_resources(t)):
+                    if on(res) and res not in pz and not shared.read_pause(res):
+                        out["need"].append(f"{name} #{t['id']} ({res})")
+        except Exception as e:
+            out["need"].append(f"{name} (its state cannot be read: {type(e).__name__})")
+        finally:
+            db.close()
+    for alias_res in sorted({r for r in rs._shared_resources(alias)}):
+        sp = shared.read_pause(alias_res)
+        if sp:
+            out["user" if sp.get("by") == "user" else "shared"].append(f"shared {alias_res}")
+    out["need"] += [f"{who} (not readable from here)" for who in reporters if who not in seen]
+    return out
+
+
+def quiet_reason(c: dict, now: float, doc: dict | None = None) -> tuple[str, bool]:
+    """(why condition `c` escalates no further, whether nobody is paged at all); ("", False) when it pages as
+    usual (module doc: Quiet outages)."""
+    alias, cond = c["alias"], c["condition"]
+    o = outages(now, doc).get(alias)
+    if o:
+        return (f"known outage until {ends.stamp(o['until'])}"
+                + (f", owned by {o['owner']}" if o.get("owner") else "") + f": {o['why']}"), True
+    for ch in changes({alias}):
+        if cond in (ch.get("expects") or []) and not overdue(ch, now):
+            return f"expected from machine change #{ch['id']} by {ch.get('by')}: {ch['what']}", True
+    d = _demand(alias, list(c.get("seen_by") or []))
+    if d["user"]:
+        return f"the user paused {', '.join(d['user'])}", False
+    if d["shared"]:
+        return f"paused for every project: {', '.join(d['shared'])}", False
+    known = c.get("known_by") or {}
+    if known:
+        return "known fault: " + "; ".join(f"{who}: {why}" for who, why in sorted(known.items())), False
+    if not d["need"]:
+        return "no open work uses it" + (f" (paused: {', '.join(d['paused'])})" if d["paused"] else ""), False
+    return "", False
 
 
 # who can act ---------------------------------------------------------------------------------------
@@ -289,12 +430,15 @@ def _vouched(c: dict, targets: list[str], now: float,
 
 
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
-          claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None) -> list[dict]:
+          claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None,
+          quiet: Callable[[dict, float, dict], tuple[str, bool]] | None = None) -> list[dict]:
     """The pages to deliver now, model-free: [{target, kind, key, alias, stage, id, text}]. Each due
     page is recorded as pending; the pending pages nobody holds (or whose claim lapsed after CLAIM_S)
-    are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it."""
+    are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it.
+    `quiet` (default quiet_reason) stops a condition's escalation, or every page of it."""
     now = time.time() if now is None else now
     able = able or can_act
+    quiet = quiet or quiet_reason
     if healthy is None:
         from .responsibilities import healthy_checks as healthy
     out: list[dict] = []
@@ -338,7 +482,25 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 claim(page)
                 continue
             page.pop("held", None)
+            why, silent = quiet(c, now, doc)
+            if why and (silent or "stage" in page):
+                # Known, or nobody needs it: no further page, one daily-review record, the user's alert clears.
+                page["quiet"] = why
+                pend = page.get("pending")
+                if pend and pend.get("kind") == "machine_condition" and (silent or int(pend.get("stage") or 0) > 0):
+                    page.pop("pending")
+                doc.setdefault("quiet", {})[c["alias"]] = {
+                    "condition": c["condition"], "first": c["first"], "why": why, "at": now,
+                    "seen_by": list(c.get("seen_by") or [])}
+                claim(page)
+                continue
+            if page.pop("quiet", None) is not None and "stage" in page:
+                page.update(at=now)   # the steps resume from now, not from the page before the quiet spell
+                page.pop("unable_since", None)
             target = _step(page, targets, now, able)
+            coordinators = [w for w in c.get("seen_by") or [] if (c.get("escalate_by") or {}).get(w) == "coordinator"]
+            if target == USER and coordinators:
+                target = coordinators[0]   # its heal check escalates to its coordinator, not the user
             if target:
                 skipped = f" ({targets[page['stage'] - 1]} cannot act: {page.get('why') or 'no answer'})" \
                     if page["stage"] else ""
@@ -349,6 +511,9 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                          f"Recovery page {page['stage'] + 1}{skipped}: "
                          f"check and recover it; record any live change with `ttp machines change add`.")
             claim(page)
+        doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
+                        if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
+        doc["outages"] = outages(now, doc)
         _write(ROUTES, doc)
         ledger = _read(LEDGER, {"next": 1, "changes": []})
         changed = False
@@ -406,7 +571,8 @@ def condition_open(key: str, now: float | None = None) -> bool:
     """Whether condition `key` (alias:condition) is still reported (alerts.holds)."""
     now = time.time() if now is None else now
     c = conditions().get(key)
-    return isinstance(c, dict) and now - float(c.get("last") or 0) < CONDITION_GONE_S
+    return isinstance(c, dict) and now - float(c.get("last") or 0) < CONDITION_GONE_S \
+        and not (c.get("page") or {}).get("quiet")
 
 
 def change_overdue(cid: int, now: float | None = None) -> bool:
@@ -488,9 +654,12 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         if c.get("alias") in mine:
             owner = (known.get(c["alias"]) or {}).get("recovery_owner")
             held = (c.get("page") or {}).get("held")
+            hush = (c.get("page") or {}).get("quiet")
             lines.append(f"{c['alias']} {c['condition']} since {ends.stamp(c['first'])} (seen by "
                          f"{', '.join(c.get('seen_by', []))}; recovery owner: {owner or 'none set'}"
-                         + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "") + ")")
+                         + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "")
+                         + (f"; not escalated: {hush}" if hush else "") + ")")
+    lines += [outage_line(a, o) for a, o in sorted(outages(now).items()) if a in mine]
     named = list(p.db.kv(GAP_KV) or [])
     gaps = [a for a in mine if not (known.get(a) or {}).get("recovery_owner") and a not in named]
     if gaps:
@@ -499,3 +668,17 @@ def digest_lines(p, now: float | None = None) -> list[str]:
                      "(named once).")
         p.db.set_kv(GAP_KV, named + gaps)
     return lines
+
+
+def review_lines(p, now: float | None = None) -> list[str]:
+    """For the daily review: each outage of the last day on a machine in `p`'s Resources (or one it is the
+    recovery owner or fallback of) that was not paged, and why; one line per machine."""
+    now = time.time() if now is None else now
+    known = machines.load()
+    mine = set(resource_machines(p)) | {a for a, m in known.items()
+                                        if p.name in (m.get("recovery_owner"), m.get("recovery_fallback"))}
+    got = _read(ROUTES, {"conditions": {}}).get("quiet") or {}
+    return [f"{a} {q.get('condition')} since {ends.stamp(float(q.get('first') or 0))} (seen by "
+            f"{', '.join(q.get('seen_by') or []) or '?'}), last {ends.stamp(float(q['at']))}: not paged: {q.get('why')}"
+            for a, q in sorted(got.items()) if a in mine and isinstance(q, dict)
+            and now - float(q.get("at") or 0) < REVIEW_S]

@@ -27,6 +27,9 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   Moving escalation to the coordinator closes an earlier user alert with its reason. Adding a
   known fault that covers the current confirmed failure does the same, without claiming recovery.
 
+An outage check whose `resource` this project paused (its own pause or a shared one) is not escalated
+and reports nothing to the machine ledger while the pause lasts: the outage is known here.
+
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
 nothing for 60 min (or past its grace_s, if shorter) it escalates as above whatever `known_fault`
@@ -64,7 +67,9 @@ Shared machines: a check that watches one of the user's machines (`machine: "<al
 ledger (machine_ledger.report), so the machine's recovery owner is paged once the condition outlasts
 the check's grace: `held` while a broker's hold field is set, otherwise `down` (`condition` overrides
 it); an unknown result counts only once an outage check escalates on it, and never when only its route
-failed (above); a single known fault never does. The next healthy result reports it cleared.
+failed (above); a single known fault never does. An outage check's report carries its `known_fault`,
+which keeps the page from escalating past the owner (machine_ledger: Quiet outages). The next healthy
+result reports it cleared.
 
 State lives in the database (kv `heal:<name>`), so a daemon restart, even in the middle of a fix,
 picks up where it was: a fix that started counts toward the cap, and the next run is its recheck,
@@ -449,6 +454,8 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
             want = [alias, "held"]
         elif spec.get("preset") != "broker":   # a broker only missing its automatic recovery is not down
             want = [alias, "down"]
+    if st.get("resource_paused"):
+        want = None   # its own resource is paused: the outage is known here, nothing is reported
     if not was and not want:
         return
     from . import machine_ledger
@@ -456,7 +463,8 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
         machine_ledger.report(host.p.name, was[0], was[1], cleared=True, now=now)
     if want:
         machine_ledger.report(host.p.name, want[0], want[1], f"heal check {name}: {st.get('last_out') or ''}",
-                              grace_s=grace, now=now)
+                              grace_s=grace, now=now, known=str(spec.get("known_fault") or ""),
+                              escalate=escalate_to(host, spec))
     if want != was:
         st = state(db, name)
         if want:
@@ -490,6 +498,11 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     else:
         st.pop("finding", None)
     pending = st.get("phase") in ("fixing", "settling")   # a fix ran (or a restart cut it short)
+    paused = _paused_resource(db, spec)
+    if paused:
+        st["resource_paused"] = paused
+    else:
+        st.pop("resource_paused", None)
     if rc == 0:
         was = st.get("status")
         nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported")
@@ -517,6 +530,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             if dark >= window:
                 st["status"] = "unhealthy"
                 st.setdefault("since", st["unknown_since"])
+                if paused:
+                    return _paused_outage(db, name, st, paused, now)
                 if st.get("task") or st.get("escalated"):
                     return _escalated(host, name, spec, st, now)
                 if st["route_only"]:
@@ -543,6 +558,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             st.pop(key, None)
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
+    if paused:
+        return _paused_outage(db, name, st, paused, now)
     if st.get("task") or st.get("escalated"):
         return _escalated(host, name, spec, st, now)
     if pending:
@@ -650,6 +667,27 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
                    + f" {name} still fails and its {how}. Last check: {last}", "high")
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
+
+
+def _paused_resource(db: Any, spec: dict) -> str:
+    """The resource an outage check watches when this project paused it (its own or shared), else ""."""
+    res = str(spec.get("resource") or "")
+    if not spec.get("outage") or not res:
+        return ""
+    try:
+        return res if res in db.paused_resources() else ""
+    except Exception:
+        return ""
+
+
+def _paused_outage(db: Any, name: str, st: dict, res: str, now: float) -> tuple[str, float | None]:
+    """An outage check whose own resource is paused: the outage is known here, so no fix, no escalation,
+    nothing reported to the machine ledger, and an earlier user alert clears."""
+    from . import alerts
+    alerts.close_key(db, STATE_KEY + name, f"{res} is paused", now)
+    st.pop("alerted", None)
+    _save(db, name, st)
+    return f"unhealthy ({res} paused: not escalated)", None
 
 
 def escalate_to(host: Any, spec: dict) -> str:

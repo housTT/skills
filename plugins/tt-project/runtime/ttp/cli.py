@@ -2781,6 +2781,8 @@ def cmd_machines(a) -> None:
     from . import machines as mm
     if a.action == "change":
         return _machine_change(a)
+    if a.action == "outage":
+        return _machine_outage(a)
     if a.action == "status":
         from . import responsibilities
         view = responsibilities.machine_status(a.alias)
@@ -2828,6 +2830,30 @@ def cmd_machines(a) -> None:
             print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
         for alias in sorted(known):
             print(mm.line(alias, known[alias]))
+
+
+def _machine_outage(a) -> None:
+    """`ttp machines outage`: a known outage (hardware repair, an external ticket) that pages nobody."""
+    from . import machine_ledger as ml
+    if a.clear:
+        if not a.alias:
+            die("name the machine whose outage is over")
+        print(f"{a.alias}: known outage cleared" if ml.clear_outage(a.alias) else f"{a.alias}: no known outage")
+        return
+    if not a.why:
+        got = ml.outages()
+        for alias, o in sorted(got.items()):
+            if not a.alias or alias == a.alias:
+                print(ml.outage_line(alias, o))
+        if not got:
+            print("no known outages")
+        return
+    p = here()
+    try:
+        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "")
+    except ValueError as e:
+        die(str(e))
+    print(ml.outage_line(a.alias, rec))
 
 
 def _machine_change(a) -> None:
@@ -4449,6 +4475,14 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("alias")
     m = ms.add_parser("push", help="copy the list to the machines your --host projects run on, merged")
     m.add_argument("--host", help="only this machine")
+    m = ms.add_parser("outage", help="a known outage (hardware repair, an external ticket): nobody is paged "
+                                     "about the machine until it ends; the daily review lists it")
+    m.add_argument("alias", nargs="?", help="the machine (none: list the known outages)")
+    m.add_argument("why", nargs="?", help="why it is out, one line (none: show it)")
+    m.add_argument("--owner", help="who has the repair: a person's role or a ticket, not a project")
+    m.add_argument("--expires", help="when it ends: a delay (3d) or a time (required to record one)")
+    m.add_argument("--by", help="the project recording it (default: the project you are in)")
+    m.add_argument("--clear", action="store_true", help="the outage is over")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
     cs = m.add_subparsers(dest="change", required=True)
     c = cs.add_parser("add", help="record a live change: what, how to undo it and when it ends")

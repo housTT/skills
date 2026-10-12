@@ -52714,3 +52714,162 @@ def test_selector_repair_spec_forbids_whitelisting_a_harness_head(env):
     spec = " ".join(p.db.task(owner)["spec"].split())
     assert "Never add a harness-preparation head to a publication whitelist; qualify it with " \
            "`ttp checks --purpose harness` through a reviewed harness definition." in spec
+
+
+# quiet outages: known, under repair, owned by a person or ticket, paused, or needed by no open work ---------
+
+def _quiet_box(env, owner="alpha", fallback="beta"):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    alpha = make(env, owner)
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner=owner, fallback=fallback)
+    never = {owner: (False, "its daemon is stopped"), fallback: (False, "it is paused")}
+    return alpha, ml, never.get
+
+
+def _walk(ml, able, t0, cond="down", steps=8):
+    """Route the condition through every step of its chain, gamma still seeing it; returns the targets
+    paged, in order."""
+    got = []
+    for i in range(steps):
+        t = t0 + i * (ml.UNAVAILABLE_S + 60)
+        ml.report("gamma", "box-a", cond, now=t)
+        for page in ml.route(t, able=able):
+            ml.delivered(page)
+            got.append(page["target"])
+    return got
+
+
+def test_a_known_outage_pages_nobody_and_shows_in_the_daily_review(env, capsys):
+    from ttp.cli import main
+    alpha, ml, able = _quiet_box(env)
+    main(["machines", "outage", "box-a", "tray swap in progress", "--expires", "3d", "--by", "alpha"])
+    assert "box-a: known outage until" in capsys.readouterr().out
+    t0 = time.time() + 2 * 3600
+    ml.report("gamma", "box-a", "down", "no answer to ssh", now=t0 - 2 * 3600)
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0) == [], "no owner, fallback or user page while the outage is known"
+    assert not ml.condition_open("box-a:down", now=t0 + 7 * (ml.UNAVAILABLE_S + 60)), "the user's alert clears"
+    lines = ml.review_lines(alpha, now=t0 + 60)
+    assert len(lines) == 1 and "box-a down" in lines[0] and "not paged: known outage" in lines[0]
+    assert "tray swap in progress" in lines[0] and "gamma" in lines[0]
+    assert ml.review_lines(alpha, now=t0 + ml.REVIEW_S + 8 * ml.UNAVAILABLE_S) == [], "a day later it is gone"
+    main(["machines", "outage"])
+    assert "tray swap in progress" in capsys.readouterr().out
+    # Once it is cleared, an outage nobody explained escalates again, from the owner.
+    main(["machines", "outage", "box-a", "--clear"])
+    t1 = t0 + 5 * ml.UNAVAILABLE_S
+    ml.report("gamma", "box-a", "down", now=t1)
+    assert _walk(ml, able, t1) == ["alpha", "beta", ml.USER]
+
+
+def test_an_outage_owned_by_a_person_or_ticket_pages_nobody(env, capsys):
+    from ttp.cli import main
+    alpha, ml, able = _quiet_box(env)
+    with pytest.raises(SystemExit):
+        main(["machines", "outage", "box-a", "board replacement"])   # no end: refused
+    main(["machines", "outage", "box-a", "board replacement", "--owner", "hardware ticket", "--expires", "2d"])
+    assert "owner: hardware ticket" in capsys.readouterr().out
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == []
+    c = ml.conditions()["box-a:down"]
+    assert "owned by hardware ticket" in c["page"]["quiet"]
+    assert "owned by hardware ticket" in ml.review_lines(alpha)[0]
+
+
+def test_a_known_fault_or_an_expected_change_stops_the_escalation(env):
+    alpha, ml, able = _quiet_box(env)
+    t0 = time.time()
+    ml.report("gamma", "box-a", "held", now=t0, known="vendor firmware bug, repair is not ours")
+    assert _walk(ml, able, t0 + 3600, "held") == ["alpha"], "the owner hears once; nobody else is paged"
+    assert "known fault: gamma: vendor firmware bug" in ml.review_lines(alpha)[0]
+    ml.report("gamma", "box-a", "held", cleared=True)
+    ml.add_change("box-a", "disabled auto power cycle for a soak", "enable it", "gamma", expires="1d",
+                  expects=["down"], now=t0)
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == [], "a down the open change expects pages nobody"
+
+
+def test_an_outage_no_open_work_needs_escalates_no_further_until_work_needs_it(env):
+    alpha, ml, able = _quiet_box(env)
+    gamma = _second_project(env, "gamma")
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == ["alpha"]
+    assert "not paged: no open work uses it" in ml.review_lines(alpha)[0]
+    assert not ml.condition_open("box-a:down", now=t0 + 3600)
+    # Open work on the machine: the escalation resumes from the step it reached.
+    gamma.db.add_task("run the soak", labels=["resource:box-a-device"])
+    t1 = t0 + 5 * ml.UNAVAILABLE_S
+    ml.report("gamma", "box-a", "down", now=t1)
+    assert _walk(ml, able, t1) == ["beta", ml.USER]
+
+
+def test_an_unexplained_outage_that_open_work_needs_still_pages_the_user(env):
+    alpha, ml, able = _quiet_box(env)
+    gamma = _second_project(env, "gamma")
+    gamma.db.add_task("run the soak", labels=["exclusive:box-a"])
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta", ml.USER]
+    assert ml.condition_open("box-a:down", now=t0 + 3600) and ml.review_lines(alpha) == []
+
+
+@pytest.mark.parametrize("by", ["coordinator", "user"])
+def test_an_outage_whose_resource_its_project_paused_escalates_no_further(env, by):
+    alpha, ml, able = _quiet_box(env)
+    gamma = _second_project(env, "gamma")
+    gamma.db.add_task("run the soak", labels=["resource:box-a-device"])
+    gamma.db.set_kv("paused_resources", {"box-a-device": {"reason": "box out", "since": time.time(), "by": by}})
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == ["alpha"]
+    why = ml.conditions()["box-a:down"]["page"]["quiet"]
+    assert why == ("the user paused gamma box-a-device" if by == "user"
+                   else "no open work uses it (paused: gamma box-a-device)")
+
+
+def test_a_shared_pause_on_the_machine_never_pages_the_user(env):
+    from ttp import shared
+    alpha, ml, able = _quiet_box(env)
+    shared.update_pause("box-a", lambda v: {"reason": "box out", "since": time.time(), "by": "coordinator",
+                                            "project": "gamma"})
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)   # gamma is not readable here: it counts as needing it
+    assert _walk(ml, able, t0 + 3600) == ["alpha"]
+    assert "paused for every project: shared box-a" in ml.conditions()["box-a:down"]["page"]["quiet"]
+
+
+def test_the_last_step_pages_the_reporters_coordinator_when_its_heal_check_escalates_there(env):
+    alpha, ml, able = _quiet_box(env)
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0, escalate="coordinator")
+    ml.report("delta", "box-a", "down", now=t0, escalate="user")
+    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta", "gamma"]
+    ml.report("gamma", "box-a", "down", now=t0 + 3600, escalate="user")
+    assert ml.conditions()["box-a:down"].get("escalate_by") == {}
+
+
+def test_an_outage_check_whose_resource_is_paused_neither_escalates_nor_reports_the_machine(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, resource="box-a-device", outage=True, fix=None, grace_s=0)
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv("paused_resources", {"box-a-device": {"reason": "box out", "since": now, "by": "coordinator"}})
+    for dt in (0, 3600, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", spec, now + dt) == ("unhealthy (box-a-device paused: not escalated)", None)
+    dark = dict(spec, check="exit 255")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    for dt in (0, 2 * heal.OUTAGE_S):
+        heal.run(d, "svc", dark, now + dt)
+    assert ml.conditions() == {}
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    # The pause lifted: the same outage escalates and reports the machine down.
+    p.db.set_kv("paused_resources", {})
+    assert "paused" not in heal.run(d, "svc", spec, now + 3 * heal.OUTAGE_S + 60)[0]
+    assert "box-a:down" in ml.conditions()
