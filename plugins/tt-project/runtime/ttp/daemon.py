@@ -83,8 +83,8 @@ from . import shared
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
-from .project import (OWN_FLAG, Project, command_env, deep_merge, layered, disk_resume_gb, durable_write,
-                      git_fsync_env, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
+from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
+                      hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -117,6 +117,12 @@ PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
+# The daemon's review spec embeds the code task's spec and hand-off, then this line; its own steps
+# follow it. A re-review reads the first review's `ttp push --own` step only there, as this sentence.
+REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
+                     "that its tests fail without it.")
+OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delivers onto its own branch) "
+                      r".*`ttp push --own --detach`")
 # What a failed review's hand-off says failed (review_failure; kind-review.md): only a check or gate
 # that is missing or does not apply, with no code finding (check_only), code findings (substantive),
 # or both (mixed). A check-only failure gets no fix and re-review: nothing in the change is to fix.
@@ -5918,8 +5924,7 @@ class Daemon:
         if prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
-        lines.append("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
-                     "that its tests fail without it.")
+        lines.append(REVIEW_CHECK_LINE)
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
                      "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
                      "With `TTP_NO_DEVICE=1` open a device only through the device broker, `ttp devq` or "
@@ -6171,20 +6176,49 @@ class Daemon:
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             # The stack's pr_branch goes with its `ttp push --own` step: the re-review carries it as a label,
             # and its spec names the fix's branch to publish from (the reviewed branch lacks the fixes).
-            # A step it cannot carry (no pr_branch left, own pushes off) is left out: review only.
+            # Whether the first review had that step is read from its pr_branch label, or (a review older
+            # than the label) from the daemon's own step sentence after REVIEW_CHECK_LINE, never from the
+            # code task's spec and hand-off it embeds. Only that step sentence is replaced.
             first_spec = (first.get("spec") or "")[:REVIEW_FIX_SPEC_CHARS]
             onto = push.pr_elsewhere(self.p, prfix or db.task(fid), d) if d.get("push_allowed", True) else ""
-            publish = bool(OWN_FLAG.search(first_spec))
+            flines = first_spec.splitlines()
+            cut = max((i + 1 for i, ln in enumerate(flines) if ln == REVIEW_CHECK_LINE), default=0)
+            body, tail = flines[:cut], flines[cut:]
+            publish = any(lb.startswith("pr_branch:") for lb in push._labels(first)) \
+                or any(OWN_STEP.match(ln) for ln in tail)
+            step = ""
             if publish and onto:
                 step = (f"If it passes, publish #{fid}'s head onto its pr_branch {onto} with `ttp push --own --detach` "
                         f"from #{fid}'s worktree (branch {fbranch}), never from {code['branch']}, which lacks the "
                         f"fixes; never run plain `ttp push` and do not approve it for the push queue.")
             elif publish:
-                first_spec = "\n".join(x for ln in first_spec.splitlines() if (x := own_free(ln, "off")))
-                why = ("own pushes are off in this project (delivery.own_push)" if own_push(cfg) == "off" else
-                       f"#{fid} carries no pr_branch to publish onto")
-                step = (f"Review only: {why}. If it passes, hand off `done`; do not push it anywhere or approve it "
-                        f"for the push queue. This overrides any push step in the first review's spec.")
+                tail = [ln for ln in tail if not OWN_STEP.match(ln)]
+                was = push.labelled_elsewhere(self.p, prfix or db.task(fid), d)
+                if own_push(cfg) == "off":
+                    # As the first review does with own pushes off: the stack lands on the push branch
+                    # like any other change, unless nothing may reach it.
+                    tail = [x for ln in tail if (x := own_free(ln, "off"))]
+                    pb = str(d.get("push_branch") or "").strip()
+                    why = "nothing may be pushed (delivery.push_allowed is off)" if not d.get("push_allowed", True) \
+                        else "there is no push branch (delivery.push_branch)" if not pb else \
+                        push.kept_off(code, worktree.diff_lines(self.p, [code["branch"]]), d) \
+                        or push.push_branch_problem(pb, self.p.root, push.allow_protected(d)).removeprefix(
+                            "delivery.push_branch: ")
+                    if not why:
+                        only = False
+                        step = ((f"Its branch label {was} was ignored: own" if was else "Own")
+                                + f" pushes are off in this project (delivery.own_push), so it lands on {pb} like "
+                                f"any other change. If it passes, push #{fid}'s head with `ttp push` from #{fid}'s "
+                                f"worktree (branch {fbranch}; it publishes to {pb}). This overrides any push step "
+                                f"in the first review's spec.")
+                    else:
+                        why = f"own pushes are off in this project (delivery.own_push), and {why}"
+                else:
+                    why = f"#{fid} carries no pr_branch to publish onto"
+                if not step:
+                    step = (f"Review only: {why}. If it passes, hand off `done`; do not push it anywhere or approve "
+                            f"it for the push queue. This overrides any push step in the first review's spec.")
+            first_spec = "\n".join(body + tail)
             rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                               "\n".join([
                                   f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
@@ -6193,7 +6227,7 @@ class Daemon:
                                   f"Check each is fixed, then review what changed since. Where the first review's "
                                   f"spec below names a branch or worktree of this stack (such as {code['branch']} or "
                                   f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
-                                  *([step] if publish else []),
+                                  *([step] if step else []),
                                   f"The first review's spec (#{first['id']}):\n{first_spec}"]),
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),

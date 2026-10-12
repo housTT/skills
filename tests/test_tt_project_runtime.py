@@ -35075,12 +35075,59 @@ def test_the_re_review_of_a_pr_branch_stack_carries_its_pr_branch_or_no_push_ste
     assert "--own" not in rr["spec"] and "Review only" in rr["spec"], rr["spec"]
     assert "carries no pr_branch" in rr["spec"]
 
-    # Own pushes turned off since the first review: the re-review never mentions --own.
+    # A first review older than its pr_branch label: its own step sentence still counts.
+    _, rev = failed_stack("legacy")
+    p.db.update_task(rev["id"], labels=[lb for lb in json.loads(rev["labels"]) if not lb.startswith("pr_branch:")])
+    fix, rr = fix_and_re_review(rev)
+    assert "pr_branch:feature/x" in json.loads(rr["labels"]), rr["labels"]
+    assert f"publish #{fix['id']}'s head onto its pr_branch feature/x" in rr["spec"], rr["spec"]
+
+    # Own pushes turned off since the first review: as the first review then would, the stack lands on
+    # the push branch like any other change (no review-only label), and the re-review never mentions --own.
     _, rev = failed_stack("three")
     p.set_config("delivery.own_push", "off")
+    fix, rr = fix_and_re_review(rev)
+    labels = json.loads(rr["labels"])
+    assert not any(lb.startswith("pr_branch:") for lb in labels) and push.REVIEW_ONLY_LABEL not in labels, labels
+    assert "--own" not in rr["spec"] and "Review only" not in rr["spec"], rr["spec"]
+    assert "Its branch label feature/x was ignored: own pushes are off" in rr["spec"], rr["spec"]
+    assert f"push #{fix['id']}'s head with `ttp push` from #{fix['id']}'s worktree" in rr["spec"], rr["spec"]
+    assert "do not push it" not in fix["spec"] and f"Leave the push to re-review #{rr['id']}" in fix["spec"]
+    # ...unless nothing may reach the push branch: then review only, saying why.
+    p.set_config("delivery.own_push", "on")
+    _, rev = failed_stack("four")
+    for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND title='four'"):
+        p.db.update_task(t["id"], spec="no_push: an experiment")
+    p.set_config("delivery.own_push", "off")
     _, rr = fix_and_re_review(rev)
-    assert not any(lb.startswith("pr_branch:") for lb in json.loads(rr["labels"])), rr["labels"]
-    assert "--own" not in rr["spec"] and "own pushes are off" in rr["spec"], rr["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(rr["labels"]), rr["labels"]
+    assert "--own" not in rr["spec"] and "Review only: own pushes are off" in rr["spec"], rr["spec"]
+    assert "must not reach the push branch" in rr["spec"], rr["spec"]
+
+
+def test_a_push_queue_stack_whose_spec_or_hand_off_mentions_own_keeps_its_push_step_on_re_review(env, monkeypatch):
+    """A plain stack (no pr_branch) whose code spec and hand-off mention `ttp push --own`: the first
+    review pushes with `ttp push`, and so does the re-review after it fails. The mention is the code
+    task's text, not the review's push step: the re-review is not review only and keeps that text."""
+    from ttp import push, pushq
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    spec = ("Publish with `ttp push --own --detach` when asked.\n"
+            "It delivers onto its pr_branch nowhere, not here. If it passes, publish it there with "
+            "`ttp push --own --detach`.")
+    cid, _, _, (rev,) = _finish_code(env, p, "plain", {"plain.py": 3},
+                                     result={"status": "done", "summary": "fixed the `ttp push --own` refusal"},
+                                     before=lambda tid, head: p.db.update_task(tid, spec=spec))
+    assert "push it with `ttp push`" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+    p.db.update_task(rev["id"], status="failed")
+    fid, rid, _ = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug")
+    rr, fix = p.db.task(rid), p.db.task(fid)
+    labels = json.loads(rr["labels"])
+    assert push.REVIEW_ONLY_LABEL not in labels and not any(lb.startswith("pr_branch:") for lb in labels), labels
+    assert "Review only" not in rr["spec"] and "push it with `ttp push`" in rr["spec"], rr["spec"]
+    assert "fixed the `ttp push --own` refusal" in rr["spec"] and "If it passes, publish it there with `ttp push --own --detach`." in rr["spec"], rr["spec"]
+    assert f"Leave the push to re-review #{rid}" in fix["spec"]
 
 
 def test_the_review_of_a_task_with_another_pr_branch_publishes_with_own_and_never_approves_for_the_queue(
