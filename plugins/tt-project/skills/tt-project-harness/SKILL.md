@@ -75,6 +75,18 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.
 
+## CPU-only runs never open a device
+
+- The daemon sets `TTP_NO_DEVICE=1` for a task run that holds no device (not tagged `needs_device`,
+  no `*-device` resource or device lock), and `0` for one that does. Hooks can honour it.
+- For a pytest repo whose tests open a device through fixtures, ship `ttp_no_device.py` from this
+  skill's folder: copy it next to the repo's root `conftest.py` and add
+  `pytest_plugins = ["ttp_no_device"]`. Under `TTP_NO_DEVICE=1` it deselects tests that use a device
+  fixture (globs, default `*device`) or marker (none by default). Set the lists per repo with the
+  `ttp_device_fixtures` / `ttp_device_markers` ini keys or the `TTP_DEVICE_FIXTURES` /
+  `TTP_DEVICE_MARKERS` variables (comma-separated).
+- Do not rely on `-m 'not device'` alone: a marker the repo does not define deselects nothing.
+
 ## Rebooting the harness's own host
 
 A reboot ends every run in flight, and nothing lifts a plain pause afterwards: schedules and probes

@@ -1346,6 +1346,11 @@ class Daemon:
                    **({"TTP_PIDNS": ns} if (ns := push.pid_ns()) else {}),
                    **({"TTP_CGROUP": cg} if (cg := push.cgroup()) else {}),
                    "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
+            # A task that holds no device runs CPU tests only: hooks (the harness skill's pytest plugin)
+            # skip tests that would open a device outside the broker. A device task gets "0", never an
+            # inherited "1" (the runner adds its own environment under this one).
+            if task and role != "coordinator":
+                env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
@@ -5911,6 +5916,9 @@ class Daemon:
                          f"then review what changed since.")
         lines.append("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
                      "that its tests fail without it.")
+        lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
+                     "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
+                     "With `TTP_NO_DEVICE=1` run nothing that opens a device.")
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
         delivered = push.delivered_pr(self.p, task, full)
@@ -6655,6 +6663,12 @@ def needs_device(task: dict, cfg: dict) -> bool:
     labels = json.loads(task["labels"] or "[]")
     return "needs_device" in labels or any(lb.split(":", 1)[1] in dev for lb in labels
                                            if lb.startswith(("resource:", "exclusive:")))
+
+
+def holds_device(task: dict, cfg: dict) -> bool:
+    """A device task by either test: tagged `needs_device`, or naming a `*-device` resource, a machine
+    tagged `device` or a configured device lock."""
+    return effort.device_task(task) or needs_device(task, cfg)
 
 
 def _detached_jobs(run_dir: Path) -> list[dict]:

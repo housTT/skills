@@ -49816,3 +49816,36 @@ def test_ttp_detach_records_what_the_job_asked_for(env, tmp_path):
     assert job["requested"] == {}
     if job["pid"]:
         os.killpg(job["pid"], signal.SIGKILL)
+
+
+def test_a_task_run_without_a_device_gets_ttp_no_device(env, monkeypatch):
+    """A worker or reviewer that holds no device runs with TTP_NO_DEVICE=1, so hooks keep its tests off
+    the device; one tagged needs_device or holding a `*-device` resource gets 0, never an inherited 1."""
+    from ttp.providers import claude
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setenv("TTP_NO_DEVICE", "1")
+    p = make(env)
+    d = Daemon(p.base)
+
+    def run_env(role="worker", **kw):
+        tid = p.db.add_task("t", "s", kind="review" if role == "reviewer" else "work", tier="light",
+                            origin="user", **kw)
+        rid = d.start_run(role, "go", "claude", "light", str(p.root), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    assert run_env()["TTP_NO_DEVICE"] == "1"
+    assert run_env("reviewer")["TTP_NO_DEVICE"] == "1"
+    assert run_env(labels=["needs_device"])["TTP_NO_DEVICE"] == "0"
+    assert run_env(labels=["resource:box-device"])["TTP_NO_DEVICE"] == "0"
+    assert run_env(labels=["resource:build-dir"])["TTP_NO_DEVICE"] == "1"
+
+
+def test_the_daemons_review_spec_reuses_the_tasks_test_selection(env):
+    p = make(env)
+    _, _, _, (review,) = _finish_code(env, p, "change", {"a.py": 5})
+    spec = " ".join(review["spec"].split())
+    assert "Test it with the task's own test selection (the exact test ids or `-k` expression" in spec
+    assert "never a marker the repo may not define" in spec
+    assert "With `TTP_NO_DEVICE=1` run nothing that opens a device." in spec

@@ -780,3 +780,56 @@ def test_self_reboot_recipe_never_waits_on_drain_probe_while_paused():
         assert "--wait 240" in text
         assert not re.search(r"retry_when`?\s*`ttp drain", text)
         assert "ttp resume <name>" in " ".join(text.split())
+
+
+def test_runs_without_a_device_never_open_one_through_tests():
+    """A worker or reviewer that holds no device runs only the task's own test selection, and checks a
+    marker exists before deselecting by it; the harness skill ships the opt-in pytest guard."""
+    prompts = PLUGIN / "template" / "prompts"
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    assert "`TTP_NO_DEVICE=1` in your environment means your task holds no device" in worker
+    assert "exact test ids or `-k` expression" in worker
+    assert "only after `pytest --markers` shows the repo defines it" in worker
+    skill = " ".join((SKILLS / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "TTP_NO_DEVICE=1" in skill and "ttp_no_device.py" in skill
+    assert (SKILLS / "tt-project-harness" / "ttp_no_device.py").is_file()
+
+
+@pytest.mark.parametrize("no_device, fixtures, expect", [
+    (None, None, {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
+    ("0", None, {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
+    ("1", None, {"test_cpu", "test_marked"}),
+    ("1", "board_*", {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
+])
+def test_the_no_device_pytest_plugin_deselects_device_tests_only_under_ttp_no_device(
+        tmp_path, no_device, fixtures, expect):
+    import subprocess
+    import shutil
+    shutil.copy(SKILLS / "tt-project-harness" / "ttp_no_device.py", tmp_path / "ttp_no_device.py")
+    (tmp_path / "conftest.py").write_text(
+        'import pytest\npytest_plugins = ["ttp_no_device"]\n\n'
+        '@pytest.fixture\ndef mesh_device():\n    raise RuntimeError("opened a device")\n\n'
+        '@pytest.fixture\ndef model(mesh_device):\n    return mesh_device\n')
+    (tmp_path / "test_x.py").write_text(
+        "import pytest\n\ndef test_cpu():\n    pass\n\ndef test_dev(mesh_device):\n    pass\n\n"
+        "def test_indirect(model):\n    pass\n\n@pytest.mark.hw\ndef test_marked():\n    pass\n")
+    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    hw: needs hardware\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_", "PYTEST_"))}
+    if no_device is not None:
+        env["TTP_NO_DEVICE"] = no_device
+    if fixtures is not None:
+        env["TTP_DEVICE_FIXTURES"] = fixtures
+    r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
+                       cwd=tmp_path, env=env, capture_output=True, text=True)
+    got = {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln}
+    assert got == expect, r.stdout + r.stderr
+    if no_device == "1" and fixtures is None:
+        assert "2 deselected" in r.stdout, r.stdout
+        # Markers are configurable too, and an exact id that needs a device is not run.
+        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "test_x.py::test_dev"],
+                           cwd=tmp_path, env={**env, "TTP_DEVICE_MARKERS": "hw"}, capture_output=True, text=True)
+        assert r.returncode == 5 and "opened a device" not in r.stdout, r.stdout
+        assert "ttp_no_device: deselected 1 device test" in r.stdout, r.stdout
+        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
+                           cwd=tmp_path, env={**env, "TTP_DEVICE_MARKERS": "hw"}, capture_output=True, text=True)
+        assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == {"test_cpu"}, r.stdout
