@@ -6,7 +6,8 @@ A device resource of the project (candidates) is idle while no open task names i
 of it is taken or reserved and no detached-job hold keeps it. Paused resources (the user's, the
 project's own or a shared one), resources in trouble and machines with an open ledger condition are
 never candidates, nor is a machine an open change ledger entry holds (holds_work: its broker or
-queue held, paused, drained or its device work disabled), nor a device no queued, running or waiting
+queue held, paused, drained or its device work disabled, said as a phrase; file names and
+recovery switches do not count), nor a device no queued, running or waiting
 (deferred included) task names and no task run in the last `coordinator.idle_capacity_use_days` (7;
 0: no such filter) named: the project does not use it. Once one has been idle for `coordinator.idle_capacity_s` (1500 s; 0: off) while a
 worker slot is free, the budget gate is green or yellow and dispatch would start nothing queued, one
@@ -21,8 +22,8 @@ database, so a restart never raises a stretch twice.
 
 Declines (judge): once the coordinator handled an event, a resource no task created since names was
 declined. Its fire count and time are kept per resource (DECLINED_KEY, in the database), so a new
-stretch of it (after a pause or a trouble spell) resumes the doubling rearm instead of the short
-grace. An open task naming the resource, or a task created after an event naming it, clears that.
+stretch of it (after a pause or a trouble spell) waits both its grace and the doubling rearm from
+its last event, never less than an undeclined one. An open task naming the resource, or a task created after an event naming it, clears that.
 """
 from __future__ import annotations
 
@@ -40,9 +41,21 @@ SUFFIX = "-device"
 LABEL_LOOKBACK_S = 14 * 86400   # task labels this recent name the project's device resources
 USE_DAYS = 7.0
 DECLINED_KEY = "idle_capacity_declined"   # kv: {resource: {"n", "at"}} the coordinator answered with no task
-_HOLD = re.compile(r"\b(hold|holds|holding|held|paus\w*|drain\w*|stop|stops|stopped|block|blocks|blocked|offline"
-                   r"|maintenance|reserv\w*|quiesc\w*|cordon\w*|fenc\w*|mask|masked)\b"
-                   r"|\bdisabl\w*\b.*\b(broker|device|jobs?|work|queue|dispatch|scheduler|service)\b", re.I)
+_OBJ = (r"(?:(?:the|its|all|every|new|this|that|a)\s+)*(?:[\w-]+\s+)?"
+        r"(?:broker|queue|device\s+jobs?|device\s+work|jobs|box|machine|node|host|devices?|dispatch|scheduler)\b"
+        r"(?!\s+(?:from\s+)?(?:auto\w*|resets?|resetting|re-?power\w*|reboot\w*|power[\s-]?cycl\w*|recovery|watchdog"
+        r"|restart\w*)\b)")
+# Holding device work takes the verb applied to the broker, queue, jobs or box as a phrase: a bare
+# 'hold' or 'stops' elsewhere (a file name, 'the broker stops the keeper') and recovery switches
+# (auto reset, power cycle, reboot) do not count.
+_HOLD = re.compile(
+    rf"\b(?:hold|holds|holding|held|paus\w*|drain\w*|stop|stopped|stopping|block|blocked|blocking|disabl\w*"
+    rf"|quiesc\w*|cordon\w*|fenc\w*|reserv\w*)\s+(?:on\s+)?{_OBJ}"
+    rf"|\b{_OBJ}\s+(?:(?:is|was|are|were|kept|stays|left|now|set|taken)\s+)*"
+    rf"(?:held|paused|drained|stopped|disabled|blocked|quiesced|cordoned|fenced|reserved|offline|down|on\s+hold"
+    rf"|out\s+of\s+service|in\s+maintenance)\b"
+    r"|\bout\s+of\s+service\b|\bno\s+(?:new\s+)?device\s+(?:jobs?|work)\b", re.I)
+_TOKEN = re.compile(r"\S*[./_=]\S*")   # file names, paths, env settings and a/b lists: no phrase there
 
 
 def settings(cfg: dict) -> tuple[float, float]:
@@ -60,7 +73,7 @@ def use_days(cfg: dict) -> float:
 
 def holds_work(change: dict) -> bool:
     """Whether an open change ledger entry holds or disables device work on its machine."""
-    return bool(_HOLD.search(str(change.get("what") or "")))
+    return bool(_HOLD.search(_TOKEN.sub(" ", str(change.get("what") or ""))))
 
 
 def judge(declined: dict, fired: dict, named: set[str], at: float) -> dict:
@@ -132,9 +145,12 @@ def step(st: dict | None, idle: set[str], now: float, grace: float, rearm: float
                                      if dec.get("at") else {"since": now}))
         if may_fire and grace > 0:
             n = int(rec.get("n") or 0)
-            wait = grace if not rec.get("fired") else min(rearm * 2 ** max(n - 1, 0), REARM_MAX_S)
-            start = float(rec["fired"]) if rec.get("fired") else float(rec["since"])
-            if (n == 0 or rearm > 0) and now - start >= wait:
+            # Never before the grace of this stretch, nor before the rearm after the last event: a
+            # declined resource's new stretch waits at least as long as an undeclined one.
+            due = float(rec["since"]) + grace
+            if rec.get("fired"):
+                due = max(due, float(rec["fired"]) + min(rearm * 2 ** max(n - 1, 0), REARM_MAX_S))
+            if (n == 0 or rearm > 0) and now >= due:
                 rec.update(fired=now, n=n + 1)
                 fired.append(name)
         new[name] = rec

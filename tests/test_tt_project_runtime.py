@@ -15743,6 +15743,19 @@ def test_idle_capacity_skips_devices_held_by_a_machine_change_or_not_used_by_the
     assert idlecap.holds_work({"what": "paused the job queue"}) and idlecap.holds_work({"what": "drained the box"})
     assert idlecap.holds_work({"what": "disabled the broker service"})
     assert not idlecap.holds_work({"what": "added a log rotation drop-in"})
+    assert idlecap.holds_work({"what": "queue is paused"}) and idlecap.holds_work({"what": "device work disabled"})
+    # Only a clear phrase holds work: not a bare word elsewhere, a file name or a recovery switch.
+    poller = ml.add_change("rig", "broker drop-in sets POLLER_SERVICES=cap-keeper.service so the broker "
+                           "stops/starts the cap keeper around reset", "rm it", "other", expires="2d")
+    offbus = ml.add_change("rig", "broker auto resets/re-power/reboot/power-cycle off via zz-broker-offbus-hold.conf",
+                           "rm it", "other", expires="2d")
+    assert not any(idlecap.holds_work(c) for c in (poller, offbus))
+    assert not idlecap.holds_work({"what": "the broker stops the cap keeper around reset"})
+    assert not idlecap.holds_work({"what": "disabled the broker auto reset"})
+    assert len(check(now + 4 * 3600)) == 1 and "rig-device" in (p.db.kv("idle_capacity") or {}), \
+        "unrelated open changes leave the device idle capacity"
+    ml.close_change(poller["id"], "done")
+    ml.close_change(offbus["id"], "done")
     # A device no task of the project named lately is not the project's to fill.
     p.db.x("UPDATE runs SET started=? WHERE status='ok'", (now - 8 * 86400,))
     t = now + 10 * 3600
@@ -15799,6 +15812,15 @@ def test_idle_capacity_backs_off_per_resource_after_a_declined_event_and_survive
     check2(now + 8 * 3600)
     assert "rig-device" not in (p.db.kv(idlecap.DECLINED_KEY) or {})
     assert idlecap.judge({}, {"rig-device": 2}, {"rig"}, 5.0) == {}, "a task naming the machine counts"
+    # An old decline never makes a new stretch fire sooner than an undeclined one.
+    old = {"rig-device": {"n": 1, "at": now - 3 * 86400}}
+    st, fired = idlecap.step({}, {"rig-device"}, now, 1500, 21600, True, old)
+    assert fired == [] and idlecap.step(st, {"rig-device"}, now + 1499, 1500, 21600, True, old)[1] == []
+    assert idlecap.step(st, {"rig-device"}, now + 1500, 1500, 21600, True, old)[1] == ["rig-device"]
+    recent = {"rig-device": {"n": 2, "at": now - 3600}}
+    st, _ = idlecap.step({}, {"rig-device"}, now, 1500, 21600, True, recent)
+    assert idlecap.step(st, {"rig-device"}, now + 11 * 3600 - 1, 1500, 21600, True, recent)[1] == []
+    assert idlecap.step(st, {"rig-device"}, now + 11 * 3600, 1500, 21600, True, recent)[1] == ["rig-device"]
 
 
 def test_idle_capacity_device_candidates():
