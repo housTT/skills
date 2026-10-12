@@ -29256,6 +29256,12 @@ def _added(p, title):
     return p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
 
 
+def _tasks_up_to(p, n):
+    """Adds tasks until task #n exists: a landed:#<id> or depends_on must name a real task."""
+    while not p.db.task(n):
+        p.db.add_task("earlier", "s", kind="work", tier="light", origin="user")
+
+
 def test_task_add_start_after_keeps_the_task_queued_until_then(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -29415,6 +29421,7 @@ def test_a_start_when_that_is_not_exactly_landed_id_is_refused(env, probe):
     p = make(env)
     from ttp import cli
     from ttp import coordinator as coord
+    _tasks_up_to(p, 12)
     out = coord.apply(p, [{"type": "task_add", "title": "bad", "spec": "s", "start_when": probe}])
     assert len(out) == 1 and "exactly `landed:#<id>`" in out[0] and "ttp landed --task" in out[0], out
     assert not p.db.q("SELECT id FROM tasks WHERE title='bad'")
@@ -29438,6 +29445,7 @@ def test_start_when_grepping_the_push_branch_log_is_refused_for_landed(env, prob
     from ttp import cli
     from ttp import coordinator as coord
     p.set_config("delivery.push_branch", "work")
+    _tasks_up_to(p, 4)
     out = coord.apply(p, [{"type": "task_add", "title": "after", "spec": "s", "start_when": probe}])
     assert len(out) == 1 and "push branch's log" in out[0] and "landed:#<id>" in out[0], out
     assert not p.db.q("SELECT id FROM tasks WHERE title='after'")
@@ -29699,7 +29707,7 @@ def test_ttp_landed_finds_a_rebased_commit_by_patch_id_or_author_date_and_subjec
     # Not landed: a new commit, a commit nowhere, a task with nothing.
     _commit(path, "more.txt", "more\n")
     assert ttp_landed(_git_out(path, "rev-parse", "HEAD")) == 1 and ttp_landed(f"#{tid}") == 1
-    assert ttp_landed("0" * 40) == 2 and ttp_landed("--task", "9999") == 1
+    assert ttp_landed("0" * 40) == 2 and ttp_landed("--task", "9999") == 2, "no such task: it never lands"
     assert "not on origin/proj yet" in capsys.readouterr().out
 
 
@@ -29984,6 +29992,7 @@ def test_ttp_task_add_start_when_is_set_at_creation_and_holds_dispatch(env, monk
 def test_ttp_task_add_start_after_and_landed_probe(env, capsys):
     p = make(env)
     from ttp import cli
+    _tasks_up_to(p, 4)
     cli.main(["task", "demo", "add", "later", "--start-after", "2h", "--start-when", "landed:#4"])
     tid = _added(p, "later")
     assert "starts after " in capsys.readouterr().out
