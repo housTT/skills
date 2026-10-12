@@ -42842,12 +42842,12 @@ def test_heal_outage_check_that_stays_unknown_escalates_without_fixing(env):
     from ttp import alerts, heal
     p, d, up = _heal_setup(env, outage=True, grace_s=600)
     spec, now = _heal_spec(p), time.time()
-    dark = dict(spec, check="exit 255")
-    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 255)", now + 600)
-    assert heal.run(d, "svc", dark, now + 300)[0] == "ok (unknown, rc 255)"
+    dark = dict(spec, check="exit 75")   # unknown, but not only its route (255: its own test)
+    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 75)", now + 600)
+    assert heal.run(d, "svc", dark, now + 300)[0] == "ok (unknown, rc 75)"
     assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
     status = heal.run(d, "svc", dark, now + 600)[0]
-    assert "could not tell for 10 min (exit 255)" in status and not up.exists(), status
+    assert "could not tell for 10 min (exit 75)" in status and not up.exists(), status
     t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
     assert json.loads(t["labels"]) == ["heal:svc"] and heal.summary(p.db)["failing"] == 1
     assert heal.run(d, "svc", dark, now + 900)[0] == f"unhealthy (self-fix task #{t['id']} open)"
