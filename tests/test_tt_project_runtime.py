@@ -45224,6 +45224,113 @@ def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, mon
     assert all(p.db.task(t)["status"] == "queued" for t in consumers)
 
 
+def _gap_review_failure(env, p, command, base, i):
+    """One review that fails check_only on a missing target; returns (review id, daemon)."""
+    from ttp import push
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    code, _, _, (rev,) = _finish_code(env, p, f"gap docs {i}", {f"docs/gap{i}.md": 1})
+    path = p.worktrees / f"t{code}"
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    run = env["tmp"] / f"gap-{i}"
+    run.mkdir()
+    failure = push.applicability_failure(path, head, push.Check(command), 4,
+                                        "ERROR: file or directory not found: tests/test_absent.py", base)
+    (run / "check_failure.json").write_text(json.dumps(failure))
+    (run / "result.json").write_text(json.dumps({"status": "failed", "review_failure": "check_only",
+                                               "summary": "only the check target is missing"}))
+    p.db.x("INSERT INTO runs(task,role,status,dir) VALUES(?,?,?,?)", (rev["id"], "worker", "ok", str(run)))
+    d = Daemon(p.base)
+    d._finish_worker({"task": rev["id"], "note": "{}"}, RunUsage(), "ok", run)
+    return rev["id"], d
+
+
+def _gap_probe(p, tid):
+    from ttp import cli
+    args = shlex.split(json.loads(p.db.task(tid)["result"])["retry_when"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(args[args.index("checks"):])
+    return exc.value.code
+
+
+def test_check_gap_waiter_is_released_only_by_a_change_since_its_own_failure(env, monkeypatch):
+    from ttp import checkgaps
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    command = "python3 -m pytest tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command, "true"])
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    first, d = _gap_review_failure(env, p, command, base, 0)
+    assert _gap_probe(p, first) == 1
+    # An unrelated push_checks edit releases the first waiter, but not one that failed after it.
+    p.set_config("delivery.push_checks", [command, "git diff --check"])
+    assert _gap_probe(p, first) == 0
+    second, d = _gap_review_failure(env, p, command, base, 1)
+    assert json.loads(p.db.task(second)["result"])["check_gap"]
+    assert _gap_probe(p, second) == 1, "a new waiter on an old gap must not wake at once"
+    (key,) = p.db.kv(checkgaps.KEY)
+    assert not checkgaps.ready(p, key.removeprefix("check:")), "the gap's fingerprint follows its newest waiter"
+    p.set_config("delivery.push_checks", ["git diff --check"])
+    assert _gap_probe(p, second) == 0
+
+
+def test_check_gap_replaces_a_dead_owner_once_and_escalates_after_the_cap(env, monkeypatch):
+    from ttp import checkgaps
+    p = make(env)
+    command = "python3 -m pytest tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command, "true"])
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    owners = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' AND origin='daemon' ORDER BY id")]
+    first, d = _gap_review_failure(env, p, command, base, 0)
+    (owner,) = owners()
+    # A failed owner: the next check-only failure names one live replacement, and ticks add none.
+    p.db.update_task(owner, status="failed")
+    second, d = _gap_review_failure(env, p, command, base, 1)
+    gap = next(iter(p.db.kv(checkgaps.KEY).values()))
+    assert len(owners()) == 2 and gap["owner"] == owners()[1] != owner
+    assert p.db.task(gap["owner"])["status"] == "queued"
+    for tid in (first, second):
+        assert f"owner #{gap['owner']}." in json.loads(p.db.task(tid)["result"])["summary"]
+    d.reconcile_tasks()
+    d.reconcile_tasks()
+    assert len(owners()) == 2
+    # A tick alone replaces a cancelled owner, or one done while the config never changed.
+    p.db.update_task(gap["owner"], status="done")
+    d.reconcile_tasks()
+    d.reconcile_tasks()
+    assert len(owners()) == 3
+    assert next(iter(p.db.kv(checkgaps.KEY).values()))["owner"] == owners()[2]
+    # Past the cap: one coordinator event, no further owner, no loop.
+    p.db.update_task(owners()[2], status="cancelled")
+    for _ in range(3):
+        d.reconcile_tasks()
+    assert len(owners()) == checkgaps.MAX_OWNERS
+    events = p.db.q("SELECT * FROM events WHERE kind='check_gap_unowned'")
+    assert len(events) == 1 and command in events[0]["text"]
+    third, d = _gap_review_failure(env, p, command, base, 2)
+    assert len(owners()) == checkgaps.MAX_OWNERS
+    assert len(p.db.q("SELECT * FROM events WHERE kind='check_gap_unowned'")) == 1
+    assert "Raised to the coordinator" in json.loads(p.db.task(third)["result"])["summary"]
+
+
+def test_check_gap_retires_once_its_check_is_gone_and_nobody_waits(env, monkeypatch):
+    from ttp import checkgaps
+    p = make(env)
+    command = "python3 -m pytest tests/test_absent.py"
+    p.set_config("delivery.push_checks", [command, "true"])
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    tid, d = _gap_review_failure(env, p, command, base, 0)
+    p.set_config("delivery.push_checks", ["true"])
+    d._load_config()
+    monkeypatch.setattr(d, "_start_checks", lambda *args: True)
+    d.reconcile_tasks()
+    assert p.db.kv(checkgaps.KEY), "a waiter still rerunning keeps its gap"
+    p.db.update_task(tid, status="done")
+    d.reconcile_tasks()
+    assert not p.db.kv(checkgaps.KEY, {})
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness' AND origin='daemon'")) == 1
+
+
 def test_checks_record_missing_target_and_probe_config_change(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, checkgaps
     p = make(env)
@@ -45369,11 +45476,11 @@ def test_applicability_retry_start_failure_remains_retryable(env, monkeypatch):
     run = env['tmp'] / 'retry-run'
     run.mkdir()
     sig, key = 'retry-signature', 'check:retry-signature'
-    result = {'status': 'waiting', 'check_gap': key,
-              'retry_when': f'{push._own_ttp(p)} checks --gap {sig}'}
+    result = {'status': 'waiting', 'check_gap': key, 'retry_when': checkgaps.probe(p, sig, original)}
     (run / 'result.json').write_text(json.dumps(result))
     p.db.update_task(tid, result=json.dumps(result))
-    p.db.set_kv(checkgaps.KEY, {key: {'config': original, 'tasks': {str(tid): {
+    owner = p.db.add_task('repair', kind='harness', origin='daemon')
+    p.db.set_kv(checkgaps.KEY, {key: {'config': original, 'check': push.Check('true').config(), 'owner': owner, 'tasks': {str(tid): {
         'run_dir': str(run), 'worktree': str(p.root), 'head': head, 'config': original, 'extras': []}}}})
     p.set_config('delivery.push_checks', ['git diff --check'])
     d = Daemon(p.base)

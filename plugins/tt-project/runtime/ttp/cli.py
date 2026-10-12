@@ -1304,7 +1304,7 @@ def cmd_checks(a) -> None:
         p = here()
         if not p:
             die("no project found for the check gap probe")
-        sys.exit(0 if checkgaps.ready(p, a.gap) else 1)
+        sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
     run_dir = os.environ.get("TTP_RUN_DIR")
@@ -3800,6 +3800,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
+    s.add_argument("--gap-config", metavar="FINGERPRINT",
+                   help="with --gap: the push_checks fingerprint the waiter failed under")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--detach", action="store_true",
