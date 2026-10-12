@@ -20804,6 +20804,39 @@ def test_a_push_batch_whose_target_fails_its_checks_alone_pushes_nothing(env, mo
     assert _git_out(origin, "rev-parse", "proj") == before and m["pushed_sha"] is None
 
 
+@pytest.mark.parametrize("names, fresh, want, runs", [
+    (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4),   # fixing prefix passes; search above it
+    (["e1", "fix"], 2, ["pushed", "pushed"], 1),                          # tip with the batch passes: it goes
+    (["e1", "e2"], 1, ["requeued", "requeued"], 2),                       # the fresh prefix does not fix it
+    (["e1", "e2"], 0, ["requeued", "requeued"], 1),                       # nothing new: one check, no tip alone
+])
+def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_fix(env, monkeypatch, capsys, names,
+                                                                                     fresh, want, runs):
+    """A tip the queue knows fails on its own (marker "bad_tip") is not checked alone again. The tip with
+    the batch, and the tip with the entries not yet tried on it, are; an entry that fixes the tip goes,
+    with the ones after it up to the first that breaks the checks."""
+    from ttp.project import write_json
+    from ttp import push
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [
+        f"echo run >> {log}", "test ! -e broken.txt || test -e plugins/p/fix.txt", "test ! -e plugins/p/bad.txt"])
+    _commit(other, "broken.txt", "x\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    tip = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, n, {f"plugins/p/{n}.txt": f"{n}\n"}) for n in names]
+    marker = _batch_marker(p, heads)
+    write_json(marker, {**push._read(marker), "bad_tip": {"tip": tip, "fresh": fresh, "cmd": "make test"}})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == want, m
+    assert m["checks"]["runs"] == runs == len(log.read_text().split()), m
+    assert "checking the tip" not in capsys.readouterr().out
+    if want[0] == "requeued":
+        assert rc == 4 and m["outcome"] == "tip_failed" and _git_out(origin, "rev-parse", "proj") == tip
+        assert m["tip_check"]["cmd"] == "make test" and "not checked alone" in m["message"]
+        return
+    assert rc == 0 and m["outcome"] == "pushed" and _git_out(origin, "show", "proj:plugins/p/fix.txt") == "fix"
+
+
 def test_a_push_batch_starts_over_when_the_target_moves_and_gives_up_when_it_keeps_moving(env, monkeypatch):
     once = env["tmp"] / "moved"
     move = (f"cd {env['tmp'] / 'other'} && git pull -q --rebase origin proj && echo x >> late.txt"
@@ -21961,7 +21994,10 @@ def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env
     assert ev["kind"] == "push_tip_failed" and "make test" in ev["text"] and "the tip is red" in ev["text"]
     rows, why = pushq.due(s.p, time.time() + 60)
     assert rows == [] and "held" in why
-    assert pushq.due(s.p, time.time() + pushq.HOLD_S + 1)[0], "the hold ends after HOLD_S"
+    rows, why = pushq.due(s.p, time.time() + pushq.HOLD_S + 60)
+    assert rows == [] and "held" in why, "known bad after TIP_FAILS batches: held past HOLD_S"
+    assert pushq.due(s.p, time.time() + pushq.BAD_TIP_RETRY_S + 60)[0], "the hold ends after BAD_TIP_RETRY_S"
+    assert len(s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref=?", (pushq.BAD_TIP_ALERT,))) == 1
     _commit(s.other, "theirs.txt", "theirs\n")
     _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
     _git_out(s.repo, "fetch", "-q", "origin")
@@ -21972,6 +22008,68 @@ def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env
     _pq_batch(s)
     _pq_tend(s)
     assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["push_tip_failed"] * 2
+
+
+def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_fixing_approval_lands(
+        env, monkeypatch):
+    """Replays a push branch tip whose checks fail only in the batch's own checkout (a path-dependent
+    failure: they passed in the task's worktree) while more approvals wait than a batch takes. After
+    TIP_FAILS tip_failed batches on that tip, one keyed alert is raised and the approvals already tried
+    on it wait, not run again and again. A new approval goes first; the tip with it passes, so it is
+    pushed, which clears the alert, and the waiting approval then lands on the fixed tip."""
+    from ttp import alerts, pushq
+    check = 'case "$(pwd -P)" in */push) test -e fix.txt ;; esac'
+    s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=1, push_checks=[check])
+    db = s.p.db
+    _pq_hand_off(env, s)
+    tip = _git_out(s.origin, "rev-parse", "proj")
+    log = lambda bid: (s.p.state / "pushes" / f"{bid}.log").read_text()
+    for n in range(1, pushq.TIP_FAILS + 1):
+        bid = _pq_batch(s)
+        m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+        assert m["outcome"] == "tip_failed" and m["checks"]["runs"] == 2 and "bad_tip" not in m, log(bid)
+        _pq_tend(s)
+        assert (db.kv("push_queue")["bad_tip"]["fails"], db.task(s.review)["status"]) == (n, "pushing")
+    alerted = lambda: db.q("SELECT text FROM messages WHERE kind='alert' AND ref=?", (pushq.BAD_TIP_ALERT,))
+    [a] = alerted()
+    assert tip[:7] in a["text"] and check in a["text"]
+    assert alerts.holds(db, pushq.BAD_TIP_ALERT, time.time(), time.time())
+    rows, why = pushq.due(s.p, time.time() + pushq.HOLD_S + 60)
+    assert rows == [] and "held" in why, "the tried approval is not checked on that tip again"
+    code, path, branch = _code_task(s.p, "fix")
+    _commit(path, "fix.txt", "fix\n")
+    fix = db.add_task("review fix", "review the fix", kind="review", tier="standard", origin="coordinator",
+                      depends_on=[code])
+    _pq_hand_off(env, s, task=fix, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
+    rows, why = pushq.due(s.p, time.time() + 60)
+    assert [r["task"] for r in rows] == [fix], why
+    bid = _pq_batch(s)
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check}, m
+    assert m["outcome"] == "pushed" and m["checks"]["runs"] == 1, log(bid)
+    _pq_tend(s)
+    assert db.task(fix)["status"] == "done" and _git_out(s.origin, "show", "proj:fix.txt") == "fix"
+    assert "bad_tip" not in db.kv("push_queue") and not alerts.holds(db, pushq.BAD_TIP_ALERT, 0, time.time())
+    bid = _pq_batch(s)
+    _pq_tend(s)
+    assert db.task(s.review)["status"] == "done", log(bid)
+    assert len(alerted()) == 1
+
+
+def test_a_failing_push_tip_is_forgotten_once_the_branch_moves(env, monkeypatch):
+    """The known-bad tip and its alert end when the branch moves past it, even with no batch to run."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    tip = _git_out(s.repo, "rev-parse", "refs/remotes/origin/proj")
+    s.p.db.set_kv("push_queue", {"bad_tip": {"tip": tip, "fails": 2, "tried": [], "at": time.time(), "alerted": True}})
+    pushq.schedule(s.p)
+    assert alerts.holds(s.p.db, pushq.BAD_TIP_ALERT, time.time(), time.time()), "same tip: still failing"
+    _commit(s.other, "theirs.txt", "theirs\n")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    pushq.schedule(s.p)
+    assert "bad_tip" not in s.p.db.kv("push_queue")
+    assert not alerts.holds(s.p.db, pushq.BAD_TIP_ALERT, time.time(), time.time())
 
 
 @pytest.mark.parametrize("outcome, tries", [("moved", 1), ("busy", 0)])

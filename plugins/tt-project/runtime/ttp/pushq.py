@@ -26,11 +26,14 @@ from .project import Project, nice_level, push_allowed, push_queue_on, renice, w
 from .worktree import fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
-KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
+KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
 DEFAULT_BATCH_S = 900           # delivery.push_batch_s: the oldest approval waits at most this long
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: the least time from a batch's end to the next start
-HOLD_S = 1800                   # after tip_failed, the same tip and rows wait this long unless either changes
+HOLD_S = 1800                   # after tip_failed, approvals already tried on that tip wait this long unless it changes
+TIP_FAILS = 2                   # tip_failed batches in a row on one tip before it is known bad: alerted, never checked alone
+BAD_TIP_RETRY_S = 6 * 3600      # a known-bad tip with nothing new to try: the tried approvals run again after this
+BAD_TIP_ALERT = "push_tip_failing"   # the keyed alert while the push branch tip is known bad (alerts.holds)
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
@@ -526,10 +529,16 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     if not locks.any_free(push.lock_paths(p, remote, branch)) or any(
             not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))):
         return [], "another push holds its turn"
-    hold = st.get("hold") or {}
-    if (hold and now < float(hold.get("until") or 0) and sorted(r["id"] for r in rows) == sorted(hold.get("rows") or [])
-            and _tracking_tip(p, remote, branch) == hold.get("tip")):
-        return [], f"held: the same approvals on the same tip {_short(hold.get('tip'))}, which failed its checks"
+    bad = st.get("bad_tip") or {}
+    if bad.get("tip") and _tracking_tip(p, remote, branch) == bad["tip"]:
+        # Approvals not yet tried on the failing tip go first: one of them may fix it. With none, the
+        # tried ones wait, so the same tip is not checked again and again.
+        tried = set(bad.get("tried") or [])
+        fresh = [r for r in rows if r["id"] not in tried]
+        if not fresh and now < (until := _bad_until(bad)):
+            return [], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
+                        f"tried on it; next try {_at(until, now, p)} unless the tip or the approvals change")
+        rows = fresh + [r for r in rows if r["id"] in tried]
     d = _delivery(p, cfg)
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
@@ -548,6 +557,24 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     else:
         return [], "waiting for more approvals"
     return rows[:cap], why
+
+
+def _bad_until(bad: dict) -> float:
+    """When approvals already tried on the failing tip of `bad` (state "bad_tip") may run again."""
+    wait = BAD_TIP_RETRY_S if int(bad.get("fails") or 0) >= TIP_FAILS else HOLD_S
+    return float(bad.get("at") or 0) + wait
+
+
+def _known_bad(db, rows: list[dict]) -> dict | None:
+    """The marker's "bad_tip" for a batch of `rows`: the tip that failed its checks on its own in
+    TIP_FAILS batches in a row, with how many leading rows were not tried on it ("fresh"). The batch
+    then never checks that tip alone again (batch.Batch._judge)."""
+    bad = _state(db).get("bad_tip") or {}
+    if not bad.get("tip") or int(bad.get("fails") or 0) < TIP_FAILS:
+        return None
+    tried = set(bad.get("tried") or [])
+    fresh = next((n for n, r in enumerate(rows) if r["id"] in tried), len(rows))
+    return {"tip": bad["tip"], "fresh": fresh, "cmd": bad.get("cmd")}
 
 
 def batch_argv(marker: Path) -> list[str]:
@@ -613,6 +640,8 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
              "repo": str(p.root), "target": name, "log": str(marker.with_suffix(".log")), "lock": str(lock_path),
              "entries": [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"],
                           "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
+        if bad := _known_bad(db, rows):
+            m["bad_tip"] = bad
         m["check_run_dir"] = str(checkdirs.new(p.state, marker))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)
@@ -641,11 +670,25 @@ class _Changed(Exception):
     """Rows left `approved` between due() and start(): nothing starts."""
 
 
+def _forget_moved_tip(p: Project, remote: str, branch: str) -> None:
+    """Drop the failing tip once the branch has moved past it (as last fetched): that clears its alert."""
+    db = p.db
+    st = _state(db)
+    bad = st.get("bad_tip") or {}
+    if bad.get("tip") and (now := _tracking_tip(p, remote, branch)) and now != bad["tip"]:
+        st.pop("bad_tip", None)
+        db.set_kv(KV, st)
+
+
 def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = lambda m: None) -> str | None:
     """The tick's start step: send back approvals for another target, then start a batch if one is
-    due. Cheap while nothing is approved: no git, no locks."""
+    due. Cheap while nothing is approved: no locks, and no git unless a failing tip is remembered."""
     db = p.db
-    if not enabled(p, cfg) or not db.one("SELECT id FROM push_queue WHERE status='approved' LIMIT 1"):
+    if not enabled(p, cfg):
+        return None
+    if (_state(db).get("bad_tip") or {}).get("tip") and (tgt := target(p)):
+        _forget_moved_tip(p, *tgt)
+    if not db.one("SELECT id FROM push_queue WHERE status='approved' LIMIT 1"):
         return None
     tgt = target(p)
     if not tgt:
@@ -1015,17 +1058,30 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         st = _state(db)
         st["deaths"] = 0
         back = [r["id"] for r in db.q("SELECT id FROM push_queue WHERE batch=? AND status='approved'", (b["id"],))]
-        if outcome == "tip_failed" and back:
-            st["hold"] = {"tip": tip, "rows": sorted(back), "until": now + HOLD_S}
-        elif outcome in ("pushed", "landed", "nothing"):
-            st.pop("hold", None)
+        st.pop("hold", None)   # the time-boxed hold of older releases; bad_tip replaces it
+        bad = st.get("bad_tip") or {}
+        d = m.get("tip_check") if isinstance(m.get("tip_check"), dict) else {}
+        first = next((x.get("detail") for x in results.values() if isinstance(x.get("detail"), dict)
+                      and x["detail"].get("cmd")), {}) or {}
+        cmd = d.get("cmd") or first.get("cmd") or "the push checks"
+        if outcome == "tip_failed" and tip:
+            same = bad.get("tip") == tip
+            fails = int(bad.get("fails") or 0) + 1 if same else 1
+            tried = set(bad.get("tried") or []) if same else set()
+            st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried | {r["id"] for r in rows}), "at": now,
+                             "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS}
+            if fails >= TIP_FAILS and not (same and bad.get("alerted")):
+                later.append((BAD_TIP_ALERT, f"The push branch {b['target']} fails its own checks at {_short(tip)} "
+                                             f"(`{cmd}`) in {fails} push batches in a row. The queue no longer checks "
+                                             f"that tip alone: it tries approvals not yet tried on it first, and "
+                                             f"pushes them if the tip with them passes. This clears once the tip "
+                                             f"changes or passes.", "high"))
+        elif bad.get("tip") and (outcome in ("pushed", "landed", "nothing") or (tip and tip != bad["tip"])):
+            st.pop("bad_tip", None)   # the tip passed, or moved: its alert clears (alerts.holds)
+        if outcome in ("pushed", "landed", "nothing"):
             st.pop("backoff_until", None)
         if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):
             st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
-            d = m.get("tip_check") if isinstance(m.get("tip_check"), dict) else {}
-            first = next((x.get("detail") for x in results.values() if isinstance(x.get("detail"), dict)
-                          and x["detail"].get("cmd")), {}) or {}
-            cmd = d.get("cmd") or first.get("cmd") or "the push checks"
             _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
                                                 f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
         if warn := push.ff_warnings(m.get("fast_forward")):
@@ -1322,7 +1378,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
         pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _reach(db, pushed["id"])
     st = _state(db)
     return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
-            "backoff_until": st.get("backoff_until"), "hold": st.get("hold"), "deaths": int(st.get("deaths") or 0),
+            "backoff_until": st.get("backoff_until"), "bad_tip": st.get("bad_tip"), "deaths": int(st.get("deaths") or 0),
             "conflicts": conflict_stats(db, now - STATS_S)}
 
 
@@ -1373,8 +1429,10 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
     if last and last["outcome"] != "pushed" and not (live and live["id"] == last["id"]):
         parts.append(f"last batch {OUTCOME_WORDS.get(last['outcome'], last['outcome'])} "
                      f"{_age(now - (last['ended'] or last['started']))} ago")
-    hold = sm.get("hold") or {}
-    wait = max(float(sm.get("backoff_until") or 0), float(hold.get("until") or 0))
+    bad = sm.get("bad_tip") or {}
+    wait = max(float(sm.get("backoff_until") or 0), _bad_until(bad) if bad.get("tip") else 0.0)
+    if int(bad.get("fails") or 0) >= TIP_FAILS:
+        parts.append(f"the branch tip {_short(bad['tip'])} fails its own checks")
     if wait > now and n and not live:
         parts.append(f"next try {_at(wait, now, p)}")
     lp = sm.get("last_pushed")

@@ -1038,13 +1038,29 @@ class Batch:
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
         failure or None). When every prefix passes and the full head passes on a rerun, the failure
-        was flaky: the full head goes."""
+        was flaky: the full head goes.
+
+        A tip the queue knows fails on its own (the marker's "bad_tip", pushq._known_bad) is never
+        checked alone again: no prefix passes unless it fixes the tip, so only the full head and the
+        prefix of entries not yet tried on that tip ("fresh") are checked. When that prefix passes,
+        it fixed the tip, and the search above it runs as usual."""
         m = len(carried)
         fail = self._check(heads[m], checks)
         if fail is None:
             return m, heads[m], None
         fails = {m: fail}
         lo, hi = 0, m
+        known = self.m.get("bad_tip") if isinstance(self.m.get("bad_tip"), dict) else {}
+        bad = known.get("tip") == tip
+        if bad and fail[0] != STALE:
+            fresh = sum(1 for i, _ in carried if i < int(known.get("fresh") or 0))
+            if not 0 < fresh < m:
+                return self._tip_red(tip, known)
+            say(f"checking the {fresh} entr{'y' if fresh == 1 else 'ies'} not yet tried on the failing tip {tip[:10]}")
+            heads[fresh] = self._head(tip, carried, fresh)
+            if self._check(heads[fresh], checks) is not None:
+                return self._tip_red(tip, known)
+            lo = fresh
         while hi - lo > 1:
             mid = (lo + hi) // 2
             heads[mid] = self._head(tip, carried, mid)
@@ -1055,6 +1071,8 @@ class Batch:
                 hi, fails[mid] = mid, f
         if hi == 1 and fails[1][0] == STALE:
             return 0, None, fails[1]        # the version guard blames entry 1 without running anything
+        if hi == 1 and bad:
+            return self._tip_red(tip, known)
         if hi == 1:
             say(f"checking the tip {tip[:10]} alone")
             if (tf := self._check(tip, checks)) is not None:
@@ -1072,6 +1090,15 @@ class Batch:
                 return m, heads[m], None
             fails[m] = f
         return hi - 1, heads[hi - 1], fails[hi]
+
+    def _tip_red(self, tip: str, known: dict) -> tuple[int, None, None]:
+        """tip_failed for a tip known to fail on its own, without checking it alone again."""
+        self.message = (f"the tip of {self.target} fails its checks on its own (known from earlier batches, "
+                        f"not checked alone again), and no entry here fixes it")
+        say(self.message)
+        self.detail_tip = {"cmd": known.get("cmd") or "the push checks",
+                           "tail": f"{tip[:10]} failed its checks on its own in earlier batches"}
+        return 0, None, None
 
 
 # Marker, hand-over, after_push ---------------------------------------------------------------------------

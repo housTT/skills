@@ -64,6 +64,7 @@ CLEARED_TEXT = {
     "push_rejected": "Pushes go through again: a push batch pushed.",
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
+    "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
@@ -195,6 +196,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return arg.isdigit() and machine_ledger.change_overdue(int(arg), now)
     if kind == "network":   # Daemon.check_unreachable keeps the outage until reachability is back
         return bool((db.kv("network_outage") or {}).get("alerted"))
+    if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
+        return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
     if key == "push_queue_dying":
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
                           "AND finalized>=? LIMIT 1", (since,))
@@ -217,7 +220,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "heal",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
                                          "machine", "machine-change", "network", "deploy")
 
 
