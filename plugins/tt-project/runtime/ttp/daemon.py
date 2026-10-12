@@ -1671,6 +1671,7 @@ class Daemon:
                       f"The coordinator can re-point it with task_update depends_on (an empty list clears it), "
                       f"requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
         self._raise_dead_dependency_blocks(now)
+        self._raise_missing_task_refs(now)
         self._raise_review_stalls(now)
 
     def _raise_review_stalls(self, now: float) -> None:
@@ -1695,6 +1696,46 @@ class Daemon:
                   f"task_update depends_on, or cancel them.", "queued", rev["id"]))
             log(self.p, f"task {rev['id']} in review {(now - since) / 3600:.1f}h holds {len(deps)} task(s); "
                         f"raised to the coordinator")
+
+    def task_probes(self, task: dict) -> list[tuple[str, str]]:
+        """(what, probe) of every probe `task` waits on: its start_when, a hold's `waits_on when`, and
+        a waiting task's retry_when."""
+        out = []
+        when = deferral(task).get("when")
+        if when:
+            out.append(("start_when", when))
+        held = anchors.anchor(task) if task["status"] == "blocked" else None
+        if held and held[0] == "when":
+            out.append(("waits_on when", held[1]))
+        prev = load_result(task["result"]) if task["status"] == "queued" and not when else {}
+        if prev.get("status") == "waiting" and isinstance(prev.get("retry_when"), str) and prev["retry_when"].strip():
+            out.append(("retry_when", prev["retry_when"].strip()))
+        return out
+
+    def _raise_missing_task_refs(self, now: float) -> None:
+        """A task whose probe waits on a task id this project does not have (`landed:#0`, set before the
+        coordinator refused such ids) would wait forever: raised once per task and probe. Its probe is not
+        run meanwhile (probe_deferred), and status shows it as broken (coordinator.starts_text). A missing
+        depends_on id is reconcile_tasks' dead dependency."""
+        db = self.p.db
+        rows = db.q("SELECT * FROM tasks WHERE status IN ('queued','blocked') AND (labels LIKE '%start_when:%' "
+                    "OR labels LIKE '%waits:when:%' OR result LIKE '%retry_when%')")
+        for t in rows:
+            for what, probe in self.task_probes(t):
+                missing = landed.missing_task_refs(db, probe)
+                if not missing:
+                    continue
+                fp = f"missing_task_ref:{t['id']}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
+                if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                    continue
+                ids = landed.missing_words(missing)
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                     (now, "daemon", "missing_task_ref", fp, "normal",
+                      f"#{t['id']} {t['title']} waits on {ids}, which does not exist: its {what} "
+                      f"{probe[:200]} can never pass. Decide: re-point it at an existing task (task_update "
+                      f"{'waits_on when:<probe>' if what == 'waits_on when' else 'start_when'}), clear it "
+                      f"(start_when \"\" or requeue), or cancel the task.", "queued", t["id"]))
+                log(self.p, f"task {t['id']} {what} waits on missing task {ids}; raised to the coordinator")
 
     def _raise_dead_dependency_blocks(self, now: float) -> None:
         """A block on a dead dependency does not wake the coordinator, so one it let pass a whole
@@ -4871,6 +4912,8 @@ class Daemon:
             self._drop_stale_probe(t["id"], d["when"])
             if t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
                 continue
+            if landed.missing_task_refs(db, d["when"]):
+                continue   # it can never pass: _raise_missing_task_refs raised it, once
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)

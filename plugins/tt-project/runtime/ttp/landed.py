@@ -29,6 +29,8 @@ from .db import review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
 ANCESTOR_PROBE = re.compile(r"\s*git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./@{}^~-]+)\s*")
+# `ttp landed --task <id>` / `ttp landed #<id>` inside a longer probe: the task it waits on.
+_LANDED_TASK = re.compile(r"\bttp\s+landed\b[^|;&\n]*?(?:--task(?:=|\s+)|\s#)['\"]?([^\s'\"|;&)]+)")
 REPLAYED = "Ttp-Replayed-From"   # batch.REPLAYED: a commit the push queue settled names the one it replays
 FETCH_S = 40                     # within the daemon's 60 s probe timeout
 NOT_YET, CANNOT = 1, 2
@@ -42,6 +44,25 @@ def probe_command(probe: str) -> str:
     if m := ANCESTOR_PROBE.fullmatch(probe or ""):
         return f"ttp landed {m.group(1)} --onto {shlex.quote(m.group(2))}"
     return probe
+
+
+def task_refs(probe: str | None) -> list[str]:
+    """The task ids a start_when, retry_when or hold probe waits on: `landed:#<id>`, and every
+    `ttp landed --task <id>` or `ttp landed #<id>` in it, as written (a bad one stays as it is)."""
+    probe = probe or ""
+    m = LANDED_PROBE.fullmatch(probe)
+    return list(dict.fromkeys([m.group(1)] if m else _LANDED_TASK.findall(probe)))
+
+
+def missing_task_refs(db, probe: str | None) -> list[str]:
+    """The ids of `probe`'s task references (task_refs) that name no task in this project: such a
+    probe would wait forever. A task that exists keeps today's handling, whatever its state."""
+    return [r for r in task_refs(probe) if not (r.isdigit() and int(r) > 0 and db.task(int(r)))]
+
+
+def missing_words(missing: list[str]) -> str:
+    """'#0' or '#0 and #7': the missing ids as the user reads them."""
+    return " and ".join(f"#{r}" for r in missing)
 
 
 def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -319,6 +340,8 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
     except ValueError as e:
         return CANNOT, str(e)
     if tid is not None:
+        if not p.db.task(tid):   # it would never land: a probe on it must say so, not wait forever
+            return CANNOT, f"no task #{tid} in this project"
         shas, src = task_shas(p, tid)
         if not shas:
             return NOT_YET, src

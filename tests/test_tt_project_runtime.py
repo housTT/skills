@@ -41778,8 +41778,9 @@ def test_a_deferred_task_shows_plain_words_never_its_probe(env, why):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": ""}]) == []
     assert not any(lb.startswith("start_why:") for lb in json.loads(p.db.task(tid)["labels"]))
     # A wait for another task's landing reads as such without a why.
-    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "landed:#12"}]) == []
-    assert coord.starts_text(p.db.task(tid), plain=True) == "starts when #12 lands"
+    other = p.db.add_task("the change", "s", origin="user")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": f"landed:#{other}"}]) == []
+    assert coord.starts_text(p.db.task(tid), plain=True) == f"starts when #{other} lands"
 
 
 def _hold_task(p, title="hold me"):
@@ -51079,3 +51080,99 @@ def test_ssh_auth_failed_gets_a_reboot_home_hint_and_other_failures_do_not(capsy
     assert "authorized_keys" in capsys.readouterr().err
     cli._unreachable({"host": "box"}, "Connection refused")
     assert "authorized_keys" not in capsys.readouterr().err
+
+
+def test_a_task_reference_to_a_missing_task_is_rejected_and_reaches_the_coordinator(env, monkeypatch):
+    """start_when landed:#<id>, a `ttp landed --task <id>` probe, a hold's when probe and depends_on that
+    name no task in this project are refused per action, and the refusal reaches the next digest."""
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    ok = p.db.add_task("the change", "s", origin="user")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    cases = [({"start_when": "landed:#0"}, "start_when landed:#0 names no task in this project"),
+             ({"start_when": "landed:#987654"}, "names no task in this project (no task #987654)"),
+             ({"start_when": "ttp landed --task 0 && test -f x"}, "(no task #0)"),
+             ({"start_when": "ttp landed --task=abc"}, "(no task #abc)"),
+             ({"depends_on": [0]}, "depends_on #0 names no task in this project"),
+             ({"depends_on": [-3]}, "depends_on #-3 names no task in this project"),
+             ({"depends_on": [987654]}, "no task #987654")]
+    for extra, why in cases:
+        problems = coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s", **extra},
+                                   {"type": "task_add", "title": f"fine {why}", "spec": "s"}])
+        assert len(problems) == 1 and problems[0].startswith('task_add: "after it": ') and why in problems[0], \
+            (extra, problems)
+        assert "use an existing task id or drop" in problems[0], problems
+    assert not p.db.q("SELECT id FROM tasks WHERE title='after it'"), "a rejected task_add created a task"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before + len(cases), "the rest of the batch was lost"
+    for bad in ("landed:#-1", "landed:#x"):   # not a task id at all: the format check refuses it
+        assert coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s", "start_when": bad}])
+    # task_update: a re-deferral, a hold's when probe and depends_on.
+    tid = p.db.add_task("later", "s", origin="user")
+    for upd, why in (({"start_when": "landed:#0"}, f"#{tid} rejected: start_when landed:#0 names no task"),
+                     ({"status": "blocked", "waits_on": "when:landed:#424242"}, "(no task #424242)"),
+                     ({"depends_on": [0]}, "names no task in this project")):
+        problems = coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1, **upd}])
+        assert len(problems) == 1 and why in problems[0], (upd, problems)
+        assert p.db.task(tid)["priority"] == 3 and p.db.task(tid)["status"] == "queued", "a rejected update was applied"
+    # An existing id still passes, in both forms.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": f"landed:#{ok}", "depends_on": [ok]}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "waits ok", "spec": "s", "start_when": f"landed:#{ok}",
+                            "depends_on": [ok]}]) == []
+    assert coord.starts_text(p.db.task(tid), plain=True, db=p.db) == f"starts when #{ok} lands"
+    # The refusal comes back to the coordinator in its next digest.
+    d = Daemon(p.base)
+    d.update_gates()
+    bad = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": "ghost wait", "spec": "s",
+                                                   "start_when": "landed:#0"}], "summary": ""},
+                          error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    digest = coord.digest(p, {}, [], [])
+    assert 'task_add: "ghost wait": start_when landed:#0 names no task in this project' in digest, digest
+    # The CLI's paths take the same check.
+    from ttp.cli import set_when
+    with pytest.raises(ValueError, match="names no task in this project"):
+        set_when(p.db, tid, "landed:#0", p)
+    waiting = p.db.add_task("waiting one", "s", origin="user", result=None)
+    p.db.update_task(waiting, result=json.dumps({"status": "waiting", "retry_when": "true"}))
+    with pytest.raises(ValueError, match=r"retry_when ttp landed --task 0 names no task"):
+        set_when(p.db, waiting, "ttp landed --task 0", p)
+    assert "ttp landed --task" in set_when(p.db, waiting, f"ttp landed --task {ok}", p)
+
+
+def test_a_task_already_waiting_on_a_missing_task_is_flagged_once_and_shown_broken(env):
+    """State from before the check: the daemon raises one event per task, does not run the probe, `ttp landed`
+    says it cannot tell, and status and the web app show the task as broken, not as a plan."""
+    from ttp import coordinator as coord
+    from ttp import landed
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    p = make(env)
+    tid = p.db.add_task("ghost wait", "s", origin="user",
+                        labels=coord.defer_labels(None, "landed:#0"))
+    held = p.db.add_task("ghost hold", "s", origin="user")
+    p.db.update_task(held, status="blocked", labels=json.dumps(["waits:when:ttp landed --task 77777"]))
+    fine = p.db.add_task("fine wait", "s", origin="user", labels=coord.defer_labels(None, f"landed:#{held}"))
+    d = Daemon(p.base)
+    for _ in range(2):
+        d.reconcile_tasks()
+    ev = p.db.q("SELECT task, text, status FROM events WHERE kind='missing_task_ref' ORDER BY task")
+    assert [e["task"] for e in ev] == [tid, held], ev
+    assert "waits on #0, which does not exist" in ev[0]["text"] and ev[0]["status"] == "queued"
+    assert "waits on #77777, which does not exist" in ev[1]["text"]
+    assert coord.EFFORT_EVENT_TRIGGERS["missing_task_ref"] == "stuck"
+    started = []
+    d._start_probe = lambda tid_, probe, now, what="retry_when": (started.append(tid_),
+                                                                   d._probe_rc.__setitem__(tid_, (1, now, probe)))
+    d.probe_deferred(time.time())
+    assert tid not in started and fine in started, started
+    assert landed.check(p, p.root, None, 0)[0] == landed.CANNOT, "a probe on a missing task said 'not yet'"
+    t = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)
+    assert t["starts"] == "broken: waits on #0, which does not exist", t
+    out = status_text(p)
+    assert f"  #{tid} broken: waits on #0, which does not exist: ghost wait" in out, out
+    assert "starts when #0 lands" not in out
+    assert "broken: waits on #0, which does not exist (start_when: landed:#0)" in coord.digest(p, {}, [], [])

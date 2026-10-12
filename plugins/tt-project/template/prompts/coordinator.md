@@ -129,7 +129,8 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   removed by whatever writes it when the resource is paused, shows trouble or fails its check.
 - Work that waits for another task's change to land on the push branch: `start_when`
   `landed:#<id>`. It passes once that task's landed commit is on the branch, which the push queue
-  records per task. Never wait on a raw sha (`git merge-base --is-ancestor <sha> ...`): pushing
+  records per task. An id that names no task here (`#0`, a guess) is rejected, in `depends_on`
+  too; a `missing_task_ref` event is a task that already waits on one: re-point it or cancel it. Never wait on a raw sha (`git merge-base --is-ancestor <sha> ...`): pushing
   rebases each commit to a new sha. Never grep the push branch's log for a subject: batches write
   their own (such a probe is refused). For a commit that is not a task's, use `ttp landed <sha>`,
   which also finds it rebased.

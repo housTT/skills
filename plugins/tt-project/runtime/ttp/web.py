@@ -287,7 +287,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
     # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
-    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz)}
+    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz, db=db)}
                 for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
                               "ORDER BY COALESCE(not_before, 0), id")]
     deferred = [t for t in deferred if t["starts"]]
@@ -551,7 +551,7 @@ def state_payload(p: Project, db: DB) -> dict:
         t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
         # Plain words for the board; the probe itself stays in start_when, the task's detail.
-        t["starts"] = coord.starts_text(t, now, plain=True, where=tz) if t["status"] == "queued" else ""
+        t["starts"] = coord.starts_text(t, now, plain=True, where=tz, db=db) if t["status"] == "queued" else ""
         t["wait"] = waits.wait_kind(t, asks, now, tz, paused) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),

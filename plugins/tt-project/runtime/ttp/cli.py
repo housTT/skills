@@ -963,8 +963,10 @@ def status_text(p: Project) -> str:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now, tz)}: {t['title']}" + (f" — {why}" if why else ""))
         lines += [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]]
+    from .coordinator import BROKEN_START
     for t in h["deferred"][:5]:
-        lines.append(f"  #{t['id']} deferred, {t['starts']}: {t['title']}")
+        broken = t["starts"].startswith(BROKEN_START + ":")
+        lines.append(f"  #{t['id']} {t['starts'] if broken else 'deferred, ' + t['starts']}: {t['title']}")
     if h["undelivered"]:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now, tz)}; "
@@ -2509,7 +2511,7 @@ def set_when(db, tid: int, probe: str | None, p=None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
     `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update
     (the push branch's log check needs `p`)."""
-    from .coordinator import _start_args, check_probe, defer_labels, marker_only_probe, start_why
+    from .coordinator import _start_args, check_probe, check_task_refs, defer_labels, marker_only_probe, start_why
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
     if probe is None:
         raise ValueError("set-when needs the probe command (\"\" clears it)")
@@ -2523,6 +2525,7 @@ def set_when(db, tid: int, probe: str | None, p=None) -> str:
         prev = load_result(task["result"])
         if prev.get("status") == "waiting" and not deferral(task).get("when"):
             check_probe(probe, "retry_when")
+            check_task_refs(db, probe, "retry_when")
             if probe.strip():
                 prev["retry_when"] = probe.strip()
             else:

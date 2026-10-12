@@ -231,7 +231,8 @@ EFFORT_EVENT_TRIGGERS = {
     # stuck work
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
-    "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
+    "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "missing_task_ref": "stuck",
+    "review_stall": "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
     "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource",
@@ -562,7 +563,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
         cont = continues_id(t)
         title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
-        starts = (starts_text(t, now, where=p) if t["status"] == "queued" else
+        starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
@@ -790,6 +791,20 @@ _GIT_LOG = re.compile(rf"\bgit(?:\s+-[^\s|;&]+(?:\s+[^\s|;&-][^\s|;&]*)??)*\s+lo
                       rf"(?P<args>{_REDIR}*)(?P<piped>(?:\|(?!\|){_REDIR}*)*)")
 
 
+class MissingTaskRef(ValueError):
+    """A start_when, retry_when, hold probe or depends_on that names a task this project does not have."""
+
+
+def check_task_refs(db, probe: str, what: str = "start_when") -> None:
+    """Raises MissingTaskRef when `probe` waits on a task id that does not exist (landed.task_refs):
+    it would wait forever. A task that exists but failed or was cancelled is the dead-dependency
+    handling's, not this check's."""
+    missing = landed.missing_task_refs(db, probe)
+    if missing:
+        raise MissingTaskRef(f"{what} {clip(probe.strip(), 160)} names no task in this project (no task "
+                             f"{landed.missing_words(missing)}); use an existing task id or drop the condition")
+
+
 def check_start_when(probe: str, p: Project | None = None) -> None:
     """Static checks of a new start_when; it is never run when it is set: the daemon applies a turn
     inside one write transaction and `ttp task set-when` holds one, so a run would hold the project
@@ -798,7 +813,10 @@ def check_start_when(probe: str, p: Project | None = None) -> None:
     batches write their own subjects, so it never matches; `landed:#<id>` is the probe for that.
     Known gap: a probe that passes these but fails when run (127: no such command; a bare
     `git cat-file -e` exits 128) is only raised to the coordinator after the daemon's first run of
-    it, once, as a `deferral_probe_broken` event."""
+    it, once, as a `deferral_probe_broken` event. With `p`, a probe that names a task id this
+    project does not have is refused (check_task_refs)."""
+    if p:
+        check_task_refs(p.db, probe)
     if landed.LANDED_PROBE.fullmatch(probe):
         return
     if re.match(r"\s*landed:", probe, re.I):
@@ -884,6 +902,10 @@ def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], late
             raise ValueError(f"#{task['id']} rejected: waits_on until {value!r} is not in the future")
         return anchors.label("until", f"{at:.0f}")
     check_probe(value, "waits_on when")
+    try:
+        check_task_refs(db, value, "waits_on when")
+    except MissingTaskRef as e:
+        raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
     return anchors.label("when", value)
 
 
@@ -915,24 +937,32 @@ def defer_labels(after: float | None, when: str | None, why: str | None = None) 
         + ([f"start_why:{why}"] if when and why else []) + [f"deferred_since:{time.time():.0f}"]
 
 
-def starts_text(task: dict, now: float | None = None, plain: bool = False, where=None) -> str:
+def starts_text(task: dict, now: float | None = None, plain: bool = False, where=None, db=None) -> str:
     """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
     `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe.
-    Times are in the home zone `where` (a Project, zone name or ZoneInfo); UTC without one."""
+    Times are in the home zone `where` (a Project, zone name or ZoneInfo); UTC without one.
+    With `db`, a probe on a task that does not exist reads as broken (BROKEN_START), never as a plan."""
     now = time.time() if now is None else now
     d = deferral(task)
+    missing = landed.missing_task_refs(db, d.get("when")) if db is not None and d.get("when") else []
+    if missing:
+        return f"{BROKEN_START}: waits on {landed.missing_words(missing)}, which does not exist" + (
+            "" if plain else f" (start_when: {clip(d['when'], 160)})")
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
     if not after and not d.get("when"):
         return ""
     if not d.get("when"):
         when = ""
     elif plain:
-        landed = re.fullmatch(r"landed:#([0-9]+)", d["when"].strip())
-        when = (f"when {clip(d['why'], 160)}" if d.get("why") else f"when #{landed[1]} lands" if landed
+        on = re.fullmatch(r"landed:#([0-9]+)", d["when"].strip())
+        when = (f"when {clip(d['why'], 160)}" if d.get("why") else f"when #{on[1]} lands" if on
                 else "when a check passes")
     else:
         when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
     return "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
+
+
+BROKEN_START = "broken"   # starts_text's lead word for a start_when on a task that does not exist
 
 
 def _clock(ts: float, where=None) -> str:
@@ -1014,7 +1044,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append("needs_device")
                 if tier == "deep" and a.get("user_deep"):
                     labels.append(effort.USER_DEEP)   # a device task keeps deep on its first start
-                deps = _new_dependencies(db, None, a.get("depends_on") or [])
+                try:
+                    deps = _new_dependencies(db, None, a.get("depends_on") or [])
+                except MissingTaskRef as e:
+                    raise MissingTaskRef(f"{json.dumps(title, ensure_ascii=False)}: {e}") from None
                 # The daemon would block a new task on a dead dependency at once.
                 dead = db.dead_dependency(deps)
                 if dead:
@@ -1070,7 +1103,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if inherited and (a.get("pr_branch") == "" or unpublished
                                   or _lands_on_push_branch(cfg, spec_text, inherited)):
                     labels.append(worktree.NO_PR_BRANCH)
-                after, when = _start_args(a, {}, p)
+                try:
+                    after, when = _start_args(a, {}, p)
+                except MissingTaskRef as e:
+                    raise MissingTaskRef(f"{json.dumps(title, ensure_ascii=False)}: {e}") from None
                 labels += defer_labels(after, when, start_why(a, {}, when))
                 stale = marker_only_probe(when)
                 why = prguard.spec_problem(db, a.get("spec") or "")
@@ -1199,7 +1235,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    after, when = _start_args(a, cur, p)
+                    try:
+                        after, when = _start_args(a, cur, p)
+                    except MissingTaskRef as e:
+                        raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
@@ -1695,7 +1734,8 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
         if task and d == task["id"]:
             raise ValueError(f"{who} cannot depend on itself")
         if not db.task(d):
-            raise ValueError(f"{who} depends_on: no task #{d}")
+            raise MissingTaskRef(f"{who} depends_on #{d} names no task in this project (no task #{d}); use an "
+                                 f"existing task id or drop it from depends_on")
     # Nothing depends on a new task yet, so only an existing one can close a loop.
     if task and db.dependency_cycle(task["id"], deps):
         raise ValueError(f"{who} depends_on {deps} would create a cycle")
