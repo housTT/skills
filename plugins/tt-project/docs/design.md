@@ -140,6 +140,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
 - `ttp upgrade <name>` commits the installed template on `upstream`, merges it into `main` in a
   scratch worktree, and fast-forwards the live harness only when the merge is clean and the
   runtime compiles and imports. Otherwise it queues a harness task and changes nothing.
+  First it commits local changes as "local harness changes before template upgrade". While harness
+  tasks run, it commits only files changed before the oldest such run started (not the upgrade's own
+  run) and leaves newer files and deletions for their worker to commit with its own message. It does
+  not wait for those runs, which could hold the upgrade for hours. If a left file blocks the
+  fast-forward, the upgrade stops with nothing changed, and a rerun after the worker commits applies it.
   It holds the `harness-upgrade` lock (state/locks, released by the OS when it exits) for the whole
   merge, refuses while another upgrade runs, and does not commit when `main` changed runtime/,
   prompts/ or bin/ meanwhile. The open upgrade task holds the live harness until it ends

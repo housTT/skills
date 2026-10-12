@@ -11186,6 +11186,54 @@ def test_upgrade_reports_a_new_source_commit_at_the_same_version(env, monkeypatc
     assert f"installed template: ttp {__version__} (bbbb2222)" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("who", ["worker", "none", "self"])
+def test_upgrade_leaves_a_running_harness_tasks_new_files_for_it_to_commit(env, monkeypatch, capsys, who):
+    """The pre-upgrade commit swept a running harness task's new, uncommitted file and an unrelated
+    change into "local harness changes before template upgrade", losing who made them and why. Changes
+    older than the oldest running harness run are still committed; newer ones stay for their worker,
+    unless no harness task runs or the upgrade runs inside that very run."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    mark = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    _install_template(env)
+    mark.write_text("aaaa1111\n")
+    cli.main(["upgrade", "demo"])
+    now = time.time()
+    old = h / "old-notes.md"
+    old.write_text("an edit from before any harness task ran\n")
+    os.utime(old, (now - 7200, now - 7200))
+    if who != "none":
+        tid = p.db.add_task("Add a check", "spec", kind="harness")
+        p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'running')",
+               (tid, now - 3600))
+        if who == "self":
+            run = p.db.one("SELECT id FROM runs WHERE task=?", (tid,))["id"]
+            monkeypatch.setenv("TTP_PROJECT", str(p.base))
+            monkeypatch.setenv("TTP_RUN_ID", str(run))
+    (h / "audits").mkdir(exist_ok=True)
+    (h / "audits" / "new check.py").write_text("print('the worker has not committed me yet')\n")
+    (h / "staged.md").write_text("staged by the worker\n")
+    _git_out(h, "add", "staged.md")
+    capsys.readouterr()
+    mark.write_text("bbbb2222\n")
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert (h / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip() == "bbbb2222"     # still applied
+    swept = _git_out(h, "log", "--format=%H", "--grep", "before template upgrade", "-1")
+    files = _git_out(h, "show", "--name-only", "--format=", swept).split("\n")
+    assert "old-notes.md" in files
+    if who == "worker":
+        assert "audits/new check.py" not in files and "staged.md" not in files
+        status = _git_out(h, "status", "--porcelain")
+        assert "?? audits/" in status and "A  staged.md" in status
+        assert "left 2 file(s) changed since harness task" in out and "audits/new check.py" in out
+    else:
+        assert "audits/new check.py" in files and "staged.md" in files
+        assert not _git_out(h, "status", "--porcelain") and "left " not in out
+
+
 def test_a_merged_runtime_that_does_not_import_is_not_applied(env, monkeypatch):
     p = make(env)
     from ttp import cli, service

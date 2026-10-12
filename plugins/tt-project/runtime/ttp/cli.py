@@ -3278,9 +3278,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         _git(h, "checkout", "HEAD", "--", *emptied)
         print("restored files a crash left empty: " + ", ".join(emptied))
     _restore_cut_runtime(h)
-    if _git(h, "status", "--porcelain"):
-        _git(h, "add", "-A")
-        _git(h, *ident, "commit", "-q", "-m", "local harness changes before template upgrade")
+    left = _commit_local_changes(p, ident)
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
     _snapshot_upstream(p, src, new_v, new_c, ident)
     kept: dict[str, str] = {}
@@ -3347,7 +3345,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                            text=True, env=genv)
         if r.returncode != 0:
             subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
-            die(f"could not apply the checked upgrade to {h}: {r.stdout[-500:]}", 1)
+            die(f"could not apply the checked upgrade to {h}: {(r.stdout + r.stderr)[-500:]}"
+                + (f"; files a running harness task changed were left for it to commit ({', '.join(left[:5])}): "
+                   f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
     if hasattr(os, "sync"):
         os.sync()       # a reboot right after must not leave the files git just wrote empty
     release.clear_stuck(p)
@@ -3366,6 +3366,62 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               f"restarted and running work was kept."
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="alert", severity="low")
+
+
+def _running_harness_start(p: Project) -> tuple[float, int] | None:
+    """(start, task) of the oldest run of this project's harness tasks still running, leaving out the
+    run this command runs in (its worker commits its own files before it upgrades); None when none runs."""
+    me = os.environ.get("TTP_RUN_ID") if _own_run(p) else None
+    r = p.db.one("SELECT r.started, r.task FROM runs r JOIN tasks t ON t.id=r.task WHERE r.status='running' "
+                 "AND t.kind='harness' AND r.started IS NOT NULL AND CAST(r.id AS TEXT) IS NOT ? "
+                 "ORDER BY r.started LIMIT 1", (me,))
+    return (float(r["started"]), int(r["task"])) if r else None
+
+
+def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
+    """Commit the harness's local changes before a template upgrade merges into it. While harness tasks of
+    the project run, they edit this same checkout and commit with their own message: only changes older
+    than the oldest such run's start are committed here, and newer ones (and deletions, whose age is
+    unknown) are left for their worker. Waiting for the run instead could hold an upgrade for hours.
+    Returns the files left uncommitted."""
+    h = p.harness
+    if not _git(h, "status", "--porcelain"):
+        return []
+    msg = "local harness changes before template upgrade"
+    running = _running_harness_start(p)
+    if not running:
+        _git(h, "add", "-A")
+        _git(h, *ident, "commit", "-q", "-m", msg)
+        return []
+    since, tid = running
+
+    def names(*args: str) -> set[str]:
+        out = subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True).stdout
+        return {n for n in out.split("\0") if n}
+
+    changed = (names("ls-files", "-z", "--modified", "--others", "--deleted", "--exclude-standard")
+               | names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+    old, left = [], []
+    for n in sorted(changed):
+        try:
+            (old if (h / n).lstat().st_mtime <= since else left).append(n)
+        except OSError:
+            left.append(n)
+    if old:
+        spec = p.state / "upgrade-commit-paths"
+        spec.write_text("\0".join(old) + "\0")
+        try:
+            files = ["--pathspec-from-file", str(spec), "--pathspec-file-nul"]
+            _git(h, "--literal-pathspecs", "add", "-A", *files)
+            # --only: the worker's own staged files stay staged and out of this commit
+            if names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD") & set(old):
+                _git(h, "--literal-pathspecs", *ident, "commit", "-q", "--only", "-m", msg, *files)
+        finally:
+            spec.unlink(missing_ok=True)
+    if left:
+        print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
+              f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
+    return left
 
 
 def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:
