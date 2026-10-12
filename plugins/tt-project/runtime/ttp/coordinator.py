@@ -320,9 +320,9 @@ MEMORY_DIGEST_HEADER = "## Memory added since the snapshot"
 
 def _prompt_head(p: Project) -> tuple[str, str, str]:
     """The system prompt's parts other than memory: restrictions, role, charter."""
-    role = (p.harness / "prompts" / "coordinator.md").read_text()
+    from .prompts import charter_without_restrictions, coordinator_role, restrictions_block
+    role = coordinator_role(p)
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
-    from .prompts import charter_without_restrictions, restrictions_block
     rules = restrictions_block(p)
     if rules:
         rules += ("\nWorkers are shown this block verbatim; when a spec touches anything it covers, "

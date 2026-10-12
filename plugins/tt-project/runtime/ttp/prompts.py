@@ -14,7 +14,8 @@ from . import budget as bud
 from . import settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_queue_on
+from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
+                      push_queue_on)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
 
 
@@ -29,6 +30,72 @@ def strip_markers(text: str) -> str:
     the model never needs them."""
     return "".join(line for line in text.splitlines(keepends=True)
                    if not (line.startswith(("<!-- ttp:", "<!-- /ttp:")) and line.rstrip().endswith("-->")))
+
+
+_IF_RE = re.compile(r"^<!-- (/?)ttp:if (!?)([a-z_]+) -->\s*$")
+
+
+def feature_blocks(text: str, on: set[str]) -> str:
+    """`text` without each `<!-- ttp:if X -->` ... `<!-- /ttp:if X -->` block whose feature X is not in
+    `on` (`ttp:if !X` keeps its block only while X is off), then without its marker lines. The
+    coordinator's role prompt fences its rules for features most projects never turn on this way."""
+    out, skip = [], []
+    for line in text.splitlines(keepends=True):
+        m = _IF_RE.match(line)
+        if m and not m.group(1):
+            skip.append((m.group(3) in on) == bool(m.group(2)))
+        elif m:
+            if skip:
+                skip.pop()
+        elif not any(skip):
+            out.append(line)
+    return strip_markers("".join(out))
+
+
+def coordinator_features(p: Project) -> set[str]:
+    """The features whose fenced rules the coordinator's role prompt carries (feature_blocks)."""
+    from . import machines, obligations
+    cfg = p.config()
+    d = cfg.get("delivery") or {}
+    on = set()
+    if bool(str(d.get("push_branch") or "").strip()) and push_allowed(d):
+        on.add("push_branch")
+    if push_queue_on(cfg):
+        on.add("push_queue")
+    if code_tasks_may_push(cfg):
+        on.add("land")
+    mode = own_push(cfg)
+    on |= {"own_push"} if mode != "off" else set()
+    on |= {"own_push_limited"} if mode != "on" else set()
+    if d.get("draft_prs", True) is not False:
+        on.add("draft_prs")
+    if (cfg.get("notify") or {}).get("slack"):
+        on.add("slack")
+    try:
+        known = machines.load()
+    except Exception:
+        known = {}
+    if known:
+        on.add("machines")
+    # Shared-cluster rules: a machine tagged as one, or a cluster in the charter's Resources (its
+    # template's standing Policies line about clusters says nothing about this project's own).
+    charter = p.charter_path.read_text() if p.charter_path.exists() else ""
+    resources = re.search(r"(?ms)^## Resources\b.*?(?=^## |\Z)", charter)
+    tags = " ".join(str(m.get("tags") or "") for m in known.values())
+    if re.search(r"\b(slurm|cluster)", f"{tags} {resources.group(0) if resources else ''}", re.I):
+        on.add("clusters")
+    try:
+        if any(o.get("receipt") is None and o.get("dropped") is None for o in obligations.items(p.db)):
+            on.add("obligations")
+    except Exception:
+        pass
+    return on
+
+
+def coordinator_role(p: Project) -> str:
+    """The coordinator's role prompt (prompts/coordinator.md) with the rules for this project's
+    features only."""
+    return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p))
 
 
 # kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.

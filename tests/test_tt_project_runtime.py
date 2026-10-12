@@ -32204,6 +32204,32 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     assert "instead of adding a\n  separate landing, cherry-pick or fast-forward task" in coordinator
 
 
+
+def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are_on_and_stays_small(env):
+    from ttp import coordinator as coord
+    from ttp.prompts import coordinator_role, feature_blocks
+    p = make(env)
+    role = coordinator_role(p)
+    # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
+    assert len(role) <= 30_000, len(role)
+    assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
+    assert role in coord.prompt_parts(p)[0]
+    # Rules for features that are off are left out; turning one on brings its rules in.
+    assert "With the push queue on" not in role and "came in on Slack" not in role
+    assert "`landed:#<id>`" not in role and "Shared clusters" not in role
+    assert "A PR leaves draft ONLY on the user's explicit yes" in role
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.set_config("notify.slack", True)
+    on = coordinator_role(p)
+    assert "With the push queue on" in on and "came in on Slack" in on and "`landed:#<id>`" in on
+    # `ttp:if !X` keeps its block only while X is off; nested blocks follow their outer one.
+    text = ("a\n<!-- ttp:if x -->\nb\n<!-- ttp:if y -->\nc\n<!-- /ttp:if y -->\n<!-- /ttp:if x -->\n"
+            "<!-- ttp:if !x -->\nd\n<!-- /ttp:if !x -->\n")
+    assert feature_blocks(text, set()) == "a\nd\n"
+    assert feature_blocks(text, {"x"}) == "a\nb\n"
+    assert feature_blocks(text, {"x", "y"}) == "a\nb\nc\n"
+
 # --- PRs leave draft only with the user's recorded approval ---------------------------------------
 
 HEAD = "a" * 40   # the head commit pr-watch read and the fake gh reports, unless a test moves it
