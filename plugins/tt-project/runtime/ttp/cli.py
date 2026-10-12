@@ -3798,6 +3798,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--batch", metavar="MARKER", help=argparse.SUPPRESS)   # the push queue's batch process (batch.py)
     s.set_defaults(fn=cmd_push)
 
+    from . import checkplan
+    s = sub.add_parser("check-plan", help="run committed coverage independently of candidate publication identity")
+    s.add_argument("--definition-commit", required=True, help="full commit ID of the independently reviewed definition")
+    s.add_argument("--definition-path", required=True, help="exact repository path of its JSON file")
+    s.add_argument("--purpose", required=True, choices=["harness", "candidate"])
+    s.set_defaults(fn=checkplan.command)
+
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
     s.add_argument("--gap-config", metavar="FINGERPRINT",

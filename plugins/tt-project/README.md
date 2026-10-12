@@ -416,6 +416,41 @@ and preferences you add later become part of the project's charter and memory.
   `a; b` or `a | b` fails when `a` fails. Still prefer one required command per entry. A coverage
   map keyed by full commit SHA must reject unknown heads and fail when a required input is missing;
   never skip a check because of an earlier pass or failure, and add a negative control that must fail.
+- A harness selector must not need its own future HEAD in a publication whitelist. Use
+  `ttp check-plan --purpose harness --definition-commit <full-commit-id> --definition-path checks/harness.json`
+  as a mandatory check command, run from the repository root. The independently reviewed JSON
+  definition is read from that exact commit, never from its working copy. For example:
+
+  ```json
+  {"purpose": "harness", "coverage": {
+    "paths": {"checks/selector.py": "<64-character SHA-256 of committed file bytes>",
+              "tests/test_selector.py": "<64-character SHA-256 of committed file bytes>"},
+    "commands": ["python3 -m pytest -q tests/test_selector.py"]
+  }}
+  ```
+
+  Bind every input the commands rely on, including imported helpers and fixtures. Paths are
+  exact, repository-relative regular files; they are read literally, without glob expansion.
+  Each must exist at the checked HEAD, match its digest, and match the working file used by the
+  command. A different HEAD with those covered inputs runs the same required commands; this
+  says nothing about publication approval or files outside the binding. The command checks the
+  HEAD and bound inputs again after each successful command. Commands use the usual check shell
+  and venv selection, run in order, stop at the first failure, and never skip or reuse a pass.
+  Prepare the inputs first, then commit the definition and have its purpose, coverage and commands
+  independently reviewed; installation pins that definition commit. There is no self-referential
+  requirement to include the definition's or a later selector-preparation commit's own SHA.
+
+  A separate `--purpose candidate` definition keeps exact publication identities:
+  `{"purpose":"candidate","candidates":{"<full-candidate-commit-id>":{"paths":{...},"commands":[...]}}}`.
+  Each candidate uses the same paths/commands binding; unknown candidate HEADs still reject.
+  Purpose must match the committed definition and is never inferred from the current HEAD,
+  push mode or an environment variable. Keep all existing mandatory candidate gates alongside
+  the harness check; installing harness coverage does not waive them or carry earlier approvals
+  to a changed definition. Applicability-gap ownership and retries remain independent of this binding.
+  Exit codes are **65** for unknown identity, changed coverage or purpose mismatch, **66** for
+  missing/invalid required input or definition, and **20** for Git failure even if Git also prints
+  a matching identity. A selected command's nonzero exit code is preserved (for example **42**);
+  **0** means every selected command passed under the binding.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files

@@ -29,6 +29,125 @@ import urllib.request
 
 import pytest
 
+
+def _check_plan_repo(tmp_path, purpose="harness"):
+    import hashlib
+    repo = tmp_path / "plan-repo"
+    repo.mkdir()
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (repo / "selector.py").write_text("# selector\n")
+    (repo / "control.sh").write_text("exit 0\n")
+    git("add", ".")
+    git("commit", "-qm", "inputs")
+    candidate = git("rev-parse", "HEAD")
+    scope = {"paths": {p: hashlib.sha256((repo / p).read_bytes()).hexdigest()
+                       for p in ("selector.py", "control.sh")}, "commands": ["sh control.sh"]}
+    plan = {"purpose": purpose, **({"coverage": scope} if purpose == "harness" else
+                                  {"candidates": {candidate: scope}})}
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", ".")
+    git("commit", "-qm", "independent definition")
+    definition = git("rev-parse", "HEAD")
+    return repo, git, plan, definition, candidate
+
+
+@pytest.mark.parametrize("case,expected", [("harness", 0), ("unknown", 65),
+    ("missing", 66), ("mismatch", 65), ("selected", 42), ("dirty", 65), ("purpose", 65)])
+def test_check_plan_separates_coverage_from_candidate_identity(tmp_path, case, expected):
+    from ttp import checkplan
+    purpose = "candidate" if case == "unknown" else "harness"
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path, purpose)
+    if case == "harness":
+        (repo / "notes.md").write_text("selector preparation\n")
+        git("add", ".")
+        git("commit", "-qm", "unlisted harness head")
+        # A working copy of the definition cannot change the pinned commands.
+        (repo / "plan.json").write_text('{}')
+    if case in ("missing", "mismatch", "selected"):
+        if case == "missing":
+            (repo / "selector.py").unlink()
+        elif case == "mismatch":
+            (repo / "selector.py").write_text("# changed\n")
+        else:
+            (repo / "control.sh").write_text("exit 42\n")
+            import hashlib
+            plan["coverage"]["paths"]["control.sh"] = hashlib.sha256(b"exit 42\n").hexdigest()
+            (repo / "plan.json").write_text(json.dumps(plan))
+        git("add", "-A")
+        git("commit", "-qm", "next harness change")
+        if case == "selected":
+            definition = git("rev-parse", "HEAD")
+    if case == "dirty":
+        (repo / "control.sh").write_text("exit 0 # uncommitted\n")
+    assert checkplan.run(repo, definition, "plan.json", "candidate" if case == "purpose" else purpose) == expected
+    if case == "unknown":
+        git("checkout", "-q", candidate)
+        assert checkplan.run(repo, definition, "plan.json", "candidate") == 0
+
+
+def test_check_plan_git_failure_with_matching_output_still_fails(tmp_path, monkeypatch):
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    monkeypatch.setattr(checkplan, "_git", lambda *a: subprocess.CompletedProcess(a, 20, definition, "git failed"))
+    assert checkplan.run(repo, definition, "plan.json", "harness") == 20
+
+
+@pytest.mark.parametrize("case", ["empty_paths", "empty_commands", "outside_path", "glob_path",
+    "bad_digest", "unknown_key", "symlink", "missing_definition", "bad_json", "mutable_ref"])
+def test_check_plan_invalid_or_missing_coverage_never_passes(tmp_path, case):
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    scope = plan["coverage"]
+    if case == "empty_paths":
+        scope["paths"] = {}
+    elif case == "empty_commands":
+        scope["commands"] = []
+    elif case == "outside_path":
+        scope["paths"] = {"../selector.py": "0" * 64}
+    elif case == "glob_path":
+        scope["paths"] = {"*.py": "0" * 64}
+    elif case == "bad_digest":
+        scope["paths"]["selector.py"] = "bad"
+    elif case == "unknown_key":
+        scope["if_exists"] = "selector.py"
+    elif case == "symlink":
+        (repo / "selector.py").unlink()
+        (repo / "selector.py").symlink_to("control.sh")
+    elif case == "missing_definition":
+        (repo / "plan.json").unlink()
+    if case != "missing_definition":
+        (repo / "plan.json").write_text("{" if case == "bad_json" else json.dumps(plan))
+    (repo / "notes.md").write_text("control\n")
+    git("add", "-A")
+    git("commit", "-qm", "invalid definition or input")
+    definition = "HEAD" if case == "mutable_ref" else git("rev-parse", "HEAD")
+    assert checkplan.run(repo, definition, "plan.json", "harness") == 66
+
+
+def test_check_plan_keeps_all_required_commands_and_first_failure(tmp_path):
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    plan["coverage"]["commands"] = ["sh control.sh", "exit 42", "touch skipped"]
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", ".")
+    git("commit", "-qm", "mandatory commands")
+    assert checkplan.run(repo, git("rev-parse", "HEAD"), "plan.json", "harness") == 42
+    assert not (repo / "skipped").exists()
+
+
+def test_check_plan_cli_preserves_identity_exit(tmp_path, monkeypatch):
+    from ttp import cli
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path, "candidate")
+    monkeypatch.chdir(repo)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["check-plan", "--definition-commit", definition,
+                  "--definition-path", "plan.json", "--purpose", "candidate"])
+    assert e.value.code == 65
+
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 # Tests without the env fixture import ttp too; each must also pass when run alone.
