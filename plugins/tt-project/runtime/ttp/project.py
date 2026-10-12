@@ -98,8 +98,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
                 # every task that could start waits on hosts this machine cannot reach (probe exit 255),
                 # nothing runs: one normal alert this long into the outage (0: never); the outage ends
-                # once no probe has said unreachable for the debounce (netwait.py)
-                "unreachable_alert_s": 900, "unreachable_debounce_s": 600,
+                # once no probe has said unreachable for the debounce (netwait.py). Hosts whose ssh route
+                # ends at loopback (a tunnel from the user's workstation) get a low feed line instead,
+                # raised once to normal when the outage is tunnel_outage_page_after_s old (0: at once)
+                "unreachable_alert_s": 900, "unreachable_debounce_s": 600, "tunnel_outage_page_after_s": 3600,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
                 "on_pass_timeout_s": 600,
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores

@@ -45077,22 +45077,23 @@ NET_PROBE = "ssh -o ConnectTimeout=5 jump.example true"
 NET_OUT = "ssh: connect to host jump.example port 22: Connection timed out"
 
 
-def _net_setup(env, monkeypatch, n=2):
+def _net_setup(env, monkeypatch, n=2, probe=NET_PROBE, out=NET_OUT, ssh_config=None):
     """Two tasks deferred on a start_when probe that reaches a host over ssh, a home zone that is not
     the machine's, a clock the test moves, and `check(at, rc)`: the probes' latest verdict (None: no
     verdict, as once a probe passed and the task started), one check, the alert sweep; it returns the
-    network alerts posted so far."""
-    from ttp import alerts, timefmt
+    network alerts posted so far. `ssh_config`: what `ssh -G <alias>` answers per alias ({} if not)."""
+    from ttp import alerts, netwait, timefmt
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     from ttp.db import deferral
+    monkeypatch.setattr(netwait, "_ssh_config", lambda alias: dict((ssh_config or {}).get(alias) or {}))
     p = make(env)
     _no_events(p)
     timefmt.set_home(p, "America/Los_Angeles")
     d = Daemon(p.base)
     for i in range(n):
         assert coord.apply(p, [{"type": "task_add", "title": f"device job {i}", "spec": "s",
-                                "start_when": NET_PROBE}]) == []
+                                "start_when": probe}]) == []
     tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='queued' ORDER BY id")]
     clock = {"now": time.time(), "rc": 255}
     monkeypatch.setattr(time, "time", lambda: clock["now"])
@@ -45105,8 +45106,8 @@ def _net_setup(env, monkeypatch, n=2):
             if rc is None:
                 verdicts.pop(tid, None)
             else:
-                verdicts[tid] = (rc, at, NET_PROBE)
-                d._probe_out[tid] = (NET_OUT if rc == 255 else "", at, NET_PROBE)
+                verdicts[tid] = (rc, at, probe)
+                d._probe_out[tid] = (out if rc == 255 else "", at, probe)
         d._net_checked = 0.0
         d.check_unreachable()
         alerts.sweep(p.db, at)
@@ -45217,9 +45218,108 @@ def test_network_outage_names_the_hosts_from_ssh_errors_or_the_probe(env):
     assert netwait.hosts("ssh -q box2 true && ssh box3 true") == ["box2", "box3"]
     assert netwait.hosts("ttp detach --check --host box4 /runs/1/x") == ["box4"]
     assert netwait.hosts("ssh box5 true", "ssh: Could not resolve hostname gw.example: Name or service not known") \
-        == ["gw.example"]
+        == ["box5"], "the alias the probe used, not the address ssh resolved"
+    assert netwait.hosts("sh check.sh", "ssh: Could not resolve hostname gw.example: Name or service not known") \
+        == ["gw.example"], "no alias in the probe: ssh's own error"
     assert netwait.hosts("test -e /tmp/x") == []
     assert "The hosts this project's work needs cannot be reached" in netwait.text("UTC", 0.0, 1, [])
+
+
+def test_network_outage_classes_loopback_proxyjump_and_proxycommand_routes_as_tunnels(monkeypatch):
+    from ttp import netwait
+    conf = {"box-a": {"hostname": "127.0.0.1", "port": "2222"},
+            "box-b": {"hostname": "box-b.example", "proxyjump": "box-a"},
+            "box-c": {"hostname": "10.0.0.7", "proxyjump": "gw.example,user@[::1]:2200"},
+            "box-d": {"hostname": "box-d.example", "proxycommand": "ssh -W %h:%p box-a"},
+            "box-e": {"hostname": "box-e.example", "proxycommand": "nc localhost:2201"},
+            "box-f": {"hostname": "box-f.example", "proxycommand": "socat - TCP:127.0.0.2:2202"},
+            "box-g": {"hostname": "box-g.example", "proxyjump": "gw.example"},
+            "box-h": {"hostname": "box-h.example", "proxycommand": "nc %h %p"},
+            "loop": {"hostname": "box-x.example", "proxyjump": "loop"}}
+    monkeypatch.setattr(netwait, "_ssh_config", lambda alias: dict(conf.get(alias) or {}))
+    for alias in ("box-a", "box-b", "box-c", "box-d", "box-e", "box-f", "127.0.0.1", "localhost"):
+        assert netwait.route(alias)["tunnel"], alias
+    for alias in ("box-g", "box-h", "gw.example", "loop"):
+        assert not netwait.route(alias)["tunnel"], alias
+    assert netwait.describe(["box-a"]) == (["box-a"], True), "a loopback HostName is never shown"
+    assert netwait.describe(["box-c"]) == (["box-c (10.0.0.7)"], True)
+    assert netwait.describe(["127.0.0.1"]) == ([], True), "a bare loopback address is no host name"
+    assert netwait.describe(["box-a", "box-g"]) == (["box-a", "box-g (box-g.example)"], False), \
+        "one real network route among them keeps the network wording"
+    assert netwait.describe([]) == ([], False)
+
+
+TUNNEL_PROBE = "ssh -o ConnectTimeout=5 box-a true"
+TUNNEL_OUT = "ssh: connect to host 127.0.0.1 port 2222: Connection refused"
+
+
+def test_network_outage_on_a_tunnel_route_is_a_low_feed_line_raised_once_after_an_hour_then_clears(env, monkeypatch):
+    import re
+    from ttp import alerts
+    from ttp.cli import status_text
+    p, d, tids, now, check = _net_setup(env, monkeypatch, probe=TUNNEL_PROBE, out=TUNNEL_OUT,
+                                        ssh_config={"box-a": {"hostname": "127.0.0.1", "port": "2222"}})
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1, "one line per outage, after the same grace"
+    m = sent[0]
+    assert m["severity"] == "low", "a tunnel that reconnects by itself pages nobody at first"
+    assert "box-a" in m["text"] and "tunnel from the user's workstation" in m["text"], m["text"]
+    assert "reconnects by itself" in m["text"] and "VPN" not in m["text"] and "sign-in" not in m["text"], m["text"]
+    assert not re.search(r"127\.\d+\.\d+\.\d+|::1|localhost", m["text"]), m["text"]
+    assert not alerts.needs_you(p.db, now + 900) and "needs you" not in status_text(p)
+    assert [x["state"] for x in alerts.feed(p.db, now + 900) if x["id"] == m["id"]] == ["status"]
+    assert p.db.one("SELECT severity FROM alerts WHERE key='network:unreachable'")["severity"] == "low"
+    assert not p.db.unread_for_chat("c", 0), "no chat page for a low line"
+    assert len(check(now + 3000)) == 1, "quiet before the threshold (60 min into the outage)"
+    sent = check(now + 3600)
+    assert len(sent) == 2, "raised once at the threshold"
+    r = sent[1]
+    assert r["severity"] == "normal" and "box-a" in r["text"] and "down 1.0 h" in r["text"], r["text"]
+    assert "VPN" not in r["text"] and not re.search(r"127\.\d+\.\d+\.\d+", r["text"]), r["text"]
+    assert [x["id"] for x in alerts.needs_you(p.db, now + 3600)] == [r["id"]]
+    assert m["id"] not in [x["id"] for x in alerts.feed(p.db, now + 3600)], "the raised line replaces the low one"
+    for at in (now + 7200, now + 6 * 3600):
+        assert len(check(at)) == 2, "no repeat after the one raise"
+    assert p.db.one("SELECT COUNT(*) n FROM alerts WHERE key='network:unreachable'")["n"] == 1, "one issue"
+    # The tunnel is back: the outage clears under the same key.
+    t0 = now + 6 * 3600 + 300
+    check(t0, rc=None)
+    assert len(check(t0 + 660, rc=None)) == 2 and not alerts.needs_you(p.db, t0 + 660)
+    done = p.db.q("SELECT * FROM messages WHERE kind='resolved' AND ref='network:unreachable'")
+    assert len(done) == 1 and done[0]["severity"] == "low"
+    assert not p.db.kv("network_outage")
+
+
+def test_network_outage_on_a_tunnel_route_that_comes_back_before_the_threshold_never_pages(env, monkeypatch):
+    from ttp import alerts
+    p, d, tids, now, check = _net_setup(env, monkeypatch, probe=TUNNEL_PROBE, out=TUNNEL_OUT,
+                                        ssh_config={"box-a": {"hostname": "127.0.0.1", "port": "2222"}})
+    check(now)
+    assert [m["severity"] for m in check(now + 900)] == ["low"]
+    check(now + 1020, rc=None)   # back 17 min into the outage
+    assert [m["severity"] for m in check(now + 1700, rc=None)] == ["low"], "never raised"
+    assert not p.db.kv("network_outage") and not alerts.needs_you(p.db, now + 1700)
+    assert [x["state"] for x in alerts.feed(p.db, now + 1700) if x["kind"] == "alert"] == ["cleared"]
+    # 0: page at once.
+    d.cfg = {**d.cfg, "waiting": {**(d.cfg.get("waiting") or {}), "tunnel_outage_page_after_s": 0}}
+    t1 = now + 7200
+    check(t1)
+    sent = check(t1 + 900)
+    assert [m["severity"] for m in sent] == ["low", "normal"] and "tunnel" in sent[1]["text"]
+    assert len(check(t1 + 4 * 3600)) == 2
+
+
+def test_network_outage_on_a_remote_route_keeps_the_vpn_wording_and_names_the_alias_first(env, monkeypatch):
+    p, d, tids, now, check = _net_setup(env, monkeypatch, probe="ssh box-r true",
+                                        out="ssh: connect to host box-r.example port 22: Connection timed out",
+                                        ssh_config={"box-r": {"hostname": "box-r.example"}})
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1 and sent[0]["severity"] == "normal"
+    assert "box-r (box-r.example) cannot be reached" in sent[0]["text"], sent[0]["text"]
+    assert "VPN or network sign-in" in sent[0]["text"] and "tunnel" not in sent[0]["text"]
+    assert len(check(now + 6 * 3600)) == 1, "a network route is never raised again"
 
 
 def test_network_outage_counts_a_waiting_hand_off_whose_retry_when_cannot_reach_its_host(env, monkeypatch):
@@ -45248,6 +45348,8 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     stub = p.root / "reach.sh"
     stub.write_text("echo 'ssh: connect to host gw.example port 22: Connection timed out' >&2; exit 255\n")
     probe = f"sh {stub}"
+    from ttp import netwait
+    monkeypatch.setattr(netwait, "_ssh_config", lambda alias: {})
     d = Daemon(p.base)
     for i in range(2):
         assert coord.apply(p, [{"type": "task_add", "title": f"device job {i}", "spec": "s",

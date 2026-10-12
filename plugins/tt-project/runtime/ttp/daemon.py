@@ -3353,7 +3353,9 @@ class Daemon:
         """One alert per network outage (netwait): every task that could start waits on a probe saying
         this machine cannot reach its host (exit 255), no worker runs and nothing else can start, for
         `waiting.unreachable_alert_s`. Only the user can sign back in to a VPN or network; the alert
-        says so once, stays in the top section and clears itself once the hosts answer again."""
+        says so once, stays in the top section and clears itself once the hosts answer again. Hosts
+        reached through a tunnel from the user's workstation get a low feed line instead, raised once to
+        normal after `waiting.tunnel_outage_page_after_s` (netwait.py)."""
         now = time.time()
         if now - getattr(self, "_net_checked", 0.0) < every_s:
             return
@@ -3366,18 +3368,31 @@ class Daemon:
         unreachable, other = self._reachability_holds(now)
         running = db.one("SELECT id FROM runs WHERE role!='coordinator' AND status='running' LIMIT 1")
         blocking = bool(unreachable) and not other and not running
+        page_after = netwait.tunnel_page_after(self.cfg)
         new, action = netwait.step(st, blocking, len(unreachable), now, grace, debounce,
-                                   healing=blocking and self._healing())
+                                   healing=blocking and self._healing(), page_after=page_after)
+        severity = "normal"
         if action == "alert":
-            names = list(dict.fromkeys(h for _, hs in unreachable for h in hs))
-            new.update(tasks=[tid for tid, _ in unreachable], hosts=names)
+            names, tunnel = netwait.describe(list(dict.fromkeys(h for _, hs in unreachable for h in hs)))
+            new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel)
+            if tunnel and now - float(new["since"]) < page_after:
+                severity = "low"   # a tunnel that reconnects by itself: a feed line until page_after
+            elif tunnel:
+                new["raised"] = now
         if new != st:
             db.set_kv(netwait.STATE_KEY, new)
         if action == "alert":
-            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names),
-                       severity="normal")
+            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names, tunnel),
+                       severity=severity)
             log(self.p, f"network: {len(unreachable)} task(s) wait on unreachable hosts "
-                        f"({', '.join(names) or 'unnamed'}); alerted once")
+                        f"({', '.join(names) or 'unnamed'}{', tunnel route' if tunnel else ''}); "
+                        f"alerted once ({severity})")
+        elif action == "raise":
+            names = list(new.get("hosts") or [])
+            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names, True, now),
+                       severity="normal")
+            log(self.p, f"network: tunnel route to {', '.join(names) or 'unnamed hosts'} still down "
+                        f"after {(now - float(new['since'])) / 60:.0f} min; raised to normal")
         elif action == "clear":
             log(self.p, "network: the hosts answer again; the outage alert clears")
 

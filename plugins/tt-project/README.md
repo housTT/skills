@@ -300,6 +300,11 @@ prolonged whole-box outage.
   (also across projects on the same machine) and wakes no coordinator. A heal check still trying its
   fix delays it by one more grace. It clears with one low feed line once no probe has said
   unreachable for `waiting.unreachable_debounce_s` (600), so a brief reconnect stays one outage.
+  Hosts are named by the ssh or machines-list alias the probe used, never by the resolved address.
+  When every host's route (`ssh -G <alias>`) ends at loopback, directly or through its ProxyJump or
+  ProxyCommand, it is a tunnel from the user's workstation: the alert says the tunnel is down and
+  reconnects by itself (no VPN advice) and is a low feed line, raised once to normal under the same
+  key when the outage is `waiting.tunnel_outage_page_after_s` (3600; 0 pages at once) old.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

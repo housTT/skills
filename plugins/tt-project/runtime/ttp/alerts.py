@@ -9,7 +9,8 @@ ask `active()`, which also checks the condition live, so a cleared alert disappe
 
 A condition only the user can clear (USER_BLOCKERS: a lost VPN or network sign-in, netwait.py) is
 alerted at normal severity yet tracked like a high alert: an episode, the top section, and a clearing
-told as one low feed line.
+told as one low feed line. Posted low (an outage of a tunnel that reconnects by itself), it is live
+status in the feed until it clears or is raised to normal under the same key.
 
 A provider's budget gate or limit pause that lifts by itself (STATUS_CONDITIONS) is status, not a
 problem for the user: posted below high, it is tracked as an episode and listed in the feed as live
@@ -81,18 +82,21 @@ def _urgent(severity: str | None) -> bool:
 
 
 def _top(severity: str | None, ref: str | None) -> bool:
-    """An alert for the top section: high or above, or a keyed condition only the user can clear."""
-    return _urgent(severity) or bool(ref) and str(ref).partition(":")[0] in USER_BLOCKERS
+    """An alert for the top section: high or above, or a keyed condition only the user can clear
+    (posted low, it is live status instead: a tunnel that reconnects by itself, netwait.py)."""
+    return _urgent(severity) or (bool(ref) and str(ref).partition(":")[0] in USER_BLOCKERS
+                                 and severity != "low")
 
 
-def _status(ref: str | None) -> bool:
-    return bool(ref) and str(ref).partition(":")[0] in STATUS_CONDITIONS
+def _status(ref: str | None, severity: str | None = None) -> bool:
+    kind = str(ref or "").partition(":")[0]
+    return bool(ref) and (kind in STATUS_CONDITIONS or (kind in USER_BLOCKERS and severity == "low"))
 
 
 def tracked(kind: str, severity: str | None, ref: str | None) -> bool:
     """Whether a broadcast opens an episode: a top-section alert or a status condition with a
     condition key, never a reboot."""
-    return (kind == "alert" and bool(ref) and (_top(severity, ref) or _status(ref))
+    return (kind == "alert" and bool(ref) and (_top(severity, ref) or _status(ref, severity))
             and not str(ref).startswith("reboot:"))
 
 
@@ -550,8 +554,11 @@ def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
             else:
                 m["state"] = "cleared"
                 m["cleared_at"] = ep["cleared"] if ep else None
-        elif m["kind"] == "alert" and _status(ref):   # a gate or pause that lifts by itself
+        elif m["kind"] == "alert" and _status(ref, m["severity"]):   # a gate or pause that lifts by itself
             if active(db, ref, m["ts"], now):
+                ep = episode(db, ref, m["ts"])
+                if ep and _top(ep["severity"], ref):
+                    continue   # raised since: the condition is in the top section
                 m["state"] = "status"
             else:
                 m["state"] = "cleared"
