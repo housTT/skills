@@ -280,21 +280,26 @@ def test_blackhole_destination_needs_its_trace(tmp_path):
 def test_sheet_spec_layout(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
     write_rows(run / "changes_op_table.csv", [{"change": "added", "key": "k", "column": "", "old": "", "new": ""}])
-    result = run_script("sheet_spec.py", str(run), "--summary-sheet-id", "7", "--first-sheet-id", "20")
+    result = run_script("sheet_spec.py", str(run), "--info-sheet-id", "7", "--first-sheet-id", "20")
     assert result.returncode == 0, result.stderr
     spec = json.loads(result.stdout)
+    assert spec["info"] == {"sheetId": 7, "title": "Info"}
+    assert spec["summary"] == {"sheetId": 20, "title": "Summary"}
     assert [(t["tab"], t["sheetId"]) for t in spec["tabs"]] == [
-        ("Op table", 20), ("Call trace", 21), ("Port blockers", 22), ("Host ops", 23), ("Changes: Op table", 24)]
+        ("Op table", 21), ("Call trace", 22), ("Port blockers", 23), ("Host ops", 24), ("Changes: Op table", 25)]
     headers = spec["tabs"][0]["headers"]
     assert "Call site (file:line)" in headers
     assert "Quasar, BF16 projection: evidence and gap" in headers
     assert spec["tabs"][2]["headers"][3] == "Evidence"
     reqs = spec["requests"]
-    assert reqs[0]["updateSheetProperties"]["properties"]["sheetId"] == 7
+    assert reqs[0]["updateSheetProperties"]["properties"] == {"sheetId": 7, "title": "Info"}
+    added = [(r["addSheet"]["properties"]["title"], r["addSheet"]["properties"]["index"]) for r in reqs if "addSheet" in r]
+    assert added == [("Summary", 1), ("Op table", 2), ("Call trace", 3), ("Port blockers", 4), ("Host ops", 5),
+                     ("Changes: Op table", 6)]
     assert not any("autoResizeDimensions" in r for r in reqs)
     wrapped = {r["repeatCell"]["range"]["sheetId"] for r in reqs
                if "repeatCell" in r and r["repeatCell"]["cell"]["userEnteredFormat"].get("wrapStrategy") == "WRAP"}
-    assert wrapped == {7, 20, 21, 22, 23, 24}
+    assert wrapped == {7, 20, 21, 22, 23, 24, 25}
 
 
 TENSOR_FIELDS = ["W_PAD[LOGICAL]", "Z_PAD[LOGICAL]", "Y_PAD[LOGICAL]", "X_PAD[LOGICAL]",

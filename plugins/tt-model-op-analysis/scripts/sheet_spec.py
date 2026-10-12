@@ -1,13 +1,14 @@
 """Spreadsheet layout for a run: tab order, readable headers and the formatting requests.
 
-Prints JSON with `tabs` (one entry per CSV present in the run: csv, tab title, sheetId, display
-headers, row count) and `requests` (a Google Sheets batchUpdate list that renames the first tab to
-Summary, adds the other tabs and formats every tab: wrapped top-aligned cells, fixed column widths,
-bold frozen header row). Merge outputs (`changes_<table>.csv`) become `Changes: <tab>` tabs. `kernel_ops.csv` is listed in
-`summary_tables` with its headers, to be written into the Summary tab.
+Prints JSON with `info` and `summary` (sheetId and title of the first two tabs), `tabs` (one entry
+per CSV present in the run: csv, tab title, sheetId, display headers, row count) and `requests` (a
+Google Sheets batchUpdate list that renames the first tab to Info, adds Summary as the second tab,
+adds the CSV tabs after it and formats every tab: wrapped top-aligned cells, fixed column widths,
+bold frozen header row). Merge outputs (`changes_<table>.csv`) become `Changes: <tab>` tabs.
+`kernel_ops.csv` is listed in `summary_tables` with its headers, to be written into the Summary tab.
 
 For an existing spreadsheet, delete every tab but the first and clear it, then pass that tab's id
-as --summary-sheet-id and a --first-sheet-id above every id the spreadsheet has used.
+as --info-sheet-id and a --first-sheet-id above every id the spreadsheet has used.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import SHEET_TABS, TARGET_LABELS, column_width, display_header, read_csv, read_header  # noqa: E402
 
 HEADER_GREY = {"red": 0.9, "green": 0.9, "blue": 0.9}
+INFO_WIDTHS = (260, 900)
 SUMMARY_WIDTHS = (300, 700, 90, 90, 90, 90)
 
 
@@ -39,11 +41,15 @@ def _width(sheet_id: int, index: int, pixels: int) -> dict:
     }}
 
 
-def spec(run_dir: pathlib.Path, summary_id: int = 0, first_id: int = 1) -> dict:
+def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
     tabs = []
-    requests = [{"updateSheetProperties": {"properties": {"sheetId": summary_id, "title": "Summary"},
+    summary_id = first_id
+    requests = [{"updateSheetProperties": {"properties": {"sheetId": info_id, "title": "Info"},
                                            "fields": "title"}},
-                _wrap_all(summary_id)]
+                _wrap_all(info_id)]
+    requests += [_width(info_id, i, w) for i, w in enumerate(INFO_WIDTHS)]
+    requests.append({"addSheet": {"properties": {"sheetId": summary_id, "title": "Summary", "index": 1}}})
+    requests.append(_wrap_all(summary_id))
     requests += [_width(summary_id, i, w) for i, w in enumerate(SUMMARY_WIDTHS)]
     summary_tables = []
     kernel_ops = run_dir / "kernel_ops.csv"
@@ -68,13 +74,13 @@ def spec(run_dir: pathlib.Path, summary_id: int = 0, first_id: int = 1) -> dict:
         path = run_dir / f"{name}.csv"
         if not path.exists():
             continue
-        sheet_id = first_id + len(tabs)
+        sheet_id = summary_id + 1 + len(tabs)
         columns = read_header(path)
         rows = len(read_csv(path))
         tabs.append({"csv": path.name, "tab": title, "sheetId": sheet_id,
                      "headers": [display_header(c) for c in columns], "rows": rows})
         requests.append({"addSheet": {"properties": {
-            "sheetId": sheet_id, "title": title, "index": len(tabs),
+            "sheetId": sheet_id, "title": title, "index": len(tabs) + 1,
             "gridProperties": {"rowCount": rows + 50, "columnCount": len(columns), "frozenRowCount": 1},
         }}})
         requests.append(_wrap_all(sheet_id))
@@ -85,16 +91,17 @@ def spec(run_dir: pathlib.Path, summary_id: int = 0, first_id: int = 1) -> dict:
             "fields": "userEnteredFormat.textFormat.bold,userEnteredFormat.backgroundColorStyle",
         }})
         requests += [_width(sheet_id, i, column_width(c)) for i, c in enumerate(columns)]
-    return {"tabs": tabs, "summary_tables": summary_tables, "requests": requests}
+    return {"info": {"sheetId": info_id, "title": "Info"}, "summary": {"sheetId": summary_id, "title": "Summary"},
+            "tabs": tabs, "summary_tables": summary_tables, "requests": requests}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
-    parser.add_argument("--summary-sheet-id", type=int, default=0)
+    parser.add_argument("--info-sheet-id", type=int, default=0)
     parser.add_argument("--first-sheet-id", type=int, default=1)
     args = parser.parse_args()
-    print(json.dumps(spec(args.run_dir, args.summary_sheet_id, args.first_sheet_id), ensure_ascii=False, indent=1))
+    print(json.dumps(spec(args.run_dir, args.info_sheet_id, args.first_sheet_id), ensure_ascii=False, indent=1))
     return 0
 
 
