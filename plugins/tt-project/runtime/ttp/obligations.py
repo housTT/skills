@@ -23,12 +23,22 @@ open obligation with an owner past its clock (or no owner at all, past the clock
 raises one high observation keyed `obligation:<id>:<episode>` for the coordinator. It is not raised
 again on a timer while the same owners stay stalled; an owner not yet covered that stalls (say one
 attached after an earlier owner ended) opens the next episode, and once no owner is late the episode ends.
+Milestones have stable keys, absolute due times and evidence_required. The coordinator adds them on
+its obligation action; an owner records a checked milestone with `ttp obligation receipt <id>
+"<evidence>" --milestone <key>`, leaving the obligation open. A missing milestone receipt at its due
+time raises one durable high episode, even with fresh owner progress or a healthy heartbeat. Each
+open obligation also needs an owner able to advance it; an uncovered episode ends once one is unblocked
+or attached. Status and the web app show the next deadline in the project's home time zone.
+
 A mistaken or no longer wanted obligation is withdrawn with `ttp obligation drop <id> "<why>"`.
 """
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 KV = "obligations"            # kv: {"next": n, "items": {id: record}, "runs": {run id: lines filed}}
@@ -65,7 +75,8 @@ def _need(st: dict, oid: str) -> dict:
     return o
 
 
-def add(p, text: str, owners: list[int] = (), by: str = "user", now: float | None = None) -> str:
+def add(p, text: str, owners: list[int] = (), by: str = "user", now: float | None = None,
+        milestones: list[dict] = ()) -> str:
     text = " ".join(text.split())[:TEXT_MAX]
     if not text:
         raise ValueError("an obligation needs a text: what is owed")
@@ -76,9 +87,76 @@ def add(p, text: str, owners: list[int] = (), by: str = "user", now: float | Non
         st["next"] += 1
         o = st["items"][oid] = {"id": oid, "text": text, "by": by, "created": now, "owners": {},
                                 "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": []}
+        _milestones(o, milestones)
         _attach(p, o, owners, now)
         p.db.set_kv(KV, st)
     return oid
+
+
+def _due(value) -> float:
+    """An absolute epoch or ISO timestamp with an explicit offset; never an ambiguous local time."""
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                raise ValueError("missing offset")
+            value = dt.timestamp()
+        except ValueError as e:
+            raise ValueError("milestone due needs an absolute timestamp with a time zone offset") from e
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError("milestone due needs a finite positive absolute timestamp")
+    try:
+        datetime.fromtimestamp(value)
+    except (ValueError, OverflowError, OSError) as e:
+        raise ValueError("milestone due is outside the supported timestamp range") from e
+    return float(value)
+
+
+def _milestones(o: dict, milestones) -> None:
+    if not isinstance(milestones, (list, tuple)):
+        raise ValueError("milestones needs a list")
+    saved = o.setdefault("milestones", {})
+    for m in milestones:
+        if not isinstance(m, dict):
+            raise ValueError("each milestone needs key, due and evidence_required")
+        key = str(m.get("key") or "")
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", key):
+            raise ValueError("milestone key needs 1-64 letters, numbers, underscores or hyphens")
+        required = " ".join(str(m.get("evidence_required") or "").split())[:EVIDENCE_MAX]
+        if not required:
+            raise ValueError("milestone needs evidence_required")
+        due = _due(m.get("due"))
+        if key in saved:
+            if (saved[key]["due"], saved[key]["evidence_required"]) != (due, required):
+                raise ValueError(f"milestone {key} already exists with a different due time or required evidence")
+            continue
+        saved[key] = {"key": key, "due": due, "evidence_required": required, "receipt": None,
+                      "episode": 0, "raised": None}
+
+
+def add_milestones(p, oid: str, milestones: list[dict]) -> None:
+    with p.db.tx():
+        st = _load(p.db)
+        o = _need(st, oid)
+        if o["receipt"] or o.get("dropped"):
+            raise ValueError(f"obligation {oid} is closed")
+        before = set(o.get("milestones") or {})
+        _milestones(o, milestones)
+        new = set(o["milestones"]) - before
+        from .coordinator import _append_update
+        for key in sorted(new):
+            note = _milestone_note(p, oid, o["milestones"][key])
+            for tid in o["owners"]:
+                t = p.db.task(int(tid))
+                if t:
+                    p.db.update_task(int(tid), spec=t["spec"].rstrip() + "\n\n" + note + "\n")
+            def tell(note=note, key=key):
+                for tid in o["owners"]:
+                    for r in p.db.q("SELECT dir FROM runs WHERE task=? AND status='running' AND dir IS NOT NULL",
+                                    (int(tid),)):
+                        _append_update(Path(r["dir"]) / "steer.md", note, f"obligation-{oid}-milestone-{key}")
+            p.db.after_commit(tell)
+        p.db.set_kv(KV, st)
 
 
 def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> str:
@@ -99,12 +177,21 @@ def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> s
     return f"{oid} dropped; it is no longer owed"
 
 
-def _owner_note(o: dict) -> str:
+def _milestone_note(p, oid: str, m: dict) -> str:
+    from . import timefmt
+    return (f"### Obligation {oid} milestone {m['key']}\n"
+            f"Due: {timefmt.long(m['due'], p)}. Required evidence: {m['evidence_required']}.\n"
+            f"After checking it, record `ttp obligation receipt {oid} \"<evidence>\" "
+            f"--milestone {m['key']}`; this satisfies only this milestone.")
+
+
+def _owner_note(o: dict, p) -> str:
     return (f"## Obligation {o['id']} (urgent, owed to the user)\n{o['text']}\n"
             f"This task is a required owner. Record durable progress with evidence (a commit, a file, a URL) "
             f"at least every {CLOCK_S // 3600} h: `ttp obligation progress {o['id']} \"<evidence>\"`. Once "
             f"the deliverable exists and you checked it: `ttp obligation receipt {o['id']} \"<evidence>\"`. "
-            f"Running, waiting or finishing this task without a receipt leaves it owed.")
+            f"Running, waiting or finishing this task without a receipt leaves it owed."
+            + "".join("\n\n" + _milestone_note(p, o["id"], m) for m in (o.get("milestones") or {}).values()))
 
 
 def attach(p, oid: str, tids: list[int], now: float | None = None) -> list[int]:
@@ -142,9 +229,9 @@ def _attach(p, o: dict, tids, now: float) -> list[int]:
             continue
         o["owners"][str(tid)] = {"since": now, "progress": None, "evidence": []}
         if f"## Obligation {oid} " not in (t["spec"] or ""):
-            db.update_task(tid, spec=(t["spec"] or "").rstrip() + "\n\n" + _owner_note(o) + "\n")
+            db.update_task(tid, spec=(t["spec"] or "").rstrip() + "\n\n" + _owner_note(o, p) + "\n")
         new.append(tid)
-    note = _owner_note(o)
+    note = _owner_note(o, p)
 
     def tell():
         for tid in new:
@@ -154,7 +241,14 @@ def _attach(p, o: dict, tids, now: float) -> list[int]:
     return new
 
 
-def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float | None = None) -> str:
+
+def _record_progress(own: dict, evidence: str, now: float) -> None:
+    own["progress"] = max(float(own.get("progress") or 0), now)
+    own["evidence"] = (own.get("evidence") or [])[-(EVIDENCE_KEPT - 1):] + [{"at": now, "text": evidence}]
+
+
+def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float | None = None,
+           milestone: str | None = None) -> str:
     """File durable progress or a receipt. Progress counts only from a required owner, and resets only
     that owner's clock. Returns what was done, in a few words."""
     if kind not in ("progress", "receipt"):
@@ -173,11 +267,23 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         own = o["owners"].get(str(task)) if task is not None else None
         if task is not None and own is None:
             raise ValueError(f"task #{task} is not a required owner of {oid}")
+        if milestone is not None:
+            if kind != "receipt":
+                raise ValueError("a milestone requires a receipt, not general progress")
+            m = (o.get("milestones") or {}).get(milestone)
+            if not m:
+                raise ValueError(f"no milestone {milestone} on {oid}")
+            if not m["receipt"]:
+                m["receipt"] = {"at": now, "task": task, "evidence": evidence}
+                m["raised"] = None
+                if own is not None:
+                    _record_progress(own, evidence, now)
+            p.db.set_kv(KV, st)
+            return f"milestone {milestone} on {oid} has its receipt"
         if kind == "progress":
             if own is None:
                 raise ValueError("progress is recorded by an owner task, from its run")
-            own["progress"] = max(float(own.get("progress") or 0), now)
-            own["evidence"] = (own.get("evidence") or [])[-(EVIDENCE_KEPT - 1):] + [{"at": now, "text": evidence}]
+            _record_progress(own, evidence, now)
             msg = f"progress on {oid} recorded for #{task}"
         else:
             o["receipt"] = {"at": now, "task": task, "evidence": evidence}
@@ -186,10 +292,10 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
     return msg
 
 
-def append_run(run_dir: Path, oid: str, kind: str, evidence: str, task: str) -> None:
+def append_run(run_dir: Path, oid: str, kind: str, evidence: str, task: str, milestone: str | None = None) -> None:
     from .project import durable_append
     durable_append(Path(run_dir) / RUN_FILE, json.dumps({"ts": time.time(), "id": oid, "kind": kind,
-                                                          "evidence": evidence, "task": task}) + "\n")
+                                                          "evidence": evidence, "task": task, "milestone": milestone}) + "\n")
 
 
 def file_runs(p, now: float | None = None) -> list[str]:
@@ -213,7 +319,7 @@ def file_runs(p, now: float | None = None) -> list[str]:
             try:
                 rec = json.loads(line)
                 record(p, str(rec["id"]), str(rec["kind"]), str(rec.get("evidence") or ""), int(r["task"]),
-                       now=min(float(rec.get("ts") or now), now))
+                       now=min(float(rec.get("ts") or now), now), milestone=rec.get("milestone"))
             except (ValueError, KeyError, TypeError) as e:
                 out.append(f"run {r['id']}: {str(e)[:200]}")
         seen[str(r["id"])] = len(lines)
@@ -259,6 +365,89 @@ def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str])
               f"have the owner record progress or its receipt.")
 
 
+def coverage(db, o: dict, now: float, cfg: dict | None = None) -> list[int]:
+    """Owners that can advance it, using stored task and gate facts; no probes or dispatch mutations."""
+    from .coordinator import task_resources
+    from .db import deferral
+    cfg = cfg or {}
+    gates = db.kv("gates", {}) or {}
+    paused = db.paused_resources()
+    available = []
+    for tid in o["owners"]:
+        t = db.task(int(tid))
+        if not t or t["status"] not in ("queued", "running", "review", "pushing"):
+            continue
+        if t["status"] == "queued":
+            if db.kv("paused") or t.get("blocked_reason") or float(t.get("not_before") or 0) > now \
+                    or deferral(t).get("when"):
+                continue
+            if db.unmet_dependencies([t])[t["id"]]:
+                continue
+            gate = gates.get(t.get("provider") or cfg.get("core_provider") or "claude") or {}
+            if not gate.get("allow_new_work", True) or task_resources(t) & paused.keys():
+                continue
+        available.append(int(tid))
+    return available
+
+
+def _evidence(o: dict) -> str:
+    parts = []
+    for tid, own in o["owners"].items():
+        ev = max(own.get("evidence") or [], key=lambda e: e["at"], default=None)
+        parts.append(f"#{tid}: {ev['text'] if ev else 'none recorded'}")
+    return "; ".join(parts) or "no owner attached"
+
+
+def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None) -> bool:
+    if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return False
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+         (now, "daemon", kind, fp, "high", text[:4000], "queued", task))
+    return True
+
+
+def _check_deadlines_and_coverage(p, o: dict, now: float, raised: list[str]) -> bool:
+    from . import timefmt
+    changed = False
+    closed = o["receipt"] or o.get("dropped")
+    cov = o.setdefault("coverage", {"episode": 0, "raised": None})
+    if closed or coverage(p.db, o, now, p.config()):
+        if cov["raised"] is not None:
+            cov["raised"] = None
+            changed = True
+    elif cov["raised"] is None:
+        cov["episode"] += 1
+        cov["raised"] = now
+        changed = True
+        fp = f"obligation:{o['id']}:uncovered:{cov['episode']}"
+        statuses = "; ".join(f"#{tid} ({(p.db.task(int(tid)) or {}).get('status', 'gone')})"
+                             for tid in o["owners"]) or "no owner task is attached"
+        text = (f"Obligation {o['id']} is uncovered: {o['text']}\nOwners: {statuses}. "
+                f"Every owner is stuck or held. Last evidence: {_evidence(o)}. "
+                "Unblock or attach an owner that can advance the deliverable.")
+        task = int(next(iter(o["owners"]))) if o["owners"] else None
+        if _raise(p.db, now, fp, "obligation_uncovered", text, task):
+            raised.append(fp)
+    for m in (o.get("milestones") or {}).values():
+        if closed or m["receipt"]:
+            if m["raised"] is not None:
+                m["raised"] = None
+                changed = True
+        elif now >= m["due"] and m["raised"] is None:
+            m["episode"] += 1
+            m["raised"] = now
+            changed = True
+            fp = f"obligation:{o['id']}:milestone:{m['key']}:{m['episode']}"
+            text = (f"Obligation {o['id']} milestone {m['key']} is overdue: {o['text']}\n"
+                    f"Due: {timefmt.long(m['due'], p)}. Required evidence: {m['evidence_required']}.\n"
+                    f"Owners and last evidence: {_evidence(o)}. "
+                    "Get the owner moving and record the checked milestone receipt.")
+            task = int(next(iter(o["owners"]))) if o["owners"] else None
+            if _raise(p.db, now, fp, "obligation_overdue", text, task):
+                raised.append(fp)
+    return changed
+
+
 def check(p, now: float | None = None) -> list[str]:
     """Raise one keyed observation per stall (file_runs first). An episode covers the owners late when it
     was raised: none again while they stay late, a new one when an owner it does not cover runs late, and
@@ -270,6 +459,7 @@ def check(p, now: float | None = None) -> list[str]:
         st = _load(db)
         changed = False
         for o in st["items"].values():
+            changed = _check_deadlines_and_coverage(p, o, now, raised) or changed
             late = overdue(o, now)
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
@@ -301,7 +491,8 @@ def check(p, now: float | None = None) -> list[str]:
     return raised
 
 
-def lines(db, now: float | None = None) -> list[str]:
+def lines(db, now: float | None = None, where=None) -> list[str]:
+    from . import timefmt
     now = time.time() if now is None else now
     out = []
     for o in items(db):
@@ -315,5 +506,14 @@ def lines(db, now: float | None = None) -> list[str]:
                 f"#{t} {(now - _last(w)) / 3600:.1f} h"
                 + (" OVERDUE" if t in late else "") for t, w in sorted(o["owners"].items(), key=lambda kv: int(kv[0])))
             state = "owed; " + (f"owners: {owners}" if owners else "no owner attached" + (" OVERDUE" if late else ""))
+            cfg = where if isinstance(where, dict) else where.config() if where is not None else {}
+            active = coverage(db, o, now, cfg)
+            state += "; " + ("covered by " + ", ".join(f"#{t}" for t in active) if active else "uncovered")
+            pending = [m for m in (o.get("milestones") or {}).values() if not m["receipt"]]
+            if pending:
+                m = min(pending, key=lambda m: (m["due"], m["key"]))
+                state += f"; next milestone {m['key']} due {timefmt.long(m['due'], where)}"
+                if now >= m["due"]:
+                    state += " OVERDUE"
         out.append(f"{o['id']}  {o['text'][:100]}  [{state}]")
     return out

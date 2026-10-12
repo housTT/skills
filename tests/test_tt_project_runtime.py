@@ -43769,6 +43769,197 @@ def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkey
     assert coord.apply(p, [{"type": "obligation", "key": "o1"}]) != [], "an action with nothing to do is rejected"
 
 
+
+def _ob_milestone(p, tid, now):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    assert coord.apply(p, [{"type": "obligation", "text": "checked report", "owners": [tid],
+                           "milestones": [{"key": "report", "due": now + 1800,
+                                           "evidence_required": "checked docs/report.md"}]}]) == []
+    oid = ob.items(p.db)[0]["id"]
+    return oid
+
+
+def test_obligation_milestone_overdue_despite_heartbeat_and_unrelated_done(env, monkeypatch):
+    from ttp import obligations as ob
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = _ob_milestone(p, tid, now)
+    p.db.update_task(tid, status="running")
+    for i in range(15):
+        other = p.db.add_task(f"unrelated {i}", "s", kind="work", tier="light", origin="coordinator")
+        p.db.update_task(other, status="done")
+    ob.record(p, oid, "progress", "commit abc: preparatory work", tid, now=now + 1700)
+    (p.state / "heartbeat").write_text(json.dumps({"ts": now + 1900, "pid": os.getpid()}))
+    evs = check(now + 1900)
+    assert len(evs) == 1
+    e = evs[0]
+    assert e["fingerprint"] == f"obligation:{oid}:milestone:report:1"
+    assert e["task"] == tid and e["severity"] == "high"
+    assert f"#{tid}" in e["text"] and "checked docs/report.md" in e["text"] and "commit abc" in e["text"]
+    assert "high severity event" in coord.effort_triggers(p.db, p.config(), [e["id"]], None)[0]
+    check(now + 2000)
+    restarted = Daemon(p.base)
+    monkeypatch.setattr(time, "time", lambda: now + 2100)
+    restarted.check_obligations()
+    assert len(p.db.q("SELECT * FROM events WHERE kind='obligation_overdue'")) == 1
+
+
+def test_obligation_milestone_receipt_before_due_survives_run_filing(env, monkeypatch):
+    from ttp import obligations as ob
+    from ttp import cli
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = _ob_milestone(p, tid, now)
+    run_dir = p.runs / "milestone-run"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setattr(time, "time", lambda: now + 1700)
+    cli.main(["obligation", "receipt", oid, "docs/report.md checked", "--milestone", "report"])
+    assert check(now + 1900) == []
+    o = ob.get(p.db, oid)
+    assert o["milestones"]["report"]["receipt"]["at"] == now + 1700
+    assert o["receipt"] is None, "one milestone does not close the whole obligation"
+    assert o["owners"][str(tid)]["progress"] == now + 1700
+    assert check(now + 2000) == []
+
+
+@pytest.mark.parametrize("stuck", ["blocked", "failed", "done", "cancelled", "held", "paused", "waiting"])
+def test_obligation_uncovered_episode_clears_and_rearms_on_unblock(env, monkeypatch, stuck):
+    from ttp import obligations as ob
+    from ttp.daemon import Daemon
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "report", [tid], now=now)
+    p.db.update_task(tid, status=stuck)
+    check(now + 60)
+    evs = p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")
+    assert len(evs) == 1 and evs[0]["severity"] == "high" and f"#{tid}" in evs[0]["text"]
+    restarted = Daemon(p.base)
+    monkeypatch.setattr(time, "time", lambda: now + 120)
+    restarted.check_obligations()
+    assert len(p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")) == 1
+    p.db.update_task(tid, status="queued", blocked_reason=None, not_before=None)
+    check(now + 180)
+    assert ob.get(p.db, oid)["coverage"]["raised"] is None
+    p.db.update_task(tid, status=stuck)
+    check(now + 240)
+    evs = p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:uncovered:1", f"obligation:{oid}:uncovered:2"]
+
+
+@pytest.mark.parametrize("hold", ["reason", "time", "dependency", "resource", "provider", "probe"])
+def test_obligation_coverage_excludes_queued_holds_and_recovers_on_attach(env, monkeypatch, hold):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "report", [tid], now=now)
+    if hold == "reason":
+        p.db.update_task(tid, blocked_reason="held: network")
+    elif hold == "time":
+        p.db.update_task(tid, not_before=now + 3600)
+    elif hold == "dependency":
+        dep = p.db.add_task("dependency", "s", kind="work", tier="light", origin="coordinator")
+        p.db.update_task(tid, depends_on=json.dumps([dep]))
+    elif hold == "probe":
+        p.db.update_task(tid, labels=json.dumps(["start_when:false"]))
+    elif hold == "resource":
+        p.db.update_task(tid, labels=json.dumps(["resource:test-device"]))
+        p.db.set_kv("paused_resources", {"test-device": {"by": "user", "since": now}})
+    else:
+        p.db.set_kv("gates", {p.config()["core_provider"]: {"allow_new_work": False}})
+    check(now + 60)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")) == 1
+    other = p.db.add_task("available owner", "s", kind="work", tier="light", origin="coordinator", provider="other")
+    ob.attach(p, oid, [other], now=now + 70)
+    check(now + 80)
+    assert ob.get(p.db, oid)["coverage"]["raised"] is None
+
+
+def test_obligation_milestone_and_coverage_shown_in_status_and_web(env, monkeypatch):
+    from ttp import obligations as ob
+    from ttp import timefmt
+    from ttp.web import health
+    from ttp.cli import status_text
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    oid = _ob_milestone(p, tid, now)
+    line = ob.lines(p.db, now=now, where=p.config())[0]
+    due = timefmt.long(now + 1800, p)
+    assert "covered" in line and "report" in line and due in line
+    assert line in health(p, p.db, now=now)["obligations"]
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert due in status_text(p)
+    p.db.update_task(tid, status="blocked")
+    assert "uncovered" in health(p, p.db, now=now)["obligations"][0]
+
+
+def test_obligation_milestone_validation_atomic_and_receipt_scoped(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    for milestone in ({"key": "bad", "due": "tomorrow", "evidence_required": "report"},
+                      {"key": "bad", "due": float("nan"), "evidence_required": "report"},
+                      {"key": "bad", "due": now + 1800},
+                      {"key": "bad", "due": "2026-10-12T12:00:00", "evidence_required": "report"}):
+        assert coord.apply(p, [{"type": "obligation", "text": "report", "owners": [tid],
+                               "milestones": [milestone]}])
+        assert ob.items(p.db) == []
+    oid = _ob_milestone(p, tid, now)
+    assert "--milestone report" in p.db.task(tid)["spec"]
+    extra = {"key": "deploy", "due": "2026-10-12T12:00:00-07:00", "evidence_required": "running receipt"}
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "milestones": [extra]}]) == []
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "milestones": [extra]}]) == []
+    assert len(ob.get(p.db, oid)["milestones"]) == 2
+    assert p.db.task(tid)["spec"].count("--milestone deploy") == 1
+    stranger = p.db.add_task("unrelated", "s", kind="work", tier="light", origin="coordinator")
+    with pytest.raises(ValueError, match="not a required owner"):
+        ob.record(p, oid, "receipt", "unrelated evidence", stranger, milestone="report")
+    with pytest.raises(ValueError, match="no milestone"):
+        ob.record(p, oid, "receipt", "report", tid, milestone="missing")
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "milestone": "report", "evidence": "checked report"}]) == []
+    assert ob.get(p.db, oid)["milestones"]["report"]["receipt"]
+    ob.drop(p, oid, "no longer owed")
+    check(now + 3600)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('obligation_overdue','obligation_uncovered')")
+
+
+
+def test_obligation_milestone_episodes_are_independent_and_receipt_clears(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = _ob_milestone(p, tid, now)
+    ob.add_milestones(p, oid, [{"key": "deploy", "due": now + 1900, "evidence_required": "running receipt"}])
+    evs = check(now + 2000)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:milestone:report:1",
+                                              f"obligation:{oid}:milestone:deploy:1"]
+    ob.record(p, oid, "receipt", "checked report", tid, now=now + 2100, milestone="report")
+    assert ob.get(p.db, oid)["milestones"]["report"]["raised"] is None
+    assert len(check(now + 2200)) == 2
+    pending = ob.lines(p.db, now + 2200, where=p)[0]
+    assert "next milestone deploy" in pending
+    ob.record(p, oid, "receipt", "complete deliverable checked", tid, now=now + 2300)
+    assert len(check(now + 2400)) == 2
+    assert ob.get(p.db, oid)["milestones"]["deploy"]["raised"] is None
+
+
+def test_obligation_coverage_one_available_owner_prevents_episode(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("second owner", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "report", [tid, other], now=now)
+    p.db.update_task(tid, status="blocked")
+    check(now + 60)
+    assert not p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")
+    p.db.update_task(other, status="blocked")
+    check(now + 120)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='obligation_uncovered'")) == 1
+    p.db.update_task(other, status="queued")
+    check(now + 180)
+    assert ob.get(p.db, oid)["coverage"]["raised"] is None
+
+
 def _refwait_ask(p, handled=0):
     return p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)",
                   (time.time(), "out", "ask", "which way?", handled))

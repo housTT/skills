@@ -1513,17 +1513,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 from . import obligations
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
                 if not oid:
-                    oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator")
+                    oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
+                                          milestones=a.get("milestones") or [])
                     notes.append(f"obligation {oid} recorded")
                 elif str(a.get("evidence") or "").strip():
-                    notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None))
+                    notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None,
+                                                     milestone=a.get("milestone")))
                 elif str(a.get("why") or "").strip():
                     notes.append(obligations.drop(p, oid, str(a["why"]), by="coordinator"))
-                elif owners:
-                    obligations.attach(p, oid, owners)
+                elif owners or a.get("milestones"):
+                    with db.tx():
+                        if a.get("milestones"):
+                            obligations.add_milestones(p, oid, a["milestones"])
+                        if owners:
+                            obligations.attach(p, oid, owners)
                 else:
                     raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach), "
-                                     "`evidence` (receipt) or `why` (drop)")
+                                     "`milestones` (add), `evidence` (receipt, optional `milestone`) or `why` (drop)")
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")

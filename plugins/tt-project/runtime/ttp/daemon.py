@@ -3153,8 +3153,8 @@ class Daemon:
 
     def check_obligations(self) -> None:
         """Urgent user obligations (obligations.py), model-free: file the progress and receipts runs
-        recorded, then one keyed high observation per obligation whose owner went CLOCK_S without durable
-        progress; never repeated on a timer while that stall lasts."""
+        recorded, then keyed high observations for stalled owners, overdue milestones and missing owner
+        coverage; each episode survives restart and is never repeated on a timer."""
         now = time.time()
         if now - getattr(self, "_obligations_at", 0.0) < obligations.CHECK_EVERY_S:
             return
@@ -3163,7 +3163,7 @@ class Daemon:
             for line in obligations.file_runs(self.p, now):
                 log(self.p, f"obligation record refused: {line}")
             for fp in obligations.check(self.p, now):
-                log(self.p, f"obligation overdue: raised {fp}")
+                log(self.p, f"obligation: raised {fp}")
         except Exception:
             log(self.p, "obligations: check failed\n" + traceback.format_exc())
 

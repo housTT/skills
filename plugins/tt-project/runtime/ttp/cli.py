@@ -815,6 +815,7 @@ def status_text(p: Project) -> str:
         lines.append(h["health"])
     if h.get("coverage"):
         lines.append(h["coverage"])
+    lines.extend(h.get("obligations") or [])
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")
@@ -2449,6 +2450,8 @@ def cmd_obligation(a) -> None:
     """`ttp obligation add|attach|progress|receipt|drop|list`: urgent deliverables owed to the user (obligations.py).
     Inside a run, progress and receipts go to the run's file and the daemon files them for its task."""
     from . import obligations as ob
+    if a.milestone and a.action != "receipt":
+        die("--milestone is for a checked milestone receipt")
     run_dir = os.environ.get("TTP_RUN_DIR")
     if run_dir and a.action in ("progress", "receipt"):
         task = os.environ.get("TTP_TASK") or ""
@@ -2456,7 +2459,7 @@ def cmd_obligation(a) -> None:
             die(f"ttp obligation {a.action}: this run has no task (TTP_TASK)")
         if len(a.args) != 2 or not a.args[1].strip():
             die(f"usage: ttp obligation {a.action} <id> \"<evidence>\"")
-        ob.append_run(Path(run_dir), a.args[0], a.action, a.args[1], task)
+        ob.append_run(Path(run_dir), a.args[0], a.action, a.args[1], task, milestone=a.milestone)
         print(f"{a.action} on {a.args[0]} recorded for task #{task}; the daemon files it within "
               f"{ob.CHECK_EVERY_S // 60} min (only if this task owns {a.args[0]})")
         return
@@ -2481,7 +2484,7 @@ def cmd_obligation(a) -> None:
         elif a.action in ("progress", "receipt"):
             if len(a.args) != 2:
                 die(f"usage: ttp obligation {a.action} <id> \"<evidence>\" [--task <owner>]")
-            print(ob.record(p, a.args[0], a.action, a.args[1], a.task))
+            print(ob.record(p, a.args[0], a.action, a.args[1], a.task, milestone=a.milestone))
         elif a.action == "drop":
             if len(a.args) != 2:
                 die('usage: ttp obligation drop <id> "<why it is no longer owed>"')
@@ -2489,7 +2492,7 @@ def cmd_obligation(a) -> None:
         elif a.json:
             print(json.dumps(ob.items(p.db), indent=1))
         else:
-            print("\n".join(ob.lines(p.db)) or "no obligations")
+            print("\n".join(ob.lines(p.db, where=p)) or "no obligations")
     except ValueError as e:
         die(str(e))
 
@@ -4000,6 +4003,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>; "
                                            "drop: <id> <why>")
     s.add_argument("--owner", type=int, action="append", help="add: a required owner task (repeatable)")
+    s.add_argument("--milestone", help="receipt: the milestone key; leaves the obligation open")
     s.add_argument("--task", type=int, help="progress/receipt outside a run: the owner task it is for")
     s.add_argument("--project", help="the project (default: the one here)")
     s.add_argument("--json", action="store_true")
