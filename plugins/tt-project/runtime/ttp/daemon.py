@@ -973,8 +973,8 @@ class Daemon:
         coord.sync_shared_pauses(self.p)
 
     def check_pause_ends(self) -> None:
-        """Resource pauses whose end passed (pauseends): one event each for the coordinator to lift or
-        extend it; a pause without an end gets the default one. Model-free, also while paused."""
+        """Lift coordinator pauses on fenced health evidence; report other ends once. User pauses
+        only get the existing low line. Model-free, also while paused."""
         try:
             self._pause_ends.tick()
         except Exception:

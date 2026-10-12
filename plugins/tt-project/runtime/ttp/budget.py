@@ -25,6 +25,7 @@ from typing import Any
 
 from . import credits
 from . import globalcap as gcap
+from . import timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
 from .billing import PLAN_LAPSE_RUNS, billed_by_account
 from .db import DB
@@ -171,7 +172,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     paid = credits.paid_open(reading)
     if plan:
         g.regime = "windows"
-        _plan(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now, paid=paid)
+        _plan(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now, paid=paid, cfg=cfg)
         if reading and reading.get("spend_control_reached") is True:
             _raise(g, "red", f"{provider} reports its spend limit reached; new work waits until it lifts")
         at_line = [r for r in g.numbers.get("plan") or [] if r["utilization"] >= limit]
@@ -311,7 +312,7 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
 
 
 def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float,
-          paid: bool = False) -> None:
+          paid: bool = False, cfg: dict | None = None) -> None:
     """Run all `most` workers below `line`; hold back only where running work would reach it.
 
     Unused capacity is lost at each reset, so nothing spreads use evenly over a window. Running work
@@ -355,8 +356,9 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
                                  f"credits let the account go on; the dollar caps apply")
             row["allowed"] = most
         elif w.utilization >= line:
+            resume = f"resumes at {timefmt.long(w.resets_at, cfg)}" if w.resets_at else "resumes when the window resets"
             _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {line:.0f}% "
-                             f"until it resets")
+                             f"and {resume}")
             row["allowed"] = 0
         elif add is None:
             if headroom <= LINE_MARGIN_PCT:

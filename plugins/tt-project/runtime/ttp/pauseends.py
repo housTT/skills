@@ -5,7 +5,14 @@
 A resource pause (`resource_pause`, `ttp pause --resource`) must say when it ends: `until` (a time
 at most MAX_UNTIL_S ahead) and/or `end_when` (a read-only shell probe like `retry_when`: exit 0 =
 over; 1, 75 or 255 = not yet). It may also name `report_from`, another project whose report it
-waits on. A pause never ends by itself: when its time passes, its probe passes or breaks, the
+waits on. A coordinator pause of a resource with an enabled heal check gets that check's health
+end (stored as `end_when: {heal, healthy_n, clean_s}`) unless it names a probe, which replaces it:
+the daemon lifts it without a model after HEALTHY_N consecutive healthy checks over CLEAN_S
+seconds; a gap longer than the check's freshness bound (a stopped daemon, a disabled check) starts
+it over. Its `until`, if any, stays the deadline reported when it passes. Nobody writes a health end
+or tunes its thresholds: callers' `end_when` is a probe string only, and the defaults apply (an
+accepted gap). Any other pause gets the health end only when it names no end. For other ends,
+when its time passes, its probe passes or breaks, the
 daemon queues one `pause_end_due` event and the coordinator lifts the pause or extends it with a
 reason. A note from the `report_from` project re-prompts it the same way. A pause the user set is
 lifted only on their word: its end gives one low, ask-free line instead. A pause recorded without
@@ -15,37 +22,49 @@ Only the project that set a shared pause (shared.py) checks it, so one owner is 
 from __future__ import annotations
 
 import re
+import json
 import subprocess
 import time
 from typing import Any
 
-from . import ends, shared
-from .db import PAUSED_RESOURCES_KEY
+from . import ends, shared, sweep
+from .db import PAUSED_RESOURCES_KEY, SHARED_SEEN_KEY
 from .project import Project
 
 MAX_UNTIL_S = 7 * 86400
 DEFAULT_S = 7 * 86400
+HEALTHY_N, CLEAN_S = 3, 1800   # a health end's thresholds: the same for every pause
 END_FIELDS = ("until", "end_when", "report_from", "end_default")
 DUE_KEY = "pause_end_due"      # kv: {resource: end signature} whose end was reported to the coordinator
+HEALTH_KEY = "pause_health"   # kv: consecutive check results fenced to each pause's identity
+RELEASE_KEY = "pause_release"  # kv: shared pauses whose file removal began, so a crash cannot lose the receipt
 CHECK_EVERY_S = 60
 PROBE_EVERY_S = ends.PROBE_EVERY_S
 PROJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
 NEEDS_END = ("a resource pause needs an end: `until` (a delay such as 2d or an ISO time, at most 7 days "
-             "ahead) or `end_when` (a read-only shell probe that exits 0 once the pause can end)")
+             "ahead) or `end_when` (a read-only shell probe)")
 
 
-def from_action(a: dict, now: float | None = None) -> dict:
-    """The end a pause action sets: {"until": ts, "end_when": probe, "report_from": project}, only
-    those given. Raises ValueError when it has neither `until` nor `end_when`."""
+def from_action(a: dict, now: float | None = None, p: Project | None = None, by: str = "") -> dict:
+    """Validate `until`, an `end_when` shell probe and `report_from`. With `p`, a pause of a resource
+    with an enabled heal check gets its health end: a pause `by` the coordinator unless it names a
+    probe (its `until` stays the reported deadline), any other only when it names no end."""
     now = time.time() if now is None else now
     out: dict = {}
     if a.get("until"):
         out["until"] = ends.parse_expires(a["until"], now, what="until", max_s=MAX_UNTIL_S)
     probe = a.get("end_when")
-    if probe:
-        if not isinstance(probe, str) or "\n" in probe.strip() or len(probe) > ends.PROBE_CHARS:
-            raise ValueError(f"end_when must be one shell command on one line, at most {ends.PROBE_CHARS} characters")
+    if probe is not None and not isinstance(probe, str):
+        raise ValueError("end_when must be one shell command; a health end is never written by hand: a coordinator "
+                         "pause of a resource with an enabled heal check gets it unless it names a probe")
+    if probe and ("\n" in probe.strip() or len(probe) > ends.PROBE_CHARS):
+        raise ValueError(f"end_when must be one shell command on one line, at most {ends.PROBE_CHARS} characters")
+    if probe and probe.strip():
         out["end_when"] = probe.strip()
+    elif p is not None and (by == "coordinator" or not out.get("until")):
+        health = health_end(p, a.get("resource"))
+        if health:
+            out["end_when"] = health
     who = str(a.get("report_from") or "").strip()
     if who:
         if not PROJECT_RE.fullmatch(who):
@@ -56,10 +75,21 @@ def from_action(a: dict, now: float | None = None) -> dict:
     return out
 
 
+def health_end(p: Project, resource: str) -> dict | None:
+    """The health end of the first enabled heal check that covers `resource`, or None."""
+    from . import heal
+    for row, spec in heal.checks(p.db):
+        if resource and resource in (spec.get("resource"), spec.get("machine")):
+            return {"heal": row["name"], "healthy_n": HEALTHY_N, "clean_s": CLEAN_S}
+    return None
+
+
 def describe(v: dict) -> str:
     """'ends 2026-10-06T12:00Z, or when `probe` passes; waits on project x's report' (or '')."""
-    parts = ([ends.stamp(float(v["until"]))] if v.get("until") else []) \
-        + ([f"when `{v['end_when']}` passes"] if v.get("end_when") else [])
+    end = v.get("end_when")
+    when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
+            if isinstance(end, dict) else f"when `{end}` passes")
+    parts = ([ends.stamp(float(v["until"]))] if v.get("until") else []) + ([when] if end else [])
     out = "ends " + ", or ".join(parts) if parts else ""
     if v.get("end_default"):
         out += " (a default: it was set without an end)"
@@ -69,7 +99,39 @@ def describe(v: dict) -> str:
 
 
 def _sig(v: dict) -> str:
-    return f"{v.get('since')}|{v.get('until')}|{v.get('end_when')}"
+    return f"{v.get('by')}|{v.get('project')}|{v.get('generation')}|{v.get('since')}|{v.get('until')}|{v.get('end_when')}"
+
+
+def _fresh_s(check) -> float:
+    """How long a check's last result counts as current: past it, health is unknown."""
+    return max(CHECK_EVERY_S, 2 * float(check["every_s"]))
+
+
+def health_result(p: Project, name: str, rc: int, now: float, pauses: dict) -> None:
+    """Record each actual check once, against the pauses present before it started. A check that
+    fails or cannot tell resets the clean interval, as does a gap past its freshness bound since the
+    last result (no continuous evidence). No tick can replay a result after a restart."""
+    from . import heal
+    check = next((r for r, _ in heal.checks(p.db) if r["name"] == name), None)
+    with p.db.tx():
+        current = owned(p)
+        counts = {k: v for k, v in (p.db.kv(HEALTH_KEY) or {}).items() if k in current}
+        for resource, pause in pauses.items():
+            end = pause.get("end_when")
+            if not isinstance(end, dict) or end.get("heal") != name or _sig(current.get(resource, {})) != _sig(pause):
+                continue
+            sig = _sig(pause)
+            before = counts.get(resource, {})
+            if rc != 0:
+                counts.pop(resource, None)
+                continue
+            if before.get("sig") != sig or now <= before.get("last", -1) or check is None \
+                    or now - before.get("last", now) > _fresh_s(check):
+                before = {}
+            counts[resource] = {"sig": sig, "n": before.get("n", 0) + 1,
+                                "first": before.get("first", now), "last": now}
+        if counts != (p.db.kv(HEALTH_KEY) or {}):
+            p.db.set_kv(HEALTH_KEY, counts or None)
 
 
 def owned(p: Project, db=None) -> dict[str, dict]:
@@ -152,17 +214,19 @@ class PauseEnds:
     def tick(self, now: float | None = None) -> list[str]:
         """Returns the pauses whose end was reported this time."""
         now = time.time() if now is None else now
+        due = self._health_ends(now)
         verdicts = self._reap(now)
         if now - self._checked < CHECK_EVERY_S and not verdicts:
-            return []
+            return due
         self._checked = now
         migrate(self.p, now)
         db = self.p.db
         pauses = owned(self.p)
         sent = {k: v for k, v in (db.kv(DUE_KEY) or {}).items() if k in pauses}
-        due = []
         for name, v in sorted(pauses.items()):
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
+            if isinstance(probe, dict):
+                probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
             why = ""
             if v.get("until") and float(v["until"]) <= now:
                 why = f"its end time {ends.stamp(float(v['until']))} passed"
@@ -183,6 +247,136 @@ class PauseEnds:
         if due:
             self.log(f"pause end due: {', '.join(due)}")
         return due
+
+    def _health_ends(self, now: float) -> list[str]:
+        from . import heal
+        db = self.p.db
+        due = self._recover(now)
+        counts = db.kv(HEALTH_KEY) or {}
+        if not counts:
+            return due
+        checks = {r["name"]: r for r, _ in heal.checks(db)}
+        pauses = owned(self.p)
+
+        def stale(name: str, count: dict) -> bool:
+            end = (pauses.get(name) or {}).get("end_when")
+            check = checks.get(end.get("heal")) if isinstance(end, dict) else None
+            return check is None or now - count.get("last", 0) > _fresh_s(check)
+
+        if any(stale(k, c) for k, c in counts.items()):
+            # Disabled checks and old results cannot prove current health: their window starts over.
+            with db.tx():
+                saved = db.kv(HEALTH_KEY) or {}
+                kept = {k: c for k, c in saved.items() if not stale(k, c)}
+                if kept != saved:
+                    db.set_kv(HEALTH_KEY, kept or None)
+            counts = kept
+        for name, v in pauses.items():
+            end, count = v.get("end_when"), counts.get(name, {})
+            if not isinstance(end, dict) or count.get("sig") != _sig(v) \
+                    or count.get("n", 0) < end.get("healthy_n", HEALTHY_N) \
+                    or count.get("last", 0) - count.get("first", 0) < end.get("clean_s", CLEAN_S):
+                continue
+            why = (f"heal `{end['heal']}` returned {count['n']} consecutive healthy results "
+                   f"over {count['last'] - count['first']:g} s")
+            entry = None
+            with db.tx():
+                # Origin + generation (and the end itself) fence both evidence and removal.
+                cur = owned(self.p).get(name)
+                if cur is None or _sig(cur) != _sig(v) or (db.kv(HEALTH_KEY) or {}).get(name) != count:
+                    continue
+                if cur.get("by") == "user":
+                    sent = db.kv(DUE_KEY) or {}
+                    if sent.get(name) != _sig(v):
+                        _queue(db, name, cur, why, now)
+                        db.set_kv(DUE_KEY, {**sent, name: _sig(v)})
+                        due.append(name)
+                    continue
+                if cur.get("by") != "coordinator":
+                    continue
+                entry = {"sig": _sig(cur), "since": cur.get("since"), "origin": cur.get("by"),
+                         "project": cur.get("project"), "generation": cur.get("generation"), "why": why, "ts": now}
+                if not cur.get("shared"):
+                    local = db.paused_resources(shared=False)
+                    local.pop(name, None)
+                    db.set_kv(PAUSED_RESOURCES_KEY, local)
+                    self._ended(name, entry)
+            if entry is None:
+                continue
+            if cur.get("shared"):
+                def lift(w: dict | None) -> dict | None:
+                    if not (w and _sig(w) == entry["sig"] and w.get("by") == "coordinator"):
+                        return w
+                    # The receipt is durable before the file goes: a crash after it is recovered by _recover.
+                    with db.tx():
+                        db.set_kv(RELEASE_KEY, {**(db.kv(RELEASE_KEY) or {}), name: entry})
+                    return None
+                was, new = shared.update_pause(name, lift)
+                if was is None or new is not None:
+                    continue
+                with db.tx():
+                    if name not in (db.kv(RELEASE_KEY) or {}):
+                        continue
+                    self._ended(name, entry)
+            self._after(name)
+            due.append(name)
+        return due
+
+    def _ended(self, name: str, entry: dict) -> None:
+        """The receipt of one release, inside the caller's transaction: its audit event and one sweep
+        signal, its evidence and journal entry cleared, and its waiters made due."""
+        from . import coordinator as coord
+        db = self.p.db
+        journal = db.kv(RELEASE_KEY) or {}
+        if name in journal:
+            journal.pop(name)
+            db.set_kv(RELEASE_KEY, journal or None)
+        seen = db.kv(SHARED_SEEN_KEY) or {}
+        if name in seen and (seen[name] or {}).get("since") == entry.get("since"):
+            seen.pop(name)
+            db.set_kv(SHARED_SEEN_KEY, seen)
+        saved = db.kv(HEALTH_KEY) or {}
+        if saved.get(name, {}).get("sig") == entry["sig"]:
+            saved.pop(name)
+            db.set_kv(HEALTH_KEY, saved or None)
+        if name not in db.paused_resources():
+            coord._wake_pause_waiters(db, name, float(entry.get("since") or 0))
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+             (entry["ts"], "daemon", "pause_ended", "low",
+              f"Pause ended: {name}; daemon lifted it because {entry['why']}.",
+              json.dumps({"resource": name, "by": "daemon", "origin": entry.get("origin"),
+                          "project": entry.get("project"), "generation": entry.get("generation"),
+                          "why": entry["why"]}), "queued"))
+        sweep.signal(db, f"pause ended: {name}")
+
+    def _after(self, name: str) -> None:
+        from . import coordinator as coord
+        if name not in self.p.db.paused_resources():
+            coord._tell_runs(self.p.db, name, False)
+
+    def _recover(self, now: float) -> list[str]:
+        """Finish shared releases a crash cut short. A file that still holds the pause was never
+        removed: the entry goes and the pause stays. One replaced in place (same `since`) was not
+        removed by us either. Otherwise the removal happened: its receipt is written once."""
+        db, done = self.p.db, []
+        for name, entry in sorted((db.kv(RELEASE_KEY) or {}).items()):
+            w = shared.read_pause(name)
+            released = w is None or (_sig(w) != entry.get("sig") and w.get("since") != entry.get("since"))
+            with db.tx():
+                journal = db.kv(RELEASE_KEY) or {}
+                if journal.get(name) != entry:
+                    continue
+                if released:
+                    self._ended(name, entry)
+                else:
+                    journal.pop(name)
+                    db.set_kv(RELEASE_KEY, journal or None)
+            if released:
+                self._after(name)
+                done.append(name)
+        if done:
+            self.log(f"pause release recovered: {', '.join(done)}")
+        return done
 
     def _start(self, key: str, probe: str, now: float) -> None:
         self._probed[key] = now

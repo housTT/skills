@@ -8224,7 +8224,7 @@ def test_actions_schema_lists_every_action_key_apply_reads():
     from ttp import coordinator as coord
     # Keys read on an action under a name other than its schema property, each with the reason. None yet.
     read_under_another_name: dict[str, str] = {}
-    trees = {m: ast.parse((RUNTIME / "ttp" / f"{m}.py").read_text()) for m in ("coordinator", "ends")}
+    trees = {m: ast.parse((RUNTIME / "ttp" / f"{m}.py").read_text()) for m in ("coordinator", "ends", "pauseends")}
     funcs = {(m, n.name): n for m, t in trees.items() for n in t.body if isinstance(n, ast.FunctionDef)}
 
     def keys(fn: ast.FunctionDef, var: str, mod: str, seen: set) -> set[str]:
@@ -8242,7 +8242,7 @@ def test_actions_schema_lists_every_action_key_apply_reads():
             if isinstance(f, ast.Attribute) and f.attr == "get" and isinstance(f.value, ast.Name) \
                     and f.value.id == var and n.args and isinstance(n.args[0], ast.Constant):
                 out.add(n.args[0].value)
-            # Follow the action into helpers of these modules: `_start_args(a, ...)`, `ends.from_action(a)`.
+            # Follow the action into helpers of these modules: `_start_args(a, ...)`, `pauseends.from_action(a)`.
             for i, arg in enumerate(n.args):
                 if not (isinstance(arg, ast.Name) and arg.id == var):
                     continue
@@ -8254,7 +8254,8 @@ def test_actions_schema_lists_every_action_key_apply_reads():
         return out
 
     read = keys(funcs[("coordinator", "apply")], "a", "coordinator", set())
-    assert {"force", "spec", "start_after", "until_probe"} <= read  # the scan reaches apply() and its helpers
+    # The scan reaches apply() and its helpers, pauseends.from_action among them.
+    assert {"force", "spec", "start_after", "until_probe", "end_when", "report_from"} <= read
     listed = set(coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"])
     assert sorted(read - listed - set(read_under_another_name)) == []
 
@@ -47961,18 +47962,38 @@ def test_strict_schema_visits_anyof_definitions_and_refuses_free_objects():
 @pytest.mark.parametrize('preset, fields', [(None, {'check': 'true'}),
                                            ('systemd', {'unit': 'example.service'}),
                                            ('http', {'url': 'http://example.invalid'}),
-                                           ('broker', {'status_command': 'true'})])
+                                           ('broker', {'status_command': 'true'}),
+                                           ('broker', {'status_command': 'true', 'expected_count': 4,
+                                                       'max_recent_failures': 0})])
 def test_strict_heal_padding_uses_defaults_and_preset_keys(env, preset, fields):
     from ttp import coordinator as coord, heal
     p = make(env)
+    assert set(fields) <= set(coord.HEAL_SCHEMA['properties'])   # strict output sends only schema keys
     block = dict.fromkeys(coord.HEAL_SCHEMA['properties'])
     block.update(preset=preset, **fields)
     action = dict.fromkeys(coord.ACTIONS_SCHEMA['properties']['actions']['items']['properties'])
     action.update(type='schedule_set', name='probe', kind='command', heal=block)
     assert coord.apply(p, [action]) == []
     stored = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")['payload'])['heal']
-    assert all(v is not None for v in stored.values())
+    assert all(v is not None for v in stored.values()) and {k: stored[k] for k in fields} == fields
     assert heal.validate(stored)['timeout_s'] == heal.DEFAULTS['timeout_s']
+
+
+def test_heal_field_types_are_what_validate_takes():
+    """heal.py types each key once for the coordinator's wire schema: a value of every declared type
+    passes validate() for its preset, and no key has two types."""
+    from ttp import heal
+    sample = {'string': 'x', 'integer': 2, 'number': 1.5, 'boolean': True}
+    fixed = {'escalate': 'coordinator', 'condition': 'down', 'url': 'http://example.invalid'}
+    seen = {}
+    for preset, fields in [(None, {}), *heal.PRESET_FIELDS.items()]:
+        for k, t in [*heal.COMMON_FIELDS.items(), *fields.items()]:
+            assert seen.setdefault(k, t) == t, k
+        typed = {**heal.COMMON_FIELDS, **fields}
+        block = {k: fixed.get(k, [sample[t['items']['type']]] if t['type'] == 'array' else sample[t['type']])
+                 for k, t in typed.items() if k != 'preset'}
+        out = heal.validate({**block, **({'preset': preset} if preset else {})})
+        assert all(out[k] == v for k, v in block.items()), preset
 
 
 @pytest.mark.parametrize('action', [ {'type': 'noop', 'clear_fields': ['heal']},
@@ -48732,6 +48753,526 @@ def test_after_push_deploy_recovered_daemon_returns_to_owned_pending(env, tmp_pa
     assert not pages
     deploy.tick(again, page, due + 1)
     assert len(pages) == 1 and 'missed takeover' in pages[0][1]
+
+
+# Health evidence ends coordinator pauses, fenced against a changed pause.
+HEALTH_END = {"heal": "svc", "healthy_n": 3, "clean_s": 1800}   # the end health_end() gives check `svc`
+
+
+def _health_pause(env, *, shared=False, by="coordinator", every_s=900, end=None):
+    from ttp import coordinator as coord
+    p, d, up = _heal_setup(env, resource="board")
+    p.db.x("UPDATE schedules SET every_s=? WHERE name='svc'", (every_s,))   # results stay fresh 2 * every_s
+    up.touch()
+    if shared:
+        p.set_config("shared_resources", ["board"])
+    if by == "user":
+        coord.pause_resource(p, "board", True, by="user", end={"end_when": dict(HEALTH_END)})
+    else:   # the coordinator's pause of a heal-checked resource gets the health end by itself
+        assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, **(end or {})}]) == []
+    return p, d, up
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_health_pause_lifts_once_and_wakes_waiters_and_sweep(env, shared):
+    from ttp import heal, sweep
+    p, d, _ = _health_pause(env, shared=shared)
+    now = time.time()
+    tid = p.db.add_task("use board", "s", labels=["resource:board"])
+    p.db.update_task(tid, status="queued", not_before=now + 9000,
+                     result=json.dumps({"status": "waiting", "waiting_for": "board",
+                                        "retry_when": "ttp lock --probe board"}))
+    for dt in (0, 900):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+        assert "board" in p.db.paused_resources()
+    heal.run(d, "svc", _heal_spec(p), now + 1800)
+    d.check_pause_ends()
+    d.check_pause_ends()
+    assert "board" not in p.db.paused_resources()
+    assert p.db.task(tid)["not_before"] is None
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+    events = p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+    assert len(events) == 1 and events[0]["source"] == "daemon"
+    assert "svc" in events[0]["text"] and "3" in events[0]["text"]
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")
+
+
+@pytest.mark.parametrize("rc", [1, 75, 255])
+def test_health_pause_failure_or_unknown_resets_clean_window(env, monkeypatch, rc):
+    from ttp import heal
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    verdict = [0]
+    monkeypatch.setattr(heal, "check", lambda *a: (verdict[0], "result"))
+    for dt, code in [(0, 0), (900, 0), (1200, rc), (1800, 0), (2700, 0), (3600, 0)]:
+        verdict[0] = code
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+        assert ("board" in p.db.paused_resources()) == (dt < 3600)
+
+
+def test_health_pause_restart_keeps_count_and_ticks_do_not_replay_results(env):
+    from ttp import heal
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env)
+    assert p.db.paused_resources()["board"]["end_when"] == HEALTH_END
+    now = time.time()
+    heal.run(d, "svc", _heal_spec(p), now)
+    for _ in range(4):
+        d.check_pause_ends()
+    assert "board" in p.db.paused_resources()
+    heal.run(d, "svc", _heal_spec(p), now + 900)
+    restarted = Daemon(p.base)
+    heal.run(restarted, "svc", _heal_spec(p), now + 1800)
+    restarted.check_pause_ends()
+    assert "board" not in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("replacement", ["coordinator", "user"])
+def test_health_pause_changed_after_evidence_is_not_lifted(env, replacement):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env)
+    before = p.db.paused_resources()["board"]["generation"]
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    coord.pause_resource(p, "board", True, reason="new cause", by=replacement,
+                         end={"end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    assert p.db.paused_resources()["board"]["generation"] != before
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources() and not p.db.kv(sweep.SIGNAL_KEY)
+
+
+def test_health_pause_user_end_only_reports_once_and_never_lifts(env):
+    from ttp import heal, sweep
+    p, d, _ = _health_pause(env, by="user")
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+    assert p.db.paused_resources()["board"]["by"] == "user"
+    assert not p.db.kv(sweep.SIGNAL_KEY)
+    (event,) = p.db.q("SELECT * FROM events WHERE kind='observation'")
+    assert event["severity"] == "low" and "Only the user lifts it" in event["text"]
+
+
+def test_plan_red_reason_and_held_task_show_home_reset_clock(env):
+    from ttp import budget as bud, failover, timefmt
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    now = time.time()
+    reset = now + 3600
+    g = bud.evaluate(p.db, p.config(), "claude", [bud.Window("claude", "five_hour", 95, reset)], now)
+    expected = f"resumes at {timefmt.long(reset, p)}"
+    assert g.level == "red" and expected in "; ".join(g.reasons)
+    assert expected in failover.stop(g.as_dict(), None, False, now)[0]
+
+
+@pytest.mark.parametrize("field,value", [("expected_count", 4), ("max_recent_failures", 0)])
+def test_broker_heal_checks_optional_count_and_recent_failures(env, monkeypatch, field, value):
+    from ttp import heal
+    spec = heal.validate({"preset": "broker", "status_command": "status", field: value})
+    data = {"held": False, "auto_power_cycle": True, "auto_reboot": True,
+            "count": 4, "recent_failures": 0}
+    monkeypatch.setattr(heal, "_shell", lambda *args: (0, json.dumps(data)))
+    assert heal.check(spec, {}, ".")[0] == 0
+    data["count" if field == "expected_count" else "recent_failures"] = 3 if field == "expected_count" else 1
+    assert heal.check(spec, {}, ".")[0] == 1
+    data.pop("count" if field == "expected_count" else "recent_failures")
+    assert heal.check(spec, {}, ".")[0] == 75
+
+
+def test_health_pause_check_started_before_replacement_cannot_count(env, monkeypatch):
+    from ttp import coordinator as coord, heal, pauseends
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    original = heal.check
+    def replace_during_check(*args):
+        coord.pause_resource(p, "board", True, by="coordinator", reason="changed during check",
+                             end={"end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 0}})
+        return 0, "healthy old generation"
+    monkeypatch.setattr(heal, "check", replace_during_check)
+    heal.run(d, "svc", _heal_spec(p), now)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    monkeypatch.setattr(heal, "check", original)
+    for dt in (900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("change", ["shared_pause", "health_failure"])
+def test_health_pause_compare_and_swap_rechecks_pause_and_evidence(env, monkeypatch, change):
+    from ttp import coordinator as coord, heal, pauseends, shared, sweep
+    p, d, _ = _health_pause(env, shared=change == "shared_pause")
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    if change == "shared_pause":
+        update = shared.update_pause
+        def race(name, fn):
+            update(name, lambda w: {**w, "by": "user", "generation": "replacement"})
+            return update(name, fn)
+        monkeypatch.setattr(shared, "update_pause", race)
+    else:
+        owned = pauseends.owned
+        calls = [0]
+        def race(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 2:
+                p.db.set_kv(pauseends.HEALTH_KEY, None)
+            return owned(*args, **kwargs)
+        monkeypatch.setattr(pauseends, "owned", race)
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources() and not p.db.kv(sweep.SIGNAL_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+
+
+@pytest.mark.parametrize("stale", [True, False])
+def test_health_pause_old_or_disabled_check_cannot_lift(env, stale):
+    from ttp import heal
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    if not stale:
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now + 3700 if stale else now + 1800)   # past the 1800 s freshness bound
+    assert "board" in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("end", [dict(HEALTH_END), {"heal": "svc"}, {"heal": "svc", "healthy_n": 1, "clean_s": 0},
+                                 {}, ["true"], 1])
+def test_resource_pause_end_when_is_only_a_probe(env, end):
+    # Nobody writes or tunes a health end: an object (or other non-string) end is refused, never applied.
+    from ttp import coordinator as coord, pauseends
+    p, d, _ = _health_pause(env)
+    coord.pause_resource(p, "board", False)
+    problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
+                                "end_when": end}])
+    assert problems and "one shell command" in problems[0], problems
+    assert "board" not in p.db.paused_resources()
+    with pytest.raises(ValueError, match="one shell command"):
+        pauseends.from_action({"until": "1d", "end_when": end})
+
+
+@pytest.mark.parametrize("given", [True, False])
+def test_resource_pause_end_fields_ride_the_strict_wire_schema(env, given):
+    # A strict provider sends only the keys the wire schema lists and pads the rest with null: the
+    # coordinator's probe and report_from must reach apply(), and their padding must read as absent.
+    from ttp import coordinator as coord
+    from ttp.providers.base import strict_schema
+    p = make(env)
+    wire = strict_schema(coord.ACTIONS_SCHEMA)
+    item = wire["properties"]["actions"]["items"]
+    assert item["additionalProperties"] is False
+    assert all(item["properties"][k]["type"] == ["string", "null"] for k in ("end_when", "report_from"))
+    action = dict.fromkeys(item["properties"])
+    action.update(type="resource_pause", resource="board", paused=True, until="1d",
+                  **({"end_when": "test -e done", "report_from": "other"} if given else {}))
+    try:
+        import jsonschema
+    except ImportError:
+        jsonschema = None
+    if jsonschema:
+        jsonschema.validate({"actions": [action], "summary": None}, wire)
+    assert coord.apply(p, [action]) == []
+    held = p.db.paused_resources()["board"]
+    assert (held.get("end_when"), held.get("report_from")) == (("test -e done", "other") if given else (None, None))
+    assert 86400 - 60 < held["until"] - time.time() <= 86400
+
+
+@pytest.mark.parametrize("probe", [None, "false"])
+def test_coordinator_pause_with_until_still_ends_on_health(env, probe):
+    # `until` is the deadline the coordinator is told about, not a reason to drop the health end; a
+    # probe of another cause replaces it.
+    from ttp import heal
+    p, d, _ = _health_pause(env, end={"until": "1d", **({"end_when": probe} if probe else {})})
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "coordinator" and held["end_when"] == (probe or HEALTH_END)
+    assert 86400 - 60 < held["until"] - time.time() <= 86400
+    now = time.time()
+    try:
+        for dt in (0, 900, 1800):
+            heal.run(d, "svc", _heal_spec(p), now + dt)
+            d._pause_ends.tick(now + dt)
+    finally:
+        d._pause_ends.stop()
+    assert ("board" in p.db.paused_resources()) == bool(probe)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == (0 if probe else 1)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")
+
+
+@pytest.mark.parametrize("how", ["chat", "repause"])
+def test_users_pause_with_until_reports_once_and_is_never_lifted(env, how):
+    # Only the coordinator's own pause gets the health end beside its `until`. The user's (asked in
+    # chat, or already theirs when the coordinator re-pauses it) reports its deadline once and stays.
+    from ttp import coordinator as coord, heal, pauseends
+    p, d, _ = _health_pause(env, by="user" if how == "repause" else "coordinator")
+    action = {"type": "resource_pause", "resource": "board", "paused": True, "until": "1d"}
+    if how == "chat":
+        msg = p.db.post("in", "Pause board until I say so.")
+        assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
+    else:
+        assert coord.apply(p, [action]) == []
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "user" and "end_when" not in held
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due','observation')")
+    for dt in (86400 + 60, 86400 + 120):
+        d._pause_ends.tick(now + dt)
+    (event,) = p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due','observation')")
+    assert event["kind"] == "observation" and "Only the user lifts it" in event["text"]
+    assert p.db.paused_resources()["board"]["by"] == "user"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("until", [True, False])
+def test_health_pause_users_chat_pause_is_theirs_and_never_lifted(env, shared, until):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env, shared=shared)
+    # The user's words replace the coordinator's own health pause, with an end given or defaulted:
+    # only the defaulted one gets the health end, and that only reports.
+    msg = p.db.post("in", "Pause board until I explicitly allow it again.")
+    end = {"until": "1d"} if until else {}
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "reason": "the user asked", **end}], user_turn=True, messages=[msg]) == []
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "user" and held.get("end_when") == (None if until else HEALTH_END)
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert p.db.paused_resources()["board"]["by"] == "user" and not p.db.kv(sweep.SIGNAL_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due')")
+    assert len(p.db.q("SELECT * FROM events WHERE kind='observation'")) == (0 if until else 1)
+
+
+@pytest.mark.parametrize("words,context,flag,users", [
+    ("Pause board until I explicitly allow it again.", None, False, True),
+    ("Take it offline for now, please.", None, True, True),   # the coordinator marks the user's own ask
+    ("How is the build going?", None, False, False),           # unrelated words
+    ("How is the build going?", "They said to pause board.", False, False),   # a relayer's context only
+])
+def test_resource_pause_origin_follows_the_users_own_words(env, words, context, flag, users):
+    from ttp import coordinator as coord
+    p, d, _ = _health_pause(env)
+    coord.pause_resource(p, "board", False)
+    msg = p.db.post("in", words)
+    if context:
+        p.db.x("UPDATE messages SET context=? WHERE id=?", (context, msg))
+    action = {"type": "resource_pause", "resource": "board", "paused": True, **({"user_asked": True} if flag else {})}
+    assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
+    assert p.db.paused_resources()["board"]["by"] == ("user" if users else "coordinator")
+    # Without a user message in the turn, neither the words nor the flag make it theirs.
+    coord.pause_resource(p, "board", False)
+    assert coord.apply(p, [{**action, "user_asked": True}]) == []
+    assert p.db.paused_resources()["board"]["by"] == "coordinator"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("until", [True, False])
+@pytest.mark.parametrize("words", ["Pause box until I say so.", "Please stop using box for now."])
+def test_users_chat_pause_naming_the_host_is_theirs_and_never_lifted(env, shared, until, words):
+    from ttp import coordinator as coord, heal
+    # Users name the host (`box`), not the resource (`box-device`); the pause must still be theirs.
+    p, d, up = _heal_setup(env, resource="box-device")
+    up.touch()
+    if shared:
+        p.set_config("shared_resources", ["box-device"])
+    msg = p.db.post("in", words)
+    end = {"until": "1d"} if until else {}
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "box-device", "paused": True,
+                            "reason": "the user asked", **end}], user_turn=True, messages=[msg]) == []
+    assert p.db.paused_resources()["box-device"]["by"] == "user"
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert p.db.paused_resources()["box-device"]["by"] == "user"
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+
+
+@pytest.mark.parametrize("flag,users", [(None, True), (False, False), (True, True)])
+def test_resource_pause_in_a_turn_asking_to_pause_fails_safe_to_the_user(env, flag, users):
+    from ttp import coordinator as coord
+    p, d, _ = _health_pause(env)
+    coord.pause_resource(p, "board", False)
+    msg = p.db.post("in", "Pause the other box please.")
+    action = {"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
+              **({} if flag is None else {"user_asked": flag})}
+    assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
+    # Unflagged, words that ask to pause make it theirs; only an explicit `user_asked: false` keeps it ours.
+    assert p.db.paused_resources()["board"]["by"] == ("user" if users else "coordinator")
+
+
+@pytest.mark.parametrize("gap,lifts", [(600, True), (900, False)])
+def test_health_pause_gap_past_freshness_restarts_the_window(env, gap, lifts):
+    from ttp import heal
+    p, d, _ = _health_pause(env, every_s=300)   # results stay fresh 600 s
+    now = time.time()
+    times = [0, 300] + [300 + gap + 300 * k for k in range(5)]
+    for t in times:
+        heal.run(d, "svc", _heal_spec(p), now + t)
+        d._pause_ends.tick(now + t)
+    # 1800 s of clean results exist only if the gap did not break them.
+    assert ("board" not in p.db.paused_resources()) == lifts
+
+
+def test_health_pause_stale_gap_resets_with_or_without_a_tick(env):
+    from ttp import heal, pauseends
+    for tick in (True, False):
+        p, d, _ = _health_pause(env, every_s=300)
+        now = time.time()
+        for dt in (0, 300):
+            heal.run(d, "svc", _heal_spec(p), now + dt)
+        if tick:   # the daemon saw the gap: the stale window is dropped
+            d._pause_ends.tick(now + 3600)
+            assert not p.db.kv(pauseends.HEALTH_KEY)
+        heal.run(d, "svc", _heal_spec(p), now + 3600)   # after downtime: one fresh result only
+        d._pause_ends.tick(now + 3600)
+        assert "board" in p.db.paused_resources()
+        assert p.db.kv(pauseends.HEALTH_KEY)["board"]["n"] == 1
+        p.db.x("DELETE FROM kv")
+
+
+def test_health_pause_disabled_then_reenabled_check_starts_over(env):
+    from ttp import heal, pauseends
+    p, d, _ = _health_pause(env, every_s=300)
+    now = time.time()
+    for dt in (0, 300, 600):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now + 700)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    p.db.x("UPDATE schedules SET enabled=1 WHERE name='svc'")
+    for dt in (900, 1200, 1500, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert "board" in p.db.paused_resources() and p.db.kv(pauseends.HEALTH_KEY)["board"]["n"] == 4
+
+
+@pytest.mark.parametrize("by", ["coordinator", "user"])
+@pytest.mark.parametrize("evidence", ["none", "stale", "disabled"])
+def test_health_pause_until_is_reported_once_without_health(env, by, evidence):
+    from ttp import coordinator as coord, heal
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    coord.pause_resource(p, "board", True, by=by,
+                         end={"until": now + 60, "end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    if evidence == "stale":
+        heal.run(d, "svc", _heal_spec(p), now - 7200)
+    elif evidence == "disabled":
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_end_due','observation')")
+    d._pause_ends.tick(now + 120)
+    Daemon(p.base)._pause_ends.tick(now + 240)   # a restart does not report it again
+    kind = "pause_end_due" if by == "coordinator" else "observation"
+    (event,) = p.db.q("SELECT * FROM events WHERE kind IN ('pause_end_due','observation')")
+    assert event["kind"] == kind and "end time" in event["text"]
+    assert p.db.paused_resources()["board"]["by"] == by   # a deadline never lifts it by itself
+
+
+def test_health_pause_until_then_health_release_each_once(env):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    coord.pause_resource(p, "board", True, by="coordinator",
+                         end={"until": now + 60, "end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt + 120)
+    assert "board" not in p.db.paused_resources()
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")) == 1
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == 1
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+
+
+def _released_once(p):
+    from ttp import pauseends, sweep
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == 1
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+    assert not p.db.kv(pauseends.RELEASE_KEY)
+
+
+@pytest.mark.parametrize("cut", ["before_removal", "after_removal", "after_commit"])
+def test_health_pause_shared_release_survives_interruption(env, monkeypatch, cut):
+    from ttp import heal, pauseends, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    signal, update = sweep.signal, shared.update_pause
+    if cut == "before_removal":   # the receipt is saved, then the file write is cut off
+        def cut_short(name, fn):
+            fn(shared.read_pause(name))
+            raise RuntimeError("interrupted before removal")
+        monkeypatch.setattr(shared, "update_pause", cut_short)
+    elif cut == "after_removal":   # the file is gone, the database commit is cut off
+        monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    if cut == "after_commit":
+        d._pause_ends.tick(now + 1800)
+    else:
+        with pytest.raises(RuntimeError):
+            d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(sweep, "signal", signal)
+    monkeypatch.setattr(shared, "update_pause", update)
+    assert (shared.read_pause("board") is None) == (cut != "before_removal")
+    for _ in range(2):   # recovery runs once, however often the restarted daemon ticks
+        restarted = Daemon(p.base)
+        restarted.sync_shared_pauses()
+        restarted._pause_ends.tick(now + 1800)
+    assert shared.read_pause("board") is None
+    _released_once(p)
+
+
+def test_health_pause_shared_recovery_keeps_a_replacement_users_pause(env, monkeypatch):
+    from ttp import coordinator as coord, heal, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    signal = sweep.signal
+    monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    with pytest.raises(RuntimeError):
+        d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(sweep, "signal", signal)
+    coord.pause_resource(p, "board", True, reason="mine now", by="user", end={"until": now + 86400})
+    restarted = Daemon(p.base)
+    restarted._pause_ends.tick(now + 1800)
+    restarted._pause_ends.tick(now + 1900)
+    assert shared.read_pause("board")["by"] == "user"
+    _released_once(p)
+
+
+def test_health_pause_shared_replaced_in_place_before_removal_is_not_a_release(env, monkeypatch):
+    from ttp import coordinator as coord, heal, pauseends, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    update = shared.update_pause
+    def cut_short(name, fn):
+        fn(shared.read_pause(name))
+        raise RuntimeError("interrupted before removal")
+    monkeypatch.setattr(shared, "update_pause", cut_short)
+    with pytest.raises(RuntimeError):
+        d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(shared, "update_pause", update)
+    coord.pause_resource(p, "board", True, reason="still mine", by="user", end={"until": now + 86400})
+    Daemon(p.base)._pause_ends.tick(now + 1800)
+    assert shared.read_pause("board")["by"] == "user" and not p.db.kv(pauseends.RELEASE_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'") and not p.db.kv(sweep.SIGNAL_KEY)
 
 
 # ---- budget kind changes (budgetkind.py) -------------------------------------------------------

@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,16 +57,11 @@ ASK_CLASSES = ("irreversible", "restriction_change", "neither")
 ASK_REFUSED_KIND = "ask_refused"   # events: an ask the gate refused, counted in the unblocking metrics
 ASK_FLAGGED_KIND = "ask_flagged"   # events: an ask the gate sent but flagged as likely the coordinator's own call
 
-# Superset of the heal validator's common and preset fields. Strict null padding is
-# removed before validation, so unrelated preset keys never become unknown keys.
-HEAL_SCHEMA = {"type": ["object", "null"], "properties": {
-    **{k: {"type": "string"} for k in ("check", "preset", "fix", "resource", "machine", "condition",
-                                      "known_fault", "escalate", "unit", "host", "url", "status_command", "hold_field")},
-    **{k: {"type": "number"} for k in heal.DEFAULTS},
-    **{k: {"type": "boolean"} for k in ("outage", "user")},
-    "expect": {"type": "array", "items": {"type": "integer"}},
-    "auto_fields": {"type": "array", "items": {"type": "string"}},
-}}
+# Every common and preset key the heal validator takes, typed by heal.py (a copy, so the wire schema
+# never shares its dicts). Strict null padding is removed before validation, so unrelated preset keys
+# never become unknown keys.
+HEAL_SCHEMA = {"type": ["object", "null"], "properties": json.loads(json.dumps({
+    **heal.COMMON_FIELDS, **{k: t for fields in heal.PRESET_FIELDS.values() for k, t in fields.items()}}))}
 
 ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -91,11 +87,13 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
+            "user_asked": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
+            "end_when": {"type": "string"}, "report_from": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
-            "escalate_after_h": {"type": "number"}, "end_when": {"type": "string"}, "below": {"type": "string"}, "why": {"type": "string"},
+            "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
@@ -1564,8 +1562,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # A pause the user set is lifted on their word only, never by text from outside.
                     raise ValueError(f"{name} was paused by the user; lift it only in the turn that carries "
                                      f"their go-ahead")
+                # The user's own request makes it their pause before any default end is chosen:
+                # a health end then only reports, it never lifts it.
+                by = "user" if a["paused"] and _users_pause(db, a, user_turn, messages) else "coordinator"
+                # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
+                owner = "user" if "user" in (by, (held or {}).get("by")) else by
                 pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
-                               by="coordinator", key=key, end=pauseends.from_action(a) if a["paused"] else None)
+                               by=by, key=key, end=pauseends.from_action(a, p=p, by=owner) if a["paused"] else None)
             elif t == "observation_mute":
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                          a.get("why") or a.get("reason") or a.get("text") or "",
@@ -2238,6 +2241,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
         was = was or {}
         kept = end if end is not None else {k: was[k] for k in pauseends.END_FIELDS if k in was}
         return {**kept, "reason": reason or was.get("reason", ""), "since": was.get("since") or time.time(),
+                "generation": uuid.uuid4().hex,
                 # The coordinator may lift only a pause the user had no part in.
                 "by": "user" if "user" in (by, was.get("by")) else by,
                 **({"project": p.name} if is_shared else {})}
@@ -2306,6 +2310,7 @@ def sync_shared_pauses(p: Project, db=None) -> None:
                     local = db.paused_resources(shared=False)
                     was = local.get(name) or {}
                     local[name] = {**{k: still[k] for k in pauseends.END_FIELDS if k in still},
+                                   "generation": still.get("generation"),
                                    "reason": still.get("reason") or was.get("reason", ""),
                                    "since": was.get("since") or still.get("since") or time.time(),
                                    "by": "user" if "user" in (still.get("by"), was.get("by"))
@@ -3279,6 +3284,24 @@ def _users_own(db, messages: list[int]) -> list[int]:
     rows = db.q(f"SELECT id, provenance FROM messages WHERE id IN ({','.join('?' * len(messages))}) "
                 f"AND direction='in' AND kind='user'", list(messages))
     return [r["id"] for r in rows if (r["provenance"] or "") != "system"]
+
+
+_PAUSE_ASK_RE = re.compile(r"\b(?:paus\w*|hold\w*|halt\w*|stop\w*|freez\w*|block\w*|off[- ]limits|"
+                           r"(?:do not|don'?t|never) (?:use|touch|run)|stay off|keep off|leave\b.*\balone)", re.I)
+
+
+def _users_pause(db, a: dict, user_turn: bool, messages: list[int] | None) -> bool:
+    """Whether a resource_pause is the user's own request. Only a turn with their own message counts
+    (a relayer's context and messages outside the turn never do). There the action's `user_asked`
+    decides; unset, it fails safe: words that ask to pause or stop anything make it theirs, as users
+    often name a host rather than the resource (`box` for `box-device`)."""
+    ids = _users_own(db, messages or []) if user_turn else []
+    words = [relay.split(m["text"], m["context"])[0] for m in relay.recent(db, ids)] if ids else []
+    if not any(words):
+        return False
+    if isinstance(a.get("user_asked"), bool):
+        return a["user_asked"]
+    return any(_PAUSE_ASK_RE.search(w) for w in words if w)
 
 
 def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,

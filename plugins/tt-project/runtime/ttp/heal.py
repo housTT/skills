@@ -55,7 +55,9 @@ Presets fill in `check` (and a default `fix`) from config, so no host or unit is
   (any 2xx/3xx by default). No default fix.
 - `{"preset": "broker", "status_command": "...", "hold_field": "held", "auto_fields": [...]}`: the
   command prints JSON; unhealthy while `hold_field` is true or any of `auto_fields` (automatic
-  recovery: power cycle, reboot) is false. No default fix.
+  recovery: power cycle, reboot) is false. Optional `expected_count` requires JSON `count` to match;
+  `max_recent_failures` bounds JSON `recent_failures`. Missing or invalid fields are unknown.
+  No default fix.
 
 Shared machines: a check that watches one of the user's machines (`machine: "<alias>"`, or a
 `resource` naming a known alias on an `outage` or broker check) reports what it sees to the machine
@@ -105,14 +107,21 @@ ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
-_COMMON = {"check", "fix", "resource", "machine", "condition", "preset", "outage", "known_fault", "escalate",
-           *DEFAULTS}
-ESCALATE = ("user", "coordinator")   # who hears of a check its self-fix task could not repair
-PRESETS: dict[str, set[str]] = {
-    "systemd": {"unit", "user", "host"},
-    "http": {"url", "expect"},
-    "broker": {"status_command", "hold_field", "auto_fields"},
+# Every key a block takes, with its JSON type. validate() accepts exactly these keys, and the coordinator's
+# structured-output schema (coordinator.HEAL_SCHEMA) is built from these types, so a new key reaches both.
+_TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}
+COMMON_FIELDS: dict[str, dict] = {
+    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "known_fault", "escalate"), _TEXT),
+    "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
+PRESET_FIELDS: dict[str, dict[str, dict]] = {
+    "systemd": {"unit": _TEXT, "user": _FLAG, "host": _TEXT},
+    "http": {"url": _TEXT, "expect": {"type": "array", "items": {"type": "integer"}}},
+    "broker": {"status_command": _TEXT, "hold_field": _TEXT, "auto_fields": {"type": "array", "items": _TEXT},
+               "expected_count": _COUNT, "max_recent_failures": _COUNT},
 }
+_COMMON = set(COMMON_FIELDS)
+ESCALATE = ("user", "coordinator")   # who hears of a check its self-fix task could not repair
+PRESETS: dict[str, set[str]] = {name: set(fields) for name, fields in PRESET_FIELDS.items()}
 BROKER_HOLD = "held"
 BROKER_AUTO = ("auto_power_cycle", "auto_reboot")
 LEDGER_CONDITIONS = ("down", "held")   # machine_ledger.CONDITIONS
@@ -166,6 +175,9 @@ def validate(block: Any, where: str = "heal") -> dict:
         auto = out.get("auto_fields")
         if auto is not None and not (isinstance(auto, list) and all(isinstance(f, str) for f in auto)):
             raise ValueError(f"{where}: `auto_fields` is a list of field names")
+        for k in ("expected_count", "max_recent_failures"):
+            if k in out and (isinstance(out[k], bool) or not isinstance(out[k], int) or out[k] < 0):
+                raise ValueError(f"{where}: `{k}` is an integer, 0 or more")
     elif not str(out.get("check") or "").strip():
         raise ValueError(f"{where} needs `check` (a shell probe: 0 healthy, 1 unhealthy, 75/255 unknown) "
                          f"or a `preset`")
@@ -284,6 +296,14 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
             missing.append(f)
         elif not v:
             problems.append(f"{f} is off")
+    for option, field in (("expected_count", "count"), ("max_recent_failures", "recent_failures")):
+        if option not in spec:
+            continue
+        value = _field(data, field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            missing.append(field)
+        elif (value != spec[option] if option == "expected_count" else value > spec[option]):
+            problems.append(f"{field} is {value} ({option} {spec[option]})")
     if problems:
         return 1, "; ".join(problems)
     if missing:
@@ -457,7 +477,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
         # A restart cut the fix short: its recheck still waits for settle_s.
         return "unhealthy (fix interrupted; rechecking)", float(st["fix_started"]) + spec["settle_s"]
+    from . import pauseends
+    pauses = pauseends.owned(p)
     rc, out = check(spec, st, cwd, env)
+    pauseends.health_result(p, name, rc, now, pauses)
     ping = getattr(host, "_progress", None)
     if callable(ping):
         ping()
