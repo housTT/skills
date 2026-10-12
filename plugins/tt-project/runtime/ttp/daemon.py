@@ -5272,6 +5272,12 @@ class Daemon:
                         self._underuse_event(t, entry, now, s)
                     if st.get("under") and "pulled" not in entry and self._pull_check(t["id"], st["why"], now, s):
                         entry["pulled"] = st["under"]
+        # A stretch that ended (use recovered, or the job ended) before its pulled-in check: that check
+        # follows the probe as usual instead of waking a worker.
+        still = {e["task"] for e in new.values() if e.get("pulled")}
+        for tid in {e.get("task") for k, e in old.items() if e.get("pulled") and not (new.get(k) or {}).get("pulled")}:
+            if tid and tid not in still:
+                self._unpull_check(tid)
         if new or old:
             db.set_kv(jobuse.KV, new)
 
@@ -5300,6 +5306,16 @@ class Daemon:
             db.update_task(tid, not_before=nb, result=dump_result({**prev, "underuse_wake": why[:300]}))
         log(self.p, f"task {tid} next check pulled in to {timefmt.short(nb, self.p)}: its job under-uses its request")
         return True
+
+    def _unpull_check(self, tid: int) -> None:
+        db = self.p.db
+        with db.tx():
+            prev = load_result((db.task(tid) or {}).get("result"))
+            if "underuse_wake" not in prev:
+                return
+            prev.pop("underuse_wake")
+            db.update_task(tid, result=dump_result(prev))
+        log(self.p, f"task {tid} job use recovered before its pulled-in check: that check follows its probe")
 
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
         """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""

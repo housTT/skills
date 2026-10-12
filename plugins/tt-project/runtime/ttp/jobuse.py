@@ -3,8 +3,10 @@
 """Whether a detached job (`ttp detach`) uses what it asked for.
 
 `ttp detach` records the job's request in detached.json: cores (`--cores`, else read from the command:
--j N, --jobs N, --threads N, --workers N, OMP_NUM_THREADS), devices (`--devices`) and memory
-(`--mem-gb`, recorded only). A task holding a device lock (`device.locks`) asks for the device too.
+-j N, --jobs N, --threads N, --workers N, and OMP_NUM_THREADS or MAKEFLAGS only where the command sets
+them or the value differs from the daemon's own environment; nothing for a command that hands its
+work to another host over ssh), devices (`--devices`) and memory (`--mem-gb`, recorded only). A task
+holding a device lock (`device.locks`) asks for the device too.
 
 The daemon samples each running job of a live task, model-free, every `sample_s`: the CPU time of
 the job's own process tree (its wrapper's pid in <name>.started and that pid's descendants; Linux
@@ -29,7 +31,11 @@ KV = "job_use"
 DEFAULTS = {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800}
 MIN_CORES = 2   # a single-core request is never judged: an idle wait on one core is no waste
 
-_CORES = [re.compile(r"(?:^|\s)-j\s*(\d+)\b"), re.compile(r"--(?:jobs|threads|workers|parallel)[= ](\d+)\b")]
+_CORES = [re.compile(r"(?:^|\s)-j\s*(\d+)\b"), re.compile(r"--(?:jobs|threads|workers|parallel)[= ](\d+)\b"),
+          # set by the command itself: `VAR=N cmd`, `env VAR=N ...`, `export VAR=N` inside `sh -c`
+          re.compile(r"(?:^|[\s;&|(])OMP_NUM_THREADS=['\"]?(\d+)"),
+          re.compile(r"(?:^|[\s;&|(])MAKEFLAGS=['\"]?[^'\";&|]*?-j\s*(\d+)")]
+_REMOTE = re.compile(r"(?:^|[\s;&|(/])ssh\s")   # the work runs on another host: its cores are not ours
 
 
 def settings(cfg: dict) -> dict:
@@ -37,19 +43,35 @@ def settings(cfg: dict) -> dict:
     return {k: float(got.get(k, v)) for k, v in DEFAULTS.items()}
 
 
+def _env_cores(env: dict) -> list[int]:
+    found = [int(env["OMP_NUM_THREADS"])] if str(env.get("OMP_NUM_THREADS") or "").isdigit() else []
+    mk = re.search(r"-j\s*(\d+)", str(env.get("MAKEFLAGS") or ""))
+    return found + ([int(mk.group(1))] if mk else [])
+
+
+def daemon_env(pidfile: Path) -> dict | None:
+    """The project daemon's own environment (Linux /proc), which every worker and job inherits; None
+    when it cannot be read."""
+    try:
+        raw = Path(f"/proc/{int(Path(pidfile).read_text().strip())}/environ").read_bytes()
+    except (OSError, ValueError):
+        return None
+    return dict(x.split("=", 1) for x in raw.decode(errors="replace").split("\0") if "=" in x)
+
+
 def requested(cmd: list, env: dict, cores: int | None = None, devices: int | None = None,
-              mem_gb: float | None = None) -> dict:
-    """What a job asks for: explicit values win; cores are else read from its command or environment."""
+              mem_gb: float | None = None, base: dict | None = None) -> dict:
+    """What a job asks for: explicit values win; cores are else read from what its command states.
+    The environment (OMP_NUM_THREADS, MAKEFLAGS) counts only where it differs from `base`, the daemon's
+    environment every job inherits: an ambient default is no request. A command that runs its work
+    on another host (ssh) asks for no cores here."""
     if cores is None:
         text = " ".join(map(str, cmd))
-        found = [int(m) for rx in _CORES for m in rx.findall(text)]
-        for var in ("OMP_NUM_THREADS",):
-            if str(env.get(var) or "").isdigit():
-                found.append(int(env[var]))
-        mk = re.search(r"-j\s*(\d+)", str(env.get("MAKEFLAGS") or ""))
-        if mk:
-            found.append(int(mk.group(1)))
-        cores = max(found) if found else None
+        if not _REMOTE.search(text + " "):
+            found = [int(m) for rx in _CORES for m in rx.findall(text)]
+            if base is not None:
+                found += [n for n in _env_cores(env) if n not in _env_cores(base)]
+            cores = max(found) if found else None
     out = {}
     if cores:
         out["cores"] = int(cores)

@@ -48804,11 +48804,31 @@ def test_a_detached_jobs_request_is_read_from_its_flags_command_and_environment(
     from ttp import jobuse
     assert jobuse.requested(["make", "-j8", "all"], {}) == {"cores": 8}
     assert jobuse.requested(["sh", "-c", "build --threads 4 && run --jobs=6"], {}) == {"cores": 6}
-    assert jobuse.requested(["python", "x.py"], {"OMP_NUM_THREADS": "12"}) == {"cores": 12}
-    assert jobuse.requested(["make"], {"MAKEFLAGS": "-j 3"}) == {"cores": 3}
     assert jobuse.requested(["make", "-j8"], {}, cores=2, devices=1, mem_gb=16) == \
         {"cores": 2, "devices": 1, "mem_gb": 16.0}
     assert jobuse.requested(["sleep", "60"], {}) == {}
+    # Set by the command itself, or differing from the daemon's environment: a request.
+    assert jobuse.requested(["OMP_NUM_THREADS=8", "python", "x.py"], {}) == {"cores": 8}
+    assert jobuse.requested(["env", "OMP_NUM_THREADS=8", "python", "x.py"], {}) == {"cores": 8}
+    assert jobuse.requested(["sh", "-c", "export OMP_NUM_THREADS=8; python x.py"], {}) == {"cores": 8}
+    assert jobuse.requested(["sh", "-c", "MAKEFLAGS='-k -j 6' make"], {}) == {"cores": 6}
+    assert jobuse.requested(["python", "x.py"], {}, cores=8) == {"cores": 8}
+    assert jobuse.requested(["python", "x.py"], {"OMP_NUM_THREADS": "12"}, base={}) == {"cores": 12}
+    assert jobuse.requested(["make"], {"MAKEFLAGS": "-j 3"}, base={"MAKEFLAGS": "-j16"}) == {"cores": 3}
+
+
+def test_an_inherited_environment_or_a_remote_command_asks_for_no_cores():
+    """OMP_NUM_THREADS / MAKEFLAGS every job inherits from the daemon describe the host, not the job;
+    -j inside an ssh command runs on another host."""
+    from ttp import jobuse
+    host = {"OMP_NUM_THREADS": "16", "MAKEFLAGS": "-j16"}
+    assert jobuse.requested(["python", "wait.py"], host) == {}, "unknown daemon env: the environment is ignored"
+    assert jobuse.requested(["python", "wait.py"], host, base=dict(host)) == {}
+    assert jobuse.requested(["make"], {"MAKEFLAGS": "-j16"}, base={"MAKEFLAGS": "-j16"}) == {}
+    assert jobuse.requested(["ssh", "h", "make", "-j64"], {}) == {}
+    assert jobuse.requested(["/usr/bin/ssh", "h", "OMP_NUM_THREADS=8", "run"], {}) == {}
+    assert jobuse.requested(["sh", "-c", "sleep 5; ssh h 'make -j64'"], {}) == {}
+    assert jobuse.requested(["bash", "-lc", "rsync x h: && ssh -t h make --jobs 32"], {}) == {}
 
 
 def _feed(jobuse, req, cores_used, minutes, start=0.0, st=None, dev=None):
@@ -48984,6 +49004,60 @@ def test_the_daemon_leaves_a_job_using_its_request_alone(env, monkeypatch):
     assert p.db.kv(jobuse.KV) == {}
 
 
+def test_a_stretch_that_ends_before_its_pulled_in_check_wakes_no_worker(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        now = time.time()
+        cpu = {"v": 100.0}
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": cpu["v"], "start": "S", "dev": None})
+        p.db.set_kv(jobuse.KV, {str(rc): {"task": tid, "name": "build", "req": {"cores": 8},
+                                          "st": {"ring": [[now - 960, 0.0], [now - 60, 95.0]], "start": "S",
+                                                 "since": now - 960}}})
+        d = dmod.Daemon(p.base)
+        d.sample_jobs()
+        assert json.loads(p.db.task(tid)["result"])["underuse_wake"]
+        # Use recovers: 8 cores for the whole window ends the stretch before the check comes.
+        st = p.db.kv(jobuse.KV)[str(rc)]["st"]
+        st["ring"] = [[now - 960, 0.0], [now - 60, 900.0 * 8]]
+        p.db.set_kv(jobuse.KV, {**p.db.kv(jobuse.KV), str(rc): {**p.db.kv(jobuse.KV)[str(rc)], "st": st}})
+        cpu["v"] = 960.0 * 8
+        d._jobs_sampled = 0
+        d.sample_jobs()
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        assert not entry["st"].get("under") and "pulled" not in entry
+        assert "underuse_wake" not in json.loads(p.db.task(tid)["result"])
+        # The pulled-in check then follows the probe: "not yet" puts the task back to sleep.
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        assert not _ready(p, tid)
+    finally:
+        lock.close()
+
+
+def test_the_daemon_raises_nothing_for_a_job_that_inherited_omp_num_threads(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("drive", "s", kind="work", tier="light", origin="user")
+    host = {"OMP_NUM_THREADS": "16", "MAKEFLAGS": "-j16"}
+    req = jobuse.requested(["python", "wait.py"], host, base=dict(host))
+    assert req == {}
+    rc, lock = _job_of_waiting_task(p, tid, req)
+    try:
+        now = time.time()
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 1.0, "start": "S", "dev": None})
+        p.db.set_kv(jobuse.KV, {str(rc): {"st": {"ring": [[now - 960, 0.0]], "start": "S", "since": now - 960}}})
+        before = p.db.task(tid)["not_before"]
+        dmod.Daemon(p.base).sample_jobs()
+        assert not p.db.q("SELECT * FROM events WHERE kind='job_underuse'")
+        assert p.db.task(tid)["not_before"] == before
+        assert "underuse_wake" not in json.loads(p.db.task(tid)["result"])
+    finally:
+        lock.close()
+
+
 def test_ttp_detach_records_what_the_job_asked_for(env, tmp_path):
     p = make(env)
     run_dir = tmp_path / "runs" / "7"
@@ -48994,5 +49068,15 @@ def test_ttp_detach_records_what_the_job_asked_for(env, tmp_path):
     assert r.returncode == 0, r.stderr
     job = json.loads((run_dir / "detached.json").read_text())[0]
     assert job["requested"] == {"cores": 8, "mem_gb": 4.0}
+    if job["pid"]:
+        os.killpg(job["pid"], signal.SIGKILL)
+    # An inherited OMP_NUM_THREADS / MAKEFLAGS with a plain command is no request.
+    r = subprocess.run([sys.executable, str(TTP), "detach", "wait", "--", "sleep", "30"],
+                       env={**os.environ, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(p.base),
+                            "OMP_NUM_THREADS": "16", "MAKEFLAGS": "-j16"},
+                       cwd=str(p.root), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    job = json.loads((run_dir / "detached.json").read_text())[1]
+    assert job["requested"] == {}
     if job["pid"]:
         os.killpg(job["pid"], signal.SIGKILL)

@@ -2150,7 +2150,9 @@ def cmd_detach(a) -> None:
     jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
                  "requested": jobuse.requested(cmd, os.environ, getattr(a, "cores", None),
-                                               getattr(a, "devices", None), getattr(a, "mem_gb", None))})
+                                               getattr(a, "devices", None), getattr(a, "mem_gb", None),
+                                               jobuse.daemon_env(rd.parent.parent / "daemon.pid")
+                                               if rd.parent.name == "runs" else None)})
     durable_write(reg, json.dumps(jobs, indent=1))
     how = (f"(pid {pid})" if pid else
            "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
