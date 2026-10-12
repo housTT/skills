@@ -18,7 +18,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from opa_schema import SHEET_TABS, column_width, display_header, read_csv, read_header  # noqa: E402
+from opa_schema import SHEET_TABS, TARGET_LABELS, column_width, display_header, read_csv, read_header  # noqa: E402
 
 HEADER_GREY = {"red": 0.9, "green": 0.9, "blue": 0.9}
 SUMMARY_WIDTHS = (300, 700, 90, 90, 90, 90)
@@ -53,7 +53,17 @@ def spec(run_dir: pathlib.Path, summary_id: int = 0, first_id: int = 1) -> dict:
                                "headers": [display_header(c) for c in columns],
                                "rows": len(read_csv(kernel_ops))})
     # The kernel-op table is part of the Summary tab, not a tab of its own.
-    sources = [(n, t) for n, t in SHEET_TABS if n != "kernel_ops"] + [(f"changes_{name}", f"Changes: {title}") for name, title in SHEET_TABS]
+    sources = []
+    for name, title in SHEET_TABS:
+        if name == "kernel_ops":
+            continue
+        if name == "kernel_test_results":
+            for path in sorted(run_dir.glob("kernel_test_results_*.csv")):
+                target = path.stem.removeprefix("kernel_test_results_")
+                sources.append((path.stem, f"Kernel tests ({TARGET_LABELS.get(target, target)})"))
+            continue
+        sources.append((name, title))
+    sources += [(f"changes_{name}", f"Changes: {title}") for name, title in SHEET_TABS]
     for name, title in sources:
         path = run_dir / f"{name}.csv"
         if not path.exists():

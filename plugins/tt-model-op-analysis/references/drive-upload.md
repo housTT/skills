@@ -5,13 +5,12 @@ Otherwise say the CSVs are in `<run dir>` and stop.
 
 1. Ask for the Drive folder (link or name). Create a subfolder named after the model if the user
    wants one.
-2. New run: create one spreadsheet named
-   `<Model> kernel op analysis (<source> to <destination>)`, with `, measured` appended when a
-   measured phase ran.
-   Overwrite or merge with an existing `drive_url`: reuse that spreadsheet. Delete every tab but
-   the first and clear the first, then in step 3 pass `--summary-sheet-id <first tab id>
-   --first-sheet-id <highest id the spreadsheet has used + 1>`. A merge run's
-   `changes_<table>.csv` files become `Changes: <tab>` tabs.
+2. One spreadsheet per run. Without a `drive_url` in `run.json`, create one named
+   `<Model> kernel op analysis (<impl-slug> on <source>, <sha7>)`. With a `drive_url` (a
+   destination or measurement was added since the last upload), reuse that spreadsheet: delete
+   every tab but the first and clear the first, then in step 3 pass `--summary-sheet-id <first tab
+   id> --first-sheet-id <highest id the spreadsheet has used + 1>`. `changes_<table>.csv` files
+   from `compare_runs.py` become `Changes: <tab>` tabs.
 3. Run `python3 <plugin-root>/scripts/sheet_spec.py <run dir>`. Send its `requests` in one batch
    update: it renames the first tab to `Summary`, adds one tab per CSV in a fixed order with a
    readable title, wraps and top-aligns every cell, sets the column widths and freezes and bolds

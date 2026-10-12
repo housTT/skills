@@ -5,22 +5,19 @@ from __future__ import annotations
 import csv
 import pathlib
 
-# A static run compares exactly one source target (where the analysed code is expected to work)
-# with one destination target (where it would be ported). Each target answers one question.
+# A run analyses one source implementation on one profile and, optionally, projects its kernel ops
+# onto destinations. A destination is a profile running the same code, or `quasar-bf16`: the code
+# with block-float dtypes turned into bfloat16 and mainline calls routed to Quasar forks.
+PROFILES = ("p100", "p150", "n150", "n300", "quasar")
 TARGET_LABELS = {
-    "p100": "P100",
-    "p150": "P150",
-    "quasar": "Quasar, code unchanged",
-    "quasar-port": "Quasar, existing port",
+    "p100": "P100", "p150": "P150", "n150": "N150", "n300": "N300 (one chip)", "quasar": "Quasar",
     "quasar-bf16": "Quasar, BF16 projection",
 }
 TARGETS = tuple(TARGET_LABELS)
-SOURCE_TARGETS = ("p100", "p150")
-# Launch counts are traced only where the analysed code itself dispatches.
-LAUNCH_TARGETS = ("p100", "p150")
-# Profile whose grid and descriptor values each target uses.
-TARGET_PROFILE = {"p100": "p100", "p150": "p150", "quasar": "quasar", "quasar-port": "quasar",
-                  "quasar-bf16": "quasar"}
+SOURCE_TARGETS = PROFILES
+# Destinations whose launches are traced: profiles that run the same code with their own grid.
+LAUNCH_PROFILES = ("p100", "p150", "n150", "n300")
+TARGET_PROFILE = {t: t for t in PROFILES} | {"quasar-bf16": "quasar"}
 
 STATUS_VALUES = ("✅", "⚠️", "❌", "n/a")
 CONFIDENCE_VALUES = ("verified", "unverified")
@@ -28,7 +25,7 @@ ALWAYS = "always"
 ORIGIN_VALUES = ("static", "measured", "static+measured")
 NOT_TRACED = "not traced"
 # Targets whose status is decided per kernel op from Quasar tests (references/target-status.md).
-TEST_TARGETS = ("quasar", "quasar-port", "quasar-bf16")
+TEST_TARGETS = ("quasar", "quasar-bf16")
 TEST_RESULT_VALUES = ("pass", "fail", "hang", "error", "xfail", "skip", "not run")
 
 OP_TABLE_BASE = (
@@ -42,27 +39,35 @@ HOST_OP_VALUES = ("yes", "no")
 MATCH_KEY = ("stage", "ttnn_api", "device_op", "program_factory")
 
 
-def target_columns(target: str) -> list[str]:
-    columns = []
-    if target in LAUNCH_TARGETS:
-        columns += [f"{target}:shapes", f"{target}:launches"]
-    if target == "quasar-port":
-        columns.append(f"{target}:port_op")
+def run_targets(run: dict) -> tuple[str, list[str]]:
+    return run["source"], list(run.get("destinations", []))
+
+
+def has_launches(target: str, is_source: bool) -> bool:
+    return is_source or target in LAUNCH_PROFILES
+
+
+def target_columns(target: str, is_source: bool) -> list[str]:
+    columns = [f"{target}:shapes", f"{target}:launches"] if has_launches(target, is_source) else []
     if target in TEST_TARGETS:
         columns += [f"{target}:tests", f"{target}:test_result"]
     return columns + [f"{target}:status", f"{target}:evidence"]
 
 
-def op_table_columns(source: str, destination: str) -> list[str]:
-    return list(OP_TABLE_BASE) + target_columns(source) + target_columns(destination)
+def op_table_columns(source: str, destinations: list[str]) -> list[str]:
+    columns = list(OP_TABLE_BASE) + target_columns(source, True)
+    for destination in destinations:
+        columns += target_columns(destination, False)
+    return columns
 
 
-def kernel_ops_columns(source: str, destination: str) -> list[str]:
+def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
     columns = ["id", "device_op", "program_factory", "op_code", "origin", "op_table_ids",
-               "static_launches", "static_launches_op_code", "measured_launches_op_code",
-               f"{destination}:statuses"]
-    if destination in TEST_TARGETS:
-        columns += [f"{destination}:tests", f"{destination}:test_results"]
+               "static_launches", "static_launches_op_code", "measured_launches_op_code"]
+    for target in [source, *destinations]:
+        columns.append(f"{target}:statuses")
+        if target in TEST_TARGETS:
+            columns += [f"{target}:tests", f"{target}:test_results"]
     return columns
 
 
@@ -85,14 +90,14 @@ FIELD_LABELS = {
     "measured_launches_op_code": "Measured launches (op code)", "host_work": "Host work", "counts_as_host_op": "Counts as host op",
 }
 TARGET_FIELD_LABELS = {
-    "shapes": "shapes and dtypes", "launches": "launches per inference", "port_op": "op used by the port",
+    "shapes": "shapes and dtypes", "launches": "launches per inference",
     "status": "status", "evidence": "evidence and gap", "tests": "kernel-op tests", "test_result": "TTsim result",
     "statuses": "statuses (rows)", "test_results": "TTsim results",
 }
 FIELD_WIDTHS = {
     "id": 40, "stage": 120, "origin": 110, "tests": 300, "test_result": 90, "ttnn_api": 180, "op_code": 200, "device_op": 200, "program_factory": 260,
     "call_site": 220, "launch_condition": 180, "confidence": 100, "dispatch_evidence": 320,
-    "grid_dependency": 220, "shapes": 260, "launches": 90, "port_op": 240, "status": 80, "evidence": 360,
+    "grid_dependency": 220, "shapes": 260, "launches": 90, "status": 80, "evidence": 360,
     "ops": 220, "notes": 300, "blocker": 260, "required_change": 300, "host_work": 260, "reason": 320,
     "profile": 70, "repeats": 70, "launches_per_repeat": 90,
 }

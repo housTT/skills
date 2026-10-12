@@ -1,6 +1,7 @@
 # CSV schemas
 
-`<t>` is a target from `targets.md`: the run's `source` and `destination` from `run.json`.
+`<t>` is a target from `targets.md`: the run's `source` and each of its `destinations` from
+`run.json`.
 
 All CSVs are UTF-8 with a BOM (`utf-8-sig`) so Excel and Numbers show the status emoji;
 write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`. Column order is
@@ -11,7 +12,7 @@ write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`
 | Column | Content |
 |---|---|
 | `id` | 1..N in row order |
-| `stage` | model region |
+| `stage` | `<block> <module> <role>` from the model's structure, not from op names: `stem fold`, `layer1 m1 conv1`, `layer3 m2-m6 conv2`, `head fc`. The first word is one of `run.json` `stage_blocks` (the model's top-level blocks); at least two words. Variants inside one role (halo, move, conv of one conv layer) share the stage and differ by `device_op`. Measured-only rows use `measured only <op code>` |
 | `origin` | `static` (traced from source only), `measured` (seen only in the source Tracy run; `call_site` and `grid_dependency` are `not traced`) or `static+measured` |
 | `ttnn_api` | the Python-facing call |
 | `op_code` | Tracy OP CODE, e.g. `MatmulDeviceOperation`; empty only when unknown |
@@ -23,15 +24,15 @@ write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`
 | `dispatch_evidence` | file and function that select the device op and factory, and every runtime-dependent alternative |
 | `grid_dependency` | the hardcoded grid, shard spec or program config this op depends on, with its value and `<file>:<line>` (`8x4 CoreGrid, <model>.py:<line>`); `automatic` when derived from the device grid; `none` when the op uses no core grid (interleaved DRAM) |
 
-Then, for the source and then the destination target, the columns from `opa_schema.target_columns`:
+Then, for the source and then each destination in `run.json` order, the columns from
+`opa_schema.target_columns`:
 
 | Column | Targets | Content |
 |---|---|---|
-| `<t>:shapes` | p100, p150 | input and output shapes, dtype, layout and sharding on that profile |
-| `<t>:launches` | p100, p150 | launches per inference on that profile |
-| `<t>:port_op` | quasar-port | the op the port uses for this function |
-| `<t>:tests` | quasar, quasar-port, quasar-bf16 | pytest node ids of the destination kernel-op tests that decide the status, `; `-separated |
-| `<t>:test_result` | quasar, quasar-port, quasar-bf16 | `not run` until the measured destination phase; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
+| `<t>:shapes` | the source; p100, p150, n150, n300 as destinations | input and output shapes, dtype, layout and sharding on that profile; `not traced` on a destination for a measured-only row |
+| `<t>:launches` | as `<t>:shapes` | launches per inference on that profile; empty on a destination for a measured-only row |
+| `<t>:tests` | quasar, quasar-bf16 | pytest node ids of the Quasar kernel-op tests that decide the status, `; `-separated |
+| `<t>:test_result` | quasar, quasar-bf16 | `not run` until `kernel_tests.py` runs them; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
 | `<t>:status` | all | `✅`, `⚠️`, `❌`, `n/a`, defined per target in `target-status.md` |
 | `<t>:evidence` | all | evidence for this target's status only |
 
@@ -46,15 +47,16 @@ every target status match; otherwise use stable substage names so
 ## call_trace.csv (static, execution order)
 
 `id`, `profile`, `stage`, `ops` (device ops in order), `repeats`, `launches_per_repeat`, `notes`.
-`profile` is each run target that has launches (p100, p150). For each, the sum of
+`profile` is each run target that has launches: the source and every p100, p150, n150 or n300
+destination. For each, the sum of
 `repeats * launches_per_repeat` must equal the sum of `<t>:launches` in `op_table.csv`.
 
 ## port_blockers.csv (static)
 
 `id`, `blocker`, `affected_ids` (comma-separated `op_table.csv` ids, or `all`), `evidence` (the
 check at the pinned SHA), `required_change` (what the port must change). Lists what stops the
-source code from running on the destination: unsupported dtypes, kernel generations, grids larger
-than the destination grid. Empty (header only) when nothing blocks.
+source code from running on a destination: unsupported dtypes, kernel generations, grids larger
+than a destination grid. Name the destination in `blocker` when a run has more than one. Empty (header only) when nothing blocks.
 
 ## host_ops.csv (static)
 
@@ -74,7 +76,7 @@ they launch no device kernel.
 `id`, `op_code`, `op_type`, `attributes`, `inputs`, `outputs`, `core_count`, `device_kernel_ns`,
 `host_ns`.
 
-Written by `tracy_report.py` in the measured source phase; `merge_measured.py` reads it.
+Written by `tracy_report.py` for the `source:tracy` item; `merge_measured.py` reads it.
 
 ## kernel_ops.csv (one row per kernel op)
 
@@ -82,16 +84,21 @@ Written by `tracy_report.py` in the measured source phase; `merge_measured.py` r
 kernel op), `static_launches` (traced launches of these rows), `static_launches_op_code` and
 `measured_launches_op_code` (all launches of this op code, traced and measured; Tracy reports op
 codes, not factories, so the measured count is per op code and repeats on every kernel op that
-shares it), `<destination>:statuses` (count of each status over its rows), and for Quasar
-destinations `<destination>:tests` and `<destination>:test_results`. Written by `kernel_ops.py`;
+shares it), then per target (source, then destinations) `<t>:statuses` (count of each status over
+its rows), and for Quasar targets `<t>:tests` and `<t>:test_results`. Written by `kernel_ops.py`;
 the Summary starts with this table.
 
-## kernel_test_results.csv (measured destination phase)
+## kernel_tests_plan_<target>.csv and kernel_test_results_<target>.csv (TTsim)
 
-`id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `hang`, `error`, `xfail`, `skip`),
-`duration_s`, `log` (path of the pytest log), `environment` (`run.json` or the `--env-json` file
-the node ran under). Written by `kernel_tests.py run`, one row per node id of
-`kernel_tests_plan.csv` that has run; batches add to it.
+One pair per Quasar target. The plan, written by `kernel_tests.py plan`: `id`, `node_id`,
+`op_table_ids`, `row_statuses` (`;`-separated statuses of the rows citing the node, used to select
+`<target>:kernel-tests <status>` items), `kind` (`entry` for a Quasar source's entry test, otherwise
+`kernel`).
+
+The results: `id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `hang`, `error`, `xfail`,
+`skip`), `duration_s`, `log` (path of the pytest log), `environment` (`run.json` or the
+`--env-json` file the node ran under). Written by `kernel_tests.py run`, one row per plan node that
+has run; batches add to it. `measurements.py` derives item states and estimates from it.
 
 ## host_fallback.csv
 

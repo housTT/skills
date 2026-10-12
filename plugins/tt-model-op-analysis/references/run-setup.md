@@ -20,35 +20,33 @@ whole configuration in one message.
 
 ### Setup order
 
-1. Ask for the mode: **static**, **static + measured**, or **measured over an existing static
-   run**.
-2. Ask which model to analyse. Do no model-specific discovery before the answer.
-3. Existing run (measured over an existing static run): ask for the output root, list the runs
-   under `<root>/op-analysis/<model>/static/` with their `source`, `destination`,
-   `tt_metal_commit` and date, and ask which one to extend. A run whose `run.json` has `targets`
-   instead of `source` and `destination` predates this layout and cannot be extended; say so and
-   offer a new run. Its commit, targets and entry test are fixed; go to step 10.
-4. New run: ask which source ref to pin. A suggested ref is allowed, but it is not confirmation.
-   Resolve it before any discovery so every path, skip marker and CI claim comes from the pinned
-   SHA.
-5. Ask for the source target (`p100` or `p150`): where the code is expected to work today.
-6. Ask for the destination target: any other target from `<plugin-root>/references/targets.md`.
-   Offer `quasar-port` only when the model directory has a Quasar port at the pinned SHA (a
-   directory listing, not a source read). Neither target has a default; show each option's
-   one-line question from targets.md. Targets are fixed before implementation or test candidates
-   are presented.
-7. Discover implementations compatible with the source target and show the table from section 1.
+1. Ask which model to analyse. Do no model-specific discovery before the answer. Then ask for the
+   output root (or state the configured one) and list the model's runs with
+   `python3 <plugin-root>/scripts/runs.py list <root> <model>`: implementation, source profile,
+   commit and date, static state, destinations and pending measurement items. Ask: continue one of
+   them, or start a new run. A run in an older format (a `run.json` with `targets` or a single
+   `destination`, plugin 0.3.0 or earlier) cannot be extended; say so and offer a new run.
+2. Preconditions, before any question that depends on them: probe a local device of each source
+   architecture the user may pick (`probe_device.py` through `tt-device-mcp`) and TTsim readiness
+   for Quasar (`ttsim.md`). Show what is available; measurement items without their hardware stay
+   pending.
+3. New run, ref: ask which ref to pin. Recommend the local checkout's HEAD when a matching device
+   or TTsim is available and the user is likely to measure (measurements must run on the run's
+   commit, and a checkout at HEAD needs no switch or rebuild); otherwise recommend a freshly
+   fetched `origin/main`. Say which and why. Resolve the ref before any discovery so every path,
+   skip marker and CI claim comes from the pinned SHA.
+4. Ask for the source profile from `<plugin-root>/references/targets.md`: where the implementation
+   runs today. Show each option's one-line question.
+5. Discover implementations compatible with the source profile and show the table from section 1.
    Ask which implementation to analyse.
-8. Rank only the whole-model test candidates for that implementation and the source target.
-   Recommend the best candidate with a concrete reason, then ask which test to use. The measured
-   source phase reruns this same test.
-9. Ask for the output root, explain it cannot be inside the tt-metal checkout.
-10. Measured modes: ask which measured phases to run (source device, destination TTsim) and check
-    their preconditions now: a local device of the source architecture (probe through
-    `tt-device-mcp`), a checkout at the run's commit (`same_commit.py` for an existing run; for a
-    new run compare the pinned SHA with `git rev-parse HEAD` of the checkout and a clean
-    `git status`), and for a Quasar destination a ready TTsim build (`ttsim.md`). Report what is missing before any analysis
-    starts and let the user drop a phase or stop.
+6. Rank only the whole-model test candidates for that implementation and source. Recommend the
+   best candidate with a concrete reason, then ask which test to use. Measurements rerun this same
+   test.
+7. If a run with this identity (model, implementation, entry test, source, commit) already exists,
+   say so and continue it; never trace it again.
+
+Destinations are asked after static analysis (static-phase.md, "Adding a destination"), never
+during setup.
 
 Do not inspect model source, create output or delegate tracing until the applicable setup is
 complete. Candidate discovery may inspect directory structure, tests, skip markers and CI workflow
@@ -61,7 +59,7 @@ Ask which model. In the tt-metal checkout, find:
 - every model directory (`git ls-tree -r --name-only <sha> models/ | grep -i <model>`),
 - every implementation module (common, functional, interleaved, sharded, per-arch
   `blackhole/`, `wormhole/`, `t3000/`, `quasar/`),
-- for each implementation, its whole-model tests by kind (below), with the workflow under
+- for each implementation, its whole-model test candidates (below), with the workflow under
   `.github/workflows/` that runs each one, if any,
 - the skip markers on each of them: unconditional `skip` and every arch `skipif`
   (`is_blackhole`, `is_wormhole_b0`, ...), with their reasons.
@@ -71,18 +69,14 @@ output. Confirm it by reading the test body: it calls the model's top-level forw
 through a test-infra `run()`), not one layer, block or stage. Component tests
 (`test_<model>_attention`, `_layer`, `_encoder`, `_embeddings`, ...) are never candidates.
 
-Candidates by kind:
+Candidates: end-to-end PCC tests and demo tests, plus perf tests (device-perf: the
+`command = f"pytest ..."` string in `*perf_device*.py` or `*device_perf*.py`; e2e perf such as
+`test_*perf_e2e*.py`) whose test body runs the whole model, so one test serves static analysis and
+measurements. For a Quasar source, candidates are whole-model tests of that implementation that run
+on TTsim; no CI requirement.
 
-- **static**: end-to-end PCC tests and demo tests.
-- **static + measured**: the static candidates, plus perf tests (device-perf: the
-  `command = f"pytest ..."` string in `*perf_device*.py` or `*device_perf*.py`; e2e perf such as
-  `test_*perf_e2e*.py`) whose test body runs the whole model, so the same test serves both phases.
-
-For static analysis, evaluate the implementation and entry test against the source target. When
-the destination is `p100` or `p150`, record whether the entry test also runs there, but do not
-require it. For `quasar-port`, discover the port implementation separately per the rule below. Do
-not require the entry test to run on a Quasar destination. Do not offer incompatible primary
-implementations as choices; summarize how many were excluded and make their details
+Evaluate the implementation and entry test against the source profile only. Do not offer
+incompatible implementations as choices; summarize how many were excluded and make their details
 available on request.
 
 Show one row per compatible implementation: module path, target fit, candidate node ids, skip
@@ -95,7 +89,7 @@ After the user picks an implementation, rank its tests in this order:
 
 1. runnable on the source target;
 2. explicitly exercised by CI on the relevant architecture;
-3. a whole-model PCC/demo, or for static + measured a warm-capable perf/PCC test;
+3. a warm-capable whole-model perf or PCC test, then a whole-model PCC/demo;
 4. the least setup indirection and fewest unrelated parametrizations.
 
 Present the top candidates with their node ids, relevant parameters, skip status, CI coverage and a
@@ -127,15 +121,14 @@ Record it in `run.json` as `"test": "<run dir>/temp_test_<model>.py::<test name>
 `"temporary_test": true`, and state in `summary.md` that the entry test is temporary and not part
 of tt-metal.
 
-If a Blackhole and a Quasar implementation both exist (for example
-`models/demos/vision/classification/resnet50/ttnn_resnet` and `.../resnet50/quasar`) and the
-destination is `quasar-port`, record the port module in `run.json` `port_implementation`. The
-port only fills the `quasar-port:*` columns of the source rows; it never adds rows.
+When a model has a Blackhole and a Quasar implementation (for example
+`models/demos/vision/classification/resnet50/ttnn_resnet` and `.../resnet50/quasar`), each is its
+own run with its own source. Comparing the two is a separate step on two runs.
 
 ## 2. Pin the source
 
-Record the full SHA of the commit analysed (`git rev-parse <ref>`; prefer a freshly fetched
-`origin/main` unless the user names a ref). Read every file as `git show <sha>:<path>`; never read
+Record the full SHA of the commit analysed (`git rev-parse <ref>`; the recommendation is in the
+setup order, step 3). Read every file as `git show <sha>:<path>`; never read
 the working tree, except an approved temporary test (section 1). For Quasar, record the ttsim
 version if the user knows it.
 
@@ -148,62 +141,59 @@ When the user says `main`, resolve local `main` exactly, and report whether an a
 fresh remote ref and the environment permits it. Record both the symbolic ref and resolved SHA in
 the run notes so a later comparison can detect a stale or divergent pin.
 
-## 3. Output location and previous runs
+## 3. Output location and run identity
 
 Root: current working directory unless the user names one; never inside the tt-metal checkout.
 
-- Run: `<root>/op-analysis/<model>/static/<YYYY-MM-DD>_<sha7>/`. Measured phases write into the
-  same directory, so one run holds the static tables and the measured data on top of them.
+- Run: `<root>/op-analysis/<model>/<impl-slug>/<source>/<sha7>/`. `impl-slug` is the
+  implementation module's directory name, or its parent's name when that directory is `tt`
+  (`ttnn_resnet`, `quasar`). One directory holds the source trace, every destination and every
+  measurement of that run.
+- Identity: model, implementation module, entry test, source profile and `tt_metal_commit`. The
+  same model, implementation and source on another commit is a new run. There is no overwrite or
+  merge: a run with the same identity is continued.
 
 `run.json` fields:
 
 ```json
-{"kind": "static", "model": "resnet50", "test": "<node id>", "source": "p150", "destination": "quasar-port",
- "port_implementation": "models/demos/vision/classification/resnet50/quasar", "profile_values": {},
- "tt_metal_ref": "origin/main", "tt_metal_commit": "<40-char sha>", "date": "YYYY-MM-DD", "drive_url": null,
- "entry_test_passes": {}, "port_e2e": null}
+{"kind": "static", "model": "resnet50", "implementation": "<module path>", "test": "<node id>",
+ "source": "p150", "destinations": ["quasar-bf16"], "stage_blocks": ["stem", "layer1", "head"],
+ "profile_values": {}, "tt_metal_ref": "origin/main", "tt_metal_commit": "<40-char sha>",
+ "date": "YYYY-MM-DD", "drive_url": null, "entry_test_passes": {}}
 ```
 
-`entry_test_passes`, per p100/p150 target: where the entry test is shown to pass, either
-`{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}` for a
-run the user reports. It backs the `✅` rule for p100/p150 in `target-status.md`.
+`entry_test_passes`, for a Blackhole or Wormhole source: where the entry test is shown to pass,
+either `{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}`
+for a run the user reports. It backs the `✅` rule in `target-status.md`.
 
-`port_e2e`, when the user reports a passing Quasar-port e2e run: `{"by": "...", "date": "...",
-"config": "ttsim <version>, <grid>, batch <n>, <dtype>", "result": "<pcc/top-1 line>"}`.
+Measurements add: `measured_ops` (path of `measured_ops.csv`, set by `merge_measured.py`),
+`measured_inferences`, `ops_csv` (the raw Tracy report), `window` (`warm` or `cold`),
+`ci_pytest_timeout_s` (the CI `pytest_timeout` of the entry test, when it has one), `measurements`
+(marks from `measurements.py mark`), and for TTsim `ttsim_checkout`, `ttsim_commit`,
+`simulator_library`, `simulator_arch` and `ttsim_environment` (the exact non-secret variables
+`kernel_tests.py run` sets).
 
-Measured phases add: `measured_ops` (path of `measured_ops.csv`, set by `merge_measured.py`),
-`ops_csv` (the raw Tracy report), `window` (`warm` or `cold`), and for the destination phase
-`ttsim_checkout`, `ttsim_commit`, `simulator_library`, `simulator_arch` and `ttsim_environment`
-(the exact non-secret variables `kernel_tests.py run` sets).
+Other runs are never evidence: during inventory, tracing and status decisions, read no file of
+another run under `op-analysis/`. The run being continued is different:
+the run being continued is the input for adding a destination or a measurement, and its tables are
+read and extended. The scripts (`runs.py`, `compare_runs.py`) may open any run.
 
-Earlier runs are never an input to the analysis: during inventory, tracing and the Quasar pass,
-read no file of an earlier run under `op-analysis/` (the current run's temporary test is the
-only file there you read). Only the scripts open an earlier run: `compare_runs.py` in the
-merge step after the validator prints `OK`.
+On request, two runs can be compared table by table:
+`python3 <plugin-root>/scripts/compare_runs.py --old <old>/<t>.csv --new <new>/<t>.csv --out <new>/changes_<t>.csv --key <key>`.
 
-For a new run, if `op-analysis/<model>/static/` already has a run, ask once:
+| Table | `--key` |
+|---|---|
+| `op_table.csv` | default (`stage,ttnn_api,device_op,program_factory`) |
+| `call_trace.csv` | `profile,stage` |
+| `port_blockers.csv` | `blocker` |
+| `host_ops.csv` | `host_work` |
+| `host_fallback.csv` | `scope` |
+| `footprint.csv` | `op_code` |
+| `kernel_ops.csv` | `device_op,program_factory,op_code` |
+| `kernel_test_results_<target>.csv` | `node_id` |
 
-- **overwrite**: delete that run directory and write the new one; if it has a `drive_url`,
-  update the same spreadsheet.
-- **new**: new directory; the old one is untouched.
-- **merge**: new directory, then for each table below present in both runs
-  `python3 <plugin-root>/scripts/compare_runs.py --old <old>/<t>.csv --new <new>/<t>.csv --out <new>/changes_<t>.csv --key <key>`,
-  and a "Changes since <old run>" section in `summary.md` listing the commit range and the
-  counts per change type. On Drive, add a `Changes` tab to the existing spreadsheet.
-
-  | Table | `--key` |
-  |---|---|
-  | `op_table.csv` | default (`stage,ttnn_api,device_op,program_factory`) |
-  | `call_trace.csv` | `profile,stage` |
-  | `port_blockers.csv` | `blocker` |
-  | `host_ops.csv` | `host_work` |
-  | `host_fallback.csv` | `scope` |
-  | `footprint.csv` | `op_code` |
-  | `kernel_ops.csv` | `device_op,program_factory,op_code` |
-  | `kernel_test_results.csv` | `node_id` |
-
-`measured_ops.csv` is not compared: per-op timings change every run, and the
-  measured comparison is regenerated by `kernel_ops.py`. `compare_runs.py` exits 2 if a key column is missing.
+`measured_ops.csv` is not compared: per-op timings change every run. `compare_runs.py` exits 2 if a
+key column is missing.
 
 ### Interpreting a cross-run comparison
 

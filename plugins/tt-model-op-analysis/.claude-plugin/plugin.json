@@ -1,7 +1,7 @@
 {
   "name": "tt-model-op-analysis",
-  "version": "0.3.0",
-  "description": "Kernel-op analysis of a tt-metal model test and its portability to a destination architecture: static trace to device ops and program factories, Tracy measurement and TTsim kernel-op tests.",
+  "version": "0.4.0",
+  "description": "Kernel-op analysis of one implementation of a tt-metal model on its architecture (Blackhole, Wormhole or Quasar), with destinations and resumable Tracy and TTsim measurements.",
   "author": {
     "name": "tenstorrent"
   },

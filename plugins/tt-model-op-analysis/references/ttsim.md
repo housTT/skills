@@ -1,6 +1,6 @@
-# TTsim for the measured destination phase
+# TTsim for Quasar measurements
 
-Read this reference only when the measured destination phase runs kernel-op tests on TTsim.
+Read this reference for the Quasar measurement items: kernel-op tests of a Quasar target and the entry test of a Quasar source, all on TTsim.
 
 ## Discovery and selection
 

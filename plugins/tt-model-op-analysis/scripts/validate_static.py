@@ -15,15 +15,14 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_TARGETS,
+    ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
     NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, SOURCE_TARGETS, STATUS_VALUES, TARGETS,
-    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header,
+    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets,
 )
 
 CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
 # Evidence copied into this many rows (and at least half the table) says nothing row-specific.
 BOILERPLATE_MIN_ROWS = 5
-ROW_SPECIFIC_TARGETS = ("quasar-port", "quasar-bf16")
 GRID_KEYWORDS = ("automatic", "none")
 # A pytest node id: path, then ::-separated names, with an optional [parametrize id] that may hold
 # any character except the ';' this column uses as a separator.
@@ -42,21 +41,35 @@ def _int(value: str, where: str, errors: list[str]) -> int | None:
     return n
 
 
-def _targets(run: dict, errors: list[str]) -> tuple[str, str]:
+def _targets(run: dict, errors: list[str]) -> tuple[str, list[str]]:
     if "targets" in run and "source" not in run:
         errors.append("run.json predates source/destination targets (plugin 0.2.0); start a new static run")
-        return "", ""
-    if "source" not in run or "destination" not in run:
-        errors.append("run.json: needs 'source' and 'destination' (one target each); 'targets' is no longer read")
-        return "", ""
-    source, destination = run["source"], run["destination"]
+        return "", []
+    if "destination" in run:
+        errors.append("run.json has a single 'destination' (plugin 0.3.0); this format cannot be "
+                      "extended; start a new run")
+        return "", []
+    if "source" not in run:
+        errors.append("run.json: needs 'source' and 'destinations'")
+        return "", []
+    if not isinstance(run.get("destinations", []), list):
+        errors.append("run.json: destinations must be a list of target names")
+        return "", []
+    source, destinations = run_targets(run)
     if source not in SOURCE_TARGETS:
         errors.append(f"run.json: source '{source}' not in {SOURCE_TARGETS}")
-    if destination not in TARGETS:
-        errors.append(f"run.json: destination '{destination}' not in {TARGETS}")
-    if source == destination:
-        errors.append("run.json: source and destination must differ")
-    return source, destination
+    for destination in destinations:
+        if destination not in TARGETS:
+            errors.append(f"run.json: destination '{destination}' not in {TARGETS}")
+        if destination == source:
+            errors.append(f"run.json: destination '{destination}' equals the source")
+        if destination == "quasar-bf16" and source == "quasar":
+            errors.append("run.json: quasar-bf16 needs a non-Quasar source")
+    if len(set(destinations)) != len(destinations):
+        errors.append("run.json: destinations repeat")
+    if not isinstance(run.get("stage_blocks"), list) or not run["stage_blocks"]:
+        errors.append("run.json: stage_blocks must list the model's block names")
+    return source, destinations
 
 
 def _check_ids(name: str, rows: list[dict], errors: list[str]) -> None:
@@ -69,13 +82,15 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
     errors: list[str] = []
     warnings: list[str] = []
     totals: dict[str, tuple[int, int, int]] = {}
-    source, destination = _targets(json.loads((run_dir / "run.json").read_text(encoding="utf-8")), errors)
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    source, destinations = _targets(run, errors)
     if errors:
         return errors, warnings, totals
-    launch_targets = [t for t in (source, destination) if t in LAUNCH_TARGETS]
+    targets = (source, *destinations)
+    launch_targets = [source] + [d for d in destinations if d in LAUNCH_PROFILES]
 
     tables = {
-        "op_table.csv": op_table_columns(source, destination),
+        "op_table.csv": op_table_columns(source, destinations),
         "call_trace.csv": list(CALL_TRACE_COLUMNS),
         "port_blockers.csv": list(PORT_BLOCKERS_COLUMNS),
         "host_ops.csv": list(HOST_OPS_COLUMNS),
@@ -88,9 +103,6 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
         header = read_header(path)
         missing = [col for col in required if col not in header]
         errors += [f"{name} missing column {col}" for col in missing]
-        if name == "op_table.csv" and "origin" in missing:
-            errors.append("op_table.csv predates the origin column: run "
-                          "python3 <plugin-root>/scripts/upgrade_run.py <run dir>")
         errors += [f"{name} unexpected column {col}" for col in header if col not in required]
     if errors:
         return errors, warnings, totals
@@ -131,7 +143,13 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
         grid = row["grid_dependency"].strip()
         if not measured_only and grid not in GRID_KEYWORDS and not CALL_SITE.search(grid):
             errors.append(f"{where}: grid_dependency '{grid}' is not {GRID_KEYWORDS} or a value with <file>:<line>")
-        for target in (source, destination):
+        if not measured_only:
+            tokens = row["stage"].split()
+            if len(tokens) < 2:
+                errors.append(f"{where}: stage '{row['stage']}' needs '<block> <module> <role>'")
+            elif tokens[0] not in run["stage_blocks"]:
+                errors.append(f"{where}: stage block '{tokens[0]}' not in run.json stage_blocks")
+        for target in targets:
             status = row[f"{target}:status"]
             if status not in STATUS_VALUES:
                 errors.append(f"{where}: {target}:status '{status}' not in {STATUS_VALUES}")
@@ -141,8 +159,6 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
             if count is not None and (count == 0) != (status == "n/a"):
                 errors.append(f"{where}: {target} has {count} launches with status '{status}';"
                               " n/a exactly when the profile launches nothing")
-            if target == "quasar-port" and status != "n/a" and not row[f"{target}:port_op"].strip():
-                errors.append(f"{where}: quasar-port:port_op empty for status '{status}'")
             if target in TEST_TARGETS:
                 cell = row[f"{target}:tests"]
                 if any(not NODE_ID.match(t) for t in (x.strip() for x in cell.split(";")) if t):
@@ -153,8 +169,10 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
                 elif result in RESULT_STATUS and status != RESULT_STATUS[result]:
                     errors.append(f"{where}: {target}:test_result '{result}' requires status {RESULT_STATUS[result]}")
 
-    # Blackhole and unchanged-Quasar evidence legitimately repeats (one CI job, one global blocker).
-    row_specific = ["dispatch_evidence"] + [f"{t}:evidence" for t in (destination,) if t in ROW_SPECIFIC_TARGETS]
+    # Evidence decided per kernel op must differ by row. Blackhole and Wormhole evidence and unchanged
+    # Quasar as a destination legitimately repeat (one CI job, one global blocker).
+    row_specific = ["dispatch_evidence"] + [
+        f"{t}:evidence" for t in targets if t == "quasar-bf16" or (t == "quasar" and t == source)]
     for column in row_specific:
         for text, count in collections.Counter(r[column].strip() for r in ops).items():
             if text and count >= max(BOILERPLATE_MIN_ROWS, len(ops) / 2):

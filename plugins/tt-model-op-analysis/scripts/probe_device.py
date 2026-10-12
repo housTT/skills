@@ -11,7 +11,7 @@ def _grid(grid):
     return {"x": int(grid.x), "y": int(grid.y)}
 
 
-def _profile(arch, dram_grid):
+def _profile(arch, dram_grid, compute_grid):
     arch_lower = str(arch).lower()
     if "quasar" in arch_lower:
         return "quasar"
@@ -20,6 +20,14 @@ def _profile(arch, dram_grid):
             return "p150"
         if dram_grid and dram_grid["x"] == 7:
             return "p100"
+    if "wormhole" in arch_lower:
+        # Row-dispatch compute grids in core_descriptors/wormhole_b0_80_arch.yaml: nebula_x1 (N150)
+        # 8x8, nebula_x2 (N300, per chip) 8x7.
+        size = (compute_grid["x"], compute_grid["y"])
+        if size == (8, 8):
+            return "n150"
+        if size == (8, 7):
+            return "n300"
     return "custom"
 
 
@@ -41,7 +49,7 @@ def main():
                     "arch": arch,
                     "compute_grid": compute_grid,
                     "dram_grid": dram_grid,
-                    "profile": _profile(arch, dram_grid),
+                    "profile": _profile(arch, dram_grid, compute_grid),
                 },
                 sort_keys=True,
             )

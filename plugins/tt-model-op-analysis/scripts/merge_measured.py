@@ -15,10 +15,12 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from opa_schema import NOT_TRACED, TEST_TARGETS, op_table_columns, read_csv, write_csv  # noqa: E402
+from opa_schema import (  # noqa: E402
+    LAUNCH_PROFILES, NOT_TRACED, TEST_TARGETS, op_table_columns, read_csv, run_targets, write_csv,
+)
 
 
-def _measured_row(code: str, count: int, first: dict, source: str, destination: str, csv_name: str) -> dict:
+def _measured_row(code: str, count: int, first: dict, source: str, destinations: list[str], csv_name: str) -> dict:
     row = {
         "stage": f"measured only {code}", "origin": "measured", "ttnn_api": "", "op_code": code,
         "device_op": "", "program_factory": "", "call_site": NOT_TRACED, "launch_condition": "always",
@@ -27,19 +29,21 @@ def _measured_row(code: str, count: int, first: dict, source: str, destination: 
         "grid_dependency": NOT_TRACED,
         f"{source}:shapes": f"{first['inputs']} -> {first['outputs']}", f"{source}:launches": str(count),
         f"{source}:status": "✅", f"{source}:evidence": f"executed by the entry test on {source} ({csv_name})",
-        f"{destination}:status": "⚠️",
-        f"{destination}:evidence": "measured-only op; kernel-op lookup on the destination still needed",
     }
-    for target in (source, destination):
+    for target in destinations:
+        if target in LAUNCH_PROFILES:
+            row[f"{target}:shapes"] = NOT_TRACED
+            row[f"{target}:launches"] = ""
+        row[f"{target}:status"] = "⚠️"
+        row[f"{target}:evidence"] = "measured-only op; kernel-op lookup on this target still needed"
+    for target in (source, *destinations):
         if target in TEST_TARGETS:
             row[f"{target}:tests"] = ""
             row[f"{target}:test_result"] = "not run"
-        if target == "quasar-port":
-            row[f"{target}:port_op"] = NOT_TRACED
     return row
 
 
-def merge(rows: list[dict], measured: list[dict], source: str, destination: str, csv_name: str,
+def merge(rows: list[dict], measured: list[dict], source: str, destinations: list[str], csv_name: str,
           inferences: int = 1) -> list[dict]:
     rows = [dict(r, origin="static") for r in rows if r["origin"] != "measured"]
     device = [m for m in measured if m["op_type"] == "tt_dnn_device"]
@@ -67,7 +71,7 @@ def merge(rows: list[dict], measured: list[dict], source: str, destination: str,
             insert_after[code] = cursor
 
     def new_rows(after: int) -> list[dict]:
-        return [_measured_row(c, counts[c] // inferences, first_seen[c], source, destination, csv_name)
+        return [_measured_row(c, counts[c] // inferences, first_seen[c], source, destinations, csv_name)
                 for c in first_seen if insert_after[c] == after]
 
     out = new_rows(-1)
@@ -89,13 +93,14 @@ def main() -> int:
     run_path = args.run_dir / "run.json"
     run = json.loads(run_path.read_text(encoding="utf-8"))
     op_path = args.run_dir / "op_table.csv"
+    source, destinations = run_targets(run)
     try:
-        merged = merge(read_csv(op_path), read_csv(args.measured_ops), run["source"], run["destination"],
+        merged = merge(read_csv(op_path), read_csv(args.measured_ops), source, destinations,
                        args.measured_ops.name, args.inferences)
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
-    write_csv(op_path, op_table_columns(run["source"], run["destination"]), merged)
+    write_csv(op_path, op_table_columns(source, destinations), merged)
     run["measured_ops"] = str(args.measured_ops)
     run["measured_inferences"] = args.inferences
     run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
