@@ -35,6 +35,7 @@ from . import audit
 from . import awake
 from . import budget as bud
 from . import budgetkind
+from . import cachettl
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -1197,7 +1198,8 @@ class Daemon:
                   context: str | None = None, cache_ttl: str = "") -> int:
         """`context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
-        system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime."""
+        system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
+        picks it per coordinator turn (cachettl.py)."""
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
         if provider in self._net_holds:
@@ -1235,6 +1237,23 @@ class Daemon:
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied)
+        cache_fp = None
+        if cache_ttl == cachettl.AUTO:
+            if prov.cache_env("1h"):
+                cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
+                                                cachettl.cli_stamp(prov.binary()))
+                cache_ttl, ttl_why = cachettl.choose(
+                    self.p.db.kv(cachettl.KEY), cache_fp, time.time(),
+                    (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN))
+            else:
+                cache_ttl, ttl_why = "1h", "the agent sets its own cache lifetime"
+        else:
+            ttl_why = "configured"
+        if role == "coordinator":
+            # With the turn's usage, so a before/after comparison can tell the lifetimes apart.
+            note = {**(note or {}), "turn": {**(note or {}).get("turn", {}),
+                                             "cache_ttl": cache_ttl, "cache_ttl_why": ttl_why}}
+        # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
@@ -1400,6 +1419,11 @@ class Daemon:
             db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
         except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
             log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
+        if cache_fp is not None and cache_ttl == "1h":
+            try:   # the 1h entries this turn writes are what a later turn within cache_warm_min reads
+                db.set_kv(cachettl.KEY, cachettl.record(db.kv(cachettl.KEY), cache_fp))
+            except Exception as e:   # bookkeeping: the next turn then goes at 1h again
+                log(self.p, f"run {run_id}: prompt cache turn not recorded: {e}")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']}")
         return run_id
 
@@ -3689,7 +3713,7 @@ class Daemon:
             head, context = coord.prompt_parts(self.p)
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
-                           cache_ttl=str(c.get("cache_ttl", "1h") or ""),
+                           cache_ttl=str(c.get("cache_ttl", cachettl.AUTO) or ""),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),

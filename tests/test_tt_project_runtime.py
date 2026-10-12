@@ -5787,6 +5787,114 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
         assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
 
 
+def _auto_ttl_daemon(env, monkeypatch, tmp_path):
+    """A daemon whose coordinator turns go out with cache_ttl auto, and a turn starter returning
+    (env TTL, mark TTLs, turn note) of each turn."""
+    from ttp.providers import claude
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    cli = tmp_path / "claude-cli"
+    cli.write_text("v1")
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # room for the runtime's own mark
+    p = make(env)
+    head, context = coord.prompt_parts(p)
+    box = {"d": Daemon(p.base)}
+
+    def turn(system=head, schema=coord.ACTIONS_SCHEMA, ttl="auto"):
+        d = box["d"]
+        rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
+                          schema=schema, system=system, context=context, cache_ttl=ttl)
+        run = p.runs / str(rid)
+        (run / "STOP").touch()
+        spec = json.loads((run / "run.json").read_text())
+        marks = [b["cache_control"]["ttl"] for b in json.loads((run / "input.jsonl").read_text())
+                 ["message"]["content"] if "cache_control" in b] if (run / "input.jsonl").exists() else []
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["turn"]
+        return spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL"), marks, note
+    return p, box, cli, turn
+
+
+def test_auto_cache_ttl_goes_5m_only_while_a_1h_turn_with_the_same_prefix_is_warm(env, monkeypatch, tmp_path):
+    from ttp import cachettl
+    from ttp.daemon import Daemon
+    p, box, cli, turn = _auto_ttl_daemon(env, monkeypatch, tmp_path)
+    ttl, marks, note = turn()
+    assert ttl == "1h" and note["cache_ttl"] == "1h" and "no earlier 1h turn" in note["cache_ttl_why"]
+    ttl, marks, note = turn()
+    assert ttl == "5m" and note["cache_ttl"] == "5m" and note["cache_ttl_why"].startswith("warm"), note
+    assert marks == ["5m"], "the mark must take the turn's own lifetime (a mismatch is an API 400)"
+    # A daemon restart keeps the choice: the 1h turn is in the database, not in memory.
+    box["d"] = Daemon(p.base)
+    assert turn()[0] == "5m"
+    # A 5m turn does not extend the window; past cache_warm_min from the 1h turn's start it is 1h again.
+    state = p.db.kv(cachettl.KEY)
+    for e in state.values():
+        e["ts"] -= 51 * 60
+    p.db.set_kv(cachettl.KEY, state)
+    ttl, marks, note = turn()
+    assert ttl == "1h" and marks == ["1h"] and note["cache_ttl_why"].startswith("cold"), note
+    assert turn()[0] == "5m", "the new 1h turn warms the prefix again"
+    box["d"].cfg["coordinator"]["cache_warm_min"] = 0
+    assert turn()[0] == "1h", "cache_warm_min sets the window"
+
+
+def test_auto_cache_ttl_goes_1h_when_the_prefix_changed(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    p, box, cli, turn = _auto_ttl_daemon(env, monkeypatch, tmp_path)
+    head = coord.prompt_parts(p)[0]
+    assert turn()[0] == "1h" and turn()[0] == "5m"
+    ttl, _, note = turn(system=head + "\nnew charter line")
+    assert ttl == "1h" and note["cache_ttl_why"] == "changed since the last 1h turn: prompt", note
+    assert turn()[0] == "5m", "the earlier prefix's 1h turn is still warm"
+    schema = {**coord.ACTIONS_SCHEMA, "description": "changed"}
+    ttl, _, note = turn(schema=schema)
+    assert ttl == "1h" and "schema" in note["cache_ttl_why"], note
+    box["d"].cfg["coordinator"]["model"] = "another-model"
+    ttl, _, note = turn()
+    assert ttl == "1h" and "model" in note["cache_ttl_why"], note
+    assert turn()[0] == "5m"
+    cli.write_text("v2, an updated CLI")
+    ttl, _, note = turn()
+    assert ttl == "1h" and "cli" in note["cache_ttl_why"], note
+
+
+def test_explicit_cache_ttl_wins_and_turn_and_mark_lifetimes_always_match(env, monkeypatch, tmp_path):
+    from ttp.project import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["coordinator"]["cache_ttl"] == "auto"
+    p, box, cli, turn = _auto_ttl_daemon(env, monkeypatch, tmp_path)
+    for ttl in ("1h", "5m", "1h", "5m"):
+        got, marks, note = turn(ttl=ttl)
+        assert got == ttl and marks == [ttl] and note == {**note, "cache_ttl": ttl, "cache_ttl_why": "configured"}
+    got, marks, note = turn(ttl="off")
+    assert got is None and marks == [] and note["cache_ttl"] == "off"
+    for _ in range(3):
+        got, marks, _ = turn()
+        assert marks == [got], (got, marks)
+
+
+def test_coordinator_turns_take_the_configured_cache_ttl_and_auto_by_default(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    for cfg_ttl, want in ((None, "auto"), ("1h", "1h"), ("5m", "5m"), ("off", "off")):
+        d = Daemon(p.base)
+        d.update_gates()
+        if cfg_ttl:
+            d.cfg["coordinator"]["cache_ttl"] = cfg_ttl
+        calls = []
+        monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append(k) or 1)
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", "task_done", "normal", "x", "queued"))
+        clock[0] += 600
+        d.maybe_coordinate()
+        p.db.x("UPDATE events SET status='handled'")
+        assert calls and calls[-1]["cache_ttl"] == want, (cfg_ttl, calls)
+
+
 def test_cap_cache_breakpoints_keeps_the_stable_prefix_marks_and_logs_once():
     from ttp.providers import base
     mark = {"type": "ephemeral", "ttl": "1h"}
