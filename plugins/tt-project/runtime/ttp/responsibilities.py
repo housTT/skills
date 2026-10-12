@@ -61,6 +61,23 @@ def _word(needle: str, text: str) -> bool:
     return bool(needle) and re.search(rf"(?<![\w.-]){re.escape(needle)}(?![\w-]|\.\w)", text) is not None
 
 
+PATH_EXT_RE = re.compile(r"\w\.[A-Za-z][A-Za-z0-9]{0,4}$")   # a file name's extension: heal.py, run.sh
+
+
+def _named(needle: str, text: str) -> bool:
+    """A check's text names `needle`: as a word, or as a `_`-delimited part of a path-like token
+    (`bin/<alias>_heal.py`, `<alias>_up.sh`). Elsewhere `_` stays part of a word (`MY_<alias>` names nothing)."""
+    if _word(needle, text):
+        return True
+    if not needle or "_" in needle:
+        return False
+    for tok in re.split(r"[\s'\"=;|&()<>,]+", text):
+        if "_" in tok and ("/" in tok or PATH_EXT_RE.search(tok)):
+            if _word(needle, re.sub(r"\.[A-Za-z][A-Za-z0-9]{0,4}$", "", tok).replace("_", " ")):
+                return True
+    return False
+
+
 def _names(needle: str, name: str) -> bool:
     """A `resource` or `machine` field names `needle`: it is the alias, or a resource on it (`<alias>-x`)."""
     return bool(needle) and (name == needle or name.startswith((needle + "-", needle + ":")))
@@ -87,7 +104,7 @@ def watchers(db) -> list[dict]:
 def covering(needles: list[str], found: list[dict]) -> list[str]:
     """The checks that name one of `needles`."""
     return [w["name"] for w in found
-            if any(_names(n, f) for n in needles for f in w["fields"]) or any(_word(n, w["text"]) for n in needles)]
+            if any(_names(n, f) for n in needles for f in w["fields"]) or any(_named(n, w["text"]) for n in needles)]
 
 
 # The inventory ------------------------------------------------------------------------------------
@@ -217,6 +234,27 @@ def _cotenant_checks(p, needles: list[str], now: float) -> tuple[str, list[str]]
         if names:
             return f"{who} heal check", [f"{who}/{n}" for n in names]
     return "", []
+
+
+def check_cover(items: list[dict]) -> dict[str, list[str]]:
+    """{this project's check: ['machine <alias>', ...]}: the inventory items each check covers."""
+    out: dict[str, list[str]] = {}
+    for i in items:
+        if not i.get("via"):
+            for c in i["covered_by"]:
+                if not c.startswith("builtin:"):
+                    out.setdefault(c, []).append(f"{i['kind']} {i['name']}")
+    return out
+
+
+def uncovered_hint(items: list[dict]) -> str:
+    """'' or why a check covers nothing while machines, runners or tunnels lack one, and how to name them."""
+    gaps = [f"{i['kind']} {i['name']}" for i in items if i["kind"] in NEEDS_CHECK and not i["covered_by"]]
+    if not gaps:
+        return ""
+    return (f"uncovered: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''}; name one's alias or host name as a "
+            f"word or file-name part in the check (e.g. `ssh <alias> ...`, `bin/<alias>_heal.py`), or set heal "
+            f"`resource` or `machine` to it")
 
 
 def by_owner(items: list[dict]) -> list[str]:

@@ -2407,7 +2407,7 @@ def cmd_schedules(a) -> None:
 def cmd_heal(a) -> None:
     """Heal checks (command schedules with a `heal` block): `list` shows each with its state,
     `test <name>` runs its check once as a dry run (no fix, no state change)."""
-    from . import heal
+    from . import heal, responsibilities
     if a.project:
         p = need(a.project, sys.argv[1:])
     else:
@@ -2420,8 +2420,17 @@ def cmd_heal(a) -> None:
     if a.action == "list":
         if not found:
             print("no heal checks (a command schedule's `heal` block declares one)")
+        try:
+            items = responsibilities.inventory(p)
+        except Exception:
+            items = None
+        cover = responsibilities.check_cover(items or [])
         for r, spec in found:
             print(heal.describe(r, spec, p.db))
+            if items is not None:
+                hint = "" if cover.get(r["name"]) else responsibilities.uncovered_hint(items)
+                print(f"    covers: {', '.join(cover.get(r['name']) or ['no inventory item'])}"
+                      + (f" ({hint})" if hint else ""))
         line = heal.line(p.db)
         if line:
             print(line)

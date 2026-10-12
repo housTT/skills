@@ -41706,6 +41706,51 @@ def test_responsibility_inventory_credits_a_cotenants_fresh_healthy_heal_check_w
     assert t and "covered by gamma heal check" in t["spec"] and "Give each missing one" not in t["spec"]
 
 
+@pytest.mark.parametrize("text, hit", [
+    ("python3 bin/box-a_heal.py", True), ("bin/heal_box-a.py --fix", True), ("./box-a_up.sh", True),
+    ("scripts/box-a/heal.sh", True), ("ssh box-a true", True),
+    ("MY_box-a=1 true", False), ("echo heal_box-a_now", False), ("bin/xbox-a_heal.py", False),
+    ("bin/box-a2_heal.py", False), ("bin/box-a-2_heal.py", False), ("ping xbox-a.example", False)])
+def test_heal_check_names_a_machine_inside_a_path_like_file_name(env, text, hit):
+    from ttp import responsibilities as rs
+    assert rs.covering(["box-a"], [{"name": "c", "fields": [], "text": text}]) == (["c"] if hit else [])
+
+
+def test_heal_list_and_schedule_set_show_what_a_heal_check_covers(env, capsys, monkeypatch):
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    p = make(env)
+    mm.add("box-a")
+    mm.add("box-b")
+    _resources(p, "Machines: box-a, box-b")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    # A new heal check whose text names no inventory machine is set, with a note naming the gaps.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "mystery", "kind": "command", "every": "10m",
+                            "heal": {"check": "bin/check_all.sh"}}]) == []
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    assert len(notes) == 1 and "'mystery': its heal check names no inventory item" in notes[0]
+    assert "uncovered: machine box-a, machine box-b" in notes[0] and "`bin/<alias>_heal.py`" in notes[0]
+    assert p.db.one("SELECT name FROM schedules WHERE name='mystery'")
+    # One naming a machine in its file name covers it: no note.
+    coord.apply(p, [{"type": "schedule_set", "name": "a-heal", "kind": "command", "every": "10m",
+                     "heal": {"check": "python3 bin/box-a_heal.py"}}])
+    assert p.db.kv(coord.NOTES_KEY, []) == []
+    cli.main(["heal", "list"])
+    out = capsys.readouterr().out
+    assert "    covers: machine box-a\n" in out
+    assert "    covers: no inventory item (uncovered: machine box-b;" in out
+    # With every machine covered, a check covering nothing gets no hint.
+    sched.upsert(p.db, "b-heal", "command", "10m", payload={"heal": {"check": "ssh box-b true"}})
+    cli.main(["heal", "list"])
+    out = capsys.readouterr().out
+    assert "    covers: machine box-b\n" in out and "    covers: no inventory item\n" in out
+    coord.apply(p, [{"type": "schedule_set", "name": "local", "kind": "command", "every": "10m",
+                     "heal": {"check": "true"}}])
+    assert p.db.kv(coord.NOTES_KEY, []) == []
+
+
 def test_responsibility_inventory_lists_runners_schedules_prs_and_remote_jobs(env):
     from ttp import responsibilities as rs
     from ttp import schedule as sched

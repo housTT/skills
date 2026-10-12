@@ -1461,6 +1461,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
                              payload, timefmt.home(p))
                 sched.write_file(p, f"schedule {a['name']}: {'changed' if old else 'added'}")
+                if kind == "command" and enabled and a.get("heal"):
+                    try:
+                        items = responsibilities.inventory(p, cfg, db)
+                    except Exception:   # the hint is advice: the schedule is already set
+                        items = []
+                    hint = responsibilities.uncovered_hint(items)
+                    if hint and not responsibilities.check_cover(items).get(a["name"]):
+                        notes.append(f"schedule_set {a['name']!r}: its heal check names no inventory item, so "
+                                     f"health coverage counts it for nothing ({hint})")
             elif t == "config_set":
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:
