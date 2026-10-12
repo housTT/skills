@@ -43840,10 +43840,34 @@ def test_the_owners_own_healthy_heal_check_holds_a_machine_page_and_sends_one_lo
     alpha.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": t0 + 1990, "last_rc": 0})
     ml.report("alpha", "box-a", "down", grace_s=0, now=t0 + 2000)
     assert [x["kind"] for x in ml.route(t0 + 2000, able=able)] == ["machine_condition"]
-    # The fallback's healthy check holds it when the owner has none.
+    # A broker hold comes from a check that reached the box: a healthy reachability check never holds its page.
     ml.report("alpha", "box-a", "down", cleared=True)
-    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2100)
-    got = ml.route(t0 + 2100, able=able, healthy=lambda who, alias, now: ["up"] if who == "beta" else [])
+    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2010)
+    got = ml.route(t0 + 2010, able=able)
+    assert [(x["target"], x["kind"]) for x in got] == [("alpha", "machine_condition")]
+    assert "held" not in ml.conditions()["box-a:held"]["page"]
+    # Only the owner's own healthy broker check of the machine (no hold there) holds it, with no route wording.
+    ml.report("gamma", "box-a", "held", cleared=True)
+    sched.upsert(alpha.db, "box-a-broker", "command", "5m", payload={"heal": {
+        "preset": "broker", "status_command": "true", "resource": "box-a-device"}})
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-broker", {"status": "healthy", "last_check": t0 + 2020, "last_rc": 0})
+    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2030)
+    got = ml.route(t0 + 2030, able=able)
+    assert [(x["target"], x["kind"]) for x in got] == [("alpha", "machine_condition_held")]
+    assert "box-a-broker" in got[0]["text"] and "route problem" not in got[0]["text"]
+    assert ml.conditions()["box-a:held"]["page"]["held"]["checks"] == ["box-a-broker"]
+    ml.report("gamma", "box-a", "held", cleared=True)
+    # A recovery page recorded before the hold began is not delivered while the hold is on.
+    ml.report("gamma", "box-a", "down", grace_s=0, now=t0 + 2040)
+    nobody = lambda who, alias, now, cond: []
+    first = ml.route(t0 + 2040, able=able, healthy=nobody)
+    assert [x["kind"] for x in first] == ["machine_condition"]
+    assert ml.route(t0 + 2040 + ml.CLAIM_S, able=able) == [], "unclaimed while held"
+    assert ml.route(t0 + 2040 + ml.CLAIM_S, able=able, healthy=nobody)[0]["id"] == first[0]["id"]
+    ml.report("gamma", "box-a", "down", cleared=True)
+    # The fallback's healthy check holds it when the owner has none.
+    ml.report("gamma", "box-a", "down", grace_s=0, now=t0 + 2100)
+    got = ml.route(t0 + 2100, able=able, healthy=lambda who, alias, now, cond: ["up"] if who == "beta" else [])
     assert [(x["target"], x["kind"]) for x in got] == [("beta", "machine_condition_held")]
     # Delivery: a low inbox note to another project; a low feed line, no coordinator event, at home.
     d = Daemon(me.base)

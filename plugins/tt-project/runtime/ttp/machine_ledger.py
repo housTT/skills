@@ -13,9 +13,10 @@ owner: a high-severity note in its inbox (`upstream.send`), or an event when the
 project, which the coordinator takes at high effort. When the owner cannot act (its daemon stopped or
 stale, the project paused, its coordinator logged out or failing) for UNAVAILABLE_S, the condition goes to
 the fallback, then to the user as an outage. Before each page, the ledger reads the owner's (then the
-fallback's) own heal checks naming the machine, read-only (responsibilities.healthy_checks): while one ran
-healthy and fresh and that project does not itself report the condition, the page is held, and that
-project gets one low note per episode naming the reporting projects (likely their own route problem).
+fallback's) own heal checks naming the machine, read-only (responsibilities.healthy_checks): while one that
+observes the condition ran healthy and fresh (any such check for `down`, only a broker check for `held`)
+and that project does not itself report the condition, the page is held, and that project gets one low
+note per episode naming the reporting projects (for `down`, likely their own route problem).
 A condition no co-tenant reported for CONDITION_GONE_S, or reported cleared, is over. With no owner set nothing is routed: each co-tenant's digest names the gap once.
 
 Change ledger. Every live change to a shared machine (a drop-in, a disabled recovery switch, a pause) is
@@ -270,20 +271,20 @@ def _pending(page: dict, target: str, kind: str, key: str, alias: str, episode: 
 
 
 def _vouched(c: dict, targets: list[str], now: float,
-             healthy: Callable[[str, str, float], list[str]]) -> tuple[str, list[str]] | None:
+             healthy: Callable[[str, str, float, str], list[str]]) -> tuple[str, list[str]] | None:
     """(project, its checks): the first project in the page chain, not itself reporting condition `c`, whose
-    own heal check of the machine ran healthy and fresh; None when none does."""
+    own heal check of the machine that observes that condition ran healthy and fresh; None when none does."""
     for who in targets:
         if who in c.get("seen_by", []):
             continue
-        checks = healthy(who, c["alias"], now)
+        checks = healthy(who, c["alias"], now, c["condition"])
         if checks:
             return who, checks
     return None
 
 
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
-          claimer: str = "", healthy: Callable[[str, str, float], list[str]] | None = None) -> list[dict]:
+          claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None) -> list[dict]:
     """The pages to deliver now, model-free: [{target, kind, key, alias, stage, id, text}]. Each due
     page is recorded as pending; the pending pages nobody holds (or whose claim lapsed after CLAIM_S)
     are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it."""
@@ -315,7 +316,11 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 # The owner's own check sees the machine healthy: no recovery page, one low note per episode.
                 who, checks = held
                 page["held"] = {"by": who, "checks": checks, "at": now}
+                if (page.get("pending") or {}).get("kind") == "machine_condition":
+                    continue   # a recovery page recorded before the hold stays unclaimed until it lifts
                 nid = f"machine:{key}@{int(float(c['first']))}#held"
+                why = ("likely the reporting project's own route problem" if c["condition"] == "down"
+                       else "the reporting project's reading likely differs or is stale")
                 if page.get("noted") != nid and not page.get("pending"):
                     page["noted"] = nid
                     page["pending"] = {
@@ -323,7 +328,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                         "alias": c["alias"], "stage": int(page.get("stage") or 0), "id": nid, "severity": "low",
                         "text": f"Machine {c['alias']} reported {c['condition']} since {ends.stamp(c['first'])} by "
                                 f"{', '.join(c['seen_by'])}, but your own heal check {', '.join(checks)} sees it "
-                                f"healthy: likely the reporting project's own route problem. No recovery page "
+                                f"healthy: {why}. No recovery page "
                                 f"was sent; nothing to do unless you see otherwise."}
                 claim(page)
                 continue

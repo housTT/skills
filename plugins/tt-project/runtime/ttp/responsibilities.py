@@ -85,7 +85,7 @@ def _names(needle: str, name: str) -> bool:
 
 # What watches -------------------------------------------------------------------------------------
 def watchers(db) -> list[dict]:
-    """Enabled command schedules (heal checks and command watchers): {name, heal, fields, text}."""
+    """Enabled command schedules (heal checks and command watchers): {name, heal, preset, fields, text}."""
     out = []
     for r in db.q("SELECT name, payload FROM schedules WHERE enabled=1 AND kind='command' ORDER BY name"):
         try:
@@ -97,7 +97,8 @@ def watchers(db) -> list[dict]:
         text = " ".join([str(payload.get("command") or "")]
                         + [str(spec.get(k) or "") for k in HEAL_TEXT if spec])
         if spec or str(payload.get("command") or "").strip():
-            out.append({"name": r["name"], "heal": spec is not None, "fields": [f for f in fields if f], "text": text})
+            out.append({"name": r["name"], "heal": spec is not None, "preset": str((spec or {}).get("preset") or ""),
+                        "fields": [f for f in fields if f], "text": text})
     return out
 
 
@@ -176,10 +177,11 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
     return items
 
 
-def _heal_checks(base: Path, needles: list[str], fresh_at: float | None = None) -> list[str]:
+def _heal_checks(base: Path, needles: list[str], fresh_at: float | None = None,
+                 preset: str | None = None) -> list[str]:
     """The enabled heal checks naming one of `needles` in the project at `base`, read read-only from its
     database; with `fresh_at`, only those whose last check was healthy within FRESH_INTERVALS of their
-    interval. [] when it cannot be read."""
+    interval; with `preset`, only checks of that preset. [] when it cannot be read."""
     from . import globalcap
     db_path = base / "state" / "project.db"
     if not db_path.is_file():
@@ -189,7 +191,7 @@ def _heal_checks(base: Path, needles: list[str], fresh_at: float | None = None) 
     except Exception:
         return []
     try:
-        names = covering(needles, [w for w in watchers(db) if w["heal"]])
+        names = covering(needles, [w for w in watchers(db) if w["heal"] and preset in (None, w["preset"])])
         if fresh_at is not None:
             every = {r["name"]: float(r["every_s"] or 0) for r in db.q("SELECT name, every_s FROM schedules")}
             names = [n for n in names if _fresh(heal.state(db, n), every.get(n, 0.0), fresh_at)]
@@ -224,17 +226,25 @@ def _owner_checks(p, rec: dict, needles: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
-def healthy_checks(who: str, alias: str, now: float | None = None) -> list[str]:
-    """Project `who`'s enabled heal checks naming machine `alias` whose last run was healthy and fresh
-    (machine_ledger: an owner's own healthy check holds a page about the machine). Read-only; [] when
-    `who` is not on this machine or cannot be read."""
+# Which healthy heal checks rule out each ledger condition: any check that reached the machine rules out
+# `down` (the only condition a route-failed or unknown outage check reports); only a broker check, which
+# reads the hold field itself, rules out `held`.
+VOUCH_PRESET: dict[str, str | None] = {"down": None, "held": "broker"}
+
+
+def healthy_checks(who: str, alias: str, now: float | None = None, condition: str = "down") -> list[str]:
+    """Project `who`'s enabled heal checks naming machine `alias` whose last run was healthy and fresh, and
+    that observe `condition` (VOUCH_PRESET; machine_ledger: such a check holds a page about the machine).
+    Read-only; [] when `who` is not on this machine or cannot be read, or no check can observe it."""
+    if condition not in VOUCH_PRESET:
+        return []
     now = time.time() if now is None else now
     base = dict(_projects(project.hostname())).get(who)
     if base is None:
         return []
     rec = machines.load().get(alias) or {}
     needles = [alias] + ([str(rec["hostname"])] if rec.get("hostname") else [])
-    return _heal_checks(base, needles, fresh_at=now)
+    return _heal_checks(base, needles, fresh_at=now, preset=VOUCH_PRESET[condition])
 
 
 def _cotenant_checks(p, needles: list[str], now: float) -> tuple[str, list[str]]:
