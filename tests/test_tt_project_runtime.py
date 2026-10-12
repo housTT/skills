@@ -16703,6 +16703,63 @@ def test_a_half_made_workspace_never_deletes_a_branch_with_its_own_commits(env, 
     assert _git_out(path, "rev-parse", "HEAD") == head and (path / "work.txt").read_text() == "step 1"
 
 
+def test_a_transient_git_failure_never_removes_a_workspace_with_uncommitted_work(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("retried", "s", kind="code", tier="light", origin="user"))
+    path, branch = worktree.ensure(p, task)
+    (path / "work.txt").write_text("uncommitted")
+    real_is_git, real_git = worktree.is_git, worktree._git
+    # is_git times out once (it answers False then): no reason to call the worktree half-made.
+    flaky = [False]
+    monkeypatch.setattr(worktree, "is_git", lambda pth: flaky.pop() if flaky else real_is_git(pth))
+    assert worktree.ensure(p, task) == (path, branch)
+    assert (path / "work.txt").read_text() == "uncommitted"
+    # A rev-parse in the worktree, then the worktree list, time out once each: ensure raises and
+    # leaves everything as it is; the next try reuses it.
+    for failing in ("rev-parse", "list"):
+        hit = []
+
+        def git(cwd, *args, **kw):
+            if failing in args[:2] and not hit:
+                hit.append(args)
+                raise subprocess.TimeoutExpired(["git", *args], 1)
+            return real_git(cwd, *args, **kw)
+        monkeypatch.setattr(worktree, "_git", git)
+        with pytest.raises((RuntimeError, subprocess.SubprocessError)):
+            worktree.ensure(p, task)
+        assert hit and (path / "work.txt").read_text() == "uncommitted", f"a failing {failing} removed the work"
+        assert worktree.ensure(p, task) == (path, branch)
+        assert (path / "work.txt").read_text() == "uncommitted"
+
+
+def test_a_workspace_locked_initializing_with_an_index_and_edits_is_kept_and_reused(env):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("retried", "s", kind="code", tier="light", origin="user"))
+    path, branch = worktree.ensure(p, task)
+    tracked = next(f for f in _git_out(path, "ls-files").splitlines() if (path / f).is_file())
+    (path / tracked).write_text("edited")
+    (path / "new.txt").write_text("untracked")
+    _git_out(path, "worktree", "lock", "--reason", "initializing", str(path))
+    assert worktree.ensure(p, task) == (path, branch)
+    assert (path / tracked).read_text() == "edited" and (path / "new.txt").read_text() == "untracked"
+    assert not [ln for ln in _git_out(p.root, "worktree", "list", "--porcelain").splitlines() if ln.startswith("locked")], \
+        "the kept worktree stayed locked"
+
+
+def test_a_workspace_on_another_branch_is_left_alone(env):
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("moved", "s", kind="code", tier="light", origin="user"))
+    path, branch = worktree.ensure(p, task)
+    _git_out(path, "checkout", "-q", "-b", "elsewhere")
+    (path / "work.txt").write_text("mine")
+    with pytest.raises(RuntimeError, match="elsewhere"):
+        worktree.ensure(p, task)
+    assert (path / "work.txt").read_text() == "mine"
+
+
 def test_the_workspace_git_timeout_grows_with_the_hosts_load(env, monkeypatch):
     p = make(env)
     from ttp import worktree
@@ -16715,6 +16772,9 @@ def test_the_workspace_git_timeout_grows_with_the_hosts_load(env, monkeypatch):
     assert worktree.git_timeout(p) == 900
     p.set_config("worktree.git_timeout_max_s", 600)
     assert worktree.git_timeout(p) == 600
+    assert worktree.git_timeout(p, 1.5) == 600, "a later attempt's timeout went past the cap"
+    monkeypatch.setattr(worktree.os, "getloadavg", lambda: (2.0, 0, 0))
+    assert worktree.git_timeout(p, 1.5) == 180
 
 
 def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run_out(env, monkeypatch):
@@ -16740,8 +16800,9 @@ def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run
     assert t["status"] == "blocked" and t["blocked_reason"].startswith("workspace: timed out")
     d.retry_workspaces()
     assert p.db.task(tid)["status"] == "blocked", "a failure that outlasted its retries was queued again"
-    d._workspace_tries(tid, clear=True)
-    assert d._workspace_tries(tid) == 0
+    p.db.update_task(tid, status="cancelled")
+    d.retry_workspaces()
+    assert d._workspace_tries(tid) == 0, "a cancelled task's workspace tries were kept"
 
 
 def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):

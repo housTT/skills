@@ -6268,9 +6268,15 @@ class Daemon:
         """A task blocked on its workspace (`workspace:`) with retries left goes back to the queue on its
         own, on daemon start and every pass (an older daemon blocked it on the first failure);
         worktree.ensure then reuses or remakes what the failed attempt left behind. One with an anchor
-        (waits:) is the coordinator's hold and stays."""
+        (waits:) is the coordinator's hold and stays. The tries of a task closed or gone are dropped."""
         db = self.p.db
         limit = int((self.cfg.get("worktree") or {}).get("create_retries", 3) or 0)
+        with db.tx():
+            tries = db.kv(WORKSPACE_TRIES_KEY, {}) or {}
+            kept = {k: v for k, v in tries.items()
+                    if (db.task(int(k)) or {}).get("status", "cancelled") not in TERMINAL_TASK_STATES}
+            if kept != tries:
+                db.set_kv(WORKSPACE_TRIES_KEY, kept)
         for t in db.q("SELECT * FROM tasks WHERE status='blocked' AND blocked_reason LIKE 'workspace:%'"):
             if anchors.anchor(t) or self._workspace_tries(t["id"]) >= limit:
                 continue

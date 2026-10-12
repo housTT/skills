@@ -112,9 +112,10 @@
   `"$VIRTUAL_ENV"/bin/python`: workers and reviewers run with the project venv active.
 - Making a task's worktree recovers by itself. Each git command gets `worktree.git_timeout_s`
   (default 120 s), scaled by the host's load per CPU up to `worktree.git_timeout_max_s` (900 s). After
-  a timeout or a failure left behind by one, a whole worktree is reused and a half-made one is removed
-  and made again (`worktree.create_attempts`, default 2). A branch with its own commits is never
-  reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
+  a timeout or a failure left behind by one, a whole worktree is reused and a half-made one (still
+  locked "initializing", with no index or HEAD) is removed and made again (`worktree.create_attempts`,
+  default 2). A check that fails, or a worktree on another branch, is left as it is and counts as a
+  failure: an error never deletes a worktree. A branch with its own commits is never reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
   after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
   coordinator. Tasks an older daemon blocked this way are queued again on their own.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the

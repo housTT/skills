@@ -89,25 +89,27 @@ def named_base(p: Project) -> str:
     return _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
 
 
-def git_timeout(p: Project) -> float:
+def git_timeout(p: Project, scale: float = 1.0) -> float:
     """The timeout for the git commands that make a task's workspace: `worktree.git_timeout_s`
     (default 120 s) scaled by the host's load per CPU when above 1 (a loaded host checks out
-    slower), at most `worktree.git_timeout_max_s` (default 900 s)."""
+    slower) and by `scale` (a later attempt waits longer), at most `worktree.git_timeout_max_s`
+    (default 900 s)."""
     w = p.config().get("worktree") or {}
     base = float(w.get("git_timeout_s") or 120)
     try:
         load = os.getloadavg()[0] / (os.cpu_count() or 1)
     except (OSError, AttributeError):
         load = 0.0
-    return min(float(w.get("git_timeout_max_s") or 900), base * max(1.0, load))
+    return min(float(w.get("git_timeout_max_s") or 900), base * max(1.0, load) * scale)
 
 
 def _registered(p: Project, path: Path) -> dict | None:
     """`git worktree list --porcelain`'s record of the worktree at `path` ({"branch": ..., "locked":
-    reason or None, "prunable": bool}), or None when git has none there."""
+    reason or None, "prunable": bool}), or None when git has none there. Raises when git fails or
+    times out: an unknown record is no missing one."""
     want = str(path.resolve()) if path.exists() else str(path)
     rec: dict | None = None
-    for line in _git(p.root, "worktree", "list", "--porcelain", check=False).splitlines() + [""]:
+    for line in _git(p.root, "worktree", "list", "--porcelain", timeout=git_timeout(p)).splitlines() + [""]:
         key, _, val = line.partition(" ")
         if key == "worktree":
             rec = {"path": val, "branch": "", "locked": None, "prunable": False}
@@ -124,39 +126,60 @@ def _registered(p: Project, path: Path) -> dict | None:
     return None
 
 
-def _complete(p: Project, path: Path) -> bool:
-    """Whether the worktree at `path` is whole: git registers it, no `git worktree add` left it locked
-    "initializing" half way (its checkout never finished), or it did but the checkout finished anyway
-    (an index, HEAD resolves, nothing changed). A whole worktree left locked is unlocked. A worktree
-    with changes that no add left half way is the task's own work and counts as whole."""
-    rec = _registered(p, path)
-    if not rec or rec["prunable"] or not path.is_dir() or not is_git(path):
-        return False
+def _whole(p: Project, path: Path, rec: dict, branch: str) -> bool:
+    """Whether the registered worktree at `path` (`rec`, from _registered) is whole and can be reused
+    (True), or positively half-made, so removing it loses nothing (False): locked "initializing" by a
+    `git worktree add` that never finished its checkout (no `.git` file, no index or no HEAD), so no
+    task ever ran in it. Anything else is kept: a worktree with an index stays whatever it holds (a
+    whole one left locked "initializing" is unlocked), an unlocked one is never removed. Raises,
+    touching nothing, when a check fails or times out, or the worktree is on another branch."""
+    adding = (rec["locked"] or "").startswith("initializing")
     try:
-        index = path / _git(path, "rev-parse", "--git-path", "index")
-        head = _git(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
-        if not head or not index.exists():
+        if not (path / ".git").is_file():
+            if adding:
+                return False
+            raise RuntimeError("it has no .git file")
+        t = git_timeout(p)
+        top, index = _git(path, "rev-parse", "--show-toplevel", "--git-path", "index", timeout=t).splitlines()[:2]
+        if Path(top).resolve() != path.resolve():
+            raise RuntimeError(f"git finds {top} there")
+        if adding and not (path / index).exists():
             return False
-        if rec["locked"] is None or not rec["locked"].startswith("initializing"):
-            return True
-        if _git(path, "status", "--porcelain", "--untracked-files=no", timeout=git_timeout(p)):
-            return False
-        _git(p.root, "worktree", "unlock", str(path), check=False)
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+                             capture_output=True, text=True, timeout=t)
+        if out.returncode != 0 or not out.stdout.strip():
+            if adding and out.returncode == 1 and not out.stderr.strip():
+                return False
+            raise RuntimeError(f"its HEAD does not resolve {out.stderr.strip()[:200]}")
+        if rec["branch"] and rec["branch"] != branch:
+            raise RuntimeError(f"it is on branch {rec['branch']}, not {branch}")
+        if adding:
+            _git(p.root, "worktree", "unlock", str(path), timeout=t)
         return True
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        return False
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"worktree {path} left as it is: {e}") from e
 
 
-def _clear_partial(p: Project, path: Path) -> None:
-    """Remove a half-made worktree at `path` (git's record of it too) so it can be made again. A
-    directory git does not know holding more than a `.git` file is never deleted: it is not ours."""
-    if _registered(p, path):
+def _clear_partial(p: Project, path: Path, rec: dict | None) -> None:
+    """Remove what an unfinished `git worktree add` left at `path` so it can be made again: a half-made
+    registered worktree (`rec`, which _whole found half-made), or git's record of one whose directory is
+    gone. A directory git does not know holding more than a `.git` file is never deleted: it is not
+    ours."""
+    if rec and not rec["prunable"]:
         _git(p.root, "worktree", "remove", "--force", "--force", str(path), check=False, timeout=git_timeout(p))
-    _git(p.root, "worktree", "prune", check=False)
+    _git(p.root, "worktree", "prune", check=False, timeout=git_timeout(p))
     if path.is_dir() and not _registered(p, path):
         if any(c.name != ".git" for c in path.iterdir()):
             raise RuntimeError(f"{path} exists, is no worktree of this repository and is not empty")
         shutil.rmtree(path)
+
+
+def _reusable(p: Project, path: Path, branch: str) -> tuple[bool, dict | None]:
+    """(whether the worktree at `path` is whole, git's record of it); see _whole."""
+    rec = _registered(p, path)
+    if rec and not rec["prunable"] and path.is_dir():
+        return _whole(p, path, rec, branch), rec
+    return False, rec
 
 
 def ensure(p: Project, task: dict) -> tuple[Path, str]:
@@ -164,26 +187,28 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     carrying a branch (`pr_branch:<branch>`) works on that branch when it may (on_carried), else on
     its own branch from that branch's head. A git command that times out (git_timeout) or fails
     because an earlier, timed-out attempt left the branch or worktree behind is recovered here: a
-    whole worktree is reused, a half-made one removed and made again, up to `worktree.create_attempts`
-    (default 2) attempts, each with a longer timeout. A branch is never deleted: one with commits
-    beyond where it would start is checked out as it is; one without is reset to that start."""
+    whole worktree is reused, a positively half-made one removed and made again (_whole), up to
+    `worktree.create_attempts` (default 2) attempts, each with a longer timeout. A check that fails
+    raises and leaves the worktree as it is: an error never counts as half-made. A branch is never
+    deleted: one with commits beyond where it would start is checked out as it is; one without is
+    reset to that start."""
     carried = on_carried(p, task) if not task.get("branch") else ""
     branch = task.get("branch") or carried or f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
     attempts = max(1, int((p.config().get("worktree") or {}).get("create_attempts") or 2))
     for n in range(attempts):
-        if path.exists() and _complete(p, path):
-            prepare(p, path)
-            return path, branch
+        whole, rec = _reusable(p, path, branch)
+        if whole:
+            break
         try:
-            if path.exists() or _registered(p, path):
-                _clear_partial(p, path)
-            _create(p, task, path, branch, carried, git_timeout(p) * (1 + n / 2))
+            if path.exists() or rec:
+                _clear_partial(p, path, rec)
+            _create(p, task, path, branch, carried, git_timeout(p, 1 + n / 2))
             break
         except (RuntimeError, subprocess.SubprocessError):
-            if path.exists() and _complete(p, path):
-                break
             if n + 1 == attempts:
+                if _reusable(p, path, branch)[0]:
+                    break
                 raise
     prepare(p, path)
     return path, branch
