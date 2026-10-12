@@ -1111,7 +1111,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     finished task's PR); any other named branch (one a spec names, e.g. <user>/feature-x) may go
     too. Both only as a fast-forward (publish, ff_only: own_ff_only). A task labelled
     `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
-    worktree) publishes its head onto that branch instead, and so does a review covering that task.
+    worktree) publishes its head onto that branch instead, and so does a review covering that task,
+    from that task's branch or from the pr_branch itself checked out (_reviewed finds the task).
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
@@ -1125,8 +1126,11 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
     carried = bool(m and onto and m.group(1) == task and not notes)
     if m and task and m.group(1) != task and not carried and not notes:
-        # A review publishes the code task it covers onto that task's pr_branch, as the task would.
-        onto = next((pr_branch_of(p, t) for t in _reviewed(p, task) if str(t["id"]) == m.group(1)), "")
+        # A review publishes the code task it covers onto that task's pr_branch, as the task would:
+        # from that task's own branch, or from the pr_branch itself checked out (a task's ttp/t<id>-...
+        # branch another task carries as its pr_branch, e.g. one publishing a finished task's work).
+        onto = next((b for t in _reviewed(p, task)
+                     if (b := pr_branch_of(p, t)) and (str(t["id"]) == m.group(1) or b == branch)), "")
         carried = bool(onto)
     if carried:
         if not worktree.valid_branch(onto):
@@ -1569,13 +1573,18 @@ def pr_elsewhere(p: Project, task: dict | None, d: dict) -> str:
     return "" if onto in {_split_target(ref, remotes)[1] for remotes in tries} else onto
 
 
+REVIEW_TITLE = re.compile(r"\s*Review #(\d+)\b")   # a review's title names the task it covers
+
+
 def _reviewed(p: Project, task: str | None) -> list[dict]:
-    """The code tasks review `task` covers (its dependencies and auto_review: label), or []."""
+    """The code tasks review `task` covers (its dependencies, auto_review: label and the `Review #<id>`
+    its title starts with), or []."""
     t = _task_row(p, task)
     if not t or t.get("kind") != "review":
         return []
     ids = [i for i in dependency_ids(t) if i is not None]
     ids += [int(x[12:]) for x in _labels(t) if x.startswith("auto_review:") and x[12:].isdigit()]
+    ids += [int(m.group(1))] if (m := REVIEW_TITLE.match(str(t.get("title") or ""))) else []
     return [r for r in (_task_row(p, str(i)) for i in dict.fromkeys(ids)) if r]
 
 
@@ -2070,6 +2079,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
     a docs-only change since `base` (the project's push target) may go. `ff_only` (a branch that is
     not this task's own `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
+    A HEAD the remote branch already has as its tip is reported as pushed, with no checks or push.
     When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
     exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused,
     unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`)."""
@@ -2083,6 +2093,11 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     if why:
         say(why)
         return REFUSED
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    if not local and head and _existing_tip(repo, remote, branch) == head:
+        # Already published (e.g. by the change a review covers): nothing to check or push again.
+        say(f"{head[:10]} is already {remote}/{branch}'s tip; nothing to push")
+        return 0
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "

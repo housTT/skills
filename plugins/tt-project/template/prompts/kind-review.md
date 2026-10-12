@@ -52,6 +52,9 @@
   onto its own PR branch, not the push branch. If it passes, run `ttp push --own --detach` in the
   change's worktree. It runs the checks on the head and pushes it there without force. NEVER run
   plain `ttp push` or `git push`, never approve it for the push queue, and never bump versions.
+- That worktree may be on the change's own branch or on the PR branch itself (also another task's
+  `ttp/t<id>-...` branch the change carries): it publishes only that PR branch, fast-forward only.
+  A head the PR branch already has reports `pushed` at once, with no checks run again.
 - It prints `marker:` and `retry_when:` lines and returns at once. Hand off `waiting` with that
   `retry_when`, `next_step` "report the push" and `retry_after_s` 900. On resume, run that
   `retry_when`: report `pushed <sha>`, or `not pushed` with its exit code and log tail. One that

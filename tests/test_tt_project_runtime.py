@@ -32394,6 +32394,52 @@ def test_own_push_refuses_a_pr_branch_that_exists_nowhere(env, monkeypatch):
     assert target("feature/local") == ("origin", "feature/local")
 
 
+def test_a_review_publishes_the_pr_branch_its_subject_carries_and_nothing_else(env, monkeypatch, capsys):
+    """A review whose subject task (named by the `Review #<id>` title or its depends_on) carries a
+    pr_branch that is another task's ttp/t<id>-... branch publishes that branch with `ttp push --own`
+    from a worktree on it, fast-forward only. Any other task's branch is still refused, and a head
+    the remote already has is reported as pushed without running the checks or pushing again."""
+    from ttp import push
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    src = p.db.add_task("Fix the mask", "s", kind="code")
+    b = f"ttp/t{src}-fix-the-mask"
+    p.db.update_task(src, status="done", branch=b)
+    pub = p.db.add_task("Publish the mask fix", "s", kind="code", labels=[f"pr_branch:{b}"])
+    p.db.update_task(pub, status="done", branch=b)
+    by_title = p.db.add_task(f"Review #{pub}: Publish the mask fix", "s", kind="review", labels=["review_only"])
+    by_dep = p.db.add_task("Check the publish", "s", kind="review", depends_on=[pub])
+    _git_out(repo, "checkout", "-q", "-B", b)
+    _commit(repo, "mask.py", "fixed\n")   # local only, as the finished task left it
+    head = _git_out(repo, "rev-parse", "HEAD")
+    for rev in (by_title, by_dep):
+        monkeypatch.setenv("TTP_TASK", str(rev))
+        assert push.own_target(p, repo) == ("origin", b), rev
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", b) == head
+    assert log.read_text().split() == [head]
+    # Already there: success, with no checks and no push.
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0
+    assert "nothing to push" in capsys.readouterr().err
+    assert log.read_text().split() == [head]
+    # An unrelated task's branch is refused, for a review of any subject and for a non-review.
+    stray = p.db.add_task("Something else", "s", kind="code", labels=["pr_branch:feature/x"])
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{stray}-something-else")
+    _commit(repo, "stray.py", "x\n")
+    plain = p.db.add_task("Not a review", "s", kind="code", depends_on=[pub])
+    for task in (by_title, by_dep, plain):
+        monkeypatch.setenv("TTP_TASK", str(task))
+        with pytest.raises(ValueError, match="publishes only this task's own branch"):
+            push.own_target(p, repo)
+    # A review's subject carrying the branch is what lets it through: a non-review never publishes it.
+    _git_out(repo, "checkout", "-q", b)
+    monkeypatch.setenv("TTP_TASK", str(plain))
+    with pytest.raises(ValueError, match="publishes only this task's own branch"):
+        push.own_target(p, repo)
+    assert _git_out(origin, "rev-parse", b) == head
+
+
 def test_a_task_carrying_a_branch_works_on_it_in_a_worktree_and_publishes_onto_it(env, monkeypatch, capsys):
     """A task labelled pr_branch:<branch>, of any kind but review or harness, runs in a worktree on that
     branch (made from the remote's when there is no local one) and `ttp push --own` fast-forwards it.
