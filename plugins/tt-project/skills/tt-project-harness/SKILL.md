@@ -79,6 +79,8 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 
 - The daemon sets `TTP_NO_DEVICE=1` for a task run that holds no device (not tagged `needs_device`,
   no `*-device` resource or device lock), and `0` for one that does. Hooks can honour it.
+  `ttp lock` on a device resource sets it to `0` for its command, and `ttp devq` runners and jobs
+  never inherit it: those are the sanctioned ways to a device.
 - For a pytest repo whose tests open a device through fixtures, ship `ttp_no_device.py` from this
   skill's folder: copy it next to the repo's root `conftest.py` and add
   `pytest_plugins = ["ttp_no_device"]`. Under `TTP_NO_DEVICE=1` it deselects tests that use a device

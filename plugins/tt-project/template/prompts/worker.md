@@ -57,12 +57,13 @@ Other workers run at the same time as you, on other tasks of this project.
 - Shared things (a device, a reserved machine, a remote build directory) are used one command at a
   time: wrap each command that touches one in `ttp lock <resource> -- <command>`, and hold it only
   as long as that command needs. A device broker or queue that already serializes access is enough.
-- `TTP_NO_DEVICE=1` in your environment means your task holds no device: never open one, not even
-  through a test fixture. Run only the exact test ids or `-k` expression your change (or the
-  reviewed task) used. Deselect by marker (`-m 'not device'`) only after `pytest --markers` shows
-  the repo defines it: an unknown marker deselects nothing.
   If `ttp lock` exits 75, the resource stayed busy or is paused: hand off `waiting` naming it,
   with `retry_when` `ttp lock --probe <resource>` (exits 0 once it is free).
+- `TTP_NO_DEVICE=1` in your environment means your task holds no device: open one only through the
+  device broker, `ttp devq` or `ttp lock` on a device resource, never directly, not even through a
+  test fixture. Run only the exact test ids or `-k` expression your change (or the reviewed task)
+  used. Deselect by marker (`-m 'not device'`) only after `pytest --markers` shows the repo
+  defines it: an unknown marker deselects nothing.
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)

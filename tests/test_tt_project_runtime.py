@@ -38278,6 +38278,17 @@ def test_nested_device_locks_do_not_deadlock(env):
     assert r.stdout.strip() == "device-a"
 
 
+def test_lock_of_a_device_resource_clears_an_inherited_ttp_no_device(env):
+    """`ttp lock` on a configured device lock or a `*-device` resource is the sanctioned way to a device:
+    its command never inherits a CPU-only run's TTP_NO_DEVICE=1; any other lock keeps it."""
+    p = _device_project(env)
+    show = [sys.executable, "-c", "import os; print(os.environ.get('TTP_NO_DEVICE'))"]
+    for res, want in (("device-b", "0"), ("box-device", "0"), ("build-dir", "1")):
+        r = _ttp_run(p, "lock", res, "--", *show, env={"TTP_NO_DEVICE": "1"})
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == want, res
+
+
 def test_nested_lock_of_the_same_resource_passes_through_without_device_config(env):
     p = _device_project(env, device=False)
     r = _ttp_run(p, "lock", "--timeout", "5", "board", "--", sys.executable, str(TTP), "lock", "--timeout", "5",
@@ -39585,6 +39596,20 @@ def test_devq_a_job_runs_under_the_config_it_was_submitted_with(env, devq_dir, m
     finally:
         (d / "runner.pid").unlink()   # it holds this test's own pid, which the fixture would kill
     assert seen == [120]
+
+
+def test_devq_runner_and_its_jobs_never_inherit_ttp_no_device(devq_dir, tmp_path):
+    """A runner started from a CPU-only run (TTP_NO_DEVICE=1) is the device path and outlives that run:
+    neither its health check nor any job it runs sees TTP_NO_DEVICE=1."""
+    d, seen = devq_dir, tmp_path / "seen"
+    cfg = {**DEVQ_FAST, "health": f'echo "health=${{TTP_NO_DEVICE-unset}}" >> {seen}'}
+    r = subprocess.run([sys.executable, str(DEVQ), "submit", str(d), json.dumps(cfg),
+                        json.dumps({"id": "j1", "cmd": f'echo "job=${{TTP_NO_DEVICE-unset}}" >> {seen}'})],
+                       capture_output=True, text=True, timeout=30, env={**os.environ, "TTP_NO_DEVICE": "1"})
+    assert r.returncode == 0, r.stderr
+    assert _devq_marker(d, "j1")["status"] == "done"
+    lines = seen.read_text().split()
+    assert "job=unset" in lines and "health=unset" in lines, lines
 
 
 def test_devq_runs_jobs_in_order_once_the_health_gate_passes_and_writes_done_markers(devq_dir, tmp_path):
@@ -49848,4 +49873,5 @@ def test_the_daemons_review_spec_reuses_the_tasks_test_selection(env):
     spec = " ".join(review["spec"].split())
     assert "Test it with the task's own test selection (the exact test ids or `-k` expression" in spec
     assert "never a marker the repo may not define" in spec
-    assert "With `TTP_NO_DEVICE=1` run nothing that opens a device." in spec
+    assert ("With `TTP_NO_DEVICE=1` open a device only through the device broker, `ttp devq` or `ttp lock` "
+            "on a device resource, never directly." in spec)

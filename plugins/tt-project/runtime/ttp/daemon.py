@@ -5918,7 +5918,8 @@ class Daemon:
                      "that its tests fail without it.")
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
                      "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
-                     "With `TTP_NO_DEVICE=1` run nothing that opens a device.")
+                     "With `TTP_NO_DEVICE=1` open a device only through the device broker, `ttp devq` or "
+                     "`ttp lock` on a device resource, never directly.")
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
         delivered = push.delivered_pr(self.p, task, full)

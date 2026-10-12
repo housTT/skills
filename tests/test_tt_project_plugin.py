@@ -790,6 +790,12 @@ def test_runs_without_a_device_never_open_one_through_tests():
     assert "`TTP_NO_DEVICE=1` in your environment means your task holds no device" in worker
     assert "exact test ids or `-k` expression" in worker
     assert "only after `pytest --markers` shows the repo defines it" in worker
+    assert "open one only through the device broker, `ttp devq` or `ttp lock` on a device resource" in worker
+    # The `ttp lock` bullet stays whole: its exit-75 guidance is not split off by another bullet.
+    raw = (prompts / "worker.md").read_text(encoding="utf-8")
+    start = raw.index("wrap each command that touches one in `ttp lock")
+    end = raw.index("`ttp lock --probe <resource>`", start)
+    assert "\n- " not in raw[start:end]
     skill = " ".join((SKILLS / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8").split())
     assert "TTP_NO_DEVICE=1" in skill and "ttp_no_device.py" in skill
     assert (SKILLS / "tt-project-harness" / "ttp_no_device.py").is_file()

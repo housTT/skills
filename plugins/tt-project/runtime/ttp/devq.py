@@ -848,6 +848,12 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     return 0 if rc == 3 else rc
 
 
+def _env(**extra: str) -> dict:
+    """The environment for the runner and its jobs: never a submitting run's `TTP_NO_DEVICE` (the
+    runner is the device path, and outlives that run)."""
+    return {**{k: v for k, v in os.environ.items() if k != "TTP_NO_DEVICE"}, **extra}
+
+
 def start(d: Path, cfg: dict) -> int:
     """Start the runner unless one is up. Safe to call any number of times."""
     _dirs(d)
@@ -862,7 +868,7 @@ def start(d: Path, cfg: dict) -> int:
         return 3
     with open(d / "runner.out", "a") as out:
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", str(d)], cwd=str(d),
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=_env())
     for _ in range(100):
         if runner_alive(d):
             print(f"runner started (pid {proc.pid})")
@@ -950,7 +956,7 @@ class Runner:
         try:
             p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=str(self.d), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 env={**os.environ, **(env or {})}, start_new_session=True)
+                                 env=_env(**(env or {})), start_new_session=True)
         except OSError as e:
             return 127, str(e)
         self._helper = p
@@ -1049,8 +1055,8 @@ class Runner:
             p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), spec["cmd"], str(lockf)],
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env={**os.environ, "TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"]),
-                                      "TTP_DEVQ_TIMEOUT_S": str(int(self.limit(spec)))},
+                                 env=_env(TTP_DEVQ_JOB=job, TTP_DEVQ_CONFIG=str(spec["config"]),
+                                           TTP_DEVQ_TIMEOUT_S=str(int(self.limit(spec)))),
                                  pass_fds=(lock.fileno(),))
         except OSError:
             for k in ("attempts", "log", "cur"):

@@ -1962,6 +1962,8 @@ def cmd_lock(a) -> None:
     if res in held_locks:
         sys.exit(subprocess.call(cmd))   # an enclosing `ttp lock` of this command holds it already
     child_env = {**os.environ, "TTP_LOCKS_HELD": ",".join(held_locks + [res])}
+    if res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device"):
+        child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
     detached = bool(os.environ.get("TTP_DETACHED"))
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     try:
