@@ -6,8 +6,10 @@ background it decided against (open tasks, asks, schedules, red budget gates, pa
 and memory, open high or critical alerts, the push queue). A later batch of events that such a
 turn already saw, against the same background, would decide nothing again: the daemon settles its
 events without a model run and logs the skip, with the dollars the matching turn cost as the
-saving. Never skipped: user messages, an escalation rerun, a blocker sweep, and any high or
-critical event. Records last `coordinator.skip_repeat_window_s` (a day); 0 turns the gate off."""
+saving. Never skipped: user messages, an escalation rerun, a blocker sweep, any high or
+critical event, any event of a kind that raises the turn's effort (coordinator.UNBLOCK_KINDS), and
+any batch coordinator.effort_triggers finds tricky or blocking (repeated failures or waits, held
+work). Records last `coordinator.skip_repeat_window_s` (a day); 0 turns the gate off."""
 from __future__ import annotations
 
 import hashlib
@@ -81,12 +83,14 @@ def record(db, cfg: dict, note: dict, run: int | None, usd: float, now: float | 
 
 
 def repeat(db, cfg: dict, evs: list[dict], msgs: list, gate: dict, now: float,
-           sweep_kind: str, escalated: bool) -> dict | None:
-    """The no-op turns whose material content covers this batch, or None when it must run."""
+           sweep_kind: str, escalated: bool, triggers: list | None = None,
+           unblock_kinds=frozenset()) -> dict | None:
+    """The no-op turns whose material content covers this batch, or None when it must run.
+    `triggers`: the turn's effort triggers; a tricky or blocking turn always runs."""
     keep = window(cfg)
-    if not keep or msgs or escalated or not evs or not gate.get("keys"):
+    if not keep or msgs or escalated or triggers or not evs or not gate.get("keys"):
         return None
-    if any(e["kind"] == sweep_kind or e["severity"] in URGENT for e in evs):
+    if any(e["kind"] == sweep_kind or e["kind"] in unblock_kinds or e["severity"] in URGENT for e in evs):
         return None
     same = [s for s in _seen(db, now, keep) if s.get("bg") == gate["bg"]]
     want, by = set(gate["keys"]), []

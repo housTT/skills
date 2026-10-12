@@ -2285,6 +2285,70 @@ def test_a_batch_a_noop_turn_already_met_is_skipped_without_a_model_run(env, mon
     assert not turngate.repeat(p.db, d.cfg, evs, [], {"bg": "y", "keys": ["k"]}, clock[0], sweep.SWEEP_KIND, False)
 
 
+def test_the_turn_gate_never_skips_a_batch_that_raises_the_coordinators_effort(env, monkeypatch):
+    """A cost gate must not bypass a safety trigger: a batch with an event of an effort kind
+    (coordinator.UNBLOCK_KINDS), or one coordinator.effort_triggers finds tricky (a task failing again),
+    runs its turn even when a no-op turn met the same content; a plain notice repeat is still skipped."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp import turngate
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    task = p.db.add_task("feature", "s", origin="user")
+    p.db.update_task(task, status="running")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    notes = []
+
+    def start_run(role, prompt, *a, **k):
+        notes.append(k["note"])
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def event(kind, text):
+        clock[0] += 600
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (clock[0], f"task:{task}", kind, "normal", text, "queued", task))
+        clock[0] += 60
+        n = len(notes)
+        d.maybe_coordinate()
+        if len(notes) == n:
+            return None
+        rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+        usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="",
+                                final_text="", cost_usd=0.2)
+        d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
+        return notes[-1]
+
+    # The reviewed case: the same failure, numbers aside, after a no-op turn met the first one.
+    for attempt in (1, 2, 3):
+        p.db.x("INSERT INTO runs(role,task,started,ended,status) VALUES('worker',?,?,?,'failed')",
+               (task, clock[0], clock[0]))
+        ran = event("task_failed", f"#{task}: exit 1 (attempt {attempt} of 3)")
+        assert ran, f"failure {attempt} runs its turn"
+    assert "repeated failures" in ran["triggers"]
+    # A notice whose kind is routine, but whose task keeps failing: effort_triggers raises it.
+    assert event("local_only", "branch b exists only on this machine, 2 commits ahead")
+    ran = event("local_only", "branch b exists only on this machine, 3 commits ahead")
+    assert ran and "repeated failures" in ran["triggers"]
+    assert turngate.skipped(p.db, 0)["n"] == 0
+    # Every effort kind runs, with effort_triggers itself quiet: the kind alone keeps the turn.
+    monkeypatch.setattr(coord, "effort_triggers", lambda *a, **k: ([], {}))
+    p.db.x("DELETE FROM runs WHERE role='worker'")
+    for kind in sorted(coord.UNBLOCK_KINDS):
+        event(kind, f"{kind} 1")
+        assert event(kind, f"{kind} 2") is not None, f"a repeated {kind} is never skipped"
+        p.db.x("DELETE FROM runs WHERE role='coordinator'")   # stay under max_turns_per_hour
+    assert turngate.skipped(p.db, 0)["n"] == 0
+    # The plain notice repeat is still skipped.
+    event("local_only", "branch c exists only on this machine, 2 commits ahead")
+    assert event("local_only", "branch c exists only on this machine, 5 commits ahead") is None
+    assert turngate.skipped(p.db, 0)["n"] == 1
+
 def test_the_daily_review_never_lifts_a_pause_the_user_set():
     review = " ".join((RUNTIME.parent / "template" / "prompts" / "daily-review.md").read_text().split())
     assert "A resource pause the user set is never lifted without the user's word" in review

@@ -3388,10 +3388,15 @@ class Daemon:
         if evs and not msgs and not esc:
             try:
                 # A batch a turn that decided nothing already met, against the same state, is settled
-                # without a model run (turngate.py).
-                seen_now = turngate.material(db, wake_fingerprint(self.p, {k: g.as_dict() for k, g in self.gates.items()}),
-                                         [e["id"] for e in evs])
-                match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND, bool(esc))
+                # without a model run (turngate.py). A batch with an effort trigger always runs; the
+                # triggers' seen-state is saved only by a turn that starts, so here it is dropped.
+                gates_now = {k: g.as_dict() for k, g in self.gates.items()}
+                seen_now = turngate.material(db, wake_fingerprint(self.p, gates_now), [e["id"] for e in evs])
+                pre = [] if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs) else \
+                    coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], None, [], gates_now, now,
+                                          coord.charter_conflicts(self.p))[0]
+                match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND, bool(esc),
+                                        pre, coord.UNBLOCK_KINDS)
                 if match:
                     turngate.skip(db, evs, match, now)
                     log(self.p, f"coordinator turn skipped: events {[e['id'] for e in evs]} repeat what "
