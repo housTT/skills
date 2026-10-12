@@ -6193,7 +6193,7 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     p.charter_path.write_text(base)
     err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
                            "text": "Workers may push to the main branch for hotfixes."}], turn=60, user_turn=True)
-    assert "two equal fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
+    assert "three fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
 
 _SELF_HEALING = ("Self-healing (prime directive): keep the project stable without the user. Keep checking "
                  "everything the project is responsible for (its workers, daemon, schedules, watchers and the "
@@ -6348,7 +6348,8 @@ def test_text_put_into_a_bullet_item_keeps_one_bullet_in_and_out_of_user_turns(e
 
 
 def _retries(db):
-    return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry'")]
+    return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry' "
+                                    "AND text NOT LIKE '%immediate retry%'")]
 
 
 def test_a_guard_refused_charter_change_is_never_raised_again(env):
@@ -6921,6 +6922,154 @@ def test_a_users_yes_to_a_charter_change_stays_valid_until_it_is_applied(env):
     assert len(err) == 1 and "expired after 7 days" in err[0], err
     assert "coordinator.charter_approval_days" in coord.USER_SETTABLE
     assert "Keep the docs generic.\n" in p.charter_path.read_text()
+
+
+# A permanent push rule, an unrelated sibling that shares words with it, and other bans.
+_PUSH_ITEM = "Push only to branch work/x of the demo repo. Never push to main. Never open pull requests."
+_EXC_CHARTER = ("# demo\n\n## Restrictions\n- " + _PUSH_ITEM + "\n"
+                "- Every change keeps the demo repo's test suite green and its validator passing.\n"
+                "- Never modify another project's harness or state.\n"
+                "- User-set device pauses are lifted only on the user's explicit word.\n\n## Policies\nReview first.\n")
+_EXCEPTION = ("One-time exception (user, ask {ask}): stray tmp/* branches on the demo repo that this project's runs "
+              "created may be deleted (a deletion only; nothing is pushed to them).")
+_COMPANION = ("Push only to branch work/x of the demo repo, except the stray branch deletions the temporary "
+              "one-time exception (ask {ask}) allows while it lasts. Never push to main. Never open pull requests.")
+
+
+def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_its_yes(env):
+    """Replays a refusal: the user said yes to a temporary exception; the coordinator then quoted the
+    permanent item and sent it back naming the exception, as its prompt requires. The guard refused the
+    exception as contradicting the item, the companion in a later turn as 'other text' than the yes, and
+    the companion in a user turn as contradicting an unrelated sibling item."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    ask = db.post("out", "May stray tmp/* branches be deleted once?", kind="ask")
+    yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web-session")
+    exc = {"type": "charter_update", "section": "Restrictions", "text": _EXCEPTION.format(ask=ask),
+           "until": "the branch cleanup task is done"}
+    comp = {"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM,
+            "text": _COMPANION.format(ask=ask)}
+    # The turn of the yes: the guard refuses the exception, naming the exact forms that pass.
+    p.charter_path.write_text(_EXC_CHARTER)
+    err = coord.apply(p, [exc], turn=1, user_turn=True, messages=[yes])
+    assert len(err) == 1 and "`both_hold`: true and add a companion edit" in err[0], err
+    # A later turn without a user message: the exception with `both_hold`, then the companion edit,
+    # both on that yes.
+    assert coord.apply(p, [{**exc, "both_hold": True}], turn=2) == []
+    got = p.charter_path.read_text()
+    assert _EXCEPTION.format(ask=ask) in got and "- " + _PUSH_ITEM in got, got
+    assert coord.apply(p, [comp], turn=3) == []
+    got = p.charter_path.read_text()
+    assert _COMPANION.format(ask=ask) in got and _PUSH_ITEM not in got, got
+    assert "Every change keeps" in got and any("to the exception it names" in x for x in db.kv(coord.NOTES_KEY))
+    # Both in the user's own turn: neither is refused, and the companion is never checked against a sibling.
+    p.charter_path.write_text(_EXC_CHARTER)
+    db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
+    assert coord.apply(p, [{**exc, "both_hold": True}, comp], turn=4, user_turn=True, messages=[yes]) == []
+    assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
+    recs = db.kv(coord.CHARTER_APPROVALS_KEY)
+    assert len(recs) == 1 and recs[0]["used"] and recs[0]["messages"] == [yes], recs   # never applied again
+    p.charter_path.write_text(_EXC_CHARTER)
+    assert coord.apply(p, [comp], turn=5) == [], "a later companion edit passes on that yes too"
+    p.charter_path.write_text(_EXC_CHARTER)
+    assert coord.apply(p, [comp], turn=6, user_turn=True, messages=[yes]) == []
+    # The yes recorded under the item, as when the guard refused the exception itself: still covered.
+    p.charter_path.write_text(_EXC_CHARTER)
+    db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
+    coord._record_charter_approval(p, [yes], "Restrictions", _PUSH_ITEM, "", _EXCEPTION.format(ask=ask), None,
+                                   coord.GUARD_REJECTED)
+    assert coord.apply(p, [comp], turn=7) == []
+    assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
+    assert not db.kv(coord.CHARTER_APPROVALS_KEY)[0]["used"], "the exception's own yes is left to it"
+
+
+def test_the_guard_still_refuses_a_removal_or_real_loosening_without_the_users_word(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_EXC_CHARTER)
+    ask = db.post("out", "May stray tmp/* branches be deleted once?", kind="ask")
+    comp = {"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM,
+            "text": _COMPANION.format(ask=ask)}
+    # No yes on record: a companion edit, a removal and a rewrite that drops a ban are all refused.
+    for a in (comp, {**comp, "text": ""},
+              {**comp, "text": "Push only to branch work/x of the demo repo. Never open pull requests."}):
+        err = coord.apply(p, [a], turn=1)
+        assert len(err) == 1 and "needs the user's word" in err[0], err
+    assert "- " + _PUSH_ITEM in p.charter_path.read_text()
+    # With a yes to the exception on record: an edit that drops words, or adds a clause naming no
+    # exception, is no companion, and the yes (for the exception) does not cover it.
+    yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web-session")
+    exc = {"type": "charter_update", "section": "Restrictions", "text": _EXCEPTION.format(ask=ask),
+           "until": "the branch cleanup task is done"}
+    assert coord.apply(p, [{**exc, "both_hold": True}], turn=2, user_turn=True, messages=[yes]) == []
+    for text in ("Push only to branch work/x of the demo repo, except the deletions the temporary exception "
+                 "allows. Never open pull requests.",
+                 "Push only to branch work/x of the demo repo, except any branch a worker picks. Never push to "
+                 "main. Never open pull requests."):
+        err = coord.apply(p, [{**comp, "text": text}], turn=3)
+        assert len(err) == 1 and "needs the user's word" in err[0], err
+    assert "- " + _PUSH_ITEM in p.charter_path.read_text()
+    # A real lift outside Restrictions with no yes: refused while the ban stands, naming the forms
+    # that pass; saying it loosens nothing does not let a sentence that lifts the ban through.
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                           "text": "Workers may push to main for hotfixes."}], turn=4)
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0] and "Never push to main" in err[0], err
+    assert "companion edit" in err[0] and "loosens no restriction" in err[0], err
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                           "text": "Workers may push to main. This loosens no restriction."}], turn=5)
+    assert len(err) == 1 and "Never push to main" in err[0], err
+
+
+_SWEEP = ("Blocker sweep (user, high priority): at least once every 6 hours the coordinator re-evaluates every "
+          "blocked, waiting and paused item. Each item gets exactly one recorded outcome: unblocked, rerouted "
+          "(another box or account the charter allows), retired, or still blocked. Box health comes from the "
+          "broker, and pauses the coordinator set itself are lifted once the box is healthy. A harness upgrade "
+          "can never be blocked by the project's own task machinery.")
+
+
+def test_a_duty_that_shares_words_with_bans_and_loosens_nothing_is_not_refused(env):
+    """Replays a refusal: a blocker-sweep policy was refused as contradicting every ban it shared a word
+    with ('box', 'project', 'harness', 'pauses'), though it lifts none of them."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    said = db.post("in", "add the blocker sweep", chat=None, channel="web", kind="user", provenance="web-session")
+    # Without saying so it may lift the pauses item ("lifted"): refused, naming the form that passes.
+    p.charter_path.write_text(_EXC_CHARTER)
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": _SWEEP}], turn=1,
+                      user_turn=True, messages=[said])
+    assert len(err) == 1 and "say in the text that it loosens no restriction" in err[0], err
+    # Saying so, as the refused text did: it goes in, in the user's turn or on its yes later.
+    for turn, kw in ((2, {"user_turn": True, "messages": [said]}), (3, {})):
+        p.charter_path.write_text(_EXC_CHARTER)
+        text = _SWEEP + " This loosens no Restriction."
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}], turn=turn,
+                           **kw) == []
+        assert text in " ".join(p.charter_path.read_text().split())
+    assert not coord._may_lift("A harness upgrade can never be blocked.")
+    assert coord._may_lift("Workers may push to main.")
+
+
+def test_a_fixable_charter_refusal_raises_a_capped_immediate_retry(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_EXC_CHARTER)
+    lift = {"type": "charter_update", "section": "Policies", "text": "Workers may push to main for hotfixes."}
+    for turn in (1, 1, 2, 3):   # turn 1 retried: counted once; two immediate retries per change, then none
+        assert len(coord.apply(p, [lift], turn=turn)) == 1
+    def now():
+        return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry' ORDER BY id")]
+    out = now()
+    assert len(out) == 2 and "immediate retry 1 of 2" in out[0] and "immediate retry 2 of 2" in out[1], out
+    assert "Never push to main" in out[0] and "`both_hold`" in out[0] and "charter_retry" in coord.UNBLOCK_KINDS
+    assert {r["status"] for r in db.q("SELECT status FROM events WHERE kind='charter_retry'")} == {"queued"}
+    # A refusal whose only fix is the user's word raises none.
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM, "text": ""}],
+                      turn=4)
+    assert len(err) == 1 and "needs the user's word" in err[0] and len(now()) == 2, err
 
 
 def test_only_the_users_own_turn_records_a_charter_approval(env):

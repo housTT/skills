@@ -231,15 +231,22 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   Policies or other) that says otherwise: workers see Restrictions verbatim as binding and obey
   the old item. A temporary loosening of a permanent item also `quote`s that item, `text` naming
   the exception ("Never push to the main branch, except as the temporary section allows"), so
-  the two cannot both bind. Such a change also merges the permanent Restrictions sections into
+  the two cannot both bind. Send the exception with `both_hold`: true, then that companion edit:
+  the item kept word for word, only a clause added that names the exception ("..., except as the
+  temporary exception (ask N) allows"). The user's yes to the exception covers the companion in
+  that turn or a later one; it is checked against its own item only. Such a change also merges the permanent Restrictions sections into
   one block (temporary ones stay separate with their end); what goes is kept in CHARTER.history.md.
   Example: Restrictions says "Never modify main." and the user says "pushing to main is allowed":
   send `{"section": "Restrictions", "quote": "Never modify main.", "text": "Pushing to main is
   allowed."}`, never an appended "Pushing to main is allowed." next to the old line. Text that
   touches what a standing item is about (the same action or target, even a new ban or a scoped
-  lift) is rejected, quoting it; resend it with `quote` (`both_hold`: true when both truly hold).
-  In the user's turn only a sentence that may lift such an item ("may", "allowed", "except") is
-  rejected: a duty or goal that just shares words goes in, and a note names the items it overlaps.
+  lift) is rejected, quoting it and naming the forms that pass: resend it with `quote` when it
+  replaces the item, with `both_hold`: true plus the companion edit for an exception, or with
+  `both_hold`: true when both truly hold. In the user's turn only a sentence that may lift such an
+  item ("may", "allowed", "except"; "can never" is a ban) is rejected: a duty or goal that just
+  shares words goes in, and a note names the items it overlaps. A duty or goal that says so in
+  its text ("This loosens no Restriction.") goes in too, unless a sentence takes the very action
+  an item bans.
   A `quote` with no exact match may still name one whole item, or text inside one item, by its
   words (bullet, case, spacing, smart quotes and end punctuation aside); a quote spanning items
   needs their exact text, or `replaces`. A miss names the closest items: resend one exactly. A `## Charter conflicts` digest section lists item pairs that
@@ -251,7 +258,9 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   section, target and text, for `coordinator.charter_approval_days` (7 by default). If it is refused
   as different text, used or expired, the rejection says which. A `charter_retry` event raises
   such a pending change once more (a day later, or after a guard change): fix what its error names
-  and send it. One the guard refused is not raised again: its rejection names both fixes.
+  and send it. A refusal whose error names a fix you can make (a resend, `both_hold`, a quote)
+  raises an immediate `charter_retry` (at most two per change): apply that fix in the same turn.
+  One the guard refused is not raised again a day later: its rejection names the fixes.
 - Temporary instructions: when the user's words are temporary ("while X", "until Y", "for now",
   "this week"), record the end with the entry: `expires` (a delay such as `3d` or an ISO time),
   `until` (the end in plain words) and, when a shell check can tell, `until_probe` (read-only,

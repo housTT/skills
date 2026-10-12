@@ -11,6 +11,7 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -1414,10 +1415,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if user_turn:
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
+                    if user_turn and text and not quote and _may_lift(text):
+                        _record_applied_lift(p, messages or [], target, text, key)
                     if ok is not None:
-                        _use_charter_approval(p, ok["id"], key)
+                        if not ok.get("companion"):   # a companion edit leaves the exception's yes to it
+                            _use_charter_approval(p, ok["id"], key)
                         notes.append(f"charter_update: applied on the user's yes in message "
-                                     f"#{', #'.join(map(str, ok['messages']))}, recorded when it first failed")
+                                     f"#{', #'.join(map(str, ok['messages']))}"
+                                     + (" to the exception it names" if ok.get("companion")
+                                        else ", recorded when it first failed"))
                     msg += extra
                     if (quote and target.lower().startswith("restriction")
                             or extra.lower().startswith(" (replaces restriction")):
@@ -1572,6 +1578,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+            if t == "charter_update":
+                _charter_retry_now(p, a, str(e), key)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
     for k, before, upd in new_ask_holds:
@@ -2594,6 +2602,15 @@ _PERMIT_RE = re.compile(r"\b(?:allow\w*|permit\w*|may|can|fine|ok(?:ay)?|lift\w*
                         r"no (?:problem|objection|issue)s?|objects|minds|stops)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
+# A permit word negated is a ban: "an upgrade can never be blocked", "workers may not push".
+_NEGATED_PERMIT_RE = re.compile(r"\b(?:can|may)\s+(?:not|never)\b|\bcannot\b|\bcan['’]t\b", re.I)
+# A clause that names an exception defined elsewhere: "except as the temporary exception (ask 12) allows".
+_EXCEPTION_REF_RE = re.compile(r"\b(?:exceptions?|temporary|dated|one-time|expir\w*|while it lasts)\b|"
+                               r"\bask\s*#?\d+|#\d+", re.I)
+# Text that says it loosens nothing ("This loosens no Restriction."): an added duty, never a lift.
+_NO_LOOSEN_RE = re.compile(r"\b(?:loosens?|lifts?|relax(?:es)?|weakens?)\s+no\s+(?:\w+\s+)?restrictions?\b|"
+                           r"\bdo(?:es)?\s+not\s+(?:loosen|lift|relax|weaken)\s+(?:any|a|the)\s+(?:\w+\s+)?"
+                           r"restrictions?\b|\bloosens?\s+nothing\b", re.I)
 # Actions, by what they do. A generic verb ("touch", "modify", "use") covers every action (_ANY); a
 # write covers every action that changes something (_WRITES); two specific ones conflict only when
 # they are the same.
@@ -2764,30 +2781,56 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
 
 
 def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
-                      lifts_only: bool = False) -> list[tuple[str, str]]:
+                      lifts_only: bool = False, strict: bool = False) -> list[tuple[str, str]]:
     """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals
     or Policies is about, as (item, its section): every item one of its sentences overlaps
     (_overlaps), whatever either one says about it (a lift, a new ban, a condition, a scope). An item
     the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out. A
     false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
-    workers obey it. `lifts_only`: only sentences that may permit or loosen something (_may_lift)."""
+    workers obey it. `lifts_only`: only sentences that may permit or loosen something (_may_lift),
+    and only items they may lift (_lifts_item; `strict`: the same action on the same object)."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
     new, gone = _sentences(text.splitlines()), _loose(quote)
     if lifts_only:
         new = [x for x in new if _may_lift(x)]
     out: list[tuple[str, str]] = []
+    hit = (lambda item, s: _lifts_item(item, s, strict)) if lifts_only else _overlaps
     for item, sec, _ in _restriction_items(charter):
         if ((item, sec) not in out and not (gone and _loose(item) in gone)
-                and not _OWN_EXCEPTION_RE.search(item) and any(_overlaps(item, s) for s in new)):
+                and not _OWN_EXCEPTION_RE.search(item) and any(hit(item, s) for s in new)):
             out.append((item, sec))
     return out
 
 
 def _may_lift(sentence: str) -> bool:
     """Whether a sentence has a word that permits or loosens ("may", "allowed", "except", "no
-    longer"): it may lift a ban it overlaps. A duty, a goal or a new ban has none."""
+    longer"): it may lift a ban it overlaps. A duty, a goal or a new ban has none, and a negated
+    permit ("can never", "may not") is a ban."""
+    sentence = _NEGATED_PERMIT_RE.sub(" ", sentence)
     return bool(_PERMIT_RE.search(sentence) or _LOOSEN_RE.search(sentence))
+
+
+def _lifts_item(item: str, sentence: str, strict: bool = False) -> bool:
+    """Whether a sentence that may lift something (_may_lift) is about what a Restrictions item bans:
+    the item bans (_BAN_RE) and the two overlap (_overlaps; `strict`: the same action on the same
+    object, as for text that says it loosens no restriction)."""
+    return bool(_BAN_RE.search(item)) and _overlaps(item, sentence, strict=strict)
+
+
+def _companion_clause(quote: str, text: str) -> str:
+    """The clause a companion edit adds to the item it quotes, or "": `text` keeps every word of
+    `quote` in order and only inserts words, and the inserted words name an exception (an
+    exception word, and a reference to it: "the temporary exception", "the dated section", "ask
+    12"). Such an edit loosens the item only as far as that exception already does."""
+    q, t = (re.findall(r"[^\s.,;:!?()\"]+", _loose(x)) for x in (quote, text))   # words, punctuation aside
+    if not q or len(t) <= len(q):
+        return ""
+    ops = difflib.SequenceMatcher(a=q, b=t, autojunk=False).get_opcodes()
+    if any(op not in ("equal", "insert") for op, *_ in ops):
+        return ""
+    added = " ".join(" ".join(t[j1:j2]) for op, _, _, j1, j2 in ops if op == "insert")
+    return added if _OWN_EXCEPTION_RE.search(added) and _EXCEPTION_REF_RE.search(added) else ""
 
 
 GUARD_REJECTED = "the old Restrictions item it contradicts still stood"   # _record_charter_approval `failed`
@@ -2809,17 +2852,23 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     charter = p.charter_path.read_text()
     if " ".join(text.split()) in " ".join(charter.split()):
         return ""
+    if quote and _companion_clause(quote, text):
+        return ""   # the quoted item kept whole, naming an exception: no sibling item is touched
     hits = _append_conflicts(charter, section, text, quote)
     if not hits:
         return ""
     said = list(messages or []) if user_turn else list((ok or {}).get("messages") or [])
+    named = "; ".join(f"\"{clip(i, 160)}\"" for i, _ in hits)
+    if _NO_LOOSEN_RE.search(text) and not _append_conflicts(charter, section, text, quote, True, True):
+        # It says it loosens nothing and no sentence takes the same action on what an item bans.
+        return (f"charter_update: {clip(text, 120)!r} went in, taken as holding alongside the Restrictions item "
+                f"{named} (it says it loosens no restriction; workers obey both)")
     if user_turn or ok is not None:
         lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
         if not lifts:
             return (f"charter_update: {clip(text, 120)!r} went in on the user's word, taken as holding alongside "
-                    "the Restrictions item " + "; ".join(f"\"{clip(i, 160)}\"" for i, _ in hits)
-                    + " (it only shares words with them; workers obey both). If the user changed one of them, "
-                      "charter_update its section with `quote` set to it")
+                    f"the Restrictions item {named} (it only shares words with them; workers obey both). If the "
+                    "user changed one of them, charter_update its section with `quote` set to it")
         hits = lifts
     if user_turn:
         _record_charter_approval(p, said, section, quote, "", text, end, "the charter guard: " + GUARD_REJECTED)
@@ -2830,15 +2879,16 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     raise ValueError(
         f"charter_update: {clip(text, 200)!r} contradicts the Restrictions item "
         + "; ".join(f"\"{clip(i, 200)}\" (section {s!r})" for i, s in hits)
-        + ", which would stay standing, and workers obey it as binding. Pick by what the user meant, two "
-          "equal fixes: if this text replaces that item, resend with section "
+        + ", which would stay standing, and workers obey it as binding. Pick by what the user meant, three "
+          "fixes: if this text replaces that item, resend with section "
           f"{first[1]!r}, `quote` \"{first[0]}\" and this `text`"
         + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
         + (", and retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
-        + "; if both hold (this text only adds a limit, a ban or a condition, is the item's "
-          "exception, or is not about the same thing), resend "
-          "with `both_hold`: true, or rewrite the item to name its exception. Never drop a restriction the "
-          "user did not change")
+        + "; if it is an exception to that item, resend it with `both_hold`: true and add a companion edit "
+          f"in section {first[1]!r} (`quote` the item, `text` the same item plus \", except as <the exception> "
+          "allows\"), which passes on the same yes; if both hold (this text only adds a limit, a ban, a "
+          "condition or a duty, or is not about the same thing), resend with `both_hold`: true, or say in the "
+          "text that it loosens no restriction. Never drop a restriction the user did not change")
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
@@ -3216,7 +3266,9 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     """The recorded, unused, unexpired approval (see _record_charter_approval) this change matches
     exactly: same section, same `quote` or the same section `replaces` names (by any of the names
     that resolve to it, or one of the headings an ambiguous one matched), the same text up to
-    whitespace. Else (None, why none counts)."""
+    whitespace. Or a companion edit of a Restrictions item (_companion_clause) that a recorded
+    temporary exception loosens: that record, with this text and `companion` set (not used up).
+    Else (None, why none counts)."""
     have = p.db.kv(CHARTER_APPROVALS_KEY, []) or []
     if not have:
         return None, "No approval of the user's is on record for this change"
@@ -3250,7 +3302,27 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
             found = found or f"The user's yes in message #{ids} expired after {days:g} days; ask again"
         else:
             return rec, ""
+    companion = _DATED.sub("", _ws(section)).lower().startswith("restriction") and _companion_clause(quote, text)
+    for rec in reversed(have) if companion else ():
+        # A companion edit of an item that only names a temporary exception the user said yes to (the
+        # record names the item, or a sentence of it the guard split out): that yes covers it, in the turn of the yes or a later one, used or not (it reconciles the item
+        # with the exception; it lifts nothing the exception does not).
+        if (time.time() - rec["ts"] <= days * 86400 and _may_lift(rec["text"])
+                and _DATED.sub("", rec["section"]).startswith("restriction")
+                and (rec["quote"] in _ws(quote) if rec["quote"] else _overlaps(quote, rec["text"]))):
+            return {**rec, "text": text, "companion": True}, ""
     return None, found or why
+
+
+def _record_applied_lift(p: Project, messages: list[int], section: str, text: str, key: str | None) -> None:
+    """Keep the user's yes to an added text that may lift something (an exception), applied in their
+    turn, on record as already used: it never applies that text again, but a companion edit of an
+    item it loosens (_charter_approval) still passes on it in a later turn."""
+    _record_charter_approval(p, messages, section, "", "", text, None)
+    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
+    rec = next((r for r in reversed(p.db.kv(CHARTER_APPROVALS_KEY, []) or []) if r.get("sha") == sha), None)
+    if rec and not rec.get("used"):
+        _use_charter_approval(p, rec["id"], key)
 
 
 def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
@@ -3270,11 +3342,50 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 3
+CHARTER_GUARD_VERSION = 4
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_quote_hits",
-                       "_item_quote_hits", "_items", "_norm", "_may_lift")
-CHARTER_GUARD_PIN = (3, "1dd6797f084673b4177959b53a76aced9468cef9c17dcc50cd79b8346cc2edd9")
+                       "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
+                       "_charter_approval")
+CHARTER_GUARD_PIN = (4, "2cceca200b492491e54583013544bf1a9d8bf7b8a698786a46df81e6fdd1fc25")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
+
+
+CHARTER_RETRY_NOW_KEY = "charter_retry_now"   # kv: {change id: {"n", "turns"}} of immediate charter retries
+CHARTER_RETRY_NOW_MAX = 2   # immediate retries per change: a resend refused again twice waits for the digest
+# A refusal that names a resend the coordinator can make itself (a quoted resend, `both_hold`, the
+# approved text): no ask, no new word of the user's.
+_CHARTER_FIXABLE_RE = re.compile(r"\bresend\b|send that text|`both_hold`|quote the exact text", re.I)
+
+
+def _charter_retry_now(p: Project, a: dict, err: str, key: str | None) -> str:
+    """Queue a charter_retry event for a refused charter_update whose error names a fix the
+    coordinator can apply (_CHARTER_FIXABLE_RE), so the next turn makes it at once instead of the
+    change waiting for a digest or a day (reraise_charter_changes). At most CHARTER_RETRY_NOW_MAX
+    per change (section, quote, replaces, text), once per turn: it cannot loop. A refusal that needs
+    the user's word or concerns relayed text is left to the digest. Returns the event text, or ""."""
+    if not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err:
+        return ""
+    cid = hashlib.sha256("\n".join(_ws(str(a.get(k) or "")) for k in ("section", "quote", "replaces", "text"))
+                         .encode()).hexdigest()[:16]
+    db = p.db
+    with db.tx():
+        have = db.kv(CHARTER_RETRY_NOW_KEY, {}) or {}
+        mine = have.get(cid) or {"n": 0, "turns": []}
+        if mine["n"] >= CHARTER_RETRY_NOW_MAX or key and key in mine["turns"]:
+            return ""
+        mine = {"n": mine["n"] + 1, "turns": (mine["turns"] + [key])[-5:], "ts": time.time()}
+        have[cid] = mine
+        db.set_kv(CHARTER_RETRY_NOW_KEY, dict(sorted(have.items(), key=lambda x: x[1].get("ts", 0))[-50:]))
+        sent = (f"section {_ws(str(a.get('section') or ''))!r}"
+                + (f", `quote` {clip(_ws(str(a['quote'])), 300)!r}" if a.get("quote") else "")
+                + (f", `replaces` {_ws(str(a['replaces']))!r}" if a.get("replaces") else "")
+                + (f", `text` {clip(_ws(str(a['text'])), 400)!r}" if a.get("text") else ""))
+        msg = (f"A charter_update was refused ({sent}): {clip(err, 1200)}. Apply the fix that error names "
+               f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); if the user has since "
+               "said otherwise, leave it.")
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (time.time(), "harness", "charter_retry", "normal", msg, "queued"))
+    return msg
 
 
 def reraise_charter_changes(p: Project, now: float | None = None) -> list[str]:
