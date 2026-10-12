@@ -28035,6 +28035,70 @@ def test_ttp_task_set_when_rejects_bad_input(env, capsys, args, why):
     assert p.db.task(tid)["result"] == before
 
 
+def test_ttp_task_add_start_when_is_set_at_creation_and_holds_dispatch(env, monkeypatch, capsys):
+    # `ttp task add` then `set-when` left a window in which the daemon could start the task; the
+    # deferral now goes in with the insert, so it never starts before its probe passes.
+    p = make(env)
+    from ttp import cli
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    flag = env["tmp"] / "added.flag"
+    cli.main(["task", "demo", "add", "after the flag", "--spec", "s", "--start-when", f"test -f {flag}",
+              "--why", "the  flag   exists"])
+    tid = _added(p, "after the flag")
+    assert f"task #{tid} queued; starts when: test -f {flag}" in capsys.readouterr().out
+    labels = _labels(p, tid)
+    assert f"start_when:test -f {flag}" in labels and "start_why:the flag exists" in labels
+    assert not _ready(p, tid)
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_deferred(d, tid)
+        assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+    flag.write_text("")
+    _settle_deferred(d, tid, until=lambda: _ready(p, tid))
+    assert _ready(p, tid)
+
+
+def test_ttp_task_add_start_after_and_landed_probe(env, capsys):
+    p = make(env)
+    from ttp import cli
+    cli.main(["task", "demo", "add", "later", "--start-after", "2h", "--start-when", "landed:#4"])
+    tid = _added(p, "later")
+    assert "starts after " in capsys.readouterr().out
+    assert abs(p.db.task(tid)["not_before"] - (time.time() + 2 * 3600)) < 60
+    assert "start_when:landed:#4" in _labels(p, tid) and tid not in [t["id"] for t in p.db.ready_tasks()]
+    cli.main(["task", "demo", "add", "plain"])
+    assert _labels(p, _added(p, "plain")) == [] and p.db.task(_added(p, "plain"))["not_before"] is None
+
+
+@pytest.mark.parametrize("args, why", [
+    (["--start-when", "git log origin/work --oneline | grep -q fix"], "push branch's log"),
+    (["--start-when", "landed:#4 || exit 1"], "not a landed probe"),
+    (["--start-when", "x" * 1001], "start_when must be one shell command"),
+    (["--start-after", "soon"], "start_after"),
+    (["--why", "no probe"], "--why explains a --start-when"),
+])
+def test_ttp_task_add_refuses_a_bad_deferral_and_adds_nothing(env, capsys, args, why):
+    p = make(env)
+    from ttp import cli
+    p.set_config("delivery.push_branch", "work")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "add", "bad", *args])
+    assert why in capsys.readouterr().err
+    assert not p.db.q("SELECT id FROM tasks WHERE title='bad'")
+
+
+def test_ttp_task_deferral_flags_go_only_with_add(env, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), "true", "--start-after", "1h"])
+    assert "go with add" in capsys.readouterr().err
+    assert _labels(p, tid) == []
+
+
 def test_task_update_changes_or_clears_a_deferral(env):
     p = make(env)
     from ttp import coordinator as coord

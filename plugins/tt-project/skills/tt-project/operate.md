@@ -9,7 +9,7 @@
 | `ttp find <name>` | locate by registry, then by chat-log locators |
 | `ttp adopt <name> --host H --dir D` | record where a project lives |
 | `ttp status [<name>] [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions, a newer tt-project release; without a name, the project of the current folder |
-| `ttp task <name> list` / `add "<title>" --spec …` | inspect or queue work by hand |
+| `ttp task <name> list` / `add "<title>" --spec … [--start-when "<cmd>" [--why "<words>"]] [--start-after <2h or ISO time>]` | inspect or queue work by hand; a deferral given to `add` is set with the task, so it never starts before its probe passes (same checks as `task_add`, e.g. `landed:#<id>`; a grep of the push branch's log is refused) |
 | `ttp memory <name> "<fact>" [--kind K] [--standing]` / `--forget <entry> [--why W]` | add a durable fact / retire a stale one to memory/archive/. Prompts get restrictions, preferences, resources and standing entries whole, then the newest decisions and facts that fit. `--standing`: a duty that recurs; retiring it needs `--why` (its end condition or the user's words ending it) |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |
 | `ttp pause <name>` / `resume` | stop starting model runs / start again |
@@ -26,7 +26,7 @@
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back; from a sandbox it asks the running daemon to restart (exit 75 while deferred, 1 on failure) |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
-| `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks |
+| `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks: to defer a new task, give `--start-when` to `add` instead |
 | `ttp landed <sha>` / `ttp landed --task <id>` | probe: exit 0 once the commit, or the task's landing, is on the push branch, also after a rebase gave it a new sha (same patch-id, or same author, date and subject); 1 not yet. `start_when` `landed:#<id>` runs it |
 | `ttp doctor <name>` / `ttp doctor --scheduler` | providers, accounts, Jev, notifications, web / the installed runtime's command-watcher lifecycle (reports at exit 1, an `"error": true` line repaired and reopening, a clean run closing all) in a scratch project, each tick in a fresh process: no model, $0, exit 1 on a failed step; run it after an upgrade instead of the repository's tests, which are not installed |
 | `ttp alerts <name> --after N` | alerts since a message id |

@@ -2241,9 +2241,14 @@ def cmd_adopt(a) -> None:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
+    if a.action != "add" and (a.start_when, a.start_after, a.why) != (None, None, None):
+        die("--start-when, --start-after and --why go with add; for a queued task use set-when")
     if a.action == "add":
-        tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user")
-        print(f"task #{tid} queued")
+        try:
+            tid, note = add_task(p, a)
+        except ValueError as e:
+            die(str(e))
+        print(f"task #{tid} queued" + note)
     elif a.action == "list":
         for t in p.db.q("SELECT id,status,kind,result,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
             print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{t['title']}")
@@ -2261,6 +2266,23 @@ def cmd_task(a) -> None:
             print(set_when(p.db, int(a.title), a.probe, p))
         except ValueError as e:
             die(str(e))
+
+
+def add_task(p, a) -> tuple[int, str]:
+    """`ttp task add`: the task and its deferral (--start-after, --start-when, --why) in one insert, so
+    the daemon can never start it before its probe is set. Same checks as the coordinator's task_add."""
+    from .coordinator import _start_args, defer_labels, marker_only_probe, start_why
+    if not a.title.strip():
+        raise ValueError("add needs a title")
+    d = {"start_after": a.start_after, "start_when": a.start_when, "why": a.why}
+    if a.why is not None and a.start_when is None:
+        raise ValueError("--why explains a --start-when probe; give one")
+    after, when = _start_args(d, {}, p)
+    tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user",
+                        labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
+    stale = marker_only_probe(when)
+    return tid, (f"; starts when: {when}" if when else "") \
+        + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
 
 def set_when(db, tid: int, probe: str | None, p=None) -> str:
@@ -3948,7 +3970,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", required=True)
     s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("task", help="add/list/cancel tasks by hand, or re-point a not-yet-started task's probe")
+    s = sub.add_parser("task", help="add (deferred with --start-when/--start-after)/list/cancel tasks "
+                                       "by hand, or re-point a not-yet-started task's probe")
     s.add_argument("name")
     s.add_argument("action", choices=["add", "list", "cancel", "set-when"])
     s.add_argument("title", nargs="?", default="", help="add: the title; cancel/set-when: the task id")
@@ -3957,6 +3980,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")
     s.add_argument("--priority", type=int, default=3)
+    s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
+    s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
+    s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")
     s.set_defaults(fn=cmd_task)
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
