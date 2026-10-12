@@ -83,8 +83,8 @@ from . import shared
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
-from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
-                      hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
+from .project import (OWN_FLAG, Project, command_env, deep_merge, layered, disk_resume_gb, durable_write,
+                      git_fsync_env, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -5999,10 +5999,12 @@ class Daemon:
             lines.append(self._precheck_line(task, head, checks))
         if notes := own_free(str(rules.get("auto_notes") or ""), own_mode):
             lines.append(notes)
-        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or (
-            elsewhere and not uncreatable and d.get("push_allowed", True)) else "."))
+        own_step = bool(elsewhere and not uncreatable and d.get("push_allowed", True))
+        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or own_step else "."))
+        # A review that publishes with `ttp push --own` carries the branch it publishes onto, as its subject does.
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else [])
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else []) \
+            + ([f"pr_branch:{elsewhere}"] if own_step else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
@@ -6167,6 +6169,22 @@ class Daemon:
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                                   labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
+            # The stack's pr_branch goes with its `ttp push --own` step: the re-review carries it as a label,
+            # and its spec names the fix's branch to publish from (the reviewed branch lacks the fixes).
+            # A step it cannot carry (no pr_branch left, own pushes off) is left out: review only.
+            first_spec = (first.get("spec") or "")[:REVIEW_FIX_SPEC_CHARS]
+            onto = push.pr_elsewhere(self.p, prfix or db.task(fid), d) if d.get("push_allowed", True) else ""
+            publish = bool(OWN_FLAG.search(first_spec))
+            if publish and onto:
+                step = (f"If it passes, publish #{fid}'s head onto its pr_branch {onto} with `ttp push --own --detach` "
+                        f"from #{fid}'s worktree (branch {fbranch}), never from {code['branch']}, which lacks the "
+                        f"fixes; never run plain `ttp push` and do not approve it for the push queue.")
+            elif publish:
+                first_spec = "\n".join(x for ln in first_spec.splitlines() if (x := own_free(ln, "off")))
+                why = ("own pushes are off in this project (delivery.own_push)" if own_push(cfg) == "off" else
+                       f"#{fid} carries no pr_branch to publish onto")
+                step = (f"Review only: {why}. If it passes, hand off `done`; do not push it anywhere or approve it "
+                        f"for the push queue. This overrides any push step in the first review's spec.")
             rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                               "\n".join([
                                   f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
@@ -6175,12 +6193,14 @@ class Daemon:
                                   f"Check each is fixed, then review what changed since. Where the first review's "
                                   f"spec below names a branch or worktree of this stack (such as {code['branch']} or "
                                   f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
-                                  f"The first review's spec (#{first['id']}):\n"
-                                  f"{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
+                                  *([step] if publish else []),
+                                  f"The first review's spec (#{first['id']}):\n{first_spec}"]),
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"]
-                              + ([push.REVIEW_ONLY_LABEL] if only else []), **(pin_of(review) or pin_of(code)))
+                              + ([push.REVIEW_ONLY_LABEL] if only else [])
+                              + ([f"pr_branch:{onto}"] if publish and onto else []),
+                              **(pin_of(review) or pin_of(code)))
             if prfix:
                 extra = "\n".join([
                     f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "

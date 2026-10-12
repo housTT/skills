@@ -35024,6 +35024,65 @@ def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queu
     assert started == []
 
 
+def test_the_re_review_of_a_pr_branch_stack_carries_its_pr_branch_or_no_push_step(env, monkeypatch):
+    """A code task labelled pr_branch:<branch> whose review fails: the daemon's fix and re-review keep
+    delivering onto that branch. The re-review carries the label and says to publish the fix's head
+    from the fix's branch, so `ttp push --own` from there (or from its own branch) publishes onto
+    the pr_branch. A re-review that cannot carry it (the stack carries no pr_branch now, or own
+    pushes are off) has no push step and never mentions --own."""
+    from ttp import push, pushq, worktree
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
+
+    def failed_stack(title):
+        for t in p.db.q("SELECT id FROM tasks WHERE status NOT IN ('done','failed','cancelled')"):
+            p.db.update_task(t["id"], status="cancelled")   # one stack at a time
+        cid, _, _, (rev,) = _finish_code(env, p, title, {f"{title}.py": 3}, labels=["pr_branch:feature/x"])
+        assert "`ttp push --own --detach`" in rev["spec"], rev["spec"]
+        assert "pr_branch:feature/x" in json.loads(rev["labels"])
+        p.db.update_task(rev["id"], status="failed")
+        return cid, rev
+
+    def fix_and_re_review(rev):
+        out = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug")
+        assert out, "no fix queued"
+        return p.db.task(out[0]), p.db.task(out[1])
+
+    cid, rev = failed_stack("one")
+    fix, rr = fix_and_re_review(rev)
+    labels = json.loads(rr["labels"])
+    assert "pr_branch:feature/x" in labels and push.REVIEW_ONLY_LABEL in labels, labels
+    assert (f"publish #{fix['id']}'s head onto its pr_branch feature/x with `ttp push --own --detach` from "
+            f"#{fix['id']}'s worktree (branch {fix['branch']})") in rr["spec"], rr["spec"]
+    # The fix leaves the push to the re-review.
+    assert "do not push it" in fix["spec"] and "--own" not in fix["spec"]
+    path, branch = worktree.ensure(p, fix)
+    _commit(path, "fixed.py", "fixed\n")
+    monkeypatch.setenv("TTP_TASK", str(rr["id"]))
+    assert push.own_target(p, path) == ("origin", "feature/x")
+    # From a branch of its own, too: the label is what it publishes onto.
+    _git_out(path, "checkout", "-q", "-b", f"ttp/t{rr['id']}-re-review")
+    assert push.own_target(p, path) == ("origin", "feature/x")
+
+    # The stack no longer carries a pr_branch: no label, and the first review's --own step is left out.
+    _, rev = failed_stack("two")
+    for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND title='two'"):
+        p.db.update_task(t["id"], labels=[worktree.NO_PR_BRANCH])
+    _, rr = fix_and_re_review(rev)
+    assert not any(lb.startswith("pr_branch:") for lb in json.loads(rr["labels"])), rr["labels"]
+    assert "--own" not in rr["spec"] and "Review only" in rr["spec"], rr["spec"]
+    assert "carries no pr_branch" in rr["spec"]
+
+    # Own pushes turned off since the first review: the re-review never mentions --own.
+    _, rev = failed_stack("three")
+    p.set_config("delivery.own_push", "off")
+    _, rr = fix_and_re_review(rev)
+    assert not any(lb.startswith("pr_branch:") for lb in json.loads(rr["labels"])), rr["labels"]
+    assert "--own" not in rr["spec"] and "own pushes are off" in rr["spec"], rr["spec"]
+
+
 def test_the_review_of_a_task_with_another_pr_branch_publishes_with_own_and_never_approves_for_the_queue(
         env, monkeypatch):
     """A code task whose pr_branch is the push branch gets the usual push step; one whose pr_branch is
