@@ -49,6 +49,7 @@ from . import heal
 from . import pauseends
 from . import hold
 from . import identity
+from . import idlecap
 from . import integrity
 from . import jevuse
 from . import landed
@@ -701,7 +702,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3189,6 +3190,89 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
+
+    def check_idle_capacity(self, every_s: float = 60) -> None:
+        """Model-free idle-capacity wake (idlecap.py): a device resource of the project idle for
+        coordinator.idle_capacity_s while a worker slot is free, the core provider's gate is green
+        or yellow and dispatch would start nothing raises one normal `idle_capacity` event naming it,
+        the running work and the next scheduled check, so the coordinator can queue work for it."""
+        now = time.time()
+        last = getattr(self, "_idle_cap_checked", 0.0)
+        if now - last < every_s:
+            return
+        self._idle_cap_checked = now
+        db = self.p.db
+        grace, rearm = idlecap.settings(self.cfg)
+        st = db.kv(idlecap.STATE_KEY) or {}
+        if grace <= 0 or self.cfg_status == "unavailable":
+            if st:
+                db.set_kv(idlecap.STATE_KEY, {})
+            return
+        try:
+            idle, free = self._idle_devices(now)
+        except Exception:
+            log(self.p, "idle capacity check failed\n" + traceback.format_exc())
+            return
+        may_fire = free > 0 and not self.settling() and now - self._started >= STALL_SETTLE_S
+        new, fired = idlecap.step(st, idle, now, grace, rearm, may_fire)
+        if new != st:
+            db.set_kv(idlecap.STATE_KEY, new)
+        if not fired:
+            return
+        running = [f"#{r['task']} {(r['title'] or '')[:60]}" for r in db.q(
+            "SELECT r.task, t.title FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+            "WHERE r.role!='coordinator' AND r.status='running' ORDER BY r.id")]
+        running += [f"detached jobs of run {Path(h['run_dir']).name} (task #{h.get('task')})"
+                    for h in hold.holding(self.p.state / "holds")]
+        nxt = db.one("SELECT id, not_before FROM tasks WHERE status='queued' AND not_before>? "
+                     "ORDER BY not_before LIMIT 1", (now,))
+        when = (f"#{nxt['id']} at {timefmt.short(float(nxt['not_before']), self.p, now)} "
+                f"(in {(float(nxt['not_before']) - now) / 3600:.1f} h)" if nxt else "")
+        text = idlecap.text(new, fired, now, free, running, when, rearm)
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", idlecap.KIND, f"{idlecap.KIND}:{','.join(fired)}:{int(now)}", "normal",
+              text[:4000], "queued"))
+        log(self.p, f"idle capacity: {', '.join(fired)} idle, {free} slot(s) free; coordinator told")
+
+    def _idle_devices(self, now: float) -> tuple[set[str], int]:
+        """(the project's device resources idle now, worker slots free for new work). Free slots are 0
+        while the core provider's gate is orange or red or holds new work, or a ready task would start
+        now. Paused resources, resources in trouble and machines with an open ledger condition are
+        never idle: they are out of use on purpose or broken."""
+        db, core = self.p.db, self.cfg.get("core_provider") or "claude"
+        open_tasks = db.q("SELECT labels FROM tasks WHERE status IN ('queued','running')")
+        recent = db.q("SELECT labels FROM tasks WHERE created>?", (now - idlecap.LABEL_LOOKBACK_S,))
+        named = {n for t in recent for n in idlecap.task_names(t, self.cfg)}
+        known = machines.load()
+        cands = idlecap.candidates(self.cfg, named, machine_ledger.resource_machines(self.p), known)
+        paused = db.paused_resources()
+        out = {locks.canonical(self.cfg, str(n)) for n in (
+            *paused, *(db.kv("resource_trouble") or {}),
+            *(c.get("alias") or "" for c in machine_ledger.conditions().values() if isinstance(c, dict)))}
+        used = {n for t in open_tasks for n in idlecap.task_names(t, self.cfg)}
+        used |= {locks.canonical(self.cfg, str(r.get("resource"))) for h in hold.holding(self.p.state / "holds")
+                 for r in h.get("resources") or []}
+        idle = set()
+        for c in cands:
+            if any(idlecap.uses(n, c) for n in out | used):
+                continue
+            if locks.held_labels(self._slot_paths(c)) or locks.reserved_by(self._reserve_path(c)):
+                continue
+            idle.add(c)
+        if not idle:
+            return idle, 0
+        gate = self.gates.get(core) or bud.evaluate(db, self.cfg, core, bud.plan_windows(db))
+        busy = {r["provider"]: r["n"] for r in db.q(
+            "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
+        if gate.level in ("orange", "red") or not gate.allow_new_work:
+            return idle, 0
+        free = max(gate.max_parallel - busy.get(core, 0), 0)
+        ready = db.ready_tasks()
+        ctx = {"now": now, "paused": paused, "busy": busy, "committed": None,
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
+        if any(self._start_hold(t, t["provider"] or core, ctx) is None for t in ready):
+            return idle, 0   # dispatch fills the slot first
+        return idle, free
 
     def check_obligations(self) -> None:
         """Urgent user obligations (obligations.py), model-free: file the progress and receipts runs

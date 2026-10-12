@@ -134,6 +134,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # No worker run started for this long while dispatch would start a queued task:
                     # one high observation per stall lists those tasks (Daemon.check_stall; 0: off).
                     "stall_wake_h": 3,
+                    # A device resource of the project idle this long while a slot is free, the gate is
+                    # green or yellow and nothing queued would start: one idle_capacity event (idlecap.py;
+                    # 0: off). Still idle after it: raised again after the rearm, doubling up to 48 h.
+                    "idle_capacity_s": 1500, "idle_capacity_rearm_s": 21600,
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,

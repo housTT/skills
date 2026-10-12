@@ -270,6 +270,14 @@ prolonged whole-box outage.
   offline provider, or the budget gate's slots are never counted: each hold has its own alert.
   Known gap: a hold that is itself wrong (a lock that never clears, a probe that can never pass) is
   not reported by this check; the lock, hold and wait checks cover it.
+- Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
+  config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
+  no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`
+  (1500; 0 turns it off), while a worker slot is free, the gate is green or yellow and dispatch would
+  start nothing, raises one `idle_capacity` event naming it, the running work and the next scheduled
+  check. Paused resources, resources in trouble and machines with an open ledger condition never
+  count. One event per idle stretch; one still idle is raised again only after
+  `coordinator.idle_capacity_rearm_s` (6 h), doubling each time up to 48 h.
 - Network outage (model-free): when every task that could start waits on a probe saying this
   machine cannot reach its host (ssh exit 255), no worker runs and nothing else can start, for
   `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect

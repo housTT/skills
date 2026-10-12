@@ -175,6 +175,9 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   failed or cancelled one carries the branch that one carried, unless its spec names only the
   push branch, that branch was never published (and its spec does not name it), or you set
   `pr_branch` to `""` (task_add, or task_update before it starts): then it lands on the push branch.
+- An `idle_capacity` event: a device the project holds sits idle with free slots and nothing
+  queued for it. Queue useful charter work that uses it (name it in `resources`), or say once in
+  your note that nothing useful remains. Never ask the user about it.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
   out, once the failures are the machine's, not the task's own. A line marked "waits only" is

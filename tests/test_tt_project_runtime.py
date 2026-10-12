@@ -15397,6 +15397,118 @@ def test_stall_check_stays_quiet_when_nothing_is_stalled(env, monkeypatch):
     assert len(check(now + 22.5 * 3600)) == 1
 
 
+def _idle_setup(env, monkeypatch):
+    """A daemon past its start settle with one device resource ("rig-device") and a green gate of two
+    slots; check(at) runs the idle-capacity check at `at` and returns its events."""
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    now = time.time()
+    d = Daemon(p.base)
+    d._started = now - 86400
+    d.cfg["resources"] = {"rig-device": 1}
+    prov = d.cfg.get("core_provider", "claude")
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2)}
+
+    def check(at):
+        d._idle_cap_checked = at - 60
+        monkeypatch.setattr(time, "time", lambda: at)
+        d.check_idle_capacity()
+        return p.db.q("SELECT * FROM events WHERE kind='idle_capacity' ORDER BY id")
+    return p, d, now, prov, check
+
+
+def test_idle_capacity_wakes_the_coordinator_once_per_idle_stretch_with_a_long_doubling_rearm(env, monkeypatch):
+    p, d, now, prov, check = _idle_setup(env, monkeypatch)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(NULL,'worker',?,?,'running')",
+           (prov, now - 3600))
+    later = p.db.add_task("check the slow CPU job", "s", kind="work", tier="light", origin="coordinator",
+                          not_before=now + 3.7 * 3600)
+    assert check(now) == [] and check(now + 20 * 60) == [], "idle for less than the grace raises nothing"
+    evs = check(now + 26 * 60)
+    assert len(evs) == 1, "a device idle past the grace with a free slot and nothing queued raises one event"
+    e = evs[0]
+    assert e["status"] == "queued" and e["severity"] == "normal" and e["source"] == "daemon"
+    assert "rig-device for 26 min" in e["text"] and "1 worker slot(s) free" in e["text"], e["text"]
+    assert f"#{later} at " in e["text"] and "(in 3.3 h)" in e["text"], "it names the next scheduled check"
+    assert "Running: #None " in e["text"], "it names the running work"
+    assert len(check(now + 3.8 * 3600)) == 1, "a ready task dispatch would start comes first"
+    p.db.update_task(later, status="done")
+    for h in (1, 3, 6):
+        assert len(check(now + h * 3600)) == 1, "one event per idle stretch"
+    assert len(check(now + 26 * 60 + 6 * 3600)) == 2, "still idle after the rearm: raised once more"
+    assert len(check(now + 26 * 60 + 11 * 3600)) == 2, "the next rearm is twice as long"
+    assert len(check(now + 26 * 60 + 18 * 3600)) == 3
+    # The stretch ends once the device is used; a new one counts its grace afresh.
+    t = now + 20 * 3600
+    use = p.db.add_task("uses it", "s", kind="work", tier="light", origin="coordinator",
+                        labels=["exclusive:rig-device"], not_before=t + 86400)
+    assert len(check(t)) == 3
+    p.db.update_task(use, status="done")
+    assert len(check(t + 60)) == 3 and len(check(t + 20 * 60)) == 3
+    assert len(check(t + 26 * 60)) == 4, "a new idle stretch raises once its grace has passed"
+    # A restart keeps the stretches: nothing is raised twice.
+    from ttp.daemon import Daemon
+    d2 = Daemon(p.base)
+    d2._started, d2.gates, d2.cfg["resources"] = now - 86400, d.gates, {"rig-device": 1}
+    d2._idle_cap_checked = 0.0
+    monkeypatch.setattr(time, "time", lambda: t + 30 * 60)
+    d2.check_idle_capacity()
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='idle_capacity'")["n"] == 4
+    d.cfg["coordinator"]["idle_capacity_s"] = 0
+    assert len(check(t + 30 * 3600)) == 4 and not p.db.kv("idle_capacity"), "0 turns it off"
+
+
+def test_idle_capacity_stays_quiet_when_paused_gated_full_in_trouble_or_work_is_queued(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    p, d, now, prov, check = _idle_setup(env, monkeypatch)
+    coord.pause_resource(p, "rig-device", True, reason="maintenance", by="user")
+    assert check(now) == [] and check(now + 3600) == [], "a user-paused device is never idle capacity"
+    assert not p.db.kv("idle_capacity")
+    coord.pause_resource(p, "rig-device", False)
+    p.db.set_kv("resource_trouble", {"rig-device": now})
+    assert check(now + 2 * 3600) == [] and check(now + 3 * 3600) == [], "a device in trouble is not idle"
+    p.db.set_kv("resource_trouble", {})
+
+    t = now + 4 * 3600
+    for level in ("red", "orange"):
+        d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2, level=level)}
+        assert check(t) == [] and check(t + 3600) == [], f"a {level} gate raises nothing"
+        t += 2 * 3600
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2, allow_new_work=False)}
+    assert check(t) == [], "a gate that holds new work raises nothing"
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=1)}
+    run = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(NULL,'worker',?,?,'running')",
+                 (prov, t))
+    assert check(t + 3600) == [], "no worker slot free: nothing could start for it"
+    p.db.x("UPDATE runs SET status='ok' WHERE id=?", (run,))
+    ready = p.db.add_task("ready work", "s", kind="work", tier="light", origin="coordinator")
+    assert check(t + 2 * 3600) == [], "dispatch would start queued work first"
+    p.db.update_task(ready, status="cancelled")
+    waiting = p.db.add_task("waits on its device job", "s", kind="work", tier="light", origin="coordinator",
+                            labels=["resource:rig-device"], not_before=t + 86400)
+    assert check(t + 3 * 3600) == [] and check(t + 4 * 3600) == [], "queued work names the device"
+    p.db.update_task(waiting, status="cancelled")
+    # The stretch went on while only the slots or the gate held it back: once they free, it raises.
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2, level="red")}
+    assert check(t + 5 * 3600) == [] and check(t + 6 * 3600) == []
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=2, level="yellow")}
+    assert len(check(t + 6 * 3600 + 60)) == 1, "a yellow gate with a free slot raises the idle stretch"
+
+
+def test_idle_capacity_device_candidates():
+    from ttp import idlecap
+    machines = {"rig": {"tags": ["device"]}, "box": {"tags": ["device", "x86"]}, "cpu": {"tags": ["x86"]}}
+    cfg = {"device": {"locks": ["board", "board-device"]}, "resources": {"build-dir": 2}}
+    got = idlecap.candidates(cfg, {"rig-device", "scratch"}, ["rig", "box", "cpu"], machines)
+    assert got == {"board", "rig-device", "box"}, got
+    assert idlecap.candidates({}, set(), [], {}) == set(), "a project with no device has no idle capacity"
+    assert idlecap.uses("rig", "rig-device") and idlecap.uses("rig-device", "rig") and not idlecap.uses("rig", "box")
+    assert idlecap.task_names({"labels": '["needs_device", "exclusive:board-device"]'}, cfg) == {"board"}
+
+
 def _objects(schema):
     if isinstance(schema, dict):
         if schema.get("type") == "object" or "properties" in schema:
