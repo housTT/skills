@@ -582,6 +582,16 @@ prolonged whole-box outage.
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
+- `delivery.own_push` (`on` by default) says which remote branches besides the push branch
+  `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
+  `pr_branch:` or `rebases:` task). `on`: the task's own or carried branch, created on the remote
+  when new (what draft PRs need). `existing_only`: only onto a branch the remote already has; it
+  never creates one. `off`: none; `ttp push --own` refuses and names the push queue, a
+  `pr_branch:` or `rebases:` task lands on the push branch like any other change, and no spec the
+  daemon writes (reviews, fixes, PR fixes, `review.auto_notes`) mentions `--own`. Set it `off`
+  when the project may push to one branch only. An unknown value reads as `off`. The coordinator
+  may turn it `off` itself; `on` and `existing_only` need the user's word. The default stays `on`
+  so projects that publish draft PRs keep working without a change.
 - `delivery.allow_protected_push_branch` (off by default) lets `ttp push` and the push queue
   publish to a push branch that is `main`, `master` or the remote's default branch. Off, such a
   push branch is refused, the config alert and `ttp doctor` say so, and every review is review

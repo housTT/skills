@@ -43296,6 +43296,94 @@ def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_
     assert "`ttp push --own --detach`" in rev["spec"] and "do not approve it for the push queue" in rev["spec"]
 
 
+def test_own_push_off_refuses_every_own_push_and_names_the_push_queue(env, monkeypatch, capsys):
+    """delivery.own_push off: `ttp push --own` and `--own --detach` push nothing, start no detached
+    push and say how the work lands instead; on (the default) still publishes."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", "30")
+    p.set_config("delivery.own_push", "off")
+    p.set_config("delivery.push_queue", True)
+    capsys.readouterr()
+    for args in (["push", "--own"], ["push", "--own", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "delivery.own_push = off" in err and "approves it for the push queue" in err, err
+    assert not (p.state / "pushes").exists()
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj"
+    # An unknown value fails closed, and the config check names it.
+    from ttp.project import config_problems
+    p.set_config("delivery.own_push", "sometimes")
+    assert _ttp("push", "--own") == 2 and "delivery.own_push = off" in capsys.readouterr().err
+    assert any(x.startswith("delivery.own_push:") for x in config_problems(p.raw_config()))
+    p.set_config("delivery.own_push", "on")
+    assert _ttp("push", "--own") == 0 and _git_out(origin, "rev-parse", "ttp/t30-exp") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_own_push_existing_only_never_creates_a_remote_branch_but_updates_one(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", "existing_only")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    monkeypatch.setenv("TTP_TASK", "30")
+    _commit(repo, "mine.txt", "mine\n")
+    capsys.readouterr()
+    for args in (["push", "--own"], ["push", "--own", "--detach"]):
+        assert _ttp(*args) == 2, args
+        assert "not creating it" in capsys.readouterr().err
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj"
+    # Once the branch exists there, --own moves it on (fast-forward, as always).
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t30-exp")
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t30-exp") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_own_push_off_keeps_own_out_of_daemon_specs_and_a_rebase_lands_through_the_queue(env, monkeypatch):
+    """With own pushes off, a rebases: task's review, its worker prompt and review.auto_notes never
+    mention --own; the review approves it for the push queue, which takes it."""
+    from ttp import coordinator as coord, push, pushq
+    from ttp.prompts import OWN_SECTION, worker_task
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.own_push", "off")
+    p.set_config("review.auto_notes", "Run the linter. If it passes, publish it with `ttp push --own --detach`.")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    _git_out(p.root, "branch", "feature/x")
+    assert coord.apply(p, [{"type": "task_add", "title": "Rebase feature/x onto work", "kind": "code",
+                            "spec": "pr_branch: `feature/x`\nRebase it onto the latest work."}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='Rebase feature/x onto work'")
+    assert json.loads(t["labels"]) == ["rebases:feature/x"]
+    notes = " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert "own pushes are off" in notes and "push --own`" not in notes.replace("never write `--own`", "")
+    prompt = worker_task(p, t, str(p.root), f"ttp/t{t['id']}-rebase")
+    assert "own pushes are off" in prompt and "own pushes=off" in prompt
+    code, _, _, (rev,) = _finish_code(env, p, "rebase it", {"r.py": 3}, labels=["rebases:feature/x"])
+    d = p.config()["delivery"]
+    assert push.pr_elsewhere(p, p.db.task(code), d) == ""
+    assert "--own" not in rev["spec"] and "Run the linter." in rev["spec"], rev["spec"]
+    assert "own pushes are off" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+    assert OWN_SECTION not in worker_task(p, rev, str(p.root), None)
+    # The queue takes the review's approval instead of sending it to --own; with own pushes on it would not.
+    p.set_config("delivery.push_queue", True)
+    approval = [{"branch": p.db.task(code)["branch"], "head": "ab" * 20}]
+    assert "delivers onto its pr_branch" not in str(pushq.check_approval(p, rev, approval))
+    p.set_config("delivery.own_push", "on")
+    assert "delivers onto its pr_branch" in str(pushq.check_approval(p, rev, approval))
+
+
+def test_the_coordinator_may_turn_own_pushes_off_but_only_the_user_turns_them_on(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.own_push", "value": "off"}]) == []
+    assert p.config()["delivery"]["own_push"] == "off"
+    for v in ("on", "existing_only"):
+        out = coord.apply(p, [{"type": "config_set", "key": "delivery.own_push", "value": v}])
+        assert any("needs the user's approval" in x for x in out), out
+    assert p.config()["delivery"]["own_push"] == "off"
+
+
 # One alert per network outage (netwait, Daemon.check_unreachable) -----------------------------------
 NET_PROBE = "ssh -o ConnectTimeout=5 jump.example true"
 NET_OUT = "ssh: connect to host jump.example port 22: Connection timed out"

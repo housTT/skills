@@ -13,7 +13,7 @@ from . import budget as bud
 from . import settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
+from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_queue_on
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
 
 
@@ -32,6 +32,16 @@ def strip_markers(text: str) -> str:
 
 # kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.
 REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the push queue")
+
+
+OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp push --own` section
+
+
+def _sections(text: str, cfg: dict) -> str:
+    """A kind prompt without the push section that does not apply: the plain push's or the queue's,
+    and the `ttp push --own` one while own pushes are off (delivery.own_push)."""
+    text = drop_section(text, REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1])
+    return drop_section(text, OWN_SECTION) if own_push(cfg) == "off" else text
 
 
 def drop_section(text: str, heading: str) -> str:
@@ -249,7 +259,12 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
                     + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
-    if (onto := carried_branch(task)) and branch:
+    own_off = own_push(cfg) == "off"
+    if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):
+        history += (f"\nThis task builds on branch {onto}, but own pushes are off in this project "
+                    f"(delivery.own_push): it lands on the push branch like any other change. Never run "
+                    f"`ttp push --own` or `git push` to {onto} or any other branch.\n")
+    elif (onto := carried_branch(task)) and branch:
         history += (f"\nThis task delivers onto branch {onto} (`ttp push --own --detach`, fast-forward only)"
                     + (": its worktree is on it.\n" if branch == onto else
                        f": it could not be checked out here, so this task works on its own branch, from that "
@@ -264,7 +279,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "workers, so do not install into it; its editable installs import the project root's code, not "
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
-        drop_section(_read(p, f"kind-{kind}.md"), REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1]),
+        _sections(_read(p, f"kind-{kind}.md"), cfg),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
@@ -284,7 +299,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"push allowed={delivery.get('push_allowed', True)}"
         + (f", code tasks may land on {delivery['push_branch']} with ttp push=True"
            if kind == "code" and code_tasks_may_push(cfg) else "")
-        + (", push queue=True" if kind == "review" and push_queue_on(cfg) else "") + "\n"
+        + (", push queue=True" if kind == "review" and push_queue_on(cfg) else "")
+        + (f", own pushes={own_push(cfg)} (delivery.own_push: `ttp push --own` "
+           + ("refuses; never push any branch but the push branch)" if own_off else
+              "publishes only onto a branch the remote already has)") if own_push(cfg) != "on" else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())

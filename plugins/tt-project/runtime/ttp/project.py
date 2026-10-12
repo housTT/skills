@@ -262,7 +262,7 @@ EXTRA_KEYS = {
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch"},
+                 "allow_protected_push_branch", "own_push"},
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -356,6 +356,47 @@ def push_allowed(d: dict) -> bool:
     """delivery.push_allowed of the delivery settings `d` as `ttp push` reads it: unset allows."""
     v = d.get("push_allowed")
     return v is None or v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# delivery.own_push: which remote branches other than delivery.push_branch `ttp push --own` (and any
+# push that publishes as with --own: a notes branch, a pr_branch or rebases: task) may push to.
+# "on" (default): the task's own or carried branch, created on the remote when new (draft PRs).
+# "existing_only": only onto a branch the remote already has; never creates one. "off": none; the
+# push branch, through `ttp push` or the push queue, is the only branch the project pushes, and a
+# pr_branch or rebases: task lands there too. A project whose charter allows only one push branch
+# sets "off". An unknown value reads as "off": a typo never widens what may be pushed.
+OWN_PUSH_MODES = ("on", "existing_only", "off")
+
+
+def own_push_mode(v: Any) -> str:
+    """A delivery.own_push value as one of OWN_PUSH_MODES: unset is "on", true/false are on/off,
+    "existing"/"existing-only" are existing_only, anything else is "off"."""
+    if v is None or v is True:
+        return "on"
+    if v is False:
+        return "off"
+    s = str(v).strip().lower().replace("-", "_")
+    if s in ("on", "true", "yes", "1"):
+        return "on"
+    return "existing_only" if s in ("existing_only", "existing") else "off"
+
+
+def own_push(cfg: dict) -> str:
+    """The project's delivery.own_push mode (own_push_mode)."""
+    return own_push_mode((cfg.get("delivery") or {}).get("own_push"))
+
+
+OWN_FLAG = re.compile(r"(?<![\w-])--own\b")
+
+
+def own_free(text: str, mode: str) -> str:
+    """`text` (a daemon-written spec part such as review.auto_notes), stripped, without its sentences
+    that mention `--own` while own pushes are off (`mode`, own_push): a spec never asks for one then."""
+    text = text.strip()
+    if mode != "off" or not OWN_FLAG.search(text):
+        return text
+    parts = re.split(r"(?<=[.;!?])\s+|\n+", text)
+    return " ".join(x for x in parts if x.strip() and not OWN_FLAG.search(x)).strip()
 
 
 def push_queue_on(cfg: dict) -> bool:
@@ -473,6 +514,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     may_push = delivery.get("code_tasks_may_push", False)
     if not isinstance(may_push, bool):
         out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")
+    own = delivery.get("own_push")
+    if own is not None and not isinstance(own, bool) and \
+            str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):
+        out.append(f"delivery.own_push: {own!r} is not one of {', '.join(OWN_PUSH_MODES)}; `ttp push --own` is off")
     queue = delivery.get("push_queue", False)
     if not isinstance(queue, bool):
         out.append(f"delivery.push_queue: {queue!r} is not true or false; reviews push with ttp push")

@@ -34,7 +34,8 @@ from urllib.parse import quote, unquote
 from . import landed, locks, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
-from .project import Project, durable_append, durable_write, git_fsync_env, nice_level, renice, write_json
+from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
+                      renice, write_json)
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1322,7 +1323,44 @@ def _on_remote(repo: Path, remote: str, branch: str) -> bool:
     return ls.returncode == 0 and any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
 
 
+def own_landing(cfg: dict) -> str:
+    """How work lands while own pushes are off (delivery.own_push): through the push queue or `ttp push`."""
+    d = cfg.get("delivery") or {}
+    to = str(d.get("push_branch") or "").strip()
+    if not to:
+        return "set delivery.push_branch: with no push branch and own pushes off, nothing is pushed"
+    return (f"its review approves it for the push queue, which lands it on {to}" if push_queue_on(cfg) else
+            f"plain `ttp push` lands it on {to}")
+
+
+def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
+    """Refuse (ValueError) a push that publishes `branch` on `remote` as with --own when
+    delivery.own_push forbids it: "off" refuses every one, "existing_only" one the remote does not
+    have yet (or cannot be asked about). A code repo with no git remote (LOCAL) moves only a local
+    branch, which pushes nothing, so it is never refused here."""
+    if remote == LOCAL:
+        return
+    cfg = p.config()
+    mode = own_push(cfg)
+    if mode == "off":
+        raise ValueError(f"own pushes are off in this project (delivery.own_push = off): it pushes to no "
+                         f"remote branch but delivery.push_branch, so {remote}/{branch} is not pushed. Never "
+                         f"publish it another way (no `git push`): {own_landing(cfg)}")
+    if mode == "existing_only" and not _on_remote(repo, remote, branch):
+        raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
+                         f"only onto a branch the remote already has (delivery.own_push = existing_only): not "
+                         f"creating it. Never create it another way (no `git push`): {own_landing(cfg)}")
+
+
 def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
+    """(remote, branch, own) for `ttp push`, each publish as with --own passed through own_gate."""
+    remote, branch, own = _resolve(p, repo, own)
+    if own:
+        own_gate(p, repo, remote, branch)
+    return remote, branch, own
+
+
+def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
     `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
     refused (it would land that task's work: _may_land), a notes branch (is_notes_branch) is published
@@ -1561,7 +1599,14 @@ def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bo
 def pr_elsewhere(p: Project, task: dict | None, d: dict) -> str:
     """The branch a task delivers onto (pr_branch_of) when it is not `delivery.push_branch`, else "".
     Its work goes to that PR with `ttp push --own`: a plain push or a push-queue approval would
-    rebase it onto the push branch, which may be unrelated to it."""
+    rebase it onto the push branch, which may be unrelated to it. "" while own pushes are off
+    (delivery.own_push): the push branch is then the only one, and the task lands there."""
+    return "" if own_push({"delivery": d}) == "off" else labelled_elsewhere(p, task, d)
+
+
+def labelled_elsewhere(p: Project, task: dict | None, d: dict) -> str:
+    """The branch a task's labels deliver onto (pr_branch_of) when it is not `delivery.push_branch`,
+    whatever delivery.own_push says, else ""."""
     onto = pr_branch_of(p, task)
     ref = str(d.get("push_branch") or "").strip()
     if not onto or not ref:

@@ -82,7 +82,7 @@ from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
-                      hostname, nice_level, output_tail, push_allowed, zombie)
+                      hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -5641,11 +5641,16 @@ class Daemon:
         elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)
         # Unless it means to create that branch (its spec asks for `ttp push --own`), a pr_branch the push
         # remote has no branch of is ignored, as the push queue's check_approval ignores it.
-        ignored = ""
+        # Under delivery.own_push existing_only `ttp push --own` cannot create it either, whatever the spec asks.
+        ignored, own_mode = "", own_push(cfg)
         if elsewhere and not worktree.rebased_branch(task) and pushq.enabled(self.p, cfg) \
-                and not settinghold.asks_own(task) and (tgt := pushq.target(self.p)) \
-                and pushq._absent(self.p, tgt[0], elsewhere):
+                and (own_mode == "existing_only" or not settinghold.asks_own(task)) \
+                and (tgt := pushq.target(self.p)) and pushq._absent(self.p, tgt[0], elsewhere):
             ignored, elsewhere = f"Its pr_branch label {elsewhere} was ignored: {tgt[0]} has no such branch.", ""
+        # Own pushes off: a pr_branch or rebases: task lands on the push branch like any other (pr_elsewhere).
+        if own_mode == "off" and not delivered and (onto := push.labelled_elsewhere(self.p, task, d)):
+            ignored = (f"Its branch label {onto} was ignored: own pushes are off in this project "
+                       f"(delivery.own_push), so it lands on {d.get('push_branch')} like any other change.")
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
         off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d)
@@ -5691,8 +5696,8 @@ class Daemon:
         checks = self._precheck(task, full) if pushes else None
         if checks:
             lines.append(self._precheck_line(task, head, checks))
-        if str(rules.get("auto_notes") or "").strip():
-            lines.append(str(rules["auto_notes"]).strip())
+        if notes := own_free(str(rules.get("auto_notes") or ""), own_mode):
+            lines.append(notes)
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or (
             elsewhere and d.get("push_allowed", True)) else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
@@ -5937,16 +5942,20 @@ class Daemon:
         base_title = re.sub(r"^(?:Fix PR findings: )+", "", src["title"])
         tier = src["tier"] if src["tier"] in bud.TIER_ORDER else "standard"
         url = rec.get("url") or key
+        off = own_push(self.cfg) == "off"
         on = (f"This task's branch is the PR's branch {branch}: build on it" if branch and not held else
               f"This task's branch starts from #{src['id']}'s branch head" + (
                   f"; the PR's branch {branch} is checked out elsewhere, and `ttp push --own` publishes this "
-                  f"task's head onto it (fast-forward only)" if branch else ""))
+                  f"task's head onto it (fast-forward only)" if branch and not off else ""))
+        deliver = (f"Own pushes are off in this project (delivery.own_push): do not push anywhere yourself; "
+                   f"{push.own_landing(self.cfg)}. Keep the PR a draft and open no new PR." if off else
+                   "Deliver to that PR: publish onto its branch with `ttp push --own --detach`, keep it a draft "
+                   "and its description current, and open no new PR.")
         spec = "\n".join([
             f"Pull request {url} still has open findings after task #{src['id']} ({src['title']}) finished: {what}.",
             "This task owns them now; no other task does. Fix or answer each bot review comment on the PR "
             "(answers end with the hidden line <!-- ttp -->) and get CI green.",
-            f"{on}. Deliver to that PR: publish onto its branch with `ttp push --own --detach`, keep it a draft "
-            "and its description current, and open no new PR.",
+            f"{on}. {deliver}",
             f"Put {url} in the hand-off's `pr`."])
         with db.tx():
             fid = db.add_task(f"Fix PR findings: {base_title}"[:200], spec, kind="code", tier=tier,
