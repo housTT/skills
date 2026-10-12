@@ -389,7 +389,20 @@ def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") 
                                       f"{' '.join(r2.stderr.split())[:300]}")
     if task:
         for label, text in ([("job id", job), ("workdir", workdir)] + [("script", p) for p, _ in scripts]):
-            other = sorted({m for m in _TASK_ID.findall(text or "") if m.lstrip("0") != str(task).lstrip("0")})
+            identity = text or ""
+            if label != "job id":
+                # Temporary ancestors belong to the launcher, not the submitted job. Keep
+                # ids below that prefix (and in job names), including real task worktrees.
+                prefixes = {os.environ[k] for k in ("TMPDIR", "TMP", "TEMP") if os.environ.get(k)}
+                for prefix in sorted(prefixes, key=len, reverse=True):
+                    if not Path(prefix).is_absolute() or Path(prefix) == Path("/"):
+                        continue
+                    try:
+                        identity = str(Path(identity).relative_to(prefix))
+                        break
+                    except ValueError:
+                        pass
+            other = sorted({m for m in _TASK_ID.findall(identity) if m.lstrip("0") != str(task).lstrip("0")})
             if other:
                 warnings.append(f"the {label} {text} names task {', '.join(other)}, but this is task {task}: "
                                 f"copied from another task? (ignore this if it is not a task id)")

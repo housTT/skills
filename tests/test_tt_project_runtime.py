@@ -13062,7 +13062,10 @@ def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(en
     d.prune_worktrees()
     assert not clean.exists(), "a clean finished worktree was kept"
     assert _git_out(p.root, "rev-parse", clean_branch) == head, "the task branch was lost"
-    assert f"t{t_clean}" not in _git_out(p.root, "worktree", "list"), "the worktree was not pruned from git"
+    worktrees = {pathlib.Path(line.removeprefix("worktree "))
+                 for line in _git_out(p.root, "worktree", "list", "--porcelain").splitlines()
+                 if line.startswith("worktree ")}
+    assert clean not in worktrees, "the worktree was not pruned from git"
     assert dirty.exists() and (dirty / "README.md").read_text() == "edited\n", "uncommitted work was lost"
     assert not any((dirty / c).exists() for c in ("build", "pkg/__pycache__", ".venv")), "caches were kept"
     assert open_.exists() and running.exists() and detached.exists()
@@ -23592,6 +23595,9 @@ def test_checks_a_reboot_killed_start_again_without_a_model_run(env, tmp_path):
     assert _wait_precheck(run_dir) == "0", (run_dir / cli.CHECKS_OUT).read_text()
     info = cli._read_checks_pid(run_dir)
     assert info["boot"] == d.boot and info["worktree"] == str(wt) and info["fresh"] is True, info
+    scratch = pathlib.Path(info['check_run_dir'])
+    assert scratch.parent == p.state / 'check-runs' and re.fullmatch(r'[0-9a-f]{32}', scratch.name)
+    assert not scratch.is_relative_to(wt)
     assert "$ test -f app.py" in (run_dir / "checks.log").read_text(), "not the same checks"
     # A daemon restart on the same boot starts nothing more and wakes nothing, even with them dead again.
     _checks_killed_by_reboot(p, tmp_path, tid)
@@ -39702,6 +39708,45 @@ def test_devq_called_scripts_finds_the_scripts_a_job_command_runs():
         assert called_scripts(unsure, "/w") == [], unsure
 
 
+@pytest.mark.parametrize("scratch_name", ["t1436", "ttp-t1544-checks"])
+def test_devq_task_ids_ignore_only_the_temporary_ancestor(tmp_path, monkeypatch, scratch_name):
+    from ttp import devq
+    scratch = tmp_path / scratch_name
+    scratch.mkdir()
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(key, str(scratch))
+    script = scratch / "t17" / "run.sh"
+    script.parent.mkdir()
+    script.write_text("true\n")
+    errors, warnings = devq.lint(str(script), {}, job="t17-a", workdir=str(script.parent), task="23")
+    assert errors == []
+    assert len(warnings) == 3 and all("names task 17, but this is task 23" in w for w in warnings), warnings
+    script.rename(script.parent / "plain.sh")
+    _, warnings = devq.lint(str(script.parent / "plain.sh"), {}, job="t1436-a", workdir=str(scratch), task="23")
+    assert len(warnings) == 2, warnings
+    assert any("the job id t1436-a names task 1436" in w for w in warnings)
+    # A neighbouring prefix is not the configured scratch directory.
+    neighbour = tmp_path / (scratch_name + "-other") / "t18"
+    _, warnings = devq.lint("true", {}, workdir=str(neighbour), task="23")
+    assert len(warnings) == 1 and "18" in warnings[0], warnings
+    assert ("1436" if scratch_name == "t1436" else "1544") in warnings[0], warnings
+
+
+@pytest.mark.parametrize("scratch_name", ["t1436", "ttp-t1544-checks"])
+def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch_name):
+    scratch = tmp_path / scratch_name
+    scratch.mkdir()
+    names = ("test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost",
+             "test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_id",
+             "test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unless_no_lint")
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q",
+                             *(f"{__file__}::{name}" for name in names)],
+                            cwd=pathlib.Path(__file__).resolve().parents[1],
+                            env={**os.environ, **{k: str(scratch) for k in ("TMPDIR", "TMP", "TEMP")},
+                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_id(tmp_path, monkeypatch):
     from ttp import devq
     good, bad, py = tmp_path / "good.sh", tmp_path / "bad.sh", tmp_path / "x.py"
@@ -48628,17 +48673,33 @@ def test_check_output_detached_outside_worktree_and_unique(env, tmp_path, monkey
         assert not output.is_relative_to(repo), 'check output must not be repository-local'
         assert not scratch.is_relative_to(repo), 'scratch must not be repository-local'
         assert output.is_relative_to(p.state)
+        assert scratch.parent.parent == p.state / 'check-runs'
+        assert re.fullmatch(r'[0-9a-f]{32}', scratch.parent.name), 'scratch name must be neutral'
         assert (output / 'x').read_text() == 'report\n'
         dirs.append(output)
     assert dirs[0] != dirs[1]
 
 
-def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys):
+def _check_output_paths_command():
+    # Check containment before writing: a regression must never try creating root-level files.
+    code = ("import os,json,pathlib,tempfile; "
+            "out=pathlib.Path(os.environ['TTP_RUN_DIR']); "
+            "tmp=pathlib.Path(tempfile.gettempdir()); "
+            "assert out.is_absolute() and out.parent.name == 'check-reports', out; "
+            "assert tmp.parent.parent.name == 'check-runs', tmp; "
+            "assert out.name == tmp.parent.name and out.parent.parent == tmp.parent.parent.parent; "
+            "assert all(os.environ[k] == str(tmp) for k in ('TMPDIR','TMP','TEMP')); "
+            "assert not os.environ.get('TTP_PIDNS') and not os.environ.get('TTP_CGROUP'); "
+            "(out/'pre-commit-cache').mkdir(); "
+            "(out/'result.json').write_text(json.dumps({'output':str(out),'scratch':str(tmp)}))")
+    return shlex.join([sys.executable, '-c', code])
+
+
+@pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
+def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys, run_env):
     from ttp import push
     from ttp.project import Project
-    command = ('test -n "$TTP_RUN_DIR"; test "$TTP_RUN_DIR" != /; '
-               'test -z "${TTP_PIDNS:-}"; test -z "${TTP_CGROUP:-}"; '
-               'echo report > "$TTP_RUN_DIR/x"')
+    command = _check_output_paths_command()
     p, repo, origin, other = _push_setup(env, monkeypatch, [command])
     _commit(repo, 'mine.txt', 'mine\n')
     monkeypatch.setattr(push, '_boxed', lambda: True)
@@ -48653,7 +48714,10 @@ def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys
         pending.append((marker, output))
         shutil.rmtree(output)
     assert pending[0][1] != pending[1][1], 'queued invocations must not collide'
-    monkeypatch.delenv('TTP_RUN_DIR', raising=False)
+    if run_env is None:
+        monkeypatch.delenv('TTP_RUN_DIR', raising=False)
+    else:
+        monkeypatch.setenv('TTP_RUN_DIR', run_env)
     monkeypatch.setenv('TTP_PIDNS', 'must not inherit')
     monkeypatch.setenv('TTP_CGROUP', 'must not inherit')
     push.tend(Project(p.base))  # restart reads only persisted queue data, without the worker's env
@@ -48663,7 +48727,41 @@ def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys
         # Rebuilt storage has no owner record. The narrowed cleanup contract leaves it alone.
         assert _wait_for(lambda: json.loads(marker.read_text()).get('ended'))
         assert output.exists() and not (output / 'owner.json').exists()
-        assert (pathlib.Path(json.loads(marker.read_text())['check_report_dir']) / 'x').read_text() == 'report\n'
+        reports = pathlib.Path(json.loads(marker.read_text())['check_report_dir'])
+        assert reports.parent == p.state / 'check-reports'
+        assert (reports / 'pre-commit-cache').is_dir()
+        paths = json.loads((reports / 'result.json').read_text())
+        assert paths == {'output': str(reports), 'scratch': str(output / 'checks-tmp')}
+
+
+@pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
+def test_check_output_queued_checks_after_restart_without_run_env(env, tmp_path, monkeypatch, capsys, run_env):
+    from ttp import cli, detach
+    from ttp.daemon import Daemon
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv('TTP_PIDNS', 'disposable-command')
+    cli.main(['checks', '--detach', '--', _check_output_paths_command()])
+    assert 'queued' in capsys.readouterr().out
+    assert not (run / cli.CHECKS_PID).exists()
+    q = next((p.state / detach.QUEUE).glob('*.json'))
+    record = json.loads(q.read_text())
+    if run_env is None:
+        monkeypatch.delenv('TTP_RUN_DIR')
+        record['env'].pop('TTP_RUN_DIR', None)
+    else:
+        monkeypatch.setenv('TTP_RUN_DIR', run_env)
+        record['env']['TTP_RUN_DIR'] = run_env
+    q.write_text(json.dumps(record))
+    monkeypatch.delenv('TTP_PIDNS')
+    Daemon(p.base).tend_pushes()  # a fresh daemon has only the persisted request
+    assert _wait_precheck(run) == '0', (run / cli.CHECKS_OUT).read_text()
+    info = cli._read_checks_pid(run)
+    reports = pathlib.Path(info['check_report_dir'])
+    assert reports.is_relative_to(p.state) and not reports.is_relative_to(repo)
+    assert (reports / 'pre-commit-cache').is_dir()
+    paths = json.loads((reports / 'result.json').read_text())
+    assert paths == {'output': str(reports), 'scratch': str(pathlib.Path(info['check_run_dir']) / 'checks-tmp')}
+    assert not q.exists()
 
 
 @pytest.mark.parametrize('value', [None, '', '/', '//', 'relative'])
@@ -48675,6 +48773,20 @@ def test_check_output_missing_or_invalid_fails_closed(env, monkeypatch, value):
         monkeypatch.setenv('TTP_RUN_DIR', value)
     with pytest.raises((OSError, ValueError), match='TTP_RUN_DIR'):
         push.check_env('target')
+
+
+@pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
+def test_detached_checks_without_run_env_refuse_before_launch(env, tmp_path, monkeypatch, capsys, run_env):
+    from ttp import cli, checkdirs
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    if run_env is None:
+        monkeypatch.delenv('TTP_RUN_DIR')
+    else:
+        monkeypatch.setenv('TTP_RUN_DIR', run_env)
+    with pytest.raises(SystemExit) as refused:
+        cli.main(['checks', '--detach', '--', _check_output_paths_command()])
+    assert refused.value.code == 2 and 'only works inside a tt-project run' in capsys.readouterr().err
+    assert not (run / cli.CHECKS_PID).exists() and not (p.state / checkdirs.FOLDER).exists()
 
 
 @pytest.mark.parametrize('kind', ['symlink', 'hardlink', 'fifo'])
