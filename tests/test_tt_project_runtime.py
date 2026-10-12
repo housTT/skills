@@ -29346,6 +29346,62 @@ def test_queued_checks_that_cannot_start_end_the_wait(env, tmp_path, monkeypatch
     assert not q.exists() and not (run / cli.CHECKS_PID).exists()
 
 
+@pytest.mark.parametrize("exit_code", [None, "0\n", "7\n"])
+def test_aged_queued_checks_already_started_are_settled_without_being_lost(env, tmp_path, monkeypatch, capsys, exit_code):
+    from ttp import cli, detach
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    rc = run / cli.CHECKS_RC
+    q = detach.enqueue(p.state, rc, run / "checks.log", [], str(tmp_path), {},
+                       checks={"cmd": ["--", "true"], "fresh": False, "worktree": str(tmp_path), "head": "head"})
+    request = json.loads(q.read_text())
+    request["queued"] -= detach.QUEUED_S + 60
+    q.write_text(json.dumps(request))
+    # A daemon crash after publishing checks.pid, before settling the queue entry.
+    (run / cli.CHECKS_PID).write_text(json.dumps({"req": request["id"], "pid": 123}))
+    if exit_code is not None:
+        rc.write_text(exit_code)
+    monkeypatch.setattr(cli, "_checks_start", lambda *args: pytest.fail("checks were started twice"))
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: True)
+    monkeypatch.setattr(cli, "_checks_elsewhere", lambda info: False)
+
+    detach.tend(p)
+
+    assert not q.exists() and not detach.queued(rc).exists()
+    assert not detach.lost(rc).exists(), "already started checks must not expire as unstarted"
+    assert cli._checks_result(run) == (1 if exit_code is None else 0)
+    if exit_code is None:
+        assert not rc.exists()
+    else:
+        assert rc.read_text() == exit_code
+    assert "not started" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("operation", ["pending", "withdraw"])
+@pytest.mark.parametrize("marker_contents", [None, ""])
+def test_a_missing_queue_marker_read_does_not_delete_a_new_enqueue(tmp_path, monkeypatch, operation, marker_contents):
+    from ttp import detach
+    rc = tmp_path / "checks.rc"
+    marker = detach.queued(rc)
+    if marker_contents is not None:
+        marker.write_text(marker_contents)
+    real_marker, requests = detach._marker, []
+
+    def read_then_enqueue(path):
+        result = real_marker(path)
+        assert result == (None, None)
+        # enqueue publishes after the caller's empty read, before it can clean up.
+        requests.append(detach.enqueue(tmp_path / "state", rc, tmp_path / "checks.log", ["true"], str(tmp_path), {}))
+        return result
+
+    monkeypatch.setattr(detach, "_marker", read_then_enqueue)
+    result = getattr(detach, operation)(rc)
+    assert result is (False if operation == "pending" else None)
+    assert requests[0].exists()
+    assert real_marker(rc) == (requests[0], json.loads(requests[0].read_text())["id"]), "a fresh marker was deleted"
+
+
 def test_a_request_queued_while_the_daemon_starts_an_older_one_is_kept_and_runs_last(env, tmp_path, monkeypatch):
     from ttp import cli, detach, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

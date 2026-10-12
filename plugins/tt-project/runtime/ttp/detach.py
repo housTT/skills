@@ -126,7 +126,6 @@ def pending(rc: Path) -> bool:
     rc = Path(rc)
     q, _ = _marker(rc)
     if q is None:
-        queued(rc).unlink(missing_ok=True)   # none, or one naming no request
         return False
     try:
         with _locked(q.parent):
@@ -145,7 +144,6 @@ def withdraw(rc: Path) -> None:
     """Drop the job's pending request (a foreground launch replaces it)."""
     q, _ = _marker(rc)
     if q is None:
-        queued(rc).unlink(missing_ok=True)
         return
     with _locked(q.parent):
         q.unlink(missing_ok=True)
@@ -185,25 +183,30 @@ def tend(p: Project) -> None:
             q.unlink(missing_ok=True)
             continue
         rid, why = m.get("id"), ""
+        if "checks" in m:
+            from .cli import _read_checks_pid
+            # A restart after launch but before settlement must not expire checks already
+            # started, even when the daemon was down longer than QUEUED_S.
+            if rid and _read_checks_pid(rc.parent).get("req") == rid:
+                _settle(q, rc, rid)
+                continue
         if time.time() - float(m.get("queued") or 0) > QUEUED_S:
             why = (f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
                    f"(was the daemon down?)")
         elif "checks" in m:
             # Replacement checks must cancel their earlier host pid here, never in the tool's
             # PID namespace. An earlier checks.rc is removed only after that process ends. The
-            # request stays queued while they start, so a crash here starts them again; checks.pid
-            # naming this request means they already started (a restart after the launch).
+            # request stays queued while they start, so a crash here starts them again.
             from argparse import Namespace
-            from .cli import _checks_start, _read_checks_pid
-            if not rid or _read_checks_pid(rc.parent).get("req") != rid:
-                try:
-                    c = m["checks"]
-                    lost(rc).unlink(missing_ok=True)
-                    pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"]), rc.parent, c["worktree"],
-                                        c["head"], {**os.environ, **(m.get("env") or {})}, rid or "")
-                    renice(pid, nice_level(p.config().get("runner"))[0])
-                except (OSError, ValueError, TypeError, KeyError) as e:
-                    why = f"the daemon could not start the checks: {e}"
+            from .cli import _checks_start
+            try:
+                c = m["checks"]
+                lost(rc).unlink(missing_ok=True)
+                pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"]), rc.parent, c["worktree"],
+                                    c["head"], {**os.environ, **(m.get("env") or {})}, rid or "")
+                renice(pid, nice_level(p.config().get("runner"))[0])
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                why = f"the daemon could not start the checks: {e}"
         elif not (lost(rc).exists() or rc.exists()):
             lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
             if lock is not None:   # else it already runs
