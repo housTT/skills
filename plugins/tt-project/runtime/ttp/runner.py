@@ -252,9 +252,12 @@ def remove_files(paths: list[str]) -> None:
 
 def remove_tmp(run_dir: Path, spec: dict) -> None:
     """Delete the run's private temp dir: run dirs are kept, so its scratch must not pile up there.
-    Only a dir directly inside the run dir is ever removed."""
+    Only a dir directly inside the run dir, or a short one (shorttmp), is ever removed."""
+    from . import shorttmp
     tmp = spec.get("tmp_dir")
-    if tmp and Path(tmp).parent.resolve() == run_dir.resolve() and not Path(tmp).is_symlink():
+    if shorttmp.owned(tmp):
+        shorttmp.remove(tmp)
+    elif tmp and Path(tmp).parent.resolve() == run_dir.resolve() and not Path(tmp).is_symlink():
         shutil.rmtree(tmp, ignore_errors=True)
 
 

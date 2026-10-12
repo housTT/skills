@@ -81,6 +81,7 @@ from . import waitheal
 from . import watchdup
 from . import screen as scr
 from . import shared
+from . import shorttmp
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
@@ -1276,6 +1277,10 @@ class Daemon:
                            f"{', '.join(missing)}. Fix providers.{provider}.plugin_dirs in project.json.",
                            severity="normal", every_s=86400)
             roots = [str(self.p.state)] + worktree.git_dirs(Path(cwd))
+            # Short temp dirs (shorttmp): the worker's own, and those of the checks and detached
+            # jobs it starts. The root must exist for the sandbox to grant it.
+            if shorttmp.ready():
+                roots += list(dict.fromkeys([str(shorttmp.root()), str(shorttmp.root().resolve())]))
             # `ttp lock` on a resource shared across projects takes its slot under the user's shared
             # lock root, outside the project: only that directory, not the rest of the user's
             # tt-project home. It must exist for the sandbox to grant it.
@@ -1316,16 +1321,20 @@ class Daemon:
         run_dir = self.p.runs / str(run_id)
         prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
         # Raising from here on means nothing was launched: the run row must not stay "running".
+        tmp_env: dict = {}
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
-            # A fenced worker gets a temp dir of its own under the run dir (inside state/, a writable
-            # root; never in the worktree): on macOS git's xcrun shim otherwise fails to write its
-            # cache, and tools that honour TMPDIR stay off the shared /tmp. The runner removes it when
-            # the run ends (remove_private if the runner died).
-            tmp_env = {}
+            # A fenced worker gets a temp dir of its own (a writable root; never in the worktree): on
+            # macOS git's xcrun shim otherwise fails to write its cache, and tools that honour TMPDIR
+            # stay off the shared /tmp. A short one (shorttmp), so a socket a test binds beneath it
+            # stays within the AF_UNIX path limit; else one under the run dir. run.json records it and
+            # the runner removes it when the run ends (remove_private if the runner died).
             if sandboxed:
-                (run_dir / "tmp").mkdir(exist_ok=True)
-                tmp_env = {var: str(run_dir / "tmp") for var in ("TMPDIR", "TMP", "TEMP")}
+                tmp = shorttmp.make()
+                if not tmp:
+                    tmp = run_dir / "tmp"
+                    tmp.mkdir(exist_ok=True)
+                tmp_env = {var: str(tmp) for var in ("TMPDIR", "TMP", "TEMP")}
             if mcp_servers:
                 # Outside the repo and the run directory, owner-only: server entries can carry tokens.
                 fd, mcp_path = tempfile.mkstemp(prefix=f"ttp-mcp-{run_id}-", suffix=".json")
@@ -1414,6 +1423,7 @@ class Daemon:
         except BaseException:
             db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (time.time(), run_id))
             runner.remove_files(private)
+            shorttmp.remove(tmp_env.get("TMPDIR"))
             raise
         try:
             # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.

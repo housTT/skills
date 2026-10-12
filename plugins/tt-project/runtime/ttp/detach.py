@@ -21,7 +21,10 @@ marker whose request is gone (a crash between the two writes) is cleared instead
 A job gets a temp dir of its own (scratch), with TMPDIR, TMP and TEMP pointing at it: the run's own
 tmp dir, which a fenced run's environment names, goes when that run ends, while the job still runs
 (a compiler then loses its scratch partway through). The wrapper removes it when the job ends; tend
-sweeps those of jobs gone without doing so (killed, or the host restarted).
+sweeps those of jobs gone without doing so (killed, or the host restarted). The temp dir itself is a
+short one (shorttmp), so a socket bound beneath it stays within the AF_UNIX path limit; the job's
+record under the state names it in its `path` file. Without a usable short root the record is the
+temp dir.
 """
 from __future__ import annotations
 
@@ -37,7 +40,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import locks, machines
+from . import locks, machines, shorttmp
 from .project import Project, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
@@ -47,8 +50,8 @@ QUEUED_S = 900           # a queued job the daemon has not started by then is re
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
 _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
-WRAPPER = ('o="$1" r="$2" s="$3" t="$4"; shift 4; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
-           'rm -rf "$t"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"')
+WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
+           'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")
 
 
@@ -65,23 +68,45 @@ def lost(rc: Path) -> Path:
 
 
 def scratch(rc: Path) -> Path:
-    """The job's own temp dir, under the project's state for a job of a run (keyed by run and job
-    name, so tend can tell whose it is), else next to its .rc."""
+    """The record of the job's own temp dir, under the project's state for a job of a run (keyed by
+    run and job name, so tend can tell whose it is), else next to its .rc."""
     rc = Path(rc)
     if rc.parent.parent.name == "runs":
         return rc.parent.parent.parent / SCRATCH / f"{rc.parent.name}-{rc.stem}"
     return rc.with_suffix(".tmp")
 
 
+def tmp_dir(record: Path) -> Path:
+    """The temp dir a job's record names, else the record itself."""
+    try:
+        named = (Path(record) / "path").read_text().strip()
+    except OSError:
+        return Path(record)
+    return Path(named) if shorttmp.owned(named) else Path(record)
+
+
+def _drop(record: Path) -> None:
+    shorttmp.remove(tmp_dir(record))
+    shutil.rmtree(record, ignore_errors=True)
+
+
 def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
     """Start the job's wrapper in a session of its own, holding `lock` (its job lock, which the
     caller took and closes after), with a fresh temp dir of its own. Returns its pid."""
-    tmp = scratch(rc)
-    if tmp.exists() and not tmp.is_symlink():   # left by an earlier start of it that never ran
-        shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(mode=0o700, parents=True)
+    record = scratch(rc)
+    if record.exists() and not record.is_symlink():   # left by an earlier start of it that never ran
+        _drop(record)
+    record.mkdir(mode=0o700, parents=True)
+    tmp = shorttmp.make() or record
+    if tmp != record:
+        try:
+            durable_write(record / "path", f"{tmp}\n")
+        except OSError:   # unrecorded, nothing would remove it: use the record itself
+            shorttmp.remove(tmp)
+            tmp = record
     env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_DETACHED": "1"}
-    proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp), *cmd],
+    proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp),
+                             str(record), *cmd],
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                             pass_fds=(lock.fileno(),))
@@ -257,7 +282,7 @@ def sweep(state: Path) -> None:
             continue
         rc = Path(state) / "runs" / m[1] / f"{m[2]}.rc"
         if rc.exists() or lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
-            shutil.rmtree(d, ignore_errors=True)
+            _drop(d)
 
 
 def _entry(rc: Path) -> dict:

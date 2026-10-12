@@ -281,6 +281,17 @@ def _no_real_providers(tmp_path, monkeypatch) -> list:
 
 
 @pytest.fixture(scope="session")
+def _short_tmp():
+    """A short folder for the short temp dirs (ttp.shorttmp) tests make, removed at the end."""
+    try:
+        base = tempfile.mkdtemp(prefix="ts", dir="/tmp")
+    except OSError:   # a sandbox that refuses /tmp: the default temp root
+        base = tempfile.mkdtemp(prefix="ts")
+    yield base
+    shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
 def _git_session(tmp_path_factory):
     """Made once per session: the starting repository each test copies, and an object store holding
     every runtime and template file, which test repositories borrow (git alternates). A project's
@@ -311,9 +322,10 @@ def _git_session(tmp_path_factory):
 
 
 @pytest.fixture()
-def env(tmp_path, monkeypatch, _git_session):
+def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     home = tmp_path / "home"
     monkeypatch.setenv("TTP_HOME", str(home))
+    monkeypatch.setenv("TTP_TEST_SHORT_TMP", _short_tmp)   # never the real /tmp/ttp-<uid>
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
@@ -16280,17 +16292,24 @@ def _codex_worker_launch(env, p, cwd):
 def test_sandboxed_workers_get_a_private_writable_temp_dir(env):
     # On macOS git is an xcrun shim; in Codex's sandbox xcrun could not write its cache under /tmp
     # (`couldn't create cache file /tmp/xcrun_db-...`), so git failed. A fenced worker gets its own
-    # temp dir in its run dir, inside its writable roots and outside the worktree.
+    # temp dir, a short one (shorttmp: AF_UNIX path limit), inside its writable roots and outside
+    # the worktree; run.json records it, and the run's end removes it.
+    from ttp import runner, shorttmp
     p = make(env)
     repo = env["repo"]
     roots, run_env = _codex_worker_launch(env, p, repo)
     tmp = pathlib.Path(run_env["TMPDIR"])
     assert run_env["TMP"] == run_env["TEMP"] == str(tmp) and tmp.is_dir()
-    assert tmp.parent.parent == p.runs, "the run's own dir, under state/runs"
+    assert shorttmp.owned(tmp), "a short dir of its own"
     assert any(tmp.is_relative_to(r) for r in roots), roots
+    assert str(shorttmp.root()) in roots, "the worker may make the short dirs of its checks and jobs"
     (tmp / "scratch").write_text("x")
     assert subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
                           capture_output=True, text=True).stdout == "", "never committed with the work"
+    run_dir = next(d for d in p.runs.iterdir()
+                   if json.loads((d / "run.json").read_text()).get("tmp_dir") == str(tmp))
+    runner.remove_private(run_dir)   # also what the daemon does for a runner that died
+    assert not tmp.exists()
     # An unfenced provider (no writable roots) keeps the caller's temp dir.
     from ttp.providers import claude as claude_provider
     from ttp.daemon import Daemon
@@ -16509,7 +16528,7 @@ if sys.argv[1:2] == ["app-server"]:
 (log / "cwd.txt").write_text(os.getcwd())
 (log / "stdin.txt").write_text(sys.stdin.read())
 tmp = os.environ.get("TMPDIR", "")
-if os.environ.get("TTP_RUN_DIR") and tmp.startswith(os.environ["TTP_RUN_DIR"]):
+if tmp and any(tmp.startswith(os.environ[v]) for v in ("TTP_RUN_DIR", "TTP_TEST_SHORT_TMP") if os.environ.get(v)):
     (Path(tmp) / "scratch").mkdir()   # a run's own temp dir only, never the test's
     (Path(tmp) / "scratch" / "basetemp.txt").write_text("x")
     (log / "tmpdir.txt").write_text(tmp)
@@ -16610,8 +16629,10 @@ def test_sandboxed_worker_temp_dir_is_removed_when_the_run_ends(env, monkeypatch
     done = {"status": "done", "summary": "ok"}
     p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done)
     run_dir = p.runs / str(run["id"])
+    from ttp import shorttmp
     tmp = pathlib.Path((env["tmp"] / "fakecli" / "tmpdir.txt").read_text())
-    assert tmp == run_dir / "tmp", "the agent wrote its scratch into its own temp dir"
+    assert shorttmp.owned(tmp), "the agent wrote its scratch into its own (short) temp dir"
+    assert json.loads((run_dir / "run.json").read_text())["tmp_dir"] == str(tmp)
     assert not tmp.exists(), "the run's temp dir outlived the run"
     assert (run_dir / "run.json").exists() and (run_dir / "result.json").exists() and (run_dir / "exit.json").exists()
     assert run["status"] == "ok" and task["status"] == "done"
@@ -39423,8 +39444,9 @@ def test_detach_writes_rc_log_and_a_durable_registry(env):
 def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_when_the_job_ends(env, tmp_path):
     """The reported failure: a fenced run's TMPDIR is its run's tmp dir, removed when the run ends,
     while its detached build still runs (a compiler lost its scratch partway through). The job gets
-    a temp dir of its own under the project's state, kept until the job ends, then removed."""
-    from ttp import detach, runner
+    a temp dir of its own, recorded under the project's state, kept until the job ends, then removed.
+    A short one (shorttmp), so a socket a test binds beneath it stays within the AF_UNIX path limit."""
+    from ttp import detach, runner, shorttmp
     p = _device_project(env, device=False)
     run_dir = p.runs / "8"
     (run_dir / "tmp").mkdir(parents=True)
@@ -39437,6 +39459,8 @@ def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_wh
     rc = run_dir / "build.rc"
     own = detach.scratch(rc)
     assert own.parent == p.state / detach.SCRATCH and own.is_dir()
+    tmp = detach.tmp_dir(own)
+    assert shorttmp.owned(tmp) and tmp.is_dir()
     runner.remove_tmp(run_dir, {"tmp_dir": str(run_dir / "tmp")})   # the run that started it ends
     assert not (run_dir / "tmp").exists()
     detach.tend(p)   # the sweep leaves a running job's dir alone
@@ -39444,9 +39468,9 @@ def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_wh
     go.touch()
     assert _wait_for_path(rc)
     assert rc.read_text().strip() == "0", (run_dir / "build.log").read_text()
-    assert seen.read_text().split() == [str(own)] * 3
+    assert seen.read_text().split() == [str(tmp)] * 3
     assert (run_dir / "build.log").read_text().strip() == "scratch"
-    assert not own.exists(), "removed once the job ended"
+    assert not own.exists() and not tmp.exists(), "removed once the job ended"
 
 
 def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could_remove_it(env):
@@ -39458,7 +39482,9 @@ def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could
                  env={"TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
     own = detach.scratch(run_dir / "long.rc")
-    assert _wait_for_path(own / "in")
+    assert _wait_for_path(own / "path")
+    tmp = detach.tmp_dir(own)
+    assert _wait_for_path(tmp / "in")
     stray = p.state / detach.SCRATCH / "not-a-job"
     stray.mkdir()
     detach.sweep(p.state)
@@ -39467,7 +39493,25 @@ def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could
     os.killpg(pid, signal.SIGKILL)
     assert _check_until_ended(p, run_dir / "long.rc").returncode == 0
     detach.tend(p)
-    assert not own.exists() and stray.is_dir()
+    assert not own.exists() and not tmp.exists() and stray.is_dir()
+
+
+def test_a_detached_job_gets_a_short_temp_dir_that_holds_a_unix_socket(env):
+    from ttp import detach, shorttmp
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    code = ("import os, socket; t = os.environ['TMPDIR']; "
+            "d = os.path.join(t, 'pytest-of-x', 'pytest-0', 'test_some_long_name0'); os.makedirs(d); "
+            "socket.socket(socket.AF_UNIX).bind(os.path.join(d, 's.sock')); print(t)")
+    r = _ttp_run(p, "detach", "sock", "--", sys.executable, "-c", code, env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = run_dir / "sock.rc"
+    assert _wait_for_path(rc)
+    assert rc.read_text().strip() == "0", (run_dir / "sock.log").read_text()
+    tmp = (run_dir / "sock.log").read_text().strip()
+    assert shorttmp.owned(tmp), tmp
+    assert not pathlib.Path(tmp).exists() and not detach.scratch(rc).exists(), "removed once the job ended"
 
 
 def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
@@ -50829,17 +50873,18 @@ def test_detached_checks_recovery_preserves_scratch_after_supervisor_killed(env,
         assert _wait_for(ready.exists)
         child = int(ready.read_text())
         output = pathlib.Path(cli._read_checks_pid(run)["check_run_dir"])
+        scratch = pathlib.Path(json.loads((output / "owner.json").read_text())["tmp"])   # short (shorttmp)
         os.killpg(pid, signal.SIGKILL)
         assert _wait_for(lambda: _gone_pid(pid))
         monkeypatch.setattr(p, "runs", tmp_path)
         detach.tend(p)
-        assert list((output / cli.CHECKS_TMP).glob("*/keep")), "live command lost its scratch"
+        assert list(scratch.glob("*/keep")), "live command lost its scratch"
         assert cli._checks_result(run) == 0
-        assert (output / cli.CHECKS_TMP).exists(), "lost-supervisor probe removed a live command's scratch"
+        assert scratch.exists(), "lost-supervisor probe removed a live command's scratch"
         os.kill(child, signal.SIGTERM)
         assert _wait_for(lambda: _gone_pid(child))
         detach.tend(p)
-        assert not (output / cli.CHECKS_TMP).exists()
+        assert not scratch.exists() and not output.exists()
     finally:
         for owned in (pid, child):
             if owned:
@@ -50905,7 +50950,7 @@ def test_check_output_recovery_never_follows_symlinks(env, tmp_path, monkeypatch
 
 
 def test_check_output_detached_outside_worktree_and_unique(env, tmp_path, monkeypatch, capsys):
-    from ttp import cli
+    from ttp import cli, shorttmp
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     local = repo / 'local-run'
     local.mkdir()
@@ -50920,8 +50965,8 @@ def test_check_output_detached_outside_worktree_and_unique(env, tmp_path, monkey
         assert not output.is_relative_to(repo), 'check output must not be repository-local'
         assert not scratch.is_relative_to(repo), 'scratch must not be repository-local'
         assert output.is_relative_to(p.state)
-        assert scratch.parent.parent == p.state / 'check-runs'
-        assert re.fullmatch(r'[0-9a-f]{32}', scratch.parent.name), 'scratch name must be neutral'
+        assert shorttmp.owned(scratch), 'a short scratch dir (AF_UNIX path limit)'
+        assert re.fullmatch(r'[0-9a-f]{8}', scratch.name), 'scratch name must be neutral'
         assert (output / 'x').read_text() == 'report\n'
         dirs.append(output)
     assert dirs[0] != dirs[1]
@@ -50933,8 +50978,10 @@ def _check_output_paths_command():
             "out=pathlib.Path(os.environ['TTP_RUN_DIR']); "
             "tmp=pathlib.Path(tempfile.gettempdir()); "
             "assert out.is_absolute() and out.parent.name == 'check-reports', out; "
-            "assert tmp.parent.parent.name == 'check-runs', tmp; "
-            "assert out.name == tmp.parent.name and out.parent.parent == tmp.parent.parent.parent; "
+            # A short dir its owner.json names (shorttmp), else checks-tmp inside the allocation.
+            "short = tmp.parent.name.startswith('ttp-') and len(tmp.name) == 8; "
+            "assert short or tmp.parent.parent.name == 'check-runs', tmp; "
+            "assert short or (out.name == tmp.parent.name and out.parent.parent == tmp.parent.parent.parent); "
             "assert all(os.environ[k] == str(tmp) for k in ('TMPDIR','TMP','TEMP')); "
             "assert not os.environ.get('TTP_PIDNS') and not os.environ.get('TTP_CGROUP'); "
             "(out/'pre-commit-cache').mkdir(); "
@@ -50978,12 +51025,13 @@ def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys
         assert reports.parent == p.state / 'check-reports'
         assert (reports / 'pre-commit-cache').is_dir()
         paths = json.loads((reports / 'result.json').read_text())
-        assert paths == {'output': str(reports), 'scratch': str(output / 'checks-tmp')}
+        assert paths == {'output': str(reports), 'scratch': str(output / 'checks-tmp')}, \
+            'a rebuilt allocation has no owner.json naming a short dir: it keeps checks-tmp'
 
 
 @pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
 def test_check_output_queued_checks_after_restart_without_run_env(env, tmp_path, monkeypatch, capsys, run_env):
-    from ttp import cli, detach
+    from ttp import cli, detach, shorttmp
     from ttp.daemon import Daemon
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv('TTP_PIDNS', 'disposable-command')
@@ -51007,7 +51055,8 @@ def test_check_output_queued_checks_after_restart_without_run_env(env, tmp_path,
     assert reports.is_relative_to(p.state) and not reports.is_relative_to(repo)
     assert (reports / 'pre-commit-cache').is_dir()
     paths = json.loads((reports / 'result.json').read_text())
-    assert paths == {'output': str(reports), 'scratch': str(pathlib.Path(info['check_run_dir']) / 'checks-tmp')}
+    assert paths['output'] == str(reports) and shorttmp.owned(paths['scratch']), paths
+    assert _wait_for(lambda: not pathlib.Path(paths['scratch']).exists()), 'removed with its allocation'
     assert not q.exists()
 
 
@@ -51362,7 +51411,7 @@ def test_check_output_foreground_push_preserves_worker_context(env, monkeypatch,
     report, scratch = map(pathlib.Path, seen.read_text().splitlines())
     assert report != worker and report.is_relative_to(p.state / 'check-reports')
     assert (report / 'report').read_text() == 'report\n'
-    assert not scratch.parent.exists()
+    assert not scratch.exists()
     assert not (worker / 'report').exists()
     assert dict(os.environ) == before
 
@@ -51409,6 +51458,82 @@ def test_check_scratch_failed_launch_or_check_cleans_allocation(env, tmp_path, m
         _commit(repo, 'mine.txt', 'mine\n')
         assert push.run(p, repo) == push.CHECKS_FAILED
     assert not [f for f in (p.state / checkdirs.FOLDER).iterdir() if f.is_dir()]
+
+
+def _bind_deep_socket(tmp):
+    """A socket where pytest's tmp_path would put one: TMPDIR/pytest-of-<user>/pytest-N/<test>0/."""
+    deep = pathlib.Path(tmp) / 'pytest-of-x' / 'pytest-0' / 'test_some_long_name0'
+    deep.mkdir(parents=True)
+    with socket.socket(socket.AF_UNIX) as s:
+        s.bind(str(deep / 's.sock'))
+
+
+def test_short_tmp_root_is_short_in_production(env, monkeypatch):
+    from ttp import shorttmp
+    monkeypatch.delenv('TTP_TEST_SHORT_TMP')
+    assert shorttmp.root() == pathlib.Path('/tmp') / f'ttp-{os.getuid()}'
+    assert len(str(shorttmp.root() / 'abcdef12')) <= 40
+
+
+@pytest.mark.parametrize('end', ['finish', 'crash', 'reboot'])
+def test_check_scratch_is_short_holds_a_socket_and_goes_with_its_allocation(env, end):
+    """Under the state, TMPDIR plus pytest's tmp_path suffix passed the AF_UNIX path limit (108
+    bytes, 104 on macOS): 'AF_UNIX path too long'. A check gets a short dir its owner.json names,
+    removed when the check finishes, or by recovery after its owner died or the host restarted."""
+    from ttp import checkdirs, shorttmp
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    with checkdirs.take(output) as guard:
+        child = checkdirs.for_check({'TTP_CHECKS_TMP_FD': str(guard.fileno()),
+                                     'TTP_CHECK_OUTPUT_DIR': str(checkdirs.reports(output))})
+        tmp = pathlib.Path(child['TMPDIR'])
+        assert child['TMP'] == child['TEMP'] == str(tmp)
+        assert shorttmp.owned(tmp) and tmp.is_dir() and stat.S_IMODE(tmp.stat().st_mode) == 0o700
+        assert json.loads((output / checkdirs.OWNER).read_text())['tmp'] == str(tmp)
+        _bind_deep_socket(tmp)
+    if end == 'finish':
+        checkdirs.finish(output)
+    else:
+        owner = json.loads((output / checkdirs.OWNER).read_text())
+        owner.update(pid=2 ** 22 + 1) if end == 'crash' else owner.update(boot='an-earlier-boot')
+        (output / checkdirs.OWNER).write_text(json.dumps(owner))
+        checkdirs.recover(p.state, p.runs)
+    assert not output.exists() and not tmp.exists()
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'file', 'open-mode'])
+def test_short_tmp_root_refused_unless_own_dir_and_checks_fall_back(env, tmp_path, monkeypatch, kind):
+    from ttp import checkdirs, shorttmp
+    base = tmp_path / 'b'
+    base.mkdir()
+    monkeypatch.setenv('TTP_TEST_SHORT_TMP', str(base))
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    (elsewhere / 'abcdef12').mkdir()
+    if kind == 'symlink':
+        shorttmp.root().symlink_to(elsewhere, target_is_directory=True)
+    elif kind == 'file':
+        shorttmp.root().write_text('x')
+    else:
+        shorttmp.root().mkdir(mode=0o755)
+        shorttmp.root().chmod(0o755)
+    if kind == 'open-mode':   # its own dir, too open: made 0700 and used
+        assert shorttmp.make() and stat.S_IMODE(shorttmp.root().stat().st_mode) == 0o700
+        return
+    assert shorttmp.make() is None and not shorttmp.ready()
+    shorttmp.remove(shorttmp.root() / 'abcdef12')
+    shorttmp.remove(elsewhere / 'abcdef12')
+    assert (elsewhere / 'abcdef12').is_dir(), 'never removed through a link or outside the root'
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    with checkdirs.take(output) as guard:
+        child = checkdirs.for_check({'TTP_CHECKS_TMP_FD': str(guard.fileno()),
+                                     'TTP_CHECK_OUTPUT_DIR': str(checkdirs.reports(output))})
+    assert child['TMPDIR'] == str(output / checkdirs.SCRATCH)
+    checkdirs.finish(output)
+    assert not output.exists()
 
 
 def test_check_scratch_recovery_skips_link_and_continues(env, tmp_path):

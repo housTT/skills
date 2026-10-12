@@ -6,6 +6,9 @@ Managed scratch is only for check processes holding the lifetime guard. Supervis
 non-check commands (including after_push) keep their ordinary temporary environment.
 Legacy allocations without owner.json and old run-local scratch are left untouched, with
 no migration. Only owned, unlocked check allocations are reclaimed; nothing else is.
+A check's TMPDIR is a short dir (shorttmp) its owner.json records, so an AF_UNIX socket a test
+binds beneath it stays within the path limit; it goes with the allocation. Without a usable
+short root the check keeps checks-tmp inside the allocation.
 """
 from __future__ import annotations
 
@@ -60,6 +63,7 @@ def writable(value, *, create=False) -> str:
 
 
 def new(state: Path, owner: Path | None = None) -> Path:
+    from . import shorttmp
     from .runner import boot_id, proc_start
     folder = state / FOLDER
     with directory(folder, create=True) as fd:
@@ -67,11 +71,13 @@ def new(state: Path, owner: Path | None = None) -> Path:
         with _take_fd(fd, wait=True):
             name = uuid.uuid4().hex
             os.mkdir(name, mode=0o700, dir_fd=fd)
+            tmp = shorttmp.make()
             with directory(folder / name) as child:
                 out = os.open(OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=child)
                 with os.fdopen(out, 'w') as f:
                     json.dump({'marker': str(owner) if owner else None, 'pid': os.getpid(),
-                               'started': proc_start(os.getpid()), 'boot': boot_id()}, f)
+                               'started': proc_start(os.getpid()), 'boot': boot_id(),
+                               'tmp': str(tmp) if tmp else None}, f)
                     f.flush()
                     os.fsync(f.fileno())
                 os.fsync(child)
@@ -99,12 +105,23 @@ def for_check(env: dict) -> dict:
     if env.get('TTP_CHECKS_TMP_FD') and env.get('TTP_CHECK_OUTPUT_DIR'):
         output = Path(env['TTP_CHECK_OUTPUT_DIR'])
         folder = output.parent.parent / FOLDER
-        scratch = writable(folder / output.name / SCRATCH)
+        scratch = _short(folder / output.name) or writable(folder / output.name / SCRATCH)
         env.update({k: scratch for k in ('TMPDIR', 'TMP', 'TEMP')})
         # Preserve user ceilings; this one only bounds discovery beneath check-runs.
         inherited = env.get('GIT_CEILING_DIRECTORIES', '')
         env['GIT_CEILING_DIRECTORIES'] = os.pathsep.join(filter(None, (inherited, str(folder))))
     return env
+
+
+def _short(path: Path) -> str | None:
+    """The short scratch the allocation's owner.json records, when it is still usable."""
+    from . import shorttmp
+    try:
+        with directory(path) as fd:
+            tmp = _read(fd, OWNER).get('tmp')
+        return writable(tmp) if shorttmp.owned(tmp) else None
+    except OSError:
+        return None
 
 
 def inherited() -> tuple[int, ...]:
@@ -247,6 +264,8 @@ def cleanup(path: Path, *, whole=False, wait=False) -> None:
                         return
                     try:
                         if not _reserved(fd, path):
+                            from . import shorttmp
+                            shorttmp.remove(_read(fd, OWNER).get('tmp'))
                             _remove(parent, path.name)
                             try:
                                 with directory(reports(path).parent) as report_fd:
