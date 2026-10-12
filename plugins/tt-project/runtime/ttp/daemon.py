@@ -3146,7 +3146,7 @@ class Daemon:
             return duplicate
         # A review of a period with no work and no user message would report that nothing moved.
         # The built-in daily review opts in by name, so projects created before the flag get it too.
-        # Changed evidence (a task outcome moved with no run, e.g. an owner cancelled it) or this
+        # A changed outcome (a task outcome moved with no run, e.g. an owner cancelled it) or this
         # schedule's own failed or cancelled run still owes a run: the idle guard sees neither.
         if (not owed and payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"]
                 and not self._active_since(float(s["last_run"]), s["name"])):

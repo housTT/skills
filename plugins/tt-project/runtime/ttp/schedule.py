@@ -362,33 +362,46 @@ def evidence(db: DB) -> str:
     return _sha(json.dumps([tasks, user and user["id"]], sort_keys=True, default=str))
 
 
+def outcome(db: DB) -> str:
+    """The part of the evidence only an owner or the user moves: the task set with each task's status,
+    spec, result and dependencies, and the last message from the user. The daemon rewrites not_before
+    and blocked_reason model-free on every waiting probe ("next try ..."), so they are left out: a
+    quiet project with a waiting task must not owe a review every day."""
+    tasks = db.q("SELECT id, status, spec, result, depends_on FROM tasks WHERE origin!='schedule' ORDER BY id")
+    user = db.one("SELECT MAX(id) id FROM messages WHERE direction='in'")
+    return _sha(json.dumps([tasks, user and user["id"]], sort_keys=True, default=str))
+
+
 def debounce_gate(db: DB, name: str, payload: dict,
-                  now: float | None = None) -> tuple[str, str | None, str]:
-    """(skip reason or "", the evidence digest to record with a run queued now (None without a
-    debounce), why a run is owed: "changed", "not-done", or "" when only the idle guard can say).
+                  now: float | None = None) -> tuple[str, dict | None, str]:
+    """(skip reason or "", the digests to record with a run queued now (None without a debounce),
+    why a run is owed: "changed", "not-done", or "" when only the idle guard can say).
 
     Only a run that ended done, within the debounce, on the evidence it was queued on, makes a
-    trigger a duplicate. A missing or older record never does. Changed evidence, or a last run
-    that did not end done, owes a run whatever the idle guard sees."""
+    trigger a duplicate. A missing or older record never does. A changed outcome, or a last run
+    that did not end done, owes a run whatever the idle guard sees; evidence that moved only in
+    what the daemon rewrites model-free is no duplicate but leaves the call to the idle guard."""
     window = debounce_s(name, payload)
     if not window:
         return "", None, ""
     now = time.time() if now is None else now
-    digest = evidence(db)
+    digests = {"evidence": evidence(db), "outcome": outcome(db)}
     last = db.kv(DEBOUNCE_KEY + name) or {}
     task = db.task(int(last["task"])) if isinstance(last, dict) and str(last.get("task", "")).isdigit() else None
     if not task:
-        return "", digest, ""
-    if last.get("evidence") != digest:
-        return "", digest, "changed"
+        return "", digests, ""
+    # A record from before the outcome digest falls back to the full evidence (owes one run at most).
+    key = "outcome" if "outcome" in last else "evidence"
+    if last.get(key) != digests[key]:
+        return "", digests, "changed"
     if task["status"] != "done":
-        return "", digest, "not-done"
+        return "", digests, "not-done"
     run = db.one("SELECT MAX(ended) e FROM runs WHERE task=? AND ended IS NOT NULL", (task["id"],))
     ended = float(run["e"]) if run and run["e"] else None
-    if ended is None or not 0 <= now - ended < window:
-        return "", digest, ""
-    return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digest, ""
+    if last.get("evidence") != digests["evidence"] or ended is None or not 0 <= now - ended < window:
+        return "", digests, ""
+    return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digests, ""
 
 
-def record_evidence(db: DB, name: str, task_id: int, digest: str) -> None:
-    db.set_kv(DEBOUNCE_KEY + name, {"task": task_id, "evidence": digest})
+def record_evidence(db: DB, name: str, task_id: int, digests: dict) -> None:
+    db.set_kv(DEBOUNCE_KEY + name, {"task": task_id, **digests})

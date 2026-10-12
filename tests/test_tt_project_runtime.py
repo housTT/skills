@@ -10141,6 +10141,53 @@ def test_the_idle_guard_never_skips_a_review_owed_by_changed_evidence_or_its_own
         assert _review_status(p) == "queued" and _reviews(p)[-1] != last, status
 
 
+def test_the_waiting_probes_model_free_rewrites_never_owe_an_idle_review(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    work = _idle_review(p, d)
+    # The task goes waiting and a review covers that; then the project is idle again.
+    p.db.update_task(work, status="waiting", not_before=time.time() + 600,
+                     blocked_reason="waiting for ci; next try 16:40 PDT")
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "queued"
+    _review_done(p, _reviews(p)[-1], time.time() - 3 * 3600)
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "skipped: nothing happened since the last run"
+    n = len(_reviews(p))
+    # The probe loop says "not yet" again: only not_before and blocked_reason move, with no run.
+    p.db.update_task(work, not_before=time.time() + 1200,
+                     blocked_reason="waiting for ci; its probe says pending; next try 16:50 PDT")
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "skipped: nothing happened since the last run" and len(_reviews(p)) == n
+    # The same churn after a failed review still retries it.
+    _review_done(p, _reviews(p)[-1], time.time() - 3 * 3600)
+    p.db.update_task(_reviews(p)[-1], status="failed")
+    p.db.update_task(work, not_before=time.time() + 1800, blocked_reason="waiting for ci; next try 17:00 PDT")
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "queued" and len(_reviews(p)) == n + 1
+
+
+def test_a_debounce_record_from_before_the_outcome_digest_falls_back_to_the_evidence(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    _idle_review(p, d)
+    last = p.db.kv(sched.DEBOUNCE_KEY + "daily-review")
+    assert last["outcome"] == sched.outcome(p.db) and last["evidence"] == sched.evidence(p.db)
+    p.db.set_kv(sched.DEBOUNCE_KEY + "daily-review", {"task": last["task"], "evidence": last["evidence"]})
+    assert sched.debounce_gate(p.db, "daily-review", {})[2] == ""
+    p.db.set_kv(sched.DEBOUNCE_KEY + "daily-review", {"task": last["task"], "evidence": "older"})
+    assert sched.debounce_gate(p.db, "daily-review", {})[2] == "changed"
+
+
 def test_a_review_owed_by_changed_evidence_still_waits_for_its_budget_and_its_open_run(env):
     p = make(env)
     from ttp.daemon import Daemon
