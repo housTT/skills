@@ -17,7 +17,8 @@ Each line starts with the message id: `[#<id> coordinator] <text>`.
   retried (5 s, doubling to 2 min) until it is back; each message prints once per listener.
 - With `--once`, a batch that arrived before a drop ends the listener normally (exit 0).
 - Exit codes: `0` messages shown or `--timeout` reached; `2` the project refused it (unknown chat
-  or project); `75` still unreachable when `--timeout` ran out (nothing is lost: start it again).
+  or project); `3` a newer listener for this chat took over (do not restart this one); `75` still
+  unreachable when `--timeout` ran out (nothing is lost: start it again).
 
 ## Claude Code
 

@@ -4118,7 +4118,9 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
 
 
 def test_one_listener_per_chat(env):
-    """The newest listener wins, and a listener whose starter is gone exits by itself."""
+    """The newest listener wins, and a listener whose starter is gone exits by itself. The replaced
+    one says so and exits LISTEN_REPLACED; any other SIGTERM still ends a listener as before."""
+    from ttp import cli
     p = make(env)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -4145,9 +4147,15 @@ def test_one_listener_per_chat(env):
                 time.sleep(0.05)
                 out = p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] and "hello" or ""
             assert out == "hello", "the newest listener did not receive the message"
-        finally:
-            second.terminate()
+            err = first.stderr.read()
+            assert first.returncode == cli.LISTEN_REPLACED and cli.REPLACED_MARK in err, (first.returncode, err)
+            second.terminate()      # nobody claimed the chat: a plain SIGTERM, not a replacement
             second.wait(timeout=10)
+            assert second.returncode == -signal.SIGTERM and cli.REPLACED_MARK not in second.stderr.read()
+        finally:
+            if second.poll() is None:
+                second.terminate()
+                second.wait(timeout=10)
     finally:
         if first.poll() is None:
             first.terminate()
@@ -8798,6 +8806,26 @@ def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, mo
     assert err.count("will keep retrying until --timeout runs out") == 1 and "(exit 75)" in err, err
     assert calls[0].endswith("--timeout=12") and calls[1].endswith("--timeout=7"), calls
     assert len(calls) == 2
+
+
+_REPLACED = "ttp: replaced by a newer listener for chat c1 (pid 4242); this one stops without reconnecting (exit 3)\n"
+
+
+@pytest.mark.parametrize("rc", [255, 143, 3])
+def test_replaced_remote_listener_stops_instead_of_reconnecting(env, monkeypatch, capsys, rc):
+    """A newer listener SIGTERMs the older one. However ssh reports that session's end (255 when the
+    far shell execs ttp, 143 when it does not, 3 from ttp itself), the older forwarder must not
+    reconnect: its new remote listen would displace the newer listener, and the two would take
+    turns forever. It stops with LISTEN_REPLACED and shows why."""
+    from ttp import cli
+    calls = []
+    _ssh_sessions(monkeypatch, env["tmp"], [(["[#7 coordinator] hi\n"], rc, _REPLACED)], calls)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: pytest.fail("reconnected after being replaced"))
+    assert cli.LISTEN_REPLACED == 3
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == cli.LISTEN_REPLACED
+    out, err = capsys.readouterr()
+    assert len(calls) == 1 and out == "[#7 coordinator] hi\n", (calls, out)
+    assert cli.REPLACED_MARK in err and "retrying" not in err and "cannot reach" not in err, err
 
 
 def test_remote_listen_exit_of_its_own_is_passed_through_not_retried(env, monkeypatch, capsys):

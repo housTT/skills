@@ -71,6 +71,8 @@ def remote_hosts() -> list[str]:
 
 
 LISTEN_GAVE_UP = 75   # `ttp listen --timeout` on another machine: still unreachable when the timeout ran out
+LISTEN_REPLACED = 3   # a newer listener for the same chat took over; this one stops and does not reconnect
+REPLACED_MARK = "ttp: replaced by a newer listener"   # its stderr line, read even when ssh reports a drop
 _MSG_LINE = re.compile(r"\[#(\d+) ")
 
 
@@ -79,7 +81,7 @@ def _dropped(rc: int) -> bool:
 
     ssh exits 255 when it fails. A status of 128 or more is a signal ending the session (the far
     side's shell, a shared ssh connection, the network stack): `ttp listen` itself exits only
-    0, 1 or 2. Below 0, ssh here was killed by a signal."""
+    0, 1, 2 or LISTEN_REPLACED. Below 0, ssh here was killed by a signal."""
     return rc == 255 or rc >= 128 or rc < 0
 
 
@@ -117,6 +119,8 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     arrived before the drop ends the listener (exit 0) like a clean finish. Acknowledging stays
     with --ack, so nothing a reader missed is lost. With --timeout, it stops retrying once the
     timeout has run out and exits LISTEN_GAVE_UP; every other exit is the far side's own.
+    A listener replaced by a newer one for the same chat ends with LISTEN_REPLACED and is not
+    retried: reconnecting would displace the newer one in turn, and the two would take turns.
     """
     once = "--once" in argv
     limit = _listen_timeout(argv)
@@ -198,6 +202,10 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
     """Run this same command on the project's machine, streaming its output. With `shown` (a
     listener), message lines already printed are not printed again."""
     r = _ssh(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
+    if shown is not None and REPLACED_MARK in (r.stderr or ""):
+        # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
+        sys.stderr.write(r.stderr)
+        return LISTEN_REPLACED
     if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
         if not quiet:
             _unreachable(entry, r.stderr)
@@ -755,6 +763,7 @@ def cmd_listen(a) -> None:
                 break
             time.sleep(0.1)
         print(f"ttp: replaced an older listener for chat {a.chat} (pid {other})", file=sys.stderr)
+    _on_replaced(lock, a.chat)
     try:
         _listen_loop(p, db, a, after, floor)
     finally:
@@ -763,6 +772,32 @@ def cmd_listen(a) -> None:
                 lock.unlink()
         except OSError:
             pass
+
+
+def _on_replaced(lock: Path, chat: str) -> None:
+    """On SIGTERM from a newer listener (it claimed the lock first), say so on stderr and exit
+    LISTEN_REPLACED, so a forwarder on another machine stops instead of reconnecting and taking
+    the chat back. Any other SIGTERM ends the listener as before."""
+    def handler(signum, frame):
+        try:
+            newer = int(lock.read_text())
+        except (OSError, ValueError):
+            newer = 0
+        if newer and newer != os.getpid() and _pid_alive(newer):
+            print(f"{REPLACED_MARK} for chat {chat} (pid {newer}); this one stops without reconnecting "
+                  f"(exit {LISTEN_REPLACED})", file=sys.stderr, flush=True)
+            sys.exit(LISTEN_REPLACED)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+    signal.signal(signal.SIGTERM, handler)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def _listener_alive(pid: int, chat: str) -> bool:
@@ -3982,7 +4017,8 @@ def main(argv: list[str] | None = None) -> None:
         "there over ssh; a dropped connection (ssh exit 255, or a signal ending the session) is "
         "retried after 5 s, doubling to 2 min, and each message is printed once per listener. "
         "Exit codes: 0 messages shown (--once) or --timeout reached; 2 the project refused it "
-        "(unknown chat or project); 75 the project stayed unreachable until --timeout ran out; "
+        "(unknown chat or project); 3 a newer listener for the chat replaced this one (not retried); "
+        "75 the project stayed unreachable until --timeout ran out; "
         "any other code is the project's own ttp failing."))
     s.add_argument("name")
     s.add_argument("--chat", required=True)
