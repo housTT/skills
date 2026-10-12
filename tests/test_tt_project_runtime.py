@@ -10893,7 +10893,8 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
         r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
                            capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
-        return r.stdout
+        # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
+        return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
 
     assert "/tt-project" not in setup() and not claude.exists()       # no Claude Code: nothing written
     claude.mkdir()
