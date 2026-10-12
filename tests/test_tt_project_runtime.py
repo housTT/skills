@@ -10896,18 +10896,19 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
 
-    assert "Claude Code: /tt-project" not in setup() and not claude.exists()   # no Claude Code: nothing written
+    ready = "Claude Code: /tt-project is ready"
+    assert ready not in setup() and not claude.exists()              # no Claude Code: nothing written
     claude.mkdir()
     assert "/tt-project is ready" in setup()
     text = f.read_text()
     assert "name: tt-project\n" in text and "disable-model-invocation: true" in text
     assert "`tt-project:tt-project`" in text
-    assert "Claude Code: /tt-project" not in setup() and f.read_text() == text     # idempotent
+    assert ready not in setup() and f.read_text() == text             # idempotent
     f.write_text(text.replace("Request:", "Old request:"))            # an older release's text
     assert "/tt-project is ready" in setup() and f.read_text() == text
     assert "removed the /tt-project shortcut" in setup("--no-shortcut")
     assert not f.parent.exists()
-    assert "/tt-project shortcut" not in setup("--no-shortcut")          # nothing left to remove
+    assert "removed the /tt-project shortcut" not in setup("--no-shortcut")  # nothing left to remove
     f.parent.mkdir(parents=True)
     f.write_text("---\nname: tt-project\ndescription: mine\n---\nmy own skill\n")
     assert "left your own" in setup() and f.read_text().endswith("my own skill\n")
@@ -39732,13 +39733,15 @@ def test_devq_task_ids_ignore_only_the_temporary_ancestor(tmp_path, monkeypatch,
     assert ("1436" if scratch_name == "t1436" else "1544") in warnings[0], warnings
 
 
-@pytest.mark.parametrize("scratch_name", ["t1436", "ttp-t1544-checks"])
+@pytest.mark.parametrize("scratch_name", ["t1436", "ttp-t1544-checks", "tt-project/check-runs/neutral/checks-tmp"])
 def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch_name):
     scratch = tmp_path / scratch_name
-    scratch.mkdir()
+    scratch.mkdir(parents=True)
     names = ("test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost",
              "test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_id",
-             "test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unless_no_lint")
+             "test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unless_no_lint",
+             "test_setup_installs_the_plain_tt_project_shortcut_for_claude_code",
+             "test_after_push_and_git_hooks_receive_no_managed_scratch")
     result = subprocess.run([sys.executable, "-m", "pytest", "-q",
                              *(f"{__file__}::{name}" for name in names)],
                             cwd=pathlib.Path(__file__).resolve().parents[1],
