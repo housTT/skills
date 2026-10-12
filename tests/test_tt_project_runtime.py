@@ -39995,26 +39995,33 @@ class _FakeCaffeinate:
         return 0
 
 
-def _idle_hold(platform="darwin", ac=True):
+def _idle_hold(platform="darwin", ac=True, lid=None):
     from ttp import awake
     _FakeCaffeinate.started = []
-    power = {"ac": ac, "reads": 0}
+    power = {"ac": ac, "reads": 0, "lid": lid, "lid_reads": 0}
 
     def read():
         power["reads"] += 1
         return power["ac"]
+
+    def read_lid():
+        power["lid_reads"] += 1
+        return power["lid"]
     shown = []
-    h = awake.IdleHold(platform=platform, power=read, spawn=_FakeCaffeinate, pid=777, record=shown.append)
-    h._fresh = lambda: setattr(h, "_ac", None)   # forget the cached power reading, as after POWER_EVERY_S
+    h = awake.IdleHold(platform=platform, power=read, spawn=_FakeCaffeinate, pid=777, record=shown.append,
+                       read_lid=read_lid)
+    # forget the cached power and lid readings, as after POWER_EVERY_S
+    h._fresh = lambda: (setattr(h, "_ac", None), setattr(h, "_lid", None))
     return h, power, shown
 
 
-def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_tied_to_the_daemon(env):
+def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(env):
     h, _, shown = _idle_hold()
     h.update({}, lambda: True)
     [c] = _FakeCaffeinate.started
-    assert c.argv == ["caffeinate", "-i", "-w", "777"]
-    assert not {"-s", "-d", "-u", "-m"} & set(c.argv), "only idle sleep is held: lid close and user sleep stay"
+    assert c.argv == ["caffeinate", "-i", "-s", "-w", "777"], "idle and system (maintenance) sleep, on AC"
+    assert not {"-d", "-u", "-m"} & set(c.argv), "the display may sleep and no user activity is faked"
+    assert not {"sudo", "pmset"} & set(c.argv)
     assert c.kw.get("start_new_session") is True
     assert shown == [{"daemon": 777, "held": True, "pid": c.pid, "why": ""}]
 
@@ -40033,7 +40040,8 @@ def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env
     h.update(cfg, lambda: checked.append(1) or work)
     assert _FakeCaffeinate.started == []
     if why is None:
-        assert shown == [] and checked == [] and power["reads"] == 0, "nothing is read or spawned off macOS"
+        assert shown == [] and checked == [] and power["reads"] == power["lid_reads"] == 0, \
+            "nothing is read or spawned off macOS"
     else:
         assert shown == ([{"daemon": 777, "held": False, "pid": None, "why": why}] if why else [])
 
@@ -40087,6 +40095,71 @@ def test_idle_sleep_power_source_unreadable_counts_as_battery(env):
     assert not awake.on_ac_power(slow)
 
 
+def test_lid_read_from_ioreg_and_unreadable_means_no_lid(env):
+    from ttp import awake
+    seen = []
+
+    def ok(out, rc=0):
+        def run(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, rc, out, "")
+        return run
+    closed = '  | |   "AppleClamshellState" = Yes\n  | |   "AppleClamshellCausesSleep" = Yes\n'
+    clamshell = '  | |   "AppleClamshellState" = Yes\n  | |   "AppleClamshellCausesSleep" = No\n'
+    assert awake.lid(ok(closed)) == {"closed": True, "causes_sleep": True}
+    assert seen[0][:4] == ["ioreg", "-r", "-k", "AppleClamshellState"], "a read-only ioreg query"
+    assert awake.lid(ok(clamshell)) == {"closed": True, "causes_sleep": False}
+    assert awake.lid(ok('"AppleClamshellState" = No\n')) == {"closed": False, "causes_sleep": True}
+    assert awake.lid(ok('"AppleClamshellState" = Yes\n')) == {"closed": True, "causes_sleep": True}, \
+        "no CausesSleep key counts as sleeping"
+    assert awake.lid(ok("")) is None, "a desktop Mac has no lid"
+    assert awake.lid(ok(closed, rc=1)) is None
+
+    def missing(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory")
+    assert awake.lid(missing) is None
+
+
+@pytest.mark.parametrize("lid,ac,says", [
+    ({"closed": True, "causes_sleep": True}, True, True),     # lid closed, no external display: sleeps on AC too
+    ({"closed": True, "causes_sleep": True}, False, True),
+    ({"closed": True, "causes_sleep": False}, False, True),   # clamshell mode needs AC power
+    ({"closed": True, "causes_sleep": False}, True, False),   # clamshell mode on AC keeps working
+    ({"closed": False, "causes_sleep": True}, True, False),
+    (None, True, False),
+])
+def test_closed_lid_that_sleeps_the_mac_is_recorded_while_there_is_work(env, lid, ac, says):
+    from ttp import awake
+    h, power, shown = _idle_hold(ac=ac, lid=lid)
+    h.update({}, lambda: True)
+    assert bool(shown and shown[-1] and shown[-1].get("lid_closed")) is says
+    assert (awake.line(shown[-1], 777) == awake.LID_LINE) is says
+    assert [c.argv for c in _FakeCaffeinate.started] == ([["caffeinate", "-i", "-s", "-w", "777"]] if ac else []), \
+        "the lid changes what status says, not what is held"
+    h.update({}, lambda: False)
+    assert shown[-1] is None, "no work, nothing to say about the lid"
+
+
+def test_closed_lid_line_clears_when_the_lid_opens_and_off_by_config_still_says_it(env):
+    from ttp import awake
+    h, power, shown = _idle_hold(lid={"closed": True, "causes_sleep": True})
+    h.update({"runner": {"prevent_idle_sleep": "off"}}, lambda: True)
+    assert _FakeCaffeinate.started == [] and awake.line(shown[-1], 777) == awake.LID_LINE
+    h.update({}, lambda: True)
+    assert power["lid_reads"] == 1, "the lid is read at most every POWER_EVERY_S"
+    assert awake.line(shown[-1], 777) == awake.LID_LINE and shown[-1]["held"]
+    power["lid"] = {"closed": False, "causes_sleep": True}
+    h._fresh()
+    h.update({}, lambda: True)
+    assert "lid_closed" not in shown[-1]
+    assert awake.line(shown[-1], 777).startswith("idle sleep: held while there is work")
+    power["lid"] = {"closed": True, "causes_sleep": True}
+    h._fresh()
+    h.update({}, lambda: True)
+    h.release()
+    assert shown[-1] is None, "shutdown clears the lid line too"
+
+
 def test_idle_sleep_work_is_running_or_startable_work_only(env):
     p = make(env)
     from ttp import daemon as dm
@@ -40138,6 +40211,28 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     assert web.health(p, p.db)["idle_sleep"] == "idle sleep: not held: on battery power"
     p.db.set_kv(awake.KV, {"daemon": pid + 1, "held": True, "pid": 5, "why": ""})
     assert "idle sleep" not in status_text(p), "another daemon's leftover record is not shown"
+
+
+def test_closed_lid_says_work_pauses_in_status_and_web_instead_of_just_woke(env):
+    p = make(env)
+    from ttp import awake, web
+    from ttp.cli import status_text
+    pid = os.getpid()
+    p.db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": time.time()})
+    p.db.set_kv("settle_until", time.time() + 200)
+    assert "the host just woke from sleep" in status_text(p)
+    p.db.set_kv(awake.KV, {"daemon": pid, "held": True, "pid": 5, "why": "", "lid_closed": True})
+    text = status_text(p)
+    assert text.count("the lid is closed: work pauses while the Mac sleeps") == 1, text
+    assert "just woke" not in text
+    assert not any(w in text for w in ("pmset", "sudo", "caffeinate")), "no command for the user to run"
+    h = web.health(p, p.db)
+    assert "the lid is closed: work pauses while the Mac sleeps" in h["why_idle"] and h["idle_sleep"] == ""
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time(),))
+    h = web.health(p, p.db)
+    assert h["idle_sleep"] == awake.LID_LINE, "with a run working and nothing held, the sleep line says it"
+    p.db.set_kv(awake.KV, {"daemon": pid, "held": True, "pid": 5, "why": ""})
+    assert "lid is closed" not in status_text(p), "it clears once the lid opens"
 
 
 def test_idle_sleep_config_key_is_known_and_checked(env):

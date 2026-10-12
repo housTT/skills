@@ -1076,7 +1076,7 @@ class Daemon:
                  (woke, "host", "host_slept", "normal", _sleep_text(data), json.dumps(data), "record"))
         self.alert("host_slept",
                    f"{hostname()} slept for {slept / 60:.0f} min and the project stood still meanwhile"
-                   f"{f' (runs {_ids(runs)} paused)' if runs else ''}. Keep-awake only stops idle sleep, "
+                   f"{f' (runs {_ids(runs)} paused)' if runs else ''}. Keep-awake stops idle and maintenance sleep, "
                    f"not a closed lid. To keep working the project needs one of: the lid open, power "
                    f"plus an external display (clamshell mode), or an always-on host.",
                    "low", every_s=86400)

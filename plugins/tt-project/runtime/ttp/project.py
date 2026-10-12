@@ -253,8 +253,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
     # coordinator's turns keep normal priority.
     # prevent_idle_sleep (auto/on/off): on macOS, while the project has work and the machine is on AC
-    # power, the daemon keeps the machine from idle-sleeping (`caffeinate -i`; a closed lid or a sleep
-    # the user asks for still sleeps it). auto = on for workstations (a Mac is one); other platforms never.
+    # power, the daemon keeps the machine from idle and maintenance sleep (`caffeinate -i -s`; a closed lid
+    # without an external display, or a sleep the user asks for, still sleeps it). auto = on for
+    # workstations (a Mac is one); other platforms never.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
 }
