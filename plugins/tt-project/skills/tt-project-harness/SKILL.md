@@ -86,11 +86,22 @@ do not run while the project is paused. A task that must reboot the host its har
    again in further tool calls of the same run, at most 3 times. Still not drained: `ttp resume
    <name>` and hand off `waiting` with a time-based `retry_when` (`test "$(date +%s)" -ge <epoch>`).
    Never leave a paused project with a waiting task: probes do not run while paused, so it never wakes.
+   Drain also lists the project's `ttp detach` jobs still running on this host: the reboot ends them.
+   `--jobs` waits for them too. A chain that only drives another machine belongs there instead
+   (`ttp detach --remote`), where this host's reboot cannot end it.
 2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no
    `survives_reboot`: a reboot then wakes the task at once), and start the reboot a little later
    (for example `shutdown -r +2`), so the run ends cleanly first.
+
+A planned reboot or power cycle (a recovery owner cycling the host on purpose, for any project on it):
+add `--reboot "<why>"` to the drain. It records the cycle in `state/host-cycle/<id>/record.json`
+(`boot_id`, `started`, `reason`, `dry_run`, and the detached jobs it interrupts). On the next boot
+every project here reads the records of all projects on this host: a detached job that a matching
+cycle (not a dry run, started at most 2 h before the boot) cut short is not counted toward the
+task's `budget.max_reboot_losses`, and the boot notice and the woken task's next run say it was planned.
+A recovery tool of its own may write the same record itself.
 
 The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else kern.boottime); where none can be read,
 `--until-reboot` is refused.

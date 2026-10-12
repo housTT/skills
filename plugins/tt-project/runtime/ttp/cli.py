@@ -2832,24 +2832,36 @@ def _draining_runs(p: Project) -> list[dict]:
 
 
 def cmd_drain(a) -> None:
-    """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept."""
+    """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept.
+    Its `ttp detach` jobs still running here are listed (a reboot ends them); with --jobs it waits for
+    them too. With --reboot it records the planned host cycle (hostcycle), so the next boot does not
+    count the jobs it cuts as the tasks' reboot losses."""
+    from . import hostcycle
     p = need(a.name, sys.argv[1:])
     if not p.db.kv("paused", False):
         p.db.set_paused(True)
         print(f"{p.name} paused: no new model runs start")
     end = time.time() + max(0.0, a.wait)
     while True:
-        left = _draining_runs(p)
-        if not left:
-            print(f"{p.name} drained: no runs in flight")
-            return
-        if time.time() >= end:
+        left, jobs = _draining_runs(p), hostcycle.running_jobs(p)
+        if not left and not (a.jobs and jobs) or time.time() >= end:
             break
         time.sleep(min(poll_s(2.0), max(0.1, end - time.time())))
+    if a.reboot:
+        print(f"planned host cycle recorded: {hostcycle.record(p, a.reboot, left, jobs)}")
+    if jobs:
+        print(f"{p.name}: {len(jobs)} detached job(s) still running on this host; a reboot ends them"
+              + (" (recorded as interrupted by the planned cycle)" if a.reboot else "") + f": {hostcycle.describe(jobs)}",
+              file=sys.stderr if a.jobs else sys.stdout)
+    if not left and not (a.jobs and jobs):
+        print(f"{p.name} drained: no runs in flight")
+        return
     what = ", ".join(f"push of task #{r['task']}" if r["role"] == "push" else
                      f"run {r['id']} ({r['role']}" + (f", task #{r['task']})" if r["task"] else ")") for r in left)
-    print(f"{p.name} not drained after {a.wait:g} s: {len(left)} in flight: {what}. The project stays paused; "
-          f"`ttp resume {p.name}` lifts it", file=sys.stderr)
+    if a.jobs and jobs:
+        what = ", ".join(x for x in (what, f"{len(jobs)} detached job(s)") if x)
+    print(f"{p.name} not drained after {a.wait:g} s: {len(left) + (len(jobs) if a.jobs else 0)} in flight: {what}"
+          + f". The project stays paused; `ttp resume {p.name}` lifts it", file=sys.stderr)
     sys.exit(1)
 
 
@@ -4348,6 +4360,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name")
     s.add_argument("--wait", type=float, default=0, metavar="S",
                    help="seconds to wait; exits 0 once no run or push is in flight, 1 at the timeout (default 0: check once)")
+    s.add_argument("--jobs", action="store_true",
+                   help="also wait for the project's `ttp detach` jobs running on this host (listed either way)")
+    s.add_argument("--reboot", metavar="REASON",
+                   help="record a planned reboot or power cycle of this host, about to happen: on the next boot "
+                        "the detached jobs it ends do not count as the tasks' reboot losses")
     s.set_defaults(fn=cmd_drain)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")

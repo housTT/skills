@@ -170,7 +170,8 @@ never write to a run folder named in earlier context):
   Under `set -e`, write that marker from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`).
   For a job on another machine (a device job goes through a device runner instead, when your task
   header lists them; see below), start its driver there with `ttp detach --remote <ssh alias> <name>
-  -- <command...>`, set `"survives_reboot": true` (a reboot here does not end it) and use the
+  -- <command...>` (also a chain that only drives it over ssh: a local driver dies when this host
+  reboots), set `"survives_reboot": true` (a reboot here does not end it) and use the
   `retry_when` it prints, `ttp detach --check --host <alias> <dir>/<name>`: it exits 0 once the job
   wrote its exit code or is gone (killed, or that host restarted), 1 while it runs, 255 while ssh
   fails. Prefer it to a bare `ssh <host> test -e <marker>`, which never wakes when the driver dies

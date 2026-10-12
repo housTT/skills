@@ -231,7 +231,8 @@ def _reboot_note(reboot, tz: str | None = None) -> str:
     at = reboot.get("at")
     when = (timefmt.long(at, tz) if tz else time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at))) \
         if isinstance(at, (int, float)) else "recently"
-    out = (f"The host rebooted (booted {when}) since the last run; that does not count as an attempt. "
+    planned = f" It was a planned host cycle: {reboot['planned']}." if reboot.get("planned") else ""
+    out = (f"The host rebooted (booted {when}) since the last run; that does not count as an attempt.{planned} "
            "Detached jobs, /tmp files and device state from before the reboot are gone. Check `git status` "
            "and the job logs before redoing work.\n")
     notes = [str(x) for x in reboot.get("notes") or []]

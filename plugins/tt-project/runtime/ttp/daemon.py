@@ -428,6 +428,7 @@ class Daemon:
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._boot_woken = False
+        self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
@@ -1529,7 +1530,9 @@ class Daemon:
             held = list(prev.get("held") or [])
             booted = self.boot_at
             shutdown = prev.get("shutdown") or "abrupt"
+            cycle = self._planned_cycle(prev["prev_boot"]) if prev.get("prev_boot") else None
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
+                    "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"]} if cycle else None,
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
                     "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
                               "usd": round(float(r["cost_usd"] or 0), 2)} for r in lost]}
@@ -1549,6 +1552,8 @@ class Daemon:
                 unstable = (f" The host looks unstable: {cut} abrupt reboots cut runs short in 24 h; check its "
                             f"power, cooling and system logs.")
             then = f" Held at its last heartbeat: {', '.join(held)}." if held else ""
+            if cycle:
+                then += f" It was a planned host cycle: {data['planned']['reason'] or 'no reason recorded'}."
             parts = []
             for r in lost:
                 task = db.task(r["task"]) if r["task"] else None
@@ -4908,6 +4913,9 @@ class Daemon:
         if not self.boot_at:
             return
         db = self.p.db
+        earlier = (db.kv("boot_prev") or {}).get("prev_boot")
+        cycle = self._planned_cycle(earlier) if earlier and self._this_boot((db.kv("boot_prev") or {}).get("boot")) \
+            else None
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             if prev.get("status") != "waiting" or prev.get("survives_reboot") is True:
@@ -4935,8 +4943,11 @@ class Daemon:
                           f"#{t['id']} {t['title']} → blocked: {reason}", "queued", t["id"]))
                 log(self.p, f"task {t['id']} blocked: {reason}")
                 continue
+            reboot = {"at": self.boot_at}
+            if cycle:
+                reboot["planned"] = str(cycle.get("reason") or "no reason recorded")[:300]
             db.update_task(t["id"], not_before=None, result=dump_result(
-                {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
+                {**prev, "woke": "the host rebooted", "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
     def _relaunch_checks(self, t: dict, prev: dict) -> tuple[bool, int]:
@@ -5023,6 +5034,18 @@ class Daemon:
             return False
         return True
 
+    def _planned_cycle(self, boot: str) -> dict | None:
+        """The record of a planned host cycle that ended boot `boot`, if any (hostcycle.planned); read
+        once per boot."""
+        from . import hostcycle
+        if boot not in self._cycles:
+            try:
+                self._cycles[boot] = hostcycle.planned(self.p, boot, self.boot_at)
+            except Exception:
+                log(self.p, "host-cycle records: " + traceback.format_exc().replace("\n", " | ")[:1000])
+                self._cycles[boot] = None
+        return self._cycles[boot]
+
     def _job_cut_by_reboot(self, tid: int) -> bool:
         """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
         runs on the earlier boot started that wrote no .rc."""
@@ -5030,6 +5053,11 @@ class Daemon:
         last = db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id NOT IN (?,?) "
                       "ORDER BY id DESC LIMIT 1", (tid, *self.boots))
         if not last or self._shutdown(last["boot_id"]) == "orderly":
+            return False
+        if cycle := self._planned_cycle(last["boot_id"]):
+            # A planned host cycle (a recovery owner power cycled the host on purpose) ended it, not the task.
+            log(self.p, f"task {tid}: its detached job was cut by a planned host cycle ({cycle['path']}); "
+                        "not counted as a reboot loss")
             return False
         dirs = db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, last["boot_id"]))
         return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))

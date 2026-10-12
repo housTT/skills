@@ -23854,6 +23854,76 @@ def test_a_boot_time_wake_counts_only_for_its_own_job_cut_by_an_abrupt_reboot(en
         assert not json.loads(t["result"]).get("reboot_wakes"), "a wake that was not the task's counted"
 
 
+def _host_cycle_record(state, boot, started, **kw):
+    d = pathlib.Path(state) / "host-cycle" / f"rec-{boot}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "record.json").write_text(json.dumps({"boot_id": boot, "started": started, "dry_run": False,
+                                               "reason": "chips off the bus; power cycled", **kw}))
+
+
+@pytest.mark.parametrize("where", ["own", "other_project"])
+def test_a_planned_host_cycle_does_not_count_a_detached_job_it_cut_as_a_reboot_loss(env, tmp_path, where):
+    p = make(env)
+    from ttp import project
+    from ttp.daemon import Daemon
+    from ttp.prompts import _reboot_note
+    state = p.state
+    if where == "other_project":   # the machine's recovery owner is another project on this host
+        project.register("recovery", {"host": "testhost", "dir": str(tmp_path / "recovery")})
+        state = tmp_path / "recovery" / project.FOLDER / "state"
+    tid = p.db.add_task("drive the remote box", "s", kind="work", tier="light", origin="user")
+    for i in range(4):
+        earlier = f"boot-{i}"
+        _waiting_from_before_the_boot(p, tid, boot=earlier)
+        d = Daemon(p.base)
+        d.boot_at = time.time() - 300
+        _host_cycle_record(state, earlier, d.boot_at - 120)
+        p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": earlier, "shutdown": "abrupt"})
+        d.wake_after_reboot()
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and not t["not_before"], (i, dict(t))
+        res = json.loads(t["result"])
+        assert not res.get("reboot_wakes"), "a job cut by a planned host cycle counted as a reboot loss"
+        assert res["reboot"]["planned"] == "chips off the bus; power cycled"
+    assert "It was a planned host cycle: chips off the bus" in _reboot_note(res["reboot"])
+
+
+@pytest.mark.parametrize("case", ["dry_run", "other_boot", "too_old", "not_rebooted"])
+def test_a_host_cycle_record_that_does_not_match_the_reboot_still_counts(env, case):
+    p = make(env)
+    from ttp import hostcycle
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    started = d.boot_at - (hostcycle.WINDOW_S + 60 if case == "too_old" else 120)
+    _host_cycle_record(p.state, "another-boot" if case == "other_boot" else "an-earlier-boot", started,
+                       **({"dry_run": True} if case == "dry_run" else {"rebooted": False} if case == "not_rebooted"
+                          else {}))
+    d.wake_after_reboot()
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["reboot_wakes"] == 1 and "planned" not in res["reboot"], (case, res)
+
+
+def test_the_boot_record_names_a_planned_host_cycle(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _boot_as(monkeypatch, "boot-a")
+    Daemon(p.base).tick()
+    _lost_deep_runs(p, tmp_path, "boot-a")
+    booted = time.time() - 120
+    _host_cycle_record(p.state, "boot-a", booted - 60)
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    (row,) = p.db.q("SELECT data FROM events WHERE source='host' AND kind='boot'")
+    assert json.loads(row["data"])["planned"]["reason"] == "chips off the bus; power cycled"
+    note = _reboot_notices(p)
+    assert len(note) == 1 and "It was a planned host cycle: chips off the bus" in note[0]["text"], note
+
+
 def test_a_coordinator_turn_lost_to_a_reboot_is_not_a_failed_turn(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
@@ -24258,6 +24328,47 @@ def test_drain_pauses_and_exits_once_runs_end_or_fails_at_its_timeout(env, monke
     with pytest.raises(SystemExit):
         cli.main(["drain", "demo"])
     assert f"push of task #{tid}" in capsys.readouterr().err
+
+
+def test_drain_lists_detached_jobs_waits_for_them_with_jobs_and_records_a_planned_cycle(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, hostcycle
+    from ttp.daemon import Daemon
+    from ttp.runner import boot_id
+    tid = p.db.add_task("drive the remote box", "s", kind="work", tier="light", origin="user")
+    run_dir = p.runs / "drv"
+    run_dir.mkdir(parents=True)
+    rc = run_dir / "chain.rc"
+    (run_dir / "detached.json").write_text(json.dumps([
+        {"name": "chain", "rc": str(rc), "log": str(run_dir / "chain.log"), "boot": boot_id()},
+        {"name": "old", "rc": str(run_dir / "old.rc"), "log": str(run_dir / "old.log"), "boot": "an-earlier-boot"}]))
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 600, time.time() - 300, "ok", str(run_dir), boot_id()))
+    monkeypatch.setattr("ttp.detach.state", lambda r: ("running", "") if pathlib.Path(r) == rc and not rc.exists()
+                        else ("ended", "0"))
+    # No model run in flight: drained, and the job a reboot would end is listed.
+    cli.main(["drain", "demo"])
+    out = capsys.readouterr().out
+    assert "drained" in out and f"1 detached job(s) still running on this host" in out and f"chain (task #{tid}" in out
+    assert "old (" not in out, "a job of an earlier boot is listed"
+    # --jobs waits for it too.
+    with pytest.raises(SystemExit) as e:
+        cli.main(["drain", "demo", "--jobs", "--wait", "0.2"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "not drained" in err and "1 detached job(s)" in err, err
+    # --reboot records the planned cycle with the job it interrupts; the next boot matches it.
+    cli.main(["drain", "demo", "--reboot", "chips off the bus"])
+    assert "planned host cycle recorded" in capsys.readouterr().out
+    (f,) = (p.state / hostcycle.FOLDER).glob("*/record.json")
+    rec = json.loads(f.read_text())
+    assert rec["boot_id"] == boot_id() and rec["reason"] == "chips off the bus" and not rec["dry_run"]
+    assert [j["name"] for j in rec["interrupted"]] == ["chain"]
+    d = Daemon(p.base)
+    d.boot_at = time.time() + 60
+    assert d._planned_cycle(boot_id())["reason"] == "chips off the bus"
+    rc.write_text("0\n")
+    cli.main(["drain", "demo", "--jobs"])
+    assert "detached job" not in capsys.readouterr().out
 
 
 def test_resuming_a_resource_wakes_the_tasks_that_waited_on_its_pause(env):

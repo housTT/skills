@@ -74,6 +74,9 @@ and preferences you add later become part of the project's charter and memory.
   A run a reboot, a sleep or a lost supervisor cut short after real progress
   (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
   working directory with a short prompt, instead of starting over.
+  A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. A
+  detached job cut by a planned host cycle (`ttp drain <name> --reboot "<why>"`, or another project's
+  `state/host-cycle/<id>/record.json` on the same host) does not count.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file. A temporary entry carries its end (a time, a plain-language condition or a probe); the daemon retires it to the archive or `CHARTER.history.md` once that passes and says so.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
