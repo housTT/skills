@@ -10100,6 +10100,76 @@ def test_a_debounced_schedule_keeps_its_period_while_its_run_is_open_or_its_budg
     assert sched.waiting_line(p.db) == "" and not sched.failing(s["last_status"])
 
 
+def _idle_review(p, d):
+    """A user task and a review that ended done 3 h ago (past the debounce), due again with no run and
+    no user message since its last trigger: only the evidence or the review's own outcome can owe a run."""
+    work = p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    _review_due(p)
+    d.run_schedules()
+    _review_done(p, _reviews(p)[-1], time.time() - 3 * 3600)
+    p.db.x("UPDATE messages SET ts=?", (time.time() - 86400,))
+    return work
+
+
+def _review_status(p):
+    return p.db.one("SELECT last_status FROM schedules WHERE name='daily-review'")["last_status"]
+
+
+def test_the_idle_guard_never_skips_a_review_owed_by_changed_evidence_or_its_own_failed_run(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    work = _idle_review(p, d)
+    # Nothing changed and nothing ran: the idle guard still skips it.
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "skipped: nothing happened since the last run"
+    n = len(_reviews(p))
+    # An owner cancels a task: its outcome moved with no run since the last review.
+    p.db.update_task(work, status="cancelled")
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "queued" and len(_reviews(p)) == n + 1
+    # The review itself failed, or was cancelled, on unchanged evidence and with nothing run since: retried.
+    for status in ("failed", "cancelled"):
+        last = _reviews(p)[-1]
+        _review_done(p, last, time.time() - 3 * 3600)
+        p.db.update_task(last, status=status)
+        _review_due(p, time.time() - 1800)
+        d.run_schedules()
+        assert _review_status(p) == "queued" and _reviews(p)[-1] != last, status
+
+
+def test_a_review_owed_by_changed_evidence_still_waits_for_its_budget_and_its_open_run(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    work = _idle_review(p, d)
+    # Changed evidence while the day's budget is used: deferred, then queued once the budget allows.
+    p.db.update_task(work, status="done", result=json.dumps({"summary": "shipped"}))
+    spend = p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)",
+                   (time.time() - 600, "schedule:daily-review", 1e6))
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "deferred: daily budget used"
+    p.db.x("DELETE FROM ledger WHERE id=?", (spend,))
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "queued"
+    # A change during the open review: deferred while it runs, queued once it ended (done).
+    open_review = _reviews(p)[-1]
+    p.db.add_task("more work", "x", kind="work", tier="light", origin="user")
+    _review_due(p, time.time() - 1800)
+    d.run_schedules()
+    assert _review_status(p) == "deferred: previous run still open" and _reviews(p)[-1] == open_review
+    _review_done(p, open_review, time.time() - 60)
+    _review_due(p, time.time() - 30)
+    d.run_schedules()
+    assert _review_status(p) == "queued" and _reviews(p)[-1] != open_review
+
+
 def test_a_worker_that_finishes_after_the_last_review_counts_as_activity(env):
     p = make(env)
     from ttp.daemon import Daemon

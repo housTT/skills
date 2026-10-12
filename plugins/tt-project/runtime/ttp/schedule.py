@@ -362,25 +362,32 @@ def evidence(db: DB) -> str:
     return _sha(json.dumps([tasks, user and user["id"]], sort_keys=True, default=str))
 
 
-def debounce_gate(db: DB, name: str, payload: dict, now: float | None = None) -> tuple[str, str | None]:
-    """(skip reason or "", the evidence digest to record with a run queued now; None without a debounce).
+def debounce_gate(db: DB, name: str, payload: dict,
+                  now: float | None = None) -> tuple[str, str | None, str]:
+    """(skip reason or "", the evidence digest to record with a run queued now (None without a
+    debounce), why a run is owed: "changed", "not-done", or "" when only the idle guard can say).
 
     Only a run that ended done, within the debounce, on the evidence it was queued on, makes a
-    trigger a duplicate. A missing or older record never does."""
+    trigger a duplicate. A missing or older record never does. Changed evidence, or a last run
+    that did not end done, owes a run whatever the idle guard sees."""
     window = debounce_s(name, payload)
     if not window:
-        return "", None
+        return "", None, ""
     now = time.time() if now is None else now
     digest = evidence(db)
     last = db.kv(DEBOUNCE_KEY + name) or {}
     task = db.task(int(last["task"])) if isinstance(last, dict) and str(last.get("task", "")).isdigit() else None
-    if not task or task["status"] != "done" or last.get("evidence") != digest:
-        return "", digest
+    if not task:
+        return "", digest, ""
+    if last.get("evidence") != digest:
+        return "", digest, "changed"
+    if task["status"] != "done":
+        return "", digest, "not-done"
     run = db.one("SELECT MAX(ended) e FROM runs WHERE task=? AND ended IS NOT NULL", (task["id"],))
     ended = float(run["e"]) if run and run["e"] else None
     if ended is None or not 0 <= now - ended < window:
-        return "", digest
-    return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digest
+        return "", digest, ""
+    return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digest, ""
 
 
 def record_evidence(db: DB, name: str, task_id: int, digest: str) -> None:
