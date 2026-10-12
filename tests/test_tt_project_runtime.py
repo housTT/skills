@@ -14011,6 +14011,83 @@ def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, mon
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "the undelivered work stays flagged"
 
 
+def test_a_task_whose_change_landed_under_another_commit_gets_no_review_or_fix(env, monkeypatch):
+    """Replay of a duplicate: a code task's one commit (its change plus a version bump and changeset)
+    sits in review while a fix chain of another task rebased the change and the push queue landed it
+    as a new commit, without the bump and with other context around it, so git's patch-id differs. The
+    sweep, the daemon's review and the fix of a failed review all find it landed: the task is recorded
+    as superseded and closed, the coordinator is told once, and no review or fix is queued."""
+    from ttp import landed
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    BUMP = {"files": ["VERSION"], "changeset_dir": ".changeset"}
+    p.set_config("delivery.version_bump", BUMP)
+    lines = [f"line {i}" for i in range(1, 11)]
+    (repo / "VERSION").write_text("0.1.0\n")
+    (repo / "app.txt").write_text("\n".join(lines) + "\n")
+    _git_out(repo, "add", "VERSION", "app.txt")
+    _git_out(repo, "commit", "-qm", "base")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    tid, path, branch = _code_task(p, "duplicate change", status="review")
+    p.db.update_task(tid, result=json.dumps({"status": "done", "summary": "made the change"}))
+    change = lines[:5] + ["line 6 changed"] + lines[6:]
+    (path / "app.txt").write_text("\n".join(change) + "\n")
+    (path / "VERSION").write_text("0.1.1\n")
+    (path / ".changeset").mkdir()
+    (path / ".changeset" / "change.md").write_text("the change\n")
+    _git_out(path, "add", "-A")
+    _git_out(path, "commit", "-qm", "the change, with its version bump")
+    head = _git_out(path, "rev-parse", "HEAD")
+    assert landed.equivalent(p, branch, BUMP) is None, "not landed yet"
+    # Another task's chain: a neighbouring change first, then the same change re-landed, then a fix.
+    (other / "app.txt").write_text("\n".join(lines[:3] + ["line 4 by someone else"] + lines[4:]) + "\n")
+    _git_out(other, "commit", "-qam", "a neighbouring change")
+    (other / "app.txt").write_text("\n".join(lines[:3] + ["line 4 by someone else"] + change[4:]) + "\n")
+    _git_out(other, "commit", "-qam", "re-land of the change under another task")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _commit(other, "fix.txt", "a later fix of the change\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert not landed.on_branch(repo, head, tip), "git's patch-id and the commit keys miss it"
+    assert landed.equivalent(p, branch, None) is None, "the version files count unless excluded"
+    assert landed.equivalent(p, branch, BUMP) == (relanded, head)
+
+    def reset():
+        p.db.x("DELETE FROM task_superseded")
+        p.db.x("DELETE FROM events WHERE kind='task_superseded'")
+        p.db.update_task(tid, status="review")
+
+    def told():
+        return p.db.q("SELECT status, text FROM events WHERE kind='task_superseded' AND task=?", (tid,))
+
+    def closed():
+        t = p.db.task(tid)
+        assert t["status"] == "done" and json.loads(t["result"])["superseded_by"] == relanded
+        assert landed.superseded(p.db, [tid]) == {tid: [(head, relanded)]}
+        (e,) = told()
+        assert e["status"] == "queued" and relanded[:10] in e["text"] and "no review or fix" in e["text"]
+        assert not p.db.q("SELECT id FROM tasks WHERE id!=? AND status NOT IN ('done','failed','cancelled')",
+                          (tid,)), "no review or fix queued"
+
+    _ran(p, tid, time.time() - 1900)
+    d = Daemon(p.base)
+    _sweep(d)
+    closed()
+    _sweep(d)
+    assert len(told()) == 1, "told once"
+    reset()
+    assert d._auto_review(p.db.task(tid), "made the change") is None
+    closed()
+    reset()
+    review = p.db.add_task(f"Review #{tid}: duplicate change", "Review it.", kind="review", origin="coordinator",
+                           depends_on=[tid])
+    p.db.update_task(review, status="failed")
+    assert d._fix_failed_review(p.db.task(review), [{"title": "fix it", "spec": "fix the finding"}], "bad") is None
+    closed()
+
+
 def _done_code_task_on(p, branch):
     tid = p.db.add_task("example work", "s", kind="code", tier="light", origin="user")
     p.db.update_task(tid, status="done", branch=branch)

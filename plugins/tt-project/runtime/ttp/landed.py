@@ -16,6 +16,7 @@ shas. The push queue (and `ttp push`) rebase each approved head onto the branch 
 Exit codes, as a probe's: 0 landed, 1 not yet, 2 cannot tell (a bad id, sha or ref)."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -218,6 +219,79 @@ def record_superseded(p, tid: int, sha: str) -> str:
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
            (tid, head, full, time.time()))
     return f"task #{tid}: branch {branch} at {head[:10]} recorded as superseded by {full[:10]} ({words})"
+
+
+def _keys(repo: Path, args: list[str], skip: list[str]) -> list[tuple[str, str]]:
+    """[(commit, key)] of `git log <args>`, oldest first: the key is a hash of each file's added and
+    removed lines (no context, no line numbers), with the `skip` paths left out. A rebase that moved
+    the context or took the version files keeps the key; git's patch-id does not. Merges and commits
+    that change only `skip` paths are left out."""
+    out = _git(repo, "log", "--reverse", "--no-merges", "-p", "-U0", "--no-renames", "--no-color",
+               "--format=%x00%H", *args, "--", ".", *(f":(exclude){x}" for x in skip), timeout=60)
+    if out.returncode != 0:
+        return []
+    keys = []
+    for chunk in out.stdout.split("\0")[1:]:
+        sha, _, body = chunk.partition("\n")
+        if key := _key_of(body):
+            keys.append((sha.strip(), key))
+    return keys
+
+
+def _key_of(diff: str) -> str:
+    """The key _keys gives a diff's changed lines; "" when it changes nothing."""
+    files: dict[str, list[str]] = {}
+    name, hunk = "", False
+    for ln in diff.splitlines():
+        if ln.startswith("diff --git "):
+            name, hunk = ln, False
+            files.setdefault(name, [])
+        elif ln.startswith("@@"):
+            hunk = True
+        elif hunk and ln[:1] in ("+", "-"):
+            files[name].append(ln)
+    files = {f: lines for f, lines in files.items() if lines}
+    if not files:
+        return ""
+    return hashlib.sha256("\n".join(f"{f}\n" + "\n".join(lines) for f, lines in sorted(files.items()))
+                          .encode()).hexdigest()
+
+
+def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
+    """(commit on the push branch, branch head) when `branch`'s change already landed there under
+    other commits: each of its own commits, or its whole change at once (a squash), has the same
+    changed lines as a commit the push branch gained since the two parted, the version files and
+    changesets of `bump` (delivery.version_bump) aside. None when it did not, the branch already is
+    on the push branch (a plain landing) or has no change of its own, or it cannot be read.
+    Local refs only: no fetch."""
+    repo = p.root
+    head = _commit(repo, f"refs/heads/{branch}")
+    try:
+        tip = _commit(repo, _push_ref(p, repo))
+    except ValueError:
+        return None
+    if not head or not tip or _git(repo, "merge-base", "--is-ancestor", head, tip).returncode == 0:
+        return None
+    base = _git(repo, "merge-base", tip, head).stdout.strip()
+    if not base:
+        return None
+    try:
+        cfg = push.bump_of(bump)
+    except ValueError:
+        cfg = None
+    skip = (cfg["files"] + ([cfg["changeset_dir"]] if cfg["changeset_dir"] else [])) if cfg else []
+    mine = _keys(repo, [f"{base}..{head}"], skip)
+    if not mine:
+        return None
+    theirs: dict[str, str] = {}
+    for sha, key in _keys(repo, ["--max-count=500", f"{base}..{tip}"], skip):
+        theirs.setdefault(key, sha)
+    if all(key in theirs for _, key in mine):
+        return theirs[mine[-1][1]], head
+    whole = _git(repo, "diff", "-U0", "--no-renames", "--no-color", base, head, "--", ".",
+                 *(f":(exclude){x}" for x in skip), timeout=60)
+    key = _key_of(whole.stdout) if whole.returncode == 0 else ""
+    return (theirs[key], head) if key in theirs else None
 
 
 def superseded(db, tids) -> dict[int, list[tuple[str, str]]]:

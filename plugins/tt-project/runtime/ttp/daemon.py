@@ -5590,11 +5590,51 @@ class Daemon:
             self.p.db.update_task(task["id"], tier=tier)
         return dict(task, tier=tier), pick
 
+    def _landed_elsewhere(self, task: dict) -> str:
+        """The commit on the push branch that already carries code task `task`'s change under other
+        commits (landed.equivalent: a fix or rebase of another task landed it), or "": then the caller
+        reviews or fixes it as usual. When found, it is recorded as superseding the task, a task left in
+        'review' is closed, and the coordinator is told once, instead of spending a review or fix on
+        a duplicate."""
+        d = self.cfg.get("delivery") or {}
+        branch = task.get("branch")
+        if task.get("kind") != "code" or not branch or not d.get("push_branch"):
+            return ""
+        try:
+            found = landed.equivalent(self.p, branch, d.get("version_bump"))
+        except Exception as e:
+            log(self.p, f"task {task['id']}: could not compare its change with the push branch: {e}")
+            return ""
+        if not found:
+            return ""
+        sha, head = found
+        db, now = self.p.db, time.time()
+        line = (f"its change already landed on {d['push_branch']} as {sha[:10]} under another commit (the same "
+                f"changed lines, version files aside): branch {branch} at {head[:10]} is superseded")
+        with db.tx():
+            if not db.conn.execute("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) "
+                                   "ON CONFLICT DO NOTHING", (task["id"], head, sha, now)).rowcount:
+                return sha
+            prev = load_result((db.task(task["id"]) or task).get("result"))
+            result = {**prev, "status": "done", "superseded_by": sha,
+                      "summary": f"{str(prev.get('summary') or '').rstrip()} ({line})".strip()[:1500]}
+            closed = db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
+                                     "WHERE id=? AND status='review'", (dump_result(result), now, task["id"])).rowcount
+            db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                            (now, f"task:{task['id']}", "task_superseded", "normal",
+                             f"#{task['id']} {task['title']}: {line}; "
+                             + ("closed as done; " if closed else "") + "no review or fix queued for it.",
+                             "queued", task["id"]))
+        log(self.p, f"task {task['id']}: superseded by {sha[:10]}; no review or fix queued")
+        return sha
+
     def sweep_reviews(self) -> None:
         """Model-free retry of reviews left to the coordinator: a code task in 'review' whose last run
         ended review.sweep_after_s ago (0 off) and that no review has covered since it entered review
         gets its review (_auto_review), so a hand-off with notes the coordinator queued no review for
-        does not sit there. It only queues reviews; it never closes or changes a task. Coverage here
+        does not sit there. It only queues reviews and never closes or changes a task, except one
+        whose change already landed under other commits (_landed_elsewhere): that one is closed as
+        superseded, with no review. Coverage here
         is direct (pushq._covers without following continues:<id>): a continuation need not carry the
         task's commits, so a task whose continuation passed review stays in review and gets its own
         review (known gap: one review each, no work lost)."""
@@ -5626,6 +5666,10 @@ class Daemon:
             for t in todo:
                 ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (t["id"],))["e"]
                 if ended is None or now - float(ended) < after:
+                    continue
+                # A change that landed under another task's commits needs no review of its own; the
+                # task is closed as superseded (it may have had its say from a review already).
+                if self._landed_elsewhere(t):
                     continue
                 # A review that ran or still runs since the task entered review had its say: what it
                 # found is the coordinator's (or the push queue's) to act on, not a second review's.
@@ -5663,6 +5707,8 @@ class Daemon:
         d = cfg.get("delivery") or {}
         rules = cfg.get("review") or {}
         if not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
+            return None
+        if self._landed_elsewhere(task):
             return None
         branch = task.get("branch")
         try:
@@ -5933,7 +5979,7 @@ class Daemon:
         except Exception as e:
             log(self.p, f"review {review['id']}: no fix queued, its branch was not read: {e}")
             return None
-        if not code or not head:
+        if not code or not head or self._landed_elsewhere(code):
             return None
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         # A stack kept off the push branch stays review only through its fix and re-review.

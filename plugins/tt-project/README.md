@@ -171,6 +171,11 @@ prolonged whole-box outage.
   with no review `review.sweep_after_s` (default 1800, 0 off) after its last run gets its review
   from the daemon. The sweep only queues reviews and never closes a task, so a task whose
   continuation already passed review still gets its own review (one review each, no work lost).
+  The exception is a task whose change already landed on the push branch under other commits
+  (the same changed lines, its `delivery.version_bump` files and changesets aside, commit by
+  commit or squashed): the sweep, the daemon's review and the fix of a failed review record it as
+  superseded (as `ttp task superseded` does), close it if it is in review, tell the coordinator
+  once, and queue no review or fix for it.
   `review.auto_notes` is added
   to each such review's spec (for example, what to do after a push). When the task's PR already
   carries the reviewed head (as pr-watch last read it, or as the task's own `ttp push --own`
