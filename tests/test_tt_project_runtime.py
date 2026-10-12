@@ -51717,6 +51717,7 @@ def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, mon
     from ttp.daemon import Daemon
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
     monkeypatch.delenv(mm.MASK_RECORD, raising=False)   # this run's own record, if any, is not the test's
+    monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor its own mask, when it runs on a device machine
     before = json.dumps({"TT_VISIBLE_DEVICES": os.environ.get("TT_VISIBLE_DEVICES")}, sort_keys=True)
     p = make(env)
     d = Daemon(p.base)
@@ -52109,7 +52110,7 @@ def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
 HARNESS_PLAN = "ttp check-plan --purpose harness --definition-commit " + "a" * 40 + " --definition-path checks/harness.json"
 
 
-def _fake_ttp(tmp_path, monkeypatch, log, rc=0):
+def _fake_check_plan_ttp(tmp_path, monkeypatch, log, rc=0):
     """A `ttp` on PATH that only logs its call: the harness entry's check-plan command."""
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir(exist_ok=True)
@@ -52120,7 +52121,7 @@ def _fake_ttp(tmp_path, monkeypatch, log, rc=0):
 
 def test_check_purpose_tag_is_validated_and_kept(tmp_path, monkeypatch):
     from ttp import push
-    _fake_ttp(tmp_path, monkeypatch, tmp_path / "log")
+    _fake_check_plan_ttp(tmp_path, monkeypatch, tmp_path / "log")
     harness = {"run": HARNESS_PLAN, "purpose": "harness"}
     gate = {"run": "true", "purpose": "candidate"}
     assert push.check_problems([harness, gate, "true"]) == []
@@ -52148,7 +52149,7 @@ def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_
     from ttp import daemon as daemon_mod
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
-    _fake_ttp(tmp_path, monkeypatch, log)
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
     selector = ("sh -c 'echo \"mandatory check selector: no case for HEAD $(git rev-parse HEAD)\"; "
                 "echo gate >> " + str(log) + "; exit 1'")
     p.set_config("delivery.push_checks", [{"run": selector, "purpose": "candidate"},
@@ -52187,7 +52188,7 @@ def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypa
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
-    _fake_ttp(tmp_path, monkeypatch, log)
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
     p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
     ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
     cli.main(["checks"])
@@ -52207,7 +52208,7 @@ def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, cap
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
-    _fake_ttp(tmp_path, monkeypatch, log)
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
     # No harness entry: nothing qualifies the head, even with untagged checks and extras.
     p.set_config("delivery.push_checks", ["true", {"run": "true", "purpose": "candidate"}])
     with pytest.raises(SystemExit) as exc:
@@ -52229,7 +52230,7 @@ def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, cap
     assert rec["passed"] is False and rec["purpose"] == "harness"
     assert not (run / "check_failure.json").exists(), "a harness run opened a check gap"
     # A failing harness plan fails it as well.
-    _fake_ttp(tmp_path, monkeypatch, log, rc=65)
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log, rc=65)
     p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
     with pytest.raises(SystemExit) as exc:
         cli.main(["checks", "--purpose", "harness"])
@@ -52246,7 +52247,7 @@ def test_detached_and_relaunched_checks_keep_the_harness_purpose(env, tmp_path, 
 
 def test_push_runs_every_check_whatever_its_purpose(env, monkeypatch, tmp_path):
     log = tmp_path / "log"
-    _fake_ttp(tmp_path, monkeypatch, log)
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
     p, repo, origin, other = _push_setup(env, monkeypatch, [{"run": f"echo gate >> {log}", "purpose": "candidate"},
                                                            {"run": HARNESS_PLAN, "purpose": "harness"},
                                                            f"echo consumer >> {log}"])
