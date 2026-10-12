@@ -24,6 +24,21 @@ Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`, or sta
 The first use installs a `ttp` command for your user (`ttp setup`). Python 3.9+ and `git` are the
 only requirements; the runtime uses the standard library.
 
+To call the skill directly instead of just asking for a project:
+
+| Host | Main skill | Harness skill |
+|---|---|---|
+| Claude Code | `/tt-project` | `/tt-project:tt-project-harness` |
+| Codex | `$tt-project:tt-project` | `$tt-project:tt-project-harness` |
+| Cursor | `/tt-project` | `/tt-project-harness` |
+
+Claude Code always shows a plugin's skills under the plugin's name, so its own entry for the main
+skill is `/tt-project:tt-project`. `ttp setup` adds a small personal skill,
+`~/.claude/skills/tt-project/SKILL.md` (under `$CLAUDE_CONFIG_DIR` when set), that the slash menu
+lists as `/tt-project` and that loads the plugin's skill. Only you can run it, so Claude still sees one
+tt-project skill, not two. Every `ttp setup` refreshes it. If you already have your own skill named
+`tt-project`, setup leaves it as it is. `ttp setup --no-shortcut` removes the shortcut.
+
 ## Using it
 
 | You say | What happens |

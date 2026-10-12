@@ -102,6 +102,23 @@ def test_skills_are_discoverable_and_self_contained():
             raise AssertionError(f"{md}: references missing sibling {ref}")
 
 
+def test_claude_code_shortcut_is_plain_tt_project_and_loads_the_plugin_skill():
+    """Claude Code namespaces plugin skills (`/tt-project:tt-project`); `ttp setup` adds a personal
+    `/tt-project` that only the user invokes and that loads the plugin's main skill by its full name."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ttp_shortcut", RUNTIME / "shortcut.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fm = yaml.safe_load(mod.TEXT.split("---")[1])
+    assert fm["name"] == "tt-project" and fm["name"].startswith("tt-")
+    assert fm["disable-model-invocation"] is True, "the model must see one tt-project skill, not two"
+    plugin = json.loads(MANIFESTS[0].read_text())["name"]
+    assert f"`{plugin}:{fm['name']}`" in mod.TEXT and (SKILLS / fm["name"] / "SKILL.md").exists()
+    assert "$ARGUMENTS" in mod.TEXT and mod.MARK in mod.TEXT
+    readme = " ".join((PLUGIN / "README.md").read_text(encoding="utf-8").split())
+    assert "`/tt-project`" in readme and "`/tt-project:tt-project-harness`" in readme
+
+
 def test_runtime_is_standard_library_only_and_python39_compatible():
     stdlib = set(sys.stdlib_module_names)
     for py in RUNTIME.rglob("*.py"):

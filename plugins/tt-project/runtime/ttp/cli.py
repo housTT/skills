@@ -2882,7 +2882,8 @@ def stale_install_warning(cwd: Path | None = None) -> str:
 
 
 def cmd_setup(a) -> None:
-    """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
+    """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
+    `/tt-project` command for Claude Code (shortcut.py)."""
     from .project import HOME_DIR
     from .release import forced_mark, forced_version, is_newer, runtime_version
     lib = HOME_DIR / "lib" / __version__
@@ -2923,6 +2924,10 @@ def cmd_setup(a) -> None:
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
     if before and before != commit:
         print(f"replaced ttp {__version__} from commit {before} with commit {commit}")
+    from . import shortcut
+    line = shortcut.remove() if a.no_shortcut else shortcut.install()
+    if line:
+        print(line)
 
 
 def cmd_upgrade(a) -> None:
@@ -4163,6 +4168,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
     s.add_argument("--bin-dir", default="~/.local/bin")
     s.add_argument("--force", action="store_true", help="install even over a newer installed ttp")
+    s.add_argument("--no-shortcut", action="store_true",
+                   help="remove (and do not install) the plain /tt-project command for Claude Code")
     s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")

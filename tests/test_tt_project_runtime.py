@@ -320,6 +320,7 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
     # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
                 "TTP_CGROUP"):
@@ -10524,6 +10525,34 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
     out, got = setup()                                   # same version, newer commit
     assert got == second and f"replaced ttp {__version__} from commit {first}-dirty with commit {second}" in out
     assert version() == f"ttp {__version__} ({second})"
+
+
+def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_path):
+    claude = env["tmp"] / "claude"
+    f = claude / "skills" / "tt-project" / "SKILL.md"
+
+    def setup(*extra):
+        r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+
+    assert "/tt-project" not in setup() and not claude.exists()       # no Claude Code: nothing written
+    claude.mkdir()
+    assert "/tt-project is ready" in setup()
+    text = f.read_text()
+    assert "name: tt-project\n" in text and "disable-model-invocation: true" in text
+    assert "`tt-project:tt-project`" in text
+    assert "/tt-project" not in setup() and f.read_text() == text     # idempotent
+    f.write_text(text.replace("Request:", "Old request:"))            # an older release's text
+    assert "/tt-project is ready" in setup() and f.read_text() == text
+    assert "removed the /tt-project shortcut" in setup("--no-shortcut")
+    assert not f.parent.exists()
+    assert setup("--no-shortcut").count("/tt-project") == 0           # nothing left to remove
+    f.parent.mkdir(parents=True)
+    f.write_text("---\nname: tt-project\ndescription: mine\n---\nmy own skill\n")
+    assert "left your own" in setup() and f.read_text().endswith("my own skill\n")
+    assert "left " in setup("--no-shortcut") and f.read_text().endswith("my own skill\n")
 
 
 def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
