@@ -917,6 +917,12 @@ class Batch:
             if real or not files:       # a real conflict, or a stop that is no conflict at all
                 if stopped:
                     _git(wt, "rebase", "--abort")
+                if real and merges and (new := push.squash_merge(wt, onto, top)):
+                    # A commit after a merge edits lines the merge resolved; the merge itself is clean.
+                    say(f"rebase of {top[:10]} conflicts in {', '.join(real)}, but its merge with {onto[:10]} "
+                        f"is clean: carrying that merge as one commit {new[:10]}")
+                    self._checkout(new)
+                    return new, None
                 return onto, real or [f"(the rebase stopped: {_last(r.stderr or r.stdout, 3)})"]
             how = ", ".join(SETTLED_WORDS.get(k, k) for k in sorted(kinds)) or "a clean three-way merge"
             say(f"settled {', '.join(files)} ({how})")

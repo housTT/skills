@@ -2227,6 +2227,47 @@ def descends(repo: Path, tip: str, head: str) -> bool:
     return _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0
 
 
+REPLAYED = "Ttp-Replayed-From"   # batch.REPLAYED: names each commit a squash carries, for ttp landed
+
+
+def squash_merge(repo: Path, tip: str, head: str = "HEAD") -> str:
+    """One commit on `tip` whose tree is the merge of `head` with `tip`, when that merge is clean:
+    the landing for a branch with merges whose rebase conflicts only because a commit after a merge
+    edits lines the merge resolved. Its body lists the branch's commits, each also as a trailer
+    naming it, so ttp landed and the push queue find them landed. `tip` itself when the merge adds
+    nothing; "" when it conflicts. Made in a scratch worktree: `repo` is left as it is."""
+    import tempfile
+    head = _git(repo, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}").stdout.strip()
+    if not head:
+        return ""
+    with tempfile.TemporaryDirectory(prefix="ttp-push-squash-") as tmp:
+        scratch = Path(tmp) / "wt"
+        if _git(repo, "worktree", "add", "-q", "--detach", str(scratch), tip).returncode:
+            return ""
+        try:
+            if _git(scratch, "-c", "rerere.enabled=false", "merge", "-q", "--no-commit", "--no-ff",
+                    head).returncode:
+                return ""
+            tree = _git(scratch, "write-tree").stdout.strip()
+        finally:
+            _git(repo, "worktree", "remove", "--force", str(scratch))
+            _git(repo, "worktree", "prune")
+    if not tree:
+        return ""
+    if tree == _git(repo, "rev-parse", f"{tip}^{{tree}}").stdout.strip():
+        return tip
+    commits = [ln.split(" ", 1) for ln in _git(repo, "log", "--reverse", "--no-merges", "--format=%H %s",
+                                               head, f"^{tip}").stdout.splitlines()]
+    subject = _git(repo, "log", "-1", "--format=%s", head).stdout.strip()
+    if subject.startswith("Merge ") and commits:
+        subject = commits[-1][-1]
+    body = ("Squashed onto the target: its rebase conflicted where a commit after a merge edits lines "
+            "the merge resolved, and its merge with the target is clean. It carries:\n\n"
+            + "".join(f"- {c[-1]}\n" for c in commits)
+            + "\n" + "".join(f"{REPLAYED}: {c[0]}\n" for c in commits))
+    return _git(repo, "commit-tree", tree, "-p", tip, "-m", subject, "-m", body).stdout.strip()
+
+
 def _rebase(repo: Path, tip: str) -> bool:
     """Rebase HEAD onto `tip`. A branch with merge commits (a review combining several branches)
     keeps them (--rebase-merges), and the conflicts they resolved are resolved again the same way
@@ -2253,6 +2294,20 @@ def _rebase(repo: Path, tip: str) -> bool:
     return False
 
 
+def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], None]) -> bool:
+    """After a conflicting rebase of a branch with merges (aborted), put HEAD on squash_merge's commit
+    when the branch's merge with `tip` is clean. False when the branch has no merges or the merge
+    conflicts too: a real conflict, left to the caller."""
+    if not _git(repo, "rev-list", "--merges", "-1", "HEAD", f"^{tip}").stdout.strip():
+        return False
+    squashed = squash_merge(repo, tip)
+    if not squashed or _git(repo, "reset", "-q", "--hard", squashed).returncode:
+        return False
+    say(f"rebase onto {upstream} conflicts where a commit after a merge edits lines the merge resolved, "
+        f"but its merge with {upstream} is clean: landing that merge as one commit {squashed[:10]} on {upstream}")
+    return True
+
+
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
@@ -2277,14 +2332,15 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             return REFUSED
         if not _rebase(repo, tip):
             _git(repo, "rebase", "--abort")
-            if keep:
-                # Rebasing the branch by hand would rewrite what the remote already has.
-                say(f"rebase onto {upstream} conflicts; {keep} is already on {remote}, so do not rebase it: "
-                    f"merge {upstream} into it (`git fetch {remote} {branch} && git merge {upstream}`), "
-                    "resolve keeping both sides' intents, commit, then rerun")
-            else:
-                say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
-            return CONFLICT
+            if not _land_squashed(repo, tip, upstream, say):
+                if keep:
+                    # Rebasing the branch by hand would rewrite what the remote already has.
+                    say(f"rebase onto {upstream} conflicts; {keep} is already on {remote}, so do not rebase it: "
+                        f"merge {upstream} into it (`git fetch {remote} {branch} && git merge {upstream}`), "
+                        "resolve keeping both sides' intents, commit, then rerun")
+                else:
+                    say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
+                return CONFLICT
         if version_bump and (r := bump(repo, tip, version_bump, say)):
             return r
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()

@@ -18728,6 +18728,75 @@ def test_push_rebases_a_stale_merge_keeping_it(env, monkeypatch):
     assert _git_out(origin, "show", "proj:b.txt") == "b" and _git_out(origin, "show", "proj:late.txt") == "late"
 
 
+def _merge_then_edit(repo, other, tip_line="2z"):
+    """A branch with a merge (side sets line 2 of f.txt, the other side adds g.txt), then a commit
+    editing line 2 again to 2z, while the target (pushed from `other`) set line 2 to `tip_line`: the
+    rebase replays the side's edit onto the target's and conflicts, which no recorded resolution of
+    the merge covers. Returns the branch's head."""
+    _git_out(repo, "checkout", "-qb", "side")
+    (repo / "f.txt").write_text("1\n2a\n3\n")
+    _git_out(repo, "commit", "-qam", "side sets line 2")
+    _git_out(repo, "checkout", "-q", "-")
+    _commit(repo, "g.txt", "g\n")
+    _git_out(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    (repo / "f.txt").write_text("1\n2z\n3\n")
+    _git_out(repo, "commit", "-qam", "edit line 2 after the merge")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    (other / "f.txt").write_text(f"1\n{tip_line}\n3\n")
+    _git_out(other, "commit", "-qam", "target sets line 2")
+    _commit(other, "late.txt", "late\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def _f_base(repo, origin):
+    _commit(repo, "f.txt", "1\n2\n3\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+
+
+def test_push_lands_a_merge_carrying_branch_whose_rebase_conflicts_as_one_commit_of_its_clean_merge(
+        env, monkeypatch, capsys):
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    _f_base(repo, origin)
+    head = _merge_then_edit(repo, other)
+    moved = _git_out(origin, "rev-parse", "proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    merged = subprocess.run(["git", "-C", str(repo), "merge-tree", _git_out(repo, "merge-base", head, moved),
+                             head, moved], capture_output=True, text=True).stdout
+    assert "<<<<<<<" not in merged, "the merge with the target must be clean"
+    capsys.readouterr()
+    assert _ttp_push() == 0
+    err = capsys.readouterr().err
+    assert "merge with origin/proj is clean" in err, err
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-parse", f"{pushed}^") == moved, "one commit on the target's tip"
+    assert log.read_text().split() == [pushed], "the checks run on the pushed commit"
+    for name, text in (("f.txt", "1\n2z\n3"), ("g.txt", "g"), ("late.txt", "late")):
+        assert _git_out(origin, "show", f"proj:{name}") == text, name
+    body = _git_out(origin, "log", "-1", "--format=%B", "proj")
+    assert _git_out(origin, "log", "-1", "--format=%s", "proj") == "edit line 2 after the merge"
+    for subject in ("side sets line 2", "edit g.txt", "edit line 2 after the merge"):
+        assert f"- {subject}" in body, body
+    for c in _git_out(repo, "rev-list", "--no-merges", head, f"^{moved}").splitlines():
+        assert f"Ttp-Replayed-From: {c}" in body, "ttp landed finds each carried commit by its trailer"
+
+
+def test_push_refuses_a_merge_carrying_branch_whose_merge_with_the_target_conflicts_too(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _f_base(repo, origin)
+    head = _merge_then_edit(repo, other, tip_line="2t")
+    moved = _git_out(origin, "rev-parse", "proj")
+    capsys.readouterr()
+    assert _ttp_push() == 3
+    err = capsys.readouterr().err
+    assert "conflicts; resolve it keeping both sides' intents" in err and "is clean" not in err, err
+    assert _git_out(origin, "rev-parse", "proj") == moved
+    assert _git_out(repo, "rev-parse", "HEAD") == head, "a refused push leaves the branch as it was"
+    assert _git_out(repo, "status", "--porcelain") == ""
+    assert "ttp-push-squash" not in _git_out(repo, "worktree", "list"), "no scratch worktree left behind"
+
+
 def _plugin_commit(path, version, name, text):
     """Commit a file of plugin `p` and set both its manifests to `version`."""
     for m in (".claude-plugin", ".codex-plugin"):
@@ -20362,6 +20431,20 @@ def test_a_push_batch_names_each_entrys_own_rebased_commit_and_the_queue_records
     m["results"][1].pop("sha")
     pushq._apply(p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
     assert [r["landed_sha"] for r in p.db.q("SELECT landed_sha FROM push_queue ORDER BY id")] == [shas[0], tip, on]
+
+
+def test_a_push_batch_carries_a_merge_entry_whose_rebase_conflicts_as_one_commit_of_its_clean_merge(
+        env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _f_base(repo, origin)
+    head = _merge_then_edit(repo, other)
+    moved = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-parse", f"{pushed}^") == moved and m["results"][0].get("sha") == pushed
+    for name, text in (("f.txt", "1\n2z\n3"), ("g.txt", "g"), ("late.txt", "late")):
+        assert _git_out(origin, "show", f"proj:{name}") == text, name
 
 
 def test_a_push_batch_entry_with_a_real_conflict_stays_out_and_the_others_land(env, monkeypatch, capsys):
