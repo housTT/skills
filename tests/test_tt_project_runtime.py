@@ -20801,24 +20801,26 @@ def test_a_push_batch_whose_target_fails_its_checks_alone_pushes_nothing(env, mo
     heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert rc == 4 and m["outcome"] == "tip_failed" and _statuses(m) == ["requeued", "requeued"], m
-    assert m["tip_check"]["cmd"] == "test ! -e broken.txt" and m["checks"]["runs"] == 3
+    assert m["tip_check"]["cmd"] == "test ! -e broken.txt" and m["checks"]["runs"] == 3 and m["tip_tried"] == [1]
     assert _git_out(origin, "rev-parse", "proj") == before and m["pushed_sha"] is None
 
 
-@pytest.mark.parametrize("names, fresh, want, runs", [
-    (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4),   # fixing prefix passes; search above it
-    (["fix", "e2", "bad"], 3, ["pushed", "pushed", "check_failed"], 4),   # all untried: search the whole batch
-    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "requeued"], 3),  # the breaker is in the untried prefix
-    (["e1", "e2"], 2, ["requeued", "requeued"], 2),                       # all untried, none fixes it
-    (["e1", "fix"], 2, ["pushed", "pushed"], 1),                          # tip with the batch passes: it goes
-    (["e1", "e2"], 1, ["requeued", "requeued"], 2),                       # the fresh prefix does not fix it
-    (["e1", "e2"], 0, ["requeued", "requeued"], 1),                       # nothing new: one check, no tip alone
+@pytest.mark.parametrize("names, fresh, want, runs, tried", [
+    (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4, None),   # fixing prefix passes; search above
+    (["fix", "e2", "bad"], 3, ["pushed", "pushed", "check_failed"], 4, None),   # all untried: search the whole batch
+    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "requeued"], 3, None),  # the breaker is in the untried prefix
+    (["e1", "fix", "bad"], 3, ["requeued"] * 3, 2, [1]),    # prefix 1 fails: only entry 1 is shown not to fix it
+    (["e1", "e2"], 2, ["requeued", "requeued"], 2, [1]),                       # all untried, none fixes it
+    (["e1", "fix"], 2, ["pushed", "pushed"], 1, None),                         # tip with the batch passes: it goes
+    (["e1", "e2"], 1, ["requeued", "requeued"], 2, [1]),                       # the fresh prefix does not fix it
+    (["e1", "e2"], 0, ["requeued", "requeued"], 1, []),                        # nothing new: one check, no tip alone
 ])
 def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_fix(env, monkeypatch, capsys, names,
-                                                                                     fresh, want, runs):
+                                                                                     fresh, want, runs, tried):
     """A tip the queue knows fails on its own (marker "bad_tip") is not checked alone again. The tip with
     the batch, and the tip with the entries not yet tried on it, are; an entry that fixes the tip goes,
-    with the ones after it up to the first that breaks the checks."""
+    with the ones after it up to the first that breaks the checks. A batch that ends at prefix 1 failing
+    names only the entries it showed do not fix the tip ("tip_tried"): a fix after them stays untried."""
     from ttp.project import write_json
     from ttp import push
     log = env["tmp"] / "checks.log"
@@ -20837,6 +20839,7 @@ def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_
     if want[0] == "requeued":
         assert rc == 4 and m["outcome"] == "tip_failed" and _git_out(origin, "rev-parse", "proj") == tip
         assert m["tip_check"]["cmd"] == "make test" and "not checked alone" in m["message"]
+        assert m["tip_tried"] == tried, m
         return
     assert rc == 0 and m["outcome"] == "pushed" and _git_out(origin, "show", "proj:plugins/p/fix.txt") == "fix"
 
@@ -22059,6 +22062,48 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
     _pq_tend(s)
     assert db.task(s.review)["status"] == "done", log(bid)
     assert len(alerted()) == 1
+
+
+def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_the_next_batch(env, monkeypatch):
+    """On a known-bad tip, a batch [e1, fix, bad] fails at prefix 1 and ends tip_failed. Only e1 is then
+    tried on that tip: fix and bad stay untried, go first in the next batch at once (not held), and that
+    batch pushes fix and blames bad. e1 then lands on the fixed tip."""
+    from ttp import pushq
+    s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=3,
+                 push_checks=["test ! -e broken.txt || test -e fix.txt", "test ! -e bad.txt"])
+    db = s.p.db
+    _commit(s.other, "broken.txt", "x\n")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    tip = _git_out(s.origin, "rev-parse", "proj")
+    db.set_kv("push_queue", {"bad_tip": {"tip": tip, "fails": pushq.TIP_FAILS, "tried": [], "at": time.time(),
+                                         "alerted": True}})
+    _pq_hand_off(env, s)
+    tasks = {}
+    for name in ("fix", "bad"):
+        code, path, branch = _code_task(s.p, name)
+        _commit(path, f"{name}.txt", f"{name}\n")
+        tasks[name] = db.add_task(f"review {name}", "r", kind="review", tier="standard", origin="coordinator",
+                                  depends_on=[code])
+        _pq_hand_off(env, s, task=tasks[name], push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
+    row = {r["task"]: r["id"] for r in db.q("SELECT id, task FROM push_queue")}
+    log = lambda bid: (s.p.state / "pushes" / f"{bid}.log").read_text()
+    bid = _pq_batch(s)
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert m["outcome"] == "tip_failed" and m["tip_tried"] == [row[s.review]], log(bid)
+    _pq_tend(s)
+    assert db.kv("push_queue")["bad_tip"]["tried"] == [row[s.review]]
+    rows, why = pushq.due(s.p, time.time() + 60)
+    assert [r["task"] for r in rows] == [tasks["fix"], tasks["bad"], s.review], why
+    bid = _pq_batch(s)
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "requeued"], log(bid)
+    _pq_tend(s)
+    assert _git_out(s.origin, "show", "proj:fix.txt") == "fix" and "bad_tip" not in db.kv("push_queue")
+    assert db.task(tasks["fix"])["status"] == "done" and db.task(tasks["bad"])["status"] != "done"
+    bid = _pq_batch(s)
+    _pq_tend(s)
+    assert db.task(s.review)["status"] == "done", log(bid)
 
 
 def test_a_failing_push_tip_is_forgotten_once_the_branch_moves(env, monkeypatch):

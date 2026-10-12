@@ -1068,7 +1068,11 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             same = bad.get("tip") == tip
             fails = int(bad.get("fails") or 0) + 1 if same else 1
             tried = set(bad.get("tried") or []) if same else set()
-            st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried | {r["id"] for r in rows}), "at": now,
+            # Only the approvals the batch showed do not fix the tip are tried; the rest go first next
+            # time. A marker from a release before "tip_tried" counts every approval it carried.
+            shown = m.get("tip_tried") if isinstance(m.get("tip_tried"), list) else [r["id"] for r in rows]
+            tried |= {r["id"] for r in rows if r["id"] in shown}
+            st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried), "at": now,
                              "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS}
             if fails >= TIP_FAILS and not (same and bad.get("alerted")):
                 later.append((BAD_TIP_ALERT, f"The push branch {b['target']} fails its own checks at {_short(tip)} "

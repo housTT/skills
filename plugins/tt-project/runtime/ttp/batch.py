@@ -608,6 +608,7 @@ class Batch:
         self.target_lock = None
         self.detail_tip: dict | None = None     # the tip's own failing check, for tip_failed
         self.tip_passed = False                 # the tip passed its checks alone this round
+        self.tip_tried = 0                      # leading entries shown not to fix a failing tip (tip_failed)
         self.info: dict[int, dict] = {}
         self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
@@ -726,6 +727,7 @@ class Batch:
     def _round(self, tip: str, checks: list[str]) -> str:
         """One round on `tip`: replay, bump, check, push. "moved" when the tip moved meanwhile."""
         self.tip_passed = False
+        self.tip_tried = 0
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -1046,7 +1048,9 @@ class Batch:
         checked alone again: no prefix passes unless it fixes the tip. The prefix of entries not yet
         tried on that tip ("fresh") is checked first; when it passes, it fixed the tip and the search
         runs above it, else inside it, as a fix may come before an entry that breaks the checks. A
-        search that ends at prefix 1 failing means no entry fixed the tip (tip_failed)."""
+        search that ends at prefix 1 failing shows only that entry 1 does not fix the tip: the batch
+        ends tip_failed and names the entries up to it ("tip_tried"), so the later ones stay untried
+        and go first in the next batch. A batch with none untried ends at once and names none."""
         m = len(carried)
         fail = self._check(heads[m], checks)
         if fail is None:
@@ -1076,6 +1080,8 @@ class Batch:
                 hi, fails[mid] = mid, f
         if hi == 1 and fails[1][0] == STALE:
             return 0, None, fails[1]        # the version guard blames entry 1 without running anything
+        if hi == 1:
+            self.tip_tried = carried[0][0] + 1   # entry 1, and those before it that carried nothing
         if hi == 1 and bad:
             return self._tip_red(tip, known)
         if hi == 1:
@@ -1311,6 +1317,7 @@ def run_batch(p: Project, marker: Path) -> int:
             f"{conflicts['sent_back']} sent back")
     if outcome == "tip_failed":
         m["tip_check"] = b.detail_tip
+        m["tip_tried"] = [e.get("id") for e in b.entries[:b.tip_tried]]
     if b.tip_passed:
         m["tip_passed"] = True
     write_json(marker, m)
