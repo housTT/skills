@@ -81,7 +81,7 @@ from . import watchdup
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids, pin_of,
+from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
@@ -166,7 +166,6 @@ STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a 
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
-WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400

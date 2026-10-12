@@ -26,6 +26,7 @@
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back; from a sandbox it asks the running daemon to restart (exit 75 while deferred, 1 on failure) |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
+| `ttp task <name> requeue <id>` | queue a task that is not running again (blocked, waiting, failed): clears its blocked reason, its waiting state and its failed workspace tries, like Requeue in the web app |
 | `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks: to defer a new task, give `--start-when` to `add` instead |
 | `ttp task <name> superseded <id> <sha>` | record that done task <id>'s work landed on the push branch as commit <sha> (re-landed after a push conflict), so the local-only check and `landed:#<id>` count it. Refused unless the task is done and <sha> is on the push branch, newer than the branch's base and changes a file the branch changes; covers the branch head at the time |
 | `ttp landed <sha>` / `ttp landed --task <id>` | probe: exit 0 once the commit, or the task's landing, is on the push branch, also after a rebase gave it a new sha (same patch-id, or same author, date and subject); 1 not yet. `start_when` `landed:#<id>` runs it |
@@ -117,7 +118,9 @@
   default 2). A check that fails, or a worktree on another branch, is left as it is and counts as a
   failure: an error never deletes a worktree. A branch with its own commits is never reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
   after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
-  coordinator. Tasks an older daemon blocked this way are queued again on their own.
+  coordinator. Tasks an older daemon blocked this way are queued again on their own. Checkouts
+  leave Git LFS files as pointers (`GIT_LFS_SKIP_SMUDGE=1`), so a large download never outlasts the
+  timeout; a task that needs them runs `git lfs pull`, or `worktree.lfs_smudge: true` downloads them.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
   last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
   remote: a remote-tracking branch contains its head, or its changes are already on the delivery

@@ -2459,6 +2459,13 @@ def cmd_task(a) -> None:
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
+    elif a.action == "requeue":
+        if not a.title.strip().isdigit():
+            die(f"requeue needs a task id, not {a.title!r}")
+        why = p.db.requeue(int(a.title))
+        if why:
+            die(why)
+        print(f"task #{int(a.title)} queued")
     elif a.action == "set-when":
         if not a.title.strip().isdigit():
             die(f"set-when needs a task id, not {a.title!r}")
@@ -4231,12 +4238,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", required=True)
     s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("task", help="add (deferred with --start-when/--start-after)/list/cancel tasks "
-                                       "by hand, re-point a not-yet-started task's probe, "
+    s = sub.add_parser("task", help="add (deferred with --start-when/--start-after)/list/cancel/requeue tasks "
+                                       "by hand (requeue: a blocked or stopped task runs again), re-point a not-yet-started task's probe, "
                                        "or record a done task's work as re-landed under another commit")
     s.add_argument("name")
-    s.add_argument("action", choices=["add", "list", "cancel", "set-when", "superseded"])
-    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/set-when/superseded: the task id")
+    s.add_argument("action", choices=["add", "list", "cancel", "requeue", "set-when", "superseded"])
+    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/requeue/set-when/superseded: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--spec")

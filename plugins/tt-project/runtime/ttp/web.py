@@ -702,18 +702,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not t:
                     return self._send(404, {"error": "no task"})
                 if body.get("status") == "queued":
-                    # One statement, so dispatch cannot start the task between a check and the write.
-                    if not db.conn.execute("UPDATE tasks SET status='queued', blocked_reason=NULL, updated=? "
-                                           "WHERE id=? AND status!='running'", (time.time(), tid)).rowcount:
-                        return self._send(409, {"error": f"task #{tid} is running: cancel it first"})
-                    prev = load_result(t["result"])
-                    if t["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
-                        # A requeue is a decision to run it, not to sleep on its probe, and its
-                        # earlier unchanged wakes no longer count.
-                        prev.pop("waiting_since", None)
-                        prev.pop("stale_wakes", None)
-                        db.x("UPDATE tasks SET result=? WHERE id=? AND result=?",
-                             (dump_result(prev), tid, t["result"]))
+                    why = db.requeue(tid)
+                    if why:
+                        return self._send(409, {"error": why})
                 elif body.get("status") == "cancelled":
                     db.update_task(tid, status="cancelled")
                     stop_runs(db, p.runs, tid)

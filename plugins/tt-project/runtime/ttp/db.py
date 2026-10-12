@@ -139,6 +139,7 @@ CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
 # A review that asked for changes is a review that worked. It is stored 'failed', so the change it
 # reviewed stays gated (its fix and re-review follow), and its hand-off status says changes_needed:
 # readers show and count it on its own, never as a failure (task_outcome, DB.status_counts).
@@ -473,6 +474,31 @@ class DB:
         kw["updated"] = time.time()
         sets = ",".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE tasks SET {sets} WHERE id=?", [*kw.values(), task_id])
+
+    def requeue(self, task_id: int) -> str:
+        """Put a task that is not running back in the queue (the user's decision to run it: the web app,
+        `ttp task requeue`): its blocked reason, its waiting state and earlier unchanged wakes, and its
+        failed workspace tries are cleared. Returns "" when done, else why not (no such task, running)."""
+        with self.tx():
+            t = self.task(task_id)
+            if not t:
+                return f"no task #{task_id}"
+            # One statement, so dispatch cannot start the task between a check and the write.
+            if not self.conn.execute("UPDATE tasks SET status='queued', blocked_reason=NULL, updated=? "
+                                     "WHERE id=? AND status!='running'", (time.time(), task_id)).rowcount:
+                return f"task #{task_id} is running: cancel it first"
+            prev = load_result(t["result"])
+            if t["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
+                # A requeue is a decision to run it, not to sleep on its probe, and its earlier
+                # unchanged wakes no longer count.
+                prev.pop("waiting_since", None)
+                prev.pop("stale_wakes", None)
+                self.x("UPDATE tasks SET result=? WHERE id=?", (dump_result(prev), task_id))
+            tries = self.kv(WORKSPACE_TRIES_KEY, {}) or {}
+            if str(task_id) in tries:
+                tries.pop(str(task_id))
+                self.set_kv(WORKSPACE_TRIES_KEY, tries)
+        return ""
 
     def task(self, task_id: int) -> dict | None:
         return self.one("SELECT * FROM tasks WHERE id=?", (task_id,))

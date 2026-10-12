@@ -16707,6 +16707,26 @@ def test_a_half_made_workspace_never_deletes_a_branch_with_its_own_commits(env, 
     assert _git_out(path, "rev-parse", "HEAD") == head and (path / "work.txt").read_text() == "step 1"
 
 
+@pytest.mark.parametrize("smudge", [False, True])
+def test_a_workspace_checkout_skips_git_lfs_downloads_unless_configured(env, monkeypatch, smudge):
+    # A checkout that downloads LFS objects outlasts git_timeout and leaves a half-made worktree.
+    p = make(env)
+    from ttp import worktree
+    if smudge:
+        p.set_config("worktree.lfs_smudge", True)
+    task = p.db.task(p.db.add_task("lfs repo", "s", kind="code", tier="light", origin="user"))
+    real, seen = worktree._git, []
+
+    def git(cwd, *args, **kw):
+        if args[:2] == ("worktree", "add"):
+            seen.append((kw.get("env") or {}).get("GIT_LFS_SKIP_SMUDGE"))
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(worktree, "_git", git)
+    path, branch = worktree.ensure(p, task)
+    assert seen == [None if smudge else "1"]
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch
+
+
 def test_a_transient_git_failure_never_removes_a_workspace_with_uncommitted_work(env, monkeypatch):
     p = make(env)
     from ttp import worktree
@@ -29468,6 +29488,36 @@ def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys
     cli.main(["task", "demo", "set-when", str(tid), ""])
     assert not any(lb.startswith("start_when:") for lb in _labels(p, tid))
     assert "resource:board" in _labels(p, tid) and abs(p.db.task(tid)["not_before"] - after) < 1
+
+
+def test_ttp_task_requeue_queues_a_blocked_task_and_clears_its_workspace_tries(env, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp.db import WORKSPACE_TRIES_KEY, dump_result
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    other = p.db.add_task("u", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason="workspace: git worktree add timed out (after 4 tries)",
+                     result=dump_result({"status": "blocked", "waiting_since": 1.0, "stale_wakes": 2}))
+    p.db.set_kv(WORKSPACE_TRIES_KEY, {str(tid): 4, str(other): 1})
+    cli.main(["task", "demo", "requeue", str(tid)])
+    assert f"task #{tid} queued" in capsys.readouterr().out
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["blocked_reason"] is None
+    assert "waiting_since" not in t["result"] and "stale_wakes" not in t["result"]
+    assert p.db.kv(WORKSPACE_TRIES_KEY) == {str(other): 1}, "its exhausted workspace tries would block it at once"
+
+
+@pytest.mark.parametrize("args, why", [(["{tid}"], "is running: cancel it first"),
+                                       (["999"], "no task #999"), (["x"], "needs a task id")])
+def test_ttp_task_requeue_refuses_a_running_or_unknown_task(env, capsys, args, why):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "requeue", *[x.format(tid=tid) for x in args]])
+    assert why in capsys.readouterr().err
+    assert p.db.task(tid)["status"] == "running"
 
 
 @pytest.mark.parametrize("status", ["running", "done", "failed", "cancelled"])

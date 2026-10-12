@@ -15,8 +15,8 @@ from .db import continues_id
 from .project import Project, durable_write
 
 
-def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120) -> str:
-    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout)
+def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120, env: dict | None = None) -> str:
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout, env=env)
     if check and out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:300]}")
     return out.stdout.strip()
@@ -219,13 +219,24 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     return path, branch
 
 
+def checkout_env(p: Project) -> dict | None:
+    """The environment of the git commands that check a task's worktree out: Git LFS files stay
+    pointers (GIT_LFS_SKIP_SMUDGE=1), so a checkout never downloads large objects and outlasts its
+    timeout; a task that needs them runs `git lfs pull` in its worktree. `worktree.lfs_smudge: true`
+    downloads them at checkout. None (git's own environment) then."""
+    if (p.config().get("worktree") or {}).get("lfs_smudge"):
+        return None
+    return {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+
+
 def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeout: float) -> None:
     p.worktrees.mkdir(parents=True, exist_ok=True)
+    env = checkout_env(p)
     exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
     if exists and carried:
-        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout)
+        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout, env=env)
         # A local copy left behind by the remote's catches up, fast-forward only.
-        _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False, timeout=timeout)
+        _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False, timeout=timeout, env=env)
         return
     if not exists:
         _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
@@ -240,10 +251,10 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     if exists and (not start or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", branch,
                                                 start], capture_output=True, timeout=timeout).returncode != 0):
         # Commits beyond its start (a retried task's own work): checked out as it is, never reset.
-        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout)
+        _git(p.root, "worktree", "add", str(path), branch, timeout=timeout, env=env)
         return
     # New, or left behind with nothing of its own by an attempt that timed out: (re)made at its start.
-    _git(p.root, "worktree", "add", "-B" if exists else "-b", branch, str(path), start, timeout=timeout)
+    _git(p.root, "worktree", "add", "-B" if exists else "-b", branch, str(path), start, timeout=timeout, env=env)
 
 
 _VALID_BRANCHES: dict[str, bool] = {}
