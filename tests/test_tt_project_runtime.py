@@ -51788,6 +51788,7 @@ def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, mon
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
     monkeypatch.delenv(mm.MASK_RECORD, raising=False)   # this run's own record, if any, is not the test's
     monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor its own mask, when it runs on a device machine
+    monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor its mask: run.json holds only what the daemon set
     before = json.dumps({"TT_VISIBLE_DEVICES": os.environ.get("TT_VISIBLE_DEVICES")}, sort_keys=True)
     p = make(env)
     d = Daemon(p.base)
