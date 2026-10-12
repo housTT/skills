@@ -28,7 +28,9 @@
   `check_failure.json` with the tested tree and failing command. The daemon verifies that receipt,
   creates one harness repair owner per check signature, and keeps unrelated reviews waiting on a
   `ttp checks --gap <sig>` probe. A config change reruns their checks without a model; related
-  changes still fail. Other check-only failures go to the coordinator. Left out, it counts as
+  changes still fail. A mandatory selector explicitly reporting no case for the exact tested
+  HEAD also gets one owner; retain every original mandatory check and never infer a pass from
+  byte equivalence or weaken the selector. Other check-only failures go to the coordinator. Left out, it counts as
   `substantive`. Include `on_pass` only when the review verdict is complete and a check pass is the
   sole remaining condition; preserve any required push approval in that hand-off.
 - A head the spec says is already delivered as a PR, or a change it says must not reach the push

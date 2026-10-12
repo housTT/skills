@@ -798,6 +798,28 @@ def target_missing(repo: Path, head: str, check: Check, rc: int, output: str, ba
             "rc": rc, "output": output[-8000:], "unrelated": unrelated}
 
 
+def applicability_failure(repo: Path, head: str, check: Check, rc: int, output: str,
+                          base: str = "") -> dict | None:
+    """Missing target or an explicit selector coverage gap for the exact tested commit.
+    A selector can report `check selector: no case for HEAD <40-hex>` (or `no matching case`).
+    This records ownership only: every mandatory command remains applicable and no prior tree's
+    pass, byte equivalence or selector verdict for another commit can approve this head.
+    """
+    missing = target_missing(repo, head, check, rc, output, base)
+    if missing or not rc:
+        return missing
+    selected = re.findall(r"(?i)\bno (?:matching )?(?:(?:selector|check|verification) )?"
+                          r"case for (?:HEAD|commit)\s*[:=]?\s*([0-9a-f]{40})\b", output)
+    if not selected:
+        return None
+    tested = _git(repo, "rev-parse", "--verify", head + "^{commit}")
+    if tested.returncode or tested.stdout.strip() not in {s.lower() for s in selected}:
+        return None
+    return {"kind": "selector_missing", "sig": check_sig(check), "check": check.config(),
+            "targets": [tested.stdout.strip()], "head": head, "base": base, "worktree": str(repo),
+            "rc": rc, "output": output[-8000:], "unrelated": True}
+
+
 def checks_of(v: Any) -> list[str | dict]:
     """The config value of `v`'s checks, rejecting entries that are not commands (e.g. a sentence
     describing the checks) or malformed check objects."""

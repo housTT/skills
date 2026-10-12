@@ -45149,13 +45149,18 @@ def test_missing_check_target_requires_tree_evidence_and_preserves_related_failu
     assert push.target_missing(p.root, "HEAD", check, 1, "FAILED test_assertion", base) is None
 
 
-def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, monkeypatch):
+@pytest.mark.parametrize("gap_kind", ["target_missing", "selector_missing"])
+def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, monkeypatch, gap_kind):
     from ttp import checkgaps, push
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage
     p = make(env)
     command = "python3 -m pytest tests/test_absent.py"
-    p.set_config("delivery.push_checks", [command])
+    if gap_kind == "selector_missing":
+        (p.root / "scripts").mkdir()
+        _commit_files(p.root, {"scripts/check_selector.py": "# mandatory selector\n"}, "selector")
+        command = "python3 scripts/check_selector.py"
+    p.set_config("delivery.push_checks", [command, "true"])
     base = _git_out(p.root, "rev-parse", "HEAD").strip()
     reviews, consumers = [], []
     for i in range(3):
@@ -45165,10 +45170,12 @@ def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, mon
         run.mkdir()
         path = p.worktrees / f"t{code}"
         head = _git_out(path, "rev-parse", "HEAD").strip()
-        failure = push.target_missing(path, head, push.Check(command), 4,
-                                      "ERROR: file or directory not found: tests/test_absent.py", base)
+        output = (f"mandatory check selector: no case for HEAD {head}" if gap_kind == "selector_missing"
+                  else "ERROR: file or directory not found: tests/test_absent.py")
+        failure = push.applicability_failure(path, head, push.Check(command),
+                                            1 if gap_kind == "selector_missing" else 4, output, base)
         (run / "check_failure.json").write_text(json.dumps(failure))
-        (run / "checks.json").write_text(json.dumps({"commands": [command, "git diff --check"]}))
+        (run / "checks.json").write_text(json.dumps({"commands": [command, "true", "git diff --check"]}))
         (run / "result.json").write_text(json.dumps({"status": "failed", "review_failure": "check_only",
                                                    "summary": "only the check target is missing",
                                                    "on_pass": {"status": "done", "summary": "review complete; checks passed"}}))
@@ -45195,7 +45202,8 @@ def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, mon
     monkeypatch.setattr(d, "_start_checks", lambda path, out, name, tid, extra: started.append((tid, extra)) or True)
     d.reconcile_tasks()
     assert not started
-    p.set_config("delivery.push_checks", ["true"])
+    repaired = [command + " --updated-head-cases", "true"] if gap_kind == "selector_missing" else ["true"]
+    p.set_config("delivery.push_checks", repaired)
     d._load_config()
     d.reconcile_tasks()
     assert {tid for tid, _ in started} == set(reviews)
@@ -45210,7 +45218,7 @@ def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, mon
         out = pathlib.Path(member["run_dir"])
         (out / "checks.rc").write_text("0\n")
         (out / "checks.json").write_text(json.dumps({"passed": True, "head": member["head"],
-                                                    "worktree": member["worktree"], "commands": ["true"]}))
+                                                    "worktree": member["worktree"], "commands": repaired}))
         d._probe_passed(p.db.task(tid), time.time())
         assert p.db.task(tid)["status"] == "done"
     assert all(p.db.task(t)["status"] == "queued" for t in consumers)
@@ -45304,3 +45312,77 @@ def test_related_or_substantive_missing_check_failure_still_fails(env, finding, 
     Daemon(p.base)._finish_worker({"task": rev["id"], "note": "{}"}, RunUsage(), "ok", run)
     assert p.db.task(rev["id"])["status"] == "failed"
     assert not p.db.kv(checkgaps.KEY, {})
+
+
+@pytest.mark.parametrize("diagnostic", ["mandatory check selector: no case for HEAD {head}",
+                                        "check selector: no matching case for HEAD {head}",
+                                        "ERROR: no verification case for HEAD {head}"])
+def test_unmatched_check_selector_requires_the_exact_tested_head(env, diagnostic):
+    from ttp import push
+    p = make(env)
+    (p.root / "scripts").mkdir()
+    _commit_files(p.root, {"scripts/select.py": "# mandatory selector\n"}, "selector")
+    head = _git_out(p.root, "rev-parse", "HEAD").strip()
+    check = push.Check("python3 scripts/select.py")
+    output = diagnostic.format(head=head)
+    failure = push.applicability_failure(p.root, head, check, 1, output)
+    assert failure and failure["kind"] == "selector_missing"
+    assert failure["targets"] == [head] and failure["unrelated"] is True
+    assert push.applicable(p.root, head, [check, push.Check("git diff --check")], lambda _: None)[0] == [check, "git diff --check"]
+    for rc, text in [(0, output), (1, diagnostic.format(head="a" * 40)),
+                     (1, "selector assertion failed"), (1, "byte-equivalent tree; checks passed previously")]:
+        assert push.applicability_failure(p.root, head, check, rc, text) is None
+
+
+def test_checks_record_unmatched_selector_without_approving_or_dropping_mandatory_checks(env, monkeypatch):
+    from ttp import cli
+    p = make(env)
+    (p.root / "scripts").mkdir()
+    _commit_files(p.root, {"scripts/select.py": "import subprocess\n"
+        "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+        "print('mandatory check selector: no case for HEAD ' + head)\nraise SystemExit(1)\n"}, "selector")
+    mandatory = ["python3 scripts/select.py", "git diff --check"]
+    p.set_config("delivery.push_checks", mandatory)
+    run = env["tmp"] / "selector-run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--", "python3 -m compileall -q scripts"])
+    assert exc.value.code == 1
+    record = json.loads((run / "checks.json").read_text())
+    assert record["passed"] is False
+    assert record["commands"] == mandatory + ["python3 -m compileall -q scripts"]
+    failure = json.loads((run / "check_failure.json").read_text())
+    assert failure["kind"] == "selector_missing" and failure["head"] == record["head"]
+
+
+def test_applicability_retry_start_failure_remains_retryable(env, monkeypatch):
+    from ttp import checkgaps, push
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config('delivery.push_checks', ['true'])
+    original = checkgaps.config_sig(p.config())
+    head = _git_out(p.root, 'rev-parse', 'HEAD').strip()
+    tid = p.db.add_task('waiting review', kind='review')
+    run = env['tmp'] / 'retry-run'
+    run.mkdir()
+    sig, key = 'retry-signature', 'check:retry-signature'
+    result = {'status': 'waiting', 'check_gap': key,
+              'retry_when': f'{push._own_ttp(p)} checks --gap {sig}'}
+    (run / 'result.json').write_text(json.dumps(result))
+    p.db.update_task(tid, result=json.dumps(result))
+    p.db.set_kv(checkgaps.KEY, {key: {'config': original, 'tasks': {str(tid): {
+        'run_dir': str(run), 'worktree': str(p.root), 'head': head, 'config': original, 'extras': []}}}})
+    p.set_config('delivery.push_checks', ['git diff --check'])
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, '_start_checks', lambda *args: False)
+    checkgaps.rerun(d)
+    assert p.db.kv(checkgaps.KEY)[key]['tasks'][str(tid)]['config'] == original
+    assert json.loads(p.db.task(tid)['result']) == result
+    started = []
+    monkeypatch.setattr(d, '_start_checks', lambda *args: started.append(args) or True)
+    checkgaps.rerun(d)
+    assert len(started) == 1
+    assert 'checks --result' in json.loads(p.db.task(tid)['result'])['retry_when']

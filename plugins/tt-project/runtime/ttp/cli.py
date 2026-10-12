@@ -1398,7 +1398,7 @@ def cmd_checks(a) -> None:
             with open(log, "rb") as f:
                 f.seek(check_start)
                 output = f.read().decode("utf-8", errors="replace")
-            failure = push.target_missing(Path(top), head, push.Check(failed) if not isinstance(failed, push.Check)
+            failure = push.applicability_failure(Path(top), head, push.Check(failed) if not isinstance(failed, push.Check)
                                           else failed, rc, output, base)
             if failure:
                 write_json(Path(run_dir) / "check_failure.json", failure)

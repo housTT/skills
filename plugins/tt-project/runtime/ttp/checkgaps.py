@@ -40,7 +40,7 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
             return None
         if worktree._git(path, "rev-parse", "HEAD") != head:
             return None
-        failure = push.target_missing(path, head, check, receipt["rc"], receipt["output"], receipt.get("base", ""))
+        failure = push.applicability_failure(path, head, check, receipt["rc"], receipt["output"], receipt.get("base", ""))
     except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
         return None
     if not failure or not failure["unrelated"]:
@@ -54,11 +54,14 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
             owner = p.db.add_task(
                 f"Repair check applicability {sig}",
                 "Fix this project's own delivery.push_checks in its harness config. "
-                f"Check signature {key}; command {str(check)!r}; missing targets: {', '.join(failure['targets'])}. "
+                f"Check signature {key}; command {str(check)!r}; {failure['kind']}: {', '.join(failure['targets'])}. "
                 "Reproduce at the branch tip. Remove stale SHA pins or temporary environment paths and "
                 "declare the actual scope with if_exists/if_changed, retaining mandatory coverage for "
                 "related changes. Do not edit another project's harness or disable checks wholesale. "
-                "Commit the config repair; the daemon reruns dependent checks without a model when it changes.",
+                "For an unmatched mandatory selector, add coverage for the tested head without weakening the "
+                "selector or any original mandatory check. Never approve from byte equivalence or a "
+                "previous head's pass. Commit the config repair; the daemon reruns dependent checks "
+                "without a model when it changes.",
                 kind="harness", origin="daemon", labels=[key], priority=2)
             gap = {"owner": owner, "check": check.config(), "config": config_sig(cfg),
                    "created": now, "tasks": {}}
@@ -110,9 +113,12 @@ def rerun(daemon) -> None:
                        "wait_kind": "self"}
             write_json(out / "result.json", waiting)
             p.db.update_task(task["id"], result=dump_result(waiting), not_before=time.time() + 1800)
+            previous_config = member["config"]
             member["config"] = current
             p.db.set_kv(KEY, gaps)
             extra = ["--fresh"] + (["--", *member["extras"]] if member.get("extras") else [])
             if not daemon._start_checks(path, out, f"check-gap-t{tid}", task["id"], extra):
+                member["config"] = previous_config
+                p.db.set_kv(KEY, gaps)
                 write_json(out / "result.json", prev)
                 p.db.update_task(task["id"], result=dump_result(prev))

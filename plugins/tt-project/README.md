@@ -397,7 +397,11 @@ and preferences you add later become part of the project's charter and memory.
   checks without a model. Related changes still fail; missing scope or unreadable history is treated
   conservatively. Without explicit scope, a nested component test covers its component and root
   `tests/` covers all code. A retry never approves code unless the reviewer supplied an `on_pass`
-  verdict and the unchanged, clean commit passes its checks.
+  verdict and the unchanged, clean commit passes its checks. A mandatory selector with no case
+  for HEAD can report `check selector: no case for HEAD <40-hex>` (or `no matching case`). A
+  nonzero check with that exact tested commit gets the same single repair owner and waiting
+  dependents. Its repair retains the selector and every mandatory check; a previous head's pass
+  or byte-equivalent tree never approves the unmatched head.
 - Checks run with `TTP_PUSH_MODE` set to `target` (`ttp push` or the push queue, to
   `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
