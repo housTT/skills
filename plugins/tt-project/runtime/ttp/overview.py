@@ -67,6 +67,32 @@ def _gate_global(conn: sqlite3.Connection) -> tuple[float, dict]:
     return (float(r[1] or 0) if r else 0.0), out
 
 
+class _ReadOnly:
+    """What waits.blocked reads of a project (q, paused_resources) over a read-only connection, so
+    the overview counts 'waiting on you' as `ttp status` and the web app do. Shared pauses are the
+    ones the project last acted on (its kv): reading the share list would write its settings copy."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def q(self, sql: str, args: tuple = ()) -> list[dict]:
+        cur = self.conn.execute(sql, args)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def paused_resources(self) -> dict[str, dict]:
+        from .db import PAUSED_RESOURCES_KEY, SHARED_SEEN_KEY
+        out = {}
+        for key in (SHARED_SEEN_KEY, PAUSED_RESOURCES_KEY):   # the project's own pause wins
+            r = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            try:
+                v = json.loads(r[0]) if r else {}
+            except (TypeError, ValueError):
+                v = {}
+            out.update(v if isinstance(v, dict) else {})
+        return out
+
+
 def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, window: tuple[float, float]) -> dict:
     """One project's line as data. Never writes to the project."""
     row = {"name": name, "host": entry.get("host"), "dir": entry.get("dir"), "remote": False, "ok": False}
@@ -100,7 +126,8 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
         row.update({k: rt[k] for k in ("running_version", "running_commit", "instance", "tick_done",
                                        "files_version", "restart_pending")})
         row["asks"] = conn.execute("SELECT COUNT(*) FROM messages WHERE kind='ask' AND handled=0").fetchone()[0]
-        row["waiting_on_user"] = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='blocked'").fetchone()[0]
+        from . import waits
+        row["waiting_on_user"] = len(waits.blocked(_ReadOnly(conn), now)[0])
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
         from . import billing
         from .db import counted_spend

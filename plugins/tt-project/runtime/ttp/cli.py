@@ -869,8 +869,7 @@ def status_text(p: Project) -> str:
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
-    you, stuck = waits.split(db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id"),
-                             waits.open_asks(db), now, tz)
+    you, stuck = waits.blocked(db, now, tz)
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])

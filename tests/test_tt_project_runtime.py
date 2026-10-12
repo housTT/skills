@@ -35917,9 +35917,11 @@ def test_overview_lists_every_project_and_never_modifies_them(env, tmp_path, cap
     b.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (now,))
     # An open ask and a blocked task; its daemon's process is up but its heartbeat is old.
     cb, c = _overview_project(tmp_path, "gamma", "0.9.0")
-    c.post("out", "Merge it?", kind="ask")
-    c.add_task("needs a credential", "", kind="code")
-    c.x("UPDATE tasks SET status='blocked'")
+    # Only the task the open ask names waits on the user; one held by the coordinator does not count.
+    cid = c.add_task("needs a credential", "", kind="code")
+    c.add_task("needs a workspace fix", "", kind="code")
+    c.x("UPDATE tasks SET status='blocked', blocked_reason='workspace: worktree add failed'")
+    c.post("out", f"Merge it? (#{cid})", kind="ask")
     c.set_kv("daemon", {"pid": os.getpid(), "host": "testhost", "started": now})
     hb = cb / "state" / "heartbeat"
     hb.write_text(json.dumps({"pid": os.getpid()}))
@@ -40642,6 +40644,71 @@ def test_wait_kind_label_wins_and_queued_holds_read_plainly():
     assert waits.wait_kind({**t, "status": "queued", "labels": "[]",
                             "blocked_reason": "waiting for the build box; its probe says not yet; next try 10:00"},
                            [], 100.0)["text"] == "waits on the build box"
+
+
+def test_waiting_on_you_counts_only_blocked_tasks_that_truly_wait_on_the_user(env):
+    """'waiting on you' in `ttp status`, the web app and `ttp overview` counts a blocked task only when
+    it waits on an open ask, an explicit user mark or a resource the user paused; one that waits on
+    the coordinator, a coordinator pause or an answered ask gets a neutral 'held' line instead."""
+    from ttp import waits
+    from ttp.cli import status_text
+    from ttp.db import PAUSED_RESOURCES_KEY
+    from ttp.globalcap import connect_ro
+    from ttp.overview import _ReadOnly
+    from ttp.web import health, state_payload
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (now,))
+    ask = p.db.post("out", "Which layout should the cache use?", kind="ask", severity="high")
+    answered = p.db.post("out", "Which board?", kind="ask")
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (answered,))
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"box": {"reason": "maintenance", "since": now, "by": "user"},
+                                       "rig": {"reason": "flaky", "since": now, "by": "coordinator"}})
+    tasks = {
+        "coordinator": ("workspace: worktree add failed", []),
+        "open ask": ("", [f"waits:ask:{ask}"]),
+        "user paused": ("", ["waits:resource:box"]),
+        "user mark": ("", ["waits:user:a signature"]),
+        "coordinator paused": ("", ["waits:resource:rig"]),
+        "answered ask": ("", [f"waits:ask:{answered}"]),
+        "unknown": ("something odd happened", []),
+    }
+    ids = {}
+    for title, (reason, labels) in tasks.items():
+        ids[title] = tid = p.db.add_task(title, "s", origin="user")
+        p.db.x("UPDATE tasks SET status='blocked', blocked_reason=?, labels=? WHERE id=?",
+               (reason, json.dumps(labels), tid))
+    you, stuck = waits.blocked(p.db, now)
+    assert {t["title"] for t in you} == {"open ask", "user paused", "user mark"}, [t["wait"] for t in you]
+    assert {t["title"]: t["wait"]["kind"] for t in stuck} == {
+        "coordinator": "coordinator", "coordinator paused": "resource", "answered ask": "coordinator",
+        "unknown": "coordinator"}
+    assert waits.held_line(stuck) == "held: 4 blocked task(s) (waiting on the coordinator 3, a resource 1)"
+    assert waits.held_line([]) == ""
+
+    h = health(p, p.db, now=now)
+    assert h["waiting_on_user"] == 3 and h["held_blocked"] == 4, h
+    p.db.x("UPDATE runs SET status='done'")
+    h = health(p, p.db, now=now)
+    assert "waiting on you: 3 blocked task(s), 1 open question(s)" in h["why_idle"], h["why_idle"]
+    assert "held: 4 blocked task(s) (waiting on the coordinator 3, a resource 1)" in h["why_idle"], h["why_idle"]
+    # The web board's task waits agree with the count.
+    st = state_payload(p, p.db)
+    board = {t["title"] for t in st["tasks"] if t["wait"] and t["wait"]["kind"] == "user"}
+    assert board == {t["title"] for t in you}, board
+    assert st["health"]["waiting_on_user"] == h["waiting_on_user"]
+    # `ttp status` lists the same tasks under 'needs you', never the coordinator's.
+    out = status_text(p)
+    for title in ("open ask", "user paused", "user mark"):
+        assert f"needs you (#{ids[title]}," in out, out
+    for title in ("coordinator", "coordinator paused", "answered ask", "unknown"):
+        assert f"needs you (#{ids[title]}," not in out, out
+    # `ttp overview` counts through the same classifier over a read-only connection.
+    conn = connect_ro(p.db.path)
+    try:
+        assert len(waits.blocked(_ReadOnly(conn), now)[0]) == 3
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize("why", [None, "the build lands on the branch"])

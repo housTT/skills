@@ -1,8 +1,10 @@
 """What a stuck task waits on, in plain words, for the web board, `ttp status` and the relay.
 
-A task blocked on the user (an open ask that names it, a `waits:user:...` label, or a coordinator hold
-anchored on an ask, `waits:ask:<id>`) belongs under 'Waiting on you'. Every other stuck task is the project's to move: it waits on a resource, budget,
-a review, the coordinator or a time, and the user is shown that, not asked."""
+A task blocked on the user (an open ask that names it, a `waits:user:...` label, a coordinator hold
+anchored on an ask still open, `waits:ask:<id>`, or a resource the user paused) belongs under 'Waiting on you'.
+Every other stuck task is the project's to move: it waits on a resource, budget, a review, the coordinator or a
+time, and the user is shown that, not asked. An unknown reason is the coordinator's, never the user's.
+`ttp status`, `ttp overview`, the web app and the relay all count through `split`, so they cannot disagree."""
 from __future__ import annotations
 
 import json
@@ -95,10 +97,23 @@ def _from_reason(reason: str) -> tuple[str, str]:
     return "coordinator", r
 
 
-def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where=None) -> dict:
+def _user_paused(detail: str, paused: dict | None) -> str:
+    """The resource named by a resource wait's detail (a name, or 'paused resource <name>: <why>')
+    when the user paused it, else ''. A pause the coordinator or a project set is not the user's."""
+    for name in {detail.strip(), detail.removeprefix("paused resource ").split(":")[0].strip()}:
+        if name and ((paused or {}).get(name) or {}).get("by") == "user":
+            return name
+    return ""
+
+
+def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where=None,
+              paused: dict | None = None) -> dict:
     """What `task` waits on: {"kind": one of KINDS, "text": "waits on ...", "since": epoch,
     "age": "3.2h", "asks": [ask ids]}. The `waits:` label wins, then open asks that name the
-    task, then the blocked_reason's prefix. A time is shown in the home zone `where` (UTC without one)."""
+    task, then the blocked_reason's prefix. A hold on an ask that is no longer open waits on the
+    coordinator; a resource wait is the user's only when `paused` (DB.paused_resources) says the user
+    paused it. A time is shown in the home zone `where` (UTC without one)."""
+    from .anchors import anchor
     now = time.time() if now is None else now
     since = float(task.get("updated") or task.get("created") or now)
     linked = asks_for(task["id"], open_asks)
@@ -108,7 +123,11 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
         linked += [a for a in open_asks if a.get("id") == held and a not in linked]
     if lab:
         kind, detail = lab
-        if held is not None and linked:
+        on_ask = (anchor(task) or ("",))[0] == "ask"
+        if on_ask and not any(a.get("id") == held for a in linked):
+            # The ask was answered or withdrawn (or never sent): acting on it is the coordinator's.
+            kind, detail = "coordinator", (f"the answer to ask {held}" if held is not None else "an ask not sent")
+        elif held is not None and linked:
             since = min(float(a.get("ts") or since) for a in linked)
     elif linked:
         kind, detail = "user", ", ".join(f"ask {a['id']}" for a in linked)
@@ -117,6 +136,8 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
         kind, detail = "review", ""
     else:
         kind, detail = _from_reason(task.get("blocked_reason") or "")
+    if kind == "resource" and (name := _user_paused(detail, paused)):
+        kind, detail = "user", f"{name}, which you paused"
     if kind == "time" and re.fullmatch(r"[0-9]+(\.[0-9]+)?", detail):
         text = "waits until " + timefmt.long(float(detail), where)
     elif kind in ("resource", "time") and detail:
@@ -128,16 +149,36 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
             "asks": [a["id"] for a in linked]}
 
 
-def split(tasks: list[dict], open_asks: list[dict], now: float | None = None, where=None) -> tuple[list[dict], list[dict]]:
+def split(tasks: list[dict], open_asks: list[dict], now: float | None = None, where=None,
+          paused: dict | None = None) -> tuple[list[dict], list[dict]]:
     """Blocked tasks as (waiting on the user, stuck with the project on it), each task with its
     `wait` (see wait_kind)."""
     you, stuck = [], []
     for t in tasks:
         if t.get("status") != "blocked":
             continue
-        w = wait_kind(t, open_asks, now, where)
+        w = wait_kind(t, open_asks, now, where, paused)
         (you if w["kind"] == "user" else stuck).append({**t, "wait": w})
     return you, stuck
+
+
+def blocked(db, now: float | None = None, where=None) -> tuple[list[dict], list[dict]]:
+    """`split` of the project's blocked tasks against its open asks and resource pauses: the one
+    count of what waits on the user, for `ttp status`, the web app and `ttp overview`."""
+    return split(db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id"), open_asks(db),
+                 now, where, db.paused_resources())
+
+
+def held_line(stuck: list[dict]) -> str:
+    """The blocked tasks that do not wait on the user, by what holds them, in neutral words:
+    'held: 3 blocked task(s) (waiting on the coordinator 2, a resource 1)'; '' for none."""
+    if not stuck:
+        return ""
+    n: dict[str, int] = {}
+    for t in stuck:
+        n[t["wait"]["kind"]] = n.get(t["wait"]["kind"], 0) + 1
+    parts = ", ".join(f"{_WHO[k]} {c}" for k, c in sorted(n.items(), key=lambda kc: (-kc[1], KINDS.index(kc[0]))))
+    return f"held: {len(stuck)} blocked task(s) (waiting on {parts})"
 
 
 def open_asks(db) -> list[dict]:

@@ -309,7 +309,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     held_ids = {t["id"] for t in logged_out + net_held}
     ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources}
                 and t["id"] not in held_ids)
-    blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
+    # Only a blocked task that truly waits on the user counts as waiting on you (waits.split);
+    # the rest wait on the coordinator, a resource or a time and get a neutral 'held' line.
+    on_you, held_tasks = waits.blocked(db, now, tz)
+    blocked = len(on_you)
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
@@ -389,6 +392,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             why.append(f"the 24 h cap on {what} is full; the coordinator adds held work at {at(retry['at'], now, tz)}")
     if len(queued) > len(due):
         why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
+    if held_tasks:
+        why.append(waits.held_line(held_tasks))
     if you:
         why.append(you)
     if not why and next_wake:
@@ -422,6 +427,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "net_held": [{k: t[k] for k in ("id", "title", "provider")} for t in net_held],
         "breakers": breakers,
         "asks": asks, "running": running, "working": working,
+        "waiting_on_user": blocked, "held_blocked": len(held_tasks),   # blocked tasks, as waits.split counts them
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY), tz),
@@ -531,6 +537,7 @@ def state_payload(p: Project, db: DB) -> dict:
     unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
     asks = waits.open_asks(db)
     job_use = db.kv("job_use", {}) or {}
+    paused = db.paused_resources()
     for t in tasks:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
@@ -542,7 +549,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
         # Plain words for the board; the probe itself stays in start_when, the task's detail.
         t["starts"] = coord.starts_text(t, now, plain=True, where=tz) if t["status"] == "queued" else ""
-        t["wait"] = waits.wait_kind(t, asks, now, tz) if t["status"] == "blocked" else None
+        t["wait"] = waits.wait_kind(t, asks, now, tz, paused) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
                  start_after=d.get("after"), start_when=d.get("when"), start_why=d.get("why"),
