@@ -3027,8 +3027,7 @@ class Daemon:
             try:
                 line = responsibilities.line(db)
                 if line:
-                    spec += (f"\n\nResponsibilities: {line}. Give each missing one a heal check naming it "
-                             "(`ttp machines status` shows the shared machines).")
+                    spec += f"\n\nResponsibilities: {line}." + responsibilities.review_advice(db)
             except Exception as e:   # nor must the inventory
                 log(self.p, f"health coverage line failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":

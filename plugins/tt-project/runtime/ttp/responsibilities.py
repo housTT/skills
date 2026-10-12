@@ -11,8 +11,12 @@ Responsibility inventory. The daemon lists, model-free, what the project is resp
 A machine, runner or tunnel is covered when an enabled heal check or command watcher names it: in its
 `resource` or `machine` (the alias itself, or `<alias>-...`), or as a word of its command, check, fix,
 status command, unit, host or URL. A shared machine this project has no such check for is covered when
-its recovery owner (else its fallback) runs an enabled heal check naming it: that project's database is
-read read-only, and the line says 'machine <alias> covered by owner <project>'. The rest the daemon
+its recovery owner (else its fallback) runs an enabled heal check naming it, and the line says
+'machine <alias> covered by owner <project>'. Failing that (no owner set, or the owner has no such
+check), it is covered when another project on this machine (a co-tenant) has an enabled heal check
+naming it that ran healthy within FRESH_INTERVALS of its interval: 'machine <alias> covered by <project>
+heal check'. A stale or unhealthy co-tenant check does not cover it. Other projects' databases are only
+read, read-only. A machine is missing only when no project checks it. The rest the daemon
 already watches by itself (a schedule failing twice queues its fix task, the push queue recovers dead
 batches, the PR watcher reads open PRs, a wait probe wakes its task when the remote job ends or its host
 is gone), so they are covered by `builtin`; open PRs need the built-in PR watcher schedule to be on.
@@ -43,6 +47,7 @@ from . import heal, machines, project
 KV = "responsibilities"            # kv: {"at", "items": [{kind, name, covered_by}], "line"}
 TOLD_KV = "responsibilities_told"  # kv: the missing list the coordinator's digest last named
 CHECK_EVERY_S = 300
+FRESH_INTERVALS = 2                # a co-tenant's heal check counts while its last healthy run is this many intervals old
 REBUILD_S = 86400
 OPEN_TASK = ("queued", "running", "waiting", "needs_review", "blocked", "pushing")
 DONE_PR = ("MERGED", "CLOSED")
@@ -86,9 +91,10 @@ def covering(needles: list[str], found: list[dict]) -> list[str]:
 
 
 # The inventory ------------------------------------------------------------------------------------
-def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
+def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> list[dict]:
     """[{kind, name, covered_by: [check names or 'builtin: ...']}], in KINDS order."""
     from . import machine_ledger, pushq, tunnel
+    now = time.time() if now is None else now
     cfg = p.config() if cfg is None else cfg
     db = p.db if db is None else db
     found = watchers(db)
@@ -99,6 +105,8 @@ def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
         item = {"kind": "machine", "name": alias, "covered_by": covering(needles, found)}
         if not item["covered_by"]:
             via, checks = _owner_checks(p, known.get(alias) or {}, needles)
+            if not checks:
+                via, checks = _cotenant_checks(p, needles, now)
             if checks:
                 item.update(covered_by=checks, via=via)
         items.append(item)
@@ -151,33 +159,69 @@ def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
     return items
 
 
+def _heal_checks(base: Path, needles: list[str], fresh_at: float | None = None) -> list[str]:
+    """The enabled heal checks naming one of `needles` in the project at `base`, read read-only from its
+    database; with `fresh_at`, only those whose last check was healthy within FRESH_INTERVALS of their
+    interval. [] when it cannot be read."""
+    from . import globalcap
+    db_path = base / "state" / "project.db"
+    if not db_path.is_file():
+        return []
+    try:
+        db = ReadOnly(globalcap.connect_ro(db_path))
+    except Exception:
+        return []
+    try:
+        names = covering(needles, [w for w in watchers(db) if w["heal"]])
+        if fresh_at is not None:
+            every = {r["name"]: float(r["every_s"] or 0) for r in db.q("SELECT name, every_s FROM schedules")}
+            names = [n for n in names if _fresh(heal.state(db, n), every.get(n, 0.0), fresh_at)]
+        return names
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+
+def _fresh(st: dict, every_s: float, now: float) -> bool:
+    """A heal check's last run was healthy and is no older than FRESH_INTERVALS of its interval."""
+    try:
+        last = float(st.get("last_check") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (st.get("status") == "healthy" and "unknown_since" not in st and every_s > 0 and last > 0
+            and now - last <= FRESH_INTERVALS * every_s)
+
+
 def _owner_checks(p, rec: dict, needles: list[str]) -> tuple[str, list[str]]:
     """('owner <project>', ['<project>/<check>', ...]): the recovery owner's (else fallback's) enabled heal
     checks naming the machine, read read-only from its database; ("", []) when neither runs one here."""
-    from . import globalcap
     bases = dict(_projects(project.hostname()))
     for role in ("owner", "fallback"):
         who = str(rec.get(f"recovery_{role}") or "")
-        db_path = bases[who] / "state" / "project.db" if who and who != p.name and who in bases else None
-        if not db_path or not db_path.is_file():
+        if not who or who == p.name or who not in bases:
             continue
-        try:
-            db = ReadOnly(globalcap.connect_ro(db_path))
-        except Exception:
-            continue
-        try:
-            names = covering(needles, [w for w in watchers(db) if w["heal"]])
-        except Exception:
-            names = []
-        finally:
-            db.close()
+        names = _heal_checks(bases[who], needles)
         if names:
             return f"{role} {who}", [f"{who}/{n}" for n in names]
     return "", []
 
 
+def _cotenant_checks(p, needles: list[str], now: float) -> tuple[str, list[str]]:
+    """('<project> heal check', ['<project>/<check>', ...]): the first other project on this machine with an
+    enabled heal check naming the machine that ran healthy within its interval; ("", []) when none has."""
+    for who, base in _projects(project.hostname()):
+        if who == p.name:
+            continue
+        names = _heal_checks(base, needles, fresh_at=now)
+        if names:
+            return f"{who} heal check", [f"{who}/{n}" for n in names]
+    return "", []
+
+
 def by_owner(items: list[dict]) -> list[str]:
-    """'machine <alias> covered by owner <project>' for each item only another project's heal check covers."""
+    """'machine <alias> covered by owner <project>' (or 'by <project> heal check', a co-tenant's) for each item
+    only another project's heal check covers."""
     return [f"{i['kind']} {i['name']} covered by {i['via']}" for i in items if i.get("via") and i["covered_by"]]
 
 
@@ -197,7 +241,7 @@ def line_of(items: list[dict]) -> str:
 def refresh(p, cfg: dict | None = None, now: float | None = None) -> dict:
     """Build the inventory; store it when it changed or is a day old. Returns the stored record."""
     now = time.time() if now is None else now
-    items = inventory(p, cfg)
+    items = inventory(p, cfg, now=now)
     old = p.db.kv(KV) or {}
     if old.get("items") != items or now - float(old.get("at") or 0) >= REBUILD_S:
         old = {"at": now, "items": items, "line": line_of(items)}
@@ -227,6 +271,19 @@ def digest_lines(db) -> list[str]:
             + (f"; now covered: {', '.join(fixed)}" if fixed else "")
             + ("; give each missing one a heal check (harness/schedules.json, `heal` block) naming it"
                if gaps else "")]
+
+
+def review_advice(db) -> str:
+    """The daily review's advice after the coverage line: a heal check for each missing item only; a
+    machine another project's heal check covers needs no duplicate of its own."""
+    items = (db.kv(KV) or {}).get("items") or []
+    out = []
+    if missing(items):
+        out.append("Give each missing one a heal check naming it (`ttp machines status` shows the shared "
+                   "machines).")
+    if by_owner(items):
+        out.append("A machine covered by another project's heal check needs no duplicate check here.")
+    return "".join(" " + x for x in out)
 
 
 # Read-only view of other projects ------------------------------------------------------------------

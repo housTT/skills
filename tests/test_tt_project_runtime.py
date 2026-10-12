@@ -41529,6 +41529,54 @@ def test_responsibility_inventory_credits_the_recovery_owners_heal_check_for_a_s
     assert [i["covered_by"] for i in rs.inventory(alpha) if i["kind"] == "machine"] == [["beta/box-a-up"]]
 
 
+def test_responsibility_inventory_credits_a_cotenants_fresh_healthy_heal_check_without_an_owner(env):
+    from ttp import heal
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    mm.add("box-a", tags="device")
+    me, gamma = make(env), _second_project(env, "gamma")
+    _resources(me, "Machines: box-a")
+    n = len(rs.inventory(me))
+    # A co-tenant's heal check that never ran, ran unhealthy, or ran healthy too long ago does not cover it.
+    sched.upsert(gamma.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    assert rs.refresh(me, now=10_000.0)["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "unhealthy", "last_check": 9_900.0, "last_rc": 1})
+    assert rs.inventory(me, now=10_000.0)[0]["covered_by"] == []
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 10_000.0 - 3 * 300, "last_rc": 0})
+    assert rs.inventory(me, now=10_000.0)[0]["covered_by"] == [], "stale: not covered"
+    # Healthy within its interval: covered by the co-tenant, with no recovery owner set, and gamma is only read.
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 9_800.0, "last_rc": 0})
+    mtime = (gamma.base / "state" / "project.db").stat().st_mtime_ns
+    rec = rs.refresh(me, now=10_000.0)
+    assert rec["items"][0] == {"kind": "machine", "name": "box-a", "covered_by": ["gamma/box-a-up"],
+                               "via": "gamma heal check"}
+    assert rec["line"] == f"health coverage: {n}/{n} (machine box-a covered by gamma heal check)"
+    assert (gamma.base / "state" / "project.db").stat().st_mtime_ns == mtime
+    advice = rs.review_advice(me.db)
+    assert "Give each missing one" not in advice and "no duplicate check" in advice
+    # Its check going stale makes the machine missing again, and the review advises a check.
+    rec = rs.refresh(me, now=9_800.0 + 3 * 300)
+    assert rec["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    assert "Give each missing one a heal check" in rs.review_advice(me.db)
+    # A recovery owner's heal check still covers it whatever its state, and wins over the co-tenant's.
+    mm.set_recovery("box-a", "alpha", None)
+    alpha = _second_project(env, "alpha")
+    sched.upsert(alpha.db, "box-a-own", "command", "5m", payload={"heal": {"check": "ssh box-a true"}})
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 20_000.0, "last_rc": 0})
+    assert rs.refresh(me, now=20_000.0)["line"] == f"health coverage: {n}/{n} (machine box-a covered by owner alpha)"
+    # The owner set but without a check of its own: the co-tenant's healthy check covers it.
+    alpha.db.x("DELETE FROM schedules WHERE name='box-a-own'")
+    assert rs.refresh(me, now=20_000.0)["line"] == f"health coverage: {n}/{n} (machine box-a covered by gamma heal check)"
+    # The daily review spec carries the coverage line and no advice to add a duplicate check.
+    from ttp import daemon as dm
+    sched.upsert(me.db, "daily-review", "llm", "1d", payload={})
+    me.db.x("UPDATE schedules SET next_run=0 WHERE name='daily-review'")
+    dm.Daemon(me.base).run_schedules()
+    t = me.db.one("SELECT spec FROM tasks WHERE labels LIKE '%daily-review%'")
+    assert t and "covered by gamma heal check" in t["spec"] and "Give each missing one" not in t["spec"]
+
+
 def test_responsibility_inventory_lists_runners_schedules_prs_and_remote_jobs(env):
     from ttp import responsibilities as rs
     from ttp import schedule as sched
