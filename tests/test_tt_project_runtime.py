@@ -52355,6 +52355,48 @@ def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, cap
     assert exc.value.code == 1 and json.loads((run / "checks.json").read_text())["passed"] is False
 
 
+def _out_of_scope_head(p, tmp_path, git):
+    """A push target at HEAD and a later commit that changes nothing: if_changed scopes skip on it."""
+    p.set_config("delivery.push_branch", "origin/proj")
+    subprocess.run([*git, "remote", "add", "origin", str(tmp_path / "none.git")], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/proj", "HEAD"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "notes"], check=True)
+
+
+@pytest.mark.parametrize("case", ["consumer", "extra", "all_out_of_scope"])
+def test_ttp_checks_purpose_harness_fails_when_its_harness_check_is_skipped(env, tmp_path, monkeypatch, capsys,
+                                                                            case):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    _out_of_scope_head(p, tmp_path, git)
+    harness = {"run": HARNESS_PLAN, "purpose": "harness", "if_changed": "src"}
+    checks = {"consumer": [harness, f"echo consumer >> {log}"], "extra": [harness],
+              "all_out_of_scope": [harness, {"run": f"echo consumer >> {log}", "if_changed": "src"}]}[case]
+    p.set_config("delivery.push_checks", checks)
+    extra = ["--", f"echo extra >> {log}"] if case == "extra" else []
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--purpose", "harness", *extra])
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "every purpose harness check was skipped" in err, err
+    assert not log.exists(), "checks ran though nothing could qualify the head"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["purpose"] == "harness" and rec["commands"] == []
+    assert not (run / "check_failure.json").exists()
+    # The same entries qualify a head the harness check applies to.
+    (repo / "src").write_text("x\n")
+    subprocess.run([*git, "add", "src"], check=True)
+    subprocess.run([*git, "commit", "-qm", "src"], check=True)
+    cli.main(["checks", "--purpose", "harness", *extra])
+    assert log.read_text().split()[0] == "plan"
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # A reused harness pass still qualifies it.
+    cli.main(["checks", "--purpose", "harness", *extra])
+    assert "(recorded)" in capsys.readouterr().out
+
+
 def test_detached_and_relaunched_checks_keep_the_harness_purpose(env, tmp_path, monkeypatch):
     from argparse import Namespace
     from ttp import cli

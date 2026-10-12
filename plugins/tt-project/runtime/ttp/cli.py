@@ -1432,7 +1432,7 @@ def cmd_checks(a) -> None:
 
     `--purpose harness` qualifies a harness-preparation head: it runs the harness-tagged and untagged
     project checks plus the commands after `--`, lists candidate-tagged ones as not run, and fails
-    when no harness-tagged check is set. Its pass is recorded as such and never counts for a PR,
+    unless a harness-tagged check applies to the head and ran or reused a recorded pass. Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
     from . import checkdirs, prguard, push
     if getattr(a, "gap", None):
@@ -1518,6 +1518,14 @@ def cmd_checks(a) -> None:
         except push.ScopeError as e:
             out.write(f"{e}\n")
             todo, skipped, passed, failed = [], [], False, str(e.check)
+        # A harness run qualifies the head only through a harness check: one skipped by if_exists or
+        # if_changed leaves the untagged checks and extras (or nothing) to pass, which is no qualification.
+        unqualified = (purpose == "harness" and passed
+                       and not any(getattr(c, "purpose", "") == "harness" for c in todo))
+        if unqualified:
+            failed = HARNESS_SKIPPED
+            out.write(f"{failed}\n")
+            passed, todo = False, []
         hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
         if not todo and passed and push.outside_scope(cmds, skipped):
             out.write(f"{push.OUT_OF_SCOPE}\n")
@@ -1572,6 +1580,9 @@ def cmd_checks(a) -> None:
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
     if not passed:
         from . import trim
+        if unqualified:
+            die(f"ttp checks --purpose harness: {HARNESS_SKIPPED} on {head[:12]}, so nothing qualifies this "
+                f"head; the purpose harness check must apply to it (full output: {log})", 1)
         print(trim.summary(text))   # a test run's failures, else head and tail
         if also:
             die(f"ttp checks: {failed!r} failed on {head[:12]}: tests failed, and there is also an environment "
@@ -1589,6 +1600,9 @@ def cmd_checks(a) -> None:
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
              if purpose == "harness" else "recorded for the draft PR"))
+
+
+HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
 
 
 def _harness_purpose(a) -> dict:

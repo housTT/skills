@@ -528,15 +528,16 @@ prolonged whole-box outage.
   push mode or an environment variable. Keep all existing mandatory candidate gates alongside
   the harness check; installing harness coverage does not waive them or carry earlier approvals
   to a changed definition. Applicability-gap ownership and retries remain independent of this binding.
-- Tag a check entry `"purpose": "harness"` (only that `ttp check-plan --purpose harness ...` command) or
-  `"purpose": "candidate"`; untagged entries serve both. `ttp checks --purpose harness` runs the harness and
-  untagged entries plus the commands after `--`, lists candidate entries as `not run: candidate publication
-  gate`, fails when no harness entry is set, and records a pass that never counts for a PR, an `on_pass`
-  hand-off or `ttp push --own`, and opens no check gap. `ttp push` and the push queue run every entry.
   Exit codes are **65** for unknown identity, changed coverage or purpose mismatch, **66** for
   missing/invalid required input or definition, and **20** for Git failure even if Git also prints
   a matching identity. A selected command's nonzero exit code is preserved (for example **42**);
   **0** means every selected command passed under the binding.
+- Tag a check entry `"purpose": "harness"` (only that `ttp check-plan --purpose harness ...` command) or
+  `"purpose": "candidate"`; untagged entries serve both. `ttp checks --purpose harness` runs the harness and
+  untagged entries plus the commands after `--`, lists candidate entries as `not run: candidate publication
+  gate`, fails (exit 1) unless a harness entry ran or reused a recorded pass (one skipped by `if_exists`
+  or `if_changed` does not count), and records a pass that never counts for a PR, an `on_pass` hand-off
+  or `ttp push --own`, and opens no check gap. `ttp push` and the push queue run every entry.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
