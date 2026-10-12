@@ -1044,7 +1044,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
-                onto = given.group(1) if given else carried[1] if carried and not taken else ""
+                onto = given.group("branch") if given else carried[1] if carried and not taken else ""
                 # A rebase of that branch cannot fast-forward it: it delivers on its own branch.
                 rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
@@ -1780,13 +1780,15 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 
 
 # A task's own work branch named in a spec (worktree.ensure names them ttp/t<id>-<slug>), and a
-# spec line naming the branch a task delivers onto: its first token, backticks or quotes aside, so
-# text may follow on the same line. Known gap, accepted: prose such as `pr_branch: use that branch`
-# labels a bogus branch ("use"); `ttp push --own` refuses one that exists nowhere and on_carried
-# sends the task back to its own branch, so no parser heuristics here.
+# spec line naming the branch a task delivers onto: the marker starts the line (a list bullet aside)
+# and the branch is the whole next token, bare or in matching backticks or quotes, so text may follow
+# it. A mention in running prose ("the spec's pr_branch: line") is no such line. Known gap, accepted:
+# a line such as `pr_branch: use that branch` labels a bogus branch ("use"); `ttp push --own` refuses
+# one that exists nowhere and on_carried sends the task back to its own branch.
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
-SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:\s*[`'\"]?([A-Za-z0-9][\w./-]*[\w-])")
+SPEC_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?P<q>[`'\"]?)"
+                            r"(?P<branch>[A-Za-z0-9][\w./-]*[\w-])(?P=q)(?=[.,;:]?(?:[ \t]|$))", re.M)
 
 
 def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:

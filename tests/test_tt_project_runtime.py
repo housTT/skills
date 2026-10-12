@@ -32342,8 +32342,9 @@ def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
 
 
 def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
-    """A spec's `pr_branch:` line labels the task with the branch right after it, backticks or quotes
-    aside, even with more text on the same line, and writes no note about it. A label that is not a
+    """A spec's `pr_branch:` line (the marker starts the line, a list bullet aside) labels the task with
+    the branch right after it, backticks or quotes aside, even with more text on the same line, and
+    writes no note about it; a mention in running prose labels nothing. A label that is not a
     valid branch name is ignored when the task runs (worktree.carried_branch)."""
     p = make(env)
     from ttp import coordinator as coord, worktree
@@ -32355,11 +32356,23 @@ def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
                                       ("pr_branch: `ttp/t5-x` Context: the old parser read it.", "ttp/t5-x"),
                                       ("Goal: fix CI.\npr_branch: `user/fix-ci`.", "user/fix-ci"),
                                       ("pr_branch: 'release-2.1' then more", "release-2.1"),
-                                      ('pr_branch: "feature/q"', "feature/q"))):
+                                      ('pr_branch: "feature/q"', "feature/q"),
+                                      ("Goal: fix CI.\n  - pr_branch: `feature/bullet`", "feature/bullet"),
+                                      ("Steps:\n1. pr_branch: feature/numbered\n2. Fix CI.", "feature/numbered"))):
         title = f"carry {i}"
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
         assert labels(title) == [f"pr_branch:{want}"], spec
     assert not [n for n in p.db.kv(coord.NOTES_KEY) or [] if "pr_branch" in n]
+    # A mention in running prose is no `pr_branch:` line: it labels nothing.
+    for i, spec in enumerate(("SPEC_PR_BRANCH misread the spec's pr_branch: line in running prose.",
+                              "Fix how the spec's `pr_branch:` line is parsed.",
+                              "`pr_branch:` line parsing: fix it.",
+                              "pr_branch:\nfeature/next-line",
+                              "pr_branch: line's parsing",
+                              'pr_branch: ""')):
+        title = f"prose {i}"
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        assert not [x for x in labels(title) if x.startswith("pr_branch:")], spec
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:use that branch"])}) == ""
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feat..ure"])}) == ""
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feature/x"])}) == "feature/x"
