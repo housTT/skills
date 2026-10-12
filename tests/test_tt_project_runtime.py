@@ -2737,6 +2737,13 @@ def test_keyed_issue_a_quiet_run_closed_only_counts_when_resent_within_the_windo
         before = wakes()
         run(line("fleet gate: closed", "critical"))
         assert wakes() == before + 1 and issue()["status"] == "open"
+    # A "repeat": true line wakes on every occurrence, also within the window.
+    rep = json.dumps({"text": "fleet gate: tripped", "severity": "high", "key": "rep", "repeat": True})
+    run(rep)
+    run("")
+    before = wakes()
+    run(rep)
+    assert wakes() == before + 1 and issue("rep")["status"] == "open"
     # Lines without a key keep the old rule: a recurrence after a quiet run wakes.
     run(json.dumps({"text": "box-b: fan failed", "severity": "high"}))
     run("")

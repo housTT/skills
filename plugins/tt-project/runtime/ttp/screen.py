@@ -149,7 +149,7 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         if row["status"] == "fixed":
             # Seen again after it was fixed or closed: it wakes when this sighting is at or above the floor.
             sev = hint if seen_at >= 0 else row["severity"]
-            if reraise_s > 0 and row.get("cleared_why") == CLEAN_RUN_WHY and row.get("closed") is not None \
+            if reraise_s > 0 and not repeat and row.get("cleared_why") == CLEAN_RUN_WHY and row.get("closed") is not None \
                     and now - float(row["closed"]) <= reraise_s and SEVERITY_RANK.get(sev, 1) <= rank:
                 # Closed by a quiet run moments ago and sent again unchanged: counted, not reopened.
                 return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a quiet run",
