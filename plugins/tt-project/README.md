@@ -432,6 +432,19 @@ prolonged whole-box outage.
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
   for `ttp checks`). A check that should only gate the push branch tests
   `[ "$TTP_PUSH_MODE" != target ] || ...`.
+- Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
+  uses the worker's run directory. Detached checks, pushes and push-queue batches each
+  get a unique directory under the project's `state/check-reports/`, outside the checked worktree.
+  Write reports there, for example `echo passed > "$TTP_RUN_DIR/x"`. Outputs survive worker cleanup
+  and remain after completion. Their `TMPDIR`/`TMP`/`TEMP` scratch lives separately under
+  `state/check-runs/`; the whole allocation is removed after its owner and last command exit
+  (or by later recovery). Git discovery in scratch stops before reaching the enclosing project,
+  while discovery in the checked worktree works normally. Scratch and lifetime locks never
+  follow symlinks. `checks.pid` and push queue markers record `check_run_dir` and `check_report_dir`; queued launches
+  rebuild missing directories from project state after a daemon restart. A rebooted check invocation
+  gets a fresh directory. An invalid or unwritable output directory fails before any check runs.
+  Foreground pushes keep progress notes and lock-wait accounting in the worker's original run directory.
+  Detached launches do not inherit the worker's `TTP_PIDNS` or `TTP_CGROUP`.
 - `delivery.push_exclude_paths` (globs, off by default) keeps files off the push branch, such as
   task notes or `tmp/`: `["tmp/**", "notes/*.md"]`. `ttp push` and the push queue refuse a change
   when any commit it brings adds or modifies a matching file, and name the files; a commit that

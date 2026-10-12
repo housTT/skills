@@ -1299,7 +1299,7 @@ def cmd_checks(a) -> None:
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
     killed outright. Starting it again stops the run's earlier detached checks."""
-    from . import prguard, push
+    from . import checkdirs, prguard, push
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -1343,8 +1343,16 @@ def cmd_checks(a) -> None:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     if a.detach:
-        _checks_detach(a, Path(run_dir), p, top, head)
+        try:
+            checkdirs.writable(run_dir)
+            _checks_detach(a, Path(run_dir), p, top, head)
+        except OSError as e:
+            die(f"ttp checks: {e}")
         return
+    try:
+        checkdirs.writable(getattr(a, "check_run_dir", None) or run_dir)
+    except OSError as e:
+        die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc = True, None, None, None
     base = _checks_base(p, Path(top), cmds)
@@ -1378,7 +1386,9 @@ def cmd_checks(a) -> None:
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
             proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=group, env={**push.check_env("checks"), "PWD": top})
+                                    start_new_session=group, env={**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
+                                         "PWD": top},
+                                    pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             try:
                 rc = proc.wait()
             except BaseException:
@@ -1442,6 +1452,24 @@ def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
 
 
 CHECKS_RC, CHECKS_PID, CHECKS_OUT = "checks.rc", "checks.pid", "checks.out"   # in the run's directory
+
+CHECKS_TMP, CHECKS_TMP_LOCK = "checks-tmp", "checks-tmp.lock"
+
+
+def _checks_tmp_cleanup(run_dir: Path) -> None:
+    """Remove abandoned scratch only while its lifetime lock is free. The launcher, checks
+    process and check commands inherit the same lock, so recovery never removes live storage,
+    even between launch and checks.pid or after the checks supervisor was killed."""
+    from . import checkdirs
+    try:
+        with checkdirs.directory(run_dir):
+            info = _read_checks_pid(run_dir)
+        base = os.environ.get("TTP_PROJECT")
+        output = info.get("check_run_dir")
+        if base and output and Path(output).parent == Project(base).state / checkdirs.FOLDER:
+            checkdirs.cleanup(Path(output), whole=True)
+    except OSError:
+        pass
 
 
 def _end_check(proc: subprocess.Popen) -> None:
@@ -1518,6 +1546,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
     request this launch serves (detach.tend)."""
     from .push import pid_ns
     from .runner import boot_id, proc_start
+    from . import checkdirs
+    checkdirs.writable(str(run_dir))
     old = _read_checks_pid(run_dir)
     if _checks_alive(old):
         try:
@@ -1532,29 +1562,59 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                 os.killpg(old["pid"], signal.SIGKILL)
             except OSError:
                 pass
-    (run_dir / CHECKS_RC).unlink(missing_ok=True)
-    with open(run_dir / CHECKS_OUT, "wb") as out:
-        child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
-                                  *(["--fresh"] if a.fresh else []), *a.cmd],
-                                 cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+    base = env.get("TTP_PROJECT")
+    if not base:
+        raise OSError("TTP_RUN_DIR for detached checks requires a project state directory (TTP_PROJECT)")
+    # Refuse a linked legacy lock, and preserve the old commands' lifetime on upgrade.
+    previous = Path(old["check_run_dir"]) if old.get("check_run_dir") else run_dir
+    if previous != run_dir and previous.parent != Project(base).state / checkdirs.FOLDER:
+        raise OSError("TTP_RUN_DIR in checks.pid is outside the project's check output directory")
+    old_guard = checkdirs.take(previous) if previous.exists() or previous.is_symlink() else False
+    if old_guard is None:
+        raise OSError("earlier check commands still own their temporary storage; not starting replacement checks")
+    if old_guard:
+        old_guard.close()
+        if previous != run_dir:
+            checkdirs.finish(previous)
+    output = checkdirs.new(Project(base).state, run_dir / CHECKS_PID)
+    guard = checkdirs.take(output)
+    launched = False
     try:
-        write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
-                                          "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
-                                          "fresh": bool(a.fresh), "req": req, "pidns": pid_ns()})
-    except BaseException:
+        env = checkdirs.environment(output, env)
+        # The supervisor records checks.log/rc in the original run; commands get the report dir.
+        env['TTP_RUN_DIR'] = str(run_dir)
+        env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
+        (run_dir / CHECKS_RC).unlink(missing_ok=True)
+        with open(run_dir / CHECKS_OUT, "wb") as out:
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
+                                      *(["--fresh"] if a.fresh else []), *a.cmd],
+                                     cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
+                                     stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
         try:
-            os.killpg(child.pid, signal.SIGKILL)   # this launch's own child, still waiting for its go
+            write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
+                                              "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
+                                              "fresh": bool(a.fresh), "req": req, "pidns": pid_ns(),
+                                              "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)   # this launch's own child, still waiting for its go
+            except OSError:
+                pass
+            child.wait()
+            raise
+        try:
+            child.stdin.write(b"go\n")
+            child.stdin.close()
         except OSError:
-            pass
-        child.wait()
-        raise
-    try:
-        child.stdin.write(b"go\n")
-        child.stdin.close()
-    except OSError:
-        pass   # it died: the probe reports that
-    return child.pid
+            pass   # it died: the probe reports that
+        launched = True
+        return child.pid
+    finally:
+        guard.close()
+        if launched:
+            checkdirs.cleanup(output, whole=True)
+        else:
+            checkdirs.finish(output)
 
 
 def _checks_released(go: bytes, run_dir: Path) -> bool:
@@ -1570,28 +1630,44 @@ def _checks_released(go: bytes, run_dir: Path) -> bool:
 def _checks_child(a) -> int:
     """The detached `ttp checks`: run them, then write the exit code to `--rc` however it ends."""
     rc_file = Path(a.rc)
-    if not _checks_released(sys.stdin.buffer.read(), rc_file.parent):
-        # Its launcher ended before recording it: no record names it, so it must not run, and it
-        # leaves checks.rc alone (a newer launch may own it by now).
-        print("ttp checks: not started: the launcher ended before it recorded this process", flush=True)
-        return 1
+    tmp_fd = int(os.environ["TTP_CHECKS_TMP_FD"]) if "TTP_CHECKS_TMP_FD" in os.environ else None
+    released = False
+    code: int | str = 1
 
     def stop(sig, _frame):
         raise SystemExit(128 + sig)
 
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, stop)
-    code: int | str = 1
     try:
-        cmd_checks(argparse.Namespace(**{**vars(a), "rc": None, "detach": False, "own_group": True}))
+        released = _checks_released(sys.stdin.buffer.read(), rc_file.parent)
+        if not released:
+            # A newer launch may own checks.rc: this unrecorded child leaves it alone.
+            print("ttp checks: not started: the launcher ended before it recorded this process", flush=True)
+            return 1
+        from . import checkdirs
+        output = checkdirs.writable(os.environ.get("TTP_CHECK_OUTPUT_DIR"))
+        cmd_checks(argparse.Namespace(**{**vars(a), "rc": None, "detach": False, "own_group": True,
+                                         "check_run_dir": output, "tmp_fd": tmp_fd}))
         code = 0
+    except OSError as e:
+        print(f"ttp checks: {e}", file=sys.stderr, flush=True)
+        code = 1
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code > 128:
             with open(rc_file.parent / "checks.log", "a") as log:
                 log.write(f"ttp checks: stopped by signal {code - 128}\n")
     finally:
-        durable_write(rc_file, f"{code}\n")
+        if tmp_fd is not None:
+            os.close(tmp_fd)
+            from . import checkdirs
+            info = _read_checks_pid(rc_file.parent)
+            if info.get('pid') == os.getpid() and info.get('check_run_dir'):
+                checkdirs.finish(Path(info['check_run_dir']))
+            _checks_tmp_cleanup(rc_file.parent)
+        if released:
+            durable_write(rc_file, f"{code}\n")
     return code if isinstance(code, int) else 1
 
 
@@ -1600,6 +1676,7 @@ def _checks_result(run_dir: Path) -> int:
     writing it (it then writes `killed` there), 1 while they run."""
     rc_file = run_dir / CHECKS_RC
     from . import detach
+    _checks_tmp_cleanup(run_dir)
     if detach.pending(rc_file):
         print("ttp checks: queued for the daemon, which starts them outside the sandbox")
         return 1

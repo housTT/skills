@@ -321,9 +321,10 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
-    # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
+    # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
+    # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
-                "TTP_CGROUP"):
+                "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD"):
         monkeypatch.delenv(var, raising=False)
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
@@ -18946,7 +18947,9 @@ def test_a_malformed_queued_push_marker_is_recorded_as_failed_and_the_tick_goes_
            "c-log": {"queued": now, "repo": str(p.root)},
            "d-env": {"queued": now, "repo": str(p.root), "log": str(folder / "d-env.log"), "env": ["X=1"]}}
     for rid, m in bad.items():
-        (folder / f"{rid}.json").write_text(json.dumps({"id": rid, "status": "queued", **m}))
+        from ttp import checkdirs
+        (folder / f"{rid}.json").write_text(json.dumps({"id": rid, "status": "queued",
+                                                     "check_run_dir": str(checkdirs.new(p.state)), **m}))
     tid = p.db.add_task("after the pushes", "s", kind="work", tier="light", origin="user")
     d.tick()
     assert p.db.q("SELECT id FROM runs WHERE task=?", (tid,)), "a malformed push marker stopped the tick"
@@ -19231,10 +19234,14 @@ def _entry(repo, name, files):
 def _batch_marker(p, heads, bid="b1", target="origin/proj"):
     """A batch marker as the push queue writes it: entry n (task 100 + n, branch e<n>) pushes heads[n-1]."""
     from ttp.project import write_json
+    from ttp import checkdirs
     marker = p.state / "pushes" / f"{bid}.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
+    output = checkdirs.new(p.state, marker)
+    checkdirs.environment(output, {})
     write_json(marker, {
         "v": 1, "kind": "batch", "id": bid, "status": "running", "phase": "push", "pid": os.getpid(),
+        "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output)),
         "started": time.time(), "repo": str(p.root), "target": target, "log": str(marker.with_suffix(".log")),
         "lock": str(p.state / "locks" / f"push:run-{bid}.0.lock"),
         "entries": [{"id": n, "task": 100 + n, "branch": f"e{n}", "head": h, "ref": f"refs/ttp/push/{n}"}
@@ -19246,6 +19253,7 @@ def _run_batch(p, marker, monkeypatch):
     """`ttp push --batch <marker>` in this process, its go given: (exit code, the marker after it)."""
     from ttp import batch, push
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     return batch.run_batch(p, marker), push._read(marker)
 
 
@@ -19724,8 +19732,11 @@ def test_a_push_batch_rebuilds_a_worktree_a_crash_left_mid_rebase(env, monkeypat
     before = _git_out(origin, "rev-parse", "proj")
     crash = ("import os, sys\nfrom ttp import batch, cli\n"
              "batch.settle = lambda *a, **k: os._exit(9)\ncli.main(['push', '--batch', sys.argv[1]])\n")
-    r = subprocess.run([sys.executable, "-c", crash, str(_batch_marker(p, heads))], cwd=str(repo), input="",
-                       capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    marker = _batch_marker(p, heads)
+    output = json.loads(marker.read_text())["check_report_dir"]
+    r = subprocess.run([sys.executable, "-c", crash, str(marker)], cwd=str(repo), input="",
+                       capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_RUN_DIR": output})
     from ttp import batch
     wt = p.worktrees / "push"
     assert r.returncode == 9 and batch._rebasing(wt), r.stdout + r.stderr
@@ -19820,6 +19831,7 @@ def test_a_push_batch_finds_the_push_lock_busy_and_touches_nothing(env, monkeypa
     marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
     worktrees = _git_out(repo, "worktree", "list")
     held = push.take(p, "origin", "proj", 0, who="someone else")
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     try:
         assert _ttp("push", "--batch", str(marker)) == 75
@@ -19866,7 +19878,8 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
     from ttp import locks
     run_lock = locks.try_take([p.state / "locks" / "push:run-b1.0.lock"], "push queue")
     proc = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--batch", str(marker)], cwd=str(repo),
-                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_BATCH_LOCK_FD": str(run_lock.fileno())}, stdin=subprocess.PIPE,
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_BATCH_LOCK_FD": str(run_lock.fileno()),
+                                 "TTP_RUN_DIR": json.loads(marker.read_text())["check_report_dir"]}, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=(run_lock.fileno(),))
     run_lock.close()        # the child holds it now
     out = proc.communicate("", timeout=120)[0]
@@ -20712,6 +20725,7 @@ def test_a_batch_records_its_reach_with_its_outcome_so_a_tick_meanwhile_cannot_s
         return real(*a, **kw)
     monkeypatch.setattr(push, "reach", reach)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     assert batch.run_batch(s.p, marker) == 0
     assert seen == [None, "pushing"], seen
     m = push._read(marker)
@@ -24590,6 +24604,8 @@ def test_the_push_queues_batch_process_runs_niced(env, monkeypatch):
     stub.write_text("import os, sys\nsys.stdin.read()\nprint('nice', os.nice(0))\n")
     monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, str(stub)])
     marker = env["tmp"] / "batch.json"
+    from ttp import checkdirs
+    marker.write_text(json.dumps({"check_run_dir": str(checkdirs.new(p.state))}))
     for level in (4, 0):
         p.set_config("runner.nice", level)
         with open(env["tmp"] / "batch.lock", "w") as lock:
@@ -28780,6 +28796,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
@@ -47463,3 +47480,708 @@ def test_budget_change_never_shows_the_account_in_clear(env, monkeypatch):
     for secret in ("a@example.org", "example.org", "Org |", "usage-billed |"):
         assert secret not in stored, secret
     assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash(ACCT_BILLED)
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["direct", "daemon-queued"])
+def test_detached_checks_temp_survives_worker_cleanup(env, tmp_path, monkeypatch, queued):
+    from ttp import cli, detach, push, runner
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    worker_tmp = run / "tmp"
+    worker_tmp.mkdir()
+    (run / "run.json").write_text(json.dumps({"tmp_dir": str(worker_tmp)}))
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(key, str(worker_tmp))
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    os.mkfifo(release)
+    code = ("import os, pathlib, tempfile; "
+            "f = pathlib.Path(tempfile.mkdtemp()) / 'keep'; f.write_text('alive'); "
+            f"pathlib.Path({str(ready)!r}).write_text(str(f)); "
+            f"open({str(release)!r}).read(); "
+            "assert f.read_text() == 'alive'; "
+            "assert all(os.environ[k] == tempfile.gettempdir() for k in ('TMPDIR', 'TMP', 'TEMP'))")
+    # Real marker mismatch, not a mock of _boxed: the disposable command queues, exits,
+    # and leaves no child with a sandbox-local pid for the daemon to misidentify.
+    launch = subprocess.run([sys.executable, "-m", "ttp", "checks", "--detach", "--",
+                             shlex.join([sys.executable, "-c", code])], cwd=repo,
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME),
+                                 **({"TTP_PIDNS": "pid:[disposable-command]"} if queued else {})},
+                            capture_output=True, text=True, timeout=30)
+    assert launch.returncode == 0, launch.stderr
+    if queued:
+        assert "queued" in launch.stdout and not (run / cli.CHECKS_PID).exists()
+        detach.tend(p)
+    info = cli._read_checks_pid(run)
+    try:
+        assert _wait_for(ready.exists), (run / cli.CHECKS_OUT).read_text()
+        scratch = pathlib.Path(ready.read_text()).parent.parent
+        runner.remove_private(run)
+        assert not worker_tmp.exists()
+        assert pathlib.Path(ready.read_text()).exists(), "worker cleanup deleted live checks temp files"
+        monkeypatch.setattr(p, "runs", tmp_path)
+        detach.tend(p)   # recovery must leave live checks' storage alone
+        assert pathlib.Path(ready.read_text()).exists()
+        release.write_text("go")
+        assert _wait_precheck(run) == "0"
+        assert _wait_for(lambda: not scratch.exists()), "completed checks left scratch behind"
+        assert cli._checks_result(run) == 0
+        assert info["pidns"] == push.pid_ns()
+    finally:
+        try:
+            os.killpg(info["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize("command, expected", [("true", "0"), ("false", "1"), ("sleep 60", "143")])
+def test_detached_checks_clean_scratch_on_exit(env, tmp_path, monkeypatch, capsys, command, expected):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    pid = _detached_checks(run, capsys, command)
+    scratch = pathlib.Path(cli._read_checks_pid(run)["check_run_dir"]) / cli.CHECKS_TMP
+    if expected == "143":
+        assert _wait_for(lambda: (run / "checks.log").exists())
+        os.killpg(pid, signal.SIGTERM)
+    assert _wait_precheck(run) == expected
+    assert _wait_for(lambda: not scratch.exists())
+    assert not scratch.parent.exists(), 'completed checks left their check-runs folder behind'
+
+
+def test_detached_checks_recovery_leaves_legacy_scratch(env, tmp_path, monkeypatch):
+    from ttp import cli, detach
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    scratch = run / "checks-tmp"
+    scratch.mkdir()
+    (scratch / "orphan").write_text("left by a killed check or reboot")
+    monkeypatch.setattr(p, "runs", tmp_path)
+    detach.tend(p)
+    assert (scratch / "orphan").read_text() == "left by a killed check or reboot"
+    cli._checks_tmp_cleanup(run)
+    assert scratch.exists(), "legacy storage is outside managed reclamation"
+
+
+
+def test_detached_checks_recovery_preserves_scratch_after_supervisor_killed(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    ready = tmp_path / "check.pid"
+    code = ("import os, pathlib, tempfile, time; "
+            "f = pathlib.Path(tempfile.mkdtemp()) / 'keep'; f.write_text('alive'); "
+            f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)")
+    pid = _detached_checks(run, capsys, shlex.join([sys.executable, "-c", code]))
+    child = None
+    try:
+        assert _wait_for(ready.exists)
+        child = int(ready.read_text())
+        output = pathlib.Path(cli._read_checks_pid(run)["check_run_dir"])
+        os.killpg(pid, signal.SIGKILL)
+        assert _wait_for(lambda: _gone_pid(pid))
+        monkeypatch.setattr(p, "runs", tmp_path)
+        detach.tend(p)
+        assert list((output / cli.CHECKS_TMP).glob("*/keep")), "live command lost its scratch"
+        assert cli._checks_result(run) == 0
+        assert (output / cli.CHECKS_TMP).exists(), "lost-supervisor probe removed a live command's scratch"
+        os.kill(child, signal.SIGTERM)
+        assert _wait_for(lambda: _gone_pid(child))
+        detach.tend(p)
+        assert not (output / cli.CHECKS_TMP).exists()
+    finally:
+        for owned in (pid, child):
+            if owned:
+                try:
+                    os.kill(owned, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def test_foreground_checks_keep_worker_temporary_environment(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    scratch = run / "tmp"
+    scratch.mkdir()
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(key, str(scratch))
+    code = ("import os, tempfile; "
+            f"assert tempfile.gettempdir() == {str(scratch)!r}; "
+            "assert all(os.environ[k] == tempfile.gettempdir() for k in ('TMPDIR', 'TMP', 'TEMP'))")
+    cli.main(["checks", "--", shlex.join([sys.executable, "-c", code])])
+    assert scratch.exists() and not (run / cli.CHECKS_TMP).exists()
+
+
+def test_sandboxed_detached_checks_without_daemon_refused_before_launch(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("TTP_PROJECT")
+    monkeypatch.setenv("TTP_PIDNS", "pid:[disposable-command]")
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["checks", "--detach", "--", "true"])
+    assert refused.value.code == 2
+    assert "need a project daemon" in capsys.readouterr().err
+    assert not (run / cli.CHECKS_PID).exists() and not (run / cli.CHECKS_TMP).exists()
+
+
+@pytest.mark.parametrize('linked', ['run', 'ancestor', 'lock'])
+def test_check_output_recovery_never_follows_symlinks(env, tmp_path, monkeypatch, linked):
+    from ttp import cli, detach
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    scratch = outside / cli.CHECKS_TMP
+    scratch.mkdir()
+    keep = scratch / 'keep'
+    keep.write_text('untouched')
+    lock = outside / cli.CHECKS_TMP_LOCK
+    lock.write_text('unrelated file')
+    if linked == 'lock':
+        (run / cli.CHECKS_TMP).mkdir()
+        (run / cli.CHECKS_TMP_LOCK).symlink_to(lock)
+        cli._checks_tmp_cleanup(run)
+    else:
+        runs = tmp_path / 'runs'
+        if linked == 'run':
+            runs.mkdir()
+            (runs / 'linked').symlink_to(outside, target_is_directory=True)
+        else:
+            runs.symlink_to(tmp_path, target_is_directory=True)
+        monkeypatch.setattr(p, 'runs', runs)
+        detach.tend(p)
+    assert keep.read_text() == 'untouched'
+    assert lock.read_text() == 'unrelated file'
+
+
+def test_check_output_detached_outside_worktree_and_unique(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    local = repo / 'local-run'
+    local.mkdir()
+    monkeypatch.setenv('TTP_RUN_DIR', str(local))
+    seen = tmp_path / 'seen'
+    command = f'printf "%s\\n%s\\n" "$TTP_RUN_DIR" "$TMPDIR" >> {shlex.quote(str(seen))}; echo report > "$TTP_RUN_DIR/x"'
+    dirs = []
+    for _ in range(2):
+        cli.main(['checks', '--detach', '--fresh', '--', command])
+        assert _wait_precheck(local) == '0'
+        output, scratch = map(pathlib.Path, seen.read_text().splitlines()[-2:])
+        assert not output.is_relative_to(repo), 'check output must not be repository-local'
+        assert not scratch.is_relative_to(repo), 'scratch must not be repository-local'
+        assert output.is_relative_to(p.state)
+        assert (output / 'x').read_text() == 'report\n'
+        dirs.append(output)
+    assert dirs[0] != dirs[1]
+
+
+def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys):
+    from ttp import push
+    from ttp.project import Project
+    command = ('test -n "$TTP_RUN_DIR"; test "$TTP_RUN_DIR" != /; '
+               'test -z "${TTP_PIDNS:-}"; test -z "${TTP_CGROUP:-}"; '
+               'echo report > "$TTP_RUN_DIR/x"')
+    p, repo, origin, other = _push_setup(env, monkeypatch, [command])
+    _commit(repo, 'mine.txt', 'mine\n')
+    monkeypatch.setattr(push, '_boxed', lambda: True)
+    pending = []
+    for _ in range(2):
+        assert _ttp('push', '--detach') == 0
+        out = capsys.readouterr().out
+        marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
+        m = json.loads(marker.read_text())
+        assert m.get('check_run_dir'), 'queue must persist the check output directory'
+        output = pathlib.Path(m['check_run_dir'])
+        pending.append((marker, output))
+        shutil.rmtree(output)
+    assert pending[0][1] != pending[1][1], 'queued invocations must not collide'
+    monkeypatch.delenv('TTP_RUN_DIR', raising=False)
+    monkeypatch.setenv('TTP_PIDNS', 'must not inherit')
+    monkeypatch.setenv('TTP_CGROUP', 'must not inherit')
+    push.tend(Project(p.base))  # restart reads only persisted queue data, without the worker's env
+    for marker, output in pending:
+        result = _probe_until_done(p, push.result_probe(marker, p))
+        assert 'pushed' in result.stdout, result.stdout
+        # Rebuilt storage has no owner record. The narrowed cleanup contract leaves it alone.
+        assert _wait_for(lambda: json.loads(marker.read_text()).get('ended'))
+        assert output.exists() and not (output / 'owner.json').exists()
+        assert (pathlib.Path(json.loads(marker.read_text())['check_report_dir']) / 'x').read_text() == 'report\n'
+
+
+@pytest.mark.parametrize('value', [None, '', '/', '//', 'relative'])
+def test_check_output_missing_or_invalid_fails_closed(env, monkeypatch, value):
+    from ttp import push
+    if value is None:
+        monkeypatch.delenv('TTP_RUN_DIR', raising=False)
+    else:
+        monkeypatch.setenv('TTP_RUN_DIR', value)
+    with pytest.raises((OSError, ValueError), match='TTP_RUN_DIR'):
+        push.check_env('target')
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'hardlink', 'fifo'])
+def test_check_output_lifetime_lock_refuses_unsafe_files(env, tmp_path, kind):
+    from ttp import checkdirs
+    output = checkdirs.new(make(env).state)
+    outside = tmp_path / 'keep'
+    outside.write_text('untouched')
+    lock = output / checkdirs.LOCK
+    if kind == 'symlink':
+        lock.symlink_to(outside)
+    elif kind == 'hardlink':
+        os.link(outside, lock)
+    else:
+        os.mkfifo(lock)
+    with pytest.raises(OSError):
+        checkdirs.take(output)
+    checkdirs.finish(output)
+    assert output.exists(), 'cleanup bypassed the unsafe lifetime lock'
+    assert outside.read_text() == 'untouched'
+
+
+def test_check_output_foreground_and_detached_write_the_same_check(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    command = 'echo report > "$TTP_RUN_DIR/x"'
+    cli.main(['checks', '--fresh', '--', command])
+    assert (run / 'x').read_text() == 'report\n'
+    cli.main(['checks', '--detach', '--fresh', '--', command])
+    assert _wait_precheck(run) == '0'
+    output = pathlib.Path(cli._read_checks_pid(run)['check_report_dir'])
+    assert not pathlib.Path(cli._read_checks_pid(run)['check_run_dir']).exists()
+    assert output != run and (output / 'x').read_text() == 'report\n'
+    shutil.rmtree(output)   # lost storage after a reboot: restart reconstructs a fresh invocation
+    cli.main(['checks', '--detach', '--fresh', '--', command])
+    assert _wait_precheck(run) == '0'
+    replacement = pathlib.Path(cli._read_checks_pid(run)['check_report_dir'])
+    assert replacement != output and (replacement / 'x').read_text() == 'report\n'
+
+
+def test_check_output_batch_child_has_own_writable_directory(env, monkeypatch):
+    from ttp import pushq
+    command = ('test -n "$TTP_RUN_DIR"; test "$TTP_RUN_DIR" != /; '
+               'test -z "${TTP_PIDNS:-}"; test -z "${TTP_CGROUP:-}"; '
+               'echo report > "$TTP_RUN_DIR/x"')
+    s = _pq_real(env, monkeypatch, push_checks=[command])
+    monkeypatch.setenv('TTP_PIDNS', 'worker-only')
+    monkeypatch.setenv('TTP_CGROUP', 'worker-only')
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = s.p.state / 'pushes' / f'{bid}.json'
+    m = json.loads(marker.read_text())
+    assert m['outcome'] == 'pushed', marker.with_suffix('.log').read_text()
+    output = pathlib.Path(m['check_run_dir'])
+    assert not output.exists()
+    reports = pathlib.Path(m['check_report_dir'])
+    assert reports.is_relative_to(s.p.state) and (reports / 'x').read_text() == 'report\n'
+
+
+@pytest.mark.parametrize('bad', ['symlink', 'file', 'root', 'missing'])
+def test_check_output_bad_queue_directory_runs_no_check(env, monkeypatch, capsys, bad):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ['true'])
+    _commit(repo, 'mine.txt', 'mine\n')
+    monkeypatch.setattr(push, '_boxed', lambda: True)
+    assert _ttp('push', '--detach') == 0
+    out = capsys.readouterr().out
+    marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
+    m = json.loads(marker.read_text())
+    output = pathlib.Path(m['check_run_dir'])
+    shutil.rmtree(output)
+    if bad == 'symlink':
+        output.symlink_to(repo, target_is_directory=True)
+    elif bad == 'file':
+        output.write_text('keep')
+    elif bad == 'root':
+        m['check_run_dir'] = '/'
+    else:
+        del m['check_run_dir']
+    marker.write_text(json.dumps(m))
+    real_popen = push.subprocess.Popen
+    def never(argv, *a, **kw):
+        if argv == ['git', '--version']:
+            return real_popen(argv, *a, **kw)
+        pytest.fail('started a check with invalid output storage')
+    monkeypatch.setattr(push.subprocess, 'Popen', never)
+    push.tend(p)
+    m = json.loads(marker.read_text())
+    assert m['status'] == 'failed' and 'TTP_RUN_DIR' in m['reason']
+
+
+def test_check_output_unwritable_storage_prevents_launch(env, tmp_path, monkeypatch):
+    from ttp import cli, checkdirs
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    root = p.state / checkdirs.FOLDER
+    root.mkdir(mode=0o500)
+    check = tmp_path / 'must-not-run'
+    try:
+        with pytest.raises(SystemExit) as refused:
+            cli.main(['checks', '--detach', '--', f'touch {shlex.quote(str(check))}'])
+        assert refused.value.code != 0 and not check.exists()
+    finally:
+        root.chmod(0o700)
+
+
+def test_check_output_missing_in_batch_process_fails_before_checks(env, monkeypatch):
+    from ttp import batch, push
+    check = env['tmp'] / 'must-not-run'
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f'touch {shlex.quote(str(check))}'])
+    heads = [_entry(repo, 'e1', {'feature.txt': 'feature'})]
+    marker = _batch_marker(p, heads)
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
+    monkeypatch.delenv('TTP_RUN_DIR', raising=False)
+    assert batch.run_batch(p, marker) != 0
+    m = push._read(marker)
+    assert m['outcome'] == 'error' and 'TTP_RUN_DIR' in m['message']
+    assert not check.exists()
+
+
+@pytest.mark.parametrize('linked', ['folder', 'output', 'scratch'])
+def test_check_output_state_recovery_never_follows_links(env, tmp_path, linked):
+    from ttp import checkdirs
+    p = make(env)
+    outside = tmp_path / 'external'
+    outside.mkdir()
+    folder = p.state / checkdirs.FOLDER
+    name = 'a' * 32
+    if linked == 'folder':
+        (outside / name / checkdirs.SCRATCH).mkdir(parents=True)
+        keep = outside / name / checkdirs.SCRATCH / 'keep'
+        folder.symlink_to(outside, target_is_directory=True)
+    elif linked == 'output':
+        folder.mkdir()
+        (outside / checkdirs.SCRATCH).mkdir()
+        keep = outside / checkdirs.SCRATCH / 'keep'
+        (folder / name).symlink_to(outside, target_is_directory=True)
+    else:
+        (folder / name).mkdir(parents=True)
+        keep = outside / 'keep'
+        (folder / name / checkdirs.SCRATCH).symlink_to(outside, target_is_directory=True)
+    keep.write_text('untouched')
+    checkdirs.recover(p.state, p.runs)
+    assert keep.read_text() == 'untouched'
+
+
+@pytest.mark.parametrize('mode', ['detached', 'batch-env'])
+def test_check_scratch_git_discovery_stops_before_project(env, tmp_path, monkeypatch, mode):
+    from ttp import cli, checkdirs, pushq
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    subprocess.run(['git', 'init', '-q', str(p.root)], check=True)
+    inherited = str(tmp_path / 'existing-ceiling')
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', inherited)
+    code = ("import os, subprocess, tempfile; "
+            f"assert {inherited!r} in os.environ['GIT_CEILING_DIRECTORIES'].split(os.pathsep); "
+            "r = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=tempfile.gettempdir(), capture_output=True); "
+            "assert r.returncode != 0, r.stdout; "
+            f"r = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd={str(repo)!r}, capture_output=True, text=True); "
+            f"assert r.returncode == 0 and r.stdout.strip() == {str(repo)!r}")
+    if mode == 'detached':
+        cli.main(['checks', '--detach', '--fresh', '--', shlex.join([sys.executable, '-c', code])])
+        assert _wait_precheck(run) == '0', (run / cli.CHECKS_OUT).read_text()
+    else:
+        output = checkdirs.new(p.state)
+        with checkdirs.take(output) as guard:
+            child_env = pushq._child_env(p, str(output))
+            child_env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
+            r = subprocess.run([sys.executable, '-c', code], env=checkdirs.for_check(child_env),
+                               pass_fds=(guard.fileno(),), capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize('kind', ['push', 'batch'])
+def test_check_scratch_push_and_batch_live_across_recovery(env, tmp_path, monkeypatch, capsys, kind):
+    from ttp import checkdirs, push, pushq
+    from ttp.project import Project
+    ready, release = tmp_path / 'ready', tmp_path / 'release'
+    os.mkfifo(release)
+    code = ("import os, pathlib, subprocess, tempfile; "
+            "os.fstat(int(os.environ['TTP_CHECKS_TMP_FD'])); "
+            "f = pathlib.Path(tempfile.mkdtemp()) / 'keep'; f.write_text('alive'); "
+            "assert subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=tempfile.gettempdir(), capture_output=True).returncode != 0; "
+            "assert subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True).returncode == 0; "
+            f"pathlib.Path({str(ready)!r}).write_text(str(f)); "
+            f"open({str(release)!r}).read(); assert f.read_text() == 'alive'; "
+            "pathlib.Path(os.environ['TTP_RUN_DIR'], 'report').write_text('kept')")
+    command = shlex.join([sys.executable, '-c', code])
+    if kind == 'push':
+        p, repo, origin, other = _push_setup(env, monkeypatch, [command])
+        _commit(repo, 'mine.txt', 'mine\n')
+        monkeypatch.setattr(push, '_boxed', lambda: True)
+        assert _ttp('push', '--detach') == 0
+        output = capsys.readouterr().out
+        marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in output.splitlines() if ln.startswith('marker: ')))
+        scratch = pathlib.Path(push._read(marker)['check_run_dir'])
+        # No child or lifetime lock exists while queued; a new daemon must preserve the allocation.
+        checkdirs.recover(p.state, p.runs)
+        assert scratch.exists()
+        push.tend(Project(p.base))
+    else:
+        s = _pq_real(env, monkeypatch, push_checks=[command])
+        p = s.p
+        _pq_hand_off(env, s)
+        bid = _pq_batch(s, wait=False)
+        marker = p.state / 'pushes' / f'{bid}.json'
+        scratch = pathlib.Path(push._read(marker)['check_run_dir'])
+    try:
+        assert _wait_for(ready.exists), marker.with_suffix('.log').read_text()
+        fresh = Project(p.base)
+        checkdirs.recover(fresh.state, fresh.runs)
+        assert pathlib.Path(ready.read_text()).read_text() == 'alive'
+        assert checkdirs.take(scratch) is None, 'push/batch did not hold the scratch lifetime lock'
+        release.write_text('go')
+        if kind == 'push':
+            result = _probe_until_done(p, push.result_probe(marker, p))
+            assert 'pushed' in result.stdout, result.stdout
+        else:
+            assert pushq._children[bid].wait(timeout=30) == 0
+        assert _wait_for(lambda: not scratch.exists())
+        reports = pathlib.Path(push._read(marker)['check_report_dir'])
+        assert (reports / 'report').read_text() == 'kept'
+    finally:
+        if kind == 'batch':
+            child = pushq._children[bid]
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=10)
+        else:
+            pid = push._read(marker).get('pid')
+            if pid and not _gone_pid(pid):
+                os.killpg(pid, signal.SIGKILL)
+
+
+def test_check_scratch_owner_is_synced_before_publication(env, monkeypatch):
+    from ttp import checkdirs
+    p = make(env)
+    synced = []
+    real = os.fsync
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        synced.append((st.st_dev, st.st_ino))
+        real(fd)
+
+    monkeypatch.setattr(checkdirs.os, 'fsync', fsync)
+    output = checkdirs.new(p.state)
+    owner = output / checkdirs.OWNER
+    assert json.loads(owner.read_text())['pid'] == os.getpid()
+    assert synced[-3:] == [(path.stat().st_dev, path.stat().st_ino)
+                           for path in (owner, output, output.parent)]
+    checkdirs.finish(output)
+
+
+def test_check_scratch_finished_allocation_waits_for_descendant_lock(env):
+    from ttp import checkdirs
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    temp = output / checkdirs.SCRATCH / 'keep'
+    temp.write_text('alive')
+    guard = checkdirs.take(output)
+    try:
+        checkdirs.finish(output)
+        checkdirs.recover(p.state, p.runs)
+        assert temp.read_text() == 'alive'
+    finally:
+        guard.close()
+    checkdirs.recover(p.state, p.runs)
+    assert not output.exists()
+
+
+def test_check_scratch_finish_waits_for_concurrent_catalogue_operation(env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from ttp import checkdirs
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    with checkdirs.directory(output.parent) as fd:
+        catalogue = checkdirs._take_fd(fd)
+    entered, finished = threading.Event(), threading.Event()
+    real = checkdirs._take_fd
+
+    def take(fd, **kw):
+        entered.set()
+        return real(fd, **kw)
+
+    def finish():
+        try:
+            checkdirs.finish(output)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(checkdirs, '_take_fd', take)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(finish)
+        try:
+            assert entered.wait(5)
+            assert not finished.wait(0.1), 'completion abandoned cleanup while the catalogue was busy'
+        finally:
+            catalogue.close()
+        result.result(timeout=5)
+    assert not output.exists(), 'completion must reclaim scratch without waiting for daemon recovery'
+
+
+@pytest.mark.parametrize('own', [False, True])
+def test_check_output_foreground_push_preserves_worker_context(env, monkeypatch, own):
+    from ttp import push
+    seen = env['tmp'] / 'seen'
+    command = (f'printf "%s\\n%s\\n" "$TTP_RUN_DIR" "$TMPDIR" > {shlex.quote(str(seen))}; '
+               'echo report > "$TTP_RUN_DIR/report"')
+    p, repo, origin, other = _push_setup(env, monkeypatch, [command])
+    worker = env['tmp'] / 'run'
+    worker.mkdir()
+    if own:
+        _git_out(repo, 'checkout', '-qb', 'task/check-output')
+    monkeypatch.setenv('TTP_RUN_DIR', str(worker))
+    before = dict(os.environ)
+    real = push.take
+
+    def take(*a, **kw):
+        assert os.environ['TTP_RUN_DIR'] == str(worker), 'push bookkeeping lost the worker run'
+        return real(*a, **kw)
+
+    monkeypatch.setattr(push, 'take', take)
+    _commit(repo, 'mine.txt', 'mine\n')
+    assert push.run(p, repo, own=own) == 0
+    report, scratch = map(pathlib.Path, seen.read_text().splitlines())
+    assert report != worker and report.is_relative_to(p.state / 'check-reports')
+    assert (report / 'report').read_text() == 'report\n'
+    assert not scratch.parent.exists()
+    assert not (worker / 'report').exists()
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize('finished', [False, True])
+def test_check_scratch_recovery_preserves_legacy_allocation(env, finished):
+    from ttp import checkdirs
+    p = make(env)
+    output = checkdirs.new(p.state)
+    (output / checkdirs.OWNER).unlink()  # an allocation made by the previous runtime
+    (output / 'pytest-temp').mkdir()
+    (output / 'pytest-temp' / 'large-file').write_bytes(b'x' * 1024)
+    (output / 'report.json').write_text('{"passed": true}')
+    if finished:
+        (output / 'finished').touch()
+    legacy = p.runs / 'old' / checkdirs.SCRATCH
+    legacy.mkdir(parents=True)
+    before = {str(f.relative_to(output)): (f.read_bytes(), f.stat().st_mtime_ns)
+              for f in output.rglob('*') if f.is_file()}
+    checkdirs.recover(p.state, p.runs)
+    checkdirs.finish(output)  # completion of an old marker must not rewrite or remove it either
+    checkdirs.recover(p.state, p.runs)
+    assert {str(f.relative_to(output)): (f.read_bytes(), f.stat().st_mtime_ns)
+            for f in output.rglob('*') if f.is_file()} == before
+    assert legacy.is_dir()
+    assert not checkdirs.reports(output).exists(), 'legacy allocations are not migrated'
+
+
+@pytest.mark.parametrize('kind', ['detached-check', 'foreground-push'])
+def test_check_scratch_failed_launch_or_check_cleans_allocation(env, tmp_path, monkeypatch, kind):
+    from ttp import cli, checkdirs, push
+    if kind == 'detached-check':
+        p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+        real_popen = cli.subprocess.Popen
+        def launch(argv, *args, **kw):
+            if isinstance(argv, list) and argv[:3] == [sys.executable, '-m', 'ttp']:
+                raise OSError('test launch refused')
+            return real_popen(argv, *args, **kw)
+        monkeypatch.setattr(cli.subprocess, 'Popen', launch)
+        with pytest.raises(SystemExit):
+            cli.main(['checks', '--detach', '--', 'true'])
+    else:
+        p, repo, origin, other = _push_setup(env, monkeypatch, ['false'])
+        _commit(repo, 'mine.txt', 'mine\n')
+        assert push.run(p, repo) == push.CHECKS_FAILED
+    assert not [f for f in (p.state / checkdirs.FOLDER).iterdir() if f.is_dir()]
+
+
+def test_check_scratch_recovery_skips_link_and_continues(env, tmp_path):
+    from ttp import checkdirs
+    p = make(env)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    keep = outside / 'keep'
+    keep.write_text('untouched')
+    folder = p.state / checkdirs.FOLDER
+    folder.mkdir()
+    (folder / ('0' * 32)).symlink_to(outside, target_is_directory=True)
+    abandoned = folder / ('f' * 32)
+    abandoned.mkdir()
+    (abandoned / checkdirs.OWNER).write_text('{"pid": 0}')
+    (abandoned / 'temp').write_text('remove')
+    checkdirs.recover(p.state, p.runs)
+    assert keep.read_text() == 'untouched'
+    assert not abandoned.exists()
+
+
+@pytest.mark.parametrize('kind', ['batch', 'foreground', 'detached'])
+def test_after_push_and_git_hooks_receive_no_managed_scratch(env, tmp_path, monkeypatch, capsys, kind):
+    from ttp import push, pushq
+    seen, hook_seen = tmp_path / 'after-env.json', tmp_path / 'git-env.json'
+    code = "import json,os,pathlib; pathlib.Path({!r}).write_text(json.dumps(dict(os.environ)))"
+    command = shlex.join([sys.executable, '-c', code.format(str(seen))])
+    if kind == 'batch':
+        s = _pq_real(env, monkeypatch, after_push=[command])
+        p, repo = s.p, s.repo
+    else:
+        p, repo, origin, other = _push_setup(env, monkeypatch, ['true'])
+        p.set_config('delivery.after_push', [command])
+        _commit(repo, 'feature.txt', 'feature\n')
+    # The daemon's temporary directory must remain available to non-check commands.
+    normal = tmp_path / 'daemon-tmp'
+    normal.mkdir()
+    for key in ('TMPDIR', 'TMP', 'TEMP'):
+        monkeypatch.setenv(key, str(normal))
+    hook = repo / '.git' / 'hooks' / 'pre-push'
+    hook.write_text('#!/bin/sh\nexec ' + shlex.join([sys.executable, '-c', code.format(str(hook_seen))]) + '\n')
+    hook.chmod(0o755)
+    if kind == 'batch':
+        _pq_hand_off(env, s)
+        bid = _pq_batch(s)
+        assert pushq._children[bid].returncode == 0
+    elif kind == 'foreground':
+        assert push.run(p, repo) == 0
+    else:
+        assert _ttp('push', '--detach') == 0
+        out = capsys.readouterr().out
+        marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
+        assert 'pushed' in _probe_until_done(p, push.result_probe(marker, p)).stdout
+        assert _wait_for(lambda: push._read(marker).get('after_push', {}).get('ended'))
+    for path in (seen, hook_seen):
+        recorded = json.loads(path.read_text())
+        assert all(recorded.get(k) == str(normal) for k in ('TMPDIR', 'TMP', 'TEMP')), recorded
+        assert not any('/check-runs/' in value for value in recorded.values()), recorded
+    assert 'TTP_CHECKS_TMP_FD' not in json.loads(seen.read_text())
+    assert 'TTP_CHECK_OUTPUT_DIR' not in json.loads(seen.read_text())
+
+
+def test_live_after_push_keeps_ordinary_temp_after_batch_supervisor_dies(env, tmp_path, monkeypatch):
+    from ttp import checkdirs, pushq, push
+    ready, release = tmp_path / 'ready', tmp_path / 'release'
+    os.mkfifo(release)
+    normal = tmp_path / 'daemon-tmp'
+    normal.mkdir()
+    for key in ('TMPDIR', 'TMP', 'TEMP'):
+        monkeypatch.setenv(key, str(normal))
+    code = ('import os,json,pathlib,tempfile; '
+            "f=pathlib.Path(tempfile.mkdtemp())/'keep'; f.write_text('alive'); "
+            f'pathlib.Path({str(ready)!r}).write_text(json.dumps([os.getpid(),str(f)])); '
+            f'open({str(release)!r}).read(); assert f.read_text() == "alive"')
+    s = _pq_real(env, monkeypatch, after_push=[shlex.join([sys.executable, '-c', code])])
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s, wait=False)
+    marker = s.p.state / 'pushes' / f'{bid}.json'
+    child = pushq._children[bid]
+    after_pid = None
+    try:
+        assert _wait_for(ready.exists), marker.with_suffix('.log').read_text()
+        after_pid, temp = json.loads(ready.read_text())
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+        os.kill(after_pid, 0)
+        checkdirs.recover(s.p.state, s.p.runs)
+        assert pathlib.Path(temp).read_text() == 'alive'
+        assert pathlib.Path(temp).is_relative_to(normal)
+        assert not pathlib.Path(push._read(marker)['check_run_dir']).exists()
+    finally:
+        if child.poll() is None:
+            os.kill(child.pid, signal.SIGKILL)
+            child.wait(timeout=10)
+        if after_pid:
+            try:
+                os.kill(after_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

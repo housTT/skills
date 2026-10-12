@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import landed, locks, prguard, runner, worktree
+from . import checkdirs, landed, locks, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
@@ -351,12 +351,13 @@ def _in_repo(name: str, top: str | Path) -> bool:
     return False
 
 
-def check_env(mode: str, tip: str = "") -> dict[str, str]:
+def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
     as fetched before the checks; empty when there is none (a new branch, or `ttp checks`)."""
-    return {**os.environ, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""}
+    output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
+    return checkdirs.for_check({**os.environ, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""})
 
 
 def exclude_list(v: Any) -> list[str]:
@@ -2057,7 +2058,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
          timed: Callable[[float], None] | None = None, exclude: list[str] | None = None,
-         allow: bool = False) -> int:
+         allow: bool = False, check_run_dir: str | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
     touches nothing but docs goes through, and none that adds or modifies a file `exclude` matches
@@ -2085,7 +2086,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         say(f"{keep} is on {remote}; rebasing a detached copy, the branch stays as it is")
         _git(repo, "switch", "--detach", "--quiet")
     try:
-        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude)
+        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude, check_run_dir)
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -2118,7 +2119,8 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
-            base: str | None = None, ff_only: bool = False, recorded: dict | None = None) -> int:
+            base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
+            check_run_dir: str | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -2170,9 +2172,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                     f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         started = time.time()
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
-        env = check_env("own", tip)
+        env = check_env("own", tip, check_run_dir)
         for cmd in todo:
-            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -2254,7 +2256,7 @@ def _rebase(repo: Path, tip: str) -> bool:
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
-            exclude: list[str] | None = None) -> int:
+            exclude: list[str] | None = None, check_run_dir: str | None = None) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
@@ -2302,9 +2304,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
         started = time.time()
-        env = check_env("target", tip)
+        env = check_env("target", tip, check_run_dir)
         for cmd in todo:
-            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -2326,6 +2328,39 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
 
 
 def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
+    if os.environ.get("TTP_CHECK_OUTPUT_DIR"):
+        return _run(p, repo, own, recorded, after)
+    output = None
+    guard = None
+    previous = dict(os.environ)
+    recorded = recorded or recorded_checks(previous.get("TTP_RUN_DIR"))
+    try:
+        output = checkdirs.new(p.state)
+        guard = checkdirs.take(output)
+        if guard is None:
+            raise OSError("check scratch is busy")
+        env = checkdirs.environment(output, previous)
+        if previous.get("TTP_RUN_DIR"):
+            # Foreground bookkeeping belongs to the worker; only check subprocesses
+            # receive the independent report directory through check_env().
+            env["TTP_RUN_DIR"] = previous["TTP_RUN_DIR"]
+        os.environ.clear()
+        os.environ.update(env)
+        os.environ['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
+        return _run(p, repo, own, recorded, after)
+    except OSError as e:
+        print(f"ttp push: {e}", file=sys.stderr)
+        return CHECKS_FAILED
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+        if guard is not None:
+            guard.close()
+        if output is not None:
+            checkdirs.finish(output)
+
+
+def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
     """`ttp push` for a project: target, checks and rounds come from its `delivery` config. `own`
     publishes the task's own branch instead (own_target, publish), with the checks `recorded` (by
     default those of the run's `ttp checks`) for when every project check is skipped. A push to the
@@ -2339,6 +2374,11 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
     if local_harness(p, repo):
         print(f"ttp push: {LOCAL_HARNESS}", file=sys.stderr)
         return 0
+    try:
+        output = checkdirs.writable(os.environ.get("TTP_CHECK_OUTPUT_DIR") or os.environ.get("TTP_RUN_DIR"))
+    except OSError as e:
+        print(f"ttp push: {e}", file=sys.stderr)
+        return CHECKS_FAILED
     checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
     try:
         remote, branch, own = resolve(p, repo, own)
@@ -2360,11 +2400,11 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch),
-                     recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
+                     recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
-                  exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d))
+                  exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output)
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
         if rc == 0 and last_pushed and (mirrors := mirror_list(d.get("mirror_remotes"))):
@@ -2454,7 +2494,7 @@ LOG_TAIL = 20
 KEEP_S = 30 * 86400        # finished markers and logs older than this go when the next push starts
 QUEUED_S = 900             # a queued push the daemon has not started by then is recorded as failed
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.
-QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON")
+QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES")
 
 
 def _run_lock(marker: Path) -> Path:
@@ -2549,19 +2589,33 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
     levels below this process, write the marker as running, then give the go. Returns the pid."""
     log = Path(m["log"])
     env = {k: v for k, v in env.items() if k not in ("TTP_RUN_DIR", "TTP_PIDNS", "TTP_CGROUP")}   # the run ends first
-    env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
-    _log_line(log, f"starting the push process for marker {marker}")
-    with open(log, "ab") as out:
-        child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker),
-                                  *(["--own"] if m.get("own") else [])],
-                                 cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,
-                                 stderr=subprocess.STDOUT, start_new_session=True,
-                                 pass_fds=(lock.fileno(),))
-    renice(child.pid, nice)  # before the go
-    m.update(status="running", pid=child.pid, started=time.time(), boot=runner.boot_id())
-    write_json(marker, m)
-    child.stdin.close()      # the go: the push starts once its marker is written
-    return child.pid
+    output = checkdirs.restore(p.state, m.get("check_run_dir"))
+    guard = checkdirs.take(output)
+    if guard is None:
+        raise OSError("check scratch is busy")
+    try:
+        env = checkdirs.environment(output, env)
+        env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base),
+                   TTP_CHECKS_TMP_FD=str(guard.fileno()))
+        _log_line(log, f"starting the push process for marker {marker}")
+        with open(log, "ab") as out:
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker),
+                                      *(["--own"] if m.get("own") else [])],
+                                     cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,
+                                     stderr=subprocess.STDOUT, start_new_session=True,
+                                     pass_fds=(lock.fileno(), guard.fileno()))
+        renice(child.pid, nice)
+        m.update(status="running", pid=child.pid, started=time.time(), boot=runner.boot_id(),
+                 check_report_dir=str(checkdirs.reports(output)))
+        write_json(marker, m)
+        child.stdin.close()
+        return child.pid
+    except BaseException:
+        checkdirs.finish(output)
+        raise
+    finally:
+        guard.close()
+        checkdirs.cleanup(output, whole=True)
 
 
 def detach(p: Project, repo: Path, own: bool = False) -> int:
@@ -2606,8 +2660,14 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     m = {"id": rid, "repo": str(top), "head": _git(top, "rev-parse", "HEAD").stdout.strip(),
          "target": f"{remote}/{branch}", "log": str(log), "lock": str(_run_lock(marker)),
          "task": task, "run": os.environ.get("TTP_RUN_ID"), "own": own}
+    try:
+        m["check_run_dir"] = str(checkdirs.new(p.state, marker))
+        m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
+    except OSError as e:
+        print(f"ttp push: {e}", file=sys.stderr)
+        return REFUSED
     if own and (rec := recorded_checks(os.environ.get("TTP_RUN_DIR"))):
-        m["recorded_checks"] = rec   # the push process runs without TTP_RUN_DIR
+        m["recorded_checks"] = rec   # the push process has a different TTP_RUN_DIR
     if _boxed():
         m.update(status="queued", queued=time.time(),
                  env={k: os.environ[k] for k in os.environ if k in QUEUE_ENV or k.startswith("GIT_CONFIG_")})
@@ -2653,9 +2713,13 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         m["alive"] = time.time()   # it began: a death from here on is not one at startup
         write_json(marker, m)
     reason = None
+    output = None
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, _stop)
     try:
+        output = checkdirs.restore(p.state, m.get("check_run_dir"))
+        if os.environ.get("TTP_RUN_DIR") != str(checkdirs.reports(output)):
+            raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         rec = m.get("recorded_checks")
         rc = run(p, repo, own, rec if isinstance(rec, dict) else None, after=False)
     except Exception as e:     # recorded as a failure, never left as "running"
@@ -2696,6 +2760,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         m = _read(marker) or m
         m["after_push"] = a
         write_json(marker, m)
+    if output is not None:
+        checkdirs.release(output)
     return rc
 
 

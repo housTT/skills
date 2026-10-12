@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import batch, locks, push, timefmt
+from . import checkdirs, batch, locks, push, timefmt
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  review_subject, reviewed_ids)
 from .landed import on_branch
@@ -555,10 +555,11 @@ def batch_argv(marker: Path) -> list[str]:
     return [sys.executable, "-m", "ttp", "push", "--batch", str(marker)]
 
 
-def _child_env(p: Project) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID")}
-    env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
-    return env
+def _child_env(p: Project, output: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PIDNS", "TTP_CGROUP")}
+    env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base),
+               TTP_RUN_DIR=output, TTP_CHECK_OUTPUT_DIR=output)
+    return checkdirs.environment(Path(output), env)
 
 
 def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
@@ -566,15 +567,27 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
     push.detach does), in a session of its own so a daemon restart leaves it running. It starts once
     its stdin closes: the go, given after the marker is complete. It runs niced like the workers
     (runner.nice), checks and after_push commands included."""
-    env = _child_env(p)
-    env["TTP_BATCH_LOCK_FD"] = str(lock.fileno())   # batch._inherited trusts only this descriptor
-    with open(marker.with_suffix(".log"), "ab") as out:
-        child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=env, stdin=subprocess.PIPE,
-                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
-                                 pass_fds=(lock.fileno(),))
-    renice(child.pid, nice_level(p.config().get("runner"))[0])   # before the go
-    _children[bid] = child
-    return child
+    output = checkdirs.restore(p.state, push._read(marker).get("check_run_dir"))
+    guard = checkdirs.take(output)
+    if guard is None:
+        raise OSError("check scratch is busy")
+    try:
+        env = _child_env(p, str(output))
+        env["TTP_BATCH_LOCK_FD"] = str(lock.fileno())
+        env["TTP_CHECKS_TMP_FD"] = str(guard.fileno())
+        with open(marker.with_suffix(".log"), "ab") as out:
+            child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=env, stdin=subprocess.PIPE,
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                     pass_fds=(lock.fileno(), guard.fileno()))
+        renice(child.pid, nice_level(p.config().get("runner"))[0])
+        _children[bid] = child
+        return child
+    except BaseException:
+        checkdirs.finish(output)
+        raise
+    finally:
+        guard.close()
+        checkdirs.cleanup(output, whole=True)
 
 
 def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> str | None:
@@ -600,6 +613,8 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
              "repo": str(p.root), "target": name, "log": str(marker.with_suffix(".log")), "lock": str(lock_path),
              "entries": [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"],
                           "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
+        m["check_run_dir"] = str(checkdirs.new(p.state, marker))
+        m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)
         ids = [r["id"] for r in rows]
         with db.tx():
@@ -615,6 +630,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         child.stdin.close()      # the go
     except _Changed:
         marker.unlink(missing_ok=True)
+        checkdirs.finish(Path(m["check_run_dir"]))
         return None
     finally:
         lock.close()             # the child holds the run lock from here on

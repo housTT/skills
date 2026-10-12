@@ -37,7 +37,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import locks, push, runner, worktree
+from . import checkdirs, locks, push, runner, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -157,14 +157,14 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
-            group: bool = False) -> tuple[int | None, str, bool]:
+            group: bool = False, pass_fds: tuple = ()) -> tuple[int | None, str, bool]:
     """Run `cmd` (a shell string, or an argv run without a shell), copying its output into this
     process's output (the batch log): (exit code, the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
     process group of its own, which a timeout kills whole."""
     sys.stdout.flush()
     sys.stderr.flush()
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
 
     def pump() -> None:
@@ -598,6 +598,7 @@ class Batch:
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
+        self.check_run_dir = m.get("check_run_dir")
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
@@ -1017,7 +1018,7 @@ class Batch:
         try:
             for cmd in todo:
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
-                                      env=push.check_env("target", self.tip))
+                                      env=push.check_env("target", self.tip, self.check_run_dir), pass_fds=checkdirs.inherited())
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail
@@ -1122,6 +1123,9 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     env = {**command_env(p), "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
            "TTP_PUSH_TARGET": str(m.get("target") or ""), "TTP_PUSH_TASKS": ",".join(tasks),
            "TTP_PUSH_BATCH" if m.get("kind") == "batch" else "TTP_PUSH_RECEIPT": str(marker)}
+    # Deploy commands have no check lifetime guard and use the supervisor's ordinary temp dir.
+    for key in ("TTP_CHECKS_TMP_FD", "TTP_CHECK_OUTPUT_DIR"):
+        env.pop(key, None)
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
     try:
         for cmd in cmds:
@@ -1204,6 +1208,8 @@ def _finish(p: Project, marker: Path, m: dict, after: dict, lock) -> None:
     _forget(_after_lock(p, str(m.get("id") or marker.stem)))
     if lock is not None:
         lock.close()
+    if m.get("check_run_dir"):
+        checkdirs.release(Path(m["check_run_dir"]))
 
 
 def run_batch(p: Project, marker: Path) -> int:
@@ -1229,6 +1235,9 @@ def run_batch(p: Project, marker: Path) -> int:
         return push.BUSY
     b = Batch(p, marker, m)
     try:
+        b.check_run_dir = str(checkdirs.reports(checkdirs.restore(p.state, b.check_run_dir)))
+        if os.environ.get("TTP_RUN_DIR") != b.check_run_dir:
+            raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         outcome = b.push_phase()
     except Exception as e:      # recorded, never left without an outcome
         outcome = b.error(e)

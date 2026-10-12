@@ -174,6 +174,10 @@ def _mark_lost(rc: Path, why: str) -> None:
 def tend(p: Project) -> None:
     """The daemon's part, each tick: start the queued jobs, and record as lost those queued too long
     ago or that cannot start. The .lost goes before the queue entry, so a probe never sees neither."""
+    # Completion normally removes scratch; SIGKILL, a launcher crash or a reboot cannot.
+    # The inherited lifetime lock protects live checks across daemon restarts and pid namespaces.
+    from . import checkdirs
+    checkdirs.recover(p.state, p.runs)
     folder = p.state / QUEUE
     for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:

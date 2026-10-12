@@ -23,6 +23,13 @@ For people (and agents) changing tt-project itself. Users start with the plugin 
 State is one SQLite file per project (`state/project.db`). Everything a run produces is on disk
 in `state/runs/<id>/`, so a daemon restart never loses a result.
 
+Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
+`state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive
+that scratch environment; push and batch supervisors, Git commands and `after_push` keep
+their ordinary temporary directory. Recovery reclaims only owned, unlocked check allocations.
+Accepted gaps: legacy allocations without `owner.json` and old run-local scratch remain on
+disk untouched, with no migration; nothing else is reclaimed by check recovery.
+
 ## Invariants (keep them; tests guard most)
 
 1. Models never poll. The daemon polls; a model runs only for a decision or a task.
