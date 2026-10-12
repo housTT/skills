@@ -389,6 +389,7 @@ class Daemon:
         self._probed: dict[int, float] = {}
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
+        self._mute_ends = pauseends.MuteEnds(self.p, log=lambda m: log(self.p, m))   # observation mutes' end_when
         self._machine_probes = machine_ledger.Probes(self.p, log=lambda m: log(self.p, m))
         self._machines_routed = 0.0
         self._coverage_at = 0.0
@@ -473,6 +474,7 @@ class Daemon:
         self._idle.release()
         self._ends.stop()   # end-condition probes are rerun after the next start
         self._pause_ends.stop()
+        self._mute_ends.stop()
         self._machine_probes.stop()
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
@@ -671,6 +673,7 @@ class Daemon:
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         scr.expire_mutes(self.p.db, where=self.p)
+        self.check_mute_ends()
         self.sweep_watcher_issues()
         self.review_jev()
         settling = self.settling()
@@ -946,6 +949,13 @@ class Daemon:
             self._pause_ends.tick()
         except Exception:
             log(self.p, "checking resource pause ends failed\n" + traceback.format_exc())
+
+    def check_mute_ends(self) -> None:
+        """Observation mutes with an end_when probe: a pass ends the mute (pauseends.MuteEnds). Model-free."""
+        try:
+            self._mute_ends.tick()
+        except Exception:
+            log(self.p, "checking observation mute ends failed\n" + traceback.format_exc())
 
     def tend_pushes(self) -> None:
         """Start the detached pushes and jobs queued from inside a sandbox; record the dead pushes as failed. Then

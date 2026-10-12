@@ -196,3 +196,53 @@ class PauseEnds:
 
     def stop(self) -> None:
         ends.stop_probes(self._procs, self._errs)
+
+
+class MuteEnds:
+    """The daemon's side of observation mutes with an `end_when` probe (screen.mute): the same probe
+    semantics as a pause's. Its pass ends the mute with its summary event, with no model; a broken or
+    timed-out probe is reported once and the mute keeps its time."""
+
+    def __init__(self, p: Project, log=lambda msg: None):
+        self.p, self.log = p, log
+        self._checked = 0.0
+        self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
+        self._errs: dict[int, Any] = {}
+        self._probed: dict[str, float] = {}
+
+    def tick(self, now: float | None = None) -> list[str]:
+        """Returns the mutes ("source 'match'") their probe ended this time."""
+        from . import screen as scr
+        now = time.time() if now is None else now
+        verdicts = ends.reap_probes(self._procs, self._errs, now)
+        if now - self._checked < CHECK_EVERY_S and not verdicts:
+            return []
+        self._checked = now
+        done = []
+        for m in scr.mutes(self.p.db, now):
+            probe = m.get("end_when")
+            if not probe:
+                continue
+            key = f"{m['source'].lower()}\n{m['match'].lower()}"
+            rc, ran, err = verdicts.get(key, (None, "", ""))
+            if ran == probe and rc == 0:
+                if scr.end_mute(self.p.db, m["source"], m["match"], probe, f"its end_when probe `{probe}` passed",
+                                now, where=self.p):
+                    done.append(f"{m['source']} {m['match']!r}")
+                continue
+            if ran == probe and rc is not None and rc not in ends.NOT_YET_RCS:
+                scr.mute_probe_broken(self.p.db, m["source"], m["match"], probe,
+                                      (rc if isinstance(rc, str) else f"exit {rc}") + (f"; stderr: {err}" if err else ""),
+                                      now, where=self.p)
+            if key not in self._procs and now - self._probed.get(key, 0) >= PROBE_EVERY_S:
+                self._probed[key] = now
+                try:
+                    self._procs[key] = (ends.spawn_probe(self.p, probe, self._errs), now, probe)
+                except OSError as e:
+                    self.log(f"end_when probe of the mute of {m['source']} {m['match']!r} could not start: {e}")
+        if done:
+            self.log(f"mute ended by its probe: {', '.join(done)}")
+        return done
+
+    def stop(self) -> None:
+        ends.stop_probes(self._procs, self._errs)

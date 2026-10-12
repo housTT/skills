@@ -2997,6 +2997,81 @@ def test_observation_mute_rejects_bad_input(env):
     assert m["below"] == "high" and m["until"] > time.time() + 7 * 3600
 
 
+def test_a_mute_with_an_end_when_probe_ends_on_its_pass_and_reports_a_broken_probe_once(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    from ttp.cli import status_text
+    flag = p.root / "repaired"
+    ok = {"type": "observation_mute", "source": "watcher:hw", "match": "held", "end_when": f"test -e {flag}",
+          "why": "repair ticket open"}
+    bad = coord.apply(p, [{**ok, "end_when": "true\nfalse"}, {**ok, "end_when": ["x"]},
+                          {**ok, "end_when": "x" * 1001}, {**ok, "end_when": "", "hours": None}])
+    assert len(bad) == 4 and all("end_when" in b for b in bad[:3]) and "hours" in bad[3], bad
+    now = time.time()
+    assert coord.apply(p, [ok]) == []   # hours are optional with a probe: it runs to the cap
+    [m] = scr.mutes(p.db)
+    assert m["end_when"] == f"test -e {flag}" and abs(m["until"] - (m["since"] + scr.MUTE_CAP_S)) < 5
+    assert "or when `test -e" in status_text(p) and "or when `test -e" in coord.digest(p, {}, [], [])
+    me = pauseends.MuteEnds(p)
+
+    def settle(at):
+        me.tick(at)
+        for proc, _, _ in list(me._procs.values()):
+            proc.wait(10)
+        return me.tick(at + 1)
+
+    def events():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation' ORDER BY id")]
+    assert settle(now) == [] and events() == [] and len(scr.mutes(p.db)) == 1   # exit 1: not yet
+    flag.write_text("")
+    assert settle(now + 5) == [], "probed at most every PROBE_EVERY_S"
+    assert settle(now + pauseends.PROBE_EVERY_S + 5) == ["watcher:hw 'held'"]
+    [ended] = events()
+    assert ended.startswith("mute ended") and "probe `test -e" in ended and "passed" in ended
+    assert "repair ticket" in ended and scr.mutes(p.db) == []
+    assert settle(now + 2 * pauseends.PROBE_EVERY_S + 10) == [] and len(events()) == 1
+    # A broken probe is reported once; the mute keeps its time (an extension keeps the probe and the report).
+    assert coord.apply(p, [{**ok, "end_when": "exit 7", "hours": 6}]) == []
+    for i in range(3):
+        assert settle(now + (3 + i) * pauseends.PROBE_EVERY_S) == []
+        if i == 1:
+            assert coord.apply(p, [{**ok, "end_when": None, "hours": 8}]) == []
+    broken = [t for t in events()[1:] if "broken" in t]
+    assert len(broken) == 1 and "exit 7" in broken[0] and "Mute it again" in broken[0], events()
+    [m] = scr.mutes(p.db)
+    assert m["end_when"] == "exit 7" and m["probe_broken"] and m["until"] > now + 7 * 3600
+    assert "(that probe is broken)" in scr.mute_line(m)
+    me.stop()
+    # The daemon runs it, model-free.
+    d = dm.Daemon(p.base)
+    assert isinstance(d._mute_ends, pauseends.MuteEnds)
+    d._mute_ends.stop()
+
+
+def test_no_mute_outlasts_its_cap_however_often_it_is_extended(env):
+    p = make(env)
+    from ttp import screen as scr
+    t0 = time.time()
+    scr.mute(p.db, "watcher:hw", "dropped", 72, now=t0)
+    at = t0
+    for _ in range(3):   # 72 h extensions on days 0-6
+        at += 2 * 86400
+        m = scr.mute(p.db, "watcher:hw", "dropped", 72, now=at)
+    assert m["since"] == t0 and m["until"] == t0 + scr.MUTE_CAP_S and m["capped"]
+    with pytest.raises(ValueError, match="7 days"):
+        scr.mute(p.db, "watcher:hw", "dropped", 72, now=t0 + scr.MUTE_CAP_S - 30)
+    [done] = scr.expire_mutes(p.db, now=t0 + scr.MUTE_CAP_S + 1)
+    [ended] = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation'")]
+    assert ended.startswith("mute ended") and "for 168 h" in ended and "7-day cap" in ended, ended
+    # Over, a new mute starts a new clock; one ended by its time alone says nothing of a cap.
+    m = scr.mute(p.db, "watcher:hw", "dropped", 2, now=t0 + scr.MUTE_CAP_S + 2)
+    assert m["since"] == t0 + scr.MUTE_CAP_S + 2 and not m["capped"]
+    scr.expire_mutes(p.db, now=m["until"] + 1)
+    assert "cap" not in p.db.q("SELECT text FROM events WHERE kind='observation' ORDER BY id")[-1]["text"]
+
+
 def test_mute_escalates_once_when_a_muted_condition_persists(env):
     p = make(env)
     from ttp import coordinator as coord

@@ -595,11 +595,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
              "persists past its ask time; one summary event when each ends)"] if muted else []
     for m in muted:
         lines.append(f"- {clip(scr.mute_line(m, now, p), MUTE_CHARS)}")
-    section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why")] for m in muted]),
+    section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why"),
+                                         m.get("end_when"), m.get("probe_broken")] for m in muted]),
             "## Muted observations (as last turn; never wake you): "
             + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, "
                         + (f"persisting {', '.join(scr.mute_ages(m, now))}, " if scr.mute_ages(m, now) else "")
-                        + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" for m in muted))
+                        + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + scr.mute_probe(m)
+                        for m in muted))
     # Open asks of any age: one still waits on the user however long ago it was sent.
     lines = []
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
@@ -1551,7 +1553,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "observation_mute":
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                          a.get("why") or a.get("reason") or a.get("text") or "",
-                         escalate_after_h=a.get("escalate_after_h"))
+                         escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"))
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)))
             elif t in ("noop", "escalate", None):

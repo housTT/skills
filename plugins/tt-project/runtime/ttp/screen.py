@@ -438,7 +438,10 @@ def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float
 # a muted condition still seen escalate_after_h after it was first muted queues one high event
 # (MUTE_PERSISTS), once per mute, re-armed when the condition clears and comes back. It clears on a
 # "cleared:" item, on a successful watcher run that no longer reports it (settle_mutes), or after
-# MUTE_CLEAR_GAP_S unseen.
+# MUTE_CLEAR_GAP_S unseen. A mute ends when its time is up or, with an `end_when` probe (read-only,
+# like a resource pause's: exit 0 = over; 1, 75 or 255 = not yet; run by pauseends.MuteEnds), when
+# its probe passes. A broken probe is reported once and the mute keeps its time. However often it is
+# extended, no mute outlasts MUTE_CAP_S from when it began: its end then makes the coordinator look again.
 MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
 MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
 MUTE_BELOW = ("normal", "high", "critical")
@@ -447,18 +450,22 @@ MUTE_ESCALATE_MIN_H = 0.5
 # A muted condition not seen for this long has cleared: its next sighting starts a new clock. The
 # fallback for runs that never settle (failed or killed ones, sources other than command watchers).
 MUTE_CLEAR_GAP_S = 3 * 3600
+MUTE_CAP_S = 7 * 86400   # the longest any mute lasts, from its first `since`
+MUTE_PROBE_CHARS = 1000
 MUTE_CONDS_MAX = 50   # conditions tracked per mute; the longest unseen go first
 MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escalation's text; effort trigger
 
 
 def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
-         now: float | None = None, escalate_after_h: Any = None) -> dict:
+         now: float | None = None, escalate_after_h: Any = None, end_when: Any = None) -> dict:
     """Mute observations from `source` whose text contains `match` (any case) and whose severity is
-    below `below` (default critical), for `hours`. A matching condition still seen `escalate_after_h`
+    below `below` (default critical), for `hours`, or until probe `end_when` passes (`hours` is then
+    optional), never past MUTE_CAP_S from its start. A matching condition still seen `escalate_after_h`
     (default MUTE_ESCALATE_H) after it was first muted queues one high event; 0 never does and needs
-    a `why`. Muting the same source and match again replaces its end, threshold, reason and
-    escalation (kept when not given) and keeps its count and the clocks of its conditions, except
-    those that already escalated, which re-arm from now. Raises ValueError on bad input."""
+    a `why`. Muting the same source and match again replaces its end, threshold, reason, escalation
+    and probe (the last two kept when not given) and keeps its start, its count and the clocks of its
+    conditions, except those that already escalated, which re-arm from now. Raises ValueError on bad
+    input."""
     now = time.time() if now is None else now
     source, match = str(source or "").strip(), str(match or "").strip()
     why = str(why or "").strip()[:300]
@@ -468,12 +475,19 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     if len(match) < MUTE_MIN_MATCH:
         raise ValueError(f"observation_mute needs `match`, a piece of the observation's text of at least "
                          f"{MUTE_MIN_MATCH} characters; got {match!r}")
-    try:
-        h = float(hours)
-    except (TypeError, ValueError):
-        h = float("nan")
-    if not 1 <= h <= MUTE_MAX_H:
-        raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H}; got {hours!r}")
+    probe = end_when.strip() if isinstance(end_when, str) else end_when
+    if probe and (not isinstance(probe, str) or "\n" in probe or len(probe) > MUTE_PROBE_CHARS):
+        raise ValueError(f"observation_mute `end_when` must be one shell command on one line, at most "
+                         f"{MUTE_PROBE_CHARS} characters (exit 0 once the mute can end, 1 while not)")
+    h = None
+    if not (probe and hours in (None, "")):
+        try:
+            h = float(hours)
+        except (TypeError, ValueError):
+            h = float("nan")
+        if not 1 <= h <= MUTE_MAX_H:
+            raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H} (optional with an "
+                             f"`end_when` probe); got {hours!r}")
     below = str(below or "critical").strip().lower()
     if below not in MUTE_BELOW:
         raise ValueError(f"observation_mute `below` must be one of {', '.join(MUTE_BELOW)}; got {below!r}")
@@ -496,12 +510,26 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
             raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
         if esc is None:
             esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
+        probe = probe or (old or {}).get("end_when") or None
+        if probe is None and h is None:
+            raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H} or an `end_when` probe")
+        since = float(old["since"]) if old else now
+        cap = since + MUTE_CAP_S
+        if cap <= now + 60:
+            raise ValueError(f"observation_mute rejected: {source} {match!r} has been muted for "
+                             f"{MUTE_CAP_S // 86400} days, the most a mute lasts; let it end and check why its "
+                             f"condition still recurs before muting it again")
+        until = min(cap, now + (h * 3600 if h is not None else MUTE_CAP_S))
         conds = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)
                  for k, c in ((old or {}).get("conds") or {}).items()}
         m = {"source": source, "match": match, "below": below, "hours": h, "why": why,
-             "since": old["since"] if old else now, "until": now + h * 3600,
+             "since": since, "until": until, "capped": until >= cap,
              "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None,
              "escalate_after_h": esc, "armed_at": now, "conds": conds}
+        if probe:
+            m["end_when"] = probe
+            if old and old.get("end_when") == probe and old.get("probe_broken"):
+                m["probe_broken"] = old["probe_broken"]   # reported once per probe, not again on each extension
         db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
     return m
 
@@ -624,14 +652,58 @@ def expire_mutes(db: DB, now: float | None = None, where: Any = None) -> list[di
             return []
         db.set_kv(MUTES_KEY, [m for m in active if float(m["until"]) > now])
         for m in done:
-            n = int(m["count"])
-            seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'], where)}" if n
-                    else "no observations")
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                 (now, m["source"], "observation", "info",
-                  f"mute ended: muted {m['source']} {m['match']!r} below {m['below']} for {_hours(m)} h: "
-                  f"{seen}" + (f". Muted because: {m['why']}" if m.get("why") else ""), "queued"))
+            _ended(db, m, min(now, float(m["until"])), now,
+                   f"it reached the {MUTE_CAP_S // 86400}-day cap on a mute: if its condition still recurs, "
+                   f"check why before muting it again" if m.get("capped") else "", where)
     return done
+
+
+def end_mute(db: DB, source: str, match: str, probe: str, why: str, now: float | None = None,
+             where: Any = None) -> dict | None:
+    """End the active mute of `source` and `match` whose `end_when` is still `probe` (it passed),
+    queuing its one summary event with `why`; None when no such mute is left."""
+    now = time.time() if now is None else now
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        m = next((x for x in active if _same_mute(x, source, match) and x.get("end_when") == probe
+                  and float(x["until"]) > now), None)
+        if m is None:
+            return None
+        db.set_kv(MUTES_KEY, [x for x in active if x is not m])
+        _ended(db, m, now, now, why, where)
+    return m
+
+
+def mute_probe_broken(db: DB, source: str, match: str, probe: str, why: str, now: float | None = None,
+                      where: Any = None) -> bool:
+    """Record that the `end_when` probe of a mute is broken and queue one event saying so, once per
+    mute and probe. Returns whether it was reported now."""
+    now = time.time() if now is None else now
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        m = next((x for x in active if _same_mute(x, source, match) and x.get("end_when") == probe), None)
+        if m is None or m.get("probe_broken"):
+            return False
+        m["probe_broken"] = why[:300]
+        db.set_kv(MUTES_KEY, active)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (now, "daemon", "observation", "normal",
+              f"The end_when probe `{probe}` of the mute of {m['source']} {m['match']!r} is broken ({why}): "
+              f"it would never end the mute, which now ends only at {_when(m['until'], where)}. Mute it again "
+              f"with a working `end_when` if it should end on its own.", "queued"))
+    return True
+
+
+def _ended(db: DB, m: dict, end: float, now: float, why: str, where: Any) -> None:
+    """Queue the one summary event of mute `m`, which ended at `end` (`why`, if given)."""
+    n = int(m["count"])
+    seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'], where)}" if n
+            else "no observations")
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+         (now, m["source"], "observation", "info",
+          f"mute ended: muted {m['source']} {m['match']!r} below {m['below']} for "
+          f"{_h(end - float(m['since']))} h" + (f" ({why})" if why else "") + f": {seen}"
+          + (f". Muted because: {m['why']}" if m.get("why") else ""), "queued"))
 
 
 def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
@@ -644,15 +716,19 @@ def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
     return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; "
             + (f"persisting {', '.join(ages)}; " if ages else "")
             + (f"asks after {_h(esc * 3600)} h; " if esc > 0 else "never asks; ")
-            + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + (f" ({m['why']})" if m.get("why") else ""))
+            + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + mute_probe(m)
+            + (f" ({m['why']})" if m.get("why") else ""))
+
+
+def mute_probe(m: dict) -> str:
+    """' or when `probe` passes' (and whether it is broken) for a mute with an end_when, else ''."""
+    if not m.get("end_when"):
+        return ""
+    return f" or when `{m['end_when']}` passes" + (" (that probe is broken)" if m.get("probe_broken") else "")
 
 
 def _h(seconds: float) -> str:
     return f"{seconds / 3600:.1f}".rstrip("0").rstrip(".")
-
-
-def _hours(m: dict) -> str:
-    return f"{(float(m['until']) - float(m['since'])) / 3600:.1f}".rstrip("0").rstrip(".")
 
 
 def _when(ts: Any, where: Any = None) -> str:
