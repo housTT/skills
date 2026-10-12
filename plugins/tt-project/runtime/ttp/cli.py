@@ -2208,10 +2208,17 @@ def cmd_deployed(a) -> None:
     """Probe for a deploy (and a retry_when): exit 0 once every project `ttp list` shows on this machine
     runs the target version and commit by its daemon's own receipt and completed a tick since; 1 while
     any is pending (a deferred merge, a restart not yet done), one line each with owner and resume time;
-    2 when it cannot tell. Read only (overview.deployed)."""
+    2 when it cannot tell. Read only unless --after-push records owned pending merges and alerts
+    in the reporting project (done/pending exit 0, failed exit 1)."""
     from . import overview as ov
     names = [n.strip() for n in (a.projects or "").split(",") if n.strip()] or None
-    data = ov.deployed(a.version, a.commit, names, a.fresh_s)
+    data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=a.after_push)
+    if a.after_push:
+        from . import deploy
+        p = here()
+        if not p:
+            die("--after-push needs a reporting project (TTP_PROJECT or the current folder)")
+        data = deploy.record(p, data)
     print(json.dumps(data, indent=1, default=str) if a.json else data["text"])
     sys.exit(data["rc"])
 
@@ -3928,6 +3935,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--projects", help="only these projects, comma-separated (default: every one `ttp list` shows here)")
     s.add_argument("--fresh-s", type=float, default=300, help="a completed tick at most this old (default 300)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--after-push", action="store_true",
+                   help="accept owned merges with takeover times, record follow-ups in this project, "
+                        "and alert on failures; exit 0 for done/pending, 1 for failed")
     s.set_defaults(fn=cmd_deployed)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name")

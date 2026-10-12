@@ -950,6 +950,11 @@ class Daemon:
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
         turned off, and batches that ended (pushq.tend). Now and then, pins of settled rows go and code
         tasks left in 'review' after their review pushed their work are closed (pushq.settle_reviewed)."""
+        from . import deploy
+        try:
+            deploy.tick(self.p, self.alert)
+        except Exception:
+            log(self.p, "checking pending deploys failed\n" + traceback.format_exc())
         push.tend(self.p)
         try:
             detach.tend(self.p)

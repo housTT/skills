@@ -73,7 +73,7 @@ CLEARED_TEXT = {
 USER_BLOCKERS = ("network",)
 CLEARED_SEVERITY = {"network": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
-STATUS_CONDITIONS = ("budget", "limit")
+STATUS_CONDITIONS = ("budget", "limit", "deploy")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -167,6 +167,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
         return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
+    if kind == "deploy":
+        from . import deploy
+        return deploy.holds(db, arg, now)
     if kind == "heal":   # an outage from a heal check lasts until the check passes (heal.holds)
         from . import heal
         return heal.holds(db, arg)
@@ -211,7 +214,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "heal",
-                                         "machine", "machine-change", "network")
+                                         "machine", "machine-change", "network", "deploy")
 
 
 def _since(ep: dict) -> float:

@@ -523,7 +523,18 @@ and preferences you add later become part of the project's charter and memory.
   commit; empty without `version_bump`), `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`, `TTP_PUSH_BATCH` and
   `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never fails the reviews:
   their change is already on the branch. A malformed `after_push` (a scalar such as `true`) counts
-  as a failed one. It also runs, queue on or off, after
+  as a failed one. After setup and upgrades, use `ttp deployed "$TTP_PUSHED_VERSION"
+  --commit "$TTP_PUSHED_SHA" --after-push` as the final verification (after allowing new
+  daemons to complete their first tick). This mode returns 0 for done or pending, and 1 for
+  failed. A pending merge needs a live daemon, a harness task owner and a known takeover
+  time; it emits one low note and records a model-free check in the deploying project's
+  state, due five minutes after takeover. The original deadline survives retries and
+  restarts. A missed takeover raises one normal alert per project and release; it clears
+  quietly when that project's own daemon reports the release or a newer version. Missing
+  ownership/deadlines, upgrade errors and daemons that fail to start remain failures.
+  Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred,
+  and needs this final verification. Ordinary `ttp deployed` remains a strict read-only
+  probe for `retry_when`. It also runs, queue on or off, after
   each `ttp push` or `ttp push --detach` that pushed to the push branch (never after `--own`), with
   `TTP_PUSH_RECEIPT` instead of `TTP_PUSH_BATCH`: a receipt under the project's state records it,
   a detached push runs it once its outcome is written and its locks are let go, and the daemon

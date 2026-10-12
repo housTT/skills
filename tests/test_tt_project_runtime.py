@@ -45612,3 +45612,200 @@ def test_applicability_retry_start_failure_remains_retryable(env, monkeypatch):
     checkgaps.rerun(d)
     assert len(started) == 1
     assert 'checks --result' in json.loads(p.db.task(tid)['result'])['retry_when']
+
+
+def test_after_push_deploy_done_and_owned_pending(env, tmp_path):
+    from ttp import deploy, overview, release
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    _deploy_lib('0.5.0')
+    _deploy_project(tmp_path, 'alpha', '0.5.0')
+    _, db = _deploy_project(tmp_path, 'beta', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    report = deploy.record(p, overview.deployed(names=['alpha', 'beta']))
+    assert report['rc'] == 0
+    assert [r['outcome'] for r in report['projects']] == ['done', 'pending']
+    checks = p.db.kv(deploy.CHECKS)
+    pending = next(iter(checks.values()))
+    assert pending['owner'] == f'harness task #{tid}' and pending['due'] > time.time()
+    assert pending['takeover_at'] > 0
+    notes = p.db.q("SELECT severity,text FROM messages WHERE direction='out'")
+    assert len(notes) == 1 and notes[0]['severity'] == 'low'
+    assert 'beta' in notes[0]['text'] and 'PDT' in notes[0]['text']
+    assert not p.db.q('SELECT * FROM alerts')
+    deploy.record(p, overview.deployed(names=['alpha', 'beta']))
+    assert len(p.db.q("SELECT * FROM messages WHERE direction='out'")) == 1
+
+
+def test_after_push_deploy_all_done(env, tmp_path, monkeypatch, capsys):
+    from ttp import deploy, overview
+    from ttp.cli import main
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _deploy_project(tmp_path, 'alpha', '0.5.0')
+    monkeypatch.setenv('TTP_PROJECT', str(p.base))
+    with pytest.raises(SystemExit) as e:
+        main(['deployed', '--projects', 'alpha', '--after-push', '--json'])
+    data = json.loads(capsys.readouterr().out)
+    assert e.value.code == 0 and data['projects'][0]['outcome'] == 'done'
+    assert p.db.kv(deploy.CHECKS) == {}
+    assert not p.db.q("SELECT * FROM messages WHERE direction='out'")
+    assert overview.deployed(names=['alpha'])['rc'] == 0
+
+
+@pytest.mark.parametrize('missing', ['owner', 'takeover'])
+def test_after_push_deploy_pending_without_owner_or_takeover_fails(env, tmp_path, missing):
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0].pop('merge_owner' if missing == 'owner' else 'takeover_at')
+    before = _tree(base)
+    result = deploy.record(p, report)
+    assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
+    alert = p.db.one("SELECT * FROM messages WHERE kind='alert'")
+    assert alert['severity'] == 'normal' and alert['ref'] == 'deploy:alpha:0.5.0'
+    assert _tree(base) == before, 'verification never writes another project'
+
+
+@pytest.mark.parametrize('files', ['0.4.9', '0.5.0'])
+def test_after_push_deploy_daemon_not_coming_up_fails(env, tmp_path, files):
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', files)
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.set_kv('daemon', {'pid': 0, 'host': 'testhost'})
+    result = deploy.record(p, overview.deployed(names=['alpha']))
+    assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
+    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:alpha:0.5.0'
+
+
+@pytest.mark.parametrize('caught_up', [False, '0.5.0', '0.5.1'])
+def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
+    from ttp import alerts, deploy, overview, release
+    p = make(env)
+    p.set_config('home_timezone', 'America/Los_Angeles')
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    assert deploy.record(p, report, now)['rc'] == 0
+    due = now + 1 + deploy.GRACE_S
+    pages = []
+    def page(key, text, severity):
+        pages.append((key, text, severity))
+        p.db.post('out', text, kind='alert', ref=key, severity=severity)
+    deploy.tick(p, page, due - 1)
+    assert not pages
+    if caught_up:
+        hb = base / 'state' / 'heartbeat'
+        data = json.loads(hb.read_text())
+        data['receipt'].update(version=caught_up, commit=DEPLOY_C if caught_up == '0.5.0' else '123456789abcd')
+        hb.write_text(json.dumps(data))
+        os.utime(base / 'state' / 'tick_done', (due - 1, due - 1))
+    deploy.tick(p, page, due + deploy.PROBE_S)
+    deploy.tick(p, page, due + deploy.PROBE_S * 2)
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    if caught_up:
+        assert rec['closed'] and not pages
+    else:
+        assert len(pages) == 1 and pages[0][0] == 'deploy:alpha:0.5.0' and pages[0][2] == 'normal'
+        assert 'missed takeover' in pages[0][1] and 'PDT' in pages[0][1]
+        assert alerts.holds(p.db, pages[0][0], now, due)
+        hb = base / 'state' / 'heartbeat'
+        data = json.loads(hb.read_text())
+        data['receipt']['version'] = '0.5.0'
+        hb.write_text(json.dumps(data))
+        os.utime(base / 'state' / 'tick_done', (due, due))
+        assert [e['key'] for e in alerts.sweep(p.db, now=due)] == ['deploy:alpha:0.5.0']
+        assert not alerts.active(p.db, pages[0][0], now, due)
+
+
+@pytest.mark.parametrize('held', [False, True])
+def test_after_push_deploy_unknown_upgrade_error_fails(env, tmp_path, held):
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    if held:
+        db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.set_kv(release.KV_AUTO, {'outcome': 'failed', 'why': 'runtime import failed'})
+    result = deploy.record(p, overview.deployed(names=['alpha']))
+    assert result['rc'] == 1
+    assert 'runtime import failed' in p.db.one("SELECT text FROM messages WHERE kind='alert'")['text']
+
+
+def test_after_push_deploy_old_daemon_after_files_applied_fails(env, tmp_path):
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.5.0', running='0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    result = deploy.record(p, overview.deployed(names=['alpha']))
+    assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed'
+
+
+def test_after_push_deploy_deadline_is_not_extended_by_retries_or_restart(env, tmp_path):
+    from ttp import deploy, overview, release
+    from ttp.project import Project
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    report = overview.deployed(names=['alpha'])
+    deploy.record(p, report)
+    before = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    report['projects'][0]['takeover_at'] += 3600
+    again = Project(p.base)
+    deploy.record(again, report)
+    assert again.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0'] == before
+    assert len(p.db.q("SELECT * FROM messages WHERE direction='out'")) == 1
+    pages = []
+    deploy.tick(again, lambda *a, **k: pages.append(a), before['due'] + 1)
+    assert len(pages) == 1
+
+
+def test_after_push_deploy_pending_success_does_not_page_push_queue(env, tmp_path):
+    from ttp import deploy, overview, pushq, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    rc = deploy.record(p, overview.deployed(names=['alpha']))['rc']
+    now = time.time()
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
+           ('batch-test', 'marker', 'origin/topic', now))
+    pages = []
+    pushq._after(p, {'id': 'batch-test'}, {'pushed_sha': DEPLOY_C, 'version': '0.5.0',
+                 'after_push': {'exit': rc, 'started': now, 'ended': now}},
+                 'ok' if rc == 0 else 'failed', lambda *a, **k: pages.append(a), now)
+    assert not pages and not p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")
+    assert p.db.one("SELECT after_push FROM push_batches")['after_push'] == 'ok'
+
+
+def test_after_push_deploy_unknown_release_is_not_success(env):
+    from ttp import deploy, overview
+    p = make(env)
+    assert deploy.record(p, overview.deployed())['rc'] == 1
+
+
+def test_after_push_deploy_followup_runs_while_reporting_project_paused(env, tmp_path):
+    from ttp import deploy, overview, release
+    from ttp.daemon import Daemon
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    deploy.record(p, overview.deployed(names=['alpha']))
+    checks = p.db.kv(deploy.CHECKS)
+    checks['deploy:alpha:0.5.0']['due'] = time.time() - 1
+    p.db.set_kv(deploy.CHECKS, checks)
+    p.db.set_kv('paused', True)
+    daemon = Daemon(p.base)
+    daemon.tend_pushes()
+    assert p.db.one("SELECT key FROM alerts")['key'] == 'deploy:alpha:0.5.0'

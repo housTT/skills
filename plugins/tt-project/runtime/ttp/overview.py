@@ -269,10 +269,10 @@ def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> t
 
 
 def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
-                  fresh_s: float = DEPLOY_FRESH_S) -> dict:
+                  fresh_s: float = DEPLOY_FRESH_S, allow_newer: bool = False) -> dict:
     """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
     CANNOT, "line", ...}. Read only, like project_status: the database read-only, no lock taken."""
-    from .release import runtime_commit
+    from .release import KV_AUTO, runtime_commit
     row = {"name": name, "state": CANNOT, "reason": "", "owner": None, "resumes": None}
 
     def done(state: int, reason: str, owner: str | None = None, resumes: str | None = None) -> dict:
@@ -298,6 +298,19 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
     try:
         db = _RO(conn)
         daemon, pid = _daemon(conn, state, here)
+        row["daemon_alive"] = bool(pid) and daemon == "running"
+        row["daemon_state"] = daemon
+        tid = _holder(db, state)
+        row["merge_pending"] = bool(tid and not at_target)
+        auto, _ = db.kv(KV_AUTO)
+        if auto.get("outcome") == "failed":
+            row["upgrade_error"] = auto.get("why") or "the last upgrade failed"
+        if tid:
+            from .release import STALE_S, task_activity
+            task, last = task_activity(db, tid)
+            row["merge_owner"] = f"harness task #{tid}"
+            if task and last:
+                row["takeover_at"] = now if task["status"] == "blocked" else last + STALE_S
         if not pid:
             if not at_target:
                 return done(PENDING, *_behind(name, db, state, files, now, where))
@@ -309,7 +322,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             return done(CANNOT, f"receipt unverified: {r.get('why') or 'unknown provenance'}")
         rv, rc = str(r.get("version") or "?"), r.get("commit")
         row.update(running_version=rv, running_commit=rc, instance=r.get("instance"))
-        if rv != target or (commit and not _same_commit(rc, commit)):
+        if not (allow_newer and is_newer(rv, target)) and (rv != target or (commit and not _same_commit(rc, commit))):
             running = f"{rv} ({(rc or '?')[:12]})"
             if not at_target:
                 reason, owner, resumes = _behind(name, db, state, files, now, where)
@@ -342,7 +355,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
 
 
 def deployed(target: str | None = None, commit: str | None = None, names: list[str] | None = None,
-             fresh_s: float = DEPLOY_FRESH_S, now: float | None = None) -> dict:
+             fresh_s: float = DEPLOY_FRESH_S, now: float | None = None, allow_newer: bool = False) -> dict:
     """{"rc", "target", "commit", "projects": [...], "text"} for `ttp deployed`. The registry is read now,
     so a project registered after the deploy started is checked too; projects on other machines are
     not (unless named). rc: 0 every project passes, 1 some are pending, 2 some cannot be told."""
@@ -367,7 +380,7 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
             rows.append({"name": n, "state": CANNOT, "reason": "not registered on this machine",
                          "line": f"{n}\tcannot tell: not registered on this machine"})
         elif names or e.get("host") in (None, here):
-            rows.append(deploy_status(n, e, target, commit, now, here, fresh_s))
+            rows.append(deploy_status(n, e, target, commit, now, here, fresh_s, allow_newer))
     rc = max((r["state"] for r in rows), default=OK)
     head = f"tt-project {target}" + (f" ({commit[:12]})" if commit else "")
     counts = {s: sum(1 for r in rows if r["state"] == s) for s in (OK, PENDING, CANNOT)}
