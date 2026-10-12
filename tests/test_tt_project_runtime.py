@@ -48060,7 +48060,8 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
     details = json.loads(row["note"])["turn"]
     assert details == {"provider": "fake", "model": "reasoning-model", "effort": expected,
                        "prompt_bytes": len("digest ésystemcontext".encode()),
-                       "timeout_s": {"low": 300, "high": 1200, "xhigh": 1800}[expected]}
+                       "timeout_s": {"low": 300, "high": 1200, "xhigh": 1800}[expected],
+                       "cache_ttl": "", "cache_ttl_why": "configured"}
     assert spec["timeout_s"] == details["timeout_s"] and spec["effort"] == expected
     d.finish_run(row, {"rc": 1, "stopped": "timeout", "ended": time.time()})
     finished = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
