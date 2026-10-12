@@ -28,6 +28,11 @@ a build, rerun discovery and require `ready=true` before running any test.
 If no checkout is found, do not present TTsim as currently available. Say that the user may provide
 its path; do not clone or build it without a separate request.
 
+When `--tt-metal-home` is supplied, discovery also prints a `recommended_run` object for each
+architecture. Use its working directory, interpreter and environment as the runnable baseline;
+do not reconstruct these paths by hand. A checked-in `.vscode/launch.json`, test docstring or task
+that targets the same simulator build may add model/test-specific variables to a separate batch.
+
 ## Environment
 
 Construct a fresh environment and record it in `run.json` as `ttsim_environment`;
@@ -59,6 +64,10 @@ different variables, run them as separate `kernel_tests.py run --only ... --env-
 never apply `TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE` to every Quasar test: some require the full
 grid. When an override is required, record both its inclusive end coordinate and the resulting grid.
 
+TTsim opens a local Unix socket. If a managed sandbox reports `Failed to bind simulation server
+socket ... Operation not permitted`, rerun the same command with the required outside-sandbox
+approval; do not classify that setup error as a kernel failure.
+
 Run TTsim discovery, build and pytest directly on the host, not through the physical-device broker.
 Do not run two TTsim jobs against the same build directory concurrently unless the simulator
 documentation explicitly permits it.
@@ -69,3 +78,7 @@ The measured destination phase (`<plugin-root>/references/measured-destination.m
 kernel-op test per process with `kernel_tests.py`. TTsim proves execution and correctness on the
 simulated architecture, never performance: do not report TTsim timing, throughput, host fallback
 or footprint.
+
+Before the first measured run, confirm parameterized node IDs with pytest collection when they were
+copied or generated rather than obtained from a current collection. A `not found` collection error
+means the plan's node ID must be corrected and regenerated; it is not a kernel result.

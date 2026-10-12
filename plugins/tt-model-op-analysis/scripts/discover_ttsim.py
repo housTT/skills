@@ -46,7 +46,31 @@ def _candidate_paths(explicit, tt_metal_home):
     return unique
 
 
-def _inspect_checkout(path):
+def _recommended_run(arch, build_dir, library, tt_metal_home):
+    if not tt_metal_home:
+        return None
+
+    tt_metal = Path(tt_metal_home).expanduser().resolve()
+    python = tt_metal / "python_env" / "bin" / "python"
+    environment = {
+        "TT_METAL_HOME": str(tt_metal),
+        "TT_METAL_SIMULATOR": str(library),
+        "TT_METAL_SIMULATOR_HOME": str(build_dir),
+        "TT_METAL_SLOW_DISPATCH_MODE": "1",
+        "TT_METAL_DISABLE_SFPLOADMACRO": "1",
+        "ARCH_NAME": arch,
+        "CHIP_ARCH": arch,
+    }
+    if arch == "quasar":
+        environment["TT_METAL_QUASAR_NOC_API_VERSION"] = "1"
+    return {
+        "working_directory": str(tt_metal),
+        "python": str(python) if python.is_file() else None,
+        "environment": environment,
+    }
+
+
+def _inspect_checkout(path, tt_metal_home):
     if not (path / "make.py").is_file() or not (path / "src").is_dir():
         return None
 
@@ -55,8 +79,7 @@ def _inspect_checkout(path):
         build_dir = path / "src" / "_out" / f"release_{suffix}"
         library = build_dir / "libttsim.so"
         descriptor = build_dir / "soc_descriptor.yaml"
-        architectures.append(
-            {
+        architecture = {
                 "arch": arch,
                 "build_dir": str(build_dir),
                 "library": str(library),
@@ -66,7 +89,10 @@ def _inspect_checkout(path):
                 "ready": library.is_file() and descriptor.is_file(),
                 "build_target": f"src/_out/release_{suffix}/libttsim.so",
             }
-        )
+        recommended_run = _recommended_run(arch, build_dir, library, tt_metal_home)
+        if recommended_run is not None:
+            architecture["recommended_run"] = recommended_run
+        architectures.append(architecture)
 
     return {
         "path": str(path),
@@ -83,7 +109,7 @@ def main():
 
     checkouts = []
     for path in _candidate_paths(args.ttsim_home, args.tt_metal_home):
-        checkout = _inspect_checkout(path)
+        checkout = _inspect_checkout(path, args.tt_metal_home)
         if checkout is not None:
             checkouts.append(checkout)
 
