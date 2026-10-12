@@ -233,8 +233,10 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   the exception ("Never push to the main branch, except as the temporary section allows"), so
   the two cannot both bind. Send the exception with `both_hold`: true, then that companion edit:
   the item kept word for word, only a clause added that names the exception ("..., except as the
-  temporary exception (ask N) allows"). The user's yes to the exception covers the companion in
-  that turn or a later one; it is checked against its own item only. Such a change also merges the permanent Restrictions sections into
+  temporary exception (ask N) allows"), naming it by its ask or message id and adding no object
+  or action the exception does not name, on the sentence the exception is about. While that
+  exception stands, the user's yes to it covers the companion in that turn or a later one; it is
+  checked against its own item only. Such a change also merges the permanent Restrictions sections into
   one block (temporary ones stay separate with their end); what goes is kept in CHARTER.history.md.
   Example: Restrictions says "Never modify main." and the user says "pushing to main is allowed":
   send `{"section": "Restrictions", "quote": "Never modify main.", "text": "Pushing to main is

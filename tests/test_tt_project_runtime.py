@@ -6940,6 +6940,12 @@ _COMPANION = ("Push only to branch work/x of the demo repo, except the stray bra
               "one-time exception (ask {ask}) allows while it lasts. Never push to main. Never open pull requests.")
 
 
+def _exception_section(ask: int, turn: str = "1.0") -> str:
+    """_EXCEPTION as charter_update writes it with its end: a dated Restrictions section."""
+    return (f"\n## Restrictions (added 2026-10-12, turn {turn})\n{_EXCEPTION.format(ask=ask)}\n"
+            "Until: the branch cleanup task is done\n")
+
+
 def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_its_yes(env):
     """Replays a refusal: the user said yes to a temporary exception; the coordinator then quoted the
     permanent item and sent it back naming the exception, as its prompt requires. The guard refused the
@@ -6974,12 +6980,13 @@ def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_i
     assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
     recs = db.kv(coord.CHARTER_APPROVALS_KEY)
     assert len(recs) == 1 and recs[0]["used"] and recs[0]["messages"] == [yes], recs   # never applied again
-    p.charter_path.write_text(_EXC_CHARTER)
+    standing = _EXC_CHARTER + _exception_section(ask)   # the exception stands; the item is back as it was
+    p.charter_path.write_text(standing)
     assert coord.apply(p, [comp], turn=5) == [], "a later companion edit passes on that yes too"
-    p.charter_path.write_text(_EXC_CHARTER)
+    p.charter_path.write_text(standing)
     assert coord.apply(p, [comp], turn=6, user_turn=True, messages=[yes]) == []
     # The yes recorded under the item, as when the guard refused the exception itself: still covered.
-    p.charter_path.write_text(_EXC_CHARTER)
+    p.charter_path.write_text(standing)
     db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
     coord._record_charter_approval(p, [yes], "Restrictions", _PUSH_ITEM, "", _EXCEPTION.format(ask=ask), None,
                                    coord.GUARD_REJECTED)
@@ -6987,6 +6994,54 @@ def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_i
     assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
     assert not db.kv(coord.CHARTER_APPROVALS_KEY)[0]["used"], "the exception's own yes is left to it"
 
+
+
+def test_a_companion_edit_counts_only_for_a_standing_exception_it_names_and_adds_nothing_to(env):
+    """Replays review probes: after the user's yes to the stray-branch exception, a turn with no user
+    message got 'Never push to main, except temporary hotfixes.' and an exception clause on an item the
+    exception is not about applied as companion edits. Each is refused; so is a companion of an
+    exception that was retired (expired, or its end met)."""
+    p = make(env)
+    from ttp import coordinator as coord, ends
+    db = p.db
+    ask = db.post("out", "May stray tmp/* branches be deleted once?", kind="ask")
+    yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web-session")
+    exc = {"type": "charter_update", "section": "Restrictions", "text": _EXCEPTION.format(ask=ask),
+           "until": "the branch cleanup task is done", "both_hold": True}
+    p.charter_path.write_text(_EXC_CHARTER)
+    assert coord.apply(p, [exc], turn=1, user_turn=True, messages=[yes]) == []
+    harness = "Never modify another project's harness or state."
+    probes = [(_PUSH_ITEM, "Push only to branch work/x of the demo repo. Never push to main, except temporary "
+                           "hotfixes. Never open pull requests."),
+              (harness, "Never modify another project's harness or state, except as the temporary exception allows."),
+              # Naming the exception by its ask does not let a clause add its own object, or edit an item
+              # the exception is not about.
+              (_PUSH_ITEM, f"Push only to branch work/x of the demo repo. Never push to main, except hotfixes the "
+                           f"temporary exception (ask {ask}) allows. Never open pull requests."),
+              (harness, f"Never modify another project's harness or state, except as the temporary exception "
+                        f"(ask {ask}) allows."),
+              (_PUSH_ITEM, f"Push only to branch work/x of the demo repo. Never push to main, except the stray branch "
+                           f"deletions the temporary exception (ask {ask}) allows. Never open pull requests.")]
+    before = p.charter_path.read_text()
+    for turn, (quote, text) in enumerate(probes, 2):
+        err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text}],
+                          turn=turn)
+        assert len(err) == 1 and "needs the user's word" in err[0], (text, err)
+    assert p.charter_path.read_text() == before
+    # In the user's turn a clause that names no standing exception is no companion: the guard reads it.
+    assert not coord._companion_exception(before, *probes[0], db.kv(coord.CHARTER_APPROVALS_KEY))
+    # The companion the exception's yes covers passes while the exception stands, and not once it is retired.
+    comp = {"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM,
+            "text": _COMPANION.format(ask=ask)}
+    heading = next(h for h, _ in __import__("ttp.prompts", fromlist=["x"]).charter_sections(before)
+                   if "(added" in h)
+    assert ends.retire_section(p, heading, "the branch cleanup task is done")
+    err = coord.apply(p, [comp], turn=10)
+    assert len(err) == 1 and "needs the user's word" in err[0], err
+    assert "- " + _PUSH_ITEM in p.charter_path.read_text()
+    p.charter_path.write_text(before)
+    assert coord.apply(p, [comp], turn=11) == []
+    assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
 
 def test_the_guard_still_refuses_a_removal_or_real_loosening_without_the_users_word(env):
     p = make(env)

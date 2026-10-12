@@ -2833,6 +2833,58 @@ def _companion_clause(quote: str, text: str) -> str:
     return added if _OWN_EXCEPTION_RE.search(added) and _EXCEPTION_REF_RE.search(added) else ""
 
 
+# How a companion clause names its exception: an ask or message id, or the turn of a dated section.
+_REF_ID_RE = re.compile(r"\b(?:ask|message|msg)\s*#?\s*(\d+)\b|#(\d+)\b|\bturn\s+(\d+(?:\.\d+)?)", re.I)
+
+
+def _ref_ids(text: str) -> set[str]:
+    return {("turn " if m[3] else "") + (m[1] or m[2] or m[3]) for m in _REF_ID_RE.finditer(text)}
+
+
+def _companion_exception(charter: str, quote: str, text: str, approvals: list[dict]) -> list[tuple[str, dict | None]]:
+    """The exception a companion edit names, as (its text, an approval of that text on record or
+    None): the clause _companion_clause finds names it by id (_REF_ID_RE: an id its text or heading
+    carries, or the ask or yes of an approval of it) and that exception stands in the charter now,
+    in a temporary or dated Restrictions section; the clause adds no action or object of its own
+    (what is left once exception and reference words are taken out is drawn from the exception's
+    text). [] when none: a word such as "temporary" alone names nothing, and an expired or retired
+    exception is gone from the charter."""
+    added = _companion_clause(quote, text)
+    refs = _ref_ids(added)
+    if not refs:
+        return []
+    rest = _EXCEPTION_REF_RE.sub(" ", _OWN_EXCEPTION_RE.sub(" ", _REF_ID_RE.sub(" ", added)))
+    acts, objs = _target(rest)
+    from .prompts import charter_sections
+    out: list[tuple[str, dict | None]] = []
+    for head, body in charter_sections(charter):
+        name = " ".join(head[3:].split())
+        if not (head and name.lower().startswith("restriction")
+                and (ends.charter_end(body) or _DATED.search(name) or re.search(r"\btemporary\b", name, re.I))):
+            continue
+        exc = _ws("\n".join(x for x in body if not x.strip().startswith(tuple(l for _, l in ends.CHARTER_LINES))))
+        if not exc or not _may_lift(exc):
+            continue
+        ea, eo = _target(exc)
+        if not (acts <= ea and objs <= eo):
+            continue
+        own = _ref_ids(exc) | _ref_ids(name)
+        recs = [r for r in approvals if _ws(r.get("text") or "") and _ws(r["text"]) in exc]
+        for rec in recs:
+            ids = own | {str(i) for i in [rec.get("ask"), *(rec.get("messages") or [])] if i is not None}
+            if refs <= ids:
+                out.append((exc, rec))
+        if refs <= own and not any(e == exc for e, _ in out):
+            out.append((exc, None))
+    return out
+
+
+def _changed_sentences(quote: str, text: str) -> list[str]:
+    """The sentences of `quote` a companion edit changed: those `text` no longer has word for word."""
+    kept = {_loose(x) for x in _sentences(text.splitlines())}
+    return [x for x in _sentences(quote.splitlines()) if _loose(x) not in kept]
+
+
 GUARD_REJECTED = "the old Restrictions item it contradicts still stood"   # _record_charter_approval `failed`
 
 
@@ -2852,8 +2904,8 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     charter = p.charter_path.read_text()
     if " ".join(text.split()) in " ".join(charter.split()):
         return ""
-    if quote and _companion_clause(quote, text):
-        return ""   # the quoted item kept whole, naming an exception: no sibling item is touched
+    if quote and _companion_exception(charter, quote, text, p.db.kv(CHARTER_APPROVALS_KEY, []) or []):
+        return ""   # the quoted item kept whole, naming a standing exception: no sibling item is touched
     hits = _append_conflicts(charter, section, text, quote)
     if not hits:
         return ""
@@ -2885,7 +2937,7 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
         + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
         + (", and retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
         + "; if it is an exception to that item, resend it with `both_hold`: true and add a companion edit "
-          f"in section {first[1]!r} (`quote` the item, `text` the same item plus \", except as <the exception> "
+          f"in section {first[1]!r} (`quote` the item, `text` the same item plus \", except as <the exception, by its ask id> "
           "allows\"), which passes on the same yes; if both hold (this text only adds a limit, a ban, a "
           "condition or a duty, or is not about the same thing), resend with `both_hold`: true, or say in the "
           "text that it loosens no restriction. Never drop a restriction the user did not change")
@@ -3302,14 +3354,18 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
             found = found or f"The user's yes in message #{ids} expired after {days:g} days; ask again"
         else:
             return rec, ""
-    companion = _DATED.sub("", _ws(section)).lower().startswith("restriction") and _companion_clause(quote, text)
-    for rec in reversed(have) if companion else ():
-        # A companion edit of an item that only names a temporary exception the user said yes to (the
-        # record names the item, or a sentence of it the guard split out): that yes covers it, in the turn of the yes or a later one, used or not (it reconciles the item
-        # with the exception; it lifts nothing the exception does not).
-        if (time.time() - rec["ts"] <= days * 86400 and _may_lift(rec["text"])
+    companion = (_companion_exception(p.charter_path.read_text(), quote, text, have)
+                 if _DATED.sub("", _ws(section)).lower().startswith("restriction") else [])
+    changed = _changed_sentences(quote, text)
+    for exc, rec in companion if changed else ():
+        # A companion edit of an item that only names a standing temporary exception the user said yes
+        # to: that exception's own yes covers it, in the turn of the yes or a later one, used or not
+        # (it reconciles the item with the exception; it lifts nothing the exception does not). Only
+        # the sentence the exception is about may change: the one the guard named when it refused the
+        # exception (the record's quote), or one about the same action on the same object (strict _overlaps).
+        if (rec is not None and time.time() - rec["ts"] <= days * 86400 and _may_lift(rec["text"])
                 and _DATED.sub("", rec["section"]).startswith("restriction")
-                and (rec["quote"] in _ws(quote) if rec["quote"] else _overlaps(quote, rec["text"]))):
+                and all(_loose(s) == _loose(rec["quote"]) or _overlaps(s, exc, strict=True) for s in changed)):
             return {**rec, "text": text, "companion": True}, ""
     return None, found or why
 
@@ -3342,11 +3398,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 4
+CHARTER_GUARD_VERSION = 5
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
+                       "_ref_ids", "_companion_exception", "_changed_sentences",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (4, "2cceca200b492491e54583013544bf1a9d8bf7b8a698786a46df81e6fdd1fc25")
+CHARTER_GUARD_PIN = (5, "903e90fc4d2dbb1d7f5396f2078d50dfeb77d3a788f295c8af379320e7ae0723")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
