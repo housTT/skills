@@ -282,9 +282,10 @@ def _no_real_providers(tmp_path, monkeypatch) -> list:
 
 @pytest.fixture(scope="session")
 def _short_tmp():
-    """A short folder for the short temp dirs (ttp.shorttmp) tests make, removed at the end."""
+    """A short folder for the short temp dirs (ttp.shorttmp) tests make, removed at the end.
+    TTP_TEST_SHORT_TMP_ROOT puts it elsewhere (a nested suite that must write nothing else to /tmp)."""
     try:
-        base = tempfile.mkdtemp(prefix="ts", dir="/tmp")
+        base = tempfile.mkdtemp(prefix="ts", dir=os.environ.get("TTP_TEST_SHORT_TMP_ROOT") or "/tmp")
     except OSError:   # a sandbox that refuses /tmp: the default temp root
         base = tempfile.mkdtemp(prefix="ts")
     yield base
@@ -42131,6 +42132,7 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     monkeypatch.setenv("TTP_TEST_FORBID_ROOT", "/tmp")
     monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", str(nested_tmp))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
+    monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
     for var in ("TMPDIR", "TMP", "TEMP"):
         monkeypatch.setenv(var, str(nested_tmp))
     cli.main(["checks"])
@@ -51961,6 +51963,7 @@ def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, mon
     monkeypatch.delenv(mm.MASK_RECORD, raising=False)   # this run's own record, if any, is not the test's
     monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor its own mask, when it runs on a device machine
     monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor its mask: run.json holds only what the daemon set
+    monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)   # nor this run's own mask (run.json holds only what a run adds)
     before = json.dumps({"TT_VISIBLE_DEVICES": os.environ.get("TT_VISIBLE_DEVICES")}, sort_keys=True)
     p = make(env)
     d = Daemon(p.base)
