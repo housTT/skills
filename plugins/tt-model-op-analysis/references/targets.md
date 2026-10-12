@@ -1,8 +1,29 @@
-# Target profiles
+# Targets and profiles
 
-Each profile fixes the values the model code branches on. Before using a profile, confirm its
-values at the pinned commit (the source files are named below) and record them in `run.json`
-under `profile_values`.
+A static run compares exactly two targets:
+
+- **source**: where the analysed code is expected to work today. The implementation and entry
+  test are chosen for it, and its launches are traced.
+- **destination**: where the code would be ported. Its columns say what happens to each source
+  op there.
+
+The user picks both; neither has a default. Source and destination must differ. To compare more
+targets, make another run.
+
+| Target | Question its status answers | Allowed as | Profile |
+|---|---|---|---|
+| `p100` | Does this op run on P100 as written? | source, destination | `p100` |
+| `p150` | Does this op run on P150 as written? | source, destination | `p150` |
+| `quasar` | Does this op run on Quasar with the code unchanged (same dtypes, grids, mainline ttnn calls)? | destination | `quasar` |
+| `quasar-port` | Does the existing Quasar port of this model cover this function, and with which op? | destination, only when a port exists in the tree | `quasar` |
+| `quasar-bf16` | Would this op run on Quasar if block-float dtypes became BF16 and mainline calls used their `ttnn.experimental.quasar.*` forks, everything else unchanged? | destination | `quasar` |
+
+Status and evidence rules for every target are in `<plugin-root>/references/target-status.md`.
+
+## Profiles
+
+Each profile fixes the values the model code branches on. Confirm its values at the pinned commit
+(source files below) and record them in `run.json` under `profile_values`.
 
 | Profile | arch | Tensix compute grid | DRAM grid x | Where to confirm |
 |---|---|---|---|---|
@@ -21,8 +42,8 @@ profile. Common ones:
   takes the P100 branch, including a P150 run with ETH dispatch (14x10).
 - `device.compute_with_storage_grid_size()` and `dram_grid_size()` feed core counts and shard
   specs; compute them per profile.
-- Hardcoded `CoreGrid(...)` / `CoreCoord(...)` larger than the profile grid: record in
-  `grid_dependency` and treat as a blocker for that profile.
+- Hardcoded `CoreGrid(...)` / `CoreCoord(...)` larger than a profile grid: record the value in
+  `grid_dependency` and, for the destination, in `port_blockers.csv`.
 
 ## Quasar grid override (measured mode, informational)
 

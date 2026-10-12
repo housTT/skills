@@ -1,0 +1,127 @@
+# Target status rules
+
+Every target of a run (`targets.md`) has two columns in `op_table.csv`: `<t>:status` and
+`<t>:evidence`. Evidence belongs only to its own target's status; never share one evidence column
+between targets.
+
+A status answers one question: is this op supported on this target? It does not answer whether
+the launch happens or which factory is chosen; `launch_condition` and `confidence` carry that.
+Do not downgrade a status because dispatch is `unverified` or the launch is conditional.
+
+| Value | Meaning | `<t>:evidence` must name |
+|---|---|---|
+| `✅` | Supported, shown by a test or recorded run a reader can open (rules per target below) | the test or run and why it matches this row |
+| `⚠️` | The code path exists, but no test or run covers this variant on this target | the factory or fork path, and what coverage is missing |
+| `❌` | Directly proven not to work: API/binding mismatch, validation failure, TT_FATAL, or an exact reproducer of a hang or wrong result | the failing check or reproducer |
+| `n/a` | The target never executes this op (untaken branch; for p100/p150 exactly when launches is 0) | why it is not executed |
+
+Apply the definitions as written. Absence of a test is never evidence of failure. For the
+Quasar targets the definitions are made concrete per kernel op in "Quasar status by kernel op"
+below.
+
+## p100, p150
+
+The code runs as written on that profile.
+
+- `✅`: the entry test passes on this profile, either in a CI workflow that runs it on this
+  profile (name the workflow file and job) or in a passing run recorded in `run.json`
+  `entry_test_passes`. Every op the test launches is then covered. A dedicated op test on this
+  profile with the same variant also counts.
+- `⚠️`: the profile is reached only through a branch the entry test does not run on this profile,
+  or no passing run exists for this profile.
+- Branch-dependent rows (a reshard that only P150 needs) are `n/a` with 0 launches on the other
+  profile.
+
+## quasar (code unchanged)
+
+The analysed code unchanged on Quasar: same dtypes, grids and mainline ttnn calls. Mainline calls
+are not routed to Quasar forks automatically. Most rows are usually `❌` for a reason shared by
+many rows; state the specific check once in `port_blockers.csv` and cite its id plus the row's own
+detail (dtype, factory family) in the evidence.
+
+## quasar-port (existing port)
+
+Only offered when a Quasar port of the model exists in the tree. For each source row,
+`quasar-port:port_op` names the op the port uses for the same function, with its factory or
+algorithm when it differs (for example `ttnn.experimental.quasar.conv2d, split program: tilize then
+quasar.linear`).
+
+- Status follows "Quasar status by kernel op" for `port_op`. A passing port e2e run recorded in
+  `run.json` `port_e2e` also gives `✅` for every op it executes.
+- `n/a`: the port has no counterpart because the function does not exist there (for example a
+  Blackhole-only branch). Using a different op is not `n/a`; that is what `port_op` records.
+
+## quasar-bf16 (projection)
+
+Not existing code. The status the op would have if the analysed code changed in exactly two ways:
+every block-float dtype (`bfloat8_b`, `bfloat4_b`) becomes `bfloat16`, and every mainline call
+that has a `ttnn.experimental.quasar.*` fork calls that fork instead. A mechanical substitution to
+the fork's corresponding program-config type is part of that routing only when its fields map
+one-to-one; all values and topology stay unchanged. No retuning, algorithm change or missing
+argument may be assumed. Grids, shard specs and program-config values stay as written; grid
+blockers go to `port_blockers.csv`. The evidence names the dtype change, fork and config-type
+mapping, or says none applies. `✅` means a Quasar test covers the projected kernel op, not that the
+projected model runs.
+
+If a fork lacks a required argument or has no one-to-one program-config type, the projection is
+`❌`; the signature mismatch is direct evidence. Do not silently redesign the model.
+
+## Quasar status by kernel op
+
+All three Quasar targets (`quasar`, `quasar-port`, `quasar-bf16`) decide status per kernel op. The
+kernel op of a row is its **device op + program factory + layout/sharding + dtype** as it would
+run on Quasar (for `quasar-bf16` after the bf16 change and fork routing; for `quasar-port` the op
+named in `port_op`). Batch size, core grid and shard sizes are not part of the key; record them in
+the evidence as the test's scope. They become part of the key only when a documented failure
+depends on them (for example a block-sharded matmul that fails only when K is split across
+several cores, `in0_num_blocks_w > 1`).
+
+1. Find the Quasar tests that call this kernel op: the model's Quasar op tests, the Quasar unit
+   tests under `tests/ttnn/**/quasar/`, and the rows of `tests/scripts/quasar/*.yaml`. Read each
+   candidate test: its parameters, markers and comments.
+2. Decide:
+
+| Status | When | Evidence names |
+|---|---|---|
+| `✅` | A test runs this kernel op (same op, factory, layout, dtype) with no `xfail`/`skip` marker, is not a hang reproducer, and has no comment reporting that it fails | the test node and parameters; the batch/grid it uses when they differ from the row |
+| `❌` | A test or reproducer for this kernel op is marked `xfail`, is a hang reproducer, or carries a comment reporting a hang, wrong result or error; or the Quasar code has no factory for this combination (validate TT_FATAL, no fork and only a ProgramDescriptor/legacy factory, unsupported dtype) | the marker, reproducer, comment or failing check with `file:line` |
+| `⚠️` | No test runs this kernel op, but the Quasar fork has a Metal 2.0 ProgramSpec factory whose validate accepts this layout and dtype | the factory and the scope its validate supports (layouts, dtypes, sharding), and that no test exists |
+| `n/a` | The target never executes this op | why |
+
+- A test without a marker is assumed to pass; results of `tests/scripts/quasar/*.yaml` are only in
+  an external emulator check. Say whether the test is in CI, in a yaml list, or in neither.
+- `<t>:tests` holds the node ids of the tests that decide the status; `<t>:test_result` stays
+  `not run` until the measured destination phase runs them on TTsim. A run result overrides the
+  marker rule: a `fail`, `hang` or `xfail` of any of the row's tests gives `❌`; `✅` needs every
+  test of the row to pass. `error` (the test could not run, for example a broken environment),
+  `skip` and unrun tests decide nothing: the status stays as decided here.
+- When tests disagree (one passes, another reproduces a hang for the same kernel op), use `❌` and
+  cite both; a comment elsewhere saying "fixed" does not override a live reproducer without a run.
+- A failure applies to every row with the same kernel op key. A failure for another factory,
+  layout or dtype does not.
+
+## Quasar facts to verify at the pinned commit
+
+- Block-float formats: `is_supported_quasar` in `tt_metal/common/tt_backend_api_types.cpp` lists
+  the formats Quasar accepts; at the time of writing it has no `Bfp8_b`/`Bfp4_b`.
+- Legacy kernels: `DataMovementKernel`/`ComputeKernel` constructors in
+  `tt_metal/impl/kernels/kernel.hpp` TT_FATAL on Quasar, so ProgramDescriptor/CreateKernel
+  factories cannot run there; only Metal 2.0 ProgramSpec factories lower to Quasar kernels.
+- Quasar forks live under `ttnn/cpp/ttnn/operations/experimental/quasar/` and are exposed as
+  `ttnn.experimental.quasar.*`.
+- Quasar op tests are mostly outside CI (`tests/scripts/quasar/*.yaml`); say so when a `✅` rests
+  on a locally run test.
+
+## Coverage matching and consistency
+
+Match the semantics that affect dispatch: required arguments and output behavior, in-place versus
+out-of-place, broadcast mode, sharding/layout, dtype, fused bias/activation, and factory family
+(for example 1D versus 2D multicast). A test of fold without `collapse_output` does not cover a
+call that requires `collapse_output`; a 1D-mcast linear test does not cover a 2D-mcast linear.
+Memory placement alone may differ.
+
+Before finishing, group rows by the target-relevant signature (operation semantics, factory,
+layout, dtype and sharding). Equal signatures must have equal statuses unless the evidence states
+the row-specific distinction. `quasar-port` and `quasar-bf16` evidence is row-specific: text
+copied unchanged into many rows says nothing a reader can check, and the validator warns about it
+(and about repeated `dispatch_evidence`).

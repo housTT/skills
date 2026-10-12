@@ -1,4 +1,4 @@
-# Run setup (both skills)
+# Run setup
 
 ## Interactive gate
 
@@ -18,36 +18,37 @@ conversation. When discovery leaves exactly one compatible choice, state the cho
 the only one, then continue without a redundant confirmation. Never ask the user to confirm the
 whole configuration in one message.
 
-### Static setup order
+### Setup order
 
-1. Ask which model to analyse. Do no model-specific discovery before the answer.
-2. Ask for the architecture scope: Blackhole, Quasar, or both. If Blackhole is included, ask next
-   for P100, P150, or both. Architecture/profile selection must finish before implementation or
-   test candidates are presented.
-3. Ask which source ref to pin. A suggested ref is allowed, but it is not confirmation. Resolve it
-   before candidate discovery so every path, skip marker and CI claim comes from the pinned SHA.
-4. Discover implementations compatible with the selected as-written profiles and show the table
-   from section 1. Ask which implementation to analyse.
-5. Rank only the whole-model test candidates for that implementation and the selected as-written
-   profiles. Recommend the best candidate with a concrete reason, then ask which test to use.
-6. Ask for the output root, explain it cannot be inside the tt-metal checkout, and stop.
-
-### Measured setup order
-
-1. Before asking about the model, perform backend discovery from
-   `<plugin-root>/skills/measured-op-analysis/SKILL.md`. Ask for silicon, TTsim, or both using only
-   discovered available/buildable choices.
-2. If silicon is included, probe its actual architecture and grids. If TTsim is included, ask for
-   one of the architectures reported by its checkout and complete its readiness check. Do not offer
-   an architecture unsupported by the selected backend.
-3. Ask which model to analyse.
-4. Ask which source ref represents the checkout/build that will run. Resolve it before candidate
-   discovery.
-5. For each selected backend, discover and show only compatible implementations, then ask which one
-   to analyse. Share a choice only when compatibility is proven for both.
-6. Rank runnable whole-model tests separately per backend. Recommend the best candidate with a
-   concrete reason, then ask which test to use. Different architectures may require different tests.
-7. Ask for the output root once, explain it cannot be inside the tt-metal checkout, and stop.
+1. Ask for the mode: **static**, **static + measured**, or **measured over an existing static
+   run**.
+2. Ask which model to analyse. Do no model-specific discovery before the answer.
+3. Existing run (measured over an existing static run): ask for the output root, list the runs
+   under `<root>/op-analysis/<model>/static/` with their `source`, `destination`,
+   `tt_metal_commit` and date, and ask which one to extend. A run whose `run.json` has `targets`
+   instead of `source` and `destination` predates this layout and cannot be extended; say so and
+   offer a new run. Its commit, targets and entry test are fixed; go to step 10.
+4. New run: ask which source ref to pin. A suggested ref is allowed, but it is not confirmation.
+   Resolve it before any discovery so every path, skip marker and CI claim comes from the pinned
+   SHA.
+5. Ask for the source target (`p100` or `p150`): where the code is expected to work today.
+6. Ask for the destination target: any other target from `<plugin-root>/references/targets.md`.
+   Offer `quasar-port` only when the model directory has a Quasar port at the pinned SHA (a
+   directory listing, not a source read). Neither target has a default; show each option's
+   one-line question from targets.md. Targets are fixed before implementation or test candidates
+   are presented.
+7. Discover implementations compatible with the source target and show the table from section 1.
+   Ask which implementation to analyse.
+8. Rank only the whole-model test candidates for that implementation and the source target.
+   Recommend the best candidate with a concrete reason, then ask which test to use. The measured
+   source phase reruns this same test.
+9. Ask for the output root, explain it cannot be inside the tt-metal checkout.
+10. Measured modes: ask which measured phases to run (source device, destination TTsim) and check
+    their preconditions now: a local device of the source architecture (probe through
+    `tt-device-mcp`), a checkout at the run's commit (`same_commit.py` for an existing run; for a
+    new run compare the pinned SHA with `git rev-parse HEAD` of the checkout and a clean
+    `git status`), and for a Quasar destination a ready TTsim build (`ttsim.md`). Report what is missing before any analysis
+    starts and let the user drop a phase or stop.
 
 Do not inspect model source, create output or delegate tracing until the applicable setup is
 complete. Candidate discovery may inspect directory structure, tests, skip markers and CI workflow
@@ -73,21 +74,16 @@ through a test-infra `run()`), not one layer, block or stage. Component tests
 Candidates by kind:
 
 - **static**: end-to-end PCC tests and demo tests.
-- **measured silicon**: the static candidates, plus perf tests (device-perf: the `command = f"pytest ..."`
-  string in `*perf_device*.py` or `*device_perf*.py`; e2e perf such as
-  `test_*perf_e2e*.py`) whose test body runs the whole model.
-- **measured TTsim**: simulator-specific or ordinary end-to-end PCC/demo tests that run the whole
-  model on the selected simulated architecture. Do not recommend a perf test merely because it is
-  named `perf`; no performance is collected from TTsim.
+- **static + measured**: the static candidates, plus perf tests (device-perf: the
+  `command = f"pytest ..."` string in `*perf_device*.py` or `*device_perf*.py`; e2e perf such as
+  `test_*perf_e2e*.py`) whose test body runs the whole model, so the same test serves both phases.
 
-For static analysis, evaluate the primary implementation and entry test against every selected
-as-written profile. When Blackhole and Quasar are both selected, the chosen Blackhole
-implementation/test is primary; discover a Quasar implementation separately as port evidence per
-the rule below. Do not require the Blackhole entry test to run on Quasar. For measured analysis,
-evaluate compatibility separately against each selected backend profile. Do not offer incompatible
-primary implementations as choices; summarize how many were excluded and make their details
-available on request. If no single primary implementation supports all selected P100/P150 profiles, do not
-silently combine implementations: ask whether to create separate runs or narrow the target set.
+For static analysis, evaluate the implementation and entry test against the source target. When
+the destination is `p100` or `p150`, record whether the entry test also runs there, but do not
+require it. For `quasar-port`, discover the port implementation separately per the rule below. Do
+not require the entry test to run on a Quasar destination. Do not offer incompatible primary
+implementations as choices; summarize how many were excluded and make their details
+available on request.
 
 Show one row per compatible implementation: module path, target fit, candidate node ids, skip
 markers and whether CI runs them on the relevant architecture. Never derive the implementation
@@ -97,16 +93,13 @@ tests over naming or directory proximity.
 
 After the user picks an implementation, rank its tests in this order:
 
-1. runnable on every selected static as-written profile, or on the measured backend being configured;
+1. runnable on the source target;
 2. explicitly exercised by CI on the relevant architecture;
-3. a whole-model PCC/demo for static or TTsim, or a warm-capable perf/PCC test for measured silicon;
+3. a whole-model PCC/demo, or for static + measured a warm-capable perf/PCC test;
 4. the least setup indirection and fewest unrelated parametrizations.
 
 Present the top candidates with their node ids, relevant parameters, skip status, CI coverage and a
-one-line recommendation reason. For TTsim also show the checkout/build target, interpreter, working
-directory and test-specific environment required by pinned source or a launch configuration the
-user supplied. Treat such a launch configuration as candidate evidence, not as a global default.
-Never recommend a test skipped unconditionally or for a relevant architecture. If none is runnable,
+one-line recommendation reason. Never recommend a test skipped unconditionally or for a relevant architecture. If none is runnable,
 say so and follow the temporary-test procedure instead of silently choosing another implementation.
 
 ### No whole-model test
@@ -125,18 +118,19 @@ Where it lives:
 - **static**: only in the run directory as `temp_test_<model>.py`, written once the output root
   is confirmed; never in the tt-metal checkout. Read it from there; every other source is still
   read as `git show <sha>:<path>`.
-- **measured**: as an untracked file next to the model's tests in the tt-metal checkout, so its
-  conftest and fixtures apply. Write it warm from the start (two forwards with the signposts
-  from the measured workflow's warm-run step). Copy it into the run directory, and delete it
-  from the checkout after the run and say so.
+- **measured source phase**: copied as an untracked file next to the model's tests in the tt-metal
+  checkout for the Tracy run, so its conftest and fixtures apply. Write it warm from the start (two
+  forwards with `op-analysis-start` / `op-analysis-end` signposts). Delete it from the checkout
+  after the run and say so.
 
 Record it in `run.json` as `"test": "<run dir>/temp_test_<model>.py::<test name>"` and
 `"temporary_test": true`, and state in `summary.md` that the entry test is temporary and not part
 of tt-metal.
 
 If a Blackhole and a Quasar implementation both exist (for example
-`models/demos/vision/classification/resnet50/ttnn_resnet` and `.../resnet50/quasar`), the
-Quasar port goes in the `quasar:port` column, never mixed into the Blackhole rows.
+`models/demos/vision/classification/resnet50/ttnn_resnet` and `.../resnet50/quasar`) and the
+destination is `quasar-port`, record the port module in `run.json` `port_implementation`. The
+port only fills the `quasar-port:*` columns of the source rows; it never adds rows.
 
 ## 2. Pin the source
 
@@ -158,34 +152,36 @@ the run notes so a later comparison can detect a stale or divergent pin.
 
 Root: current working directory unless the user names one; never inside the tt-metal checkout.
 
-- Static run: `<root>/op-analysis/<model>/static/<YYYY-MM-DD>_<sha7>/`.
-- Measured run: `<root>/op-analysis/<model>/measured/<YYYY-MM-DD>_<sha7>_<backend>-<profile>/`.
-
-Use `silicon` or `ttsim` for `<backend>`. If both are selected, create sibling measured runs with
-independent `run.json`, logs and summaries; never merge their artifacts.
+- Run: `<root>/op-analysis/<model>/static/<YYYY-MM-DD>_<sha7>/`. Measured phases write into the
+  same directory, so one run holds the static tables and the measured data on top of them.
 
 `run.json` fields:
 
 ```json
-{"kind": "static", "model": "resnet50", "test": "<node id>", "targets": ["p150", "quasar"],
+{"kind": "static", "model": "resnet50", "test": "<node id>", "source": "p150", "destination": "quasar-port",
+ "port_implementation": "models/demos/vision/classification/resnet50/quasar", "profile_values": {},
  "tt_metal_ref": "origin/main", "tt_metal_commit": "<40-char sha>", "date": "YYYY-MM-DD", "drive_url": null,
- "port_e2e": null}
+ "entry_test_passes": {}, "port_e2e": null}
 ```
+
+`entry_test_passes`, per p100/p150 target: where the entry test is shown to pass, either
+`{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}` for a
+run the user reports. It backs the `✅` rule for p100/p150 in `target-status.md`.
 
 `port_e2e`, when the user reports a passing Quasar-port e2e run: `{"by": "...", "date": "...",
 "config": "ttsim <version>, <grid>, batch <n>, <dtype>", "result": "<pcc/top-1 line>"}`.
 
-Measured `run.json` additionally records `backend` (`silicon` or `ttsim`), `profile`, and
-`observation_scope` (`silicon-profiled` or `ttsim-operations`). A TTsim run also records
-`ttsim_checkout`, `ttsim_commit`, `simulator_library`, `simulator_arch`, `graph_database` and the
-exact non-secret `environment` used.
+Measured phases add: `measured_ops` (path of `measured_ops.csv`, set by `merge_measured.py`),
+`ops_csv` (the raw Tracy report), `window` (`warm` or `cold`), and for the destination phase
+`ttsim_checkout`, `ttsim_commit`, `simulator_library`, `simulator_arch` and `ttsim_environment`
+(the exact non-secret variables `kernel_tests.py run` sets).
 
 Earlier runs are never an input to the analysis: during inventory, tracing and the Quasar pass,
 read no file of an earlier run under `op-analysis/` (the current run's temporary test is the
 only file there you read). Only the scripts open an earlier run: `compare_runs.py` in the
-merge step after the validator prints `OK`, and `diff_reports.py` in the measured diff step.
+merge step after the validator prints `OK`.
 
-If `op-analysis/<model>/<kind>/` already has a run, ask once:
+For a new run, if `op-analysis/<model>/static/` already has a run, ask once:
 
 - **overwrite**: delete that run directory and write the new one; if it has a `drive_url`,
   update the same spreadsheet.
@@ -199,15 +195,15 @@ If `op-analysis/<model>/<kind>/` already has a run, ask once:
   |---|---|
   | `op_table.csv` | default (`stage,ttnn_api,device_op,program_factory`) |
   | `call_trace.csv` | `profile,stage` |
-  | `quasar_blockers.csv` | `blocker` |
+  | `port_blockers.csv` | `blocker` |
   | `host_ops.csv` | `host_work` |
   | `host_fallback.csv` | `scope` |
   | `footprint.csv` | `op_code` |
-  | `simulated_ops.csv` | `rank,operation_id` |
-  | `simulated_op_counts.csv` | `operation` |
+  | `kernel_ops.csv` | `device_op,program_factory,op_code` |
+  | `kernel_test_results.csv` | `node_id` |
 
-`measured_ops.csv` and `diff.csv` are not compared: per-op timings change every run, and the
-  diff is regenerated. `compare_runs.py` exits 2 if a key column is missing.
+`measured_ops.csv` is not compared: per-op timings change every run, and the
+  measured comparison is regenerated by `kernel_ops.py`. `compare_runs.py` exits 2 if a key column is missing.
 
 ### Interpreting a cross-run comparison
 

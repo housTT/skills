@@ -1,64 +1,97 @@
 # CSV schemas
 
-`<p>` is a profile: `p100`, `p150`. Quasar uses its own columns.
+`<t>` is a target from `targets.md`: the run's `source` and `destination` from `run.json`.
 
 All CSVs are UTF-8 with a BOM (`utf-8-sig`) so Excel and Numbers show the status emoji;
-write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`.
+write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`. Column order is
+`opa_schema.py`; `validate_static.py` rejects missing and unexpected columns.
 
 ## op_table.csv (static, one row per unique launching device-op variant)
 
-`id` (1..N in row order), `stage`, `ttnn_api`, `op_code` (Tracy OP CODE, e.g.
-`MatmulDeviceOperation`; empty only when unknown), `device_op`, `program_factory`, `call_site`,
-`evidence`, `confidence` (`verified` | `unverified`), `grid_dependency` (the hardcoded grid, shard
-spec or program config this op depends on, with its value, or `automatic` when it is derived from
-the device grid), then per Blackhole profile `<p>:shapes`, `<p>:launches`, `<p>:status`, and for
-Quasar `quasar:as_written`, `quasar:port`, `quasar:evidence`, `quasar:bf16_projection`,
-`quasar:bf16_projection_evidence`. The Quasar columns are defined in `quasar-status.md`.
+| Column | Content |
+|---|---|
+| `id` | 1..N in row order |
+| `stage` | model region |
+| `origin` | `static` (traced from source only), `measured` (seen only in the source Tracy run; `call_site` and `grid_dependency` are `not traced`) or `static+measured` |
+| `ttnn_api` | the Python-facing call |
+| `op_code` | Tracy OP CODE, e.g. `MatmulDeviceOperation`; empty only when unknown |
+| `device_op` | `ttnn::prim::` name |
+| `program_factory` | canonical factory type name only; implementation notes go in `dispatch_evidence` |
+| `call_site` | every call site as `<path>:<line>` at the pinned SHA, `; `-separated; add the C++ dispatch line (`<file>.cpp:<line>`) when the launch comes from inside a composite |
+| `launch_condition` | exactly `always`, or the runtime condition under which the launch happens (`skipped when the new buffer lands at the same address`) |
+| `confidence` | `verified` \| `unverified`: whether the dispatch chain to this factory is fully followed (`dispatch-tracing.md`) |
+| `dispatch_evidence` | file and function that select the device op and factory, and every runtime-dependent alternative |
+| `grid_dependency` | the hardcoded grid, shard spec or program config this op depends on, with its value and `<file>:<line>` (`8x4 CoreGrid, <model>.py:<line>`); `automatic` when derived from the device grid; `none` when the op uses no core grid (interleaved DRAM) |
 
-Status values: `✅`, `⚠️`, `❌`, `n/a`, `variant not used by port` (not in
-`quasar:bf16_projection`).
+Then, for the source and then the destination target, the columns from `opa_schema.target_columns`:
+
+| Column | Targets | Content |
+|---|---|---|
+| `<t>:shapes` | p100, p150 | input and output shapes, dtype, layout and sharding on that profile |
+| `<t>:launches` | p100, p150 | launches per inference on that profile |
+| `<t>:port_op` | quasar-port | the op the port uses for this function |
+| `<t>:tests` | quasar, quasar-port, quasar-bf16 | pytest node ids of the destination kernel-op tests that decide the status, `; `-separated |
+| `<t>:test_result` | quasar, quasar-port, quasar-bf16 | `not run` until the measured destination phase; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
+| `<t>:status` | all | `✅`, `⚠️`, `❌`, `n/a`, defined per target in `target-status.md` |
+| `<t>:evidence` | all | evidence for this target's status only |
 
 Do not add rows for calls proven to launch no device operation. Record those decisions in the
 inventory and in `call_trace.csv` notes or `summary.md`. If launch versus no-launch cannot be
-settled statically, keep the potential device-op variant as `unverified`, use the maximum plausible
-launch count and label the affected total as an upper bound. Combine multiple call sites only when
-the full dispatch signature and every profile status match; otherwise use stable substage names so
-`stage,ttnn_api,device_op,program_factory` remains unique. `program_factory` is the canonical type
-name only; factory implementation notes belong in `evidence`.
+settled statically, keep the potential device-op variant, set `launch_condition` to the deciding
+condition and count the launch; the validator reports the total as a range from the `always`
+launches to all launches. Combine multiple call sites only when the full dispatch signature and
+every target status match; otherwise use stable substage names so
+`stage,ttnn_api,device_op,program_factory` remains unique.
 
 ## call_trace.csv (static, execution order)
 
 `id`, `profile`, `stage`, `ops` (device ops in order), `repeats`, `launches_per_repeat`, `notes`.
-For each Blackhole profile, sum of `repeats * launches_per_repeat` must equal the sum of
-`<p>:launches` in `op_table.csv`.
+`profile` is each run target that has launches (p100, p150). For each, the sum of
+`repeats * launches_per_repeat` must equal the sum of `<t>:launches` in `op_table.csv`.
 
-## quasar_blockers.csv, host_ops.csv (static)
+## port_blockers.csv (static)
 
-Free-form columns: `id`, `applies_to`, `blocker`, `affected_ids`, `evidence`, `required_change`;
-`id`, `host_work`, `when`, `counts_as_host_op` (`yes` when the work runs on the host once per
-inference inside the measured forward, such as torch calls in model code, so it must be added by
-hand to the host op time of `host_fallback.csv`, which Tracy does not see; `no` for test setup,
-weight preparation and reference computation; each with the reason).
+`id`, `blocker`, `affected_ids` (comma-separated `op_table.csv` ids, or `all`), `evidence` (the
+check at the pinned SHA), `required_change` (what the port must change). Lists what stops the
+source code from running on the destination: unsupported dtypes, kernel generations, grids larger
+than the destination grid. Empty (header only) when nothing blocks.
+
+## host_ops.csv (static)
+
+`id`, `host_work`, `when`, `counts_as_host_op`, `reason`. `counts_as_host_op` is `yes` when the
+work runs on the host once per inference inside the measured forward, such as torch calls in model
+code, so it must be added by hand to the host op time of `host_fallback.csv`, which Tracy does not
+see; `no` for test setup, weight preparation and reference computation. `reason` explains the
+choice.
 
 Also list per-inference Python control or metadata construction when it is material. Mark it `yes`
 only when it occurs inside the forward and a future measured report would otherwise omit it; give
-its frequency. Do not label TTNN lifetime calls as hidden host compute merely because they launch
-no device kernel.
+its frequency in `when`. Do not label TTNN lifetime calls as hidden host compute merely because
+they launch no device kernel.
 
 ## measured_ops.csv
 
 `id`, `op_code`, `op_type`, `attributes`, `inputs`, `outputs`, `core_count`, `device_kernel_ns`,
 `host_ns`.
 
-## simulated_ops.csv (TTsim, execution order)
+Written by `tracy_report.py` in the measured source phase; `merge_measured.py` reads it.
 
-`id`, `rank`, `operation_id`, `operation`. These are observed TTNN graph operations, not Tracy
-device-op codes or program factories, and carry no timing meaning.
+## kernel_ops.csv (one row per kernel op)
 
-## simulated_op_counts.csv (TTsim, first-seen order)
+`id`, `device_op`, `program_factory`, `op_code`, `origin`, `op_table_ids` (the op_table rows of this
+kernel op), `static_launches` (traced launches of these rows), `static_launches_op_code` and
+`measured_launches_op_code` (all launches of this op code, traced and measured; Tracy reports op
+codes, not factories, so the measured count is per op code and repeats on every kernel op that
+shares it), `<destination>:statuses` (count of each status over its rows), and for Quasar
+destinations `<destination>:tests` and `<destination>:test_results`. Written by `kernel_ops.py`;
+the Summary starts with this table.
 
-`id`, `operation`, `count`. Counts are grouped from `simulated_ops.csv` for the captured pytest
-execution. Never merge them with silicon timing rows.
+## kernel_test_results.csv (measured destination phase)
+
+`id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `hang`, `error`, `xfail`, `skip`),
+`duration_s`, `log` (path of the pytest log), `environment` (`run.json` or the `--env-json` file
+the node ran under). Written by `kernel_tests.py run`, one row per node id of
+`kernel_tests_plan.csv` that has run; batches add to it.
 
 ## host_fallback.csv
 
@@ -69,7 +102,7 @@ execution. Never merge them with silicon timing rows.
 
 `op_code`, `launches`, `max_core_count`, `peak_dram_mb` (`not measured` unless supplied).
 
-## diff.csv
+## diff.csv (optional, `diff_reports.py`)
 
 `category`, `op_code`, `static_launches`, `measured_launches`, `static_ids`, `detail`.
 

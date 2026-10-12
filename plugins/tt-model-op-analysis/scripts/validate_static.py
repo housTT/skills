@@ -1,93 +1,219 @@
-"""Gate for static-op-analysis output: schema, row ids, status values and launch totals."""
+"""Gate for a model-op-analysis run: schema, row ids, status values, call sites and launch totals.
+
+Prints `OK` and the launch totals per target when the run passes. Warnings (repeated boilerplate
+evidence) are printed but do not fail the gate.
+"""
 
 from __future__ import annotations
 
 import argparse
-import csv
+import collections
 import json
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CSV_ENCODING, PROFILES, PROJECTION_STATUS_VALUES,
-    STATUS_VALUES, op_table_columns, read_csv, status_columns,
+    ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_TARGETS,
+    NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, SOURCE_TARGETS, STATUS_VALUES, TARGETS,
+    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header,
 )
 
+CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
+# Evidence copied into this many rows (and at least half the table) says nothing row-specific.
+BOILERPLATE_MIN_ROWS = 5
+ROW_SPECIFIC_TARGETS = ("quasar-port", "quasar-bf16")
+GRID_KEYWORDS = ("automatic", "none")
+# A pytest node id: path, then ::-separated names, with an optional [parametrize id] that may hold
+# any character except the ';' this column uses as a separator.
+NODE_ID = re.compile(r"^[\w./-]+\.py(::\w+)*(\[[^;]*\])?$")
+RESULT_STATUS = {"pass": "✅", "fail": "❌", "hang": "❌", "xfail": "❌"}
 
-def _header(path: pathlib.Path) -> list[str]:
-    with path.open(newline="", encoding=CSV_ENCODING) as fh:
-        return next(csv.reader(fh), [])
 
-
-def _int(value: str, where: str, errors: list[str]) -> int:
+def _int(value: str, where: str, errors: list[str]) -> int | None:
     try:
         n = int(value)
     except ValueError:
         errors.append(f"{where}: '{value}' is not an integer")
-        return 0
+        return None
     if n < 0:
         errors.append(f"{where}: {n} is negative")
     return n
 
 
-def validate(run_dir: pathlib.Path) -> list[str]:
+def _targets(run: dict, errors: list[str]) -> tuple[str, str]:
+    if "targets" in run and "source" not in run:
+        errors.append("run.json predates source/destination targets (plugin 0.2.0); start a new static run")
+        return "", ""
+    if "source" not in run or "destination" not in run:
+        errors.append("run.json: needs 'source' and 'destination' (one target each); 'targets' is no longer read")
+        return "", ""
+    source, destination = run["source"], run["destination"]
+    if source not in SOURCE_TARGETS:
+        errors.append(f"run.json: source '{source}' not in {SOURCE_TARGETS}")
+    if destination not in TARGETS:
+        errors.append(f"run.json: destination '{destination}' not in {TARGETS}")
+    if source == destination:
+        errors.append("run.json: source and destination must differ")
+    return source, destination
+
+
+def _check_ids(name: str, rows: list[dict], errors: list[str]) -> None:
+    for n, row in enumerate(rows, 1):
+        if row["id"] != str(n):
+            errors.append(f"{name} row {n} has id {row['id']}")
+
+
+def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tuple[int, int, int]]]:
     errors: list[str] = []
-    targets = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["targets"]
-    for profile in targets:
-        if profile not in PROFILES:
-            errors.append(f"run.json: unknown target '{profile}'")
+    warnings: list[str] = []
+    totals: dict[str, tuple[int, int, int]] = {}
+    source, destination = _targets(json.loads((run_dir / "run.json").read_text(encoding="utf-8")), errors)
     if errors:
-        return errors
+        return errors, warnings, totals
+    launch_targets = [t for t in (source, destination) if t in LAUNCH_TARGETS]
 
-    op_path, trace_path = run_dir / "op_table.csv", run_dir / "call_trace.csv"
-    for path, required in ((op_path, op_table_columns(targets)), (trace_path, list(CALL_TRACE_COLUMNS))):
-        present = set(_header(path))
-        errors += [f"{path.name} missing column {col}" for col in required if col not in present]
+    tables = {
+        "op_table.csv": op_table_columns(source, destination),
+        "call_trace.csv": list(CALL_TRACE_COLUMNS),
+        "port_blockers.csv": list(PORT_BLOCKERS_COLUMNS),
+        "host_ops.csv": list(HOST_OPS_COLUMNS),
+    }
+    for name, required in tables.items():
+        path = run_dir / name
+        if not path.exists():
+            errors.append(f"{name} missing")
+            continue
+        header = read_header(path)
+        missing = [col for col in required if col not in header]
+        errors += [f"{name} missing column {col}" for col in missing]
+        if name == "op_table.csv" and "origin" in missing:
+            errors.append("op_table.csv predates the origin column: run "
+                          "python3 <plugin-root>/scripts/upgrade_run.py <run dir>")
+        errors += [f"{name} unexpected column {col}" for col in header if col not in required]
     if errors:
-        return errors
+        return errors, warnings, totals
 
-    ops, trace = read_csv(op_path), read_csv(trace_path)
-    for name, rows in (("op_table.csv", ops), ("call_trace.csv", trace)):
-        for n, row in enumerate(rows, 1):
-            if row["id"] != str(n):
-                errors.append(f"{name} row {n} has id {row['id']}")
+    rows = {name: read_csv(run_dir / name) for name in tables}
+    for name, table in rows.items():
+        for n, row in enumerate(table, 1):
+            if None in row or None in row.values():
+                errors.append(f"{name} row {n}: field count differs from the header")
+    if errors:
+        return errors, warnings, totals
+    for name, table in rows.items():
+        _check_ids(name, table, errors)
+    ops = rows["op_table.csv"]
+    # A measured-only row is traced on the source alone; other targets carry no launch count.
+    launches = {t: [None if r["origin"] == "measured" and t != source
+                    else _int(r[f"{t}:launches"], f"op_table.csv row {n} {t}:launches", errors)
+                    for n, r in enumerate(ops, 1)] for t in launch_targets}
 
     for n, row in enumerate(ops, 1):
+        where = f"op_table.csv row {n}"
+        measured_only = row["origin"] == "measured"
+        if row["origin"] not in ORIGIN_VALUES:
+            errors.append(f"{where}: origin '{row['origin']}' not in {ORIGIN_VALUES}")
         if row["confidence"] not in CONFIDENCE_VALUES:
-            errors.append(f"op_table.csv row {n}: confidence '{row['confidence']}' not in {CONFIDENCE_VALUES}")
-        for col in status_columns(targets):
-            allowed = PROJECTION_STATUS_VALUES if col == "quasar:bf16_projection" else STATUS_VALUES
-            if row[col] not in allowed:
-                errors.append(f"op_table.csv row {n}: {col} '{row[col]}' not in {allowed}")
-        if "quasar" in targets:
-            for col, evidence in (("quasar:as_written", "quasar:evidence"), ("quasar:port", "quasar:evidence"),
-                                  ("quasar:bf16_projection", "quasar:bf16_projection_evidence")):
-                if row[col] in ("✅", "❌") and not row[evidence].strip():
-                    errors.append(f"op_table.csv row {n}: {row[col]} in {col} without {evidence}")
+            errors.append(f"{where}: confidence '{row['confidence']}' not in {CONFIDENCE_VALUES}")
+        if measured_only:
+            for col in ("call_site", "grid_dependency"):
+                if row[col].strip() != NOT_TRACED:
+                    errors.append(f"{where}: measured-only row needs {col} '{NOT_TRACED}'")
+        elif not CALL_SITE.search(row["call_site"]):
+            errors.append(f"{where}: call_site '{row['call_site']}' has no <file>:<line>")
+        condition = row["launch_condition"].strip()
+        if not condition:
+            errors.append(f"{where}: launch_condition empty (use '{ALWAYS}' or name the condition)")
+        elif condition != ALWAYS and condition.lower().startswith(ALWAYS):
+            errors.append(f"{where}: launch_condition '{condition}' must be exactly '{ALWAYS}' or a condition")
+        grid = row["grid_dependency"].strip()
+        if not measured_only and grid not in GRID_KEYWORDS and not CALL_SITE.search(grid):
+            errors.append(f"{where}: grid_dependency '{grid}' is not {GRID_KEYWORDS} or a value with <file>:<line>")
+        for target in (source, destination):
+            status = row[f"{target}:status"]
+            if status not in STATUS_VALUES:
+                errors.append(f"{where}: {target}:status '{status}' not in {STATUS_VALUES}")
+            if not row[f"{target}:evidence"].strip():
+                errors.append(f"{where}: {target}:status without {target}:evidence")
+            count = launches[target][n - 1] if target in launch_targets else None
+            if count is not None and (count == 0) != (status == "n/a"):
+                errors.append(f"{where}: {target} has {count} launches with status '{status}';"
+                              " n/a exactly when the profile launches nothing")
+            if target == "quasar-port" and status != "n/a" and not row[f"{target}:port_op"].strip():
+                errors.append(f"{where}: quasar-port:port_op empty for status '{status}'")
+            if target in TEST_TARGETS:
+                cell = row[f"{target}:tests"]
+                if any(not NODE_ID.match(t) for t in (x.strip() for x in cell.split(";")) if t):
+                    errors.append(f"{where}: {target}:tests '{cell}' is not a list of pytest node ids")
+                result = row[f"{target}:test_result"].strip()
+                if result not in TEST_RESULT_VALUES:
+                    errors.append(f"{where}: {target}:test_result '{result}' not in {TEST_RESULT_VALUES}")
+                elif result in RESULT_STATUS and status != RESULT_STATUS[result]:
+                    errors.append(f"{where}: {target}:test_result '{result}' requires status {RESULT_STATUS[result]}")
 
-    for profile in (p for p in targets if p != "quasar"):
-        op_total = sum(_int(r[f"{profile}:launches"], f"op_table.csv row {r['id']} {profile}:launches", errors)
-                       for r in ops)
+    # Blackhole and unchanged-Quasar evidence legitimately repeats (one CI job, one global blocker).
+    row_specific = ["dispatch_evidence"] + [f"{t}:evidence" for t in (destination,) if t in ROW_SPECIFIC_TARGETS]
+    for column in row_specific:
+        for text, count in collections.Counter(r[column].strip() for r in ops).items():
+            if text and count >= max(BOILERPLATE_MIN_ROWS, len(ops) / 2):
+                warnings.append(f"op_table.csv {column}: the same text in {count} of {len(ops)} rows: '{text[:80]}'")
+
+    op_ids = {r["id"] for r in ops}
+    for n, row in enumerate(rows["port_blockers.csv"], 1):
+        if row["affected_ids"].strip() == "all":
+            continue
+        refs = [x.strip() for x in row["affected_ids"].split(",") if x.strip()]
+        if not refs:
+            errors.append(f"port_blockers.csv row {n}: affected_ids empty (comma-separated op_table ids or 'all')")
+        for ref in refs:
+            if ref not in op_ids:
+                errors.append(f"port_blockers.csv row {n}: affected id '{ref}' is not an op_table id"
+                              " (list ids separated by commas; ranges are not accepted)")
+    for n, row in enumerate(rows["host_ops.csv"], 1):
+        if row["counts_as_host_op"] not in HOST_OP_VALUES:
+            errors.append(f"host_ops.csv row {n}: counts_as_host_op '{row['counts_as_host_op']}' not in {HOST_OP_VALUES}")
+
+    trace = rows["call_trace.csv"]
+    for n, row in enumerate(trace, 1):
+        if row["profile"] not in launch_targets:
+            errors.append(f"call_trace.csv row {n}: profile '{row['profile']}' not in {launch_targets}")
+    for target in launch_targets:
+        op_total = conditional = measured = 0
+        for r, count in zip(ops, launches[target]):
+            if r["origin"] == "measured":
+                measured += count or 0
+                continue
+            op_total += count or 0
+            if r["launch_condition"].strip() != ALWAYS:
+                conditional += count or 0
         trace_total = sum(
-            _int(r["repeats"], f"call_trace.csv row {r['id']} repeats", errors)
-            * _int(r["launches_per_repeat"], f"call_trace.csv row {r['id']} launches_per_repeat", errors)
-            for r in trace if r["profile"] == profile
+            (_int(r["repeats"], f"call_trace.csv row {r['id']} repeats", errors) or 0)
+            * (_int(r["launches_per_repeat"], f"call_trace.csv row {r['id']} launches_per_repeat", errors) or 0)
+            for r in trace if r["profile"] == target
         )
         if op_total != trace_total:
-            errors.append(f"{profile}: op_table launches {op_total} != call_trace launches {trace_total}")
-    return errors
+            errors.append(f"{target}: op_table launches {op_total} != call_trace launches {trace_total}")
+        totals[target] = (op_total, conditional, measured)
+    return errors, warnings, totals
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
-    errors = validate(parser.parse_args().run_dir)
+    errors, warnings, totals = validate(parser.parse_args().run_dir)
     for error in errors:
         print(f"ERROR: {error}")
-    if not errors:
-        print("OK")
-    return 1 if errors else 0
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    if errors:
+        return 1
+    print("OK")
+    for target, (total, conditional, measured) in totals.items():
+        print(f"{target}: {total} launches per inference, {conditional} of them conditional "
+              f"({total - conditional}-{total}); {measured} measured-only launches")
+    return 0
 
 
 if __name__ == "__main__":
