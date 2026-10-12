@@ -89,6 +89,8 @@ def run(repo: Path, definition_commit: str, definition_path: str, purpose: str) 
     try:
         if not _OID.fullmatch(definition_commit) or not _path(definition_path):
             raise PlanError(INPUT_ERROR, "definition needs a full commit ID and exact repository path")
+        # Paths are repository-relative: run from the top level even when started in a subdirectory.
+        repo = Path(_read_git(repo, "rev-parse", "--show-toplevel").decode().strip())
         resolved = _read_git(repo, "rev-parse", "--verify", f"{definition_commit}^{{commit}}").decode().strip()
         if resolved != definition_commit:
             raise PlanError(IDENTITY_ERROR, "definition commit did not resolve exactly")

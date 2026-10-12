@@ -89,6 +89,23 @@ def test_check_plan_separates_coverage_from_candidate_identity(tmp_path, case, e
         assert checkplan.run(repo, definition, "plan.json", "candidate") == 0
 
 
+def test_check_plan_nested_path_from_subdirectory(tmp_path):
+    import hashlib
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    (repo / "dir").mkdir()
+    (repo / "dir" / "file.py").write_text("# nested\n")
+    plan["coverage"]["paths"]["dir/file.py"] = hashlib.sha256(b"# nested\n").hexdigest()
+    plan["coverage"]["commands"] = ["test -f dir/file.py"]
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", "-A")
+    git("commit", "-qm", "nested input")
+    definition = git("rev-parse", "HEAD")
+    assert checkplan.run(repo / "dir", definition, "plan.json", "harness") == 0
+    (repo / "dir" / "file.py").write_text("# changed\n")
+    assert checkplan.run(repo / "dir", definition, "plan.json", "harness") == 65
+
+
 def test_check_plan_git_failure_with_matching_output_still_fails(tmp_path, monkeypatch):
     from ttp import checkplan
     repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)

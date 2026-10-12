@@ -418,7 +418,7 @@ and preferences you add later become part of the project's charter and memory.
   never skip a check because of an earlier pass or failure, and add a negative control that must fail.
 - A harness selector must not need its own future HEAD in a publication whitelist. Use
   `ttp check-plan --purpose harness --definition-commit <full-commit-id> --definition-path checks/harness.json`
-  as a mandatory check command, run from the repository root. The independently reviewed JSON
+  as a mandatory check command, run from anywhere in the repository (it resolves the top level). The independently reviewed JSON
   definition is read from that exact commit, never from its working copy. For example:
 
   ```json
@@ -436,6 +436,9 @@ and preferences you add later become part of the project's charter and memory.
   says nothing about publication approval or files outside the binding. The command checks the
   HEAD and bound inputs again after each successful command. Commands use the usual check shell
   and venv selection, run in order, stop at the first failure, and never skip or reuse a pass.
+  Its own errors exit 65 (identity or coverage), 66 (input or definition) or 20 (git) and print a
+  `check-plan:` line on stderr; a failing command keeps its own exit code, so a command that itself
+  exits 65, 66 or 20 is told apart only by that stderr line, not by the code.
   Prepare the inputs first, then commit the definition and have its purpose, coverage and commands
   independently reviewed; installation pins that definition commit. There is no self-referential
   requirement to include the definition's or a later selector-preparation commit's own SHA.
