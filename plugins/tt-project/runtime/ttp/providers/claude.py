@@ -363,6 +363,9 @@ class Claude(Provider):
         # Keep missing request metadata unknown rather than inventing a denominator.
         u.extra["cache_telemetry"] = {"complete": cache_complete, "requests": None,
                                       "source": "result" if saw_result else "messages"}
+        # API messages and the first one's prompt (the prefix every later call re-reads): `ttp stats`
+        prompts = [t for t in (sum(m.get(k, 0) for k in cache_keys) for m in per_msg.values()) if t]
+        u.extra["cache_telemetry"].update(calls=len(prompts), first_context=prompts[0] if prompts else 0)
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
                 u.auth_failed = True

@@ -9094,7 +9094,9 @@ def test_runs_without_a_result_line_count_their_estimated_cost(env, tmp_path, mo
     first = stalled_run(1)
     assert first["cost_estimated"] == 1 and first["cost_usd"] == pytest.approx(4 * 107_510 * 15 / 1e6)
     assert first["cache_read_tokens"] == 4 * 800_000, "one message's usage was counted more than once"
-    assert json.loads(first["note"])["cache_telemetry"] == {"complete": True, "requests": None, "source": "messages"}
+    # four API messages; the first one's prompt is the prefix every later call re-reads (`ttp stats`)
+    assert json.loads(first["note"])["cache_telemetry"] == {"complete": True, "requests": None, "source": "messages",
+                                                            "calls": 4, "first_context": 802_010}
     assert p.db.one("SELECT estimated FROM ledger")["estimated"] == 1
     assert p.db.task(tid)["spent_usd"] == pytest.approx(first["cost_usd"])
     started = {}
@@ -39002,7 +39004,7 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
         monkey.undo()
     out = capsys.readouterr().out
     assert cli_rc is None and "Context re-reads, last 7 days: 4 runs, $9.10, 12.52 M cache-read tokens" in out
-    assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, max 9.00 M)" in out
+    assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, median 6.00 M, max 9.00 M)" in out
     assert "big code change" in out
     assert "Split steer: no run steered" in out
     for cr, at, how in ((9_000_000, 4_000_000, "done"), (3_000_000, 2_800_000, "waiting")):
@@ -39017,6 +39019,74 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
                             "handoffs": {"done": 1, "waiting": 1, "running": 1}}, s["steered"]
     assert ("Split steer: 3 runs steered, re-read after it 2.03 M avg (max 5.00 M); handed off: done 1, "
             "waiting 1, running 1") in bud.reread_text(s)
+
+
+def test_ttp_stats_leaves_runs_with_no_model_call_out_of_per_run_averages(env, capsys):
+    """Failed sign-ins (status auth, or no prompt tokens at all) cost a wake, not context: a burst of
+    them must not move per-run or median re-reads, and is reported apart."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    code = p.db.add_task("code change", "s", kind="code", tier="standard", origin="user")
+
+    def run(age, cr, status="done", inp=100, usd=1.0, calls=None):
+        note = json.dumps({"cache_telemetry": {"complete": True, "requests": None, "source": "result",
+                                               "calls": calls, "first_context": 40_000}}) if calls else None
+        p.db.x("INSERT INTO runs(task,role,provider,effort,started,ended,status,cost_usd,input_tokens,"
+               "cache_read_tokens,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               (code, "worker", "claude", "high", now - age, now - age + 60, status, usd, inp, cr, note))
+
+    run(3600, 2_000_000, calls=20)
+    run(3000, 4_000_000, calls=40)
+    run(2400, 9_000_000, calls=90)
+    clean = bud.reread_stats(p.db, 7, now=now)
+    for age in range(10, 174):   # 164 runs that never reached the model
+        run(age, 0, status="auth", inp=0, usd=0.0)
+    run(5, 50, status="auth", inp=3, usd=0.0)   # an auth status counts as no call whatever it shows
+    s = bud.reread_stats(p.db, 7, now=now)
+    assert s["runs"] == clean["runs"] == 3 and s["per_run"] == clean["per_run"] == 5_000_000
+    assert s["median"] == 4_000_000 and s["no_work"] == 165 and clean["no_work"] == 0
+    assert s["calls_per_run"] == 50.0 and s["first_context"] == 40_000
+    g = s["groups"][0]
+    assert (g["runs"], g["per_run"], g["median"], g["no_work"]) == (3, 5_000_000, 4_000_000, 165)
+    assert all(t["cache_read"] for t in s["top"]), "a no-call run listed among the top runs"
+    assert "165 runs with no model call left out" in bud.reread_text(s)
+
+
+def test_ttp_stats_split_at_compares_before_and_after_a_change(env, capsys):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    at = now - 2 * 86400
+    code = p.db.add_task("code change", "s", kind="code", tier="standard", origin="user")
+    for age, cr, status in ((4 * 86400, 6_000_000, "done"), (3 * 86400, 6_000_000, "done"),
+                            (86400, 5_000_000, "done"), (3600, 5_000_000, "done"),
+                            *((600 + i, 0, "auth") for i in range(10)), (20 * 86400, 90_000_000, "done")):
+        p.db.x("INSERT INTO runs(task,role,provider,effort,started,ended,status,cost_usd,input_tokens,"
+               "cache_read_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (code, "worker", "claude", "high", now - age, now - age + 60, status, 1.0 if cr else 0.0,
+                100 if cr else 0, cr))
+    s = bud.reread_split(p.db, at, since=at - 7 * 86400, until=now, now=now)
+    b, a = s["before"], s["after"]
+    assert (b["runs"], b["per_run"], b["no_work"]) == (2, 6_000_000, 0), "the 20-day-old run counted"
+    assert (a["runs"], a["per_run"], a["no_work"]) == (2, 5_000_000, 10)
+    assert s["per_run_pct"] == -17 and s["groups"][0]["per_run_pct"] == -17
+    assert s["groups"][0]["runs"] == (2, 2)
+    monkey = pytest.MonkeyPatch()
+    monkey.chdir(p.root)
+    try:
+        assert _ttp_main("stats", "--split-at", str(at), "--days", "7") is None
+        out = capsys.readouterr().out
+        assert "per run 6.00 M -> 5.00 M (-17%)" in out and "no model call 0 -> 10 (left out)" in out
+        assert "worker/code/standard/high: 2 -> 2 runs" in out and "Before:" in out and "After:" in out
+        iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(at))
+        assert _ttp_main("stats", "--since", iso, "--json") is None
+        after = json.loads(capsys.readouterr().out)
+        assert after["runs"] == 2 and after["no_work"] == 10 and after["per_run"] == 5_000_000
+        with pytest.raises(SystemExit):
+            _ttp_main("stats", "--until", "last tuesday")
+    finally:
+        monkey.undo()
 
 
 def _ttp_main(*args):

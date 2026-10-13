@@ -21,6 +21,7 @@ import fnmatch
 import json
 import os
 import re
+import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -715,35 +716,62 @@ def history(db: DB, days: int = 14) -> dict:
             "coordinator_cache": cache}
 
 
-def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10) -> dict:
-    """Context re-read (cache-read) tokens of the runs started in the last `days`: per run, per $,
-    their share of the weighted tokens, by role, task kind, tier and effort, and the top runs. A long
-    run re-reads its whole context on every call, so this is what trimming output and splitting long
-    tasks cut. `ttp stats` prints it; run it before and after a change to compare."""
+NO_WORK_STATUSES = ("auth",)   # a run that ended before any model call, whatever tokens it shows
+
+
+def no_work(r) -> bool:
+    """A run that made no model call: it failed sign-in, or read and wrote no prompt tokens at all.
+    It costs a wake, not context, so per-run averages leave it out (`reread_stats` counts it apart)."""
+    return (r["status"] in NO_WORK_STATUSES
+            or not ((r["input_tokens"] or 0) + (r["cache_read_tokens"] or 0) + (r["cache_write_tokens"] or 0)))
+
+
+def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10,
+                 since: float | None = None, until: float | None = None) -> dict:
+    """Context re-read (cache-read) tokens of the runs started in the last `days` (or between `since`
+    and `until`): per run (mean and median), per $, their share of the weighted tokens, model calls
+    per run and the first call's context (the prefix every later call re-reads), by role, task kind,
+    tier and effort, and the top runs. Runs with no model call (`no_work`) are counted apart and left
+    out of every average. A long run re-reads its whole context on every call, so this is what
+    trimming output and splitting long tasks cut. `ttp stats --split-at` compares before and after."""
     now = now or time.time()
-    since = now - days * 86400
+    since = now - days * 86400 if since is None else since
+    until = now if until is None else until
     w = TOKEN_WEIGHTS
-    rows = db.q("SELECT r.id, r.task, r.role, r.effort, r.started, r.ended, r.status, r.cost_usd, r.input_tokens, "
+    rows = db.q("SELECT r.id, r.task, r.role, r.effort, r.status, r.started, r.ended, r.cost_usd, r.input_tokens, "
                 "r.output_tokens, r.cache_read_tokens, r.cache_write_tokens, r.note, t.kind, t.tier, t.title "
-                "FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.started>=?", (since,))
+                "FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.started>=? AND r.started<?", (since, until))
 
     def total(rs: list, k: str) -> float:
         return sum(r[k] or 0 for r in rs)
 
-    def summary(rs: list) -> dict:
+    def mean(xs: list) -> float | None:
+        return round(sum(xs) / len(xs), 1) if xs else None
+
+    def summary(all_rs: list) -> dict:
+        rs = [r for r in all_rs if not no_work(r)]
         n, usd, cr = len(rs), total(rs, "cost_usd"), int(total(rs, "cache_read_tokens"))
         units = (total(rs, "input_tokens") * w["input"] + total(rs, "output_tokens") * w["output"]
                  + cr * w["cache_read"] + total(rs, "cache_write_tokens") * w["cache_write"])
+        tel = [(_note(r["note"]).get("cache_telemetry") or {}) for r in rs]
+        calls = [t["calls"] for t in tel if isinstance(t, dict) and isinstance(t.get("calls"), int) and t["calls"] > 0]
+        first = [t["first_context"] for t in tel
+                 if isinstance(t, dict) and isinstance(t.get("first_context"), int) and t["first_context"] > 0]
+        idle = [r for r in all_rs if no_work(r)]
         return {"runs": n, "usd": round(usd, 2), "cache_read": cr, "per_run": round(cr / n) if n else 0,
+                "median": round(statistics.median(r["cache_read_tokens"] or 0 for r in rs)) if rs else 0,
                 "per_usd": round(cr / usd) if usd else 0, "max": max((r["cache_read_tokens"] or 0 for r in rs), default=0),
-                "share": round(cr * w["cache_read"] / units, 3) if units else 0.0}
+                "share": round(cr * w["cache_read"] / units, 3) if units else 0.0,
+                "calls_per_run": mean(calls), "calls_runs": len(calls),
+                "first_context": round(sum(first) / len(first)) if first else None, "first_context_runs": len(first),
+                "no_work": len(idle), "no_work_usd": round(total(idle, "cost_usd"), 2)}
 
     groups: dict[tuple, list] = {}
     for r in rows:
         groups.setdefault((r["role"], r["kind"] or "-", r["tier"] or "-", r["effort"] or "-"), []).append(r)
     by = [{"role": k[0], "kind": k[1], "tier": k[2], "effort": k[3], **summary(v)} for k, v in groups.items()]
-    by.sort(key=lambda g: -g["cache_read"])
-    worst = sorted(rows, key=lambda r: -(r["cache_read_tokens"] or 0))[:top]
+    by.sort(key=lambda g: (-g["cache_read"], -g["no_work"]))
+    worst = sorted((r for r in rows if not no_work(r)), key=lambda r: -(r["cache_read_tokens"] or 0))[:top]
     # Runs the split steer reached (daemon._suggest_split): what they re-read after it, how they handed off.
     after, handoffs = [], {}
     for r in rows:
@@ -755,21 +783,51 @@ def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 1
         handoffs[how] = handoffs.get(how, 0) + 1
     steered = {"runs": len(after), "after_avg": round(sum(after) / len(after)) if after else 0,
                "after_max": max(after, default=0), "handoffs": dict(sorted(handoffs.items(), key=lambda kv: -kv[1]))}
-    return {"days": days, "since": since, **summary(rows), "groups": by, "steered": steered,
+    return {"days": round((until - since) / 86400, 2), "since": since, "until": until, **summary(rows), "groups": by,
+            "steered": steered,
             "top": [{"run": r["id"], "task": r["task"], "role": r["role"], "kind": r["kind"], "tier": r["tier"],
                      "effort": r["effort"], "usd": round(r["cost_usd"] or 0, 2), "cache_read": r["cache_read_tokens"] or 0,
                      "minutes": round(((r["ended"] or now) - (r["started"] or now)) / 60),
                      "title": (r["title"] or "")[:60]} for r in worst]}
 
 
-def reread_text(s: dict) -> str:
+def reread_split(db: DB, at: float, since: float, until: float | None = None, now: float | None = None,
+                 top: int = 10) -> dict:
+    """`reread_stats` before and after `at` (a change landing), with each group's per-run change.
+    Runs with no model call stay out of both sides' averages, so a burst of failed sign-ins after
+    the change does not read as a rise in context."""
+    now = now or time.time()
+    before = reread_stats(db, now=now, top=top, since=since, until=at)
+    after = reread_stats(db, now=now, top=top, since=at, until=until)
+    key = lambda g: (g["role"], g["kind"], g["tier"], g["effort"])
+    old = {key(g): g for g in before["groups"]}
+
+    def change(a, b):
+        return round(100 * (b - a) / a) if a and b is not None else None
+
+    delta = [{"role": g["role"], "kind": g["kind"], "tier": g["tier"], "effort": g["effort"],
+              "runs": (old[key(g)]["runs"], g["runs"]), "per_run": (old[key(g)]["per_run"], g["per_run"]),
+              "per_run_pct": change(old[key(g)]["per_run"], g["per_run"]),
+              "median_pct": change(old[key(g)]["median"], g["median"])}
+             for g in after["groups"] if key(g) in old and g["runs"] and old[key(g)]["runs"]]
+    return {"at": at, "before": before, "after": after, "per_run_pct": change(before["per_run"], after["per_run"]),
+            "median_pct": change(before["median"], after["median"]), "groups": delta}
+
+
+def reread_text(s: dict, tz=None) -> str:
     """`reread_stats` for people: totals, the groups and the top runs, one line each."""
     m = lambda n: f"{n / 1e6:.2f} M"
-    lines = [f"Context re-reads, last {s['days']:g} days: {s['runs']} runs, ${s['usd']:.2f}, {m(s['cache_read'])} "
-             f"cache-read tokens ({m(s['per_run'])} per run, {m(s['per_usd'])} per $, {s['share']:.0%} of "
-             "weighted tokens)", "By role / kind / tier / effort:"]
+    when = (f"{timefmt.long(s['since'], tz)} to {timefmt.long(s['until'], tz)}" if tz is not None
+            else f"last {s['days']:g} days")
+    extra = lambda g: "".join((f", {g['calls_per_run']:g} calls per run" if g["calls_per_run"] is not None else "",
+                               f", first call {g['first_context'] / 1e3:.0f} k" if g["first_context"] is not None else "",
+                               f"; {g['no_work']} runs with no model call left out" if g["no_work"] else ""))
+    lines = [f"Context re-reads, {when}: {s['runs']} runs, ${s['usd']:.2f}, {m(s['cache_read'])} "
+             f"cache-read tokens ({m(s['per_run'])} per run, median {m(s['median'])}, {m(s['per_usd'])} per $, "
+             f"{s['share']:.0%} of weighted tokens{extra(s)})", "By role / kind / tier / effort:"]
     lines += [f"  {g['role']}/{g['kind']}/{g['tier']}/{g['effort']}: {g['runs']} runs, ${g['usd']:.2f}, "
-              f"{m(g['cache_read'])} ({m(g['per_run'])} per run, max {m(g['max'])})" for g in s["groups"]]
+              f"{m(g['cache_read'])} ({m(g['per_run'])} per run, median {m(g['median'])}, max {m(g['max'])}{extra(g)})"
+              for g in s["groups"]]
     st = s.get("steered") or {}
     if st.get("runs"):
         lines.append(f"Split steer: {st['runs']} runs steered, re-read after it {m(st['after_avg'])} avg (max "
@@ -863,6 +921,20 @@ def tool_output_text(s: dict) -> str:
     lines += [f"  {g['category']}: {g['calls']} calls, {g['chars'] / 1e6:.2f} M chars ({g['share']:.0%})"
               for g in s["categories"]]
     return "\n".join(lines)
+
+
+def reread_split_text(s: dict, tz=None) -> str:
+    """`reread_split` for people: the change per group, then each side in full."""
+    m = lambda n: f"{n / 1e6:.2f} M"
+    pct = lambda v: "n/a" if v is None else f"{v:+d}%"
+    b, a = s["before"], s["after"]
+    lines = [f"Before / after {timefmt.long(s['at'], tz or 'UTC')}: per run {m(b['per_run'])} -> {m(a['per_run'])} "
+             f"({pct(s['per_run_pct'])}), median {m(b['median'])} -> {m(a['median'])} ({pct(s['median_pct'])}); "
+             f"runs {b['runs']} -> {a['runs']}, no model call {b['no_work']} -> {a['no_work']} (left out)"]
+    lines += [f"  {g['role']}/{g['kind']}/{g['tier']}/{g['effort']}: {g['runs'][0]} -> {g['runs'][1]} runs, "
+              f"per run {m(g['per_run'][0])} -> {m(g['per_run'][1])} ({pct(g['per_run_pct'])}), "
+              f"median {pct(g['median_pct'])}" for g in s["groups"]]
+    return "\n".join(lines + ["", "Before:", reread_text(b, tz or "UTC"), "", "After:", reread_text(a, tz or "UTC")])
 
 
 def _note(raw) -> dict:

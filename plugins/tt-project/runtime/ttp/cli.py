@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import datetime as _dt
 import getpass
 import hashlib
 import json
@@ -1051,8 +1052,33 @@ def cmd_stats(a) -> None:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
         return
-    s = bud.reread_stats(p.db, a.days, top=a.top)
-    print(json.dumps(s, indent=1) if a.json else bud.reread_text(s))
+    tz = timefmt.home(p)
+    since, until, at = (_stats_time(v, tz, flag) for v, flag in ((a.since, "--since"), (a.until, "--until"),
+                                                                 (a.split_at, "--split-at")))
+    if at is not None:
+        span = a.days * 86400
+        s = bud.reread_split(p.db, at, since if since is not None else at - span,
+                             until if until is not None else min(time.time(), at + span), top=a.top)
+        print(json.dumps(s, indent=1) if a.json else bud.reread_split_text(s, tz))
+        return
+    s = bud.reread_stats(p.db, a.days, top=a.top, since=since, until=until)
+    print(json.dumps(s, indent=1) if a.json else bud.reread_text(s, tz if since or until else None))
+
+
+def _stats_time(v: str | None, tz: str, flag: str) -> float | None:
+    """A `ttp stats` time: epoch seconds, or an ISO date or date-time in the project's home zone
+    unless it names its own offset ('2026-10-12', '2026-10-12 14:00', '2026-10-12T21:00Z')."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    try:
+        d = _dt.datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+    except ValueError:
+        die(f"{flag}: {v!r} is not a time; give epoch seconds or an ISO date, e.g. 2026-10-12 14:00")
+    return (d if d.tzinfo else d.replace(tzinfo=timefmt.tzinfo(tz))).timestamp()
 
 
 def cmd_audit(a) -> None:
@@ -4448,7 +4474,10 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")
     s.add_argument("name", nargs="?")
-    s.add_argument("--days", type=float, default=7)
+    s.add_argument("--days", type=float, default=7, help="the window, or each side's span with --split-at")
+    s.add_argument("--since", help="start: epoch seconds or ISO date/time (home zone unless it has an offset)")
+    s.add_argument("--until", help="end, the same way (default now)")
+    s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10)
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
     s.add_argument("--json", action="store_true")
