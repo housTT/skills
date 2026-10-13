@@ -55911,3 +55911,18 @@ def test_an_on_pass_cmd_waiting_for_its_running_run_keeps_an_expired_task_asleep
     assert not _ready(p, tid), "a model run must not start while its on_pass_cmd waits"
     assert (p.logs / "daemon.log").read_text().count(f"on_pass_cmd waits for run {run} to finish") == 1
     assert task["status"] == "queued"
+
+
+def test_start_after_accepts_a_space_and_the_home_zone_abbreviation(env):
+    from datetime import datetime, timezone
+    from ttp import coordinator
+    tz, now = "America/Los_Angeles", datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc).timestamp()
+    want = datetime(2026, 10, 13, 23, 0, tzinfo=timezone.utc).timestamp()
+    assert coordinator.parse_start_after("2026-10-13 16:00 PDT", now=now, tz=tz) == want
+    assert coordinator.parse_start_after("2026-10-13 16:00", now=now, tz=tz) == want
+    assert coordinator.parse_start_after("2026-12-01 16:00 pst", now=now, tz=tz) == \
+        datetime(2026, 12, 2, 0, 0, tzinfo=timezone.utc).timestamp()
+    with pytest.raises(ValueError, match=r"2026-10-13T16:00-07:00"):
+        coordinator.parse_start_after("2026-10-13 16:00 EDT", now=now, tz=tz)
+    with pytest.raises(ValueError, match=r"2026-10-13T16:00-07:00"):
+        coordinator.parse_start_after("2026-10-13 16:00 PST", now=now, tz=tz)

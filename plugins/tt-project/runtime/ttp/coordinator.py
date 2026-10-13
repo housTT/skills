@@ -44,7 +44,7 @@ ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "noti
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
 START_AFTER_RE = (r"^(now|[0-9]+ ?[smhdw]|[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?"
-                  r"(Z|[+-][0-9]{2}:?[0-9]{2})?)$")
+                  r"(Z|[+-][0-9]{2}:?[0-9]{2}| [A-Za-z]{2,5})?)$")
 START_WHEN_CHARS = 1000
 START_WHY_CHARS = 200     # the plain words for a start_when probe, shown to the user instead
 MAX_DEFER_S = 365 * 86400
@@ -884,11 +884,20 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
     if m:
         at = now + int(m[1]) * sched._UNIT[m[2]]
     else:
+        abbr = None
+        if (z := re.fullmatch(r"(.*[0-9]) ([A-Za-z]{2,5})", s)) and z[2].upper() != "Z":
+            s, abbr = z[1], z[2].upper()
+        elif z:
+            s = z[1] + "Z"
         iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
         try:
             at_dt = datetime.fromisoformat(iso)
             if at_dt.tzinfo is None and timefmt.valid(tz):
                 at_dt = at_dt.replace(tzinfo=ZoneInfo(timefmt.valid(tz)))
+            if abbr and (at_dt.tzinfo is None or at_dt.tzname() != abbr):
+                fix = at_dt.isoformat(timespec="minutes") if at_dt.tzinfo else iso
+                raise ValueError(f"zone {abbr} is not the home zone's ({timefmt.valid(tz) or 'none set'}); "
+                                 f"write the ISO form, e.g. {fix}")
             at = at_dt.timestamp()
         except ValueError as e:
             raise ValueError(f"start_after {raw!r}: {e}") from None
