@@ -11370,6 +11370,26 @@ def test_status_says_not_running_when_the_heartbeat_is_stale(env):
     assert st["heartbeat"]["age"] > st["heartbeat_stale_s"]
 
 
+def test_status_falls_back_to_the_heartbeat_when_the_pid_probe_fails(env, monkeypatch):
+    """In a sandboxed worker (own pid namespace or hostname) the pid probe fails for a live daemon."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.cli import daemon_state
+    dmod.Daemon(p.base)._beat()
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    monkeypatch.setattr(dmod, "_alive", lambda pid: False)
+    for run_dir in ("", "/tmp/run"):
+        monkeypatch.setenv("TTP_RUN_DIR", run_dir) if run_dir else monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+        os.utime(p.state / "heartbeat", None)
+        assert daemon_state(p).startswith("running (heartbeat ")
+        old = time.time() - dmod.HEARTBEAT_STALE_S - 60
+        os.utime(p.state / "heartbeat", (old, old))
+        assert daemon_state(p) == "NOT RUNNING"
+    mid = time.time() - 200
+    os.utime(p.state / "heartbeat", (mid, mid))
+    assert daemon_state(p) == "status unknown from this sandbox"
+
+
 def _install_template(env, edit=None):
     """A copy of the plugin as `ttp setup` installs it, optionally with prompt edits {name: text}."""
     import shutil
