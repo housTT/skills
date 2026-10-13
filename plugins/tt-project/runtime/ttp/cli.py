@@ -1662,8 +1662,18 @@ def cmd_checks(a) -> None:
             failed = HARNESS_SKIPPED
             out.write(f"{failed}\n")
             passed, todo = False, []
+        # A continuation's if_changed checks that passed at its lineage's marker, with nothing under their
+        # scope changed since, are verified through it (verified.py); `ttp push` never reads the marker.
+        mark, verified_cmds = _verified_scope(p, Path(top), head, todo, lambda m: (print(f"ttp checks: {m}"),
+                                                                                    out.write(f"{m}\n"))) \
+            if passed and todo and purpose == "candidate" else (None, [])
+        todo = [c for c in todo if c not in verified_cmds]
         hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
-        if not todo and passed and push.outside_scope(cmds, skipped):
+        if not todo and passed and verified_cmds:
+            said = f"every applicable check was {mark['line']}"
+            out.write(f"{said}\n")
+            print(f"ttp checks: {said}")
+        elif not todo and passed and push.outside_scope(cmds, skipped):
             out.write(f"{push.OUT_OF_SCOPE}\n")
             print(f"ttp checks: {push.OUT_OF_SCOPE}")
         elif not todo and passed:
@@ -1725,6 +1735,8 @@ def cmd_checks(a) -> None:
             "purpose": purpose, **({"env_problem": env_problem} if env_problem else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                     **({"verified": verified_cmds, "verified_through": mark["sha"]}
+                                                        if verified_cmds else {}),
                                                      "purpose": purpose, **({"not_run": not_run} if not_run else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
@@ -1742,10 +1754,13 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    if purpose == "candidate":
+        _mark_verified(p, head, tree, list(todo) + list(verified_cmds))
     if hit:
         print(said)
         return
-    _record_pass(p, tree, todo, purpose)
+    if todo:
+        _record_pass(p, tree, todo, purpose)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
@@ -1754,6 +1769,57 @@ def cmd_checks(a) -> None:
 
 
 HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
+
+
+def _run_task(p: Project | None) -> dict | None:
+    task = os.environ.get("TTP_TASK") or ""
+    try:
+        return p.db.task(int(task)) if p and task.isdigit() else None
+    except Exception:
+        return None
+
+
+def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say) -> tuple[dict | None, list]:
+    """(the run's task's inherited checks marker, the if_changed checks in `todo` it verifies): each passed
+    at the marker, and the commits after it change nothing under its scope. A marker that is no longer an
+    ancestor of `head` (rewritten history) verifies none: every check runs, and that is said. Checks without
+    an if_changed scope always run, as they cover the whole tree."""
+    from . import push, verified
+    t = _run_task(p)
+    try:
+        m = verified.scope(p.db, t, top, head, "checks", include_self=True) if t else None
+    except Exception:
+        return None, []
+    if not m or m["sha"] == head:
+        return m, []
+    if not m["ok"]:
+        say(m["line"])
+        return m, []
+    files = verified.changed_since(top, m["sha"], head)
+    if files is None:
+        say(f"cannot tell what changed since {m['sha'][:12]}: full verification")
+        return m, []
+    passed = {str(c) for c in m.get("commands") or []}
+    mine = [c for c in todo if getattr(c, "if_changed", ()) and str(c) in passed
+            and not any(push.matches(files, g) for g in c.if_changed)]
+    for c in mine:
+        say(f"Verified: {c} ({m['line']}: nothing under {', '.join(c.if_changed)} changed since)")
+    if not mine:
+        say(f"{m['line']}: every check runs, as each covers what changed since")
+    return m, mine
+
+
+def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
+    """Record this run's task as verified through `head` (verified.py); a failure never fails the checks."""
+    from . import verified
+    t = _run_task(p)
+    if not t:
+        return
+    try:
+        verified.record(p.db, t["id"], "checks", head, tree=tree, commands=[str(c) for c in cmds],
+                        run=os.environ.get("TTP_RUN_ID") or "?")
+    except Exception as e:
+        print(f"ttp checks: could not record the verified-through marker: {e}", file=sys.stderr)
 
 
 def _harness_purpose(a) -> dict:

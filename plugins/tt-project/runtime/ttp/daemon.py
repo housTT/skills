@@ -79,6 +79,7 @@ from . import timefmt
 from . import turngate
 from . import unblock
 from . import upstream
+from . import verified
 from . import waitheal
 from . import watchdup
 from . import screen as scr
@@ -2762,6 +2763,8 @@ class Daemon:
                 approval, new = check, "pushing"
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
+        if new in ("done", "pushing"):
+            self._mark_verified(task, approval, extra)
         if ended:
             extra["run_status"] = ended
         if wakes and new != "blocked":
@@ -6474,6 +6477,8 @@ class Daemon:
         if prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
+        if line := self._verified_review_line(task, full):
+            lines.append(line)
         lines.append(REVIEW_CHECK_LINE)
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
                      "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
@@ -6565,6 +6570,39 @@ class Daemon:
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
+
+    def _verified_review_line(self, task: dict, full: str) -> str:
+        """The review spec's line on the review marker the code task inherits (verified.py): review only
+        what came after it while it is an ancestor of the head, else the whole change. "" without one."""
+        try:
+            m = verified.scope(self.p.db, task, self.p.root, full, "review")
+        except Exception as e:
+            log(self.p, f"task {task['id']}: inherited marker not read: {e}")
+            return ""
+        if not m:
+            return ""
+        if not m["ok"]:
+            return f"Inherited marker: {m['line']}: review the whole change, inherited commits included."
+        return (f"Inherited marker: {m['line']}. Review only the commits after it (`git log {m['sha'][:12]}.."
+                f"{full[:12]}`); do not review or re-test the inherited commits again. The push checks still run "
+                f"in full on the commit that is pushed.")
+
+    def _mark_verified(self, task: dict, approval: dict | None, extra: dict) -> None:
+        """A passing review records the head it accepted as the reviewed code tasks' `review` marker
+        (verified.py); a finished task's hand-off shows the marker it reached. Never fails the hand-off."""
+        try:
+            if task["kind"] == "review":
+                heads = [e["head"] for e in (approval or {}).get("entries") or [] if e.get("head")]
+                head = heads[0] if heads else worktree.reviewed_head(self.p, task)
+                if not head:
+                    return
+                for t in push._reviewed(self.p, str(task["id"])):
+                    verified.record(self.p.db, t["id"], "review", head, review=task["id"])
+                extra["verified_through"] = head
+            elif m := verified.own(self.p.db, task["id"], "checks"):
+                extra["verified_through"] = m["sha"]
+        except Exception as e:
+            log(self.p, f"task {task['id']}: verified-through marker not recorded: {e}")
 
     def _precheck_line(self, task: dict, head: str, checks: Path) -> str:
         """The review spec's line on the checks _precheck started on the code task's head."""

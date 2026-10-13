@@ -519,6 +519,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
                     + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
+    history += verified_line(p, task, cwd)
     own_off = own_push(cfg) == "off"
     if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):
         history += (f"\nThis task builds on branch {onto}, but own pushes are off in this project "
@@ -567,6 +568,29 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
+
+
+def verified_line(p: Project, task: dict, cwd: str) -> str:
+    """What a task building on verified work verifies (verified.py): only the commits after its lineage's
+    marker while that is an ancestor of HEAD, else everything, said either way. "" with no marker or no
+    git HEAD in `cwd`."""
+    import subprocess
+    from . import verified
+    try:
+        if not continues_id(task):
+            return ""
+        head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True,
+                              timeout=30).stdout.strip() if cwd else ""
+        m = verified.scope(p.db, task, cwd, head) if head else None
+    except Exception:
+        return ""
+    if not m:
+        return ""
+    if not m["ok"]:
+        return (f"\nInherited marker: {m['line']}. Verify the whole change, inherited commits included.\n")
+    return (f"\nInherited marker: {m['line']}. Verify only the commits after it (`git log {m['sha'][:12]}..HEAD`) "
+            f"and your own: do not re-review or re-test the inherited commits. `ttp checks` scopes its "
+            f"if_changed checks the same way; the push checks still run in full on the final head.\n")
 
 
 def spec_digest(task: dict) -> str:
