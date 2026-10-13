@@ -2698,12 +2698,16 @@ def cmd_prune(a) -> None:
             print(f"  {e['path']}  {e['size'] / 1e6:.1f} MB  {e['stored']}"
                   + ("  (hand-off artifact)" if e.get("named") else "")
                   + (f"  {where['location']}" if where.get("location") else ""))
+        for e in m.get("patches") or []:
+            print(f"  tracked changes ({len(e.get('paths') or [])} file(s)): "
+                  f"git apply {archive.task_dir(p, a.archived) / e['file']}  (on {str(m.get('head') or '?')[:12]})")
         return
     dry = getattr(a, "dry_run", False)
     disk = p.config().get("disk", {})
     before = shutil.disk_usage(p.worktrees).free if p.worktrees.is_dir() else 0
     res = worktree.sweep(p, names=disk.get("cache_dirs"), leftovers_max_mb=disk.get("worktree_leftovers_max_mb"),
-                         archive_max_mb=disk.get("worktree_archive_max_mb"), dry_run=dry)
+                         archive_max_mb=disk.get("worktree_archive_max_mb"), dry_run=dry,
+                         patch_tracked=getattr(a, "patch_tracked", False))
     for r in res:
         cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
         mv, ar = r.get("moved"), r.get("archived")
@@ -2715,6 +2719,8 @@ def cmd_prune(a) -> None:
                       + (f", {'would drop' if dry else 'dropped'} {ar['dropped']} over the cap "
                          f"({ar['dropped_bytes'] / 1e6:.1f} MB, listed in the manifest)" if ar["dropped"] else "")
                       + "; ")
+        if r.get("patched"):
+            moved += f"{'would save' if dry else 'saved'} its {len(r['patched'])} changed tracked file(s) as a verified patch; "
         if r.get("unlocked") is not None:
             moved += f"{'would clear' if dry else 'cleared'} its stale lock ({r['unlocked'] or 'no reason'}); "
         print(f"#{r['task']} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
@@ -4299,6 +4305,9 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--archived", type=int, metavar="TASK",
                            help="list what the sweep archived from this task's worktree (and where)")
             s.add_argument("--restore", metavar="DIR", help="with --archived: extract the task's archived files here")
+            s.add_argument("--patch-tracked", action="store_true",
+                           help="also free done or cancelled tasks' worktrees with uncommitted tracked changes, "
+                                "saving them as a verified patch in the archive")
         if name == "logs":
             s.add_argument("--bytes", type=int, default=6000)
         if name == "doctor":

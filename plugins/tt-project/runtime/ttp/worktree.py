@@ -515,14 +515,14 @@ def resolve_base(p: Project) -> str:
                        + (f"; similar: {', '.join(near)}" if near else ""))
 
 
-def remove(p: Project, task_id: int) -> None:
+def remove(p: Project, task_id: int, force: bool = False) -> None:
     """Remove a task's worktree; its branch stays. Call only once keep_reason() found nothing to lose.
-    Ignored files go with it (sweep keeps one holding hand-off artifacts). No --force: git itself then
+    Ignored files go with it (sweep archives hand-off artifacts first). No --force: git itself then
     refuses a worktree with changes or with submodules, whose commits may live only in the worktree's
-    own git directory."""
+    own git directory. `force` only once its tracked changes are in a verified archived patch."""
     path = p.worktrees / f"t{task_id}"
     if path.exists():
-        _git(p.root, "worktree", "remove", str(path))
+        _git(p.root, "worktree", "remove", *(["--force"] if force else []), str(path))
     _git(p.root, "worktree", "prune", check=False)
 
 
@@ -796,6 +796,22 @@ HARNESS_LOCKS = ("initializing",)   # worktree lock reasons git or the harness s
 ARCHIVE_MAX_MB = 200   # disk.worktree_archive_max_mb: unnamed untracked files archived per task, the rest dropped
 
 
+def _small_logs(path: Path, limit: int = 200) -> list[str]:
+    """Ignored *.log files of at most archive.LOG_MAX_MB each (up to `limit`), relative to the worktree:
+    `git worktree remove` would delete them, and they are cheap to keep."""
+    from . import archive
+    out = []
+    for f in archive.files_of(path, sorted(_ignored(path) or [])):
+        try:
+            if f.endswith(".log") and not (path / f).is_symlink() and (path / f).stat().st_size <= archive.LOG_MAX_MB * 1e6:
+                out.append(f)
+        except OSError:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _users(path: Path) -> list[int]:
     """Live processes whose working directory is in `path` (from /proc; none known without it)."""
     root = path.resolve()
@@ -816,6 +832,7 @@ def _users(path: Path) -> list[int]:
 
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
           skip=lambda task: False, leftovers_max_mb: float | None = None, archive_max_mb: float | None = None,
+          patch_tracked: bool = False,
           dry_run: bool = False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run or process still
     going: clear their build and cache directories, then remove each one whose removal loses nothing
@@ -827,7 +844,11 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     reported in `archived`). Other untracked files (HEAD on a branch) move to the last run's
     directory when they total at most `leftovers_max_mb` (see leftovers; reported in `moved`); larger
     ones are listed in the archive's manifest and kept there up to `archive_max_mb` (None:
-    ARCHIVE_MAX_MB), smallest first, the rest dropped. `leftovers_max_mb` 0 or less keeps the worktree
+    ARCHIVE_MAX_MB), smallest first, the rest dropped. Small ignored logs (*.log up to
+    archive.LOG_MAX_MB each) are archived with them. With `patch_tracked` (the disk guard's sweep,
+    `ttp prune --patch-tracked`), a done or cancelled task's tracked changes go into a binary patch
+    verified to apply to its head (archive.tracked_patch) and the worktree is removed, when that head
+    is on a branch. `leftovers_max_mb` 0 or less keeps the worktree
     of untracked files as it is. One with modified tracked files is kept and reported with `tracked`
     (paths) and `fingerprint`. A stale lock git or the harness set (HARNESS_LOCKS: a `git worktree
     add` that never finished) is cleared (`unlocked`); a half-made worktree goes. Any other lock keeps
@@ -902,7 +923,18 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 info = inspect(path)
                 why = info["why"]
                 others: list[str] = []
-                if info["dirty"] == "tracked":
+                patch = None
+                if info["dirty"] == "tracked" and patch_tracked and task["status"] in ("done", "cancelled") \
+                        and _git(path, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/heads", "refs/remotes",
+                                 check=False).strip():
+                    patch = archive.tracked_patch(path)
+                    res["patched"] = info["tracked"]
+                    untracked = _git(path, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+                    untracked = [u for u in untracked if u]
+                    arts += handoff_artifacts(p, task["id"], path, ignored=set(untracked), entries=entries)
+                    others = [u for u in untracked if not any(u == a or u.startswith(a + "/") for a in arts)]
+                    why = None
+                elif info["dirty"] == "tracked":
                     res.update(tracked=info["tracked"], fingerprint=info["fingerprint"])
                 elif info["dirty"] == "untracked" and limit <= 0:
                     why = (f"uncommitted untracked files only ({len(info['untracked'])}); moving them out is off "
@@ -918,14 +950,18 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                         if not dry_run:
                             move_leftovers(path, others, run / LEFTOVERS_DIR)
                         others = []
-                if why is None and (arts or others):
-                    res["archived"] = (archive.plan(path, arts, others, cap) if dry_run else archive.store(
-                        p, task, path, arts, others, cap, head=_git(path, "rev-parse", "HEAD", check=False)))
-                if why is None and not dry_run and (res.get("moved") or res.get("archived")):
+                if why is None:
+                    others += [f for f in _small_logs(path) if f not in others and not any(
+                        f == a or f.startswith(a + "/") for a in arts)]
+                if why is None and (arts or others or patch):
+                    res["archived"] = (archive.plan(path, arts, others, cap, patch) if dry_run else archive.store(
+                        p, task, path, arts, others, cap, head=_git(path, "rev-parse", "HEAD", check=False),
+                        patch=patch, tracked=res.get("patched") or []))
+                if why is None and not dry_run and not patch and (res.get("moved") or res.get("archived")):
                     why = keep_reason(path)
                 res["why"] = why
                 if why is None and not dry_run:
-                    remove(p, task["id"])
+                    remove(p, task["id"], force=bool(patch))
             except Exception as e:
                 res["why"] = f"error: {e}"[:300]
             out.append(res)

@@ -4702,7 +4702,8 @@ class Daemon:
         results = worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"),
                                  skip=(lambda task: False) if force else recent,
                                  leftovers_max_mb=cfg.get("worktree_leftovers_max_mb"),
-                                 archive_max_mb=cfg.get("worktree_archive_max_mb"))
+                                 archive_max_mb=cfg.get("worktree_archive_max_mb"),
+                                 patch_tracked=force)   # the disk guard's sweep also frees tracked changes as patches
         for r in results:
             key = str(r["task"])
             if r.get("unlocked") is not None:
