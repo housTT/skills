@@ -47468,6 +47468,76 @@ def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
     assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
 
 
+def test_heal_known_fault_object_is_validated_and_strings_still_load(env):
+    from datetime import datetime, timezone
+    from ttp import heal
+    from ttp import schedule as sched
+    iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    assert heal.validate({"check": "true", "known_fault": "vendor bug"})["known_fault"] == "vendor bug"
+    ok = [{"name": "svc", "kind": "command", "every": "5m",
+           "payload": {"heal": {"check": "true", "known_fault": "vendor bug"}}}]
+    assert sched.parse_file(json.dumps(ok))
+    kf = {"why": "vendor bug", "match": "err [0-9]+", "until": iso(time.time() + 6 * 86400)}
+    assert heal.validate({"check": "true", "known_fault": kf})["known_fault"] == kf
+    assert heal.validate({"check": "true", "known_fault": {"why": "vendor bug"}})
+    for bad, msg in [({"why": "x", "owner": "y"}, "unknown key"), ({"match": "x"}, "needs `why`"),
+                     ({"why": " "}, "needs `why`"), ({"why": "x", "match": "("}, "not a valid regex"),
+                     ({"why": "x", "match": 3}, "is text"), ({"why": "x", "until": "soon"}, "ISO time"),
+                     ({"why": "x", "until": iso(time.time() + 8 * 86400)}, "at most 7 d"), (["x"], "text or an object")]:
+        with pytest.raises(ValueError, match=msg):
+            heal.validate({"check": "true", "known_fault": bad})
+
+
+@pytest.mark.parametrize("fix", [True, False])
+def test_heal_known_fault_match_keeps_only_matching_failures_quiet(env, fix):
+    from ttp import heal
+    p, d, up = _heal_setup(env, known_fault={"why": "vendor bug", "match": "err [0-9]+: vendor"},
+                          **({} if fix else {"fix": None}))
+    spec, now = dict(_heal_spec(p), check=f"test -e {up} || {{ echo 'err 42: vendor fault'; exit 1; }}"), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    other = dict(spec, known_fault={"why": "vendor bug", "match": "power lost"})
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    out = heal.run(d, "svc", other, now)[0]
+    if fix:
+        assert out == "unhealthy (fixed; rechecking)" and up.exists()
+    else:
+        assert "self-fix task" in out and len(p.db.q("SELECT id FROM tasks WHERE origin='daemon'")) == 1
+
+
+@pytest.mark.parametrize("form", ["string", "until"])
+def test_heal_known_fault_ends_escalates_and_asks_renewal_once(env, form):
+    from datetime import datetime, timezone
+    from ttp import heal
+    now = time.time()
+    end = now + 3600 if form == "until" else now + heal.KNOWN_FAULT_S
+    kf = ("vendor bug" if form == "string"
+          else {"why": "vendor bug", "until": datetime.fromtimestamp(end, timezone.utc).isoformat()})
+    p, d, up = _heal_setup(env, fix=None, known_fault=kf)
+    spec = _heal_spec(p)
+    renewals = lambda: p.db.q("SELECT * FROM messages WHERE direction='out' AND text LIKE '%known_fault (vendor bug) ended%'")
+    observed = lambda: p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'heal:svc:known_fault:%'")
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.state(p.db, "svc")["known_since"] == now
+    # A healthy spell keeps its end: a flapping fault never renews itself.
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 60)[0] == "ok (healthy)"
+    up.unlink()
+    assert heal.run(d, "svc", spec, end - 60)[0] == "unhealthy (known fault: kept quiet)"
+    assert not renewals() and heal.holds(p.db, "svc", end - 60) is False
+    out = heal.run(d, "svc", spec, end + 1)[0]
+    assert "self-fix task" in out, out
+    assert len(renewals()) == 1 and renewals()[0]["severity"] == "low"
+    assert len(observed()) == 1 and observed()[0]["severity"] == "low"
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    assert heal.run(d, "svc", spec, end + 120)[0] == f"unhealthy (self-fix task #{tid} failed; alerted)"
+    assert len(renewals()) == 1 and len(observed()) == 1
+    # Renewing (a changed entry) keeps it quiet again.
+    renewed = dict(spec, known_fault={"why": "vendor bug, renewed"})
+    assert heal.run(d, "svc", renewed, end + 180)[0] == "unhealthy (known fault: kept quiet)"
+
+
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
 @pytest.mark.parametrize("task_status", ["running", "done", "failed", "blocked", "gone", "escalated-only"])
 def test_heal_known_fault_added_after_self_fix_stays_quiet(env, escalate, task_status):
@@ -52857,6 +52927,7 @@ def test_heal_field_types_are_what_validate_takes():
         for k, t in [*heal.COMMON_FIELDS.items(), *fields.items()]:
             assert seen.setdefault(k, t) == t, k
         typed = {**heal.COMMON_FIELDS, **fields}
+        typed = {k: t.get('anyOf', [t])[0] for k, t in typed.items()}   # known_fault: text, or an object
         block = {k: fixed.get(k, [sample[t['items']['type']]] if t['type'] == 'array' else sample[t['type']])
                  for k, t in typed.items() if k != 'preset'}
         out = heal.validate({**block, **({'preset': preset} if preset else {})})

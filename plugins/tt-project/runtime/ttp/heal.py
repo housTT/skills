@@ -43,7 +43,14 @@ the user, is asked once per stretch (outage start and pause) whether the pause i
 here lifts a pause; lifting it restores the normal handling above.
 
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
-no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
+no task, no alert. It is text, or an object {"why": ..., "match": "<regex>", "until": "<ISO time>"}
+(no other keys). `match` must find the check's output (its last 1000 characters) for the failure to
+count as known; one it does not find is handled normally. `until` (UTC unless it names a zone) is at
+most KNOWN_FAULT_S (7 d) ahead; without it the entry ends KNOWN_FAULT_S after it first covered a
+failure, recorded in the check's state (`known_key`, `known_since`; kept while the check is healthy, so
+a flapping fault never renews itself). A changed entry starts anew. Once its end passes, the failure is
+handled normally again and one low feed line and one low observation ask the coordinator to renew the
+entry or drop it. A check with `outage: true` watches a whole box or resource; once it has served
 nothing for 60 min (or past its grace_s, if shorter) it escalates as above whatever `known_fault`
 says. Its check staying unknown (75, 255 or a broken check: an unreachable box looks like that) for as
 long escalates the same way, without running the fix; the next healthy result clears it. When every
@@ -112,6 +119,7 @@ LABEL = "heal:"                 # task label of a check's self-fix task
 UNKNOWN_RCS = (75, 255)
 OUTAGE_S = 3600                 # a whole box or resource serving nothing this long is never kept quiet
 PAUSED_QUIET_S = 21600          # heal.paused_quiet_s default: an outage under a pause it is not known by
+KNOWN_FAULT_S = 7 * 86400       # a known fault's longest life: `until` at most this far ahead, else this long
 LOCK_WAIT_S = 30                # how long a fix waits for its resource lock before it is deferred
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
@@ -128,8 +136,11 @@ OPEN = ("queued", "running", "waiting", "needs_review")
 # Every key a block takes, with its JSON type. validate() accepts exactly these keys, and the coordinator's
 # structured-output schema (coordinator.HEAL_SCHEMA) is built from these types, so a new key reaches both.
 _TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}
+KNOWN_FAULT_KEYS = ("why", "match", "until")   # known_fault as an object (module doc)
 COMMON_FIELDS: dict[str, dict] = {
-    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "known_fault", "escalate"), _TEXT),
+    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate"), _TEXT),
+    "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
+                                      "required": ["why"]}]},
     "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
 PRESET_FIELDS: dict[str, dict[str, dict]] = {
     "systemd": {"unit": _TEXT, "user": _FLAG, "host": _TEXT},
@@ -165,9 +176,11 @@ def validate(block: Any, where: str = "heal") -> dict:
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
     out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
-    for k in ("check", "fix", "resource", "machine", "known_fault"):
+    for k in ("check", "fix", "resource", "machine"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
+    if out.get("known_fault") is not None:
+        _validate_known(out["known_fault"], where)
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
     if out.get("escalate") is not None and out["escalate"] not in ESCALATE:
@@ -200,6 +213,73 @@ def validate(block: Any, where: str = "heal") -> dict:
         raise ValueError(f"{where} needs `check` (a shell probe: 0 healthy, 1 unhealthy, 75/255 unknown) "
                          f"or a `preset`")
     return out
+
+
+def _validate_known(kf: Any, where: str) -> None:
+    """`known_fault`: text, or an object {why, match?, until?} (module doc)."""
+    if isinstance(kf, str):
+        return
+    if not isinstance(kf, dict):
+        raise ValueError(f"{where}: `known_fault` is text or an object {{why, match, until}}")
+    unknown = sorted(set(kf) - set(KNOWN_FAULT_KEYS))
+    if unknown:
+        raise ValueError(f"{where}: `known_fault` has unknown key(s) {', '.join(unknown)}; "
+                         f"use {', '.join(KNOWN_FAULT_KEYS)}")
+    if not isinstance(kf.get("why"), str) or not kf["why"].strip():
+        raise ValueError(f"{where}: `known_fault` needs `why` (why repair is not ours)")
+    for k in ("match", "until"):
+        if kf.get(k) is not None and not isinstance(kf[k], str):
+            raise ValueError(f"{where}: `known_fault.{k}` is text")
+    if kf.get("match") is not None:
+        try:
+            re.compile(kf["match"])
+        except re.error as e:
+            raise ValueError(f"{where}: `known_fault.match` is not a valid regex: {e}") from None
+    if kf.get("until") is not None:
+        from .ends import parse_time
+        at = parse_time(kf["until"])
+        if at is None:
+            raise ValueError(f"{where}: `known_fault.until` is an ISO time (UTC unless it names a zone)")
+        if at > time.time() + KNOWN_FAULT_S:
+            raise ValueError(f"{where}: `known_fault.until` is at most {KNOWN_FAULT_S // 86400} d ahead")
+
+
+def known_fault(spec: dict) -> dict | None:
+    """The block's known fault as {why, match?, until?}; None without one."""
+    kf = spec.get("known_fault")
+    if not kf:
+        return None
+    return {"why": kf} if isinstance(kf, str) else kf
+
+
+def _known_key(kf: dict) -> str:
+    """Names the entry in check state: a changed entry (new wording, match or until) starts anew."""
+    return json.dumps(kf, sort_keys=True)
+
+
+def known_end(kf: dict, st: dict) -> float | None:
+    """When the known fault stops covering failures: its `until`, else KNOWN_FAULT_S after it was first
+    applied (recorded in check state); None while an entry without `until` was never applied."""
+    if kf.get("until"):
+        from .ends import parse_time
+        return parse_time(kf["until"])
+    if st.get("known_key") == _known_key(kf) and st.get("known_since"):
+        return float(st["known_since"]) + KNOWN_FAULT_S
+    return None
+
+
+def _known_covers(kf: dict, st: dict) -> bool:
+    """The known fault's `match` (if any) finds the last check output."""
+    return not kf.get("match") or bool(re.search(kf["match"], st.get("last_out") or ""))
+
+
+def _known_live(spec: dict, st: dict, now: float) -> str:
+    """The known fault's `why` while it covers the last check output and its end has not passed, else ""."""
+    kf = known_fault(spec)
+    if not kf or not _known_covers(kf, st):
+        return ""
+    end = known_end(kf, st)
+    return kf["why"] if end is None or now < end else ""
 
 
 def of(payload: dict | None) -> dict | None:
@@ -460,7 +540,7 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
         want, grace = [alias, spec.get("condition") or "down"] if alias and not st.get("route_only") else None, 0
     elif st.get("finding"):
         pass   # the box is up: nothing to report, and an earlier down report clears
-    elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not spec.get("known_fault")):
+    elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not _known_fault(spec, st, now)):
         if spec.get("condition"):
             want = [alias, spec["condition"]]
         elif st.get("held"):
@@ -476,7 +556,7 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
         machine_ledger.report(host.p.name, was[0], was[1], cleared=True, now=now)
     if want:
         machine_ledger.report(host.p.name, want[0], want[1], f"heal check {name}: {st.get('last_out') or ''}",
-                              grace_s=grace, now=now, known=str(spec.get("known_fault") or ""),
+                              grace_s=grace, now=now, known=_known_live(spec, st, now),
                               escalate=escalate_to(host, spec))
     if want != was:
         st = state(db, name)
@@ -519,8 +599,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st.pop("pause_asked", None)
     if rc == 0:
         was = st.get("status")
-        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported")
-               if k in st}
+        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported",
+                                  "known_key", "known_since", "known_ended") if k in st}   # a flapping fault keeps its end
         _save(db, name, {**nxt, "status": "healthy"})
         t = db.task(int(st["task"])) if st.get("task") else None
         if t is not None and t["status"] == "queued":   # a running one is left to finish
@@ -569,10 +649,20 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
     down = now - float(since)
+    kf = known_fault(spec)
+    if kf and _confirmed(spec, st, now) and _known_covers(kf, st):
+        key = _known_key(kf)
+        if st.get("known_key") != key:   # first applied (or changed): its implicit end counts from now
+            st.update(known_key=key, known_since=now)
+            st.pop("known_ended", None)
+        end = known_end(kf, st)
+        if end is not None and now >= end and st.get("known_ended") != key:
+            st["known_ended"] = key
+            _known_ended(db, name, kf, st, now)
     if _known_fault(spec, st, now):
         # A self-fix may identify a known fault while its task is still open.
         from . import alerts
-        alerts.close_key(db, STATE_KEY + name, f"known_fault applies to current failure: {spec['known_fault']}", now)
+        alerts.close_key(db, STATE_KEY + name, f"known_fault applies to current failure: {kf['why']}", now)
         for key in ("task", "escalated", "alerted", "observed"):
             st.pop(key, None)
         _save(db, name, st)
@@ -823,12 +913,30 @@ def escalate_to(host: Any, spec: dict) -> str:
     return v if v in ESCALATE else "user"
 
 
-def _known_fault(spec: dict, st: dict, now: float) -> bool:
-    """A known fault matches a confirmed failure, never a prolonged outage or an unknown check."""
-    return bool(spec.get("known_fault") and st.get("status") == "unhealthy"
+def _confirmed(spec: dict, st: dict, now: float) -> bool:
+    """A confirmed failure a known fault may cover: never a prolonged outage or an unknown check."""
+    return bool(st.get("status") == "unhealthy"
                 and "unknown_since" not in st and (st.get("finding") or st.get("last_rc") == 1)
                 and (st.get("finding") or not spec.get("outage")
                      or now - float(st.get("since", now)) < min(OUTAGE_S, spec["grace_s"] or OUTAGE_S)))
+
+
+def _known_fault(spec: dict, st: dict, now: float) -> bool:
+    """A live known fault (its match finds the output, its end has not passed) covers a confirmed failure."""
+    return _confirmed(spec, st, now) and bool(_known_live(spec, st, now))
+
+
+def _known_ended(db: DB, name: str, kf: dict, st: dict, now: float) -> None:
+    """A known fault's end passed while it still covers the failure: one low feed line, and one low
+    observation so the coordinator renews or drops the entry. Normal handling resumes."""
+    text = (f"Heal check {name}: its known_fault ({kf['why']}) ended, so its failure is handled normally "
+            f"again. Renew it (a new `until`, at most {KNOWN_FAULT_S // 86400} d ahead) if repair is still "
+            f"not ours, or drop it from the heal block. Last check: {(st.get('last_out') or '')[:300]}")
+    db.post("out", text, chat=None, kind="info", severity="low", ref=STATE_KEY + name)
+    fp = f"{STATE_KEY}{name}:known_fault:{float(st.get('known_since') or now):.0f}"
+    if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", "observation", fp, "low", text, "queued"))
 
 
 def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
@@ -856,7 +964,7 @@ def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
     if escalation == "coordinator":
         return "escalation moved to coordinator"
     if _known_fault(spec, st, now):
-        return f"known_fault applies to current failure: {spec['known_fault']}"
+        return f"known_fault applies to current failure: {_known_live(spec, st, now)}"
     return None
 
 
