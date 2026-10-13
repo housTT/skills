@@ -337,7 +337,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
-                "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD"):
+                "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH"):
         monkeypatch.delenv(var, raising=False)
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
@@ -36404,7 +36404,9 @@ def test_own_push_refuses_another_tasks_branch_it_only_inherited(env, monkeypatc
     assert _ttp("push", "--own") == 2
     assert "only inherited" in capsys.readouterr().err
     assert _git_out(origin, "rev-parse", theirs) == shipped
-    # --own-branch publishes the task's own branch under its own name.
+    # --own-branch publishes the task's own branch under its own name. cmd_push sets OWN_BRANCH_ENV in
+    # this process: registered unset first, so teardown unsets it rather than restoring its value.
+    monkeypatch.delenv(push.OWN_BRANCH_ENV, raising=False)
     assert _ttp("push", "--own-branch") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")
     assert _git_out(origin, "rev-parse", theirs) == shipped
@@ -36432,11 +36434,13 @@ def test_own_push_refuses_another_tasks_branch_it_only_inherited(env, monkeypatc
     assert push.own_target(p, repo) == ("origin", theirs)
 
 
-def test_a_continuation_does_not_inherit_a_third_tasks_branch_its_spec_does_not_name(env):
+def test_a_continuation_does_not_inherit_a_third_tasks_branch_its_spec_does_not_name(env, monkeypatch):
     """A task_add continuing a task that only inherited another task's ttp/t<id>-... branch carries
-    no branch (no_pr_branch) unless its own spec has a `pr_branch:` line naming it."""
+    no branch (no_pr_branch) unless its own spec has a `pr_branch:` line naming it. The branch counts
+    as published, so only its owner being another task keeps it off."""
     p = make(env)
-    from ttp import coordinator as coord, worktree
+    from ttp import coordinator as coord, push, worktree
+    monkeypatch.setattr(push, "never_published", lambda *a, **k: False)
     src = p.db.add_task("Speed up the loader", "s", kind="code")
     b = f"ttp/t{src}-speed-up-the-loader"
     p.db.update_task(src, status="done", branch=b)
@@ -36449,6 +36453,9 @@ def test_a_continuation_does_not_inherit_a_third_tasks_branch_its_spec_does_not_
     assert coord.apply(p, [{"type": "task_add", "title": "Plan it again", "kind": "plan", "continues": mid,
                             "spec": "Redo the cache plan."}]) == []
     assert worktree.NO_PR_BRANCH in labels("Plan it again")
+    again = p.db.one("SELECT id FROM tasks WHERE title='Plan it again'")["id"]
+    assert any(f"#{again} continues #{mid} but not its branch {b} (#{src}'s branch" in n
+               for n in p.db.kv(coord.NOTES_KEY))
     assert coord.apply(p, [{"type": "task_add", "title": "Fix the loader PR", "kind": "code", "continues": mid,
                             "spec": f"pr_branch: {b}\nFix the PR."}]) == []
     assert f"pr_branch:{b}" in labels("Fix the loader PR") and worktree.NO_PR_BRANCH not in labels("Fix the loader PR")
