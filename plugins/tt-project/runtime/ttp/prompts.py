@@ -71,6 +71,8 @@ def coordinator_features(p: Project) -> set[str]:
         on.add("draft_prs")
     if (cfg.get("notify") or {}).get("slack"):
         on.add("slack")
+    if (cfg.get("upstream") or {}).get("ingest"):
+        on.add("upstream_ingest")
     try:
         known = machines.load()
     except Exception:

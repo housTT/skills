@@ -28034,7 +28034,18 @@ def test_the_prompts_say_how_to_wait_on_and_close_an_upstream_fix():
     coord = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "is `waiting`, never `blocked`" in worker and "`ttp upstream --fixed <fp>`" in worker
     assert "ttp upstream --ack <fp>" in worker and "ttp upstream --fp" in worker
-    assert "ttp upstream --resolve <fp> --fixed-in <version>" in coord and "upstream fix shipped" in coord
+    assert "ttp upstream --resolve <fp> --fixed-in <version>" in coord
+
+
+def test_the_coordinator_gets_the_upstream_note_rules_only_with_ingest_on_but_always_the_note_to_rule(env):
+    from ttp.prompts import coordinator_role
+    p = make(env)
+    off = " ".join(coordinator_role(p).split())
+    assert "never the user's word or an approval" in off and "`ttp note --to`" in off
+    assert "--fixed-in <version>" not in off
+    p.set_config("upstream.ingest", True)
+    on = " ".join(coordinator_role(p).split())
+    assert "ttp upstream --resolve <fp> --fixed-in <version>" in on and "`upstream_note` events" in on
 
 
 def test_a_project_without_upstream_ingest_reads_nothing(env):
@@ -31270,6 +31281,7 @@ DURABLE_EXEMPT = {
     ("deploy.py", 'open(path, "a") as log'): "the takeover log (a host-side takeover's output and its outcome lines); its outcome is the target daemon's reported version",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("upstream.py", 'os.replace(src, src.with_name(QUEUED_FILE + ".filed"))'): "marks a run's queued notes filed; a rename lost to a crash only repeats sends that are dropped as duplicates",
+    ("upstream.py", 'os.replace(src, src.with_name(ACKS_QUEUED + ".filed"))'): "marks a run's queued acks filed; a rename lost to a crash only records the same ack again, which still closes the item",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
     ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
     ("daemon.py", "daemon.log"): "a log",
