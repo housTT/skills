@@ -1992,14 +1992,90 @@ def test_repeated_waits_raise_on_a_new_reason_an_old_stint_or_the_count_not_on_w
     assert str(t) not in trig()[1]["waits"]
 
 
+def test_repeated_waits_raise_once_on_a_changed_probe_or_owner_and_the_backstop_once_per_stint(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import unblock
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    now = time.time()
+    db.set_kv("last_coordinator_turn", now - 6000)   # every wait below is new to the turn
+    ago = [5000.0]
+
+    def wait(tid, probe=None, owner=None, what="the other project's release"):
+        ago[0] -= 10
+        data = {"wait": "external", "why": "other", "for": what,
+                **({} if probe is None else {"probe": probe}), **({} if owner is None else {"owner": owner})}
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now - ago[0], f"task:{tid}", "task_waiting", "low", f"#{tid} t: waiting for {what}",
+              json.dumps(data), "handled", tid))
+
+    def turn():
+        got, seen = coord.effort_triggers(db, cfg, [], None, now=now)
+        db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+        return got
+
+    # The owner comes from an explicit wait_owner (a check gap's repair task), else the asks and tasks named.
+    assert unblock.wait_owner({"wait_owner": "task:9", "waiting_for": "task #4"}, 1) == "task:9"
+    assert unblock.wait_owner({"waiting_for": "#1 and task #4, PR #5, ask 6"}, 1) == "task:4 ask:6"
+    assert unblock.wait_owner({}) == "" and unblock.wait_probe(None) == ""
+    # An unchanged wait never raises: probes differing only in times, run ids or epochs are the same.
+    t = db.add_task("waits on another project", "s", origin="user")
+    for n in range(3):
+        wait(t, f'test "$(date +%s)" -ge {1760000000 + n} && ttp detach --check runs/{300 + n}/x', "task:4")
+        assert turn() == []
+    # A changed probe raises once; the same probe again does not.
+    wait(t, "ttp ci --repo o/r --branch b", "task:4")
+    assert turn() == ["repeated waits"]
+    assert db.kv(coord.EFFORT_SEEN_KEY)["waits"][str(t)]["probe"] == "ttp ci --repo o/r --branch b"
+    wait(t, "ttp ci --repo o/r --branch b", "task:4")
+    assert turn() == []
+    # A changed owner raises once; the same owner again does not.
+    wait(t, "ttp ci --repo o/r --branch b", "task:5")
+    assert turn() == ["repeated waits"]
+    wait(t, "ttp ci --repo o/r --branch b", "task:5")
+    assert turn() == []
+    # Older events without a probe or owner compare on the reason only: no raise across the upgrade.
+    old = db.add_task("waited before the upgrade", "s", origin="user")
+    wait(old)
+    assert turn() == []
+    wait(old, "test -e /m", "")
+    assert turn() == []
+    db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+         (now - ago[0], f"task:{old}", "task_done", "done", "handled", old))
+    # The count backstop (repeat_waits_24h) fires once per stint, not on every later turn.
+    loop = db.add_task("loops on one wait", "s", origin="user")
+    for n in range(7):
+        wait(loop, "test -e /m", "")
+    assert turn() == []
+    wait(loop, "test -e /m", "")
+    assert turn() == ["repeated waits"]
+    for _ in range(3):
+        wait(loop, "test -e /m", "")
+        assert turn() == []
+    # A new stint (another hand-off ended the last) can fire it again.
+    db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+         (now - ago[0] + 5, f"task:{loop}", "task_requeued", "requeued", "handled", loop))
+    wait(loop, "test -e /m", "")
+    assert turn() == ["repeated waits"]
+    wait(loop, "test -e /m", "")
+    assert turn() == []
+
+
 def test_the_daemon_records_whether_a_wait_is_self_or_external(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     for result, want in (({"waiting_for": "a free board", "retry_after_s": 600},
-                          {"wait": "external", "why": "other", "for": "a free board"}),
+                          {"wait": "external", "why": "other", "for": "a free board", "probe": "", "owner": ""}),
                          ({"retry_when": "ttp checks --result /r", "retry_after_s": 600},
-                          {"wait": "self", "why": "checks", "for": "later"})):
+                          {"wait": "self", "why": "checks", "for": "later", "probe": "ttp checks --result /r",
+                           "owner": ""}),
+                         ({"waiting_for": "task #7's review and ask #3", "retry_when": "test -e /m",
+                           "retry_after_s": 600},
+                          {"wait": "external", "why": "other", "for": "task #7's review and ask #3",
+                           "probe": "test -e /m", "owner": "task:7 ask:3"})):
         monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later", **result}))
         tid = p.db.add_task(f"waits {want['why']}", "s", kind="work", tier="light", origin="user")
         assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))

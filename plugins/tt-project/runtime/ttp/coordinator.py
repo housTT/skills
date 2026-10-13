@@ -2151,8 +2151,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # A task that keeps failing or coming back waiting, counted over 24 h for the tasks heard from
     # since the last turn. Waits: only external ones (unblock.counted_wait), and not routine waits on
     # live jobs or locks (more than live_waits_max on the same ones in 24 h, or a stalled job log, count).
-    # They raise when the task's normalized wait reason changes, once when its current stint of waits
-    # passes 24 h, and at repeat_waits_24h waits in 24 h as a backstop for real loops.
+    # They raise when the task's normalized wait reason, its probe or its owner changes, once when its
+    # current stint of waits passes 24 h, and once per stint at repeat_waits_24h waits in 24 h as a
+    # backstop for real loops.
     fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 8) or 0)
     since = now - 86400
     waits_seen = dict(seen_before.get("waits") or {})
@@ -2292,25 +2293,32 @@ def live_max(cfg: dict) -> int:
 def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float,
                 live: int = unblock.LIVE_WAITS_MAX) -> bool:
     """Whether task `tid`'s external waits make a tricky turn, updating its entry in `waits_seen`
-    ({reason, since, aged}): its normalized wait reason changed from its previous wait (the one
-    seen by the last turn, else the previous in the stint), its stint (external waits in a row,
-    the same wait's cheap wakes skipped; a self-wait or any other hand-off ends it) began over
-    24 h ago (once per stint), or `waits_at` or more external waits in 24 h (0: no backstop)."""
+    ({reason, probe, owner, since, aged, counted}): what it waits on changed from its previous wait
+    (the one seen by the last turn, else the previous in the stint): its normalized reason, its
+    retry_when probe or the owner of what it waits on (unblock.wait_marks; a probe or owner an
+    older event lacks does not compare); its stint (external waits in a row, the same wait's cheap
+    wakes skipped; a self-wait or any other hand-off ends it) began over 24 h ago; or it reached
+    `waits_at` external waits in 24 h (0: no backstop). The last two raise once per stint."""
     rows, stint = wait_stint(db, tid, now, live)
     key = str(tid)
     if not stint:
         waits_seen.pop(key, None)
         return False
     before = waits_seen.get(key) or {}
-    reason, start = unblock.wait_reason(stint[0]), stint[-1]["ts"]
+    marks, start = unblock.wait_marks(stint[0]), stint[-1]["ts"]
     if before.get("since") != start:
         before = {}   # a new stint: what an earlier one waited for does not compare
-    prev = before.get("reason") or (unblock.wait_reason(stint[1]) if len(stint) > 1 else reason)
+    older = unblock.wait_marks(stint[1]) if len(stint) > 1 else marks
+    changed = False
+    for k, now_v in marks.items():
+        prev = before[k] if k in before else older[k]
+        changed = changed or (now_v is not None and prev is not None and now_v != prev)
     aged = now - start > 86400
-    waits_seen[key] = {"reason": reason, "since": start, "aged": aged}
     count = sum(1 for i, e in enumerate(rows) if e["ts"] > now - 86400 and e["kind"] == "task_waiting"
                 and unblock.counted_wait(e, rows[i + 1:], live))
-    return reason != prev or (aged and not before.get("aged")) or bool(waits_at and count >= waits_at)
+    counted = bool(waits_at and count >= waits_at)
+    waits_seen[key] = {**marks, "since": start, "aged": aged, "counted": counted or bool(before.get("counted"))}
+    return changed or (aged and not before.get("aged")) or (counted and not before.get("counted"))
 
 
 def wait_stint(db, tid: int, now: float, live: int = unblock.LIVE_WAITS_MAX) -> tuple[list, list]:

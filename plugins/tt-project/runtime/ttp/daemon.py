@@ -2579,6 +2579,9 @@ class Daemon:
             # Self or external (unblock.classify_wait): only external waits count as stuck work.
             kind, why = ("self", "escalated wake") if extra.get("escalated_wake") else unblock.classify_wait(result)
             data: dict = {"wait": kind, "why": why, "for": what}
+            if isinstance(result, dict):   # what coordinator.wait_raises compares besides the reason
+                data.update(probe=unblock.wait_probe(result.get("retry_when")),
+                            owner=unblock.wait_owner(result, task["id"]))
             if not extra.get("escalated_wake"):
                 try:   # its live jobs or locks (unblock.live_wait), read before the job can end
                     live = unblock.live_wait(self.p, result)

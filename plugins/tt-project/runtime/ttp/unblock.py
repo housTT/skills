@@ -243,10 +243,38 @@ def wait_reason(ev: Any) -> str:
     """What a task_waiting event waits for, normalized so waits differing only in times, shas, run
     ids or counts compare equal: its `data.for`, else its text after "#id title: "."""
     raw = str(_note(ev["data"]).get("for") or (ev["text"] or "").split(": ", 1)[-1])
-    raw = re.sub(r"^waiting for\s+", "", raw.strip(), flags=re.I)
+    return _denoise(re.sub(r"^waiting for\s+", "", raw.strip(), flags=re.I))
+
+
+def _denoise(raw: str, n: int = 200) -> str:
     for rx in REASON_NOISE:
         raw = rx.sub("0" if rx.pattern == r"\d+" else "", raw)
-    return " ".join(raw.lower().split())[:200]
+    return " ".join(raw.lower().split())[:n]
+
+
+def wait_owner(result: dict, own: int | None = None) -> str:
+    """Who owns what a waiting hand-off waits on, for the task_waiting event's `data.owner`: its
+    `wait_owner` (a check gap's repair task), else the asks and tasks its `waiting_for` names
+    (refwaits.refs, never the task itself), as "task:12 ask:3"; "" when it names none."""
+    from . import refwaits
+    if str(result.get("wait_owner") or "").strip():
+        return " ".join(str(result["wait_owner"]).split())[:200]
+    return " ".join(f"{k}:{n}" for k, n in refwaits.refs(str(result.get("waiting_for") or ""), own))[:200]
+
+
+def wait_probe(raw: Any) -> str:
+    """A retry_when, for the task_waiting event's `data.probe` (as given, cut to 500 characters)."""
+    return str(raw).strip()[:500] if isinstance(raw, str) else ""
+
+
+def wait_marks(ev: Any) -> dict:
+    """What a task_waiting event's wait compares on (coordinator.wait_raises): its `reason`
+    (wait_reason), `probe` (its retry_when with times, shas, ids and counts as noise, as in reasons)
+    and `owner` (wait_owner); `probe` and `owner` are None for events recorded before they were."""
+    d = _note(ev["data"])
+    probe = d.get("probe")
+    return {"reason": wait_reason(ev), "probe": _denoise(probe, 300) if isinstance(probe, str) else None,
+            "owner": d.get("owner") if isinstance(d.get("owner"), str) else None}
 
 
 def _ask_mentions(text: str, ask_ids: set[int]) -> list[re.Match]:

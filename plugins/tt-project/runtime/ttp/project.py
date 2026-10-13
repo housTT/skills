@@ -121,8 +121,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
     # "" keeps those at the coordinator's usual effort. A task failing repeat_fails_24h times in
-    # 24 h makes one, and so do its external waits when their reason changes, when they have gone on
-    # for 24 h, or at repeat_waits_24h in 24 h (0 turns either count off). A wait on its own live
+    # 24 h makes one, and so do its external waits when their reason, probe or owner changes, and once
+    # per run of waits when they have gone on for 24 h or reach repeat_waits_24h in 24 h (0 turns
+    # either count off). A wait on its own live
     # `ttp detach` jobs or `ttp lock` resources counts only past live_waits_max waits on the same ones
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
     # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never raise a turn.

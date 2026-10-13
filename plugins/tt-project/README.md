@@ -228,7 +228,8 @@ prolonged whole-box outage.
   change of plan in it); a blocked, failed or needs-review task, a failed review, a dead dependency,
   an expired or broken deferral or a stalled review; a task failing `coordinator.repeat_fails_24h`
   (2) times in 24 h; a task's external waits (not its own checks, jobs, push or planned window)
-  changing reason, going on for 24 h, or reaching `coordinator.repeat_waits_24h` (8) in 24 h, where
+  changing reason, probe (`retry_when`) or owner (the task or ask they name), going on for 24 h, or
+  reaching `coordinator.repeat_waits_24h` (8) in 24 h (the last two once per run of waits), where
   a wait on a live `ttp detach` job or an unpaused `ttp lock` resource counts only past
   `coordinator.live_waits_max` (6) waits on the same ones in 24 h or once the job's log stops growing; a
   rejected action; free worker slots while every queued task is held by a dependency or a paused

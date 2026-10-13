@@ -147,6 +147,7 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
         p.db.set_kv(KEY, gaps)
     return {**result, "status": "waiting", "summary": str(result.get("summary") or "") + " " + _owned(key, gap),
             "waiting_for": key, "check_gap": key, "retry_when": probe(p, sig, current),
+            "wait_owner": "coordinator" if gap.get("escalated") else f"task:{gap.get('owner')}",
             "retry_after_s": 1800, "wake_tier": "standard", "wait_kind": "external"}
 
 
