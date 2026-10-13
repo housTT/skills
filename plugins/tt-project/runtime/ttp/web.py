@@ -451,11 +451,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
 def runtime_receipt(p: Project, db: DB, alive: bool = True, now: float | None = None, where=None) -> dict:
     """What code the running daemon loaded (identity.summary): its version, commit, instance, last
     completed tick, and whether the files on disk differ ("restart pending")."""
-    from .daemon import _alive
     from .project import hostname
-    d = db.kv("daemon", {}) or {}
-    pid = int(d.get("pid") or 0) if alive and isinstance(d, dict) and d.get("host") == hostname() else 0
-    return identity.summary(p.state, pid if pid and _alive(pid) else 0, p.harness / "runtime", where, now)
+    s = identity.probe(p.state, db.kv("daemon", {}), hostname(), now)
+    out = identity.summary(p.state, s["pid"] if alive and s["alive"] else 0, p.harness / "runtime", where, now)
+    return {**out, "source": s["source"] if alive and s["alive"] else None}
 
 
 def breaker_lines(db: DB, now: float, where=None) -> list[dict]:

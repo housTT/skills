@@ -49030,6 +49030,55 @@ def test_deployed_cannot_tell_without_a_receipt_and_waits_for_a_fresh_tick(env, 
     db.close()
 
 
+
+def test_status_and_deployed_agree_on_the_daemon_when_the_pid_probe_fails(env, tmp_path, capsys, monkeypatch):
+    """A sandboxed worker's pid probe fails for a live daemon: `ttp status` (its text, and the
+    runtime.running_* fields of --json) and `ttp deployed` all read the same fresh heartbeat, and all
+    say not running once it is stale."""
+    from ttp import daemon as dmod, overview
+    from ttp.cli import daemon_state, main
+    from ttp.project import Project
+    _deploy_lib("0.5.0")
+    base, db = _deploy_project(tmp_path, "alpha", "0.5.0")
+    monkeypatch.setattr(dmod, "_alive", lambda pid: False)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    hb = base / "state" / "heartbeat"
+
+    def views():
+        capsys.readouterr()
+        main(["status", "alpha", "--json"])
+        rt = json.loads(capsys.readouterr().out)["runtime"]
+        return daemon_state(Project(base.parent)), rt, overview.deployed("0.5.0", names=["alpha"])
+
+    os.utime(hb, None)
+    state, rt, dep = views()
+    assert state.startswith("running (heartbeat "), state
+    assert (rt["running_version"], rt["running_commit"], rt["instance"], rt["source"]) == (
+        "0.5.0", DEPLOY_C, "inst-alpha", "heartbeat"), rt
+    row = dep["projects"][0]
+    assert dep["rc"] == 0 and row["daemon_alive"] and row["daemon_state"] == "running", dep["text"]
+    assert row["running_version"] == rt["running_version"] and row["instance"] == rt["instance"]
+    # a fresh heartbeat of another pid than the daemon record names is not that daemon
+    db.set_kv("daemon", {"pid": os.getpid() + 1, "host": "testhost"})
+    assert daemon_state(Project(base.parent)) != "running" and not overview.deployed(
+        "0.5.0", names=["alpha"])["projects"][0]["daemon_alive"]
+    db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    # between fresh and stale: unknown from the sandbox, not alive for either
+    mid = time.time() - 200
+    os.utime(hb, (mid, mid))
+    state, rt, dep = views()
+    assert state == "status unknown from this sandbox" and rt["running_version"] is None, (state, rt)
+    assert dep["rc"] == 1 and not dep["projects"][0]["daemon_alive"], dep["text"]
+    # stale: every view says not running
+    old = time.time() - dmod.HEARTBEAT_STALE_S - 60
+    os.utime(hb, (old, old))
+    state, rt, dep = views()
+    assert state == "NOT RUNNING" and rt["running_version"] is None and rt["source"] is None, (state, rt)
+    row = dep["projects"][0]
+    assert dep["rc"] == 1 and not row["daemon_alive"] and row["daemon_state"] == "stopped", dep["text"]
+    db.close()
+
+
 def _ttp_sources() -> list[tuple[str, pathlib.Path]]:
     """(dotted module name, path) of every module in the ttp package, subpackages included."""
     pkg = RUNTIME / "ttp"

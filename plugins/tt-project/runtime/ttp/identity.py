@@ -104,6 +104,40 @@ def running(state: Path, pid: int) -> dict | None:
     return None
 
 
+HEARTBEAT_FRESH_S = 120   # a heartbeat this recent stands for a live daemon the pid probe cannot see
+
+
+def probe(state: Path, rec: dict | None, here: str, now: float | None = None) -> dict:
+    """Whether the project's daemon runs, as every CLI view tells it: {state: running, stale, unknown or
+    stopped; alive; pid (0 unless known to run); source: pid or heartbeat; age of the heartbeat}.
+    `rec` is the daemon's kv record {pid, host}. A sandboxed worker (TTP_RUN_DIR) may have its own pid
+    namespace or hostname, so the pid probe can fail for a live daemon: a fresh heartbeat decides then."""
+    from .daemon import HEARTBEAT_STALE_S, _alive
+    now = time.time() if now is None else now
+    rec = rec if isinstance(rec, dict) else {}
+    pid = int(rec.get("pid") or 0)
+    seen = bool(pid) and rec.get("host") == here and _alive(pid)
+    try:
+        hb = json.loads((state / "heartbeat").read_text())
+        hb = hb if isinstance(hb, dict) else {}
+        age = max(0.0, now - (state / "heartbeat").stat().st_mtime)
+    except (OSError, ValueError):
+        hb, age = None, None
+    out = {"state": "stopped", "alive": False, "pid": 0, "source": None, "age": age}
+    sandboxed = bool(os.environ.get("TTP_RUN_DIR"))
+    if not seen or sandboxed:
+        # the heartbeat stands in only for the daemon the record names (both carry its own pid)
+        if hb is not None and age <= HEARTBEAT_FRESH_S and (seen or pid and int(hb.get("pid") or 0) == pid):
+            return {**out, "state": "running", "alive": True, "pid": pid, "source": "pid" if seen else "heartbeat"}
+        if not seen:
+            if sandboxed and hb is not None and age <= HEARTBEAT_STALE_S:
+                out["state"] = "unknown"
+            return out
+    if hb is not None and int(hb.get("pid") or 0) == pid and age > HEARTBEAT_STALE_S:
+        return {**out, "state": "stale", "pid": pid, "source": "pid"}
+    return {**out, "state": "running", "alive": True, "pid": pid, "source": "pid"}
+
+
 def files_version(receipt: dict | None, fallback: Path) -> str:
     """The version a restart would load: the runtime the daemon was started from, else `fallback`."""
     from .release import runtime_version

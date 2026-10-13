@@ -35,24 +35,20 @@ def _settings(base: Path) -> dict:
 
 
 def _daemon(conn: sqlite3.Connection, state: Path, here: str) -> tuple[str, int]:
-    """("running", "stopped" or "stale (...)", the running daemon's pid or 0)."""
-    from .daemon import HEARTBEAT_STALE_S, _alive
+    """("running", "stopped", "unknown (...)" or "stale (...)", the running daemon's pid or 0), by
+    identity.probe: the same answer `ttp status` gives, a fresh heartbeat standing in for a pid probe
+    a sandboxed worker cannot make."""
     r = conn.execute("SELECT value FROM kv WHERE key='daemon'").fetchone()
     try:
         d = json.loads(r[0]) if r else {}
     except ValueError:
         d = {}
-    pid = int(d.get("pid") or 0) if isinstance(d, dict) else 0
-    if not pid or d.get("host") != here or not _alive(pid):
-        return "stopped", 0
-    try:
-        hb = json.loads((state / "heartbeat").read_text())
-        age = time.time() - (state / "heartbeat").stat().st_mtime
-    except (OSError, ValueError):
-        return "running", pid
-    if isinstance(hb, dict) and int(hb.get("pid") or 0) == pid and age > HEARTBEAT_STALE_S:
-        return f"stale (no tick for {int(age // 60)} min)", pid
-    return "running", pid
+    s = identity.probe(state, d, here)
+    if s["state"] == "stale":
+        return f"stale (no tick for {int(s['age'] // 60)} min)", s["pid"]
+    if s["state"] == "unknown":
+        return f"unknown (heartbeat {int(s['age'])}s old, pid probe failed in this sandbox)", 0
+    return s["state"], s["pid"]
 
 
 def _gate_global(conn: sqlite3.Connection) -> tuple[float, dict]:

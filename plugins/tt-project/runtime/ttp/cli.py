@@ -1009,23 +1009,15 @@ def status_text(p: Project) -> str:
 
 def daemon_state(p: Project) -> str:
     """'running', or NOT RUNNING with why: its process is gone, or it stopped completing ticks."""
-    from .daemon import HEARTBEAT_STALE_S, _alive, heartbeat
-    HEARTBEAT_FRESH_S = 120
-    d = p.db.kv("daemon", {})
-    alive = bool(d.get("pid")) and d.get("host") == hostname() and _alive(int(d["pid"]))
-    hb = heartbeat(p)
-    if not alive or os.environ.get("TTP_RUN_DIR"):
-        # A sandboxed worker may have its own pid namespace or hostname, so the probe can fail
-        # for a live daemon: its heartbeat file, refreshed every tick, decides instead.
-        if hb and hb["age"] <= HEARTBEAT_FRESH_S:
-            return "running" if alive else f"running (heartbeat {int(hb['age'])}s ago)"
-        if not alive and hb and hb["age"] <= HEARTBEAT_STALE_S:
-            return "status unknown from this sandbox" if os.environ.get("TTP_RUN_DIR") else "NOT RUNNING"
-        if not alive:
-            return "NOT RUNNING"
-    if hb and int(hb.get("pid") or 0) == int(d["pid"]) and hb["age"] > HEARTBEAT_STALE_S:
-        return f"NOT RUNNING (process {d['pid']} is up but stuck: no completed tick for {int(hb['age'] // 60)} min)"
-    return "running"
+    from . import identity
+    s = identity.probe(p.state, p.db.kv("daemon", {}), hostname())
+    if s["state"] == "running":
+        return "running" if s["source"] == "pid" else f"running (heartbeat {int(s['age'])}s ago)"
+    if s["state"] == "unknown":
+        return "status unknown from this sandbox"
+    if s["state"] == "stale":
+        return f"NOT RUNNING (process {s['pid']} is up but stuck: no completed tick for {int(s['age'] // 60)} min)"
+    return "NOT RUNNING"
 
 
 def here() -> Project | None:
