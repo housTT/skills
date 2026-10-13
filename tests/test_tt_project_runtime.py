@@ -44642,7 +44642,7 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
 def test_a_planned_power_cycle_tells_running_workers_on_the_machine_to_hand_off_once(env, tmp_path, capsys,
                                                                                     monkeypatch):
     """`ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle intent (no
-    undo, expects down, never overdue, closes itself after). Shortly before T the daemon tells each running
+    undo, expects down only around T, never overdue, closes itself after). Shortly before T the daemon tells each running
     worker on that machine (a task resource on it, or every worker when it is this host), once, through
     its steer.md, to commit and hand off; workers elsewhere and runs outside the window hear nothing."""
     from ttp import machine_ledger as ml
@@ -44691,6 +44691,36 @@ def test_a_planned_power_cycle_tells_running_workers_on_the_machine_to_hand_off_
     ml.Probes(p).tick(at + ml.POWER_CYCLE_AFTER_S + 1)
     assert not ml.changes(), "the intent closes itself once its time is past"
     assert ml.changes(open_only=False)[0]["closed_why"] == "the planned power cycle is past"
+
+
+def test_a_power_cycle_intent_quiets_a_down_only_in_its_window(env):
+    """A power-cycle intent expects its machine down only from POWER_CYCLE_LEAD_S before T until its end:
+    days before the cycle, or after it when nobody closed the entry, a down pages as usual (quiet_reason)
+    and raises the coordinator (_known_case). Any daemon closes an intent past its end, not only the maker's."""
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_power_cycle("box-a", "3d", "gone-project", "firmware", now=now)
+    at, end = c["at"], c["expires"]
+    down = {"alias": "box-a", "condition": "down", "seen_by": []}
+    data = json.dumps({"machine": "box-a", "condition": "down"})
+    eid = p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) "
+                 "VALUES(?,?,?,?,?,?,?,?)", (now, "daemon", "observation", "fp-down", "high", "x", data, "queued"))
+    r = p.db.one("SELECT * FROM events WHERE id=?", (eid,))
+
+    def quiet(t):
+        return ml.quiet_reason(down, t)[0].startswith("expected from machine change")
+
+    def known(t):
+        return "expects it" in coord._known_case(p.db, r, 0, t)
+    for t, want in ((now + 3600, False), (at - ml.POWER_CYCLE_LEAD_S - 1, False), (at - 60, True), (at, True),
+                    (end - 1, True), (end + 1, False), (end + 30 * 86400, False)):
+        assert (quiet(t), known(t)) == (want, want), (t - at, want)
+    ml.Probes(p).tick(end + 1)
+    assert not ml.changes(), "a daemon of another project closes the intent once it is past"
 
 
 def _ledger_writer(home, n, k):

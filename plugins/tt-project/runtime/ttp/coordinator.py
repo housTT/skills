@@ -2244,8 +2244,8 @@ def _known_case(db, r, last: float, now: float) -> str:
     open issue that a turn before the last one already saw at this severity or higher (an event of
     the same fingerprint since the issue opened; an issue that escalated or woke again is new), a
     deploy pending on an owned merge before its takeover deadline (deploy.py), or an open, not
-    overdue change in the shared ledger (machine_ledger.py) that expects this event: it lists its
-    fingerprint, or its condition on the change's machine."""
+    overdue change in the shared ledger (machine_ledger.py) that expects this event now (expects_now): it
+    lists its fingerprint, or its condition on the change's machine."""
     fp = str(r["fingerprint"] or "")
     if not fp:
         return ""
@@ -2271,8 +2271,8 @@ def _known_case(db, r, last: float, now: float) -> str:
     cond = str(data.get("condition") or "")
     try:
         for ch in machine_ledger.changes():
-            alias, expects = str(ch.get("alias") or ""), [str(x) for x in ch.get("expects") or []]
-            if not alias or machine_ledger.overdue(ch, now):
+            alias, expects = str(ch.get("alias") or ""), machine_ledger.expects_now(ch, now)
+            if not alias or not expects:
                 continue
             on_it = bool(names) and re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w.-])", names)
             if fp in expects or (cond and cond in expects and on_it):

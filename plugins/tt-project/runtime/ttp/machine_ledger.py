@@ -41,8 +41,9 @@ then the user. Nothing is undone automatically: whoever is paged runs the undo a
 from its root, as end probes do.
 
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
-intent: an entry of kind `power_cycle` that expects the machine `down`, needs no undo, and closes itself
-POWER_CYCLE_AFTER_S after T (never overdue). From POWER_CYCLE_LEAD_S before T until as long after it, each
+intent: an entry of kind `power_cycle` that needs no undo and closes itself POWER_CYCLE_AFTER_S after T
+(never overdue; any co-tenant daemon closes it once past). It expects the machine `down` only from
+POWER_CYCLE_LEAD_S before T until it ends (expects_now), so it never hides an outage outside the cycle. From POWER_CYCLE_LEAD_S before T until as long after it, each
 daemon tells its running workers on that machine (the daemon's own host, or a task resource on it) once,
 through their steer.md, to commit and hand off now (daemon.power_cycle_notices).
 
@@ -198,6 +199,20 @@ def overdue(c: dict, now: float | None = None) -> str:
     if float(c.get("expires") or 0) <= now:
         return f"expired {ends.stamp(float(c['expires']))}"
     return ""
+
+
+def expects_now(c: dict, now: float | None = None) -> list[str]:
+    """What entry `c` expects at `now`: nothing once it is closed or overdue, and for a power-cycle intent
+    nothing outside its window (POWER_CYCLE_LEAD_S before T until its end), so it never quiets an outage
+    days before the cycle, or after it when nobody closed it."""
+    now = time.time() if now is None else now
+    if c.get("closed") or overdue(c, now):
+        return []
+    if c.get("kind") == POWER_CYCLE:
+        at = float(c.get("at") or 0)
+        if not at - POWER_CYCLE_LEAD_S <= now < float(c.get("expires") or at + POWER_CYCLE_AFTER_S):
+            return []
+    return [str(x) for x in c.get("expects") or []]
 
 
 def change_line(c: dict, now: float | None = None) -> str:
@@ -357,7 +372,7 @@ def quiet_reason(c: dict, now: float, doc: dict | None = None) -> tuple[str, boo
         return (f"known outage until {ends.stamp(o['until'])}"
                 + (f", owned by {o['owner']}" if o.get("owner") else "") + f": {o['why']}"), True
     for ch in changes({alias}):
-        if cond in (ch.get("expects") or []) and not overdue(ch, now):
+        if cond in expects_now(ch, now):
             return f"expected from machine change #{ch['id']} by {ch.get('by')}: {ch['what']}", True
     d = _demand(alias, list(c.get("seen_by") or []))
     if d["user"]:
@@ -641,8 +656,8 @@ class Probes:
                         c["probe_passed"] = now
                 _write(LEDGER, doc)
         for c in changes():
-            if c.get("by") == self.p.name and c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:
-                with contextlib.suppress(ValueError):   # another daemon of the project closed it first
+            if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
+                with contextlib.suppress(ValueError):   # another daemon closed it first
                     close_change(int(c["id"]), "the planned power cycle is past", self.p.name, now)
         for c in changes():
             cid = c.get("id")
