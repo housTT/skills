@@ -34246,7 +34246,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     charter = p.charter_path.read_text()
     p.charter_path.write_text(charter + "\n## Resources\n- box1 for tests.\n")
     assert "TTP_NO_DEVICE=1" in rendered(code) and "## Shared clusters" not in rendered(code)
-    assert "ttp detach --remote" not in rendered(code), "a charter machine alone needs no remote driver"
+    assert "ttp detach --remote" in rendered(code), "a machine the charter names may run a remote job"
     # A task naming a machine gets the remote-driver rules; a question cannot wait, so it does not.
     named = {"kind": "code", "title": "run the suite on box1"}
     assert "ttp detach --remote" in rendered(named)
@@ -34272,6 +34272,39 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     monkeypatch.setattr(machines, "load", lambda: {"here1": {"tags": ["device"]}})
     monkeypatch.setenv("TTP_HOST", "here1")
     assert "TTP_NO_DEVICE=1" in rendered(question)
+    monkeypatch.delenv("TTP_HOST")
+    # A list, tag or setting that cannot be read turns on the rules it could not rule out, and
+    # never stops a worker from starting.
+    p.charter_path.write_text(charter + "\n## Resources\n- hpc1 nodes n1, n2.\n")
+    safe = ("## Shared clusters", "TTP_NO_DEVICE=1", "ttp detach --remote")
+
+    def broken_load():
+        raise OSError("unreadable")
+
+    def broken_host(known=None):
+        raise ValueError("not a tag")
+    monkeypatch.setattr(machines, "load", broken_load)
+    s = rendered({"kind": "code", "title": "run on hpc1"})
+    assert all(m in s for m in safe), [m for m in safe if m not in s]
+    monkeypatch.setattr(machines, "load", lambda: {"hpc1": {"tags": ["sl urm!"]}})
+    s = rendered(code)
+    assert all(m in s for m in safe), [m for m in safe if m not in s]
+    monkeypatch.setattr(machines, "load", lambda: {"hpc1": {"tags": ["slurm"]}})
+    monkeypatch.setattr(machines, "device_host", broken_host)
+    s = rendered(code)
+    assert all(m in s for m in safe), [m for m in safe if m not in s]
+    monkeypatch.undo()
+    monkeypatch.setattr(machines, "load", lambda: {})
+    p.charter_path.write_text(charter + "\n## Resources\n- The lab's Slurm cluster.\n")
+    p.set_config("device", {"runners": ["r1"]})
+    s = rendered(code)
+    assert all(m in s for m in safe), [m for m in safe if m not in s]
+    p.set_config("device", {})
+    p.charter_path.write_text(charter)
+    # worker_prompt renders the rules of the task it is given, as the daemon does.
+    monkeypatch.setattr(prompts, "worker_task", lambda *a: "")
+    assert "NEVER mark a PR ready for review" not in prompts.worker_prompt(p, question, ".", None)
+    assert "NEVER mark a PR ready for review" in prompts.worker_prompt(p, code, ".", None)
     # The daemon renders the prompt for the task it starts.
     assert "task" in inspect.signature(worker_system).parameters
     assert prompts.worker_system is worker_system

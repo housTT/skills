@@ -380,37 +380,46 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
         on.add("prs")
     if kind not in NO_WAIT_KINDS:
         on.add("wait")
+    # Each check that cannot be read turns on the rules it could not rule out: a missing rule costs
+    # more than a few hundred extra characters.
+    unsure = set()
     try:
         known = machines.load()
     except Exception:
-        known = {}
+        known, unsure = {}, {"device", "remote", "clusters"}
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
     resources = " ".join(re.findall(r"(?ms)^## Resources\b.*?(?=^## |\Z)", charter))
     task_text = " ".join(str((task or {}).get(k) or "") for k in ("title", "spec", "labels"))
     # Machines this project may use (the charter names them) and the ones this task names.
     used = {a: m for a, m in known.items() if _named(a, charter) or _named(a, task_text)}
-    tags = {a: machines.tag_list(m.get("tags")) for a, m in used.items()}
-    runners = (cfg.get("device") or {}).get("runners") or {}
-    runners = runners if isinstance(runners, dict) else {}
+    tags = {}
+    for a, m in used.items():
+        try:
+            tags[a] = machines.tag_list(m.get("tags"))
+        except Exception:
+            unsure |= {"device", "remote", "clusters"}
+    device = cfg.get("device") if isinstance(cfg.get("device"), dict) else {}
+    runners = device.get("runners") or {}
+    if not isinstance(runners, dict):
+        runners, unsure = {}, unsure | {"devq", "device", "remote"}
     if runners:
         on.add("devq")
     try:
         here = machines.device_host(known)
     except Exception:
-        here = False
+        here, unsure = False, unsure | {"device"}
     from .effort import device_task
     from .locks import device_locks
     holds = bool(task) and device_task(task)
     if runners or here or device_locks(cfg) or holds or any("device" in t for t in tags.values()):
         on.add("device")
-    # A job on another machine: the task names one, a device task's project uses one, or a runner is remote.
-    if any(_named(a, task_text) for a in known) or (holds and used) or any(
-            (r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
+    # A job on another machine: the project or the task names one, or a runner is remote.
+    if used or any((r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
         on.add("remote")
     if re.search(r"\b(slurm|cluster)", resources, re.I) or any(
             {"slurm", "cluster"} & set(t) for t in tags.values()):
         on.add("clusters")
-    return on
+    return on | unsure
 
 
 def worker_system(p: Project, task: dict | None = None) -> str:
@@ -599,4 +608,4 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
 
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     """The whole prompt in one piece, as a worker reads it."""
-    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)
+    return worker_system(p, task) + "\n\n" + worker_task(p, task, cwd, branch)
