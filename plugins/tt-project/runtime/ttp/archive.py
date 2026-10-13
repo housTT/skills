@@ -22,7 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .project import Project
+from .project import Project, durable_append, durable_write, fsync_dir, write_json
 
 ARCHIVE_DIR = "archive/tasks"
 MANIFEST = "manifest.json"
@@ -65,12 +65,6 @@ def files_of(root: Path, rels: list[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1))
-    os.replace(tmp, path)
-
-
 def tracked_patch(root: Path) -> bytes:
     """A binary patch of the worktree's uncommitted tracked changes against HEAD, checked to apply to
     HEAD in a scratch index (`git apply --check --cached`). Raises when there is none or it does not
@@ -110,9 +104,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
         n = 0
         while (dest / (name := "tracked.patch" if not n else f"tracked.{n}.patch")).exists():
             n += 1
-        tmp = dest / (name + ".tmp")
-        tmp.write_bytes(patch)
-        os.replace(tmp, dest / name)
+        durable_write(dest / name, patch)
         patches.append({"file": name, "size": len(patch), "sha256": hashlib.sha256(patch).hexdigest(),
                         "paths": list(tracked), "at": time.time()})
     named_files, keep, dropped, sizes = _split(root, named, others, cap_mb)
@@ -135,12 +127,15 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
         with tarfile.open(tmp, "w:gz", compresslevel=1) as tar:
             for f in small:
                 tar.add(str(root / f), arcname=f, recursive=False)
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
         os.replace(tmp, dest / tar_name)
+        fsync_dir(dest)
     for f in big:
         to = dest / "files" / f
         to.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(root / f), str(to))
-    _write_json(dest / MANIFEST, {"task": task["id"], "status": task.get("status") or "",
+    write_json(dest / MANIFEST, {"task": task["id"], "status": task.get("status") or "",
                                   "branch": task.get("branch") or "", "head": head or old.get("head") or "",
                                   "worktree": str(root), "updated": time.time(), "files": entries + new,
                                   "patches": patches})
@@ -148,8 +143,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
             f"branch {task.get('branch') or '-'}, head {(head or '-')[:12]}: {len(keep)} file(s) "
             f"({sum(sizes[f] for f in keep) / 1e6:.1f} MB) archived, {len(dropped)} listed only"
             + (f", a patch of {len(tracked)} tracked file(s)" if patch else "") + "\n")
-    with open(p.state / ARCHIVE_DIR / "MANIFEST.md", "a") as fh:
-        fh.write(line)
+    durable_append(p.state / ARCHIVE_DIR / "MANIFEST.md", line)
     for f in small + dropped:
         try:
             (root / f).unlink()

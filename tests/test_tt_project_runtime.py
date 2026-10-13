@@ -31677,6 +31677,8 @@ DURABLE_EXEMPT = {
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
     ("fake.py", '"result.json").write_text'): "the test provider",
     ("schedcheck.py", "out.write_text(printed)"): "a scratch project's watcher output, removed when the check ends",
+    ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",
+    ("archive.py", "os.replace(tmp, dest / tar_name)"): "the tarball is synced before the rename and its directory after",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
