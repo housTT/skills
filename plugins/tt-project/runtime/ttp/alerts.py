@@ -66,6 +66,7 @@ CLEARED_TEXT = {
     "push_queue_dying": "Push batches finish again.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
+    "deploy-behind": "The deploy to {arg} no longer fails: it runs the release, or its upgrade is owned and pending again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
     "network": "The hosts the queued work waits on answer again; it resumes by itself.",
@@ -75,7 +76,7 @@ CLEARED_TEXT = {
 USER_BLOCKERS = ("network",)
 CLEARED_SEVERITY = {"network": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
-STATUS_CONDITIONS = ("budget", "limit", "deploy")
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -175,6 +176,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "deploy":
         from . import deploy
         return deploy.holds(db, arg, now)
+    if kind == "deploy-behind":
+        from . import deploy
+        return deploy.holds_behind(db, arg, now)
     if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
         return heal.holds(db, arg, now)
@@ -221,7 +225,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "machine", "machine-change", "network", "deploy")
+                                         "machine", "machine-change", "network", "deploy", "deploy-behind")
 
 
 def _since(ep: dict) -> float:

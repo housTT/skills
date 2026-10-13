@@ -15,9 +15,10 @@ import sys
 import time
 
 from . import overview, project, timefmt
+from .db import SEVERITY_RANK
 
 CHECKS = "deploy_checks"
-ALERTED = "deploy_alerted"   # the last deploy alert record() sent: pushq sends no after_push alert of its own
+ALERTED = "deploy_alerted"   # the last deploy alert record() sent or updated: pushq sends no after_push alert of its own
 GRACE_S = 300
 RESTART_WAIT_S = 900         # default delivery.deploy_restart_wait_s
 PROBE_S = 60
@@ -34,8 +35,13 @@ def condition_key(name: str, version: str) -> str:
 
 
 def release_key(version: str) -> str:
-    """The one alert of a release's deploy, listing every project still behind."""
+    """The alert of a release's deploy, listing every project behind, as alerts before behind_key had one."""
     return f"deploy:{version}"
+
+
+def behind_key(name: str) -> str:
+    """The one ongoing alert of a project behind on releases: each new release updates it in place."""
+    return f"deploy-behind:{name}"
 
 
 def restart_wait(p) -> float:
@@ -87,15 +93,41 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
     return "failed", "unowned", reason
 
 
-def holds(db, arg: str, now: float) -> bool:
-    """The alert `deploy:<arg>` holds: for a release (`deploy:<version>`) while any project's check of it
-    still fails; `deploy:<name>:<version>` (one project, as alerts before releases had one) while that does."""
-    checks = db.kv(CHECKS) or {}
+def _failing(db, recs: list, now: float) -> bool:
     takeovers = db.kv(TAKEOVERS) or {}
-    recs = [checks.get("deploy:" + arg)] if ":" in arg else [r for r in checks.values() if r.get("target") == arg]
     return any(rec and not rec.get("closed") and _takeover(None, rec, *assess(rec, _probe(rec, now), now),
                                                            dict(takeovers.get(rec["name"]) or {}), now)[0] == "failed"
                for rec in recs)
+
+
+def holds(db, arg: str, now: float) -> bool:
+    """The alert `deploy:<arg>` holds (alerts before behind_key): for a release (`deploy:<version>`) while
+    any project's check of it still fails; `deploy:<name>:<version>` (one project) while that does."""
+    checks = db.kv(CHECKS) or {}
+    recs = [checks.get("deploy:" + arg)] if ":" in arg else [r for r in checks.values() if r.get("target") == arg]
+    return _failing(db, recs, now)
+
+
+def holds_behind(db, name: str, now: float) -> bool:
+    """The alert `deploy-behind:<name>` holds while a check of that project still fails: it clears once its
+    own daemon reports the release (or its upgrade is owned and pending again)."""
+    return _failing(db, [r for r in (db.kv(CHECKS) or {}).values() if r.get("name") == name], now)
+
+
+def _supersede(checks: dict, now: float) -> None:
+    """Close each open check of a project that an open check of a newer release replaces: the newest one
+    tracks it (reaching it reaches the older ones too), so a stuck project is one check and one alert."""
+    newest: dict[str, str] = {}
+    for rec in checks.values():
+        if not rec.get("closed") and _vnum(rec["target"]) > _vnum(newest.get(rec["name"], "")):
+            newest[rec["name"]] = rec["target"]
+    for rec in checks.values():
+        if not rec.get("closed") and rec["target"] != newest[rec["name"]]:
+            rec.update(closed=now, superseded=newest[rec["name"]])
+
+
+def _vnum(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
 
 
 def _owner_task(rec: dict) -> int | None:
@@ -187,17 +219,28 @@ def _mark(rec: dict, kind: str, now: float) -> bool:
     return True
 
 
-def _alert(p, target: str, failed: list[tuple[dict, str, str]], alert=None) -> str:
-    """One alert for a release's deploy, listing every project still behind (`failed`: (rec, kind, reason)).
-    High only when a daemon is down; normal otherwise. Returns its key."""
-    key = release_key(target)
-    sev = "high" if any(kind == "down" for _, kind, _ in failed) else "normal"
-    names = ", ".join(rec["name"] for rec, _, _ in failed)
-    text = (f"Deploy failed: {names} {'is' if len(failed) == 1 else 'are'} not running tt-project {target}: "
-            + "; ".join(f"{rec['name']}: {reason}" for rec, _, reason in failed) + ".")
-    if alert:
+def _span(s: float) -> str:
+    return f"{s / 86400:.1f} d" if s >= 2 * 86400 else f"{max(s, 0) / 3600:.1f} h"
+
+
+def _alert(p, rec: dict, kind: str, reason: str, now: float, alert=None) -> str:
+    """The one ongoing alert of a project behind (behind_key), naming the newest release it misses, how long
+    it has been behind and why. High only when its daemon is down; normal otherwise. An open one is updated
+    in place (no new message) unless the severity rises. Returns its key."""
+    key = behind_key(rec["name"])
+    sev = "high" if kind == "down" else "normal"
+    since = float(rec.get("since") or ((rec.get("history") or [{}])[0].get("at")) or now)
+    text = (f"Deploy failed: {rec['name']} is not running tt-project {rec['target']} (the newest release; "
+            f"behind since {timefmt.long(since, p)}, {_span(now - since)}): {reason}.")
+    ep = p.db.one("SELECT id, message, severity FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1",
+                  (key,))
+    if ep and SEVERITY_RANK.get(sev, 1) <= SEVERITY_RANK.get(ep["severity"], 1):
+        p.db.x("UPDATE alerts SET text=?, severity=?, last=? WHERE id=?", (text[:2000], sev, now, ep["id"]))
+        if ep["message"]:
+            p.db.x("UPDATE messages SET text=?, severity=? WHERE id=?", (text, sev, ep["message"]))
+    elif alert:
         alert(key, text, severity=sev, every_s=0)
-    elif not p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
+    else:
         p.db.post("out", text, kind="alert", severity=sev, ref=key)
     return key
 
@@ -236,6 +279,10 @@ def record(p, report: dict, now: float | None = None) -> dict:
             same = (old and not old.get("closed") and old.get("commit") == report.get("commit")
                     and (not owner or old.get("owner") in (None, owner)))
             rec = dict(old) if same else {k: old[k] for k in ("history",) if k in old}
+            # Behind since its first open check: a project stuck across releases keeps that time.
+            since = [float(c.get("since") or 0) for c in checks.values() if c.get("name") == row["name"]
+                     and not c.get("closed") and c.get("since")]
+            rec.setdefault("since", min(since + [now]))
             rec.update(name=row["name"], target=report["target"], commit=report.get("commit"),
                        entry=registry.get(row["name"]) or {})
             if not rec.get("takeover_at") and row.get("settling"):
@@ -270,12 +317,14 @@ def record(p, report: dict, now: float | None = None) -> dict:
                                f"{row['name']}: owner {rec['owner']}, takeover {at}")
             checks[key] = rec
             rows.append(row)
+        _supersede(checks, now)
         p.db.set_kv(CHECKS, checks)   # before the alert: condition readers can verify it at once
         p.db.set_kv(TAKEOVERS, takeovers)
         if failed:   # already alerted (still open), or alerted now: after_push's failure is this alert
-            key = _alert(p, report["target"], [f[:3] for f in failed]) if any(new for *_, new in failed) \
-                else release_key(report["target"])
-            p.db.set_kv(ALERTED, {"key": key, "target": report["target"], "commit": report.get("commit"), "at": now})
+            keys = [_alert(p, rec, kind, reason, now) if new and not rec.get("closed") else behind_key(rec["name"])
+                    for rec, kind, reason, new in failed]
+            p.db.set_kv(ALERTED, {"key": keys[0], "keys": keys, "target": report["target"],
+                                  "commit": report.get("commit"), "at": now})
         if pending:
             p.db.post("out", f"tt-project {report['target']} deploy pending: " + "; ".join(pending)
                       + ". Follow-up checks run after takeover with a 5 min grace, and after a pending "
@@ -288,16 +337,18 @@ def tick(p, alert, now: float | None = None) -> None:
     """Called even while paused, once a minute per check. Close caught-up projects quietly; alert a
     daemon that stops or fails to come up, or a current upgrade error, at the next probe; alert a merge
     that missed its takeover only after its deadline. A resolved condition resets its deduplication,
-    and its alert clears through holds. One alert per release a probe finds newly failing, listing every
-    project of that release still behind."""
+    and its alert clears through holds_behind. One ongoing alert per project a probe finds newly failing,
+    updated in place by the next release it misses."""
     now = time.time() if now is None else now
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
+        before = {k: bool(r.get("closed")) for k, r in checks.items()}
+        _supersede(checks, now)   # checks kept per release by earlier versions
+        changed = before != {k: bool(r.get("closed")) for k, r in checks.items()}
         takeovers = p.db.kv(TAKEOVERS) or {}
         for name, t in takeovers.items():
             _reap(name, t, now)
-        changed = False
-        failing: dict[str, list] = {}
+        failing: list = []
         for key, rec in checks.items():
             if rec.get("closed") or now < float(rec.get("next_probe") or 0):
                 continue
@@ -306,13 +357,12 @@ def tick(p, alert, now: float | None = None) -> None:
             outcome, kind, reason = _takeover(p, rec, *assess(rec, _probe(rec, now), now, p),
                                               takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)
-            if outcome == "failed":
-                failing.setdefault(rec["target"], []).append((rec, kind, reason, _mark(rec, kind, now)))
+            if outcome == "failed" and _mark(rec, kind, now):
+                failing.append((rec, kind, reason))
         live = {rec["name"] for rec in checks.values() if not rec.get("closed")}
         takeovers = {n: t for n, t in takeovers.items() if n in live or t.get("pid")}
         if changed or takeovers != (p.db.kv(TAKEOVERS) or {}):
             p.db.set_kv(CHECKS, checks)
             p.db.set_kv(TAKEOVERS, takeovers)
-        for target, failed in failing.items():
-            if any(new for *_, new in failed):
-                _alert(p, target, [f[:3] for f in failed], alert)
+        for rec, kind, reason in failing:
+            _alert(p, rec, kind, reason, now, alert)

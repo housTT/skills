@@ -628,9 +628,11 @@ prolonged whole-box outage.
   `delivery.deploy_restart_wait_s` (default 900). A daemon that
   stops or fails to come up (high), or an upgrade error for this release, alerts at the next
   probe (about a minute), not at takeover. A takeover still behind after its last try, or a
-  restart still behind at its re-check, alerts at normal severity. A release's deploy sends one alert, listing every
-  project still behind; the push queue then sends no after_push alert of its own for that
-  failure. Each alert clears quietly once its condition does, and a recovered
+  restart still behind at its re-check, alerts at normal severity. A project behind is one
+  ongoing alert (`deploy-behind:<project>`): each later release it misses updates that alert in
+  place (the newest release, since when it is behind, why), and only a daemon going down pages
+  again. The push queue sends no after_push alert of its own for that failure. The alert clears
+  once the project's own daemon reports the release, and a recovered
   daemon returns to pending. Missing ownership/deadlines, current upgrade errors and daemons
   that fail to start remain failures; an older release's upgrade error does not count.
   Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred,
