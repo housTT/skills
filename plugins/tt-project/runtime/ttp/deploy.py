@@ -380,6 +380,8 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 at = timefmt.long(max(rec["takeover_at"], now), p)
                 pending.append(f"{row['name']}: restart onto the new files pending, owner {rec['owner']}, "
                                f"re-checked {at}" if rec.get("restart") else
+                               f"{row['name']}: paused (stays paused), owner {rec['owner']}, host-side takeover "
+                               f"{at}" if row.get("paused") else
                                f"{row['name']}: owner {rec['owner']}, takeover {at}")
             checks[key] = rec
             rows.append(row)

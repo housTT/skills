@@ -3403,15 +3403,16 @@ def cmd_upgrade(a) -> None:
         tid = holder["task"] if holder else None
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
         took, parked = False, None
+        if tid and not mine and a.apply is None and not a.auto and not own:
+            # A blocked or idle task cannot hold off a host-side upgrade, paused or not: the pause stays and
+            # a conflict queues the merge task again, held by the pause like any other task.
+            took = _take_over_finish(p, holder, overdue=getattr(a, "take_over_from", None) == tid)
+            if took:
+                holder, tid = None, None
         if tid and not mine and a.apply is None and not a.auto and not own and p.db.kv("paused", False):
             # A paused project's merge task cannot run: the merge is tried here, files only, and the task
             # is superseded only once it merged cleanly; a conflict leaves it to finish after the resume.
             parked, holder, tid = holder, None, None
-        if tid and not mine and a.apply is None and not a.auto and not own:
-            took = _take_over_finish(p, holder,     # a blocked or idle task cannot hold off a host-side upgrade
-                                     overdue=getattr(a, "take_over_from", None) == tid)
-            if took:
-                holder, tid = None, None
         if tid and not mine and a.apply is None:    # the open task takes this release on: one merge, not two
             release.guard_harness(p.harness)
             _retarget_upgrade_task(p, holder, a.auto)
@@ -3557,7 +3558,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         if auto:
             release.finish(p, "conflict", task=tid, why=problem[:300])
         print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{tid} "
-              f"finishes it (upgrade deferred to that task).")
+              f"finishes it (upgrade deferred to that task)."
+              + (f"\n{p.name} paused; upgrades when resumed: task #{tid} runs once {p.name} is resumed "
+                 f"(the pause was left as it is)." if p.db.kv("paused", False) else ""))
         sys.exit(75)        # deferred: the project's own harness task takes it on
     if auto and release.push_in_flight(p):   # a push started while this merged: never swap under it
         release.finish(p, "held", why="a push is in flight")

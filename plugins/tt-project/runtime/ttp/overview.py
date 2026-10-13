@@ -263,6 +263,11 @@ def _holder(db: _RO, state: Path) -> int | None:
     return int(t["id"]) if t else None
 
 
+def _paused(db: _RO) -> bool:
+    r = db.one("SELECT value FROM kv WHERE key='paused'")
+    return bool(r and r["value"] in ("true", "1"))
+
+
 def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> tuple[str, str, str]:
     """(reason, owner, resumes) for a project whose harness files are not at the target yet."""
     from . import timefmt
@@ -272,9 +277,15 @@ def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> t
     if tid:
         t, last = task_activity(db, tid)
         status = t["status"] if t else "gone"
+        if _paused(db):     # its task cannot run: the pause holds it, not a deadline that would slide
+            return (f"files at {files}: paused; merge held by harness task #{tid} ({status})",
+                    f"harness task #{tid}", f"when {name} is resumed")
         return (f"files at {files}: merge held by harness task #{tid} ({status})", f"harness task #{tid}",
                 f"when it ends, or at {at(now if status == 'blocked' else last + STALE_S)} when a host-side "
                 f"`ttp upgrade {name}` may take it over")
+    if _paused(db):         # nothing upgrades it by itself: the deploy's host-side takeover merges its files
+        return (f"files at {files}: paused; not upgraded yet", "the host-side takeover (project paused)",
+                f"at the deploy's host-side `ttp upgrade {name}`, or when {name} is resumed")
     rec, _ = db.kv(KV_AUTO)
     if rec.get("outcome") == "deferred":
         why = " ".join(str(rec.get("why") or "").split())[:160]
@@ -337,8 +348,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         row["daemon_state"] = daemon
         tid = _holder(db, state)
         row["merge_pending"] = bool(tid and not at_target)
-        r = db.one("SELECT value FROM kv WHERE key='paused'")
-        row["paused"] = bool(r and r["value"] in ("true", "1"))
+        row["paused"] = _paused(db)
         auto, _ = db.kv(KV_AUTO)
         if auto.get("outcome") == "failed" and _concerns(auto, target, commit):
             row["upgrade_error"] = auto.get("why") or "the last upgrade failed"

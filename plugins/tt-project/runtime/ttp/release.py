@@ -279,8 +279,13 @@ def stale_holder(db, h: dict | None) -> str:
 
 def holder_line(p: Project, h: dict, db=None) -> str:
     """Who owns a deferral behind finish task `h`, and when it resumes, for deferral lines."""
-    t, last = task_activity(db or p.db, h["task"])
+    db = db or p.db
+    t, last = task_activity(db, h["task"])
     status = t["status"] if t else "gone"
+    if status not in ("done", "failed", "cancelled") and db.kv("paused", False):
+        # Its task cannot run, and a takeover only queues the merge again: no deadline that would slide.
+        return (f"owner: harness task #{h['task']} ({status}); {p.name} paused; upgrades when resumed "
+                f"(the task runs then)")
     at = time.time() if status == "blocked" else last + STALE_S
     return (f"owner: harness task #{h['task']} ({status}); resumes when it ends, or at "
             f"{timefmt.long(max(at, time.time()), p)} when a host-side `ttp upgrade {p.name}` may take it over")

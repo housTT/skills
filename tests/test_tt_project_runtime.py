@@ -12941,9 +12941,9 @@ def test_a_paused_project_gets_the_files_only_upgrade_and_stays_paused(env, monk
 
 
 def test_a_paused_project_whose_merge_needs_its_task_upgrades_when_resumed(env, monkeypatch, capsys):
-    """The merge conflicts and only the project's own harness task may resolve it: the host-side upgrade
-    of a paused project exits 75 saying so, supersedes nothing and queues nothing; the open task is
-    retargeted to the release and finishes it once the project is resumed."""
+    """The merge conflicts and only the project's own harness task may resolve it, which is not past its
+    takeover time: the host-side upgrade of a paused project exits 75 saying so, supersedes nothing and
+    queues nothing; the open task is retargeted to the release and finishes it once it is resumed."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
     with pytest.raises(SystemExit):
@@ -12952,7 +12952,7 @@ def test_a_paused_project_whose_merge_needs_its_task_upgrades_when_resumed(env, 
     p.db.set_paused(True)
     _next_release(env)
     head = _git_out(p.harness, "rev-parse", "HEAD")
-    for argv in (["upgrade", "demo", "--take-over-from", str(tid)], ["upgrade", "demo"]):
+    for argv in (["upgrade", "demo", "--take-over-from", str(tid + 1)], ["upgrade", "demo"]):
         capsys.readouterr()
         with pytest.raises(SystemExit) as e:
             cli.main(argv)
@@ -12961,6 +12961,47 @@ def test_a_paused_project_whose_merge_needs_its_task_upgrades_when_resumed(env, 
     assert p.db.task(tid)["status"] == "queued" and not release.fenced(p, tid) and not restarts
     assert "bbbb2222" in p.db.task(tid)["spec"] and release.finish_holder(p)["task"] == tid
     assert _git_out(p.harness, "rev-parse", "HEAD") == head and p.db.kv("paused") is True
+
+
+@pytest.mark.parametrize("how", ["take-over-from", "stale"])
+def test_a_paused_projects_stuck_merge_owner_is_taken_over_and_the_project_stays_paused(env, monkeypatch, capsys,
+                                                                                         how):
+    """Replays a paused project whose conflicting merge task could never run: `ttp upgrade <name>
+    --take-over-from <task>` printed 'paused; upgrades when resumed', changed nothing, and status and the
+    deploy kept promising a takeover at a deadline that slid. Now an owner past its takeover time (named by
+    --take-over-from, or idle past 6 h) is superseded (cancelled, finish-lock generation up), the merge is
+    queued again for this release, held by the pause; the pause and the rest of the queue stay as they were,
+    and every report names the pause, never a takeover deadline."""
+    from ttp import cli, overview, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    other = p.db.add_task("unrelated work", "x")
+    p.db.set_paused(True)
+    _next_release(env)
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    gen = int(release._lock_rec(p).get("gen") or 0)
+    if how == "stale":
+        p.db.x("UPDATE tasks SET updated=?, created=? WHERE id=?", (time.time() - 7 * 3600, time.time() - 7 * 3600, tid))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"] + (["--take-over-from", str(tid)] if how == "take-over-from" else []))
+    out = capsys.readouterr().out
+    assert e.value.code == 75, "deferred to the merge task: not applied, so never exit 0"
+    assert f"harness task #{tid} held the template merge" in out and "demo paused; upgrades when resumed" in out
+    t = p.db.task(tid)
+    assert t["status"] == "cancelled" and "superseded by host upgrade" in t["blocked_reason"] and release.fenced(p, tid)
+    assert int(release._lock_rec(p)["gen"]) == gen + 1
+    new = release.finish_holder(p)["task"]
+    assert new != tid and p.db.task(new)["status"] == "queued" and "bbbb2222" in p.db.task(new)["spec"]
+    assert p.db.kv("paused") is True and p.db.task(other)["status"] == "queued" and not restarts
+    assert _git_out(p.harness, "rev-parse", "HEAD") == head
+    held = release.holder_line(p, release.finish_holder(p))
+    assert "demo paused; upgrades when resumed" in held and "take it over" not in held
+    row = overview.deployed(names=["demo"])["projects"][0]
+    assert "paused" in row["reason"] and row["resumes"] == "when demo is resumed", row["line"]
+    assert "take it over" not in row["line"]
 
 
 def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
@@ -51609,6 +51650,55 @@ def test_a_paused_project_upgraded_by_the_takeover_closes_and_stays_paused(env, 
     assert p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['closed'] and db.kv('paused') is True
     assert not p.db.q("SELECT id FROM messages WHERE text LIKE '%upgrades when resumed%'")
     assert 'takeover ended: exit 0' in (base / 'state' / 'logs' / 'takeover.log').read_text()
+
+
+def test_the_after_push_deploy_takes_a_paused_projects_stuck_merge_over_and_names_the_pause(env, monkeypatch):
+    """Replays a paused project whose conflicting merge task never ran: the deploy's host-side takeover
+    deferred to that task and the project stayed on its old release with no end. Now the real takeover
+    (the installed `ttp upgrade --take-over-from`) supersedes the task and queues the merge again, held by
+    the pause; the project stays paused, the deploy is one low note naming the pause, and nothing pages."""
+    from ttp import cli, deploy, overview, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    p.db.set_paused(True)
+    _next_release(env)
+    rt = p.harness / "runtime"
+    old = time.time() - 3600
+    pid = os.getpid()                    # its daemon runs the old release (this process stands in for it)
+    p.db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": old})
+    (p.state / "heartbeat").write_text(json.dumps({"pid": pid, "host": "testhost", "receipt": {
+        "version": overview.runtime_version(rt), "commit": release.runtime_commit(rt), "runtime": str(rt),
+        "pid": pid, "started": old, "instance": "inst-demo", "provenance": "verified"}}))
+    (p.state / "tick_done").write_text(json.dumps({"instance": "inst-demo", "pid": pid}))
+    now = time.time()
+    report = deploy.record(p, overview.deployed(names=["demo"]), now)
+    assert report["rc"] == 0 and report["projects"][0]["outcome"] == "pending"
+    note = p.db.one("SELECT text FROM messages WHERE text LIKE '%deploy pending%' ORDER BY id DESC LIMIT 1")
+    assert "demo: paused (stays paused)" in note["text"]
+    due = p.db.kv(deploy.CHECKS)[deploy.condition_key("demo", report["target"])]["due"]
+    pages, page = _deploy_pager(p)
+    t = due + 1
+    for _ in range(6):
+        deploy.tick(p, page, t)
+        for child in deploy._children.values():
+            child.wait(timeout=120)
+        t += deploy.TAKEOVER_SETTLE_S
+    log = (p.logs / "takeover.log").read_text()
+    assert log.count(f"ttp upgrade demo --take-over-from {tid}") == 1 and "takeover ended: exit 75" in log
+    assert f"harness task #{tid} held the template merge" in log, log[-2000:]
+    task = p.db.task(tid)
+    assert task["status"] == "cancelled" and "superseded by host upgrade" in task["blocked_reason"]
+    assert release.fenced(p, tid)
+    new = release.finish_holder(p)["task"]
+    assert new != tid and p.db.task(new)["status"] == "queued" and p.db.kv("paused") is True and not restarts
+    rec = p.db.kv(deploy.CHECKS)[deploy.condition_key("demo", report["target"])]
+    assert rec["outcome"] == "pending" and not pages and not p.db.q("SELECT * FROM alerts")
+    notes = p.db.q("SELECT severity FROM messages WHERE direction='out' AND text LIKE '%upgrades when resumed%'")
+    assert [n["severity"] for n in notes] == ["low"]
+    row = overview.deployed(names=["demo"])["projects"][0]
+    assert "paused" in row["reason"] and "take it over" not in row["line"]
 
 
 def test_a_repeat_merge_owner_keeps_its_first_takeover_deadline(env, tmp_path):
