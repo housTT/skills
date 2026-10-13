@@ -666,7 +666,7 @@ class Handler(BaseHTTPRequestHandler):
                 d = Path(r["dir"])
                 tail = lambda n: (d / n).read_text(errors="replace")[-8000:] if (d / n).exists() else ""  # noqa: E731
                 return self._send(200, {"progress": tail("progress.md"), "result": tail("result.json"),
-                                        "stderr": tail("stderr.log"), "archived": archived_files(p, r["task"])})
+                                        "stderr": tail("stderr.log"), "archived": archived_files(self._proj(), r["task"])})
             return self._send(404, {"error": "unknown endpoint"})
         finally:
             db.close()

@@ -14940,6 +14940,27 @@ def test_big_artifacts_are_copied_across_filesystems_and_renamed_without_hard_li
         assert not [x for x in d.rglob("*") if x.name.endswith((".part", ".tmp"))]
 
 
+@needs_sockets
+def test_the_web_apps_run_view_lists_the_archived_files_with_their_objects(env, monkeypatch):
+    p = make(env)
+    from ttp import archive, web, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+    t, (wt,) = _big_artifact_runs(p, [b"W" * 5000])
+    rid = int(wt.parent.name)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(wt.parent), rid))
+    assert [r["why"] for r in worktree.sweep(p)] == [None]
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/run/{rid}", headers={"X-TTP-Token": web.token(p)})
+    for _ in range(50):
+        try:
+            data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            break
+        except urllib.error.URLError:
+            time.sleep(0.1)
+    (e,) = data["archived"]
+    assert e["path"] == "model.out" and e["location"] == str(archive.task_dir(p, t) / archive.blob(e["sha256"]))
+
+
 def test_an_old_layout_archive_still_resolves_and_restores(env, capsys):
     """Archives written before objects/ keep big files at files/<path> with no `blob` in the entry."""
     import io
