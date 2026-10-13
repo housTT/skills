@@ -3013,7 +3013,7 @@ def _machine_outage(a) -> None:
 
 
 def _machine_change(a) -> None:
-    """`ttp machines change add|list|close`: the ledger of live changes to shared machines (machine_ledger.py)."""
+    """`ttp machines change add|list|close|edit`: the ledger of live changes to shared machines (machine_ledger.py)."""
     from . import machine_ledger as ml
     if a.change == "list":
         got = ml.changes([a.alias] if a.alias else None, open_only=not a.all)
@@ -3034,6 +3034,13 @@ def _machine_change(a) -> None:
         except ValueError as e:
             die(str(e))
         print(f"closed machine change #{c['id']} on {c['alias']}")
+        return
+    if a.change == "edit":
+        try:
+            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe)
+        except ValueError as e:
+            die(str(e))
+        print(f"edited {ml.change_line(c)}")
         return
     if not by:
         die("run it inside a project, or say whose change it is: --by <project>")
@@ -4719,6 +4726,15 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("id", type=int)
     c.add_argument("--why")
     c.add_argument("--by")
+    c = cs.add_parser("edit", help="correct an open change in place (same id): its text, undo command or end")
+    c.add_argument("id", type=int)
+    c.add_argument("--what", help="the new text: what changed and why, one line")
+    c.add_argument("--undo", help="the new command that undoes it")
+    end = c.add_mutually_exclusive_group()
+    end.add_argument("--expires", help="a new end: a delay (6h, 3d) or a time")
+    end.add_argument("--until-probe", dest="until_probe",
+                     help="a new end: a command that exits 0 once the change should be undone")
+    c.add_argument("--by", help="who edits it (default: the project you are in)")
     s.set_defaults(fn=cmd_machines)
 
     for name in ("pause", "resume"):

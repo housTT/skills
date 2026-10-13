@@ -38,7 +38,8 @@ entry also expires after PROBE_END_S. An overdue entry pages the project that ma
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
 then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
-from its root, as end probes do.
+from its root, as end probes do. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe]`
+corrects an open entry in place (same id), with an edit trail in the entry.
 
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
 intent: an entry of kind `power_cycle` that needs no undo and closes itself POWER_CYCLE_AFTER_S after T
@@ -187,6 +188,58 @@ def close_change(cid: int, why: str = "", by: str = "", now: float | None = None
                 _write(LEDGER, doc)
                 return c
     raise ValueError(f"no open machine change #{cid}")
+
+
+def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
+                until_probe: str | None = None, now: float | None = None) -> dict:
+    """Correct open entry #cid in place: its text, undo command or end (--expires or --until-probe, as
+    add_change takes them). Keeps its id, alias, author and creation time; records who edited it, when
+    and the values it replaced in `edits`. A new end starts afresh: its until-probe result and overdue
+    pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
+    that changes nothing."""
+    now = time.time() if now is None else now
+    if expires and until_probe:
+        raise ValueError("give one end: --expires or --until-probe")
+    new: dict[str, Any] = {}
+    if what is not None:
+        new["what"] = _one_line(what)
+    if undo is not None:
+        new["undo"] = _one_line(undo, 1000)
+    if not all(new.values()):
+        raise ValueError("the text and the --undo command cannot be empty")
+    if until_probe is not None:
+        probe = _one_line(until_probe, ends.PROBE_CHARS)
+        if not probe:
+            raise ValueError("the --until-probe command cannot be empty")
+        new.update(probe=probe, expires=now + PROBE_END_S)
+    elif expires:
+        new.update(probe=None, expires=float(expires) if isinstance(expires, (int, float))
+                   else ends.parse_expires(expires, now))
+    if not new:
+        raise ValueError("say what to change: --what, --undo, --expires or --until-probe")
+    with _locked():
+        doc = _read(LEDGER, {"next": 1, "changes": []})
+        c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
+        if c is None:
+            raise ValueError(f"no machine change #{cid}")
+        if c.get("closed"):
+            raise ValueError(f"machine change #{cid} is closed; record a new one with `ttp machines change add`")
+        if c.get("kind") == POWER_CYCLE and set(new) - {"what"}:
+            raise ValueError(f"machine change #{cid} is a planned power cycle: only --what can change; "
+                             f"close it and record a new one for another time")
+        if until_probe is not None and new["probe"] == c.get("probe"):
+            del new["probe"], new["expires"]   # the same until-probe keeps its end
+        was = {k: c.get(k) for k, v in new.items() if c.get(k) != v}
+        if not was:
+            raise ValueError(f"machine change #{cid} already says that: nothing to change")
+        for k in was:
+            c[k] = new[k]
+        if "expires" in was:
+            for k in ("probe_passed", "page"):
+                c.pop(k, None)
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
+        _write(LEDGER, doc)
+        return c
 
 
 def overdue(c: dict, now: float | None = None) -> str:

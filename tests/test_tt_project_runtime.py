@@ -46572,6 +46572,62 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
         main(["machines", "change", "close", "2"])
 
 
+def test_machine_change_edit_corrects_an_open_entry_in_place(env, capsys):
+    """`ttp machines change edit <id>` corrects an open entry's text, undo command or end in place: same id,
+    alias, author and creation time, an edit trail with the old values; a new end drops its overdue pages.
+    It refuses unknown or closed ids, a power cycle's undo or end, and an edit that changes nothing."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    first = ml.add_change("box-a", "drop-in", "rm it", "alpha", expires="1h", now=now - 7200)
+    ml.add_change("box-a", "second", "undo-2", "alpha", expires="2h", now=now)
+    main(["machines", "change", "edit", "1", "--undo", "rm /etc/x.conf && reload", "--by", "beta"])
+    assert "edited #1 box-a: drop-in (by alpha; undo: `rm /etc/x.conf && reload`" in capsys.readouterr().out
+    c = ml.changes()[0]
+    assert (c["id"], c["alias"], c["by"], c["added"]) == (1, "box-a", "alpha", first["added"])
+    assert c["edits"][0]["by"] == "beta" and c["edits"][0]["was"] == {"undo": "rm it"}
+    ml.edit_change(1, "beta", what="drop-in for a soak", now=now)
+    c = ml.changes()[0]
+    assert c["what"] == "drop-in for a soak" and c["edits"][1] == {"at": now, "by": "beta", "was": {"what": "drop-in"}}
+    # Overdue and paged: a new end starts afresh, without the old pages or probe result.
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        doc["changes"][0].update(page={"stage": 1}, probe_passed=now)
+        ml._write(ml.LEDGER, doc)
+    assert ml.overdue(ml.changes()[0], now)
+    ml.edit_change(1, "beta", expires="3h", now=now)
+    c = ml.changes()[0]
+    assert c["expires"] == pytest.approx(now + 3 * 3600) and "page" not in c and "probe_passed" not in c
+    assert not ml.overdue(c, now) and c["edits"][2]["was"]["expires"] == pytest.approx(now - 3600)
+    ml.edit_change(1, "beta", until_probe="test -e /tmp/done", now=now)
+    c = ml.changes()[0]
+    assert c["probe"] == "test -e /tmp/done" and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
+    assert c["edits"][3]["was"]["probe"] is None
+    with pytest.raises(ValueError, match="nothing to change"):
+        ml.edit_change(1, "beta", what="drop-in for a soak", until_probe="test -e /tmp/done", now=now + 60)
+    with pytest.raises(ValueError, match="say what to change"):
+        ml.edit_change(1, "beta")
+    with pytest.raises(ValueError, match="cannot be empty"):
+        ml.edit_change(1, "beta", undo="  ")
+    with pytest.raises(ValueError, match="no machine change #9"):
+        ml.edit_change(9, "beta", undo="x")
+    ml.close_change(2, "undone")
+    with pytest.raises(ValueError, match="#2 is closed"):
+        ml.edit_change(2, "beta", undo="x")
+    for bad in (["9", "--undo", "x"], ["2", "--undo", "x"], ["1", "--what", "drop-in for a soak"],
+                ["1", "--expires", "1h", "--until-probe", "true"]):
+        with pytest.raises(SystemExit):
+            main(["machines", "change", "edit", *bad])
+    pc = ml.add_power_cycle("box-a", "1h", "alpha", "firmware", now=now)
+    with pytest.raises(ValueError, match="planned power cycle"):
+        ml.edit_change(pc["id"], "beta", expires="2h")
+    assert ml.edit_change(pc["id"], "beta", what="power-cycle intent: new firmware")["kind"] == ml.POWER_CYCLE
+    assert [c["id"] for c in ml.changes()] == [1, pc["id"]] and ml._read(ml.LEDGER, {})["next"] == pc["id"] + 1
+
+
 def test_a_planned_power_cycle_tells_running_workers_on_the_machine_to_hand_off_once(env, tmp_path, capsys,
                                                                                     monkeypatch):
     """`ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle intent (no
