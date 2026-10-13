@@ -3717,6 +3717,25 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     assert p.raw_config()["budget"]["daily_usd"] == 12
 
 
+def test_config_defaults_to_the_runs_project_and_prints_effective_sections(env, capsys, monkeypatch):
+    """Inside a run `ttp config KEY` reads the run's project (as `ttp stats` does), and a section or no
+    key prints the effective config, defaults included."""
+    from ttp import cli
+    from ttp.project import DEFAULT_CONFIG
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.root))
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    cli.main(["config", "budget.split_reread_tokens"])
+    assert json.loads(capsys.readouterr().out) == DEFAULT_CONFIG["budget"]["split_reread_tokens"]
+    monkeypatch.delenv("TTP_RUN_ID")
+    cli.main(["config", "demo", "budget"])
+    budget = json.loads(capsys.readouterr().out)
+    for k in ("split_reread_tokens", "bash_output_max_chars", "compact_window_tokens"):
+        assert budget[k] == DEFAULT_CONFIG["budget"][k], k
+    cli.main(["config", "demo"])
+    assert "budget" in json.loads(capsys.readouterr().out)
+
+
 def test_unreadable_config_refuses_settings_cleanly(env, capsys, monkeypatch):
     """With no project.json and no last good copy, `ttp config` set says why instead of a traceback,
     and the web app still opens (on a port it does not save)."""

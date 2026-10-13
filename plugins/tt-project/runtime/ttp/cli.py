@@ -3216,12 +3216,15 @@ def cmd_config(a) -> None:
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
         return cmd_account_config(a.name, a.key)
-    if a.key is None:
-        die("usage: ttp config NAME KEY [VALUE]")
-    p = need(a.name, sys.argv[1:])
+    from .project import DEFAULT_CONFIG
+    if a.name.split(".")[0] in DEFAULT_CONFIG and a.value is None and not local_project(a.name) and here():
+        # `ttp config KEY [VALUE]` in a run or project folder: the project is the one it runs in, as for `ttp stats`
+        p, a.key, a.value = here(), a.name, a.key
+    else:
+        p = need(a.name, sys.argv[1:])
     if a.value is None:
-        node = p.config()
-        for part in a.key.split("."):
+        node = p.config()   # the effective config: project.json over the defaults
+        for part in (a.key or "").split(".") if a.key else []:
             node = node.get(part, {}) if isinstance(node, dict) else None
         print(json.dumps(node, indent=1))
         return
@@ -4718,7 +4721,8 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--kill", action="store_true", help="also end running workers; their tasks resume on start")
         s.set_defaults(fn=cmd_service)
 
-    s = sub.add_parser("config", help="read or set a config key (dotted); with --account, the account-level "
+    s = sub.add_parser("config", help="read or set a config key (dotted); NAME defaults to the run's project; "
+                                      "a section or no key prints the effective values, defaults included; with --account, the account-level "
                                       "value every project on this machine reads: ttp config --account KEY [VALUE]")
     s.add_argument("name")
     s.add_argument("key", nargs="?")
