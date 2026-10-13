@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, locks, push, timefmt
+from . import checkdirs, batch, locks, push, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  review_subject, reviewed_ids)
 from .landed import on_branch
@@ -1146,7 +1146,6 @@ def _resolve_upstream(p: Project, review_ids: list[int], version: str | None) ->
     after a crash adds none; a failure to record is an event, never a failed batch."""
     if not version or not review_ids:
         return
-    from . import upstream
     done, failed = [], []
     for rid in dict.fromkeys(review_ids):
         for fp, t in resolves_of(p, rid):
