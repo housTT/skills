@@ -31,7 +31,7 @@ from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, task_outcome,
                  without_deferral)
-from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
+from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push, durable_append,
                       own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -75,7 +75,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "pin_verify": {"type": "string", "enum": ["strict", "lenient", ""]},
             "budget_usd": {"type": "number"}, "depends_on": {"type": "array", "items": {"type": "integer"}},
             "reply_chat": {"type": "string"}, "id": {"type": "integer"}, "status": {"type": "string"},
-            "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
+            "memory_kind": {"type": "string"}, "audience": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "command": {"type": "string"}, "timeout_s": {"type": "number"},
             "rewake_after_h": {"type": ["number", "null"]}, "debounce_h": {"type": ["number", "null"]},
@@ -1540,7 +1540,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     text = f"{text.rstrip()} {RELAYED_MARK}: {relayed}]"
                     notes.append(f"memory_add: marked in the entry as relayer context ({relayed})")
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=ends.from_action(a), standing=a.get("standing") is True)
+                                     end=ends.from_action(a), standing=a.get("standing") is True,
+                                     audience=a.get("audience"))
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
                 old = a.get("supersedes") or []
@@ -2666,29 +2667,33 @@ MEMORY_ALERT_KEY = "memory_pinned_over"   # kv: set once pinned memory alone has
 
 def memory_budget_line(p: Project) -> str:
     """One digest line once memory no longer fits whole: what each prompt leaves out."""
+    from .prompts import worker_context
     _, coord = p.memory_select(COORDINATOR_MEMORY_CHARS)
-    _, work = p.memory_select(WORKER_MEMORY_CHARS)
-    if work["shown"] >= work["entries"]:
+    work = worker_context(p)[2]
+    if work["shown"] >= work["entries"] and coord["shown"] >= coord["entries"]:
         return ""
     return (f"## Memory over budget: {coord['entries']} entries, {coord['chars']} chars; you see "
-            f"{coord['shown']}, workers see {work['shown']} (pinned restrictions/preferences/resources "
-            f"{coord['pinned_chars']} chars, always shown). Retire stale entries with `memory_forget`, "
-            f"or `supersedes` when a new one replaces them; a (standing) entry is only shortened (a "
-            f"standing `memory_add` that supersedes it), never retired for space")
+            f"{coord['shown']}, workers see {work['shown']} of the {work['entries']} meant for them "
+            f"(pinned restrictions/preferences/resources {coord['pinned_chars']} chars, always shown). Retire "
+            f"stale entries with `memory_forget`, or `supersedes` when a new one replaces them; a (standing) "
+            f"entry is only shortened (a standing `memory_add` that supersedes it), never retired for space")
 
 
 def memory_budget_check(p: Project) -> None:
-    """Tell the coordinator once when pinned memory alone no longer fits the workers' budget; it
-    is shown whole anyway, at the cost of every decision and fact. Re-arms once it fits again."""
-    over = p.memory_select(WORKER_MEMORY_CHARS)[1]
+    """Tell the coordinator once when the memory workers always get, with their charter digest, no
+    longer fits the workers' budget; it is shown whole anyway, at the cost of every other entry. Re-arms
+    once it fits again."""
+    from .prompts import worker_context
+    over = worker_context(p)[2]
+    over["pinned_over"] = over["pinned_chars"] + over["charter_chars"] > over["limit"]
     flagged = p.db.kv(MEMORY_ALERT_KEY)
     if over["pinned_over"] and not flagged:
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "daemon", "memory_over_budget", "normal",
-                f"Pinned memory ({over['pinned']} restriction/preference/resource entries, "
-                f"{over['pinned_chars']} chars) alone exceeds the workers' {over['limit']}-char memory "
-                f"budget, so they get no decisions or facts. Merge or retire pinned entries "
-                f"(`memory_add` with `supersedes`, or `memory_forget`). Shorten (standing) entries "
+                f"Memory every worker gets ({over['pinned']} restriction/resource entries or ones for workers, "
+                f"{over['pinned_chars']} chars) with their charter digest ({over['charter_chars']} chars) exceeds "
+                f"the workers' {over['limit']}-char budget, so they get no other entries. Merge or retire those "
+                f"entries (`memory_add` with `supersedes`, or `memory_forget`). Shorten (standing) entries "
                 f"with a standing `memory_add` that supersedes them; never retire them for space.", "queued"))
         p.db.set_kv(MEMORY_ALERT_KEY, True)
     elif flagged and not over["pinned_over"]:

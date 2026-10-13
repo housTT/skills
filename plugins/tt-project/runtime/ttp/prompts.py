@@ -273,18 +273,99 @@ def _runner_line(cfg: dict) -> str:
             "driver of your own\n") + out
 
 
+# A charter item's own tag says who it is for; untagged, an item is for workers when it speaks of
+# their work and names no coordinator duty.
+_AUDIENCE_TAG = re.compile(r"\[(workers?|coordinator)\]", re.I)
+_WORK_TERMS = re.compile(r"\b(workers?|branch(es)?|push(es|ed|ing)?|pull requests?|PRs?|commits?|tests?|"
+                         r"changesets?|versions?|merges?|skills?|builds?|jobs?|nodes?)\b", re.I)
+
+
+def _items(body: list[str]) -> list[str]:
+    """A section's body as its items: each top-level bullet with its continuation lines, or each
+    paragraph."""
+    out: list[list[str]] = []
+    cur: list[str] = []
+    for line in body:
+        if not line.strip() or re.match(r"(?:[-*+]|\d+[.)])\s", line):
+            if cur:
+                out.append(cur)
+            cur = [line] if line.strip() else []
+        else:
+            cur.append(line)
+    if cur:
+        out.append(cur)
+    return ["\n".join(x) for x in out]
+
+
+def for_workers(item: str) -> bool:
+    """Whether a policy (or other charter item) belongs in a worker's prompt."""
+    tag = _AUDIENCE_TAG.search(item)
+    if tag:
+        return tag[1].lower().startswith("worker")
+    return bool(_WORK_TERMS.search(item)) and not re.search(r"\bcoordinator\b", item, re.I)
+
+
+_CHARTER_HEAD = ("# CHARTER (for workers: goals, resources and the policies for workers; its restrictions are "
+                 "the binding block above. Full charter{more}: {path})\n")
+_MEMORY_HEAD = "# PROJECT MEMORY (entries for workers; all {n} entries: {path})\n"
+
+
+def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
+    more = f"; {dropped} more items for the coordinator" if dropped else ""
+    return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
+
+
+def worker_context(p: Project) -> tuple[str, list[dict], dict]:
+    """A worker's digest of the charter and memory, within WORKER_MEMORY_CHARS together: the Goals
+    and Resources whole (the Brief only when no Goals are stated), memory entries pinned for workers
+    (see worker_memory) whatever the budget, then the policies and other charter items meant for
+    workers (see for_workers) and the newest facts that fit. The Restrictions are not in it: the
+    prompt states them whole in their own block. Returns (charter text, memory entries, usage)."""
+    raw = p.charter_path.read_text() if p.charter_path.exists() else ""
+    secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
+            if h and not h[3:].strip().lower().startswith("restriction")]
+    name = lambda h: h[3:].strip().lower()
+    goals = any(name(h).startswith("goal") for h, _ in secs)
+    whole = lambda h: name(h).startswith(("goal", "resource")) or (not goals and name(h).startswith("brief"))
+    pins = p.worker_memory_select(0)[1]["pinned_chars"]
+    heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
+    used = heads + pins + sum(len(h) + len("\n".join(b).strip()) + 3 for h, b in secs if whole(h))
+    out, dropped = [], 0
+    for h, b in secs:
+        if whole(h):
+            out.append(h + "\n" + "\n".join(b).strip())
+            continue
+        if name(h).startswith("brief"):
+            continue
+        kept = []
+        used += len(h) + 3
+        for item in _items(b):
+            if for_workers(item) and used + len(item) + 1 <= WORKER_MEMORY_CHARS:
+                kept.append(item)
+                used += len(item) + 1
+            else:
+                dropped += 1
+        if kept:
+            out.append(h + "\n" + "\n\n".join(kept))
+        else:
+            used -= len(h) + 3
+    text = "\n\n".join(out)
+    mem, use = p.worker_memory_select(max(0, WORKER_MEMORY_CHARS - heads - len(text)))
+    return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS)
+
+
 def worker_system(p: Project) -> str:
     """The part of a worker's prompt shared by every task, whatever its kind or tier, until the
     charter or memory changes: sent as the system prompt where the agent allows it, so the provider
     caches it across all the project's workers. Nothing about the task may go in here."""
     parts = [restrictions_block(p), _read(p, "worker.md")]
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
-    charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
-    parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
-                 charter_without_restrictions(charter_without_placeholders(charter)))
-    mem = p.memory_text(limit_chars=WORKER_MEMORY_CHARS)
+    # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
+    charter, mem, use = worker_context(p)
+    head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
+    parts.append(head + (charter or "(none)"))
     if mem:
-        parts.append("# PROJECT MEMORY\n" + mem)
+        parts.append(mem_head + "\n".join(e["line"] for e in mem))
     return "\n\n".join(x for x in parts if x.strip())
 
 

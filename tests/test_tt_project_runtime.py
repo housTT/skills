@@ -7706,7 +7706,9 @@ def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
     for gone in ("(to be restated", "(none stated yet)", "## Goals and success criteria", "## Resources",
                  "(machines"):
         assert gone not in system, f"{gone!r} is still in the worker prompt"
-    assert "Keep it tidy." in system and "## Policies\n(drafts first)\n\n- Auto-merge repositories: none (the user merges)." in system
+    # No goals stated yet: the brief stands in for them. A note for nobody's work stays in the full charter.
+    assert "Keep it tidy." in system and "## Policies\n- Auto-merge repositories: none (the user merges)." in system
+    assert "(drafts first)" not in system
     assert system.startswith("# BINDING RESTRICTIONS")
     assert "\nNever push to main (the user merges).\n  - (and never force-push)\n" in system
 
@@ -19021,18 +19023,92 @@ def test_pinned_memory_survives_an_overflow_and_alerts_the_coordinator_once(env)
     p = make(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_system
-    big = [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 900) for i in range(10)]
+    big = [("restriction" if i % 2 else "resource", f"RULE-{i} " + "y" * 900) for i in range(10)]
     _memories(p, [("fact", "OLD-FACT")] + big)
     assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
     system = worker_system(p)
     assert all(f"RULE-{i} " in system for i in range(10)), "pinned entries were dropped"
     assert "NEW-FACT" not in system and "OLD-FACT" not in system
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
-    assert len(alerts()) == 1 and "exceeds the workers' 8000-char" in alerts()[0]["text"]
+    assert len(alerts()) == 1 and "exceeds the workers' 8000-char budget" in alerts()[0]["text"]
     assert coord.apply(p, [{"type": "memory_add", "text": "ANOTHER-FACT"}], turn=2) == []
     assert len(alerts()) == 1, "the alert repeats"
     digest = coord.digest(p, {}, [], [])
     assert "## Memory over budget: 13 entries" in digest and "workers see 10" in digest
+
+
+_BIG_CHARTER = """# demo — charter
+
+Created 2026-01-01. The coordinator keeps this file current.
+
+## Brief (verbatim from the user)
+""" + "Make the widget fast and keep it running. " * 40 + """
+
+## Goals
+Ship a faster widget: halve the p50 latency without losing accuracy.
+
+Success: the widget's benchmark shows the gain on two runs.
+
+## Restrictions
+- Push only to branch dev/widget. Never push to main.
+  - and never force-push it
+- Keep content generic: no hostnames or credentials.
+
+## Policies
+- Delivery: each change is made on a work branch, reviewed, then pushed to dev/widget.
+- Ask policy: the coordinator decides reversible questions itself and never asks the user.
+- Deployment: the coordinator upgrades every project after each push.
+- Style: answers stay short and plain. [workers]
+- Alerts: page on any failed build. [coordinator]
+""" + "".join(f"- Rule {i}: the coordinator re-checks every waiting item once a day. " + "w" * 300 + "\n"
+             for i in range(12)) + """
+## Resources
+- Box A (alias box-a): the only machine for benchmark jobs.
+"""
+
+
+def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim(env):
+    """Workers get the Goals and Resources whole, the policies and memory meant for them, a pointer
+    to the full files, and every restriction verbatim, within the 8000-char budget."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import charter_restrictions, worker_context, worker_system
+    p.charter_path.write_text(_BIG_CHARTER)
+    _memories(p, [("restriction", "Never reboot box A while a job runs."),
+                  ("resource", "Box A keeps its datasets under the project's data folder.")]
+              + [("decision", f"COORD-DECISION-{i:02} " + "d" * 300) for i in range(20)]
+              + [("preference", f"COORD-PREF-{i:02} " + "q" * 300) for i in range(5)]
+              + [("fact", f"FACT-{i:02} " + "f" * 300) for i in range(30)])
+    assert coord.apply(p, [{"type": "memory_add", "text": "TAGGED-DECISION: benchmarks run with the cache warm.",
+                            "memory_kind": "decision", "audience": "workers"},
+                           {"type": "memory_add", "text": "HIDDEN-FACT: the daily review starts at 06:00.",
+                            "audience": "coordinator"},
+                           {"type": "memory_add", "text": "TAGGED-RESTRICTION: never delete the datasets.",
+                            "memory_kind": "restriction", "audience": "coordinator"}], turn=1) == []
+    system = worker_system(p)
+    full = len(_BIG_CHARTER) + sum(len(e["line"]) + 1 for e in p._memory_entries())
+    block = system[system.index("# CHARTER"):]
+    assert full > 20000 and len(block) <= 8000, (full, len(block))
+    # Every restriction, from the charter and from memory, verbatim.
+    assert system.startswith("# BINDING RESTRICTIONS") and "\n" + charter_restrictions(_BIG_CHARTER) + "\n" in system
+    assert "- Push only to branch dev/widget. Never push to main.\n  - and never force-push it\n" in system
+    for rule in ("Never reboot box A while a job runs.", "TAGGED-RESTRICTION: never delete the datasets."):
+        assert rule in block
+    # Goals and Resources whole; the brief only stands in for missing goals.
+    assert "Ship a faster widget" in block and "Success: the widget's benchmark" in block
+    assert "- Box A (alias box-a): the only machine for benchmark jobs." in block and "Make the widget" not in block
+    # Policies: those for workers, by tag or by subject; the coordinator's stay in the full charter.
+    assert "- Delivery: each change is made on a work branch" in block and "- Style: answers stay short" in block
+    for gone in ("Ask policy", "Deployment:", "Alerts:", "Rule 0:", "Created 2026-01-01"):
+        assert gone not in block, gone
+    assert str(p.charter_path) in block and str(p.memory_index) in block
+    # Memory: pinned for workers, then the newest facts that fit; the coordinator's own entries never.
+    assert "Box A keeps its datasets" in block and "TAGGED-DECISION" in block and "FACT-29 " in block
+    for gone in ("COORD-DECISION-", "COORD-PREF-", "HIDDEN-FACT", "FACT-00 "):
+        assert gone not in block, gone
+    text, mem, use = worker_context(p)
+    assert use["charter_dropped"] == 15 and use["shown"] == len(mem) < use["entries"]
+    assert "workers see" in coord.memory_budget_line(p)
 
 
 def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):

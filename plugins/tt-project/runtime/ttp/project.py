@@ -615,8 +615,24 @@ def hostname() -> str:
 
 # Memory kinds every prompt carries whatever the budget; decisions and facts fill what is left.
 PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
-# Memory each prompt carries, in characters of whole entries (see Project.memory_select).
+# Memory each prompt carries, in characters of whole entries (see Project.memory_select). A worker's
+# charter digest and memory share theirs (see prompts.worker_context); its Restrictions come on top.
 COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
+# Memory audiences an entry's front matter may name (`audience:`); without one, see worker_memory.
+MEMORY_AUDIENCES = ("workers", "coordinator")
+_WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
+
+
+def worker_memory(e: dict) -> int:
+    """Where memory entry `e` stands in a worker's prompt: 1, always shown (tagged for workers,
+    restrictions, resources); 2, shown first while they fit (entries that speak of workers); 3, then
+    the newest facts that fit; 0, never (the rest, written for the coordinator: decisions,
+    preferences and standing duties)."""
+    if e.get("audience") in MEMORY_AUDIENCES:
+        return 1 if e["audience"] == "workers" or e["kind"] == "restriction" else 0
+    if e["kind"] in ("restriction", "resource"):
+        return 1
+    return 2 if _WORKER_WORD.search(e["line"]) else 3 if e["kind"] == "fact" else 0
 
 
 class Project:
@@ -756,12 +772,13 @@ class Project:
             return False
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
-                   end: dict | None = None, standing: bool = False) -> Path:
+                   end: dict | None = None, standing: bool = False, audience: str | None = None) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
         `standing` marks an instruction that applies every time its case comes up (a preference
-        unless pinned already): finishing one instance never retires it (see forget_memory)."""
+        unless pinned already): finishing one instance never retires it (see forget_memory).
+        `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory)."""
         from .ends import front_matter
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
@@ -783,7 +800,8 @@ class Project:
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
             durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
-                                f"{'standing: true' + chr(10) if standing else ''}{tag}"
+                                f"{'standing: true' + chr(10) if standing else ''}"
+                                f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}{tag}"
                                 f"---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
         if f"](memory/{path.name})" not in index:
@@ -794,8 +812,8 @@ class Project:
 
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
-        `end` (see ends) for a temporary one, whose line says when it ends, and `standing` (see
-        add_memory), whose line says so.
+        `end` (see ends) for a temporary one, whose line says when it ends, `standing` (see
+        add_memory), whose line says so, and `audience` (see worker_memory).
         Ordered by the front matter's `created`, then name; the file's mtime stands in only where
         `created` is missing, so a checkout or copy that touches the files does not reorder them
         (which would change the coordinator's cached prompt)."""
@@ -812,9 +830,10 @@ class Project:
             c = re.search(r"^created:\s*(\S+)", head, re.M)
             end = read_front_matter(head)
             standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
+            aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
             ends = (" (standing)" if standing else "") + (f" ({describe(end)})" if end else "")
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
-                        "standing": standing,
+                        "standing": standing, "audience": aud.group(1) if aud else "",
                         "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out
@@ -839,6 +858,26 @@ class Project:
         return chosen, {"entries": len(entries), "shown": len(chosen), "pinned": len(pinned),
                         "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
                         "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
+
+    def worker_memory_select(self, limit_chars: int) -> tuple[list[dict], dict]:
+        """The entries a worker's prompt gets, whole, oldest first: those worker_memory always shows
+        (even past the budget), then those that speak of workers and then the facts, newest first
+        while they fit `limit_chars`. Usage numbers as memory_select's, counting only the entries
+        meant for workers."""
+        entries = [e for e in self._memory_entries() if worker_memory(e)]
+        pinned = [e for e in entries if worker_memory(e) == 1]
+        used = pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
+        chosen = {e["name"] for e in pinned}
+        for rank in (2, 3):
+            for e in reversed([e for e in entries if worker_memory(e) == rank]):
+                if used + len(e["line"]) + 1 > limit_chars:
+                    break   # whole entries only, and no older one slips in past a gap
+                chosen.add(e["name"])
+                used += len(e["line"]) + 1
+        shown = [e for e in entries if e["name"] in chosen]
+        return shown, {"entries": len(entries), "shown": len(shown), "pinned": len(pinned),
+                       "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
+                       "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
 
     def memory_text(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> str:
         """Pinned entries, then the newest others (newest last), whole and bounded so they never
