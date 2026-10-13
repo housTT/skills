@@ -53024,6 +53024,31 @@ def test_coordinator_cache_line_drops_request_clause_when_no_turn_counts_request
     assert 'request count' not in bud.coordinator_cache_line(bud._cache_summary([row(2)]))
 
 
+def test_web_app_shows_the_servers_coordinator_cache_line_as_is(env):
+    """The CLI, the daily review and the web app word the cache status once, on the server: the web
+    payload carries coordinator_cache_line() per window and app.js shows it without rebuilding it."""
+    from ttp import budget as bud
+    from ttp.web import state_payload
+    p = make(env)
+    now = time.time()
+    recorded = {'cache_telemetry': {'complete': True, 'requests': None}}   # Claude counts no requests
+    for fresh, read, note in ((10, 90, recorded), (100, 0, recorded), (100, 0, {})):
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
+               "cache_write_tokens,note) VALUES('coordinator','claude',?,?,'ok',0.1,?,?,0,?)",
+               (now - 600, now - 500, fresh, read, json.dumps(note)))
+    cache = state_payload(p, p.db)['budget']['coordinator_cache']
+    for window in ('24h', '3d', '7d'):
+        assert cache[window]['line'] == bud.coordinator_cache_line(bud.coordinator_cache(p.db, now)[window])
+    line = cache['24h']['line']
+    assert 'request count unknown' not in line, line
+    # The turn from before the field existed is counted as legacy, not dropped from the counts.
+    assert 'missing 0 (unknown), legacy 1 (before telemetry)' in line, line
+    js = '\n'.join(f.read_text() for f in sorted((RUNTIME / 'ttp' / 'web').glob('*.js')))
+    assert 'cache.line' in js
+    for wording in ('token hit', 'request count unknown', '<50% read', 'before telemetry'):
+        assert wording not in js, f"the web app rebuilds the server's cache wording: {wording!r}"
+
+
 def test_cache_telemetry_backfill_rebuilds_old_turns_from_output_and_marks_the_rest_legacy(env):
     from ttp import budget as bud
     from ttp.providers.claude import Claude

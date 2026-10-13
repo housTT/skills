@@ -705,8 +705,11 @@ def history(db: DB, days: int = 14) -> dict:
         "GROUP BY d, provider, acct, window ORDER BY d", (since,)) if (r["provider"], r["acct"]) in live]
     by_source = db.q("SELECT source, provider, ROUND(SUM(usd),2) usd, COUNT(*) n FROM ledger WHERE ts>=? "
                      "GROUP BY source, provider ORDER BY usd DESC LIMIT 40", (time.time() - WEEK,))
+    cache = coordinator_cache(db)
+    for s in cache.values():   # the web app shows this as is: one wording with the CLI and daily review
+        s["line"] = coordinator_cache_line(s)
     return {"daily_spend": spend, "window_peaks": peaks, "top_sources_7d": by_source,
-            "coordinator_cache": coordinator_cache(db)}
+            "coordinator_cache": cache}
 
 
 def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10) -> dict:
