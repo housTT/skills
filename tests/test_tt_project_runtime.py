@@ -46628,6 +46628,40 @@ def test_machine_change_edit_corrects_an_open_entry_in_place(env, capsys):
     assert [c["id"] for c in ml.changes()] == [1, pc["id"]] and ml._read(ml.LEDGER, {})["next"] == pc["id"] + 1
 
 
+def test_an_edited_machine_change_overdue_again_pages_afresh_and_a_stale_probe_pass_is_ignored(env, monkeypatch):
+    """A new end from `machine change edit` starts a new page episode: once it passes too, the overdue
+    page has a new id, so the maker gets a new event rather than a duplicate of the delivered one. A
+    probe started before an edit changed the probe does not count as the new probe passing."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    now = time.time()
+    ml.add_change("box-a", "drop-in", "rm it", "alpha", expires="1h", now=now - 7200)
+    d = Daemon(alpha.base)
+    first = ml.route(now, able=lambda n: (True, ""), claimer="alpha")
+    assert [x["kind"] for x in first] == ["machine_change_overdue"]
+    assert d._machine_page(first[0], now)
+    ml.delivered(first[0])
+    ml.edit_change(1, "alpha", expires="1h", now=now + 60)
+    assert ml.route(now + 120, able=lambda n: (True, "")) == []
+    second = ml.route(now + 60 + 3601, able=lambda n: (True, ""), claimer="alpha")
+    assert [x["kind"] for x in second] == ["machine_change_overdue"] and second[0]["id"] != first[0]["id"]
+    assert d._machine_page(second[0], now + 3700)
+    assert alpha.db.one("SELECT COUNT(*) n FROM events WHERE kind='machine_change_overdue'")["n"] == 2
+    # A probe still running from before an edit to another probe: its pass is not the new probe's.
+    ml.edit_change(1, "alpha", until_probe="true", now=now + 3700)
+    probes = ml.Probes(alpha, log=lambda s: None)
+    probes.tick(now + 3800)
+    assert 1 in probes._procs
+    ml.edit_change(1, "alpha", until_probe="test -e /nonexistent-ttp-probe", now=now + 3801)
+    probes._procs[1][0].wait(10)
+    probes._probed[1] = now + 3900   # not due again yet
+    probes.tick(now + 3900)
+    assert "probe_passed" not in ml.changes()[0], "the old probe's pass does not end the edited probe"
+
+
 def test_a_planned_power_cycle_tells_running_workers_on_the_machine_to_hand_off_once(env, tmp_path, capsys,
                                                                                     monkeypatch):
     """`ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle intent (no

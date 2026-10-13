@@ -194,7 +194,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
                 until_probe: str | None = None, now: float | None = None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires or --until-probe, as
     add_change takes them). Keeps its id, alias, author and creation time; records who edited it, when
-    and the values it replaced in `edits`. A new end starts afresh: its until-probe result and overdue
+    and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
     that changes nothing."""
     now = time.time() if now is None else now
@@ -237,6 +237,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if "expires" in was:
             for k in ("probe_passed", "page"):
                 c.pop(k, None)
+            c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
         _write(LEDGER, doc)
         return c
@@ -625,7 +626,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             changed = True
             if target:
                 _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"],
-                         float(c["added"]),
+                         float(c.get("page_from") or c["added"]),
                          f"Machine change #{c['id']} on {c['alias']} is overdue ({late}): {c['what']} "
                          f"(by {c.get('by')}). Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
                          f"then `ttp machines change close {c['id']}`.")
@@ -686,13 +687,13 @@ class Probes:
 
     def __init__(self, p, log: Callable[[str], None] = print):
         self.p, self.log = p, log
-        self._procs: dict[int, tuple[subprocess.Popen, float]] = {}
+        self._procs: dict[int, tuple[subprocess.Popen, float, str]] = {}
         self._probed: dict[int, float] = {}
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
         passed = []
-        for cid, (proc, started) in list(self._procs.items()):
+        for cid, (proc, started, probe) in list(self._procs.items()):
             rc = proc.poll()
             if rc is None and now - started < ends.PROBE_TIMEOUT_S:
                 continue
@@ -700,12 +701,12 @@ class Probes:
             if rc is None:
                 ends._kill(proc)
             elif rc == 0:
-                passed.append(cid)
+                passed.append((cid, probe))
         if passed:
             with _locked():
                 doc = _read(LEDGER, {"next": 1, "changes": []})
                 for c in doc.get("changes", []):
-                    if c.get("id") in passed and not c.get("closed"):
+                    if (c.get("id"), c.get("probe")) in passed and not c.get("closed"):   # not a probe an edit replaced
                         c["probe_passed"] = now
                 _write(LEDGER, doc)
         for c in changes():
@@ -721,12 +722,12 @@ class Probes:
             try:
                 self._procs[cid] = (subprocess.Popen(c["probe"], shell=True, cwd=str(self.p.root),
                                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                                     stderr=subprocess.DEVNULL, start_new_session=True), now)
+                                                     stderr=subprocess.DEVNULL, start_new_session=True), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")
 
     def stop(self) -> None:
-        for proc, _ in self._procs.values():
+        for proc, *_ in self._procs.values():
             ends._kill(proc)
         self._procs.clear()
 
