@@ -3430,6 +3430,10 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                 print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which tries again "
                              f"after the day is up; resumes at {timefmt.long(until, p)}.")
                 sys.exit(75)
+            if p.db.kv("paused", False):    # deferred, not failed: a takeover after the resume queues the merge
+                print(took + f"{p.name} paused; upgrades when resumed: a host-side `ttp upgrade {p.name}` after "
+                             f"the resume queues the merge task from {at}.")
+                sys.exit(75)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
             print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "

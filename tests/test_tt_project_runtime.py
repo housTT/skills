@@ -12127,6 +12127,23 @@ def test_a_conflict_nothing_retries_with_upgrade_auto_off_exits_1(env, monkeypat
     assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
 
 
+@pytest.mark.parametrize("newer", [True, False])
+def test_a_paused_projects_conflict_nothing_retries_is_parked_with_exit_75(env, monkeypatch, capsys, newer):
+    """Paused, no open harness task and one ended less than a day ago: the conflict that would fail (exit 1)
+    is deferred (exit 75) with the paused line, so a deploy parks it with one low note instead of paging."""
+    from ttp import cli
+    p, first = _deferred_conflict(env, monkeypatch, newer=newer)
+    p.set_config("upgrade.auto", False)
+    p.db.set_paused(True)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and "demo paused; upgrades when resumed" in out and "nothing retries it" not in out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
+    assert p.db.kv("paused") is True
+
+
 def test_a_conflict_on_a_newer_version_is_deferred_as_the_daemon_retries_it(env, monkeypatch, capsys):
     from ttp import cli, release
     p, first = _deferred_conflict(env, monkeypatch)
