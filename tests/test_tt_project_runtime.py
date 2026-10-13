@@ -2514,7 +2514,8 @@ def test_the_audit_counts_runs_lost_to_reboots_and_continued_tasks_apart(env):
         p.db.x(run, (role, now - 600, now - 500, status, usd, json.dumps(note)))
     p.db.x(run, ("worker", now - 2 * 86400, now - 2 * 86400, "lost", 4.0, json.dumps({"not_waste": "reboot"})))
     lost = audit.lost_runs(p.db, now - 86400)
-    assert lost == {"reboot": {"n": 2, "usd": 0.75}, "sleep": {"n": 1, "usd": 0.1}}, lost
+    assert lost == {"reboot": {"n": 2, "usd": 0.75, "kept_n": 0, "kept_usd": 0.0},
+                    "sleep": {"n": 1, "usd": 0.1, "kept_n": 0, "kept_usd": 0.0}}, lost
     old = p.db.add_task("big change", "s", kind="code", origin="user")
     p.db.update_task(old, status="done", spent_usd=3.0)
     cont = p.db.add_task("continue: big change", "s", kind="code", origin="coordinator", labels=[f"continues:{old}"])
@@ -2528,6 +2529,27 @@ def test_the_audit_counts_runs_lost_to_reboots_and_continued_tasks_apart(env):
     out = "\n".join(audit.lines(p.db, now))
     assert "worker runs lost (not failures): 3, $0.85: 2 to reboot $0.75, 1 to sleep $0.10" in out
     assert f"tasks continued from an earlier one: 1: #{cont} continue: big change continues #{old} ($3.00 + $1.00)" in out
+
+
+def test_the_audit_counts_a_reboot_lost_run_that_was_resumed_as_work_kept(env):
+    """A run lost to a reboot whose retry resumed its session kept its committed work: the daily
+    review does not book its full cost as lost (only the in-flight step and the re-read on resume,
+    which the resuming run's spend shows). A resume that never started kept nothing."""
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    run = "INSERT INTO runs(role,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?)"
+    kept = p.db.x(run, ("worker", now - 900, now - 800, "lost", 2.0, json.dumps({"not_waste": "reboot"})))
+    gone = p.db.x(run, ("worker", now - 900, now - 800, "lost", 0.5, json.dumps({"not_waste": "reboot"})))
+    p.db.x(run, ("worker", now - 700, now - 100, "ok", 0.3, json.dumps({"resumes": {"run": kept, "session": "s1"}})))
+    p.db.x(run, ("worker", now - 700, now - 690, "failed", 0.0,
+                 json.dumps({"resumes": {"run": gone, "session": "s2"}, "not_waste": "resume"})))
+    lost = audit.lost_runs(p.db, now - 86400)
+    assert lost["reboot"] == {"n": 2, "usd": 2.5, "kept_n": 1, "kept_usd": 2.0}, lost
+    out = "\n".join(audit.lines(p.db, now))
+    assert ("worker runs lost (not failures): 3, $0.50 (+ 1 resumed, work kept, $2.00 not lost: only the "
+            "in-flight step and the re-read on resume, in the resuming run's spend): "
+            "2 to reboot $0.50 (1 resumed, work kept), 1 to resume $0.00") in out, out
 
 
 def test_the_audit_lists_blocked_and_waiting_work_longest_first(env, monkeypatch):

@@ -6,8 +6,9 @@ the project could have saved. Model-free; the review grades it.
 - every ask sent (its question, blocking reason, recommendation, the user's answer and how long it
   took), asks the ask gate refused, and answers that handed the decision back ("decide yourself");
 - worker runs that failed (a reboot, sleep, lost network or a resume is not a failure), runs lost
-  to those causes apart, tasks run again after a failed attempt, and tasks that continue an
-  earlier one (`continues:<id>`), with the spend of each;
+  to those causes apart (one a later run resumed kept its work: not counted as lost), tasks run
+  again after a failed attempt, and tasks that continue an earlier one (`continues:<id>`), with the
+  spend of each;
 - coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py), with the saving;
@@ -104,15 +105,30 @@ def retried_tasks(db: DB, since: float) -> list[dict]:
 
 def lost_runs(db: DB, since: float) -> dict[str, dict]:
     """Worker runs that ended since `since` without an outcome for a cause other than their own (a
-    reboot, sleep, lost network, a resume): {cause: {n, usd}}. Not failures, but their spend is gone."""
+    reboot, sleep, lost network, a resume): {cause: {n, usd, kept_n, kept_usd}}. Not failures, but their
+    spend is gone, except for a run a later run resumed (its session continued, `resumes`): its work
+    was kept, and only its in-flight step and the context re-read on resume were lost, which the
+    resuming run's own spend shows. Those are `kept_n` runs worth `kept_usd`, not counted as lost."""
     out: dict[str, dict] = {}
-    for r in db.q("SELECT status, note, cost_usd FROM runs WHERE role!='coordinator' AND ended>=? AND status IN "
-                  f"({','.join('?' * len(budget.WASTED))})", (since, *budget.WASTED)):
+    rows = db.q("SELECT id, status, note, cost_usd FROM runs WHERE role!='coordinator' AND ended>=? AND status IN "
+                f"({','.join('?' * len(budget.WASTED))})", (since, *budget.WASTED))
+    kept: set[int] = set()
+    if rows:
+        for r in db.q("SELECT note FROM runs WHERE id>? AND role!='coordinator' AND note LIKE '%\"resumes\"%'",
+                      (min(int(r["id"]) for r in rows),)):
+            note = _note(r["note"])
+            back = (note.get("resumes") or {}).get("run") if isinstance(note.get("resumes"), dict) else None
+            if back is not None and note.get("not_waste") != "resume":   # a resume that never started kept nothing
+                kept.add(int(back))
+    for r in rows:
         cause = _note(r["note"]).get("not_waste")
         if cause and cause != "handoff":   # a hand-off that stood is an outcome
-            c = out.setdefault(str(cause), {"n": 0, "usd": 0.0})
+            c = out.setdefault(str(cause), {"n": 0, "usd": 0.0, "kept_n": 0, "kept_usd": 0.0})
             c["n"] += 1
             c["usd"] += float(r["cost_usd"] or 0)
+            if int(r["id"]) in kept:
+                c["kept_n"] += 1
+                c["kept_usd"] += float(r["cost_usd"] or 0)
     return out
 
 
@@ -283,9 +299,14 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             for t in again[:TOP]) + _more(again))
     lost = lost_runs(db, since)
     if lost:
+        kept_n, kept_usd = sum(c["kept_n"] for c in lost.values()), sum(c["kept_usd"] for c in lost.values())
+        kept = (f" (+ {kept_n} resumed, work kept, ${kept_usd:.2f} not lost: only the in-flight step and the "
+                "re-read on resume, in the resuming run's spend)") if kept_n else ""
         out.append(f"worker runs lost (not failures): {sum(c['n'] for c in lost.values())}, "
-                   f"${sum(c['usd'] for c in lost.values()):.2f}: " + ", ".join(
-                       f"{c['n']} to {cause} ${c['usd']:.2f}" for cause, c in sorted(lost.items())))
+                   f"${sum(c['usd'] for c in lost.values()) - kept_usd:.2f}{kept}: " + ", ".join(
+                       f"{c['n']} to {cause} ${c['usd'] - c['kept_usd']:.2f}"
+                       + (f" ({c['kept_n']} resumed, work kept)" if c["kept_n"] else "")
+                       for cause, c in sorted(lost.items())))
     cont = continued_tasks(db, since)
     if cont:
         out.append(f"tasks continued from an earlier one: {len(cont)}: " + ", ".join(
