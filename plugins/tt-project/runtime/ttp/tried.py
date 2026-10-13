@@ -12,13 +12,17 @@ result}]); each of those is an entry of its own, so one task that shelved one le
 another records both.
 
 Matching (`similar`) is wider than the near-duplicate check on open tasks: titles are compared by
-stemmed content words, and numbers in the title and spec (bounds, sizes, rates) count as the work's
-parameters, so a reworded title with the same bounds still matches, while one whose numbers differ
-is other work."""
+stemmed content words, and numbers in the title and spec that measure something (a decimal, a number
+with a unit such as x or %, or one after a bound word) count as the work's parameters, so a reworded
+title with the same bounds still matches, while one whose numbers differ is other work. Plain counts
+and list numbering are not parameters, the spec's Restrictions/Return boilerplate is left out, and
+shared parameters alone never match: a title must name one of them and the titles must share their
+subject, leaving out words and numbers the project's ledger uses all the time (`common`)."""
 from __future__ import annotations
 
 import re
 import time
+from collections import Counter
 from datetime import datetime
 
 from . import timefmt
@@ -30,6 +34,8 @@ DIGEST_ROWS = 6            # ledger lines a digest shows
 OUTCOMES = ("landed", "kept", "shelved", "rejected", "failed", "cancelled", "done")
 SETTLED = ("landed", "kept", "shelved", "rejected")   # a result was reached: repeating it the same day is waste
 RESULT_CHARS = 100
+COMMON_SHARE = 0.15        # a title word or parameter in this share of the ledger (and at least
+COMMON_MIN = 4             # COMMON_MIN entries) is the project's own vocabulary: it says nothing alike
 TITLE_CHARS = 80
 
 _STOP = set("a an the of to for and or in on at by with from into vs via is be as it its this that".split())
@@ -43,7 +49,18 @@ _SAID = (("shelved", re.compile(r"\b(shelv\w*|parked|abandon\w*|not worth\w*|no 
          ("kept", re.compile(r"\b(kept|keeping)\b", re.I)),
          ("landed", re.compile(r"\b(landed|merged|pushed)\b", re.I)))
 _DATES = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?Z?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
-_NUMBER = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?(?:e[-+]?\d+)?)", re.I)
+_VERSION = re.compile(r"(?<![\w.])v?\d+(?:\.\d+){2,}\b", re.I)   # 0.2.300: a release, not a parameter
+# A number standing alone: not part of a name (LTX-2.5, fp16, v1.0) or a hash (63e55ab).
+_NUMBER = re.compile(r"(?<![\w.])(?<![a-z]-)(\d+(?:\.\d+)?(?:e[-+]?\d+)?)"
+                     r"(\s?(?:x|%|ms|us|ns|fps|[kmgt]i?b|gbps|[kmg]hz)\b|%)?(?![\w])", re.I)
+# A plain integer is a parameter only right after one of these (a bound, a size); else it is a count
+# ('3 manifests') or list numbering ('1.', '2.').
+_BOUND_BEFORE = re.compile(r"\b(bound|ceiling|cap|limit|target|threshold|up to|at most|at least|stop at|"
+                           r"batch(?: size)?|size|width|depth|rank|seq(?:uence)? len(?:gth)?|tile|"
+                           r"[a-z]*_?(?:bs|lr|eps))\W{0,3}$", re.I)
+# Spec paragraphs every task repeats (the charter's restrictions, the hand-off asked for): not what the
+# work is, so left out of its words and parameters.
+_BOILERPLATE = re.compile(r"^\W*(restrictions?|binding restrictions|rules|constraints|return|hand-?off)\b", re.I)
 _DIFFERS = re.compile(r"\b(differ\w*|unlike|instead of)\b", re.I)
 
 
@@ -65,11 +82,28 @@ def subject_key(title: str) -> str:
     return " ".join(sorted(words(title)))[:120]
 
 
+def content(spec: str) -> str:
+    """The spec without its boilerplate paragraphs (Restrictions, Return)."""
+    return "\n\n".join(b for b in re.split(r"\n\s*\n", spec or "") if not _BOILERPLATE.match(b))
+
+
 def params(text: str) -> set[str]:
-    """The numbers a title or spec names (bounds, sizes, rates), normalised (1.50 -> 1.5); dates,
-    times and task references are not parameters."""
+    """The numbers a title or spec names that measure something (bounds, sizes, rates), normalised
+    (1.50 -> 1.5): decimals, numbers with a unit (1.4x, 20%, 8 ms) and integers after a bound word
+    (bound 2, batch 32). Dates, times, task references, versions (0.2.300, LTX-2.5, Python 3.12),
+    counts and list numbering are not."""
+    text = _VERSION.sub(" ", _DATES.sub(" ", text or ""))
     out = set()
-    for n in _NUMBER.findall(_DATES.sub(" ", text or "")):
+    for m in _NUMBER.finditer(text):
+        n, unit = m.group(1), m.group(2)
+        before = text[: m.start()]
+        bound = _BOUND_BEFORE.search(before)
+        if not (unit or re.search(r"[.e]", n, re.I) or bound):
+            continue
+        if not (unit or bound) and re.search(r"\b[A-Za-z]*[A-Z][\w-]*\s$", before):
+            continue   # 'LTX 2.5', 'Python 3.12': a name's version
+        if not unit and re.match(r"\.(?:\s|$)", text[m.end():]) and "." not in n:
+            continue   # '2.' numbering a list
         try:
             out.add(f"{float(n):g}")
         except ValueError:
@@ -85,8 +119,20 @@ def _overlap(a: set, b: set) -> float:
     return len(a & b) / min(len(a), len(b)) if a and b else 0.0
 
 
-def similar(title1: str, spec1: str, title2: str, spec2: str) -> bool:
-    """Whether new work (title1, spec1) repeats earlier work (title2, spec2)."""
+def common(ledger: list[dict]) -> frozenset:
+    """Title words and parameters so frequent in the ledger that sharing them says nothing (the
+    project's name and machines, the time cap every job spec repeats). Empty for a small ledger."""
+    seen = Counter()
+    for e in ledger:
+        seen.update(words(e["title"]) | params(f"{e['title']} {content(e['spec'])}"))
+    least = max(COMMON_MIN, COMMON_SHARE * len(ledger))
+    return frozenset(k for k, n in seen.items() if n >= least)
+
+
+def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset = frozenset()) -> bool:
+    """Whether new work (title1, spec1) repeats earlier work (title2, spec2). `usual` (see common)
+    is left out of the shared parameters and title subject that the parameters rule needs."""
+    spec1, spec2 = content(spec1), content(spec2)
     p1, p2 = params(f"{title1} {spec1}"), params(f"{title2} {spec2}")
     shared = len(p1 & p2)
     share = shared / len(p1) if p1 else 0.0
@@ -101,8 +147,10 @@ def similar(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     sj = _jaccard(sw1, sw2) if sw1 and sw2 and len(sw1 | sw2) >= 4 else tj
     if (tj >= 0.7 and sj >= 0.45) or (tj >= 0.4 and sj >= 0.7):
         return True
-    if shared and share >= 0.5 and (to >= 0.5 or sj >= 0.35):
-        return True    # the same parameters on the same subject: a reworded repeat
+    own1, own2 = tw1 - usual, tw2 - usual
+    if (p1 & p2 & (n1 | n2)) - usual and share >= 0.5 and _overlap(own1, own2) >= 0.5 \
+            and len(own1 & own2) >= min(2, len(own1), len(own2)):
+        return True    # the same parameters on the same subject (the titles share it): a reworded repeat
     return sj >= 0.6 and to >= 0.25
 
 
@@ -165,8 +213,10 @@ def same_day(entry: dict, where=None, now: float | None = None) -> bool:
 def match(db, title: str, spec: str, where=None, skip=None, now: float | None = None) -> dict | None:
     """The ledger entry new work repeats: today's settled results first, then the newest. `skip` is
     the task the new one continues."""
-    hits = [e for e in entries(db, where, now) if str(e["id"]) != str(skip)
-            and similar(title, spec or "", e["title"], e["spec"])]
+    ledger = entries(db, where, now)
+    usual = common(ledger)
+    hits = [e for e in ledger if str(e["id"]) != str(skip)
+            and similar(title, spec or "", e["title"], e["spec"], usual)]
     if not hits:
         return None
     today = [e for e in hits if e["outcome"] in SETTLED and same_day(e, where, now)]

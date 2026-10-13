@@ -8570,6 +8570,50 @@ def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_d
     assert len(section.splitlines()) <= tried.DIGEST_ROWS + 1
 
 
+def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_and_boilerplate(env):
+    # Replays the false rejections of real history: unrelated tasks whose specs share only list
+    # numbers, counts, a release number, the project's usual job limits and the Restrictions block.
+    p = make(env)
+    from ttp import coordinator as coord, tried
+    rules = ("Restrictions (binding):\n- Commit on your own work branch; never push to main, never open pull requests.\n"
+             "- Keep the 3 test files green and the validator passing (release 0.2.300 or later).\n"
+             "- Bump the version in all 3 manifests and add a changeset.\n- Keep it generic and safe to open-source.\n\n"
+             "Return: commit sha, branch, summary per case, tests added, and suite results.")
+    limits = "Size each job at measured time +50% and at most 600 s."
+
+    def spec(goal, steps):
+        return f"Goal: {goal}\n\nWork:\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1)) + \
+            f"\n\n{limits}\n\n{rules}"
+
+    old = p.db.add_task("code: a paused project still takes upgrades", spec(
+        "a paused project must not block release upgrades forever.",
+        ["Do the files-only merge and restart the daemon while it stays paused.", "Record one low note when unsafe.",
+         "Upgrade automatically on resume.", "Write a takeover log in each path.", "Replay the exit-75 case.",
+         "Add tests for each path."]), kind="code", origin="user")
+    p.db.update_task(old, status="done", attempts=1, result=json.dumps({"status": "done", "summary": "Landed."}))
+    new = {"type": "task_add", "kind": "code", "title": "code: tried-work ledger so the coordinator never re-queues work",
+           "spec": spec("stop a coordinator from re-queuing work it already tried, shelved or landed.",
+                        ["Find out why the duplicate check missed it.", "Build a ledger from task history.",
+                         "Show matching entries in the digest.", "Check task_add against the ledger.",
+                         "Tell the coordinator prompt.", "Add tests replaying the case."])}
+    assert tried.params(new["spec"]) == {"50", "600"}     # numbering, counts and the release are not parameters
+    assert tried.params(tried.content(new["spec"])) == {"50", "600"} and "Restrictions" not in tried.content(new["spec"])
+    assert not tried.similar(new["title"], new["spec"], p.db.task(old)["title"], p.db.task(old)["spec"])
+    assert coord.apply(p, [new]) == []
+    # Words and numbers the whole ledger shares (the project's name, its job limit) are its vocabulary.
+    for i in range(5):
+        t = p.db.add_task(f"widget lever {i}: profile stage {chr(97 + i)}", f"Profile it. {limits}", origin="user")
+        p.db.update_task(t, status="done", attempts=1)
+    usual = tried.common(tried.entries(p.db, p))
+    assert {"widget", "lever", "50", "600"} <= usual and "profile" in usual
+    assert not tried.similar("widget lever: shorten the decode path, at most 600 s",
+                             f"Write fewer copies on the output path. {limits}",
+                             "widget lever: trace the decode waves, at most 600 s",
+                             f"Record a device trace of each wave. {limits}", usual)
+    # A version in a name is not a bound.
+    assert tried.params("LTX-2.5 e2e timing with the LTX 2.3 VAE, Python 3.12") == set()
+
+
 def test_tried_work_ledger_skips_reviews_and_cancelled_tasks_that_never_ran(env):
     p = make(env)
     from ttp import tried
