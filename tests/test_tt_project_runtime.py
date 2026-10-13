@@ -55628,7 +55628,8 @@ def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, cap
     assert exc.value.code == 1
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is False and rec["purpose"] == "harness"
-    assert not (run / "check_failure.json").exists(), "a harness run opened a check gap"
+    receipt = json.loads((run / "check_failure.json").read_text())
+    assert receipt["kind"] == "check_failed" and receipt["purpose"] == "harness", "a harness run opened a check gap"
     # A failing harness plan fails it as well.
     _fake_check_plan_ttp(tmp_path, monkeypatch, log, rc=65)
     p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
@@ -55666,7 +55667,8 @@ def test_ttp_checks_purpose_harness_fails_when_its_harness_check_is_skipped(env,
     assert not log.exists(), "checks ran though nothing could qualify the head"
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is False and rec["purpose"] == "harness" and rec["commands"] == []
-    assert not (run / "check_failure.json").exists()
+    receipt = json.loads((run / "check_failure.json").read_text())
+    assert receipt["kind"] == "harness_skipped" and receipt["purpose"] == "harness" and receipt["check"] is None
     # The same entries qualify a head the harness check applies to.
     (repo / "src").write_text("x\n")
     subprocess.run([*git, "add", "src"], check=True)
