@@ -1364,6 +1364,21 @@ class Daemon:
                                              "cache_ttl": cache_ttl, "cache_ttl_why": ttl_why}}
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
+        thread = ""
+        if role == "coordinator" and not resume and prov.cache_key_per_session:
+            try:   # the agent's cache follows its session: continue the last turn's while warm
+                last = self.p.db.one("SELECT provider, status, session_id, started, ended, note, input_tokens, "
+                                     "cache_read_tokens, cache_write_tokens FROM runs WHERE role='coordinator' "
+                                     "AND status!='running' ORDER BY id DESC LIMIT 1")
+                fp = cache_fp or cachettl.fingerprint(system, context, schema, model, effort,
+                                                      cachettl.cli_stamp(prov.binary()))
+                thread, why = cachettl.pick_thread(
+                    last, fp, provider, time.time(), self.cfg.get("coordinator") or {},
+                    lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env))
+                note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "thread": why}}
+            except Exception as e:   # only saves money: the turn starts a session of its own
+                log(self.p, f"coordinator session reuse skipped: {type(e).__name__}: {e}")
+                thread = ""
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
@@ -1407,6 +1422,9 @@ class Daemon:
             # arguments go last: Codex takes them as a subcommand that must follow every option.
             resume_extra = prov.resume_args(resume) if resume else []
             argv = _before_stdin(argv, extra)
+        if thread:
+            resume, resume_extra = thread, prov.resume_args(thread)
+            prompt = coord.THREAD_CONTINUED + "\n\n" + prompt
         # The agent's session gets its id here, so the run's session is known (and left out of this
         # machine's other Claude Code spend, localspend.py) before the agent writes a line of it.
         session_id = resume if resume_extra else ""

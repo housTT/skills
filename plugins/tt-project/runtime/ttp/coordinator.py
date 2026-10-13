@@ -508,6 +508,11 @@ def system_prompt(p: Project, now: float | None = None) -> str:
     return join_prompt(*prompt_parts(p, now))
 
 
+# Leads the prompt of a turn that continues the last turn's agent session (cachettl.pick_thread).
+THREAD_CONTINUED = ("This turn continues your earlier turns in this session: their actions were applied "
+                    "and their digests are out of date. Decide only on the digest below.")
+
+
 def join_prompt(head: str, context: str) -> str:
     """The whole system prompt, for a provider that cannot cache `context` as a block of its own."""
     return f"{head}\n\n{context}"

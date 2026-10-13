@@ -28534,6 +28534,160 @@ def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
     assert "PROMPT-MARKER" in stdin and run["status"] == "ok" and task["status"] == "done"
 
 
+# A Codex stand-in whose prompt cache is keyed to the thread, as Codex's prompt_cache_key is: a
+# fresh thread reads nothing, a resumed one reads what that thread sent before. Never a real agent.
+CODEX_THREAD_CACHE = r'''#!{python}
+import json, os, sys, uuid
+from pathlib import Path
+argv = sys.argv[1:]
+state = Path(os.environ["FAKE_CODEX_STATE"])
+state.mkdir(parents=True, exist_ok=True)
+(state / "argv.jsonl").open("a").write(json.dumps(argv) + "\n")
+prompt = sys.stdin.read()
+system = next((a for a in argv if a.startswith("developer_instructions=")), "")
+thread = argv[argv.index("resume") + 1] if "resume" in argv else str(uuid.uuid4())
+hist = state / (thread + ".json")
+sent = json.loads(hist.read_text()) if hist.exists() else 0
+fresh = (len(system) + len(prompt)) // 4 if not sent else len(prompt) // 4
+total = sent + fresh
+day = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "10" / "13"
+day.mkdir(parents=True, exist_ok=True)
+(day / ("rollout-2026-10-13T10-00-00-" + thread + ".jsonl")).write_text("{{}}\n")
+hist.write_text(json.dumps(total + 50))   # the answer joins the thread's history
+for ev in ({{"type": "thread.started", "thread_id": thread}}, {{"type": "turn.started"}},
+           {{"type": "item.completed", "item": {{"id": "i1", "type": "agent_message", "text": '{{"actions": []}}'}}}},
+           {{"type": "turn.completed", "usage": {{"input_tokens": total, "cached_input_tokens": sent,
+                                                "output_tokens": 50}}}}):
+    print(json.dumps(ev), flush=True)
+'''
+
+
+def _codex_coordinator(env, monkeypatch, tmp_path):
+    """A daemon whose coordinator turns go to CODEX_THREAD_CACHE, and a turn runner returning
+    (run row, argv, prompt.md) of a finished turn."""
+    from ttp.daemon import Daemon
+    from ttp.providers import base
+    from ttp.providers import codex as codex_provider
+    from ttp import coordinator as coord
+    exe = tmp_path / "codex"
+    exe.write_text(CODEX_THREAD_CACHE.format(python=sys.executable))
+    exe.chmod(0o755)
+    monkeypatch.setenv("FAKE_CODEX_STATE", str(tmp_path / "codex-state"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: str(exe))
+    for args, text in ((("exec", "--help"), CODEX_EXEC_HELP), (("features", "list"), ""),
+                       (("login", "--help"), "")):
+        monkeypatch.setitem(base._CLI_OUTPUT, (str(exe), *args), text)
+    p = make(env)
+    p.set_config("core_provider", "codex")
+    d = Daemon(p.base)
+
+    def turn(digest="EVENTS", system=None):
+        head, context = coord.prompt_parts(p)
+        rid = d.start_run("coordinator", digest, "codex", "light", str(p.base), read_only=True,
+                          schema=coord.ACTIONS_SCHEMA, system=system or head, context=context, cache_ttl="auto")
+        exit_file = p.runs / str(rid) / "exit.json"
+        deadline = time.time() + 60
+        while not exit_file.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
+        d.reap_runs()
+        argv = json.loads((tmp_path / "codex-state" / "argv.jsonl").read_text().splitlines()[-1])
+        return p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), argv, (p.runs / str(rid) / "prompt.md").read_text()
+    return p, d, turn
+
+
+def test_codex_coordinator_turns_continue_the_warm_session_and_read_the_cache(env, monkeypatch, tmp_path):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    p, d, turn = _codex_coordinator(env, monkeypatch, tmp_path)
+    first, argv, prompt = turn()
+    assert first["status"] == "ok" and "resume" not in argv and prompt == "EVENTS"
+    assert json.loads(first["note"])["turn"]["thread"] == {**json.loads(first["note"])["turn"]["thread"],
+                                                           "turn": 1, "why": "no earlier turn"}
+    for k in range(2, 5):
+        r, argv, prompt = turn(f"EVENTS {k}")
+        thread = json.loads(r["note"])["turn"]["thread"]
+        assert argv[-3:] == ["resume", first["session_id"], "-"], argv
+        assert r["status"] == "ok" and r["session_id"] == first["session_id"] and thread["turn"] == k, thread
+        assert prompt == coord.THREAD_CONTINUED + f"\n\nEVENTS {k}", "a continued turn is told its history is stale"
+        assert any(a.startswith("developer_instructions=") for a in argv[:argv.index("resume")]), \
+            "the same stable prefix goes with it"
+        assert r["cache_read_tokens"] > 0 and r["cache_read_tokens"] >= r["input_tokens"], r
+    c = bud.coordinator_cache(p.db)["24h"]
+    assert c["continued"]["turns"] == 3 and c["continued"]["hit_pct"] >= 50 and c["continued"]["miss_turns"] == 0
+    # A changed prefix (charter or memory) starts a session of its own.
+    head = coord.prompt_parts(p)[0]
+    r, argv, _ = turn(system=head + "\nnew charter line")
+    assert "resume" not in argv and json.loads(r["note"])["turn"]["thread"]["why"] == "prefix changed"
+    assert r["session_id"] != first["session_id"] and r["cache_read_tokens"] == 0
+
+
+def test_codex_coordinator_cache_before_and_after_session_reuse(env, monkeypatch, tmp_path):
+    """The before/after fixture: the same five turns, each in a fresh session (thread_max_turns 0,
+    the old behaviour) and then continuing one session, measured by coordinator_cache."""
+    from ttp import budget as bud
+    p, d, turn = _codex_coordinator(env, monkeypatch, tmp_path)
+    d.cfg["coordinator"]["thread_max_turns"] = 0
+    for k in range(5):
+        r, argv, _ = turn(f"EVENTS {k}")
+        assert "resume" not in argv and json.loads(r["note"])["turn"]["thread"]["why"] == "off"
+    before = bud.coordinator_cache(p.db)["24h"]
+    assert before["hit_pct"] == 0 and before["states"]["zero"] == 5 and before["continued"]["turns"] == 0
+    p.db.x("DELETE FROM runs")
+    d.cfg["coordinator"]["thread_max_turns"] = 8
+    for k in range(5):
+        turn(f"EVENTS {k}")
+    after = bud.coordinator_cache(p.db)["24h"]
+    assert after["continued"]["turns"] == 4 and after["states"]["zero"] == 1
+    assert after["hit_pct"] >= 60 and after["continued"]["hit_pct"] >= 75, after
+
+
+def test_pick_thread_continues_only_a_warm_cheap_session_of_the_same_prefix():
+    from ttp import cachettl
+    fp = cachettl.fingerprint("head", "ctx", {"type": "object"}, "m", "high", "cli")
+    key = cachettl._key(fp)
+    now = 10_000.0
+    note = lambda **t: json.dumps({"turn": {"thread": {"key": key, "turn": 1, **t}}})
+    last = {"provider": "codex", "status": "ok", "session_id": "s1", "started": now - 200, "ended": now - 120,
+            "note": note(), "input_tokens": 30_000, "cache_read_tokens": 0, "cache_write_tokens": 0}
+    pick = lambda row=last, cfg=None, f=fp, saved=lambda s: True: \
+        cachettl.pick_thread(row, f, "codex", now, cfg or {}, saved)
+    session, thread = pick()
+    assert session == "s1" and thread == {"key": key, "turn": 2, "base": 30_000, "why": "continued"}
+    cases = [
+        (None, {}, fp, "no earlier turn"),
+        ({**last, "provider": "claude"}, {}, fp, "no session of this agent"),
+        ({**last, "session_id": None}, {}, fp, "no session of this agent"),
+        ({**last, "status": "failed"}, {}, fp, "ended failed"),
+        (last, {}, {**fp, "effort": "xhigh"}, "prefix changed"),
+        ({**last, "note": "not json"}, {}, fp, "prefix changed"),
+        ({**last, "ended": now - 11 * 60}, {}, fp, "cold"),
+        (last, {"thread_warm_min": 1}, fp, "cold"),
+        (last, {"thread_max_turns": 1}, fp, "off"),
+        ({**last, "note": note(turn=8)}, {}, fp, "thread full"),
+        ({**last, "note": note(turn=3, base=20_000), "cache_read_tokens": 30_000}, {}, fp, "thread grew"),
+        ({**last, "note": note(turn=2, base=30_000), "input_tokens": 20_000, "cache_read_tokens": 10_000},
+         {}, fp, "missed the cache"),
+    ]
+    for row, cfg, f, why in cases:
+        session, thread = pick(row, cfg, f)
+        assert session == "" and thread["turn"] == 1 and why in thread["why"], (why, thread)
+    assert pick(saved=lambda s: False)[1]["why"] == "the session is no longer saved"
+    session, thread = pick({**last, "note": note(turn=2, base=30_000), "input_tokens": 5_000,
+                            "cache_read_tokens": 30_000})
+    assert session == "s1" and thread["turn"] == 3 and thread["base"] == 30_000
+
+
+def test_only_an_agent_whose_cache_follows_the_session_continues_coordinator_sessions(env, monkeypatch, tmp_path):
+    from ttp.providers import get_provider
+    assert get_provider("codex").cache_key_per_session and not get_provider("claude").cache_key_per_session
+    _, auto_ttl, _, turn = _auto_ttl_daemon(env, monkeypatch, tmp_path)
+    turn()
+    _, _, note = turn()
+    assert "thread" not in note, "a claude turn keeps its own fresh session"
+
+
 def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, monkeypatch):
     from ttp.daemon import Daemon
     from ttp.providers import base

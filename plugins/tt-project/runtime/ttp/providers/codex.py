@@ -70,6 +70,9 @@ class Codex(Provider):
     login_hint = "run `codex login` there"
     efforts = ("minimal", "low", "medium", "high", "xhigh")
     isolate_read_only = True
+    # Codex sends the thread id as the request's prompt_cache_key: one `codex exec` per coordinator
+    # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
+    cache_key_per_session = True
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
     _hook_held_by_user_config = ""

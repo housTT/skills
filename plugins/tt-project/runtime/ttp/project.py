@@ -162,6 +162,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # reads that turn's 1h entries; cachettl.py), "1h", "5m", or "off" (the agent's
                     # own choice, and charter and memory stay in the system prompt).
                     "cache_ttl": "auto", "cache_warm_min": 50,
+                    # An agent whose prompt cache follows its session (Codex) continues the last
+                    # turn's session for up to thread_max_turns turns (under 2: off) while it ended
+                    # under thread_warm_min minutes ago (cachettl.pick_thread).
+                    "thread_warm_min": 10, "thread_max_turns": 8,
                     "turn_budget_usd": 1.0,
                     # Turn timeout (coordlimits.turn_timeout): turn_timeouts_s.<provider>.<effort> set
                     # here wins, then a flat turn_timeout_s (0: unset; a stored 600, the old default,

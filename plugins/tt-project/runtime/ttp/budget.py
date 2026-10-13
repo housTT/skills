@@ -999,6 +999,12 @@ def _cache_summary(rows: list[dict]) -> dict:
             "digest_tokens": round(sum(sizes) / len(sizes)) if sizes else None}
 
 
+def _thread_turn(r: dict) -> int:
+    thread = (_note(r["note"]).get("turn") or {}).get("thread")
+    turn = thread.get("turn") if isinstance(thread, dict) else None
+    return turn if isinstance(turn, int) else 0
+
+
 def coordinator_cache(db: DB, now: float | None = None, window_s: float | None = None) -> dict:
     """Token hit denominator = fresh input + cache writes + cache reads (no output tokens).
     A miss is strictly below 50% read; missing metadata or a zero denominator is unknown.
@@ -1017,6 +1023,8 @@ def coordinator_cache(db: DB, now: float | None = None, window_s: float | None =
         out[label] = _cache_summary(rows)
         out[label]["gap_5_60m"] = _cache_summary([r for r in rows if r["previous_end"] is not None
                                                and 300 <= r["started"] - r["previous_end"] <= 3600])
+        # Turns that continued the last turn's agent session (cachettl.pick_thread), against the rest.
+        out[label]["continued"] = _cache_summary([r for r in rows if _thread_turn(r) >= 2])
     return out
 
 
