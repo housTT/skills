@@ -3187,6 +3187,64 @@ def test_keyed_issue_a_quiet_run_closed_only_counts_when_resent_within_the_windo
         assert wakes() == before + 1
 
 
+def test_keyed_issue_new_episode_supersedes_the_old_issue_and_wakes_once(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def line(text, episode=None, key="gate", severity="high"):
+        obs = {"text": text, "severity": severity, "key": key}
+        return json.dumps(obs if episode is None else {**obs, "episode": episode})
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    def issues(key="gate"):
+        fp = scr.key_fingerprint("watcher:hw", key)
+        return p.db.q("SELECT id, fingerprint, status, count, cleared_why, episode FROM issues "
+                      "WHERE fingerprint=? OR fingerprint LIKE ? ORDER BY id", (fp, fp + "~%"))
+
+    def run(stdout):
+        out["stdout"] = stdout
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    # (1) The same key and episode: one issue, one wake, whatever the text says.
+    run(line("box-a: link down", "e1"))
+    run(line("box-a: link down for 2h", "e1"))
+    assert wakes() == 1 and [(i["count"], i["episode"], i["status"]) for i in issues()] == [(2, "e1", "open")]
+    # (2) A new episode closes the old issue, opens a new one and wakes once.
+    run(line("box-a: link down", "e2"))
+    run(line("box-a: link down again", "e2"))
+    assert wakes() == 2
+    old, new = issues()
+    assert old["status"] == "fixed" and old["cleared_why"] == scr.SUPERSEDED_WHY and old["episode"] == "e1"
+    assert new["fingerprint"] == scr.key_fingerprint("watcher:hw", "gate")
+    assert (new["status"], new["episode"], new["count"]) == ("open", "e2", 2)
+    # A recently closed issue (a quiet run within the reraise window) and a new episode: no dedupe.
+    run("")
+    assert issues()[-1]["cleared_why"] == scr.CLEAN_RUN_WHY
+    run(line("box-a: link down", "e2"))
+    assert wakes() == 2 and issues()[-1]["status"] == "fixed"   # same episode: today's dedupe
+    run(line("box-a: link down", "e3"))
+    assert wakes() == 3 and [i["status"] for i in issues()] == ["fixed", "fixed", "open"]
+    assert issues()[1]["cleared_why"] == scr.SUPERSEDED_WHY
+    # (3) No episode keeps today's behaviour: the open issue absorbs the line, no wake, no new issue.
+    run(line("box-a: link down, other reason"))
+    assert wakes() == 3 and len(issues()) == 3 and issues()[-1]["episode"] == "e3"
+    # An issue opened without an episode adopts the first one it sees instead of being superseded.
+    run(line("box-b: fan slow", key="fan"))
+    run(line("box-b: fan slow", "f1", key="fan"))
+    assert wakes() == 4 and [(i["episode"], i["status"]) for i in issues("fan")] == [("f1", "open")]
+    # (4) An active mute still suppresses the new episode's wake; its issue opens all the same.
+    scr.mute(p.db, "watcher:hw", "box-a", 2, why="planned work")
+    run(line("box-a: link down", "e4"))
+    assert wakes() == 4 and [i["status"] for i in issues()][-2:] == ["fixed", "open"]
+    assert issues()[-1]["episode"] == "e4"
+
+
 def test_migration_closes_old_watcher_issues_once(env, tmp_path):
     import sqlite3
     from ttp.db import DB, WATCHER_ISSUES_MIGRATION

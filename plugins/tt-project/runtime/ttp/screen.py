@@ -72,7 +72,7 @@ class Verdict:
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
            rewake_after_s: float | None = None, repeat: bool = False, lifecycle: str | None = None,
-           whole: bool = False, key: str | None = None) -> Verdict:
+           whole: bool = False, key: str | None = None, episode: str | None = None) -> Verdict:
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
@@ -84,8 +84,11 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     "key" field) is the issue's identity instead of its text: the text may change without a new issue.
     A keyed issue a run that reported nothing closed, raised again under the same key within
     `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
-    closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes."""
-    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key)
+    closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.
+    `episode` (a keyed line's "episode" field) names one occurrence of the keyed condition: a keyed issue
+    that recorded another episode is closed as superseded and a new issue opens, judged as any new one
+    (no reraise dedupe). The same episode, or none, changes nothing; an issue without one adopts it."""
+    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key, episode)
     m = count_muted(db, source, text, v.severity, whole=whole, key=key)
     if m and v.wake:
         v.wake, v.reason = False, f"muted ({v.reason})"
@@ -94,7 +97,7 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
 
 def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None, whole: bool = False,
-            key: str | None = None) -> Verdict:
+            key: str | None = None, episode: str | None = None) -> Verdict:
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     judged: list[tuple[str, str, str, dict]] = []
@@ -110,8 +113,13 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
         subject, _cond, cleared = parts[0]
         if cleared:
             return _clear(db, key_fingerprint(source, key), now)
-        v = _issue(db, key_fingerprint(source, key), source, title, title, hint, judge, floor, now,
-                   rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg), key.strip())
+        fp = key_fingerprint(source, key)
+        episode = (episode or "").strip()[:EPISODE_MAX] or None
+        if episode:
+            _supersede(db, fp, episode, now)
+        v = _issue(db, fp, source, title, title, hint, judge, floor, now,
+                   rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg), key.strip(),
+                   episode)
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
         return v
     conditions = watcher_conditions(source, text, whole)
@@ -139,11 +147,12 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 
 def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: str | None, judge, floor: int,
            now: float, rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None,
-           subject: str | None = None, reraise_s: float = 0, watch_key: str | None = None) -> Verdict:
+           subject: str | None = None, reraise_s: float = 0, watch_key: str | None = None,
+           episode: str | None = None) -> Verdict:
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
-        db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title), lifecycle=?, subject=? "
-             "WHERE id=?", (now, retitle, lifecycle, subject, row["id"]))
+        db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title), lifecycle=?, subject=?, "
+             "episode=COALESCE(episode, ?) WHERE id=?", (now, retitle, lifecycle, subject, episode, row["id"]))
         rank = SEVERITY_RANK.get(row["severity"], 1)
         seen_at = SEVERITY_RANK.get(hint or "", -1)
         if row["status"] == "fixed":
@@ -174,9 +183,10 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
 
     severity, verdict_src, reason, info = judge()
     issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen,"
-                    "lifecycle,subject,opened,watch_key) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?)",
+                    "lifecycle,subject,opened,watch_key,episode) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?)",
                     (fp, source, now, now, title, severity, "open" if severity != "info" else "ignored",
-                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject, now, watch_key))
+                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject, now, watch_key,
+                     episode))
     if info.get("jev_call"):
         jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
@@ -185,6 +195,15 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
 def _reopens(row: dict, now: float) -> str | None:
     """A keyed issue's reopen times with this one (watchdup counts its churn); others keep none."""
     return watchdup.reopened(row.get("reopens"), now) if row.get("watch_key") else row.get("reopens")
+
+
+def _supersede(db: DB, fp: str, episode: str, now: float) -> None:
+    """A keyed issue that recorded another episode is over: close it (an already closed one keeps its
+    close time) and move it off the key's fingerprint, so the new episode opens an issue of its own."""
+    row = db.one("SELECT id, episode FROM issues WHERE fingerprint=?", (fp,))
+    if row and row["episode"] and row["episode"] != episode:
+        db.x("UPDATE issues SET fingerprint=?, status='fixed', closed=COALESCE(closed, ?), cleared_why=? WHERE id=?",
+             (f"{fp}~{row['id']}", now, SUPERSEDED_WHY, row["id"]))
 
 
 JEV_USE = "screen"
@@ -305,6 +324,8 @@ QUIET_RUNS = 3   # a slower watcher's issue closes after this many of its period
 CLEARED_WHY = "the watcher reported it cleared"
 QUIET_WHY = "not seen for 24 h"
 CLEAN_RUN_WHY = "a watcher run reported nothing"
+SUPERSEDED_WHY = "superseded by a new episode"
+EPISODE_MAX = 200   # a watcher's episode string is kept to this many characters
 # Receipt sources: a command schedule with issue_lifecycle "explicit_clear" reports items that stay
 # pending until acknowledged (receipts), so the quiet sweep leaves them open. A command watcher's own
 # failures are errors under a source of their own (error_source), so no receipt rule covers them: they
