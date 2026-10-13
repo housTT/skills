@@ -30853,7 +30853,7 @@ DURABLE_EXEMPT = {
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
     ("release.py", "upgrade.log"): "a log",
     ("service.py", "restart.log"): "a log",
-    ("deploy.py", "takeover.log"): "a log (a host-side takeover's output); its outcome is the target daemon's reported version",
+    ("deploy.py", 'open(path, "a") as log'): "the takeover log (a host-side takeover's output and its outcome lines); its outcome is the target daemon's reported version",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("upstream.py", 'os.replace(src, src.with_name(QUEUED_FILE + ".filed"))'): "marks a run's queued notes filed; a rename lost to a crash only repeats sends that are dropped as duplicates",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
