@@ -1159,6 +1159,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
+    Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched) is refused.
     In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
@@ -1167,6 +1168,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     task = os.environ.get("TTP_TASK")
     onto = _labelled(p, task, "pr_branch") if task else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
+    if m and task and m.group(1) == task and not notes and (why := _switched(p, task, branch)):
+        raise ValueError(why)
     carried = bool(m and onto and m.group(1) == task and not notes)
     if m and task and m.group(1) != task and not carried and not notes:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would:
@@ -1325,6 +1328,22 @@ def is_notes_branch(p: Project, branch: str) -> bool:
     if not t:
         return True
     return branch != (str(t.get("branch") or "") or f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}")
+
+
+def _switched(p: Project, task: str, branch: str) -> str:
+    """Why `ttp push --own` must not publish the checked-out `branch`, one of task `task`'s own
+    ttp/t<id>-... branches, or "": the worktree left the branch the task's run was given (its row's
+    branch) for another of its own. Publishing it would push onto the task's pr_branch, or a
+    carried branch another task owns, work that was never on the branch the task delivers from."""
+    t = _task_row(p, task)
+    given = str((t or {}).get("branch") or "")
+    if not given or given == branch:
+        return ""
+    onto = _labelled(p, task, "pr_branch")
+    to = f", which it publishes onto {onto}" if onto and onto != given else ""
+    return (f"this worktree has {branch} checked out, but task #{task} delivers from {given}{to}: "
+            f"--own publishes neither. Switch back to {given} (bring the commits over, e.g. "
+            f"`git checkout {given} && git merge --ff-only {branch}`) and rerun")
 
 
 def _carries(p: Project, task: str, owner: str, branch: str) -> bool:

@@ -34897,6 +34897,55 @@ def test_own_push_refuses_a_pr_branch_that_exists_nowhere(env, monkeypatch):
     assert target("feature/local") == ("origin", "feature/local")
 
 
+def test_own_push_refuses_a_task_branch_other_than_the_one_its_run_was_given(env, monkeypatch, capsys):
+    """A worktree that left the branch its task's run was given (the row's branch) for another of the
+    task's own ttp/t<id>-... branches is refused by `ttp push --own`, naming both branches: it would
+    otherwise publish the new branch's head onto the carried branch, which another task owns. On the
+    given branch it publishes as before: onto the carried branch, or under its own name."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    owner = p.db.add_task("First fix", "s", kind="code")
+    carried = f"ttp/t{owner}-first-fix"
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{carried}")
+    theirs = _git_out(origin, "rev-parse", carried)
+    tid = p.db.add_task("Follow up", "s", kind="code", labels=[f"pr_branch:{carried}"])
+    p.db.update_task(tid, status="running", branch=carried)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    _git_out(repo, "checkout", "-q", "-B", carried, theirs)
+    assert push.own_target(p, repo) == ("origin", carried)   # the normal case: on the given branch
+    new = f"ttp/t{tid}-new"
+    _git_out(repo, "checkout", "-q", "-B", new)
+    _commit(repo, "new.py", "x\n")
+    with pytest.raises(ValueError, match=rf"{re.escape(new)} checked out.*delivers from {re.escape(carried)}"):
+        push.own_target(p, repo)
+    capsys.readouterr()
+    assert _ttp("push", "--own") != 0
+    err = capsys.readouterr().err
+    assert new in err and carried in err, err
+    assert _git_out(origin, "rev-parse", carried) == theirs
+    assert new not in _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    # Given its own branch (the carried one was held elsewhere): that branch publishes onto the
+    # carried one; a second own branch is refused, naming the given branch and where it goes.
+    given = f"ttp/t{tid}-follow-up"
+    p.db.update_task(tid, branch=given)
+    with pytest.raises(ValueError, match=rf"delivers from {re.escape(given)}, which it publishes onto {re.escape(carried)}"):
+        push.own_target(p, repo)
+    _git_out(repo, "checkout", "-q", "-B", given)
+    assert push.own_target(p, repo) == ("origin", carried)
+    # A task with no pr_branch: its given branch goes under its own name, another of its own does not.
+    plain = p.db.add_task("Plain", "s", kind="code")
+    p.db.update_task(plain, status="running", branch=f"ttp/t{plain}-plain")
+    monkeypatch.setenv("TTP_TASK", str(plain))
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{plain}-plain")
+    assert push.own_target(p, repo) == ("origin", f"ttp/t{plain}-plain")
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{plain}-other")
+    with pytest.raises(ValueError, match=f"task #{plain} delivers from ttp/t{plain}-plain"):
+        push.own_target(p, repo)
+    # Its notes branch still publishes itself.
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{plain}-notes")
+    assert push.own_target(p, repo) == ("origin", f"ttp/t{plain}-notes")
+
+
 def test_a_review_publishes_the_pr_branch_its_subject_carries_and_nothing_else(env, monkeypatch, capsys):
     """A review whose subject task (named by the `Review #<id>` title or its depends_on) carries a
     pr_branch that is another task's ttp/t<id>-... branch publishes that branch with `ttp push --own`
