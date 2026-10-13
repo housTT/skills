@@ -926,6 +926,10 @@ class Daemon:
             return
         self._machines_routed = now
         try:
+            self.power_cycle_notices(now)
+        except Exception:
+            log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
+        try:
             self._machine_probes.tick(now)
             pages = machine_ledger.route(now, claimer=self.p.name)
         except Exception:
@@ -941,6 +945,29 @@ class Daemon:
                 (machine_ledger.delivered if ok else machine_ledger.release)(page)
             except Exception:
                 log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
+
+    def power_cycle_notices(self, now: float) -> None:
+        """A planned power cycle (machine_ledger.add_power_cycle) close at hand: tell each running worker
+        on that machine (this host, or a task resource on it), once, through its steer.md, to commit and
+        hand off now, so the cycle takes no work with it."""
+        due = machine_ledger.power_cycles_due(now)
+        if not due:
+            return
+        mine = machines.here()
+        runs = self.p.db.q("SELECT id, task, dir FROM runs WHERE status='running' AND role!='coordinator' "
+                           "AND task IS NOT NULL AND dir IS NOT NULL")
+        for c in due:
+            alias, local = str(c.get("alias")), bool(mine) and mine[0] == c.get("alias")
+            on = machine_ledger.on_machine(alias)
+            when = timefmt.short(float(c["at"]), self.p, now)
+            for r in runs:
+                if not local and not any(on(res) for res in coord.task_resources(self.p.db.task(r["task"]) or {})):
+                    continue
+                where = "this host" if local else alias
+                text = (f"{where} is to be power-cycled at {when} (machine change #{c['id']}). Commit your work now "
+                        f"and hand off before then: `waiting` with a `retry_when` that exits 0 once {alias} is back "
+                        f"(or `done` with a `continue:` followup). Start no new device job or long step on it.")
+                coord._append_update(Path(r["dir"]) / "steer.md", text, f"power-cycle-{c['id']}-{r['id']}")
 
     def refresh_coverage(self) -> None:
         """The responsibility inventory and its health coverage (responsibilities.py), model-free: a

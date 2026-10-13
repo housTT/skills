@@ -44639,6 +44639,60 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
         main(["machines", "change", "close", "2"])
 
 
+def test_a_planned_power_cycle_tells_running_workers_on_the_machine_to_hand_off_once(env, tmp_path, capsys,
+                                                                                    monkeypatch):
+    """`ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle intent (no
+    undo, expects down, never overdue, closes itself after). Shortly before T the daemon tells each running
+    worker on that machine (a task resource on it, or every worker when it is this host), once, through
+    its steer.md, to commit and hand off; workers elsewhere and runs outside the window hear nothing."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    from ttp.daemon import Daemon
+    p = make(env)
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    for bad in (["--undo", "x"], ["--expires", "2h"]):
+        with pytest.raises(SystemExit):
+            main(["machines", "change", "add", "box-a", "firmware update", "--power-cycle-at", "1h", "--by", "demo", *bad])
+    with pytest.raises(SystemExit):
+        main(["machines", "change", "add", "box-a", "drop-in", "--expires", "1h", "--by", "demo"])
+    capsys.readouterr()
+    now = time.time()
+    main(["machines", "change", "add", "box-a", "firmware update", "--power-cycle-at", "1h", "--by", p.name])
+    assert "power-cycle intent, at " in capsys.readouterr().out
+    c = ml.changes()[0]
+    at = c["at"]
+    assert c["kind"] == ml.POWER_CYCLE and c["expects"] == ["down"] and at == pytest.approx(now + 3600, abs=60)
+    assert not ml.overdue(c, at + 10 * 86400), "a power cycle has nothing to undo: never overdue"
+    on_a = p.db.add_task("device job", "s", kind="code", origin="user", labels=["resource:box-a-device"])
+    on_b = p.db.add_task("other box", "s", kind="code", origin="user", labels=["resource:box-b-device"])
+    runs = {}
+    for t in (on_a, on_b):
+        (tmp_path / str(t)).mkdir()
+        runs[t] = p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+                         (t, "worker", now, "running", str(tmp_path / str(t))))
+    steer = {t: tmp_path / str(t) / "steer.md" for t in runs}
+    monkeypatch.setattr(mm, "here", lambda known=None: None)
+    d = Daemon(p.base)
+    d.power_cycle_notices(at - ml.POWER_CYCLE_LEAD_S - 60)
+    assert not any(f.exists() for f in steer.values()), "not yet: too early"
+    d.power_cycle_notices(at - 120)
+    d.power_cycle_notices(at - 60)
+    text = steer[on_a].read_text()
+    assert text.count("## Update") == 1, "told once"
+    assert "box-a is to be power-cycled at" in text and f"machine change #{c['id']}" in text \
+        and "hand off before then" in text
+    assert not steer[on_b].exists(), "a worker on another machine is not told"
+    monkeypatch.setattr(mm, "here", lambda known=None: ("box-a", {}))
+    d.power_cycle_notices(at - 30)
+    assert "this host is to be power-cycled" in steer[on_b].read_text(), "on this host every worker is told"
+    assert steer[on_a].read_text().count("## Update") == 1
+    ml.Probes(p).tick(at + ml.POWER_CYCLE_AFTER_S + 1)
+    assert not ml.changes(), "the intent closes itself once its time is past"
+    assert ml.changes(open_only=False)[0]["closed_why"] == "the planned power cycle is past"
+
+
 def _ledger_writer(home, n, k):
     from ttp import machine_ledger as ml
     for i in range(k):

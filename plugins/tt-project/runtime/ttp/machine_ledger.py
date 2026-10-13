@@ -40,6 +40,12 @@ then the user. Nothing is undone automatically: whoever is paged runs the undo a
 (`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
 from its root, as end probes do.
 
+Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
+intent: an entry of kind `power_cycle` that expects the machine `down`, needs no undo, and closes itself
+POWER_CYCLE_AFTER_S after T (never overdue). From POWER_CYCLE_LEAD_S before T until as long after it, each
+daemon tells its running workers on that machine (the daemon's own host, or a task resource on it) once,
+through their steer.md, to commit and hand off now (daemon.power_cycle_notices).
+
 Both files live next to machines.json, written whole under one lock, so co-tenant daemons and CLIs never
 lose each other's writes. Other projects' state is only read (their database, read-only), never written.
 
@@ -77,6 +83,9 @@ CONDITIONS = ("down", "held")
 QUIET_KEPT_S = 2 * 86400     # a quiet outage's daily-review record is kept this long after it was last seen
 REVIEW_S = 86400             # the daily review lists the quiet outages seen within this
 GAP_KV = "machine_owner_gap_named"
+POWER_CYCLE = "power_cycle"
+POWER_CYCLE_LEAD_S = 600     # running workers on the machine are told to hand off this long before the cycle
+POWER_CYCLE_AFTER_S = 3600   # a power-cycle intent closes itself this long after its time
 USER = "the user"
 
 
@@ -115,10 +124,10 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 # ledger -------------------------------------------------------------------------------------------
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
-               task: int | None = None, now: float | None = None, expects=None) -> dict:
+               task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `expects`: the
     event fingerprints or machine conditions (down, held) the change is known to cause, which then
-    keep the coordinator's turn routine (coordinator._known_case)."""
+    keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind)."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -127,12 +136,13 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         raise ValueError("say what changed and give the --undo command")
     if not expires and not probe:
         raise ValueError("give an end: --expires <delay or time> or --until-probe <command>")
-    end = ends.parse_expires(expires, now) if expires else now + PROBE_END_S
+    end = float(expires) if isinstance(expires, (int, float)) else \
+        ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         n = int(doc.get("next") or 1)
         entry = {"id": n, "alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now,
-                 "expires": end, "probe": probe or None}
+                 "expires": end, "probe": probe or None, **(extra or {})}
         if expects:
             entry["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
         doc["next"] = n + 1
@@ -140,6 +150,24 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
                           or now - float(c["closed"]) < CLOSED_KEPT_S] + [entry]
         _write(LEDGER, doc)
     return entry
+
+
+def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | None = None,
+                    now: float | None = None) -> dict:
+    """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes)."""
+    now = time.time() if now is None else now
+    when = ends.parse_expires(at, now, what="--power-cycle-at")
+    what = f"power-cycle intent, at {ends.stamp(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
+    return add_change(alias, what, "none: a planned power cycle; the entry closes itself after it", by,
+                      expires=when + POWER_CYCLE_AFTER_S, task=task, now=now, expects=["down"],
+                      extra={"kind": POWER_CYCLE, "at": when})
+
+
+def power_cycles_due(now: float | None = None) -> list[dict]:
+    """Open power-cycle intents whose time is within POWER_CYCLE_LEAD_S of now, either side."""
+    now = time.time() if now is None else now
+    return [c for c in changes() if c.get("kind") == POWER_CYCLE
+            and abs(float(c.get("at") or 0) - now) <= POWER_CYCLE_LEAD_S]
 
 
 def changes(aliases=None, open_only: bool = True) -> list[dict]:
@@ -163,7 +191,7 @@ def close_change(cid: int, why: str = "", by: str = "", now: float | None = None
 def overdue(c: dict, now: float | None = None) -> str:
     """Why entry `c` is overdue ("" when it is not)."""
     now = time.time() if now is None else now
-    if c.get("closed"):
+    if c.get("closed") or c.get("kind") == POWER_CYCLE:   # a power cycle has nothing to undo: it closes itself
         return ""
     if c.get("probe_passed"):
         return "its until-probe passed"
@@ -270,6 +298,14 @@ def outage_line(alias: str, o: dict) -> str:
     return f"{alias}: known outage until {ends.stamp(o['until'])} (by {o.get('by') or '?'}{owner}): {o['why']}"
 
 
+def on_machine(alias: str) -> Callable[[str], bool]:
+    """Whether a resource name is on machine `alias` (names it, or its hostname)."""
+    from . import responsibilities as rs
+    rec = machines.load().get(alias) or {}
+    needles = [alias] + ([str(rec["hostname"])] if rec.get("hostname") else [])
+    return lambda res: any(rs._names(n, res) for n in needles)
+
+
 def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
     """Read-only, from every project on this machine: the open tasks that use a resource on `alias`
     ("need"), and the pauses of resources on it ("paused", "user": set by the user). A reporter that
@@ -278,12 +314,7 @@ def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
     from . import responsibilities as rs
     from .coordinator import task_resources
     from .db import PAUSED_RESOURCES_KEY
-    rec = machines.load().get(alias) or {}
-    needles = [alias] + ([str(rec["hostname"])] if rec.get("hostname") else [])
-
-    def on(res: str) -> bool:
-        return any(rs._names(n, res) for n in needles)
-
+    on = on_machine(alias)
     out: dict[str, list[str]] = {"need": [], "paused": [], "user": [], "shared": []}
     seen = set()
     for name, base in rs._projects(project.hostname()):
@@ -609,6 +640,10 @@ class Probes:
                     if c.get("id") in passed and not c.get("closed"):
                         c["probe_passed"] = now
                 _write(LEDGER, doc)
+        for c in changes():
+            if c.get("by") == self.p.name and c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:
+                with contextlib.suppress(ValueError):   # another daemon of the project closed it first
+                    close_change(int(c["id"]), "the planned power cycle is past", self.p.name, now)
         for c in changes():
             cid = c.get("id")
             if c.get("by") != self.p.name or not c.get("probe") or c.get("probe_passed") or cid in self._procs \

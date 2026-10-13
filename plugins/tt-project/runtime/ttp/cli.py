@@ -2900,9 +2900,16 @@ def _machine_change(a) -> None:
     if not by:
         die("run it inside a project, or say whose change it is: --by <project>")
     task = os.environ.get("TTP_TASK")
+    tid = int(task) if task and task.isdigit() else None
+    if a.power_cycle_at and (a.undo or a.expires or a.until_probe):
+        die("a power cycle needs no --undo, --expires or --until-probe: it closes itself after its time")
+    if not a.power_cycle_at and not a.undo:
+        die("give the --undo command (or --power-cycle-at <t> for a planned power cycle)")
+    if not a.power_cycle_at and not (a.expires or a.until_probe):
+        die("give an end: --expires <delay or time> or --until-probe <command>")
     try:
-        c = ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe,
-                          int(task) if task and task.isdigit() else None, expects=a.expect)
+        c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid) if a.power_cycle_at else \
+            ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect)
     except ValueError as e:
         die(str(e))
     print(f"recorded {ml.change_line(c)}")
@@ -4526,11 +4533,14 @@ def main(argv: list[str] | None = None) -> None:
     c = cs.add_parser("add", help="record a live change: what, how to undo it and when it ends")
     c.add_argument("alias")
     c.add_argument("what", help="what changed and why, one line")
-    c.add_argument("--undo", required=True, help="the command that undoes it")
-    end = c.add_mutually_exclusive_group(required=True)
+    c.add_argument("--undo", help="the command that undoes it (required, except for --power-cycle-at)")
+    end = c.add_mutually_exclusive_group()
     end.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time")
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
+    end.add_argument("--power-cycle-at", dest="power_cycle_at", metavar="T",
+                     help="a planned power cycle at T (a delay or a time): running workers on the machine are "
+                          "told to commit and hand off shortly before; the entry closes itself after")
     c.add_argument("--by", help="the project that owns the change (default: the project you are in)")
     c.add_argument("--expect", action="append", metavar="FINGERPRINT|CONDITION",
                    help="an alert the change is known to cause (an event fingerprint, or down/held on this "
