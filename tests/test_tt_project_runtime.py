@@ -53000,13 +53000,63 @@ def test_coordinator_cache_distinguishes_zero_partial_full_and_unknown(env):
                (now - 60, now, fresh, read, write, json.dumps(note)))
     s = bud.coordinator_cache(p.db, now)['24h']
     assert s['turns'] == 6 and s['known_turns'] == 3
-    assert s['states'] == {'zero': 1, 'partial': 1, 'full': 1, 'missing': 3}
+    # The turn with no cache_telemetry at all is from before the field existed: legacy, not missing.
+    assert s['states'] == {'zero': 1, 'partial': 1, 'full': 1, 'missing': 2, 'legacy': 1}
     assert s['miss_turns'] == 1 and s['hit_pct'] == 50
     assert s['raw_tokens'] == {'input_tokens': 350, 'cache_read_tokens': 150, 'cache_write_tokens': 0}
     assert s['requests_unknown_turns'] == 2
     for text in (status_text(p), '\n'.join(audit.lines(p.db, now, p=p))):
         assert 'zero 1' in text and 'partial 1' in text and 'full 1' in text
-        assert 'missing 3 (unknown)' in text
+        assert 'missing 2 (unknown), legacy 1 (before telemetry)' in text
+        assert 'request count unknown for 2 turns' in text, "some turns carry a request count"
+
+
+def test_coordinator_cache_line_drops_request_clause_when_no_turn_counts_requests():
+    from ttp import budget as bud
+
+    def row(requests):
+        return {'note': json.dumps({'cache_telemetry': {'complete': True, 'requests': requests}}),
+                'input_tokens': 10, 'cache_read_tokens': 90, 'cache_write_tokens': 0, 'cost_usd': 0.1}
+    none = bud.coordinator_cache_line(bud._cache_summary([row(None), row(None)]))
+    assert 'request count' not in none and 'legacy' not in none
+    some = bud.coordinator_cache_line(bud._cache_summary([row(None), row(3)]))
+    assert some.endswith('; request count unknown for 1 turns')
+    assert 'request count' not in bud.coordinator_cache_line(bud._cache_summary([row(2)]))
+
+
+def test_cache_telemetry_backfill_rebuilds_old_turns_from_output_and_marks_the_rest_legacy(env):
+    from ttp import budget as bud
+    from ttp.providers.claude import Claude
+    p = make(env)
+    now = time.time()
+    usage = {'input_tokens': 40, 'cache_read_input_tokens': 900, 'cache_creation_input_tokens': 60}
+    ids = []
+    for fresh, read, write, output in ((40, 900, 60, True),     # tokens match its output: filled
+                                       (40, 800, 60, True),     # stored tokens differ: legacy
+                                       (40, 900, 60, False)):   # output gone: legacy
+        rid = p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,"
+                     "cache_read_tokens,cache_write_tokens,note) VALUES('coordinator','claude',?,?,'ok',0.1,"
+                     "?,?,?,'{}')", (now - 600, now - 500, fresh, read, write))
+        ids.append(rid)
+        if output:
+            d = p.runs / str(rid)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / 'output.jsonl').write_text(json.dumps({'type': 'result', 'usage': usage, 'num_turns': 1}) + '\n')
+    before = bud.coordinator_cache(p.db, now)['24h']
+    assert before['states']['legacy'] == 3 and before['states']['missing'] == 0
+    assert bud.backfill_cache_telemetry(p.db, p.runs, now) == {'filled': 1, 'legacy': 2}
+    notes = [json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))['note'])['cache_telemetry'] for i in ids]
+    parsed = Claude().parse(p.runs / str(ids[0]) / 'output.jsonl')
+    assert (parsed.input_tokens, parsed.cache_read_tokens, parsed.cache_write_tokens) == (40, 900, 60)
+    assert notes[0]['complete'] is True and notes[0]['backfilled'] is True
+    assert notes[1]['source'] == notes[2]['source'] == 'legacy'
+    after = bud.coordinator_cache(p.db, now)['24h']
+    assert after['states'] == {'zero': 0, 'partial': 1, 'full': 0, 'missing': 0, 'legacy': 2}
+    assert after['hit_pct'] == 90
+    # Idempotent: a second pass finds nothing to do and changes no row.
+    snapshot = [p.db.one("SELECT note FROM runs WHERE id=?", (i,))['note'] for i in ids]
+    assert bud.backfill_cache_telemetry(p.db, p.runs, now) == {'filled': 0, 'legacy': 0}
+    assert [p.db.one("SELECT note FROM runs WHERE id=?", (i,))['note'] for i in ids] == snapshot
 
 
 def test_claude_cache_metadata_requires_explicit_counters(tmp_path):

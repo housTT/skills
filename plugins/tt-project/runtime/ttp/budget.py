@@ -778,17 +778,28 @@ CACHE_MISS_THRESHOLD = 0.5   # existing status metric; measurement reports may u
 CACHE_TOKEN_KEYS = ("input_tokens", "cache_read_tokens", "cache_write_tokens")
 
 
+CACHE_LEGACY = "legacy"   # cache_telemetry.source of a turn from before runs recorded it
+
+
 def _cache_summary(rows: list[dict]) -> dict:
-    """Only explicit cache telemetry contributes to hits/misses; retain all raw counters."""
-    states = dict.fromkeys(("zero", "partial", "full", "missing"), 0)
+    """Only explicit cache telemetry contributes to hits/misses; retain all raw counters.
+    A turn from before the field existed (none recorded, or the backfill could not rebuild it)
+    is legacy, not missing: missing means a recorded turn whose counters were incomplete."""
+    states = dict.fromkeys(("zero", "partial", "full", "missing", "legacy"), 0)
     known, hits = [], []
-    requests_unknown = 0
+    requests_unknown = requests_known = 0
     for r in rows:
-        meta = _note(r["note"]).get("cache_telemetry") or {}
+        note = _note(r["note"])
+        meta = note.get("cache_telemetry") or {}
         if not isinstance(meta, dict):
             meta = {}
-        if not isinstance(meta.get("requests"), int):
+        if isinstance(meta.get("requests"), int):
+            requests_known += 1
+        else:
             requests_unknown += 1
+        if "cache_telemetry" not in note or meta.get("source") == CACHE_LEGACY:
+            states["legacy"] += 1
+            continue
         hit = cache_hit(*(r[k] or 0 for k in ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
         if meta.get("complete") is not True or hit is None or not 0 <= hit <= 1:
             states["missing"] += 1
@@ -803,6 +814,7 @@ def _cache_summary(rows: list[dict]) -> dict:
              if isinstance(d, dict) and isinstance(d.get("tokens"), int)]
     return {"turns": len(rows), "known_turns": len(known), "states": states,
             "raw_tokens": raw, "measured_tokens": measured, "requests_unknown_turns": requests_unknown,
+            "requests_known_turns": requests_known,
             "hit_pct": round(100 * total) if total is not None else None,
             "miss_turns": sum(h < CACHE_MISS_THRESHOLD for h in hits),
             "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None,
@@ -835,6 +847,46 @@ def coordinator_cache_line(s: dict) -> str:
     """Shared status/daily-review wording, including the metric's existing threshold."""
     states = s["states"]
     hit = f"{s['hit_pct']}%" if s["hit_pct"] is not None else "unknown"
-    return (f"coordinator cache: {hit} token hit; zero {states['zero']}, partial {states['partial']}, "
-            f"full {states['full']}, missing {states['missing']} (unknown); "
-            f"{s['miss_turns']} misses (<50% read); request count unknown for {s['requests_unknown_turns']} turns")
+    legacy = f", legacy {states['legacy']} (before telemetry)" if states.get("legacy") else ""
+    line = (f"coordinator cache: {hit} token hit; zero {states['zero']}, partial {states['partial']}, "
+            f"full {states['full']}, missing {states['missing']} (unknown){legacy}; "
+            f"{s['miss_turns']} misses (<50% read)")
+    # Some providers never report request counts; the clause only says something when one does.
+    if s.get("requests_known_turns") and s["requests_unknown_turns"]:
+        line += f"; request count unknown for {s['requests_unknown_turns']} turns"
+    return line
+
+
+def backfill_cache_telemetry(db: DB, runs_dir, now: float | None = None, window_s: float = 8 * DAY) -> dict:
+    """Finished coordinator turns from before runs recorded cache_telemetry get it from their
+    output.jsonl, parsed by their provider. It counts as recorded only when the parse gives the
+    stored token columns back; otherwise (no output, unknown provider, other tokens) the turn is
+    marked legacy. Turns that already have the field are left alone, so a second pass changes
+    nothing. Older turns than the status windows stay as they are (legacy without a mark)."""
+    from pathlib import Path
+    from .providers import get_provider
+    now = time.time() if now is None else now
+    done = {"filled": 0, "legacy": 0}
+    rows = db.q("SELECT id, provider, dir, note, input_tokens, cache_read_tokens, cache_write_tokens "
+                "FROM runs WHERE role='coordinator' AND status!='running' AND started>=?", (now - window_s,))
+    for r in rows:
+        note = _note(r["note"])
+        if "cache_telemetry" in note:
+            continue
+        meta = None
+        out = (Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])) / "output.jsonl"
+        try:
+            if out.exists():
+                u = get_provider(r["provider"] or "").parse(out)
+                got = u.extra.get("cache_telemetry")
+                if isinstance(got, dict) and (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens) \
+                        == tuple(r[k] or 0 for k in CACHE_TOKEN_KEYS):
+                    meta = {**got, "backfilled": True}
+        except (KeyError, OSError, ValueError):
+            meta = None
+        if meta is None:
+            meta = {"complete": False, "requests": None, "source": CACHE_LEGACY}
+        note["cache_telemetry"] = meta
+        db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), r["id"]))
+        done["legacy" if meta.get("source") == CACHE_LEGACY else "filled"] += 1
+    return done

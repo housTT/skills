@@ -470,6 +470,13 @@ class Daemon:
                 self._load_config()
         except (OSError, RuntimeError) as e:
             log(self.p, f"home time zone not set: {e}")
+        try:   # coordinator turns from before runs recorded cache telemetry (bud.backfill_cache_telemetry)
+            filled = bud.backfill_cache_telemetry(self.p.db, self.p.runs)
+            if any(filled.values()):
+                log(self.p, f"cache telemetry backfilled for {filled['filled']} coordinator turns, "
+                            f"{filled['legacy']} marked legacy")
+        except Exception:  # a report backfill must never keep the daemon from starting
+            log(self.p, "cache telemetry backfill error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         r = self.identity
