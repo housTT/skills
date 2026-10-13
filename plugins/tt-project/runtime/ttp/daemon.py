@@ -47,6 +47,7 @@ from . import failover
 from . import grants
 from . import ends
 from . import heal
+from . import holdloops
 from . import pauseends
 from . import hold
 from . import identity
@@ -1816,7 +1817,7 @@ class Daemon:
                      (now, "daemon", "task_blocked", "normal", f"#{t['id']} {t['title']} is blocked: {reason}. "
                       f"The coordinator can re-point it with task_update depends_on (an empty list clears it), "
                       f"requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
-        self._raise_dead_dependency_blocks(now)
+        self._raise_hold_loops(now)
         self._raise_missing_task_refs(now)
         self._raise_review_stalls(now)
 
@@ -1883,28 +1884,19 @@ class Daemon:
                       f"(start_when \"\" or requeue), or cancel the task.", "queued", t["id"]))
                 log(self.p, f"task {t['id']} {what} waits on missing task {ids}; raised to the coordinator")
 
-    def _raise_dead_dependency_blocks(self, now: float) -> None:
-        """A block on a dead dependency does not wake the coordinator, so one it let pass a whole
-        turn could sit forever. It is raised once as an event that does."""
+    def _raise_hold_loops(self, now: float) -> None:
+        """Holds nothing will move (holdloops): a time-only hold with no producer, a dependency on a
+        blocked, failed or cancelled task, a dependency cycle. Each is raised once as an event that
+        wakes the coordinator while it lasts (a dead or blocked dependency only after a coordinator
+        turn has seen it, as the block itself does not wake one) and cleared once resolved."""
         db = self.p.db
-        rows = db.q("SELECT * FROM tasks WHERE status='blocked' AND depends_on NOT IN ('', '[]')")
-        for t in rows:
-            dead = db.dead_dependency(dependency_ids(t))
-            if not dead or not db.one("SELECT id FROM runs WHERE role='coordinator' AND status='ok' AND started>?",
-                                      (t["updated"],)):
-                continue
-            dep, why = dead
-            fp = f"dead-dependency:{t['id']}:{dep}"
-            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
-                continue
-            redo = (f"re-add that work with task_add continues={dep} (its dependents move to the new task), "
-                    if why in ("failed", "cancelled") else "")
-            what = f"#{dep} ({why})" if dep is not None else "a dependency that is not a task id"
-            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, "daemon", "dead_dependency", fp, "normal",
-                  f"#{t['id']} {t['title']} is still blocked on {what} after a coordinator turn. Options: {redo}"
-                  f"re-point #{t['id']} with task_update depends_on, or cancel it.", "queued", t["id"]))
-            log(self.p, f"task {t['id']} still blocked on dead dependency {dep}; raised to the coordinator")
+        with db.tx():
+            due = holdloops.due(db, self.cfg, now)
+            for key, e in due:
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
+                     "VALUES(?,?,?,?,?,?,?,?)", holdloops.event_row(key, e, now))
+        for key, _ in due:
+            log(self.p, f"hold loop {key} raised to the coordinator")
 
     def meter_running(self, every_s: float = 60) -> None:
         """Price runs still going from their stream, so status and the caps see a long run's spend
@@ -4940,7 +4932,8 @@ class Daemon:
             if not set(ids) - set(seen):
                 return   # only fewer: nothing new to decide
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                 (now, "daemon", anchors.STALE_EVENT, "normal", anchors.event_text(rows), "queued"))
+                 (now, "daemon", anchors.STALE_EVENT, "normal",
+                  anchors.event_text(rows) + holdloops.summary(db), "queued"))
         log(self.p, f"stale holds raised to the coordinator: {', '.join(f'#{i}' for i in ids)}")
 
     def _setting_hold(self, task: dict, holds: dict[str, int], now: float) -> bool:

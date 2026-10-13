@@ -274,6 +274,10 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path, which the daemon uses itself.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
+- Loop events (`time_only_hold`, `blocked_dependency`, `dead_dependency`, `dependency_cycle`) name
+  work nothing will move; re-holding or re-arming its time never clears one. Settle it in that turn:
+  close it as done and queue one validation task gated on `start_when`, give it a real end (a probe,
+  an ask, or a dependency that produces it), re-point its `depends_on`, break the cycle, or cancel it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
   dollar caps or into the reserve), `review` / `merge` (only the user may give it), `irreversible`

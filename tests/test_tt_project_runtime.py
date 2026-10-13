@@ -8882,6 +8882,161 @@ def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):
     assert f"#{dead}" in rows[0]["text"] and "continues" in rows[0]["text"]
 
 
+def _coord_turn(p, at):
+    p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(NULL,'coordinator',?,?,'ok')", (at, at + 1))
+
+
+def _loop_events(p, kind):
+    return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (kind,))
+
+
+def test_a_time_only_hold_with_no_producer_is_raised_once_and_re_arming_does_not_hide_it(env):
+    p = make(env)
+    from ttp import anchors, holdloops, sweep
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    done = p.db.add_task("reviewed code", "s", kind="code", origin="user")
+    p.db.update_task(done, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"])
+    rev = p.db.add_task("review it", "s", kind="review", origin="user", depends_on=[done])
+    p.db.update_task(rev, status="done")
+    fresh = p.db.add_task("fresh hold", "s", origin="user")
+    p.db.update_task(fresh, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"])
+    src = p.db.add_task("producer", "s", origin="user")
+    fed = p.db.add_task("fed hold", "s", origin="user", depends_on=[src])
+    p.db.update_task(fed, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"])
+    for _ in range(2):
+        d._raise_hold_loops(now)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [done], evs
+    assert "review passed" in evs[0]["text"] and "start_when" in evs[0]["text"] and "cancel" in evs[0]["text"]
+    # Re-arming the time keeps the flag and raises nothing new; anchors.stale never saw it.
+    p.db.update_task(done, labels=[f"waits:until:{now + 7200:.0f}"])
+    d._raise_hold_loops(now + 60)
+    assert len(_loop_events(p, "time_only_hold")) == 1
+    assert f"time-only:{done}" in p.db.kv(holdloops.LOOPS_KEY, {})
+    assert all(r["task"] != done for r in anchors.stale(p.db, p.config(), now, anchors.track(p.db, now)))
+    # Re-armed without a review counts too; one with an open producer never does.
+    p.db.update_task(fresh, labels=[f"waits:until:{now + 9000:.0f}"])
+    p.db.update_task(fed, labels=[f"waits:until:{now + 9000:.0f}"])
+    d._raise_hold_loops(now + 120)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [done, fresh] and "re-armed 1 time" in evs[1]["text"]
+    # Released and held again on a new time: still the same flag.
+    p.db.update_task(done, status="queued", labels=[])
+    d._raise_hold_loops(now + 180)
+    p.db.update_task(done, status="blocked", labels=[f"waits:until:{now + 9999:.0f}"])
+    d._raise_hold_loops(now + 240)
+    assert len(_loop_events(p, "time_only_hold")) == 2
+    # The blocker sweep flags it as a loop.
+    sweep.start(p.db, p.config(), "test", now + 300)
+    loops = p.db.kv(sweep.STATE_KEY, {})["loops"]
+    assert "held only on a time" in loops[f"task:{done}"], loops
+    # A real end clears it; a later time-only hold starts over.
+    p.db.update_task(done, labels=["waits:when:true"])
+    d._raise_hold_loops(now + 360)
+    assert f"time-only:{done}" not in p.db.kv(holdloops.LOOPS_KEY, {})
+    assert str(done) not in p.db.kv(holdloops.TIME_KEY, {})
+    # A queued start_after re-armed with nothing producing it counts as time-only too.
+    later = p.db.add_task("deferred", "s", origin="user", not_before=now + 3600, labels=[f"start_after:{now + 3600}"])
+    d._raise_hold_loops(now + 420)
+    p.db.update_task(later, not_before=now + 7200, labels=[f"start_after:{now + 7200}"])
+    d._raise_hold_loops(now + 480)
+    assert [e["task"] for e in _loop_events(p, "time_only_hold")][-1] == later
+
+
+def test_a_queued_task_on_a_blocked_dependency_raises_one_event_after_a_turn(env):
+    p = make(env)
+    from ttp import coordinator as coord, holdloops
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    b = p.db.add_task("stuck", "s", origin="user")
+    p.db.update_task(b, status="blocked", blocked_reason="needs a decision")
+    a = p.db.add_task("after stuck", "s", origin="user", depends_on=[b])
+    asked = p.db.add_task("on an ask", "s", origin="user")
+    aid = p.db.post("out", "which one?", kind="ask")
+    p.db.update_task(asked, status="blocked", labels=[f"waits:ask:{aid}"])
+    c = p.db.add_task("after the ask", "s", origin="user", depends_on=[asked])
+    d._raise_hold_loops(now)
+    assert not _loop_events(p, "blocked_dependency"), "raised before the coordinator had a turn"
+    _coord_turn(p, now + 1)
+    for i in range(3):
+        d._raise_hold_loops(now + 10 + i)
+    evs = _loop_events(p, "blocked_dependency")
+    assert len(evs) == 1 and evs[0]["task"] == a and evs[0]["status"] == "queued", evs
+    assert f"#{b}" in evs[0]["text"] and "re-point" in evs[0]["text"] and "cancel" in evs[0]["text"]
+    assert all(e["task"] != c for e in evs), "a dependency held on an ask has an end of its own"
+    assert "blocked_dependency" in coord.effort_triggers(p.db, p.config(), [evs[0]["id"]], None)[0]
+    # Re-pointed: resolved and cleared.
+    assert coord.apply(p, [{"type": "task_update", "id": a, "depends_on": []}]) == []
+    d._raise_hold_loops(now + 20)
+    assert not any(k.startswith("blocked-dependency:") for k in p.db.kv(holdloops.LOOPS_KEY, {}))
+
+
+def test_a_task_on_a_failed_dependency_is_raised_despite_re_holds_and_listed_in_stale_holds(env):
+    p = make(env)
+    from ttp import anchors, holdloops, sweep
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    dead = p.db.add_task("dead", "s", origin="user")
+    p.db.update_task(dead, status="failed")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[dead])
+    p.db.update_task(child, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"])
+    d._raise_hold_loops(now)
+    _coord_turn(p, now + 1)
+    # Each turn re-holds it, so its last update is always after the last turn.
+    p.db.update_task(child, labels=[f"waits:until:{now + 7200:.0f}"])
+    for i in range(3):
+        d._raise_hold_loops(now + 10 + i)
+    evs = _loop_events(p, "dead_dependency")
+    assert len(evs) == 1 and evs[0]["task"] == child and f"#{dead} (failed)" in evs[0]["text"], evs
+    # Surfaced while it lasts: the stale_holds event lists it, the blocker sweep flags it.
+    legacy = _hold_task(p, "legacy hold")
+    p.db.update_task(legacy, status="blocked", blocked_reason="until someone looks")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 20 * 3600, legacy))
+    d.sweep_holds()
+    stale = _loop_events(p, anchors.STALE_EVENT)
+    assert len(stale) == 1 and f"#{child} depends on dead #{dead}" in stale[0]["text"], stale
+    sweep.start(p.db, p.config(), "test", now + 30)
+    assert f"dead #{dead}" in p.db.kv(sweep.STATE_KEY, {})["loops"][f"task:{child}"]
+    # Re-pointed: cleared.
+    p.db.update_task(child, depends_on=[])
+    d._raise_hold_loops(now + 40)
+    assert not any(k.startswith("dead-dependency:") for k in p.db.kv(holdloops.LOOPS_KEY, {}))
+
+
+def test_a_dependency_cycle_is_rejected_at_creation_and_an_existing_one_is_flagged(env):
+    p = make(env)
+    from ttp import coordinator as coord, holdloops, sweep
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    a = p.db.add_task("blocked work", "s", origin="user")
+    p.db.update_task(a, status="blocked", blocked_reason="needs a replan")
+    r = p.db.add_task("replan", "s", origin="user", depends_on=[a])
+    problems = coord.apply(p, [{"type": "task_update", "id": a, "depends_on": [r]}])
+    assert len(problems) == 1 and "cycle" in problems[0], problems
+    # task_add continues=a moves r onto the new task, which may not wait on r.
+    problems = coord.apply(p, [{"type": "task_add", "title": "redo", "continues": a, "depends_on": [r]}])
+    assert len(problems) == 1 and "cycle" in problems[0], problems
+    # One written past those checks (an older release, a hand edit) is flagged with its members.
+    p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([r]), a))
+    for i in range(2):
+        d._raise_hold_loops(now + i)
+    evs = _loop_events(p, "dependency_cycle")
+    assert len(evs) == 1 and f"#{a}, #{r}" in evs[0]["text"] and f"#{a} waits on #{r}" in evs[0]["text"], evs
+    assert not _loop_events(p, "blocked_dependency"), "a cycle is raised as the cycle, not as its edges"
+    sweep.start(p.db, p.config(), "test", now + 5)
+    assert f"cycle #{a}, #{r}" in p.db.kv(sweep.STATE_KEY, {})["loops"][f"task:{a}"]
+    p.db.update_task(a, depends_on=[])
+    d._raise_hold_loops(now + 10)
+    assert not any(k.startswith("dependency-cycle:") for k in p.db.kv(holdloops.LOOPS_KEY, {}))
+    assert holdloops.cycles({1: {"depends_on": "[2]"}, 2: {"depends_on": "[3]"}, 3: {"depends_on": "[1]"},
+                             4: {"depends_on": "[4]"}, 5: {"depends_on": "[1]"}}) == [[1, 2, 3], [4]]
+
+
 def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(env):
     p = make(env)
     from ttp import coordinator as coord

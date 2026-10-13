@@ -269,6 +269,15 @@ prolonged whole-box outage.
   to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep
   context while preserving every identity and outcome request, including items beyond the old
   60-item cutoff. A restart or failed turn retries its batch; remaining batches stay queued.
+- Hold loops (model-free, every tick): work nothing will move raises one event while it lasts and
+  clears once resolved. `time_only_hold`: held only until a time (`until:` or `start_after`) with
+  no open dependency, ask, resource or probe, once its review passed, its time was re-armed or it
+  stayed so past `coordinator.hold_max_h`; re-arming the time does not clear it.
+  `blocked_dependency`: a queued or blocked task depends on a blocked task with no end of its own.
+  `dead_dependency`: a blocked task depends on a failed, cancelled or missing one (both after a
+  coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
+  each other, named; `task_add` and `task_update` refuse to create one. All are listed in the
+  `stale_holds` event and flagged as loops in each blocker sweep.
 - Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
   new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
   than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable

@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import credits, failover, settinghold, unblock
+from . import credits, failover, holdloops, settinghold, unblock
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -316,6 +316,10 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     prev = state.get("items") or {}
     flagged = flags(db, state, live, now)
     loops = {i["key"]: x for i in live if (x := loop(db, i, prev.get(i["key"])))}
+    stuck = holdloops.flagged(db)
+    for i in live:
+        if i["task"] in stuck:
+            loops[i["key"]] = "; ".join(filter(None, (loops.get(i["key"]), f"{LOOP} ({stuck[i['task']]})")))
     backlog = _cfg(cfg, "review_backlog_h", REVIEW_BACKLOG_H) * 3600
     reviews = {i["key"]: review_diagnosis(db, i["task"], now, hold_of) for i in live
                if i["kind"] == "review" and backlog > 0 and (i["age_s"] or 0) >= backlog}

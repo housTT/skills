@@ -232,6 +232,7 @@ EFFORT_EVENT_TRIGGERS = {
     # stuck work
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
+    "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "missing_task_ref": "stuck",
     "review_stall": "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
