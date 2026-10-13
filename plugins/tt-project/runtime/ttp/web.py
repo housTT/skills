@@ -444,7 +444,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "obligations": obligations.lines(db, now=now, where=cfg, open_only=True),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
-        "upstream": upstream.status_line(db, cfg),
+        "upstream": "; ".join(x for x in (upstream.status_line(db, cfg), upstream.fixes_line(p.name, cfg, now)) if x),
     }
 
 

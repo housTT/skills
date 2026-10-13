@@ -74,6 +74,11 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 - A `ttp note --to` past 4,000 characters (whitespace joined) is refused whole, never cut; a
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.
+- Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>`. Work
+  waiting on it hands off `waiting` with retry_when `ttp upstream --fixed <fp>` (0 once this
+  project's running daemon has the fix). The daemon then tells the coordinator once, and the
+  project closes the note with `ttp upstream --ack <fp> "<evidence>"`. With no ack a day after the
+  resolution, it shows as "shipped, not confirmed". `ttp upstream --mine` lists this project's notes.
 
 ## Maintainer checklist (liveness, progress, deploys)
 

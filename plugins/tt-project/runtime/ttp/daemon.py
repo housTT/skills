@@ -386,6 +386,7 @@ class Daemon:
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
         self._upstream_checked = 0.0
+        self._fixes_checked = 0.0
         self._forwarded = 0.0
         self._outbox_drained = 0.0
         self._forwarder: threading.Thread | None = None
@@ -721,7 +722,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2329,6 +2330,8 @@ class Daemon:
             sent = upstream.send_queued(run_dir, self.p.name, tid, self.p.state)
             if any(sent.values()):
                 log(self.p, f"run {run_id} of #{tid}: queued notes to other projects: {sent}")
+            if upstream.file_queued_acks(run_dir, self.p.name):
+                log(self.p, f"run {run_id} of #{tid}: queued upstream acks recorded")
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{tid}: {e}")
 
@@ -4516,6 +4519,22 @@ class Daemon:
             return
         if n:
             log(self.p, f"{n} new upstream note(s) for the coordinator")
+
+    def wake_upstream_fixes(self) -> None:
+        """On the first tick and every minute after: a resolved upstream note this project filed, whose fix
+        the code this daemon loaded (its identity receipt) has, becomes one coordinator event and an early
+        blocker sweep (upstream.wake_fixed), once per resolution across restarts."""
+        now = time.time()
+        if now - self._fixes_checked < upstream.LOCAL_EVERY_S:
+            return
+        self._fixes_checked = now
+        try:
+            got = upstream.wake_fixed(self.p, str(self.identity.get("version") or ""), now)
+        except (OSError, ValueError) as e:
+            log(self.p, f"checking upstream fixes failed: {type(e).__name__}: {e}")
+            return
+        if got:
+            log(self.p, "upstream fix(es) now running: " + ", ".join(f"{r['fp']} in {r['fixed_in']}" for r in got))
 
     def drain_note_outbox(self) -> None:
         """File the notes for other projects that wait in this project's outbox (`ttp note --to` past the

@@ -27924,6 +27924,119 @@ def test_upstream_notes_are_filed_once_in_the_users_inbox(env):
     assert sum(e["kind"] == "followup_proposed" for e in p.db.q("SELECT kind FROM events WHERE task=?", (tid,))) == 3
 
 
+def _upstream_cli(cli, *args) -> int:
+    try:
+        cli.main(["upstream", *args])
+    except SystemExit as e:
+        return int(e.code or 0)
+    return 0
+
+
+def _runs_version(p, version: str) -> None:
+    """p's running daemon (this test process) loaded `version`: its kv and heartbeat receipt say so."""
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost", "started": time.time()})
+    (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "receipt": {"pid": os.getpid(), "version": version}}))
+
+
+def test_an_upstream_fix_wakes_the_project_that_filed_it_once_its_daemon_runs_it_and_an_ack_closes_it(
+        env, monkeypatch, capsys):
+    """A resolved note: the filing project's probe passes and its coordinator is told only once its own
+    running daemon has the fix; once per resolution across restarts; an ack closes the note; with no ack
+    after a day it reads 'shipped, not confirmed'."""
+    from ttp import cli, upstream, sweep
+    from ttp.daemon import Daemon
+    p = make(env)
+    note = {"title": "upstream: retries lose the spec", "spec": "Keep the spec on retry."}
+    upstream.append("demo", 4, [note])
+    upstream.append("other", 5, [{"title": "upstream: not demo's", "spec": "s"}])
+    fp, other = upstream.fingerprint(note["title"], note["spec"]), upstream.fingerprint("upstream: not demo's", "s")
+    monkeypatch.chdir(p.base)
+    assert _upstream_cli(cli, "--fp", note["title"], note["spec"]) == 0
+    assert capsys.readouterr().out.strip() == fp
+    _runs_version(p, "0.2.9")
+    assert _upstream_cli(cli, "--fixed", fp) == 1, "an unresolved note passed the probe"
+    assert _upstream_cli(cli, "--resolve", fp, "--fixed-in", "0.2.10", "--note", "kept on retry") == 0
+    assert _upstream_cli(cli, "--resolve", other, "--fixed-in", "0.2.10") == 0
+    assert _upstream_cli(cli, "--resolve", fp) == 2, "a resolution without a version was taken"
+    capsys.readouterr()
+
+    def told():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE source='upstream' AND kind='observation'")]
+
+    # The consumer still runs the release before the fix: the probe waits, nothing is told.
+    assert _upstream_cli(cli, "--fixed", fp) == 1
+    d = Daemon(p.base)
+    d.identity["version"] = "0.2.9"
+    d.wake_upstream_fixes()
+    assert told() == [] and not p.db.kv(sweep.SIGNAL_KEY)
+    # Restarted onto the fix: the probe passes, and one event (its own note only) and a sweep signal.
+    _runs_version(p, "0.2.10")
+    assert _upstream_cli(cli, "--fixed", fp) == 0
+    d = Daemon(p.base)
+    d.identity["version"] = "0.2.10"
+    d.wake_upstream_fixes()
+    d._fixes_checked = 0
+    d.wake_upstream_fixes()
+    assert len(told()) == 1 and fp in told()[0] and other not in told()[0] and "--ack" in told()[0]
+    assert any(fp in s["why"] for s in p.db.kv(sweep.SIGNAL_KEY))
+    # The next start (a later release too) tells nothing again.
+    d = Daemon(p.base)
+    d.identity["version"] = "0.2.11"
+    d.wake_upstream_fixes()
+    assert len(told()) == 1, "a restart told the coordinator again"
+    # No ack a day after the resolution: shipped, not confirmed, for this project and for the maintainers.
+    later = time.time() + upstream.CONFIRM_S + 60
+    assert upstream.state(fp) == "resolved"
+    assert upstream.state(fp, later) == upstream.SHIPPED
+    assert upstream.fixes_line("demo", {}, later) == f"1 upstream fix {upstream.SHIPPED}: {fp}"
+    assert upstream.fixes_line("demo", {"upstream": {"ingest": True}}, later).startswith(f"2 upstream fixes {upstream.SHIPPED}")
+    with monkeypatch.context() as m:
+        m.setattr(upstream.time, "time", lambda: later)
+        assert "shipped, not confirmed" in cli.status_text(p)
+    # An ack closes it; an ack needs evidence and a resolution.
+    assert _upstream_cli(cli, "--ack", fp, " ") == 2
+    assert _upstream_cli(cli, "--ack", "0" * 16, "works") == 2
+    assert _upstream_cli(cli, "--ack", fp, "retried #4: spec kept") == 0
+    assert upstream.state(fp, later) == "closed"
+    assert upstream.fixes_line("demo", {}, later) == ""
+    capsys.readouterr()
+    assert _upstream_cli(cli, "--mine") == 0
+    assert capsys.readouterr().out.startswith(f"{fp} closed in 0.2.10: upstream: retries lose the spec")
+    # No running daemon: the probe cannot tell.
+    p.db.set_kv("daemon", {})
+    assert _upstream_cli(cli, "--fixed", fp) == 2
+
+
+def test_a_sandboxed_workers_upstream_ack_is_recorded_when_its_run_ends(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli, upstream
+    from ttp.daemon import Daemon
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: x", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: x", "y")
+    upstream.resolve(fp, "0.2.10")
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+    def read_only(*a, **k):
+        raise PermissionError(13, "Read-only file system")
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "_record", read_only)
+        assert _upstream_cli(cli, "--ack", fp, "works here") == 0
+    assert "queued" in capsys.readouterr().out and upstream.state(fp) == "resolved"
+    Daemon(p.base)._file_queued_notes(1, 4, tmp_path)
+    assert upstream.state(fp) == "closed" and upstream.acked(fp)["project"] == "demo"
+    Daemon(p.base)._file_queued_notes(1, 4, tmp_path)
+    assert sum(r.get("kind") == "ack" for r in upstream._records()) == 1
+
+
+def test_the_prompts_say_how_to_wait_on_and_close_an_upstream_fix():
+    worker = " ".join((RUNTIME.parent / "template" / "prompts" / "worker.md").read_text().split())
+    coord = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "is `waiting`, never `blocked`" in worker and "`ttp upstream --fixed <fp>`" in worker
+    assert "ttp upstream --ack <fp>" in worker and "ttp upstream --fp" in worker
+    assert "ttp upstream --resolve <fp> --fixed-in <version>" in coord and "upstream fix shipped" in coord
+
+
 def test_a_project_without_upstream_ingest_reads_nothing(env):
     p = make(env)
     from ttp import upstream, cli
@@ -27949,7 +28062,8 @@ def test_an_ingesting_project_turns_new_notes_into_events_once(env):
     d.cfg = p.config()
     d.read_upstream()
     evs = p.db.q("SELECT text, status FROM events WHERE kind='upstream_note'")
-    assert [e["text"] for e in evs] == ["upstream note from other #3 on testhost: upstream: first — one"]
+    assert [e["text"] for e in evs] == ["upstream note from other #3 on testhost: upstream: first — one "
+                                        f"[note {upstream.fingerprint('upstream: first', 'one')}]"]
     assert "1 upstream note not yet read" in cli.status_text(p)
     assert upstream.ingest(p, p.config()) == 0, "a note was read twice"
     # A torn last line waits for the rest; the cursor moves past whole lines only.

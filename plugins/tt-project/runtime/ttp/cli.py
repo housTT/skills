@@ -1248,8 +1248,57 @@ def cmd_upstream(a) -> None:
     """The user's upstream inbox across machines: `--receive` files notes another machine sends over
     ssh (JSON lines on stdin; prints one JSON ack line), `--forward-status` shows each target this
     machine sends its notes on to, and `--forward-to` sets those targets (`default`: the machines of
-    the remote projects; `none`: send nothing)."""
+    the remote projects; `none`: send nothing). Closing a note: `--resolve <fp> --fixed-in <version>`
+    records the maintainers' fix, `--fixed <fp>` is the read-only probe a task waiting on it uses
+    (0 once this project's running daemon is at or above that version, 1 before, 2 unknown), `--ack <fp>
+    "<evidence>"` closes it for this project, `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
+    follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
     from . import upstream
+    if a.fp is not None:
+        title, spec = a.fp
+        task, me = os.environ.get("TTP_TASK") or "", here()
+        # As the daemon files it (upstream.append): a spec past the limit is cut naming the hand-off.
+        print(upstream.fingerprint(title.strip()[:upstream.TITLE_CHARS], upstream.cut(
+            spec.strip(), f"the hand-off of {me.name if me else '?'} #{task}" if task else "its hand-off")))
+        return
+    if a.resolve or a.fixed or a.ack or a.mine or a.resolved:
+        try:
+            if a.resolve:
+                if not a.fixed_in:
+                    die("ttp upstream --resolve needs --fixed-in <version>")
+                me = here()
+                r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
+                print(f"note {r['fp']} resolved: fixed in {r['fixed_in']}. The project that filed it is told once its "
+                      f"daemon runs that version; it closes the note with `ttp upstream --ack {r['fp']} \"<evidence>\"`")
+                return
+            if a.resolved:
+                for line in upstream.listing(None) or ["no upstream note is resolved"]:
+                    print(line)
+                return
+            p = here()
+            if not p:
+                die("no tt-project project here", 2)
+            if a.fixed:
+                raise SystemExit(upstream.fixed(p, a.fixed))
+            if a.ack:
+                fp, evidence = a.ack
+                try:
+                    upstream.ack(fp, p.name, evidence)
+                except OSError as e:
+                    if not os.environ.get("TTP_RUN_DIR"):
+                        raise
+                    # A sandbox that cannot write the user's files: this project's daemon records it at the run's end.
+                    upstream.queue_ack(Path(os.environ["TTP_RUN_DIR"]), fp, evidence)
+                    print(f"ack of note {fp.strip().lower()} queued in this run's directory ({e.strerror or e}); this "
+                          f"project's daemon records it when the run ends")
+                    return
+                print(f"note {fp.strip().lower()} closed for {p.name}")
+                return
+            for line in upstream.listing(p.name) or [f"{p.name} filed no upstream note on this machine"]:
+                print(line)
+            return
+        except ValueError as e:
+            die(str(e), 2)
     if a.receive:
         ack, rc = upstream.receive(sys.stdin.buffer.read(upstream.RECEIVE_BYTES + 1), a.via or "")
         print(json.dumps(ack, sort_keys=True))
@@ -4272,6 +4321,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--forward-status", action="store_true", help="per target: cursor, last ok, last error (the default)")
     s.add_argument("--forward-to", metavar="ALIASES",
                    help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
+    s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in)")
+    s.add_argument("--fixed-in", metavar="VERSION", help="with --resolve: the release with the fix")
+    s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
+    s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
+                                                  "fix, 1 before, 2 when unknown")
+    s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
+    s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
+    s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")
+    s.add_argument("--resolved", action="store_true", help="every resolved note and where it stands")
     s.set_defaults(fn=cmd_upstream)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")

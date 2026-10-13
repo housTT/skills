@@ -219,6 +219,11 @@ never write to a run folder named in earlier context):
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.
+- Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the note (a
+  `followups` entry titled `upstream: ...`, or `ttp note --to`), then use `retry_when`
+  `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or `ttp upstream --fp "<title>"
+  "<spec>"`). It passes once this project's daemon runs the fix; then check it works and close
+  the note with `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (a worker, service, runner, schedule, watcher, queue,
   a hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
   never handed off `blocked` as a question about what to do.

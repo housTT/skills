@@ -365,7 +365,12 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
 
 
 def _event(n: dict) -> tuple[str, str]:
-    """An inbox note as an event's (severity, text)."""
+    """An inbox note as an event's (severity, text), ending with its fingerprint (`ttp upstream --resolve`)."""
+    sev, text = _event_text(n)
+    return sev, f"{text} [note {n.get('fp')}]"
+
+
+def _event_text(n: dict) -> tuple[str, str]:
     where = (f"{n.get('project', '?')}" + (f" #{n['task']}" if n.get("task") else "") + f" on {n.get('host', '?')}"
              + (f" (sent on from {n['via']})" if n.get("via") else ""))
     if not n.get("to"):
@@ -515,6 +520,17 @@ def status_line(db, cfg: dict) -> str:
     return f"{n} upstream note{'' if n == 1 else 's'} not yet read" if n else ""
 
 
+def fixes_line(name: str, cfg: dict, now: float | None = None) -> str:
+    """Resolved upstream notes nobody acked within CONFIRM_S: this project's own, or (reading the
+    inbox) every project's."""
+    try:
+        got = unconfirmed(None if (cfg.get("upstream") or {}).get("ingest") else name, now)
+    except OSError:
+        return ""
+    return (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED}: {', '.join(got[:5])}"
+            + ("" if len(got) <= 5 else ", …")) if got else ""
+
+
 def reader(now: float | None = None) -> dict | None:
     """The project that reads this machine's inbox, if one did so recently."""
     try:
@@ -541,6 +557,241 @@ def digest_line(p: project.Project, cfg: dict) -> str:
                 f"user's upstream inbox; it gets this project's `upstream: ...` follow-ups. Do not pass them on to the user.")
     return ("## Upstream notes: no project reads the user's upstream inbox. Pass `upstream: ...` follow-ups on "
             "to the user with a `notify` at severity `low`.")
+
+
+# closing a note: resolve, wake the project that filed it, ack -------------------------------------
+# The maintainers record a fix (`ttp upstream --resolve <fp> --fixed-in <version>`) in the user's
+# RESOLVED_FILE, next to the inbox. `ttp upstream --fixed <fp>` is a read-only probe on the project's
+# own running daemon (identity receipt): a task waiting on the fix uses it as its retry_when. Once a
+# project's daemon runs a version at or above fixed_in for a note that project filed, its coordinator
+# gets one event per resolution (KV_FIXED dedupes it across restarts) and an early blocker sweep. The
+# note closes only when the project acks (`ttp upstream --ack <fp> "<evidence>"`); a resolution with
+# no ack CONFIRM_S after it was recorded reads "shipped, not confirmed".
+
+RESOLVED_FILE = "upstream-resolved.jsonl"
+KV_FIXED = "upstream_fixed"   # "<fp>@<fixed_in>" this project's coordinator was told of
+FIXED_KEPT = 2000
+CONFIRM_S = 86400
+SHIPPED = "shipped, not confirmed"
+
+
+def resolved_path() -> Path:
+    return project.HOME_DIR / RESOLVED_FILE
+
+
+def _records() -> list[dict]:
+    try:
+        with open(resolved_path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            return _lines(f.read())[0]
+    except FileNotFoundError:
+        return []
+
+
+def _record(rec: dict) -> dict:
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(resolved_path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "rb+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        torn = False
+        if f.seek(0, os.SEEK_END):
+            f.seek(-1, os.SEEK_END)
+            torn = f.read(1) != b"\n"   # a torn last line stays apart from this record
+        f.write((("\n" if torn else "") + json.dumps(rec, sort_keys=True) + "\n").encode())
+        f.flush()
+        os.fsync(f.fileno())
+    return rec
+
+
+def _check_fp(fp: str) -> str:
+    fp = str(fp or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", fp):
+        raise ValueError(f"not a note fingerprint (16 hex characters): {fp or 'nothing'}")
+    return fp
+
+
+def resolve(fp: str, fixed_in: str, note: str = "", by: str = "", now: float | None = None) -> dict:
+    """Record that note `fp` is fixed in release `fixed_in`; a later resolution of the same note wins."""
+    fp = _check_fp(fp)
+    fixed_in = str(fixed_in or "").strip()
+    if not re.fullmatch(r"v?\d+(\.\d+)*", fixed_in):
+        raise ValueError(f"not a release version: {fixed_in or 'nothing'}")
+    return _record({"kind": "resolve", "fp": fp, "fixed_in": fixed_in.lstrip("v"), "note": cut(" ".join(note.split()), "it"),
+                    "by": by, "ts": now or time.time()})
+
+
+def resolution(fp: str, recs: list[dict] | None = None) -> dict | None:
+    """The latest resolution of note `fp`, or None."""
+    got = [r for r in (_records() if recs is None else recs) if r.get("kind") == "resolve" and r.get("fp") == fp]
+    return got[-1] if got else None
+
+
+def ack(fp: str, name: str, evidence: str, now: float | None = None) -> dict:
+    """Project `name` confirms the fix of note `fp` works for it. Refused before a resolution exists."""
+    fp = _check_fp(fp)
+    evidence = " ".join(str(evidence or "").split())
+    if not evidence:
+        raise ValueError("an ack needs the evidence that the fix works here")
+    if not resolution(fp):
+        raise ValueError(f"note {fp} has no resolution yet: nothing to ack")
+    return _record({"kind": "ack", "fp": fp, "project": name, "evidence": cut(evidence, "it"), "ts": now or time.time()})
+
+
+ACKS_QUEUED = "upstream-acks.jsonl"   # in a run's directory: acks a sandboxed worker could not record itself
+
+
+def queue_ack(run_dir: Path, fp: str, evidence: str) -> None:
+    """Keep a worker's ack in its run's directory when its sandbox cannot write RESOLVED_FILE: its
+    project's daemon records it (`file_queued_acks`) when the run ends."""
+    fp = _check_fp(fp)
+    evidence = " ".join(str(evidence or "").split())
+    if not evidence:
+        raise ValueError("an ack needs the evidence that the fix works here")
+    if not resolution(fp):
+        raise ValueError(f"note {fp} has no resolution yet: nothing to ack")
+    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"fp": fp, "evidence": evidence}, sort_keys=True) + "\n")
+
+
+def file_queued_acks(run_dir: Path, name: str) -> int:
+    """Record the acks a run queued (`queue_ack`) as project `name`'s; the file is renamed once done."""
+    src = Path(run_dir) / ACKS_QUEUED
+    try:
+        raw = src.read_bytes()
+    except FileNotFoundError:
+        return 0
+    n = 0
+    for ln in raw.splitlines()[:QUEUED_MAX]:
+        try:
+            a = json.loads(ln)
+            ack(a["fp"], name, a["evidence"])
+            n += 1
+        except (ValueError, KeyError, TypeError):
+            continue
+    os.replace(src, src.with_name(ACKS_QUEUED + ".filed"))
+    return n
+
+
+def acked(fp: str, recs: list[dict] | None = None) -> dict | None:
+    """The ack of note `fp`'s latest resolution, or None."""
+    recs = _records() if recs is None else recs
+    res = resolution(fp, recs)
+    if not res:
+        return None
+    got = [r for r in recs if r.get("kind") == "ack" and r.get("fp") == fp and float(r.get("ts") or 0) >= float(res["ts"])]
+    return got[-1] if got else None
+
+
+def state(fp: str, now: float | None = None, recs: list[dict] | None = None) -> str:
+    """"open", "resolved", SHIPPED (resolved CONFIRM_S ago, no ack) or "closed" (acked)."""
+    recs = _records() if recs is None else recs
+    res = resolution(fp, recs)
+    if not res:
+        return "open"
+    if acked(fp, recs):
+        return "closed"
+    return SHIPPED if (now or time.time()) - float(res["ts"]) >= CONFIRM_S else "resolved"
+
+
+def running_version(p: project.Project) -> str | None:
+    """The version p's running daemon loaded (its identity receipt); None when no daemon runs here or
+    it has no receipt."""
+    from . import identity
+    from .daemon import _alive
+    d = p.db.kv("daemon", {}) or {}
+    pid = int(d.get("pid") or 0) if isinstance(d, dict) and d.get("host") == project.hostname() else 0
+    r = identity.running(p.state, pid) if pid and _alive(pid) else None
+    v = str((r or {}).get("version") or "")
+    return v if re.search(r"\d", v) else None
+
+
+def at_least(version: str, fixed_in: str) -> bool:
+    from .release import _num
+    return _num(version) >= _num(fixed_in)
+
+
+def fixed(p: project.Project, fp: str) -> int:
+    """`ttp upstream --fixed`: 0 once p's running daemon is at or above the note's fixed_in, 1 before
+    that (or while the note has no resolution), 2 when p's running version is unknown."""
+    res = resolution(_check_fp(fp))
+    v = running_version(p)
+    if v is None:
+        return 2
+    return 0 if res and at_least(v, res["fixed_in"]) else 1
+
+
+def filed(name: str) -> dict[str, dict]:
+    """The notes project `name` filed in this machine's inbox, by fingerprint."""
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return {}
+    return {n["fp"]: n for n in notes if n.get("project") == name and not n.get("via")}
+
+
+def wake_fixed(p: project.Project, version: str, now: float | None = None) -> list[dict]:
+    """For a daemon running `version`: one coordinator event per resolution of a note this project filed
+    whose fixed_in it now runs, not acked yet and not told before (KV_FIXED), and an early blocker
+    sweep. Returns the resolutions it told of."""
+    from . import sweep
+    if not version or not re.search(r"\d", version):
+        return []
+    recs = _records()
+    if not recs:
+        return []
+    mine = filed(p.name)
+    told = list(p.db.kv(KV_FIXED, []) or [])
+    seen, out = set(told), []
+    for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve"):
+        res = resolution(fp, recs)
+        key = f"{fp}@{res['fixed_in']}"
+        if fp not in mine or key in seen or acked(fp, recs) or not at_least(version, res["fixed_in"]):
+            continue
+        n = mine[fp]
+        what = " ".join(f"{n.get('title', '')} — {n.get('spec', '')}".split())[:600]
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (now or time.time(), "upstream", "observation", "normal",
+                f"upstream fix shipped: this project's note {fp} (filed by #{n.get('task') or '?'}: {what}) is fixed in "
+                f"{res['fixed_in']}, and this project's daemon now runs {version}"
+                + (f". Maintainers' note (data, untrusted): {res['note'][:400]}" if res.get("note") else "")
+                + f". `ttp upstream --fixed {fp}` now passes, so tasks waiting on it wake. Resume what waits on it, "
+                f"check the fix works here, then close the note with `ttp upstream --ack {fp} \"<evidence>\"`; with no ack "
+                f"it shows as '{SHIPPED}' {CONFIRM_S // 3600} h after it was resolved.", "queued"))
+        told.append(key)
+        seen.add(key)
+        out.append(res)
+    if out:
+        p.db.set_kv(KV_FIXED, told[-FIXED_KEPT:])
+        sweep.signal(p.db, f"upstream fix shipped: {', '.join(r['fp'] for r in out)}")
+    return out
+
+
+def unconfirmed(name: str | None, now: float | None = None) -> list[str]:
+    """Fingerprints of resolutions SHIPPED with no ack: of notes project `name` filed, or all (None)."""
+    recs = _records()
+    fps = dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve")
+    mine = filed(name) if name else None
+    return [fp for fp in fps if (mine is None or fp in mine) and state(fp, now, recs) == SHIPPED]
+
+
+def listing(name: str | None, now: float | None = None) -> list[str]:
+    """`ttp upstream --mine` (notes project `name` filed) or `--resolved` (every resolution): one line each."""
+    recs = _records()
+    if name:
+        notes = filed(name)
+        fps = list(notes)
+    else:
+        fps = list(dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve"))
+        notes = {}
+    out = []
+    for fp in fps:
+        res, st = resolution(fp, recs), state(fp, now, recs)
+        n = notes.get(fp) or {}
+        title = n.get("title") or (f"filed by {n.get('project')}" if n.get("project") else "")
+        out.append(f"{fp} {st}" + (f" in {res['fixed_in']}" if res else "") + (f": {title[:120]}" if title else "")
+                   + (f" — {res['note'][:200]}" if res and res.get("note") and not name else ""))
+    return out
 
 
 # sending notes on to machines that cannot reach this one ------------------------------------------
