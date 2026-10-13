@@ -768,14 +768,14 @@ class Daemon:
 
     def _stacks_file(self):
         """logs/TICK_STACKS opened for appending, rotated once past TICK_STACKS_MAX."""
-        path = self.p.logs / TICK_STACKS
-        path.parent.mkdir(parents=True, exist_ok=True)
+        stacks = self.p.logs / TICK_STACKS
+        stacks.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if path.stat().st_size > TICK_STACKS_MAX:
-                path.replace(path.with_name(path.name + ".1"))
+            if stacks.stat().st_size > TICK_STACKS_MAX:
+                stacks.replace(stacks.with_name(stacks.name + ".1"))
         except OSError:
             pass
-        return open(path, "a")
+        return open(stacks, "a")
 
     def _watch_ticks(self, every_s: float = 30) -> None:
         """A thread that dumps every thread's stack when a tick overruns (check_overrun), and SIGUSR2

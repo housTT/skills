@@ -33081,6 +33081,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
+    ("daemon.py", 'open(stacks, "a")'): "a log (thread stacks of an overrunning tick)",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("daemon.py", '"daemon.start"'): "names a process, which a reboot ends",
     ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
