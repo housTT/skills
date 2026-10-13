@@ -1960,6 +1960,14 @@ class Daemon:
                            "and head, what is left), or `waiting` if that fits. Do not start new large steps in "
                            "this run.")
         coord._append_update(Path(r["dir"]) / "steer.md", text, f"split-{r['id']}")
+        # When the steer fired and the re-read then, once: `ttp stats` reports what the run re-read
+        # after it and how it handed off (finish_run adds that).
+        row = self.p.db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}
+        note = json.loads(row.get("note") or "{}")
+        if "split" not in note:
+            note["split"] = {"ts": time.time(), "cache_read": reread, "limit": int(limit)}
+            self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), r["id"]))
+            r["note"] = json.dumps(note)
 
     def _priced(self, r: dict, usage) -> float:
         if usage.estimated and not usage.cost_usd:
@@ -2048,6 +2056,12 @@ class Daemon:
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        if "split" not in note:   # the split steer may have fired after `r` was read
+            split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
+            if isinstance(split.get("split"), dict):
+                note["split"] = split["split"]
+        if isinstance(note.get("split"), dict):
+            note["split"]["handoff"] = (_read_result(run_dir / RESULT_FILE) or {}).get("status") or "none"
         if stopped in HUNG_STOPS:
             note["stopped"] = stopped
         if usage.session_id:

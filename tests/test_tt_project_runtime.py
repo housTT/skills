@@ -38774,19 +38774,34 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_p
                  (tid, "worker", "claude", "opus", time.time(), "running", str(run_dir), "x"))
     d = Daemon(p.base)
     turn(1, 1_500_000)
-    turn(2, 2_000_000)
+    turn(2, 1_000_000)
     d.meter_running()
-    assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 3_500_000
-    assert not (run_dir / "steer.md").exists(), "below the standard tier's 4 M line"
+    assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 2_500_000
+    assert not (run_dir / "steer.md").exists(), "below the standard tier's 3 M line"
+    assert "split" not in json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")
+    stale = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     turn(3, 1_000_000)
     d._metered.clear()
     d.meter_running()
     steer = (run_dir / "steer.md").read_text()
-    assert "re-read about 4.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
+    assert "re-read about 3.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
+    split = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["split"]
+    assert split["cache_read"] == 3_500_000 and split["limit"] == 3_000_000 and split["ts"] > 0, split
     turn(4, 2_000_000)
     d._metered.clear()
     d.meter_running()
     assert (run_dir / "steer.md").read_text() == steer, "told once per run"
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["split"] == split, "recorded once"
+    # The run ends with a hand-off: its note keeps the steer (even from a row read before it) and adds how.
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "half, continue: the rest"}))
+    d.finish_run(stale, {"rc": 0})
+    row = p.db.one("SELECT note, cache_read_tokens FROM runs WHERE id=?", (rid,))
+    assert json.loads(row["note"])["split"] == {**split, "handoff": "done"}
+    assert row["cache_read_tokens"] == 5_500_000
+    from ttp import budget as bud
+    st = bud.reread_stats(p.db, 7)["steered"]
+    assert st == {"runs": 1, "after_avg": 2_000_000, "after_max": 2_000_000, "handoffs": {"done": 1}}, st
+    p.db.x("UPDATE runs SET status='running' WHERE id=?", (rid,))
     from ttp import hook
     assert "split line" in hook.unread_update(run_dir)[0], "the worker's hook hands it over"
     p.set_config("budget.split_reread_tokens", 0)
@@ -38850,6 +38865,19 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
     assert cli_rc is None and "Context re-reads, last 7 days: 4 runs, $9.10, 12.52 M cache-read tokens" in out
     assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, max 9.00 M)" in out
     assert "big code change" in out
+    assert "Split steer: no run steered" in out
+    for cr, at, how in ((9_000_000, 4_000_000, "done"), (3_000_000, 2_800_000, "waiting")):
+        p.db.x("INSERT INTO runs(task,role,provider,effort,started,ended,status,cost_usd,cache_read_tokens,note) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?)", (code, "worker", "claude", "high", now - 60, now, "ok", 1.0, cr,
+                                              json.dumps({"split": {"ts": now - 30, "cache_read": at, "handoff": how}})))
+    p.db.x("INSERT INTO runs(task,role,provider,effort,started,status,cache_read_tokens,note) VALUES(?,?,?,?,?,?,?,?)",
+           (code, "worker", "claude", "high", now - 60, "running", 4_000_000,
+            json.dumps({"split": {"ts": now - 30, "cache_read": 3_100_000}})))
+    s = bud.reread_stats(p.db, 7, now=now)
+    assert s["steered"] == {"runs": 3, "after_avg": 2_033_333, "after_max": 5_000_000,
+                            "handoffs": {"done": 1, "waiting": 1, "running": 1}}, s["steered"]
+    assert ("Split steer: 3 runs steered, re-read after it 2.03 M avg (max 5.00 M); handed off: done 1, "
+            "waiting 1, running 1") in bud.reread_text(s)
 
 
 def _ttp_main(*args):

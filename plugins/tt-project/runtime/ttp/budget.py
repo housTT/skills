@@ -720,8 +720,8 @@ def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 1
     now = now or time.time()
     since = now - days * 86400
     w = TOKEN_WEIGHTS
-    rows = db.q("SELECT r.id, r.task, r.role, r.effort, r.started, r.ended, r.cost_usd, r.input_tokens, "
-                "r.output_tokens, r.cache_read_tokens, r.cache_write_tokens, t.kind, t.tier, t.title "
+    rows = db.q("SELECT r.id, r.task, r.role, r.effort, r.started, r.ended, r.status, r.cost_usd, r.input_tokens, "
+                "r.output_tokens, r.cache_read_tokens, r.cache_write_tokens, r.note, t.kind, t.tier, t.title "
                 "FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.started>=?", (since,))
 
     def total(rs: list, k: str) -> float:
@@ -741,7 +741,18 @@ def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 1
     by = [{"role": k[0], "kind": k[1], "tier": k[2], "effort": k[3], **summary(v)} for k, v in groups.items()]
     by.sort(key=lambda g: -g["cache_read"])
     worst = sorted(rows, key=lambda r: -(r["cache_read_tokens"] or 0))[:top]
-    return {"days": days, "since": since, **summary(rows), "groups": by,
+    # Runs the split steer reached (daemon._suggest_split): what they re-read after it, how they handed off.
+    after, handoffs = [], {}
+    for r in rows:
+        split = _note(r["note"]).get("split")
+        if not isinstance(split, dict):
+            continue
+        after.append(max(0, (r["cache_read_tokens"] or 0) - int(split.get("cache_read") or 0)))
+        how = split.get("handoff") or ("running" if r["status"] == "running" else "none")
+        handoffs[how] = handoffs.get(how, 0) + 1
+    steered = {"runs": len(after), "after_avg": round(sum(after) / len(after)) if after else 0,
+               "after_max": max(after, default=0), "handoffs": dict(sorted(handoffs.items(), key=lambda kv: -kv[1]))}
+    return {"days": days, "since": since, **summary(rows), "groups": by, "steered": steered,
             "top": [{"run": r["id"], "task": r["task"], "role": r["role"], "kind": r["kind"], "tier": r["tier"],
                      "effort": r["effort"], "usd": round(r["cost_usd"] or 0, 2), "cache_read": r["cache_read_tokens"] or 0,
                      "minutes": round(((r["ended"] or now) - (r["started"] or now)) / 60),
@@ -756,6 +767,13 @@ def reread_text(s: dict) -> str:
              "weighted tokens)", "By role / kind / tier / effort:"]
     lines += [f"  {g['role']}/{g['kind']}/{g['tier']}/{g['effort']}: {g['runs']} runs, ${g['usd']:.2f}, "
               f"{m(g['cache_read'])} ({m(g['per_run'])} per run, max {m(g['max'])})" for g in s["groups"]]
+    st = s.get("steered") or {}
+    if st.get("runs"):
+        lines.append(f"Split steer: {st['runs']} runs steered, re-read after it {m(st['after_avg'])} avg (max "
+                     f"{m(st['after_max'])}); handed off: "
+                     + ", ".join(f"{k} {v}" for k, v in st["handoffs"].items()))
+    else:
+        lines.append("Split steer: no run steered")
     lines.append("Top runs:")
     lines += [f"  run {t['run']} (#{t['task'] or '-'} {t['kind'] or t['role']}/{t['tier'] or '-'}/{t['effort'] or '-'}, "
               f"{t['minutes']} min, ${t['usd']:.2f}): {m(t['cache_read'])} {t['title']}".rstrip() for t in s["top"]]

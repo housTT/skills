@@ -824,7 +824,8 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than
-  `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up.
+  `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up; its run
+  note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls
