@@ -19129,6 +19129,34 @@ def test_worker_digest_counts_each_policy_separator_and_stays_within_its_budget(
     assert len(block) > WORKER_MEMORY_CHARS - 300, len(block)   # filled, not stopped early
 
 
+
+def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_cap(env, monkeypatch):
+    """A large charter and memory still give a worker prompt (system plus per-task rules, not the
+    spec) of at most 28k chars for a code task and 24k for a question, every restriction verbatim."""
+    from ttp import machines
+    from ttp.prompts import charter_restrictions, worker_prompt
+    p = make(env)
+    monkeypatch.setattr(machines, "load", lambda: {})
+    charter = _BIG_CHARTER + "".join(f"- Resource {i}: a shared store for run outputs. " + "r" * 200 + "\n"
+                                     for i in range(20))
+    p.charter_path.write_text(charter)
+    rules = [f"MEM-RULE-{i}: never delete another task's outputs." for i in range(4)]
+    _memories(p, [("restriction", r) for r in rules]
+              + [("fact", f"FACT-{i:02} " + "f" * 300) for i in range(30)])
+    mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
+    assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
+    spec = "SPEC-MARKER"
+    for kind, cap in (("code", 28_000), ("question", 24_000)):
+        tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
+        prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
+        assert spec in prompt
+        size = len(prompt) - len(spec)
+        assert size <= cap, (kind, size)
+        assert "\n" + charter_restrictions(charter) + "\n" in prompt
+        for r in rules:
+            assert r in prompt, (kind, r)
+
+
 def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
     p = make(env)
     from ttp import coordinator as coord
