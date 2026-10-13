@@ -33022,6 +33022,7 @@ DURABLE_EXEMPT = {
     ("devq.py", 'open(lockf, "a")'): "a flock guard file, never written",
     ("devq.py", 'runner.lock", "a")'): "a flock guard file, never written",
     ("detach.py", '.lock", "a")'): "the queue folder's flock guard file, never written",
+    ("daemon.py", 'open(path, "w" if big else "a")'): "the faulthandler stack-dump log, a diagnostic; ttp.watchdog copies each dump to an incident file",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
