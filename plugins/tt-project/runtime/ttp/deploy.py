@@ -287,7 +287,12 @@ def record(p, report: dict, now: float | None = None) -> dict:
                        entry=registry.get(row["name"]) or {})
             if not rec.get("takeover_at") and row.get("settling"):
                 # Its daemon restarts onto the files (or ticks on them) by itself: re-checked after the wait.
-                rec.update(owner=owner, takeover_at=now + wait, due=now + wait, restart=True)
+                # A restart still pending (or already failed) for an earlier release keeps that deadline:
+                # a daemon that never restarts cannot push its re-check back with each release.
+                at = min([now + wait] + [float(c["takeover_at"]) for c in checks.values()
+                                         if c.get("name") == row["name"] and not c.get("closed")
+                                         and c.get("restart") and c.get("takeover_at")])
+                rec.update(owner=owner, takeover_at=at, due=at, restart=True)
             elif not rec.get("takeover_at"):
                 # The same owner still holding the merge of an earlier release keeps that release's deadline:
                 # a task that holds every release in turn cannot push its takeover back with each one.

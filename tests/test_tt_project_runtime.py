@@ -50217,6 +50217,31 @@ def test_a_project_stuck_across_releases_is_one_alert_tracking_the_newest(env, t
         ['deploy-behind:beta']
 
 
+def test_a_daemon_that_never_restarts_onto_new_releases_is_one_alert(env, tmp_path):
+    """Files reach each release but the daemon keeps running the old code: each release set a fresh restart
+    deadline, the failed check was superseded, its alert cleared and a new one opened after the wait. The
+    earlier restart deadline is kept, so it is one alert, updated in place, never cleared in between."""
+    from ttp import alerts, deploy, overview
+    p = make(env)
+    base, _ = _deploy_project(tmp_path, 'alpha', '0.5.0', running='0.4.9')
+    pages, page = _deploy_pager(p)
+    now = time.time()
+    versions = [f'0.5.{i}' for i in range(5)]
+    for i, v in enumerate(versions):
+        t = now + 3600 * i
+        (base / 'harness' / 'runtime' / 'ttp' / '__init__.py').write_text(f'__version__ = "{v}"\n')
+        _deploy_lib(v)
+        deploy.record(p, overview.deployed(names=['alpha']), t)
+        alerts.sweep(p.db, now=t)
+        deploy.tick(p, page, t + deploy.RESTART_WAIT_S + 400)
+        alerts.sweep(p.db, now=t + deploy.RESTART_WAIT_S + 400)
+    rows = p.db.q("SELECT key,text,cleared FROM alerts WHERE key='deploy-behind:alpha'")
+    assert len(rows) == 1 and rows[0]['cleared'] is None, rows
+    assert f'tt-project {versions[-1]} ' in rows[0]['text']
+    assert not p.db.q("SELECT text FROM messages WHERE text LIKE '%Cleared%'")
+    assert len(pages) == 1
+
+
 def test_a_stuck_project_alert_pages_again_only_when_it_gets_worse(env, tmp_path):
     """Checks kept per release (by an earlier version) collapse onto the newest; a daemon that goes down is
     news (a high page under the same key), a later release is an in-place update of it."""
