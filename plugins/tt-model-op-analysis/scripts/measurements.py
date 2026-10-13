@@ -7,7 +7,7 @@ Items:
 - `<dest>:kernel-tests <status>`: the same for a Quasar destination.
 
 State comes from the run's files: `measured_ops` in run.json for Tracy, recorded results for test
-nodes (an `error` result means the test could not run, so its node stays to do). Without a plan
+nodes (an `error` or `timeout` result decides nothing, so its node stays to do). Without a plan
 file the nodes come from op_table.csv, as `kernel_tests.py plan` would write them. `mark` records `done` or `failed` (with a note) in run.json `measurements` for what files cannot
 show, such as a Tracy run that could not start. Files win over a mark once all nodes have results.
 TTsim estimates use the mean duration of tests already run in this run; until one has run the
@@ -25,7 +25,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from kernel_tests import plan_rows  # noqa: E402
-from opa_schema import LAUNCH_PROFILES, TEST_TARGETS, read_csv, run_targets  # noqa: E402
+from opa_schema import (  # noqa: E402
+    LAUNCH_PROFILES, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
+)
 
 STATUS_ORDER = ("❌", "⚠️", "✅")
 MARK_STATES = ("done", "failed")
@@ -35,7 +37,7 @@ def _results(run_dir: pathlib.Path) -> dict[tuple[str, str], dict]:
     out = {}
     for path in run_dir.glob("kernel_test_results_*.csv"):
         target = path.stem.removeprefix("kernel_test_results_")
-        for row in read_csv(path):
+        for row in read_results(path):
             out[(target, row["node_id"])] = row
     return out
 
@@ -71,8 +73,8 @@ def _derived(run_dir: pathlib.Path, run: dict) -> list[dict]:
                            [p for p in plan if p["kind"] == "kernel" and status in p["row_statuses"].split(";")]))
         for name, nodes in groups:
             if nodes:
-                done = sum(results.get((target, p["node_id"]), {}).get("result", "error") != "error"
-                           for p in nodes)
+                recorded = [results.get((target, p["node_id"]), {}).get("result") for p in nodes]
+                done = sum(r not in (None, *UNDECIDED_RESULTS) for r in recorded)
                 out.append({"item": name, "nodes": len(nodes), "done_nodes": done,
                             "estimate": _estimate(len(nodes) - done, durations)})
     return out

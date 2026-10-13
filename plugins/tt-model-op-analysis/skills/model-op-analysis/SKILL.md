@@ -54,7 +54,8 @@ resolve every `<plugin-root>/...` path against it.
 - Read tt-metal sources as `git show <sha>:<path>`; never the working tree, except an approved
   temporary test (run-setup.md).
 - Measurements run on the run's `tt_metal_commit` only; `same_commit.py` is the gate.
-- Physical-device commands go through `tt-device-mcp`; TTsim runs on the host (`ttsim.md`).
+- Physical-device commands go through `tt-device-mcp`; TTsim runs on the host with Bash, never
+  through `tt-device-mcp`, even under a rule that routes all pytest there (`ttsim.md`).
 - Subagents follow the contract in `<plugin-root>/references/dispatch-tracing.md`: no nested
   subagents, one complete result.
 - Write CSVs with the scripts or a heredoc into the run directory; never retype a table to fix it.

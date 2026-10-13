@@ -87,10 +87,16 @@ several cores, `in0_num_blocks_w > 1`).
 - A test without a marker is assumed to pass; results of `tests/scripts/quasar/*.yaml` are only in
   an external emulator check. Say whether the test is in CI, in a yaml list, or in neither.
 - `<t>:tests` holds the node ids of the tests that decide the status; `<t>:test_result` stays
-  `not run` until `kernel_tests.py` runs them on TTsim (measured-destination.md). A run result overrides the
-  marker rule: a `fail`, `hang` or `xfail` of any of the row's tests gives `❌`; `✅` needs every
-  test of the row to pass. `error` (the test could not run, for example a broken environment),
-  `skip` and unrun tests decide nothing: the status stays as decided here.
+  `not run` until `kernel_tests.py` runs them on TTsim (measured-destination.md). A run result
+  overrides the marker rule: a `fail` or `xfail` of any of the row's tests gives `❌`; `✅` needs
+  every test of the row to pass. `timeout` (killed by a `--timeout` the user chose; on TTsim a
+  slow run and a hang look the same), `error` (the test could not run, for example a broken
+  environment), `skip` and unrun tests decide nothing: the status stays as decided here.
+- "Hang reproducer" and "reproduces a hang" in this file mean a test whose marker or comment
+  documents a hang. A TTsim run that was slow or killed never makes a test one.
+- A comment or docstring that blames a missing or unfinished port ("fatals until X is ported")
+  counts only while the pinned code still lacks X. Look for X at the pinned SHA; when it exists,
+  the comment is stale: say so in the evidence and decide from the code and markers instead.
 - When tests disagree (one passes, another reproduces a hang for the same kernel op), use `❌` and
   cite both; a comment elsewhere saying "fixed" does not override a live reproducer without a run.
 - A failure applies to every row with the same kernel op key. A failure for another factory,

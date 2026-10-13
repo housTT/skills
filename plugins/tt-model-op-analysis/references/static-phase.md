@@ -22,9 +22,12 @@ Reads code only; never touches a device. Every count must survive
    traced row has `origin` `static`. Stages follow `<block> <module> <role>` (schemas.md), so runs
    of two implementations of one model align by stage.
 4. **Source status.** Load `<plugin-root>/references/target-status.md` and fill the source's
-   `<t>:status` and `<t>:evidence`. For a Quasar source fill `<t>:tests` with the node ids of the tests that
-   decide each status and set `<t>:test_result` to `not run`. Research subagents follow the
-   subagent contract in dispatch-tracing.md.
+   `<t>:status` and `<t>:evidence`. For a Quasar source fill `<t>:tests` with the node ids of the
+   tests that decide each status, in the form pytest prints them, including the ids fixtures add
+   (ttsim.md, "Node IDs"), and set `<t>:test_result` to `not run`. These ids are not checked
+   here: `kernel_tests.py check` confirms them by collection before any TTsim run
+   (measured-destination.md, step 3). Research subagents follow the subagent contract in
+   dispatch-tracing.md.
 5. **Re-check evidence.** Reopen the pinned source for every `verified` row and every status. A
    status follows its definition in target-status.md; Quasar targets decide per kernel op (device
    op, factory, layout, dtype) from the Quasar tests and fork code. Dispatch uncertainty
@@ -81,7 +84,7 @@ the source, likely ones first) and, for a non-Quasar source with Quasar chosen, 
    from targets.md for every source row and fill `<dest>:shapes` and `<dest>:launches`; add its
    `call_trace.csv` rows with `profile` set to it. Rows the destination does not launch get 0
    launches and `n/a`. Never change the source's columns or rows.
-3. Fill `<dest>:status` and `<dest>:evidence` (and for Quasar targets `<dest>:tests`, with
-   `<dest>:test_result` `not run`) per target-status.md; add the destination's blockers to
-   `port_blockers.csv`. Measured-only rows get the destination's status from a kernel-op lookup.
+3. Fill `<dest>:status` and `<dest>:evidence` (and for Quasar targets `<dest>:tests` as in step 4
+   of the static phase, with `<dest>:test_result` `not run`) per target-status.md; add the
+   destination's blockers to `port_blockers.csv`. Measured-only rows get the destination's status from a kernel-op lookup.
 4. Rerun `validate_static.py` and `kernel_ops.py`, then update `summary.md`.

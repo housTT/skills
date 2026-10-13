@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = REPO / "plugins" / "tt-model-op-analysis"
 SCRIPTS = PLUGIN / "scripts"
@@ -25,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.5.0"
+    assert claude["version"] == codex["version"] == "0.6.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -683,7 +685,7 @@ def test_written_csvs_carry_bom_for_spreadsheet_apps(tmp_path):
 def test_kernel_ops_aggregates_by_device_op_and_factory(tmp_path):
     rows = [op_row(1, 2, op_code="HaloDeviceOperation", device_op="prim::halo", program_factory="Halo"),
             op_row(2, 3, op_code="HaloDeviceOperation", device_op="prim::halo", program_factory="Halo",
-                   port="❌", **{"quasar-bf16:tests": "t.py::h", "quasar-bf16:test_result": "hang"}),
+                   port="❌", **{"quasar-bf16:tests": "t.py::h", "quasar-bf16:test_result": "fail"}),
             op_row(3, 1, op_code="MoveDeviceOperation", device_op="prim::move", program_factory="Move")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
     m = measured_table(tmp_path / "measured_ops.csv",
@@ -695,18 +697,18 @@ def test_kernel_ops_aggregates_by_device_op_and_factory(tmp_path):
             for r in got] == [("prim::halo", "1,2", "5", "4"), ("prim::move", "3", "1", "0"),
                               ("", "", "0", "1")]
     assert got[0]["quasar-bf16:statuses"] == "⚠️ 1; ❌ 1"
-    assert got[0]["quasar-bf16:test_results"] == "t.py::h: hang"
+    assert got[0]["quasar-bf16:test_results"] == "t.py::h: fail"
     assert got[2]["origin"] == "measured" and got[2]["op_code"] == "TilizeDeviceOperation"
 
 
 def test_kernel_ops_shows_only_results_of_nodes_that_ran(tmp_path):
-    tests = {"quasar-bf16:tests": "t.py::ran; t.py::not_run", "quasar-bf16:test_result": "hang"}
+    tests = {"quasar-bf16:tests": "t.py::ran; t.py::not_run", "quasar-bf16:test_result": "fail"}
     run = make_static_run(tmp_path, [op_row(1, 1, port="❌", **tests)], [trace_row(1, 1, 1)])
     write_rows(run / "kernel_test_results_quasar-bf16.csv",
-               [{"id": "1", "node_id": "t.py::ran", "op_table_ids": "1", "result": "hang", "duration_s": "900",
+               [{"id": "1", "node_id": "t.py::ran", "op_table_ids": "1", "result": "fail", "duration_s": "900",
                  "log": "x", "environment": "run.json"}])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
-    assert read(run / "kernel_ops.csv")[0]["quasar-bf16:test_results"] == "t.py::ran: hang"
+    assert read(run / "kernel_ops.csv")[0]["quasar-bf16:test_results"] == "t.py::ran: fail"
 
 
 def measured_seq(path, codes):
@@ -747,10 +749,27 @@ def test_merge_is_idempotent(tmp_path):
 
 FAKE_PYTEST = """
 import pathlib, sys, time
+assert "no:timeout" in sys.argv, "pytest-timeout must be disabled on TTsim"
+if "--collect-only" in sys.argv:
+    if "--verbosity=-1" not in sys.argv:  # a repo's addopts -v turns the id list into a tree
+        print("<Module t.py>")
+        sys.exit(0)
+    files = [a for a in sys.argv[1:] if a.endswith(".py")]
+    for line in pathlib.Path(__file__).with_name("collected.txt").read_text().splitlines():
+        # A session with several files loads a conftest that renames every id.
+        print(line.replace("[", "[renamed-") if len(files) > 1 else line)
+    print("3 tests collected")
+    sys.exit(0)
 node = sys.argv[-1]
 xml = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--junitxml="))
 if "sleep" in node:
     time.sleep(30)
+marker = pathlib.Path(__file__).with_name("slow_once.done")
+if "slow_once" in node and not marker.exists():
+    marker.touch()
+    time.sleep(30)
+if "crash" in node:
+    sys.exit(1)
 # xfail first: "xfail_c" also contains "fail".
 child = {"xfail": "<skipped type='pytest.xfail' message='x'/>", "pass": "", "fail": "<failure message='x'/>"}
 kind = next(k for k in child if k in node)
@@ -770,6 +789,8 @@ def kernel_test_run(tmp_path, tests_per_row):
     (run / "run.json").write_text(json.dumps(data))
     fake = tmp_path / "fake_pytest.py"
     fake.write_text(FAKE_PYTEST)
+    nodes = {n.strip() for t in tests_per_row for n in t.split(";") if n.strip()}
+    (tmp_path / "collected.txt").write_text("\n".join(sorted(nodes)))
     return run, f"{sys.executable} {fake}"
 
 
@@ -795,12 +816,111 @@ def test_kernel_tests_run_and_apply(tmp_path):
     assert validate(run).returncode == 0, validate(run).stdout
 
 
-def test_kernel_tests_timeout_is_hang(tmp_path):
+def test_kernel_tests_timeout_decides_nothing(tmp_path):
     run, cmd = kernel_test_run(tmp_path, ["t.py::sleep_pass", "t.py::pass_b"])
     run_script("kernel_tests.py", "plan", str(run))
     run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd,
                "--timeout", "2")
-    assert [x["result"] for x in read(run / "kernel_test_results_quasar-bf16.csv")] == ["hang", "pass"]
+    assert [x["result"] for x in read(run / "kernel_test_results_quasar-bf16.csv")] == ["timeout", "pass"]
+    assert run_script("kernel_tests.py", "apply", str(run)).returncode == 0
+    got = read(run / "op_table.csv")
+    assert [(g["quasar-bf16:test_result"], g["quasar-bf16:status"]) for g in got] == [("timeout", "⚠️"), ("pass", "✅")]
+    assert not got[0]["quasar-bf16:evidence"].startswith("TTsim run:")
+    assert validate(run).returncode == 0, validate(run).stdout
+
+
+def test_kernel_tests_resume_reruns_undecided_nodes(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::slow_once_pass", "t.py::pass_b"])
+    run_script("kernel_tests.py", "plan", str(run))
+    tm = str(tmp_path / "tt-metal")
+    run_script("kernel_tests.py", "run", str(run), "--tt-metal", tm, "--pytest-cmd", cmd, "--timeout", "2")
+    assert [x["result"] for x in read(run / "kernel_test_results_quasar-bf16.csv")] == ["timeout", "pass"]
+    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", tm, "--pytest-cmd", cmd)
+    assert "1 already done, 1 run" in r.stdout, r.stdout + r.stderr
+    assert [x["result"] for x in read(run / "kernel_test_results_quasar-bf16.csv")] == ["pass", "pass"]
+
+
+def test_kernel_tests_function_id_selects_its_parametrizations(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a"])
+    (tmp_path / "collected.txt").write_text("t.py::pass_a[x]\nt.py::pass_a[y]")
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_kernel_tests_check_empty_plan(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, [""])
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
+    assert r.returncode == 0 and "0 of 0 plan nodes collected" in r.stdout, r.stdout + r.stderr
+
+
+def test_result_classes_partition_the_result_values():
+    sys.path.insert(0, str(SCRIPTS))
+    from opa_schema import FAILING_RESULTS, LEGACY_RESULTS, RESULT_STATUS, TEST_RESULT_VALUES, UNDECIDED_RESULTS
+    classes = [set(FAILING_RESULTS), set(UNDECIDED_RESULTS), {"pass"}, {"skip", "not run"}]
+    assert sorted(v for c in classes for v in c) == sorted(TEST_RESULT_VALUES)
+    assert set(RESULT_STATUS) == set(FAILING_RESULTS) | {"pass"}
+    assert set(LEGACY_RESULTS.values()) <= set(TEST_RESULT_VALUES)
+
+
+def test_row_result_mixed_outcomes():
+    sys.path.insert(0, str(SCRIPTS))
+    from kernel_tests import _row_result
+    assert _row_result(["pass", "timeout"]) == "timeout"
+    assert _row_result(["timeout", "error"]) == "error"
+    assert _row_result(["timeout", "fail"]) == "fail"
+    assert _row_result(["skip", "not run"]) == "not run"
+
+
+def test_legacy_hang_result_is_an_undecided_timeout(tmp_path):
+    run, _ = kernel_test_run(tmp_path, ["t.py::pass_a"])
+    rows = read(run / "op_table.csv")
+    rows[0].update({"quasar-bf16:status": "❌", "quasar-bf16:test_result": "hang",
+                    "quasar-bf16:evidence": "TTsim run: t.py::pass_a hang || fork x"})
+    write_rows(run / "op_table.csv", rows)
+    assert "is from plugin 0.5.0" in validate(run).stdout
+    run_script("kernel_tests.py", "plan", str(run))
+    write_rows(run / "kernel_test_results_quasar-bf16.csv",
+               [{"id": "1", "node_id": "t.py::pass_a", "op_table_ids": "1", "result": "hang", "duration_s": "900",
+                 "log": "x", "environment": "run.json"}])
+    r = run_script("kernel_tests.py", "apply", str(run))
+    assert "WARNING: row 1" in r.stdout
+    assert read(run / "op_table.csv")[0]["quasar-bf16:test_result"] == "timeout"
+    items = {i["item"]: i for i in json.loads(run_script("measurements.py", "list", str(run), "--json").stdout)}
+    assert items["quasar-bf16:kernel-tests ❌"]["done_nodes"] == 0
+
+
+def test_kernel_tests_run_refuses_uncollected_node(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a[device_params0]", "t.py::pass_b"])
+    (tmp_path / "collected.txt").write_text("t.py::pass_a[quasar-device_params0]\nt.py::pass_b")
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "NOT COLLECTED: t.py::pass_a[device_params0]" in r.stdout
+    assert "collected: t.py::pass_a[quasar-device_params0]" in r.stdout
+    assert not (run / "kernel_test_results_quasar-bf16.csv").exists()
+    only_b = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(tmp_path / "tt-metal"),
+                        "--pytest-cmd", cmd, "--only", "pass_b")
+    assert only_b.returncode == 0, only_b.stdout + only_b.stderr
+    assert [x["result"] for x in read(run / "kernel_test_results_quasar-bf16.csv")] == ["pass"]
+
+
+def test_kernel_tests_check_collects_each_file_alone(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a[x]", "u.py::pass_c[y]"])
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "2 of 2 plan nodes collected" in r.stdout
+
+
+def test_kernel_tests_check_lists_uncollected_plan_nodes(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a", "u.py::pass_c"])
+    (tmp_path / "collected.txt").write_text("t.py::pass_a")
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
+    assert r.returncode == 3
+    assert "NOT COLLECTED: u.py::pass_c" in r.stdout and "1 of 2 plan nodes collected" in r.stdout
 
 
 def test_kernel_tests_run_resumes(tmp_path):
@@ -987,10 +1107,9 @@ def test_apply_does_not_pass_a_row_with_unrun_tests(tmp_path):
 
 
 def test_error_result_does_not_decide_status(tmp_path):
-    run, _ = kernel_test_run(tmp_path, ["t.py::pass_a"])
+    run, cmd = kernel_test_run(tmp_path, ["t.py::crash_a"])
     run_script("kernel_tests.py", "plan", str(run))
-    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(run.parent / "tt-metal"),
-                   "--pytest-cmd", f"{sys.executable} -c pass")
+    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(run.parent / "tt-metal"), "--pytest-cmd", cmd)
     assert r.returncode == 0, r.stdout
     assert read(run / "kernel_test_results_quasar-bf16.csv")[0]["result"] == "error"
     run_script("kernel_tests.py", "apply", str(run))
@@ -1178,6 +1297,7 @@ def test_kernel_tests_unknown_target_refused(tmp_path):
 def test_quasar_source_plans_entry_test(tmp_path):
     run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a"])
     to_quasar_source(run)
+    (tmp_path / "collected.txt").write_text("e2e.py::pass_e2e\nt.py::pass_a")
     assert run_script("kernel_tests.py", "plan", str(run)).returncode == 0
     plan = read(run / "kernel_tests_plan_quasar.csv")
     assert [(p["node_id"], p["kind"]) for p in plan] == [("e2e.py::pass_e2e", "entry"), ("t.py::pass_a", "kernel")]
@@ -1281,11 +1401,12 @@ def test_measurement_items_without_plan_file(tmp_path):
     assert names == ["source:ttsim-e2e", "source:kernel-tests ⚠️"]
 
 
-def test_error_result_does_not_finish_an_item(tmp_path):
+@pytest.mark.parametrize("undecided", ["error", "timeout"])
+def test_undecided_result_does_not_finish_an_item(tmp_path, undecided):
     run, _ = kernel_test_run(tmp_path, ["t.py::pass_a", "t.py::pass_b"])
     run_script("kernel_tests.py", "plan", str(run))
     write_rows(run / "kernel_test_results_quasar-bf16.csv",
-               [{"id": "1", "node_id": "t.py::pass_a", "op_table_ids": "1", "result": "error", "duration_s": "2",
+               [{"id": "1", "node_id": "t.py::pass_a", "op_table_ids": "1", "result": undecided, "duration_s": "2",
                  "log": "x", "environment": "run.json"},
                 {"id": "2", "node_id": "t.py::pass_b", "op_table_ids": "2", "result": "pass", "duration_s": "2",
                  "log": "x", "environment": "run.json"}])

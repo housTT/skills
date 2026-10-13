@@ -70,9 +70,13 @@ TTsim opens a local Unix socket. If a managed sandbox reports `Failed to bind si
 socket ... Operation not permitted`, rerun the same command with the required outside-sandbox
 approval; do not classify that setup error as a kernel failure.
 
-Run TTsim discovery, build and pytest directly on the host, not through the physical-device broker.
+Run TTsim discovery, build, collection and pytest directly on the host with Bash, never through
+`tt-device-mcp`, even when the user's instructions route every pytest through it: those rules
+protect the physical device queue. A TTsim job in the broker blocks the real device, is cut off by
+its job limits, and a killed job can leave the device held for every other user.
 Do not run two TTsim jobs against the same build directory concurrently unless the simulator
-documentation explicitly permits it.
+documentation explicitly permits it. Collection is not a TTsim job: it imports ttnn but starts no
+simulator, so `kernel_tests.py check` collects files in parallel.
 
 ## Kernel-op tests
 
@@ -81,6 +85,26 @@ kernel-op test per process with `kernel_tests.py`. TTsim proves execution and co
 simulated architecture, never performance: do not report TTsim timing, throughput, host fallback
 or footprint.
 
-Before the first measured run, confirm parameterized node IDs with pytest collection when they were
-copied or generated rather than obtained from a current collection. A `not found` collection error
-means the plan's node ID must be corrected and regenerated; it is not a kernel result.
+### Node IDs
+
+Node IDs come from collection, not from reading the parametrize decorators:
+- Fixtures such as `device_params` and an arch-parametrized `mesh_device` add ids
+  (`[quasar-device_params0]`) that the decorators do not show.
+- `tests/ttnn/conftest.py` defines `pytest_make_parametrize_id`; once a session loads it, every
+  file in that session gets `name=value` ids. Collect each file in its own pytest process, as it
+  will run.
+- tt-metal's `pytest.ini` adds `-vvs`, so `-q` still prints a tree; `--verbosity=-1` prints ids.
+- Ids are relative to the tt-metal checkout root, exactly as pytest prints them.
+
+`kernel_tests.py check` does all of this and `run` refuses a node that is not collected, so a
+wrong ID never becomes a result. A `not found` is fixed in `<target>:tests`, not recorded.
+
+### Run time
+
+TTsim simulates the chip at kHz clock rates, about a million times slower than silicon, so one
+test can take hours. It prints only when a program is dispatched, never while kernels execute, and
+it has no progress counter for tt-metal workloads. A silent log therefore means nothing: do not
+kill a run for silence or elapsed time, and do not call a killed run a hang. The pinned
+`pytest.ini` sets a pytest-timeout and tests add `@pytest.mark.timeout`; `kernel_tests.py`
+disables the plugin (`-p no:timeout`) and sets no limit of its own, so add the same flag to any
+TTsim pytest run outside it.

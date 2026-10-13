@@ -27,7 +27,14 @@ ORIGIN_VALUES = ("static", "measured", "static+measured")
 NOT_TRACED = "not traced"
 # Targets whose status is decided per kernel op from Quasar tests (references/target-status.md).
 TEST_TARGETS = ("quasar", "quasar-bf16")
-TEST_RESULT_VALUES = ("pass", "fail", "hang", "error", "xfail", "skip", "not run")
+TEST_RESULT_VALUES = ("pass", "fail", "xfail", "error", "timeout", "skip", "not run")
+# A failing result gives ❌ and a pass ✅; an undecided one leaves the status as the code decided it.
+# Each class is ordered most telling first: an error is fixable, a timeout is not.
+FAILING_RESULTS = ("fail", "xfail")
+UNDECIDED_RESULTS = ("error", "timeout")
+RESULT_STATUS = {"pass": "✅", "fail": "❌", "xfail": "❌"}
+# Plugin 0.5.0 recorded a runner timeout as a hang.
+LEGACY_RESULTS = {"hang": "timeout"}
 
 OP_TABLE_BASE = (
     "id", "stage", "origin", "ttnn_api", "op_code", "device_op", "program_factory",
@@ -152,3 +159,11 @@ def write_csv(path: pathlib.Path, columns: list[str], rows: list[dict]) -> None:
         writer = csv.DictWriter(fh, fieldnames=list(columns), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def read_results(path: pathlib.Path) -> list[dict]:
+    """kernel_test_results_<target>.csv with legacy result values renamed."""
+    rows = read_csv(path)
+    for row in rows:
+        row["result"] = LEGACY_RESULTS.get(row["result"], row["result"])
+    return rows

@@ -5,7 +5,9 @@ run's commit. This is the `source:tracy` measurement item, for a Blackhole or Wo
 
 A Quasar source has no Tracy step: its source item is `source:ttsim-e2e`, the entry test on
 TTsim. Prepare TTsim as in measured-destination.md, step 1, then
-`python3 <plugin-root>/scripts/kernel_tests.py plan <run dir> --target quasar` and
+`python3 <plugin-root>/scripts/kernel_tests.py plan <run dir> --target quasar`,
+`python3 <plugin-root>/scripts/kernel_tests.py check <run dir> --target quasar --tt-metal <checkout>`
+(measured-destination.md, step 3) and
 `python3 <plugin-root>/scripts/kernel_tests.py run <run dir> --target quasar --entry --tt-metal <checkout>`.
 Its result is recorded in `kernel_test_results_quasar.csv` and reported in `summary.md`; it does
 not set row statuses.

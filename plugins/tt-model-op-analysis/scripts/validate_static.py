@@ -15,8 +15,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
     ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
-    NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, ROW_PREFIX, SOURCE_TARGETS, STATUS_VALUES, TARGETS,
-    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
+    LEGACY_RESULTS, NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
+    SOURCE_TARGETS, STATUS_VALUES, TARGETS, TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
 )
 
 CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
@@ -26,7 +26,6 @@ GRID_KEYWORDS = ("automatic", "none")
 # A pytest node id: path, then ::-separated names, with an optional [parametrize id] that may hold
 # any character except the ';' this column uses as a separator.
 NODE_ID = re.compile(r"^[\w./-]+\.py(::\w+)*(\[[^;]*\])?$")
-RESULT_STATUS = {"pass": "✅", "fail": "❌", "hang": "❌", "xfail": "❌"}
 
 
 def _int(value: str, where: str, errors: list[str]) -> int | None:
@@ -163,7 +162,10 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
                 if any(not NODE_ID.match(t) for t in (x.strip() for x in cell.split(";")) if t):
                     errors.append(f"{where}: {target}:tests '{cell}' is not a list of pytest node ids")
                 result = row[f"{target}:test_result"].strip()
-                if result not in TEST_RESULT_VALUES:
+                if result in LEGACY_RESULTS:
+                    errors.append(f"{where}: {target}:test_result '{result}' is from plugin 0.5.0; rerun"
+                                  " kernel_tests.py apply and withdraw the result (measured-destination.md)")
+                elif result not in TEST_RESULT_VALUES:
                     errors.append(f"{where}: {target}:test_result '{result}' not in {TEST_RESULT_VALUES}")
                 elif result in RESULT_STATUS and status != RESULT_STATUS[result]:
                     errors.append(f"{where}: {target}:test_result '{result}' requires status {RESULT_STATUS[result]}")

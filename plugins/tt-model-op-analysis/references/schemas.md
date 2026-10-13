@@ -32,7 +32,7 @@ Then, for the source and then each destination in `run.json` order, the columns 
 | `<t>:shapes` | the source; p100, p150, n150, n300-1chip as destinations | input and output shapes, dtype, layout and sharding on that profile; `not traced` on a destination for a measured-only row |
 | `<t>:launches` | as `<t>:shapes` | launches per inference on that profile; empty on a destination for a measured-only row |
 | `<t>:tests` | quasar, quasar-bf16 | pytest node ids of the Quasar kernel-op tests that decide the status, `; `-separated |
-| `<t>:test_result` | quasar, quasar-bf16 | `not run` until `kernel_tests.py` runs them; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
+| `<t>:test_result` | quasar, quasar-bf16 | `not run` until `kernel_tests.py` runs them; then `pass`, `fail`, `xfail`, `timeout`, `error` or `skip` |
 | `<t>:status` | all | `✅`, `⚠️`, `❌`, `n/a`, defined per target in `target-status.md` |
 | `<t>:evidence` | all | evidence for this target's status only: the decisive fact and its `<file>:<line>`, at most 300 characters, no row-number prefix; rows with one signature share it (`target-status.md`) |
 
@@ -95,7 +95,7 @@ One pair per Quasar target. The plan, written by `kernel_tests.py plan`: `id`, `
 `<target>:kernel-tests <status>` items), `kind` (`entry` for a Quasar source's entry test, otherwise
 `kernel`).
 
-The results: `id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `hang`, `error`, `xfail`,
+The results: `id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `xfail`, `timeout`, `error`,
 `skip`), `duration_s`, `log` (path of the pytest log), `environment` (`run.json` or the
 `--env-json` file the node ran under). Written by `kernel_tests.py run`, one row per plan node that
 has run; batches add to it. `measurements.py` derives item states and estimates from it.

@@ -21,8 +21,8 @@ architecture? The skill answers it in two steps.
 2. **Kernel op by kernel op, on the destination.** The model is not run end to end on the
    destination. Instead each kernel op from step 1 is checked on its own. For a Quasar
    destination, the Quasar kernel-op tests that exercise that op are run on TTsim, and the result
-   (pass, fail, hang) sets the op's status. Without a TTsim run the status comes from the test
-   markers and the Quasar fork code. For a Blackhole or Wormhole destination there is no simulator
+   (pass, fail, xfail) sets the op's status; a timeout or error decides nothing. Without a TTsim
+   run the status comes from the test markers and the Quasar fork code. For a Blackhole or Wormhole destination there is no simulator
    step: the status comes from CI and the profile's code paths.
 
 The per-kernel-op table (`kernel_ops.csv`) is the answer: for every kernel op of the model, whether
@@ -60,7 +60,7 @@ Outputs in the run directory:
   `static+measured`;
 - `call_trace.csv`, `port_blockers.csv`, `host_ops.csv`, `summary.md`;
 - Tracy: `measured_ops.csv`, `host_fallback.csv`, `footprint.csv`;
-- TTsim: `kernel_test_results_<target>.csv` with pass, fail or hang per kernel-op test.
+- TTsim: `kernel_test_results_<target>.csv` with pass, fail, xfail, timeout or error per kernel-op test.
 
 Comparing two implementations of one model (for example the Blackhole model and its Quasar port)
 is a separate step on two runs.
