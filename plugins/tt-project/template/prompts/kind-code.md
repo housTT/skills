@@ -22,6 +22,11 @@
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
+<!-- ttp:if upstream_ingest -->
+- A change that fixes upstream notes (the spec names them, `[note <fp>]`): list them in result.json
+  as `"resolves": ["<fp>"]`, in `on_pass` too. Once the push queue ships it, each is recorded fixed
+  in that release; never guess the version with `ttp upstream --resolve`.
+<!-- /ttp:if upstream_ingest -->
 
 ## Landing on the project's branch (only when both hold)
 

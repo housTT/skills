@@ -28029,6 +28029,74 @@ def test_a_sandboxed_workers_upstream_ack_is_recorded_when_its_run_ends(env, mon
     assert sum(r.get("kind") == "ack" for r in upstream._records()) == 1
 
 
+def test_a_sandboxed_workers_upstream_resolve_is_queued_and_recorded_when_its_run_ends(
+        env, monkeypatch, tmp_path, capsys):
+    """`ttp upstream --resolve` in a sandbox that cannot write the user's files queues it in the run's
+    directory, as --ack does, instead of a traceback; the daemon records it at the run's end, once."""
+    from ttp import cli, upstream
+    from ttp.daemon import Daemon
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: x", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: x", "y")
+    monkeypatch.chdir(p.base)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+    def read_only(*a, **k):
+        raise PermissionError(13, "Read-only file system")
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "_record", read_only)
+        assert _upstream_cli(cli, "--resolve", fp, "--fixed-in", "0.2.10", "--note", "kept") == 0
+        assert _upstream_cli(cli, "--resolve", fp, "--fixed-in", "soon") == 2, "a bad version was queued"
+    assert "queued" in capsys.readouterr().out and upstream.state(fp) == "open"
+    Daemon(p.base)._file_queued_notes(1, 4, tmp_path)
+    r = upstream.resolution(fp)
+    assert (r["fixed_in"], r["note"], r["by"]) == ("0.2.10", "kept", "demo") and upstream.state(fp) == "resolved"
+    Daemon(p.base)._file_queued_notes(1, 4, tmp_path)
+    assert sum(x.get("kind") == "resolve" for x in upstream._records()) == 1
+    # Outside a run there is nowhere to queue it: the error is not hidden.
+    monkeypatch.delenv("TTP_RUN_DIR")
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "_record", read_only)
+        with pytest.raises(PermissionError):
+            _upstream_cli(cli, "--resolve", fp, "--fixed-in", "0.2.11")
+
+
+def test_a_pushed_batch_resolves_the_upstream_notes_its_hand_offs_name_with_its_own_version(env, monkeypatch):
+    """A code task's hand-off names the upstream notes it fixes (`resolves`); once the push queue's
+    batch lands it, each is recorded as fixed in the version that batch pushed. Fingerprints of the
+    task it continues count too; malformed ones are skipped; finalizing again records nothing more."""
+    from ttp import pushq, upstream
+    s = _pq(env, monkeypatch)
+    notes = [{"title": f"upstream: n{i}", "spec": "s"} for i in range(3)]
+    upstream.append("other", 2, notes)
+    fps = [upstream.fingerprint(n["title"], "s") for n in notes]
+    first = s.p.db.add_task("first try", "s", kind="code", origin="coordinator")
+    s.p.db.update_task(first, status="failed", result=json.dumps({"status": "failed", "resolves": [fps[2]]}))
+    s.p.db.update_task(s.code, result=json.dumps({"status": "done", "summary": "fixed",
+                                                  "resolves": [fps[0].upper(), "not-a-fp", fps[1]]}),
+                       labels=json.dumps([f"continues:{first}"]))
+    _pq_plan(s, outcome="pushed", sha="ab" * 20, tip="cd" * 20, version="0.3.1")
+    _pq_hand_off(env, s)
+    assert upstream.state(fps[0]) == "open", "resolved before the push landed"
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status FROM push_queue")["status"] == "pushed"
+    for fp in fps:
+        r = upstream.resolution(fp)
+        assert r and r["fixed_in"] == "0.3.1" and r["by"] == "demo", fp
+    assert f"#{s.code}" in upstream.resolution(fps[0])["note"]
+    assert f"#{first}" in upstream.resolution(fps[2])["note"]
+    [ev] = s.p.db.q("SELECT status, severity, text FROM events WHERE kind='upstream_resolved'")
+    assert ev["status"] == "handled" and "0.3.1" in ev["text"] and all(fp in ev["text"] for fp in fps)
+    n = len(upstream._records())
+    pushq._resolve_upstream(s.p, [s.review], "0.3.1")
+    _pq_tend(s)
+    assert len(upstream._records()) == n, "the same resolution was recorded twice"
+    pushq._resolve_upstream(s.p, [s.review], None)
+    assert len(upstream._records()) == n, "a batch without a version resolved notes"
+
+
 def test_the_prompts_say_how_to_wait_on_and_close_an_upstream_fix():
     worker = " ".join((RUNTIME.parent / "template" / "prompts" / "worker.md").read_text().split())
     coord = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
@@ -28046,6 +28114,14 @@ def test_the_coordinator_gets_the_upstream_note_rules_only_with_ingest_on_but_al
     p.set_config("upstream.ingest", True)
     on = " ".join(coordinator_role(p).split())
     assert "ttp upstream --resolve <fp> --fixed-in <version>" in on and "`upstream_note` events" in on
+
+
+def test_a_code_task_is_told_to_list_the_upstream_notes_it_fixes_only_with_ingest_on():
+    from ttp.prompts import _sections
+    raw = (RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text()
+    off, on = _sections(raw, {}), " ".join(_sections(raw, {"upstream": {"ingest": True}}).split())
+    assert "resolves" not in off and "ttp:if" not in off
+    assert '`"resolves": ["<fp>"]`' in on and "in `on_pass` too" in on and "ttp:if" not in on
 
 
 def test_a_project_without_upstream_ingest_reads_nothing(env):

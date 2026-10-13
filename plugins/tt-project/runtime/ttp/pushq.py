@@ -53,6 +53,7 @@ AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
 INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell which branches were rejected
 INHERIT_GIT_S = 30             # each git call of that check, bounded, as the tick waits for it
+RESOLVES_MAX = 20               # upstream note fingerprints one approval may resolve (a hand-off's `resolves`)
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
@@ -1039,6 +1040,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                  b["id"])).rowcount:
             return
         rows = db.q("SELECT * FROM push_queue WHERE batch=? AND status='batched' ORDER BY id", (b["id"],))
+        shipped: list[int] = []
         for r in rows:
             res = results.get(r["id"]) or {}
             status = res.get("status") if res.get("status") in ROW_RESULTS else (
@@ -1048,6 +1050,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                 detail = {"why": str(m.get("message") or "")[:2000] or None}
             text = json.dumps(detail)[:8000] if detail else None
             if status in ("pushed", "landed"):
+                shipped.append(r["task"])
                 own = res.get("sha") if isinstance(res.get("sha"), str) and _HEX40.fullmatch(res["sha"]) else None
                 db.x("UPDATE push_queue SET status=?, pushed_sha=?, landed_sha=?, version=?, detail=?, updated=? "
                      "WHERE id=?", (status, sha or tip, own or sha or tip, version, text, now, r["id"]))
@@ -1105,11 +1108,65 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         db.set_kv(KV, st)
         for tid in dict.fromkeys(r["task"] for r in rows):
             _settle(p, tid, b, m, now)
+        # In the transaction that finalizes the batch: a crash before it commits records them again.
+        _resolve_upstream(p, shipped, version)
         if outcome in ("moved", "busy", "rejected", "nothing", "landed", "pushed", "tip_failed") and back:
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
     for key, text, sev in later:
         alert(key, text, severity=sev)
+
+
+def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
+    """The upstream note fingerprints (upstream.fingerprint) the change review `review_id` approved
+    fixes, each with the task that names it: the `resolves` lists in the hand-offs of the review, of
+    the code tasks it covers (push._reviewed) and of the tasks they continue."""
+    review = p.db.task(review_id)
+    tasks = [review] if review else []
+    seen: set[int] = set()
+    for t in push._reviewed(p, str(review_id)):
+        while t and t["id"] not in seen:
+            seen.add(t["id"])
+            tasks.append(t)
+            c = continues_id(t)
+            t = p.db.task(c) if c is not None else None
+    out: dict[str, dict] = {}
+    for t in tasks:
+        got = load_result(t.get("result")).get("resolves")
+        for fp in (got if isinstance(got, list) else [got] if isinstance(got, str) else []):
+            fp = str(fp).strip().lower()
+            if re.fullmatch(r"[0-9a-f]{16}", fp) and len(out) < RESOLVES_MAX:
+                out.setdefault(fp, t)
+    return list(out.items())
+
+
+def _resolve_upstream(p: Project, review_ids: list[int], version: str | None) -> None:
+    """Record each upstream note the pushed approvals fix (resolves_of) as fixed in the release the
+    batch pushed (upstream.resolve). The same resolution twice is left alone, so a batch applied again
+    after a crash adds none; a failure to record is an event, never a failed batch."""
+    if not version or not review_ids:
+        return
+    from . import upstream
+    done, failed = [], []
+    for rid in dict.fromkeys(review_ids):
+        for fp, t in resolves_of(p, rid):
+            try:
+                had = upstream.resolution(fp)
+                if had and had.get("fixed_in") == str(version).lstrip("v"):
+                    continue
+                upstream.resolve(fp, version, f"#{t['id']} {t.get('title') or ''}"[:300], p.name)
+                done.append(fp)
+            except (OSError, ValueError) as e:
+                failed.append(f"{fp} ({e})")
+    if done:
+        _event(p.db, None, "upstream_resolved", f"push of {version} resolved upstream note"
+                                                f"{'s' if len(done) != 1 else ''} {', '.join(done)}",
+               queued=False, severity="low")
+    if failed:
+        _event(p.db, None, "upstream_resolve_failed", f"push of {version} could not record the resolution of "
+                                                      f"upstream notes {'; '.join(failed)[:2000]}. Record it with "
+                                                      f"`ttp upstream --resolve <fp> --fixed-in {version}`",
+               queued=True)
 
 
 def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: float) -> None:

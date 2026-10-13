@@ -641,7 +641,7 @@ def ack(fp: str, name: str, evidence: str, now: float | None = None) -> dict:
     return _record({"kind": "ack", "fp": fp, "project": name, "evidence": cut(evidence, "it"), "ts": now or time.time()})
 
 
-ACKS_QUEUED = "upstream-acks.jsonl"   # in a run's directory: acks a sandboxed worker could not record itself
+ACKS_QUEUED = "upstream-acks.jsonl"   # in a run's directory: acks and resolutions a sandboxed worker could not record
 
 
 def queue_ack(run_dir: Path, fp: str, evidence: str) -> None:
@@ -656,8 +656,21 @@ def queue_ack(run_dir: Path, fp: str, evidence: str) -> None:
     durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"fp": fp, "evidence": evidence}, sort_keys=True) + "\n")
 
 
+def queue_resolve(run_dir: Path, fp: str, fixed_in: str, note: str = "") -> None:
+    """Keep a worker's resolution in its run's directory when its sandbox cannot write RESOLVED_FILE:
+    its project's daemon records it (`file_queued_acks`) when the run ends. Checked as resolve does."""
+    fp = _check_fp(fp)
+    fixed_in = str(fixed_in or "").strip()
+    if not re.fullmatch(r"v?\d+(\.\d+)*", fixed_in):
+        raise ValueError(f"not a release version: {fixed_in or 'nothing'}")
+    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps(
+        {"kind": "resolve", "fp": fp, "fixed_in": fixed_in, "note": " ".join(str(note or "").split())},
+        sort_keys=True) + "\n")
+
+
 def file_queued_acks(run_dir: Path, name: str) -> int:
-    """Record the acks a run queued (`queue_ack`) as project `name`'s; the file is renamed once done."""
+    """Record the acks and resolutions a run queued (`queue_ack`, `queue_resolve`) as project `name`'s,
+    in their order; the file is renamed once done."""
     src = Path(run_dir) / ACKS_QUEUED
     try:
         raw = src.read_bytes()
@@ -667,7 +680,10 @@ def file_queued_acks(run_dir: Path, name: str) -> int:
     for ln in raw.splitlines()[:QUEUED_MAX]:
         try:
             a = json.loads(ln)
-            ack(a["fp"], name, a["evidence"])
+            if a.get("kind") == "resolve":
+                resolve(a["fp"], a["fixed_in"], a.get("note") or "", name)
+            else:
+                ack(a["fp"], name, a["evidence"])
             n += 1
         except (ValueError, KeyError, TypeError):
             continue

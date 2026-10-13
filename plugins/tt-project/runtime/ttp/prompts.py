@@ -109,7 +109,9 @@ OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp p
 
 def _sections(text: str, cfg: dict) -> str:
     """A kind prompt without the push section that does not apply: the plain push's or the queue's,
-    and the `ttp push --own` advice while own pushes are off (delivery.own_push)."""
+    the `ttp push --own` advice while own pushes are off (delivery.own_push), and its upstream note
+    rules while this project does not read the upstream inbox (upstream.ingest)."""
+    text = feature_blocks(text, {"upstream_ingest"} if (cfg.get("upstream") or {}).get("ingest") else set())
     text = drop_section(text, REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1])
     return own_off(drop_section(text, OWN_SECTION)) if own_push(cfg) == "off" else text
 

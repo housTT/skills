@@ -1267,7 +1267,16 @@ def cmd_upstream(a) -> None:
                 if not a.fixed_in:
                     die("ttp upstream --resolve needs --fixed-in <version>")
                 me = here()
-                r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
+                try:
+                    r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
+                except OSError as e:
+                    if not os.environ.get("TTP_RUN_DIR"):
+                        raise
+                    # A sandbox that cannot write the user's files: this project's daemon records it at the run's end.
+                    upstream.queue_resolve(Path(os.environ["TTP_RUN_DIR"]), a.resolve, a.fixed_in, a.note or "")
+                    print(f"resolution of note {a.resolve.strip().lower()} queued in this run's directory "
+                          f"({e.strerror or e}); this project's daemon records it when the run ends")
+                    return
                 print(f"note {r['fp']} resolved: fixed in {r['fixed_in']}. The project that filed it is told once its "
                       f"daemon runs that version; it closes the note with `ttp upstream --ack {r['fp']} \"<evidence>\"`")
                 return
