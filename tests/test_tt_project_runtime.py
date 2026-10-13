@@ -14335,6 +14335,49 @@ def test_the_daemon_archives_one_worktree_per_step_within_its_budget_and_finishe
     assert d.prune_worktrees() == [] and d._prune_more is None
 
 
+def test_a_failing_archive_neither_starves_a_forced_sweep_nor_is_retried_every_tick(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import archive
+    from ttp.daemon import Daemon
+    heavy = []
+    for i in range(3):
+        tid, path, _ = _code_task(p, f"output {i}")
+        (path / "one.bin").write_bytes(b"x" * 1000)
+        _handoff(p, tid, ["one.bin"])
+        heavy.append((tid, path))
+    real, calls = archive.sha256, []
+
+    def unreadable(path, progress=lambda: None):
+        if str(heavy[0][1]) in str(path):
+            calls.append(path)
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, progress)
+    monkeypatch.setattr(archive, "sha256", unreadable)
+    d = Daemon(p.base)
+    d._progress = lambda: None
+    first = {r["task"]: r for r in d.prune_worktrees(every_s=0, force=True)}
+    assert first[heavy[0][0]]["why"].startswith("error:") and heavy[0][1].exists()
+    assert first[heavy[1][0]].get("archived"), "the failed archive used up the step's slot"
+    for _ in range(5):
+        d.prune_worktrees()
+    assert not any(path.exists() for _, path in heavy[1:]), "later worktrees never archived"
+    assert len(calls) == 1, f"the failing worktree was hashed {len(calls)} times"
+    assert d._prune_more is None
+
+
+def test_a_cross_filesystem_big_file_copy_reports_progress_per_chunk(tmp_path, monkeypatch):
+    from ttp import archive
+    src, dst = tmp_path / "big.bin", tmp_path / "big.copy"
+    src.write_bytes(b"y" * 10_000)
+    os.chmod(src, 0o640)
+    monkeypatch.setattr(archive, "COPY_CHUNK", 1000)
+    ticks = []
+    archive.copy(src, dst, lambda: ticks.append(1))
+    assert dst.read_bytes() == src.read_bytes() and len(ticks) == 10
+    assert (dst.stat().st_mode & 0o777) == 0o640
+
+
 def test_a_stale_initializing_lock_is_cleared_but_a_live_or_foreign_lock_is_not(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)

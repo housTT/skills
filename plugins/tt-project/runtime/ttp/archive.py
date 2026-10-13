@@ -63,6 +63,19 @@ def sha256(path: Path, progress=lambda: None) -> str:
     return h.hexdigest()
 
 
+COPY_CHUNK = 64 << 20
+
+
+def copy(src: Path, dst: Path, progress=lambda: None) -> None:
+    """shutil.copy2 in COPY_CHUNK pieces, calling progress() per piece: a huge file on a slow disk keeps
+    the daemon's watchdogs told."""
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while chunk := fi.read(COPY_CHUNK):
+            fo.write(chunk)
+            progress()
+    shutil.copystat(src, dst)
+
+
 def files_of(root: Path, rels: list[str]) -> list[str]:
     """The regular files and links these entries (files or directories, relative to `root`) hold,
     relative to it, links not followed."""
@@ -255,7 +268,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
             else:
                 part = to.with_name(to.name + ".part")
                 made += [part] + ([] if to.exists() else [to])
-                shutil.copy2(root / f, part)
+                copy(root / f, part, progress)
                 with open(part, "rb") as fh:
                     os.fsync(fh.fileno())
                 os.replace(part, to)

@@ -861,7 +861,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     call (the daemon archives one per tick step, `ttp prune` all). `progress()` is called per worktree
     and, while archiving, per file. An archive that does not fit with `reserve_bytes` free on
     state/'s filesystem is skipped and the worktree kept (archive.NoRoom; `why` names the sizes); an
-    archiving cut off part way is finished or rolled back first (archive.recover)."""
+    archiving cut off part way is finished or rolled back first (archive.recover). Neither a skipped
+    nor a failed archive (`why` 'error: ...') counts against `archive_limit`."""
     import fcntl
     import time
     from . import archive
@@ -989,6 +990,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                             res.update(tracked=info["tracked"], fingerprint=info["fingerprint"])
                         out.append({**res, "why": str(e)})
                         continue
+                    except Exception:
+                        if not dry_run:
+                            archived -= 1   # failed (store rolled it back): the next worktree gets the slot
+                        raise
                 if why is None and not dry_run and not patch and (res.get("moved") or res.get("archived")):
                     why = keep_reason(path)
                 res["why"] = why

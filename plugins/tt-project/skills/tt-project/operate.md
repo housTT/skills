@@ -103,7 +103,9 @@
   filesystem (1 GB once the disk is already below it) archives nothing and keeps the worktree, saying
   the sizes; a failure part way removes what it wrote and keeps the worktree as it was. Removals are
   done at once, but the daemon archives at most one worktree per tick step (the rest on the next
-  ticks); `ttp prune` archives them all. Known gap: a kill between moving a big file and finalizing
+  ticks; a skipped or failed archive does not use up the step, and a failed one is retried only once
+  its task changes or after the keep recheck, even under the disk guard); `ttp prune` archives them
+  all. Known gap: a kill between moving a big file and finalizing
   the manifest is finished by the next sweep (the manifest lists it as pending until then).
   One with modified tracked files is kept and raised to the coordinator once per content (event
   `worktree_uncommitted`); `ttp status` counts them and the web app lists them in the feed. Under the

@@ -4700,7 +4700,8 @@ class Daemon:
         at once when a task finished since the last sweep. `disk.worktree_retention_days` delays
         removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
         before). A worktree kept for a reason is checked again when its task changes or after
-        KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep). Branches are never deleted.
+        KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep), except one whose sweep failed
+        (`why` 'error: ...'), so a forced re-sweep does not retry it every tick. Branches are never deleted.
         Removals are cheap and all done at once; archiving (worktree.sweep's costly part) is done for
         at most one worktree per call, and the sweep runs again at the next tick (forced again after a
         forced one) until none is left deferred. Returns the sweep's results."""
@@ -4722,11 +4723,15 @@ class Daemon:
         def recent(task: dict) -> bool:
             memo = self._kept.get(task["id"])
             return bool(memo) and memo[0] == task["updated"] and now - memo[1] < KEEP_RECHECK_S
+
+        def failed(task: dict) -> bool:   # a forced sweep still skips a recent failure, or it retries it every tick
+            memo = self._kept.get(task["id"])
+            return recent(task) and str(memo[2] or "").startswith("error:")
         db = self.p.db
         logged = db.kv(KV_WORKTREES_LOGGED) or {}      # task -> the keep reason last logged
         dirty = db.kv(KV_WORKTREES_DIRTY) or {}        # task -> its kept tracked changes
         results = worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"),
-                                 skip=(lambda task: False) if force else recent,
+                                 skip=failed if force else recent,
                                  leftovers_max_mb=cfg.get("worktree_leftovers_max_mb"),
                                  archive_max_mb=cfg.get("worktree_archive_max_mb"),
                                  patch_tracked=force,   # the disk guard's sweep also frees tracked changes as patches
