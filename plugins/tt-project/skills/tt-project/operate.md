@@ -96,7 +96,9 @@
   and is removed, if they total at most `disk.worktree_leftovers_max_mb` (50; 0 never). Hand-off
   artifacts (any task's `result.json` `artifacts`, globs too; ignored or untracked), small ignored
   `*.log` files (up to 1 MB each) and larger untracked files are archived first under
-  `state/archive/tasks/<id>/`: a `files.tar.gz` (a file over 256 MB is moved as it is into `files/`)
+  `state/archive/tasks/<id>/`: a `files.tar.gz` (a new name per archiving; a file over 256 MB is stored as it is under
+  `objects/<sha256[:2]>/<sha256>`, so identical content is kept once and archived files are never
+  overwritten)
   and `manifest.json` (path, size, sha256, stored where; the task's status, branch and head).
   Unnamed untracked files are archived smallest first up to `disk.worktree_archive_max_mb` (200) per
   task; the rest are only listed there and deleted. `state/archive/tasks/MANIFEST.md` gets one line
@@ -107,8 +109,11 @@
   done at once, but the daemon archives at most one worktree per tick step (the rest on the next
   ticks; a skipped or failed archive does not use up the step, and a failed one is retried only once
   its task changes or after the keep recheck, even under the disk guard); `ttp prune` archives them
-  all. Known gap: a kill between moving a big file and finalizing
-  the manifest is finished by the next sweep (the manifest lists it as pending until then).
+  all. Every new entry is checked against what was stored (sha256) before the worktree loses anything.
+  Known gaps: a kill mid-archive is finished or rolled back by the next sweep through the manifest's
+  pending entries (the files stay in the worktree until then); archives written before the `objects/`
+  layout keep big files under `files/<path>`, still readable, but one of two copies of the same path
+  may already have been overwritten there.
   One with modified tracked files is kept and raised to the coordinator once per content (event
   `worktree_uncommitted`); `ttp status` counts them and the web app lists them in the feed. Under the
   disk guard, and with `ttp prune --patch-tracked`, a done or cancelled task's tracked changes are

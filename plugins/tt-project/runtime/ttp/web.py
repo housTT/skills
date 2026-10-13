@@ -527,7 +527,7 @@ def attention(db: DB, now: float) -> list[dict]:
 
 
 def archived_files(p: Project, task_id: int | None) -> list[dict]:
-    """The files the worktree sweep archived from a task's worktree (archive.resolve), so a run's
+    """The files the worktree sweep archived from a task's worktree (archive.where), so a run's
     hand-off artifacts are still found once its worktree is gone: path, size, sha256, where."""
     from . import archive
     if task_id is None:
@@ -535,9 +535,8 @@ def archived_files(p: Project, task_id: int | None) -> list[dict]:
     m = archive.manifest(p, task_id) or {}
     out = []
     for e in (m.get("files") or [])[:200]:
-        where = archive.resolve(p, str(e.get("path") or ""), task_id) or {}
         out.append({"path": e.get("path"), "size": e.get("size"), "sha256": e.get("sha256"),
-                    "stored": e.get("stored"), "named": bool(e.get("named")), "location": where.get("location", "")})
+                    "stored": e.get("stored"), "named": bool(e.get("named")), "location": archive.where(p, task_id, e)})
     return out
 
 

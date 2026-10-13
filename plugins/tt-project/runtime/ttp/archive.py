@@ -3,24 +3,35 @@
 """Per-task archives of what a finished task's worktree held outside git, so the worktree can go.
 
 state/archive/tasks/<id>/ holds manifest.json and the archived files: small ones in a compressed
-tarball (files[.N].tar.gz), each over TAR_MAX_MB moved as it is under files/<path> (a rename on the
-same filesystem, so archiving it needs no space). The manifest lists every file the sweep took out
-of the worktree: path (relative to the worktree), size, sha256, whether a hand-off named it, and
-where it went ("tar", "file", or "dropped": over the cap for unnamed files, listed only). It also
+tarball (files[.N].tar.gz, a new name per archiving), each over TAR_MAX_MB as it is under
+objects/<sha256[:2]>/<sha256> (moved by a hard link on the same filesystem: it needs no space).
+The manifest lists every file the sweep took out of the worktree: path (relative to the worktree),
+size, sha256, whether a hand-off named it, and where it went ("tar" with `archive`, the tarball;
+"file" with `blob`, its object; or "dropped": over the cap for unnamed files, listed only). It also
 records the task's status, branch and head, so archived output is tied to the commit that made it,
 and `patches`: binary patches of uncommitted tracked changes (tracked.patch, verified to apply to
 that head; `git apply` restores them). state/archive/tasks/MANIFEST.md gets one line per archiving.
 
+Archived files are write-once. Big files are content-addressed: identical content is stored once,
+and different content never shares a path. Nothing is ever renamed or written onto an existing
+archive path (_place); an object already there with other content raises Conflict and the worktree
+is kept. Manifests written before this layout list big files under files/<path> with no `blob`;
+they are still read (location). Known gap: such old-layout entries could be overwritten by a later
+archiving of the same path, so one of two copies with different sha256 may already be lost.
+
 store() is transactional. It first checks that what it writes fits in the free space of state/'s
 filesystem (see room); if not, it archives nothing and raises NoRoom. It then writes the manifest
-with the new entries marked `pending`, writes the tarball, patch and big files, and finalizes the
+with the new entries marked `pending`, writes the tarball, patch and objects, checks every new entry
+against what was stored (the object or tarball member is there with its sha256), and finalizes the
 manifest; only then are files deleted from the worktree. A failure part way undoes what it wrote
-(temporary files, the tarball, partial copies, the patch; big files renamed out go back) and
-re-raises, so the worktree is kept as it was. Known gap: a kill (power cut, watchdog) between moving
-a big file and finalizing the manifest is not undone at once; the next sweep's recover() finishes or
-rolls back the pending entries, so every file under files/ is listed and resolve() finds it."""
+(temporary files, the tarball, objects it added, the patch) and re-raises, so the worktree is kept
+as it was. Known gap: a kill (power cut, watchdog) between storing and finalizing the manifest is not
+undone at once; the next sweep's recover() finishes or rolls back the pending entries, so every
+object is listed and resolve() finds it; files still in the worktree are archived again then
+(identical objects are not stored twice)."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -31,11 +42,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from .project import Project, durable_append, durable_write, fsync_dir, write_json
+from .project import Project, durable_append, fsync_dir, write_json
 
 ARCHIVE_DIR = "archive/tasks"
 MANIFEST = "manifest.json"
-TAR_MAX_MB = 256   # a file over this is moved into files/ as it is instead of into the tarball
+TAR_MAX_MB = 256   # a file over this is stored as it is under objects/ instead of in the tarball
 RESERVE_FLOOR_MB = 1024   # free space an archive leaves while the disk is already below the guard (see room)
 LOG_MAX_MB = 1     # ignored *.log files up to this size are archived with the rest (see worktree.sweep)
 
@@ -115,6 +126,89 @@ class NoRoom(Exception):
     """An archive does not fit in the free space of state/'s filesystem; nothing was archived."""
 
 
+class Conflict(RuntimeError):
+    """What is stored at an archive path is not what the manifest says belongs there; nothing is
+    overwritten and the worktree is kept."""
+
+
+def blob(digest: str) -> str:
+    """Where a big file with this sha256 is stored, relative to the task's archive."""
+    return f"objects/{digest[:2]}/{digest}"
+
+
+def location(d: Path, e: dict) -> Path | None:
+    """The stored file of a "file" entry: its object, or files/<path> for one written before objects/."""
+    if e.get("stored") != "file":
+        return None
+    return d / str(e["blob"]) if e.get("blob") else d / "files" / str(e["path"])
+
+
+def where(p: Project, task_id: int, e: dict) -> str:
+    """Where this manifest entry's file is stored: its object or old-layout file, `<tarball>:<member>`,
+    or "" (dropped)."""
+    d = task_dir(p, task_id)
+    if e.get("stored") == "tar":
+        return f"{d / str(e.get('archive'))}:{e['path']}"
+    return str(location(d, e) or "")
+
+
+def _place(src: Path, dst: Path) -> bool:
+    """Put `src` at `dst`, never replacing anything there: a hard link, which fails if `dst` exists
+    (True: `src` stays until its caller deletes it). A filesystem without hard links gets a rename
+    after checking `dst` is free (False: `src` is gone); prune.lock keeps other sweeps out meanwhile."""
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "an archived file is never overwritten", str(dst))
+    try:
+        os.link(src, dst, follow_symlinks=False)
+        return True
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "an archived file is never overwritten", str(dst))
+        os.rename(src, dst)
+        return False
+
+
+def _write_new(path: Path, data: bytes) -> None:
+    """Write a new archive file: synced under a temporary name, then placed (never over another)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _place(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    fsync_dir(path.parent)
+
+
+def _check_blob(f: Path, e: dict, progress=lambda: None) -> None:
+    """Raise Conflict unless `f` is a regular file with the entry's size and sha256."""
+    if f.is_symlink() or not f.is_file() or f.stat().st_size != e.get("size") or sha256(f, progress) != e.get("sha256"):
+        raise Conflict(f"{f} does not hold {e.get('path')} (sha256 {str(e.get('sha256'))[:12]}); "
+                       f"nothing overwritten, the worktree is kept")
+
+
+def _check_tar(f: Path, entries: list[dict], progress=lambda: None) -> None:
+    """Raise Conflict unless the tarball holds every entry: a link as a link, a file with its sha256."""
+    with tarfile.open(f, "r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+        for e in entries:
+            progress()
+            m = members.get(e["path"])
+            ok = m is not None and (m.issym() if not e.get("sha256") else m.isfile() and m.size == e.get("size"))
+            if ok and e.get("sha256"):
+                h = hashlib.sha256()
+                with tar.extractfile(m) as fh:
+                    for block in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(block)
+                ok = h.hexdigest() == e["sha256"]
+            if not ok:
+                raise Conflict(f"{f} does not hold {e['path']} as listed; the worktree is kept")
+
+
 def _same_fs(a: Path, b: Path) -> bool:
     try:
         return a.stat().st_dev == b.stat().st_dev
@@ -148,12 +242,14 @@ def room(dest: Path, need: int, reserve: float) -> str | None:
 
 def recover(p: Project, task_id: int) -> int:
     """Finish or roll back an archiving cut off part way (a kill between writing and finalizing):
-    a pending entry whose data is in place (the tarball it names, its file under files/ at its size,
-    a patch with its sha256) is finalized, the rest are dropped with their partial files, and
-    temporary files are removed. Returns how many pending entries it found. Run under prune.lock."""
+    a pending entry whose data is in place (the tarball it names, its object or old-layout file at its
+    size, a patch with its sha256) is finalized, the rest are dropped (an archived file is never
+    deleted: objects are written whole, by link or rename), and temporary and partial files are
+    removed. Returns how many pending entries it found. Run under prune.lock."""
     m = manifest(p, task_id)
     dest = task_dir(p, task_id)
-    for tmp in (list(dest.glob("*.tmp")) + list(dest.glob(".*.tmp"))) if dest.is_dir() else []:
+    for tmp in ([*dest.glob("*.tmp"), *dest.glob(".*.tmp"), *dest.glob("objects/*/.*.part")]
+                if dest.is_dir() else []):
         tmp.unlink(missing_ok=True)
     if not m:
         return 0
@@ -170,13 +266,10 @@ def recover(p: Project, task_id: int) -> int:
         if e.get("stored") == "tar":
             return (dest / str(e.get("archive"))).is_file()
         if e.get("stored") == "file":
-            f = dest / "files" / str(e["path"])
-            f.with_name(f.name + ".part").unlink(missing_ok=True)
-            if f.is_symlink() or (f.is_file() and f.stat().st_size == e.get("size")):
-                return True
-            if f.exists() or f.is_symlink():
-                f.unlink()   # a partial copy
-            return False
+            f = location(dest, e)
+            if not e.get("blob"):
+                f.with_name(f.name + ".part").unlink(missing_ok=True)
+            return f.is_symlink() or (f.is_file() and f.stat().st_size == e.get("size"))
         return False   # "dropped": the files were never deleted before finalizing
     kept_files = [{k: v for k, v in e.items() if k != "pending"} for e in files
                   if not e.get("pending") or present(e)]
@@ -228,10 +321,11 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
     for f in keep + dropped:
         full = root / f
         progress()
-        new.append({"path": f, "size": sizes[f], "sha256": "" if full.is_symlink() else sha256(full, progress),
-                    "named": f in named_files,
+        digest = "" if full.is_symlink() else sha256(full, progress)
+        new.append({"path": f, "size": sizes[f], "sha256": digest, "named": f in named_files,
                     "stored": "dropped" if f in dropped else "file" if f in big else "tar",
-                    **({"archive": tar_name} if f in small else {}), "at": time.time()})
+                    **({"archive": tar_name} if f in small else {}),
+                    **({"blob": blob(digest)} if f in big else {}), "at": time.time()})
     new_patches = [{"file": patch_name, "size": len(patch), "sha256": hashlib.sha256(patch).hexdigest(),
                     "paths": list(tracked), "at": time.time()}] if patch else []
     info = {"task": task["id"], "status": task.get("status") or "", "branch": task.get("branch") or "",
@@ -239,13 +333,13 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
     write_json(dest / MANIFEST, {**info, "updated": time.time(), "files": entries + [{**e, "pending": True} for e in new],
                                   "patches": patches + [{**e, "pending": True} for e in new_patches]})
     made: list[Path] = []          # files this call wrote under dest, removed on failure
-    moved: list[tuple[Path, Path]] = []   # big files renamed out of the worktree, renamed back on failure
-    copied: list[str] = []         # big files copied (another filesystem): deleted from the worktree after
+    moved: list[tuple[Path, Path]] = []   # big files moved out of the worktree into objects/, moved back on failure
+    release: list[str] = []        # big files copied or already stored: deleted from the worktree after
     done = False
     try:
         if patch:
+            _write_new(dest / patch_name, patch)
             made.append(dest / patch_name)
-            durable_write(dest / patch_name, patch)
         if small:
             tmp = dest / (tar_name + ".tmp")
             made.append(tmp)
@@ -255,25 +349,40 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
                     tar.add(str(root / f), arcname=f, recursive=False)
             with open(tmp, "rb") as fh:
                 os.fsync(fh.fileno())
+            _place(tmp, dest / tar_name)
             made.append(dest / tar_name)
-            os.replace(tmp, dest / tar_name)
+            tmp.unlink(missing_ok=True)
             fsync_dir(dest)
-        for f in big:
+        for e in new:
+            if e["stored"] != "file":
+                continue
             progress()
-            to = dest / "files" / f
+            f, to = e["path"], dest / e["blob"]
             to.parent.mkdir(parents=True, exist_ok=True)
-            if _same_fs(root / f, to.parent):
-                os.rename(root / f, to)
+            if os.path.lexists(to):
+                _check_blob(to, e, progress)   # the same content is stored already; other content raises
+                release.append(f)
+            elif _same_fs(root / f, to.parent):
+                if _place(root / f, to):
+                    (root / f).unlink()   # moved, so the worktree's file and the object never share an inode
                 moved.append((to, root / f))
             else:
-                part = to.with_name(to.name + ".part")
-                made += [part] + ([] if to.exists() else [to])
+                part = to.with_name(f".{to.name}.{os.getpid()}.part")
+                made.append(part)
                 copy(root / f, part, progress)
                 with open(part, "rb") as fh:
                     os.fsync(fh.fileno())
-                os.replace(part, to)
-                copied.append(f)
+                _place(part, to)
+                made.append(to)
+                part.unlink(missing_ok=True)
+                release.append(f)
             fsync_dir(to.parent)
+        # Every new entry is checked against what was stored before the worktree loses anything.
+        for e in new:
+            if e["stored"] == "file":
+                _check_blob(dest / e["blob"], e, progress)
+        if small:
+            _check_tar(dest / tar_name, [e for e in new if e["stored"] == "tar"], progress)
         write_json(dest / MANIFEST, {**info, "updated": time.time(), "files": entries + new,
                                       "patches": patches + new_patches})
         done = True
@@ -281,7 +390,8 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
         if not done:
             for to, back in reversed(moved):
                 try:
-                    os.rename(to, back)
+                    if _place(to, back):
+                        to.unlink()
                 except OSError:
                     pass   # left pending: recover() finalizes it, so the file stays listed and findable
             for f in made:
@@ -298,7 +408,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
             f"({sum(sizes[f] for f in keep) / 1e6:.1f} MB) archived, {len(dropped)} listed only"
             + (f", a patch of {len(tracked)} tracked file(s)" if patch else "") + "\n")
     durable_append(p.state / ARCHIVE_DIR / "MANIFEST.md", line)
-    for f in small + dropped + copied:
+    for f in small + dropped + release:
         try:
             (root / f).unlink()
         except FileNotFoundError:
@@ -332,8 +442,8 @@ def plan(root: Path, named: list[str], others: list[str], cap_mb: float, patch: 
 
 def resolve(p: Project, entry: str, task_id: int | None = None) -> dict | None:
     """Where an archived artifact is now: `entry` is a path inside a removed task worktree (absolute,
-    or relative to it when `task_id` is given). Returns its manifest entry with `location` (the file
-    under files/, or `<tarball>:<member>`), or None when no archive holds it."""
+    or relative to it when `task_id` is given). Returns its manifest entry with `location` (its object
+    under objects/, an old-layout file under files/, or `<tarball>:<member>`), or None when no archive holds it."""
     raw = Path(entry.strip())
     if raw.is_absolute():
         try:
@@ -353,9 +463,7 @@ def resolve(p: Project, entry: str, task_id: int | None = None) -> dict | None:
         return None
     for e in reversed(m.get("files") or []):
         if e.get("path") == path or str(e.get("path", "")).startswith(path.rstrip("/") + "/"):
-            d = task_dir(p, task_id)
-            loc = {"tar": f"{d / str(e.get('archive'))}:{e['path']}", "file": str(d / "files" / e["path"])}
-            return {**e, "task": task_id, "location": loc.get(e.get("stored"), "")}
+            return {**e, "task": task_id, "location": where(p, task_id, e)}
     return None
 
 
@@ -373,9 +481,10 @@ def restore(p: Project, task_id: int, dest: Path) -> list[str]:
             tar.extractall(dest, members=members, **safe)
             out += [x.name for x in members]
     for e in m.get("files") or []:
-        if e.get("stored") == "file" and (d / "files" / e["path"]).exists():
+        src = location(d, e)
+        if src is not None and src.exists():
             to = dest / e["path"]
             to.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(d / "files" / e["path"], to)
+            shutil.copy2(src, to)
             out.append(e["path"])
     return out

@@ -2695,10 +2695,10 @@ def cmd_prune(a) -> None:
         print(f"task #{a.archived}: branch {m.get('branch') or '?'} at {str(m.get('head') or '?')[:12]}, "
               f"archive {archive.task_dir(p, a.archived)}")
         for e in m.get("files") or []:
-            where = archive.resolve(p, e["path"], a.archived) or {}
+            where = archive.where(p, a.archived, e)
             print(f"  {e['path']}  {e['size'] / 1e6:.1f} MB  {e['stored']}"
                   + ("  (hand-off artifact)" if e.get("named") else "")
-                  + (f"  {where['location']}" if where.get("location") else ""))
+                  + (f"  {where}" if where else ""))
         for e in m.get("patches") or []:
             print(f"  tracked changes ({len(e.get('paths') or [])} file(s)): "
                   f"git apply {archive.task_dir(p, a.archived) / e['file']}  (on {str(m.get('head') or '?')[:12]})")

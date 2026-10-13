@@ -14309,7 +14309,7 @@ def test_a_kill_after_moving_a_big_file_is_recovered_by_the_next_sweep(env, monk
     p = make(env)
     _no_grace(monkeypatch)
     from ttp import archive, worktree
-    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)   # files over 1 KB are "big": moved, not tarred
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)   # files over 1 KB are "big": stored as objects, not tarred
     tid, path, _ = _code_task(p, "killed mid-archive")
     (path / "big.bin").write_bytes(b"B" * 5000)
     (path / "small.txt").write_text("s")
@@ -14330,7 +14330,8 @@ def test_a_kill_after_moving_a_big_file_is_recovered_by_the_next_sweep(env, monk
     assert os.waitpid(pid, 0)[1] >> 8 == 9
     m = archive.manifest(p, tid)
     assert all(e.get("pending") for e in m["files"]) and not (path / "big.bin").exists()
-    assert (archive.task_dir(p, tid) / "files" / "big.bin").exists() and (path / "small.txt").exists()
+    big = next(e for e in m["files"] if e["path"] == "big.bin")
+    assert (archive.task_dir(p, tid) / big["blob"]).exists() and (path / "small.txt").exists()
     (res,) = worktree.sweep(p)
     assert res["why"] is None and not path.exists(), res
     _no_pending_or_temp(p, tid)
@@ -14814,6 +14815,160 @@ def test_run_directory_worktrees_go_when_finished_and_clean_and_stay_with_a_reas
     listed = _git_out(p.root, "worktree", "list")
     assert str(clean) not in listed and str(art) not in listed and str(dirty) in listed
     assert (p.runs / str(clean_run)).is_dir(), "the run directory itself stays"
+
+
+def _big_artifact_runs(p, contents, name="model.out"):
+    """A done task with one finished run worktree per content, each leaving an ignored hand-off artifact."""
+    import json
+    (p.root / ".git" / "info").mkdir(exist_ok=True)
+    (p.root / ".git" / "info" / "exclude").write_text("*.out\n")
+    t = p.db.add_task("finished", "s", kind="experiment", tier="light", origin="user")
+    p.db.update_task(t, status="done")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (1.0, t))
+    wts = []
+    for content in contents:
+        rid, wt = _run_worktree(p, t)
+        (wt / name).write_bytes(content)
+        (p.runs / str(rid) / "result.json").write_text(json.dumps({"status": "done", "artifacts": [str(wt / name)]}))
+        wts.append(wt)
+    return t, wts
+
+
+def test_two_run_worktrees_of_one_task_keep_both_big_artifacts_content_addressed(env, monkeypatch, capsys):
+    """Review #1789: retries of a task leaving the same big artifact path must not overwrite each
+    other's archived copy; each is stored under its own sha256 and both stay readable."""
+    import hashlib
+    from pathlib import Path
+    p = make(env)
+    from ttp import archive, web, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+    t, wts = _big_artifact_runs(p, [b"A" * 5000, b"B" * 5000])
+    res = worktree.sweep(p)
+    assert all(r["why"] is None for r in res) and not any(w.exists() for w in wts), res
+    entries = [e for e in archive.manifest(p, t)["files"] if e["path"] == "model.out"]
+    assert len(entries) == 2 and {e["stored"] for e in entries} == {"file"}
+    d = archive.task_dir(p, t)
+    got = set()
+    for e in entries:
+        f = d / e["blob"] if "blob" in e else d / "files" / e["path"]   # the layout before objects/ too
+        assert hashlib.sha256(f.read_bytes()).hexdigest() == e["sha256"], "an archived copy was overwritten"
+        assert e["blob"] == f"objects/{e['sha256'][:2]}/{e['sha256']}"
+        got.add(f.read_bytes()[:1])
+    assert got == {b"A", b"B"}
+    assert not (d / "files").exists()
+    assert {Path(x["location"]).read_bytes()[:1] for x in web.archived_files(p, t)} == {b"A", b"B"}
+    assert Path(archive.resolve(p, "model.out", task_id=t)["location"]).read_bytes()[:1] == b"B", "the latest"
+    from ttp import cli
+    cli.main(["prune", "demo", "--archived", str(t)])
+    out = capsys.readouterr().out
+    assert all(str(d / e["blob"]) in out for e in entries), out
+
+
+def test_same_content_big_artifacts_are_stored_once(env, monkeypatch):
+    import json
+    p = make(env)
+    from ttp import archive, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+    t, wts = _big_artifact_runs(p, [b"S" * 5000, b"S" * 5000])
+    (wts[1] / "copy.out").write_bytes(b"S" * 5000)   # the same content under another path, in the same call
+    (wts[1].parent / "result.json").write_text(json.dumps({"artifacts": [str(wts[1] / "model.out"), str(wts[1] / "copy.out")]}))
+    res = worktree.sweep(p)
+    assert all(r["why"] is None for r in res) and not any(w.exists() for w in wts), [r["why"] for r in res]
+    files = archive.manifest(p, t)["files"]
+    assert sorted(e["path"] for e in files) == ["copy.out", "model.out", "model.out"]
+    assert len({e["blob"] for e in files}) == 1
+    objects = [x for x in (archive.task_dir(p, t) / "objects").rglob("*") if x.is_file()]
+    assert len(objects) == 1 and objects[0].read_bytes() == b"S" * 5000 and objects[0].stat().st_nlink == 1
+    restored = env["tmp"] / "back"
+    assert sorted(archive.restore(p, t, restored)) == ["copy.out", "model.out", "model.out"]
+    assert (restored / "copy.out").read_bytes() == b"S" * 5000
+
+
+def test_an_archive_path_holding_other_content_is_never_overwritten(env, monkeypatch):
+    import hashlib
+    import json
+    p = make(env)
+    from ttp import archive, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+    t, (wt,) = _big_artifact_runs(p, [b"N" * 5000])
+    for name in ("a.out", "z.out"):   # moved into objects/ before or after the conflict: moved back on failure
+        (wt / name).write_bytes(name.encode() * 2000)
+    (wt.parent / "result.json").write_text(json.dumps({"artifacts": [str(wt / x) for x in ("a.out", "model.out", "z.out")]}))
+    obj = archive.task_dir(p, t) / archive.blob(hashlib.sha256(b"N" * 5000).hexdigest())
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"something else")
+    (res,) = worktree.sweep(p)
+    assert res["why"].startswith("error:") and "nothing overwritten" in res["why"], res
+    assert obj.read_bytes() == b"something else" and (wt / "model.out").read_bytes() == b"N" * 5000
+    assert all((wt / x).read_bytes() == x.encode() * 2000 for x in ("a.out", "z.out"))
+    assert [x for x in (archive.task_dir(p, t) / "objects").rglob("*") if x.is_file()] == [obj]
+    assert archive.manifest(p, t)["files"] == [], "a failed archive left entries"
+    # The one placement primitive refuses an existing destination, a tarball or patch name included.
+    src = env["tmp"] / "src.bin"
+    src.write_bytes(b"x")
+    for existing in (obj, archive.task_dir(p, t) / "manifest.json"):
+        with pytest.raises(FileExistsError):
+            archive._place(src, existing)
+    assert src.exists() and obj.read_bytes() == b"something else"
+    import inspect
+    code = inspect.getsource(archive)
+    assert "os.replace(" not in code and "durable_write(" not in code and code.count("os.rename(") == 1
+
+
+def test_big_artifacts_are_copied_across_filesystems_and_renamed_without_hard_links(env, monkeypatch):
+    import errno
+    import hashlib
+    import os
+    p = make(env)
+    from ttp import archive, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+    monkeypatch.setattr(archive, "_same_fs", lambda a, b: False)
+    t, wts = _big_artifact_runs(p, [b"C" * 5000])
+    assert [r["why"] for r in worktree.sweep(p)] == [None] and not wts[0].exists()
+    monkeypatch.undo()
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)
+
+    def no_links(*a, **kw):
+        raise OSError(errno.EPERM, "Operation not permitted")
+    monkeypatch.setattr(os, "link", no_links)
+    t2, wts2 = _big_artifact_runs(p, [b"D" * 5000])
+    assert [r["why"] for r in worktree.sweep(p)] == [None] and not wts2[0].exists()
+    for task, data in ((t, b"C" * 5000), (t2, b"D" * 5000)):
+        d = archive.task_dir(p, task)
+        (e,) = archive.manifest(p, task)["files"]
+        assert (d / e["blob"]).read_bytes() == data and e["sha256"] == hashlib.sha256(data).hexdigest()
+        assert not [x for x in d.rglob("*") if x.name.endswith((".part", ".tmp"))]
+
+
+def test_an_old_layout_archive_still_resolves_and_restores(env, capsys):
+    """Archives written before objects/ keep big files at files/<path> with no `blob` in the entry."""
+    import io
+    import json
+    import tarfile
+    from pathlib import Path
+    p = make(env)
+    from ttp import archive, cli
+    t = p.db.add_task("old", "s", kind="experiment", tier="light", origin="user")
+    d = archive.task_dir(p, t)
+    (d / "files" / "out").mkdir(parents=True)
+    (d / "files" / "out" / "model.bin").write_bytes(b"M" * 3000)
+    with tarfile.open(d / "files.tar.gz", "w:gz") as tar:
+        info = tarfile.TarInfo("notes.txt")
+        info.size = 2
+        tar.addfile(info, io.BytesIO(b"hi"))
+    (d / "manifest.json").write_text(json.dumps({"task": t, "status": "done", "branch": "b", "head": "abc", "files": [
+        {"path": "out/model.bin", "size": 3000, "sha256": "x", "named": True, "stored": "file", "at": 1.0},
+        {"path": "notes.txt", "size": 2, "sha256": "y", "named": False, "stored": "tar", "archive": "files.tar.gz",
+         "at": 1.0}], "patches": []}))
+    found = archive.resolve(p, "out/model.bin", task_id=t)
+    assert Path(found["location"]) == d / "files" / "out" / "model.bin"
+    assert archive.resolve(p, "notes.txt", task_id=t)["location"].endswith("files.tar.gz:notes.txt")
+    back = env["tmp"] / "back"
+    assert sorted(archive.restore(p, t, back)) == ["notes.txt", "out/model.bin"]
+    assert (back / "out" / "model.bin").read_bytes() == b"M" * 3000
+    cli.main(["prune", "demo", "--archived", str(t)])
+    assert str(d / "files" / "out" / "model.bin") in capsys.readouterr().out
+    assert archive.recover(p, t) == 0 and (d / "files" / "out" / "model.bin").exists()
 
 
 def test_the_end_of_run_sweep_removes_a_finished_runs_worktree_and_ttp_prune_lists_the_kept(env, monkeypatch, capsys):
@@ -32006,9 +32161,8 @@ DURABLE_EXEMPT = {
     ("fake.py", '"result.json").write_text'): "the test provider",
     ("schedcheck.py", "out.write_text(printed)"): "a scratch project's watcher output, removed when the check ends",
     ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",
-    ("archive.py", "os.replace(tmp, dest / tar_name)"): "the tarball is synced before the rename and its directory after",
-    ("archive.py", "os.replace(part, to)"): "a big file's copy is synced before the rename and its directory after",
-    ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before its rename",
+    ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
+    ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
