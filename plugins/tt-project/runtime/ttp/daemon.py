@@ -372,6 +372,25 @@ def release_claims(p: Project, ep: dict) -> None:
         alerts.release(cleared_claims(p, ep["key"]), ep["cleared"])
 
 
+def disk_guard_limits(disk: dict) -> tuple[float, float, tuple | None]:
+    """(min_free_pct, min_free_gb, this machine's entry or None) of the disk guard, from a `disk`
+    config section; this machine's entry in the machines list sets the GB."""
+    pct, gb = float(disk.get("min_free_pct", 5) or 0), float(disk.get("min_free_gb", 150) or 0)
+    try:
+        mine = machines.disk_min_free_gb()
+    except Exception:
+        mine = None
+    if mine:
+        gb = mine[1]
+    return pct, gb, mine
+
+
+def disk_guard_bytes(disk: dict, path: Path) -> float:
+    """The disk guard's threshold in bytes for the filesystem of `path` (0: the guard is off)."""
+    pct, gb, _ = disk_guard_limits(disk)
+    return min(pct / 100 * shutil.disk_usage(path).total, gb * 1e9)
+
+
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
@@ -404,6 +423,7 @@ class Daemon:
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._last_prune = 0.0
+        self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
@@ -4097,13 +4117,7 @@ class Daemon:
         at the line does not flap.
         The episode is kept in the database: a restart neither re-alerts nor forgets it."""
         cfg = self.cfg.get("disk", {})
-        pct, gb = float(cfg.get("min_free_pct", 5) or 0), float(cfg.get("min_free_gb", 150) or 0)
-        try:
-            mine = machines.disk_min_free_gb()   # this machine's entry in the machines list wins
-        except Exception:
-            mine = None
-        if mine:
-            gb = mine[1]
+        pct, gb, mine = disk_guard_limits(cfg)
         # A machine's own threshold keeps the DISK_RESUME rule: the project's resume point was set
         # against its own threshold and could hold a shared disk that others keep near full forever.
         resume_gb = None if mine else disk_resume_gb(cfg)
@@ -4174,10 +4188,18 @@ class Daemon:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
 
+    def _archive_reserve(self) -> float:
+        """Bytes an archive of the worktree sweep leaves free on state/'s filesystem: the disk guard's threshold."""
+        try:
+            return disk_guard_bytes(self.cfg.get("disk", {}), self.p.state)
+        except OSError:
+            return 0.0
+
     def _disk_sweep(self) -> dict:
         """The disk guard's own sweep of finished tasks' worktrees (prune_worktrees, forced: kept ones
         are looked at again), model-free; check_disk runs it at most every DISK_SWEEP_EVERY_S while
-        the disk is low. Logs and returns {"removed", "kept", "freed" (bytes)}."""
+        the disk is low. It archives at most one worktree (see prune_worktrees); the rest follow on
+        later ticks, still forced. Logs and returns {"removed", "kept", "freed" (bytes)}."""
         try:
             before = shutil.disk_usage(self.p.worktrees.resolve()).free
         except OSError:
@@ -4679,7 +4701,9 @@ class Daemon:
         removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
         before). A worktree kept for a reason is checked again when its task changes or after
         KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep). Branches are never deleted.
-        Returns the sweep's results."""
+        Removals are cheap and all done at once; archiving (worktree.sweep's costly part) is done for
+        at most one worktree per call, and the sweep runs again at the next tick (forced again after a
+        forced one) until none is left deferred. Returns the sweep's results."""
         now = time.time()
         cfg = self.cfg.get("disk", {})
         days = cfg.get("worktree_retention_days")
@@ -4687,7 +4711,9 @@ class Daemon:
             return []
         latest = self.p.db.one("SELECT MAX(updated) m FROM tasks WHERE status IN (%s)"
                                % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)["m"] or 0
-        if (now - self._last_prune < every_s and latest <= self._pruned_upto and not force) \
+        more, self._prune_more = self._prune_more, None
+        force = force or more == "force"
+        if (now - self._last_prune < every_s and latest <= self._pruned_upto and not force and not more) \
                 or not self.p.worktrees.is_dir():
             return []
         self._last_prune, self._pruned_upto = now, latest
@@ -4703,7 +4729,13 @@ class Daemon:
                                  skip=(lambda task: False) if force else recent,
                                  leftovers_max_mb=cfg.get("worktree_leftovers_max_mb"),
                                  archive_max_mb=cfg.get("worktree_archive_max_mb"),
-                                 patch_tracked=force)   # the disk guard's sweep also frees tracked changes as patches
+                                 patch_tracked=force,   # the disk guard's sweep also frees tracked changes as patches
+                                 # archiving is costly: one worktree per tick step, within half the
+                                 # heartbeat's staleness, telling the watchdogs per file; the rest next tick
+                                 archive_limit=1, deadline=now + HEARTBEAT_STALE_S / 2, progress=self._progress,
+                                 reserve_bytes=self._archive_reserve())
+        if any(r.get("deferred") for r in results):
+            self._prune_more = "force" if force else "plain"
         for r in results:
             key = str(r["task"])
             if r.get("unlocked") is not None:
@@ -4721,6 +4753,9 @@ class Daemon:
                 mv = r["moved"]
                 log(self.p, f"worktree {r['path']} of task {r['task']}: moved {mv['files']} untracked file(s) "
                             f"({mv['bytes'] / 1e6:.1f} MB) to {mv['to']}")
+            if r.get("deferred"):   # archived by a later tick: no log, checked again at the next sweep
+                self._kept[r["task"]] = (r["updated"], 0, r["why"])
+                continue
             if r.get("tracked"):
                 dirty[key] = self._uncommitted(r, dirty.get(key))
             elif not r.get("held"):

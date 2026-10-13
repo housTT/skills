@@ -2705,9 +2705,14 @@ def cmd_prune(a) -> None:
     dry = getattr(a, "dry_run", False)
     disk = p.config().get("disk", {})
     before = shutil.disk_usage(p.worktrees).free if p.worktrees.is_dir() else 0
+    from .daemon import disk_guard_bytes
+    try:
+        reserve = disk_guard_bytes(disk, p.state)   # an archive leaves the disk guard's threshold free
+    except OSError:
+        reserve = 0.0
     res = worktree.sweep(p, names=disk.get("cache_dirs"), leftovers_max_mb=disk.get("worktree_leftovers_max_mb"),
                          archive_max_mb=disk.get("worktree_archive_max_mb"), dry_run=dry,
-                         patch_tracked=getattr(a, "patch_tracked", False))
+                         patch_tracked=getattr(a, "patch_tracked", False), reserve_bytes=reserve)
     for r in res:
         cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
         mv, ar = r.get("moved"), r.get("archived")

@@ -832,8 +832,8 @@ def _users(path: Path) -> list[int]:
 
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
           skip=lambda task: False, leftovers_max_mb: float | None = None, archive_max_mb: float | None = None,
-          patch_tracked: bool = False,
-          dry_run: bool = False) -> list[dict]:
+          patch_tracked: bool = False, archive_limit: int | None = None, deadline: float | None = None,
+          reserve_bytes: float = 0, progress=lambda: None, dry_run: bool = False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run or process still
     going: clear their build and cache directories, then remove each one whose removal loses nothing
     (see keep_reason). A worktree that may still be wanted (see held_by: an unfinished task needs it,
@@ -854,7 +854,14 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     add` that never finished) is cleared (`unlocked`); a half-made worktree goes. Any other lock keeps
     the worktree. Branches stay, so a task that `continues` one starts from its commits. `dry_run`
     changes nothing and reports what a sweep would do (`why` None: it would go). One sweep at a time
-    per project; a busy lock returns no results."""
+    per project; a busy lock returns no results.
+    Removing, unlocking and clearing caches is cheap and always done. Archiving (hashing, compressing,
+    patching) is the costly part: `archive_limit` caps how many worktrees one call archives, and none
+    starts after `deadline` (a time.time()); the others are kept with `deferred` set, for a later
+    call (the daemon archives one per tick step, `ttp prune` all). `progress()` is called per worktree
+    and, while archiving, per file. An archive that does not fit with `reserve_bytes` free on
+    state/'s filesystem is skipped and the worktree kept (archive.NoRoom; `why` names the sizes); an
+    archiving cut off part way is finished or rolled back first (archive.recover)."""
     import fcntl
     import time
     from . import archive
@@ -874,6 +881,12 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         records: dict | None = None
         limit = LEFTOVERS_MAX_MB if leftovers_max_mb is None else float(leftovers_max_mb)
         cap = ARCHIVE_MAX_MB if archive_max_mb is None else max(float(archive_max_mb), 0.0)
+        archived = 0
+
+        def costly_ok() -> bool:
+            return dry_run or ((archive_limit is None or archived < archive_limit)
+                               and (deadline is None or time.time() < deadline))
+        deferred = "archiving deferred to a later sweep (each daemon tick step archives at most one worktree)"
         open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
         for path in sorted(p.worktrees.iterdir()):
@@ -902,7 +915,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             if why:
                 out.append({**res, "held": True, "why": why})
                 continue
+            progress()
             try:
+                if not dry_run and archive.task_dir(p, task["id"]).is_dir():
+                    archive.recover(p, task["id"])
                 if lock is not None:
                     if not lock.startswith(HARNESS_LOCKS):
                         out.append({**res, "why": f"locked ({lock or 'no reason given'}): only a stale lock git "
@@ -927,6 +943,9 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 if info["dirty"] == "tracked" and patch_tracked and task["status"] in ("done", "cancelled") \
                         and _git(path, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/heads", "refs/remotes",
                                  check=False).strip():
+                    if not costly_ok():
+                        out.append({**res, "why": deferred, "deferred": True})
+                        continue
                     patch = archive.tracked_patch(path)
                     res["patched"] = info["tracked"]
                     untracked = _git(path, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
@@ -953,10 +972,23 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 if why is None:
                     others += [f for f in _small_logs(path) if f not in others and not any(
                         f == a or f.startswith(a + "/") for a in arts)]
+                if why is None and (arts or others or patch) and not costly_ok():
+                    out.append({**res, "why": deferred, "deferred": True})
+                    continue
                 if why is None and (arts or others or patch):
-                    res["archived"] = (archive.plan(path, arts, others, cap, patch) if dry_run else archive.store(
-                        p, task, path, arts, others, cap, head=_git(path, "rev-parse", "HEAD", check=False),
-                        patch=patch, tracked=res.get("patched") or []))
+                    if not dry_run:
+                        archived += 1
+                    try:
+                        res["archived"] = (archive.plan(path, arts, others, cap, patch) if dry_run else archive.store(
+                            p, task, path, arts, others, cap, head=_git(path, "rev-parse", "HEAD", check=False),
+                            patch=patch, tracked=res.get("patched") or [], reserve_bytes=reserve_bytes,
+                            progress=progress))
+                    except archive.NoRoom as e:
+                        archived -= 1   # nothing was written: it does not use up the step's archiving
+                        if res.pop("patched", None):
+                            res.update(tracked=info["tracked"], fingerprint=info["fingerprint"])
+                        out.append({**res, "why": str(e)})
+                        continue
                 if why is None and not dry_run and not patch and (res.get("moved") or res.get("archived")):
                     why = keep_reason(path)
                 res["why"] = why
