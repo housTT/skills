@@ -39,6 +39,9 @@ The targets are the user-level setting `upstream.forward_to` (settings.json, `tt
 --forward-to`), else the machines of this user's remote projects: notes addressed to a project go
 only to the machine that runs it, the rest only to a machine with a project reading the inbox there.
 Received notes (with `via`) are never sent on again, and stay untrusted data like any other note.
+The same exchange closes forwarded notes: each answer carries back the resolutions of the notes the
+target received from the sender, and the sender's acks of them go out with its notes (see
+`_resolved_for` below), so a project whose machine cannot be reached still sees its notes resolved.
 """
 from __future__ import annotations
 
@@ -566,7 +569,8 @@ def digest_line(p: project.Project, cfg: dict) -> str:
 # project's daemon runs a version at or above fixed_in for a note that project filed, its coordinator
 # gets one event per resolution (KV_FIXED dedupes it across restarts) and an early blocker sweep. The
 # note closes only when the project acks (`ttp upstream --ack <fp> "<evidence>"`); a resolution with
-# no ack CONFIRM_S after it was recorded reads "shipped, not confirmed".
+# no ack CONFIRM_S after it was recorded reads "shipped, not confirmed". A note forwarded from another
+# machine gets its resolution back, and sends its ack, over the forwarding exchange (`_resolved_for`).
 
 RESOLVED_FILE = "upstream-resolved.jsonl"
 KV_FIXED = "upstream_fixed"   # "<fp>@<fixed_in>" this project's coordinator was told of
@@ -882,16 +886,23 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
     if len(stream) > RECEIVE_BYTES or (stream and not stream.endswith(b"\n")):
         return {"error": "the stream is cut short or too long; nothing was filed"}, 2
     got: list[dict | None] = []
+    acks: list[dict] = []
     for ln in stream.splitlines():
         if not ln.strip():
             continue
         try:
-            got.append(_valid(json.loads(ln)))
+            n = json.loads(ln)
         except ValueError:
             return {"error": "a line is not JSON; nothing was filed"}, 2
+        if isinstance(n, dict) and n.get("kind") == "ack":
+            acks.append(n)
+        else:
+            got.append(_valid(n))
     r = reader(now)
     ack = {"accepted": 0, "duplicates": 0, "rejected": sum(n is None for n in got), "last_fp": None,
            "reader": r.get("project") if r and r.get("host") == project.hostname() else None}
+    for k, v in _receive_acks(acks, via, now).items():
+        ack[k] += v
     notes = [n for n in got if n]
     if notes:
         project.HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -913,7 +924,137 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
                 f.flush()
                 os.fsync(f.fileno())   # the ack says it is filed: it must outlast a power cut here
         ack["last_fp"] = notes[-1]["fp"]
+    ack["resolved"] = _resolved_for(via)
     return ack, 0
+
+
+# closing a forwarded note: the sender's forwarder carries resolutions back and acks over --------
+# A machine whose notes were forwarded (filed here with `via`) may be one this machine cannot reach
+# (a laptop behind NAT), so nothing is pushed back to it. Its own forwarder already calls this
+# machine: every --receive answer carries the latest resolution of each note received from that
+# alias (`resolved`), which the sender records in its own RESOLVED_FILE with `via`; its project's
+# `--fixed` probe and wake_fixed then work as for a local note. The sender's acks of those
+# resolutions travel the other way as `{"kind": "ack", ...}` lines in the same stream, filed here
+# with `via`, so the maintainers see the note closed. A sender with notes still open there asks at
+# least every PULL_EVERY_S with an empty send; an older receiver (no `resolved` in its answer) is
+# sent no acks and asked only at the probe interval.
+PULL_EVERY_S = 3600          # how often a sender with open forwarded notes asks for resolutions
+PULL_WATCH_S = 30 * 86400    # notes older than this no longer make a sender ask on their own
+RESOLVED_BACK_MAX = 100      # resolutions one answer carries (the latest)
+
+
+def _receive_acks(acks: list, via: str, now: float | None) -> dict:
+    """File the acks a sender passed along (each needs a resolution here); counts for the receive ack."""
+    out = {"accepted": 0, "duplicates": 0, "rejected": 0}
+    if not acks:
+        return out
+    recs = _records()
+    for a in acks:
+        fp, name, ev, ts = a.get("fp"), a.get("project"), a.get("evidence"), a.get("ts")
+        if not (isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) and isinstance(name, str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", name) and isinstance(ev, str) and ev.strip()
+                and len(ev) <= SPEC_CHARS and isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                and resolution(fp, recs)):
+            out["rejected"] += 1
+        elif any(r.get("kind") == "ack" and r.get("fp") == fp and r.get("project") == name and r.get("acked_at") == ts
+                 for r in recs):
+            out["duplicates"] += 1
+        else:
+            # Stamped with this machine's clock, so it counts against the resolution recorded here.
+            recs.append(_record({"kind": "ack", "fp": fp, "project": name, "evidence": " ".join(ev.split()),
+                                 "ts": now or time.time(), "acked_at": ts, "via": via}))
+            out["accepted"] += 1
+    return out
+
+
+def _resolved_for(via: str) -> list[dict]:
+    """The latest resolution of each note this machine received from `via` (at most RESOLVED_BACK_MAX)."""
+    recs = _records()
+    if not recs:
+        return []
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            fps = {n["fp"] for n in _lines(f.read())[0] if n.get("via") == via and n.get("fp")}
+    except FileNotFoundError:
+        return []
+    out = [res for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve" and r.get("fp") in fps)
+           if (res := resolution(fp, recs))]
+    out.sort(key=lambda r: float(r.get("ts") or 0))
+    return [{k: r.get(k) for k in ("fp", "fixed_in", "note", "by", "ts")} for r in out[-RESOLVED_BACK_MAX:]]
+
+
+def _own_open(now: float) -> set[str]:
+    """This machine's own general notes filed within PULL_WATCH_S that have no resolution here yet."""
+    here = project.hostname()
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return set()
+    recs = _records()
+    return {n["fp"] for n in notes if n.get("fp") and n.get("host") == here and not n.get("via") and not n.get("to")
+            and now - float(n.get("ts") or 0) < PULL_WATCH_S and not resolution(n["fp"], recs)}
+
+
+def _take_resolved(target: str, got: list) -> int:
+    """Record the resolutions `target` sent back for this machine's own notes; returns how many were new."""
+    here = project.hostname()
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            mine = {n["fp"] for n in _lines(f.read())[0] if n.get("fp") and n.get("host") == here and not n.get("via")}
+    except FileNotFoundError:
+        return 0
+    recs, new = _records(), 0
+    for r in got[:RESOLVED_BACK_MAX]:
+        if not isinstance(r, dict):
+            continue
+        fp, fixed_in, note, by, ts = r.get("fp"), r.get("fixed_in"), r.get("note") or "", r.get("by") or "", r.get("ts")
+        if not (fp in mine and isinstance(fixed_in, str) and re.fullmatch(r"\d+(\.\d+)*", fixed_in)
+                and isinstance(note, str) and isinstance(by, str) and isinstance(ts, (int, float))
+                and not isinstance(ts, bool)):
+            continue
+        if any(x.get("kind") == "resolve" and x.get("fp") == fp and x.get("fixed_in") == fixed_in
+               and x.get("resolved_at") == ts for x in recs):
+            continue
+        # Stamped with this machine's clock: CONFIRM_S and this project's ack count from its arrival here.
+        recs.append(_record({"kind": "resolve", "fp": fp, "fixed_in": fixed_in, "note": cut(" ".join(note.split()), "it"),
+                             "by": re.sub(r"[^A-Za-z0-9_.@+-]", "", by)[:80], "ts": time.time(), "resolved_at": ts,
+                             "via": target}))
+        new += 1
+    return new
+
+
+def _acks_to_send(target: str, offset: int, room: int) -> tuple[list[bytes], int]:
+    """This machine's own acks of resolutions that came from `target`, from byte `offset` of
+    RESOLVED_FILE on, within `room` bytes: (the lines to send, the offset after the last one looked at)."""
+    try:
+        with open(resolved_path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            raw = f.read()
+    except FileNotFoundError:
+        return [], 0
+    if len(raw) < offset:          # cut or replaced: look again from the start; the target dedupes
+        offset = 0
+    recs = _lines(raw)[0]
+    out, pos, nbytes = [], offset, 0
+    for ln in raw[offset:raw.rfind(b"\n") + 1].splitlines(keepends=True):
+        try:
+            a = json.loads(ln)
+        except ValueError:
+            a = None
+        if isinstance(a, dict) and a.get("kind") == "ack" and not a.get("via") and \
+                (resolution(a.get("fp"), recs) or {}).get("via") == target:
+            line = (json.dumps({k: a.get(k) for k in ("kind", "fp", "project", "evidence", "ts")}, sort_keys=True)
+                    + "\n").encode()
+            if len(out) == FORWARD_BATCH or nbytes + len(line) > room:
+                break
+            out.append(line)
+            nbytes += len(line)
+        pos += len(ln)
+    return out, max(pos, offset)
 
 
 def _remote_projects() -> dict[str, str]:
@@ -989,6 +1130,7 @@ def _forward(now: float, budget_s: float) -> int:
     targets = configured if configured is not None else sorted(set(projects.values()))
     here = project.hostname()
     sent, start, tries = 0, _clock(), [0]
+    open_fps: set[str] | None = None
 
     def save():
         project.write_json(forward_path(), {"targets": targets_st}, mode=0o600)
@@ -1005,10 +1147,13 @@ def _forward(now: float, budget_s: float) -> int:
             first, most = FORWARD_BACKOFF_S
             st.update(fails=fails, next=now + min(first * 2 ** (fails - 1), most), last_error=err, error_at=now)
         else:
-            st.update(fails=0, next=0, last_ok=now, probed=now,
+            st.update(fails=0, next=0, last_ok=now, probed=now, pulled=now,
                       reader=re.sub(r"[^A-Za-z0-9_.@+-]", "", str(ack.get("reader") or ""))[:80] or None,
                       accepted=int(st.get("accepted") or 0) + ack["accepted"],
-                      rejected=int(st.get("rejected") or 0) + ack["rejected"])
+                      rejected=int(st.get("rejected") or 0) + ack["rejected"],
+                      closure=isinstance(ack.get("resolved"), list))
+            if st["closure"] and ack["resolved"]:
+                st["resolutions"] = int(st.get("resolutions") or 0) + _take_resolved(target, ack["resolved"])
         targets_st[target] = st
         save()
         return ack
@@ -1057,16 +1202,26 @@ def _forward(now: float, budget_s: float) -> int:
                     nbytes += len(ln)
             pos += len(ln)
             end = pos
-        if not batch:
-            if end != int(st.get("cursor") or 0) or st != (targets_st.get(target) or {}):
-                targets_st[target] = {**st, "cursor": end}
+        # Acks of resolutions that came from the target go back with the notes (only to a target whose
+        # answers carry resolutions), and a target holding open notes of ours is asked now and then.
+        acks, acks_end = (_acks_to_send(target, int(st.get("acks_cursor") or 0), cap - nbytes)
+                          if st.get("closure") else ([], int(st.get("acks_cursor") or 0)))
+        every = PULL_EVERY_S if st.get("closure") is not False else FORWARD_PROBE_S
+        pull = reads and bool(st.get("accepted")) and now - float(st.get("pulled") or 0) >= every and bool(
+            open_fps if open_fps is not None else (open_fps := _own_open(now)))
+        if not batch and not acks and not pull:
+            if end != int(st.get("cursor") or 0) or acks_end != int(st.get("acks_cursor") or 0) \
+                    or st != (targets_st.get(target) or {}):
+                targets_st[target] = {**st, "cursor": end, **({"acks_cursor": acks_end} if st.get("closure") else {})}
                 save()
             continue
         if not fits():
             break
         st_sent = dict(st)
-        if send(target, st_sent, batch) is not None:
+        if send(target, st_sent, batch + acks) is not None:
             targets_st[target] = {**st_sent, "cursor": end}   # moves only once the target has them
+            if acks:
+                targets_st[target]["acks_cursor"] = acks_end
             save()
             sent += len(batch)
     return sent

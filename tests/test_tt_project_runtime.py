@@ -28775,6 +28775,101 @@ def test_upstream_notes_written_offline_reach_the_reading_machine_once(env, monk
     assert "sent on to example-host, where project reader-project reads" in upstream.digest_line(p, p.config())
 
 
+def test_a_forwarded_upstream_note_gets_its_resolution_back_and_its_ack_reaches_the_maintainers(env, monkeypatch):
+    """A note forwarded to a machine that cannot call back: the forwarder brings the resolution home, so
+    the filing project's --fixed probe passes and its coordinator is told once; its ack goes back the same
+    way and closes the note there. Resolutions of notes from other machines stay where they are."""
+    from ttp import cli, project, upstream
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    fake = _fake_forward_ssh(env, monkeypatch)
+    register("example-project", {"host": "example-host", "dir": "/w/example"})
+    far = fake["remote"] / "example-host" / ".tt-project"
+    far.mkdir(parents=True)
+    (far / "upstream-reader.json").write_text(json.dumps({"project": "reader-project", "host": "example-host",
+                                                          "ts": time.time()}))
+    p = make(env)
+    note = {"title": "upstream: retries lose the spec", "spec": "Keep the spec on retry."}
+    upstream.append("demo", 4, [note])
+    fp = upstream.fingerprint(note["title"], note["spec"])
+    now = time.time()
+    assert upstream.forward(now) == 1
+
+    def on_far(fn):                           # run fn as the maintainers' machine
+        with monkeypatch.context() as m:
+            m.setattr(project, "HOME_DIR", far)
+            m.setattr(project, "hostname", lambda: "example-host")
+            return fn()
+    other = {"ts": 1, "project": "far-project", "host": "far-host", "task": None, "title": "upstream: elsewhere",
+             "spec": "x", "fp": upstream.fingerprint("upstream: elsewhere", "x")}
+    on_far(lambda: upstream.receive((json.dumps(other) + "\n").encode(), "far-host"))
+    on_far(lambda: upstream.resolve(fp, "0.2.10", "kept on retry"))
+    on_far(lambda: upstream.resolve(other["fp"], "0.2.10"))
+    monkeypatch.chdir(p.base)
+    _runs_version(p, "0.2.10")
+    assert _upstream_cli(cli, "--fixed", fp) == 1, "resolved only on the other machine, yet the probe passed"
+    # Within the hour nothing is asked; after it, an empty send brings the resolution home, once.
+    calls = len(_ssh_calls(fake))
+    assert upstream.forward(now + 60) == 0 and len(_ssh_calls(fake)) == calls
+    assert upstream.forward(now + upstream.PULL_EVERY_S + 1) == 0 and len(_ssh_calls(fake)) == calls + 1
+    got = upstream.resolution(fp)
+    assert got and got["fixed_in"] == "0.2.10" and got["via"] == "example-host" and got["note"] == "kept on retry"
+    assert upstream.resolution(other["fp"]) is None, "another machine's resolution came here"
+    assert _upstream_cli(cli, "--fixed", fp) == 0
+    d = Daemon(p.base)
+    d.identity["version"] = "0.2.10"
+    d.wake_upstream_fixes()
+    upstream.forward(now + 3 * upstream.PULL_EVERY_S)   # no open note left: not asked again, nothing duplicated
+    d._fixes_checked = 0
+    d.wake_upstream_fixes()
+    told = [e["text"] for e in p.db.q("SELECT text FROM events WHERE source='upstream' AND kind='observation'")]
+    assert len(told) == 1 and fp in told[0] and "--ack" in told[0]
+    assert len(_ssh_calls(fake)) == calls + 1 and sum(r["kind"] == "resolve" for r in upstream._records()) == 1
+    # The ack goes back with the next pass and closes the note for the maintainers, once.
+    assert on_far(lambda: upstream.state(fp)) == "resolved"
+    assert _upstream_cli(cli, "--ack", fp, "retried #4: spec kept") == 0
+    upstream.forward(now + 4 * upstream.PULL_EVERY_S)
+    upstream.forward(now + 5 * upstream.PULL_EVERY_S)
+    upstream.append("demo", 5, [{"title": "upstream: second", "spec": "s"}])
+    assert upstream.forward(now + 6 * upstream.PULL_EVERY_S) == 1
+    assert on_far(lambda: upstream.state(fp)) == "closed"
+    acks = [r for r in on_far(upstream._records) if r["kind"] == "ack"]
+    assert len(acks) == 1 and acks[0]["project"] == "demo" and acks[0]["via"] == "testhost"
+    assert upstream.state(fp) == "closed"
+
+
+def test_upstream_closure_skips_an_older_receiver_and_rejects_acks_it_cannot_place(env, monkeypatch):
+    """A target whose answers carry no resolutions (an older release) gets no ack lines and is asked only at
+    the probe interval; a receiver refuses an ack with no resolution there, or malformed, and files one
+    resent ack once."""
+    from ttp import upstream
+    upstream.set_forward_to(["example-host"])
+    upstream.append("demo", 4, [{"title": "upstream: x", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: x", "y")
+    sends = []
+
+    def old(target, lines, timeout):
+        sends.append(lines)
+        return {"accepted": len(lines), "duplicates": 0, "rejected": 0}, ""
+    monkeypatch.setattr(upstream, "_ssh_receive", old)
+    now = time.time()
+    assert upstream.forward(now) == 1
+    assert upstream.forward(now + upstream.PULL_EVERY_S + 1) == 0 and len(sends) == 1, "an older target was asked hourly"
+    upstream.forward(now + upstream.FORWARD_PROBE_S + 1)
+    assert sends[1:] == [[]] and json.loads(upstream.forward_path().read_text())["targets"]["example-host"]["closure"] is False
+    # As a receiver: an ack needs a resolution here and well-formed fields; a resent one is a duplicate.
+    a = {"kind": "ack", "fp": fp, "project": "far-project", "evidence": "works", "ts": 5}
+    line = (json.dumps(a) + "\n").encode()
+    ack, rc = upstream.receive(line, "far-host")
+    assert (rc, ack["rejected"], ack["accepted"]) == (0, 1, 0)
+    upstream.resolve(fp, "0.2.10")
+    bad = json.dumps({**a, "project": "a b"}) + "\n" + json.dumps({**a, "evidence": " "}) + "\n"
+    ack, _ = upstream.receive(line + bad.encode(), "far-host")
+    assert (ack["accepted"], ack["rejected"]) == (1, 2)
+    ack, _ = upstream.receive(line, "far-host")
+    assert (ack["accepted"], ack["duplicates"]) == (0, 1) and upstream.state(fp) == "closed"
+
+
 def test_upstream_receive_rejects_malformed_and_oversize_notes(env, monkeypatch, capsys):
     from ttp import cli, upstream
 

@@ -151,7 +151,12 @@ counted as successes. Each claim below needs its own evidence and one owner.
   or pushing the fix is not closure. Planned: tracking each note through resolve, release, wake,
   acknowledgement and recovery under one fingerprint, with a probe for "the fix runs here" that a
   task waiting on it can use. Until then a worker waits on an upstream fix with `ttp deployed` or a
-  version probe as `retry_when`, never `blocked`.
+  version probe as `retry_when`, never `blocked`. A note forwarded from a machine the maintainers
+  cannot reach is closed over the same exchange that forwarded it: the sender pulls, the receiver
+  never pushes. Each answer to the sender's forwarder carries back the resolutions of that sender's
+  notes, and the sender's acks go out with its next send. This keeps one channel, one direction of
+  ssh and one cursor per target. Pushing back would need a new route into a machine that may sit
+  behind NAT.
 
 Accepted gap: there is no fast-fail for a schema 400. When a provider rejects the coordinator
 action schema (HTTP 400), the turn gets one ordinary retry, bounded by the coordinator turn timeout
