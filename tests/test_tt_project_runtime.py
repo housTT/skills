@@ -36615,7 +36615,8 @@ def test_a_task_carrying_a_branch_works_on_it_in_a_worktree_and_publishes_onto_i
     assert _git_out(origin, "rev-parse", b) == _git_out(cwd, "rev-parse", "HEAD")
     # Held by that worktree: the next one works on its own branch from the carried branch's head.
     monkeypatch.chdir(repo)
-    held = p.db.task(p.db.add_task("More PR comments", "s", kind="work", labels=[f"pr_branch:{b}"]))
+    held = p.db.task(p.db.add_task("More PR comments", f"pr_branch: `{b}`", kind="work",
+                                   labels=[f"pr_branch:{b}"]))
     cwd2, branch2 = d._workdir_for(held)
     assert branch2 == f"ttp/t{held['id']}-more-pr-comments"
     assert _git_out(cwd2, "rev-parse", "HEAD") == _git_out(origin, "rev-parse", b)

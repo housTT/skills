@@ -154,9 +154,8 @@ Each field's rules are in the section named; the table only lists them.
   `continues` leaves its dependents blocked. `continues` on a done task adds a follow-up instead:
   it takes over no dependents and a code task starts from the base branch.
 - A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
-  `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line); merely
-  naming the branch carries nothing, and `ttp push --own` refuses another task's branch without
-  that line. A rebase cannot fast-forward a branch: put "rebase" in its title.
+  `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
+  without it `ttp push --own` refuses that branch. A rebase cannot fast-forward a branch: put "rebase" in its title.
   A follow-up carries a branch only through its own `pr_branch:` line; a task that `continues` a
   failed or cancelled one carries its branch, unless its spec names only the push branch, that
   branch was never published, it is a third task's branch no `pr_branch:` line names, or you set
