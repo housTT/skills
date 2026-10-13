@@ -239,7 +239,7 @@ def settle_jev(db: DB, now: float | None = None) -> int:
 def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
            floor: int) -> tuple[str, str, str, dict]:
     """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured and
-    its screening use is on (see jevuse). Each Jev call is logged with the coordinator wake it skipped,
+    its screening use is on (see jevuse). Jev may lower a hinted severity but never raise it. Each Jev call is logged with the coordinator wake it skipped,
     priced at a low-effort coordinator turn, and settled later (settle_jev)."""
     rules = severity = hint or rule_severity(text)
     verdict_src, reason, info = "rules", f"rule severity {severity}", {}
@@ -260,9 +260,13 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                 severity = ["info", "normal", "high", "critical"][max(0, min(3, round(s)))]
                 if p < 0.35:
                     severity = "info"
+                capped = bool(hint) and SEVERITY_RANK.get(severity, 1) > SEVERITY_RANK.get(hint, 1)
+                if capped:   # the watcher's explicit hint is a ceiling: Jev may lower it, never raise it
+                    severity = hint
                 decision = {"rules": rules, "actionable": round(p, 2), "severity": severity,
                             "wake": SEVERITY_RANK.get(severity, 1) >= floor}
-                verdict_src, reason = "jev", f"jev actionable={p:.2f} severity={s:.2f}"
+                verdict_src, reason = "jev", f"jev actionable={p:.2f} severity={s:.2f}" + (
+                    f" (capped at the watcher's hint {hint})" if capped else "")
             if ans is not None:   # it was called and paid for
                 rules_wake = SEVERITY_RANK.get(rules, 1) >= floor
                 jev_wake = SEVERITY_RANK.get(severity, 1) >= floor

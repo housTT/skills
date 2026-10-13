@@ -1164,9 +1164,32 @@ def test_jev_use_that_never_changes_the_rules_decision_is_switched_off_after_idl
     p.db.set_kv(jevuse.OFF_KEY, {})
     cfg = p.config()
     scr.screen(p.db, cfg, "watcher:hw", "box-e: link retry failed", "high", jev=_FakeJev(0.9, 2.0))
-    scr.screen(p.db, cfg, "watcher:hw", "box-f: all fine", "info", jev=_FakeJev(0.9, 3.0))
+    scr.screen(p.db, cfg, "watcher:hw", "box-f: all fine", jev=_FakeJev(0.9, 3.0))
     a, b = p.db.q("SELECT changed FROM jev_calls WHERE use='screen' ORDER BY id DESC LIMIT 2")
     assert (b["changed"], a["changed"]) == (0, 1)
+
+
+def test_jev_never_raises_a_watcher_lines_explicit_severity_hint_but_may_lower_it(env):
+    p = make(env)
+    from ttp.screen import screen
+    p.set_config("jev.uses.screen", "on")
+    cfg = p.config()
+    loud = _FakeJev(0.95, 3.0)
+    # A hinted 'low' line (a recovery) stays low when Jev rates it critical: no coordinator wake.
+    v = screen(p.db, cfg, "watcher:hw", "box-a: recovered after link retry failed", "low", jev=loud)
+    assert loud.calls == 1 and v.severity == "low" and not v.wake
+    assert "capped at the watcher's hint low" in v.reason
+    row = p.db.one("SELECT changed FROM jev_calls WHERE use='screen' ORDER BY id DESC LIMIT 1")
+    assert row["changed"] == 0
+    # Jev may still lower a hinted line.
+    v = screen(p.db, cfg, "watcher:hw", "box-b: link retry failed", "high", jev=_FakeJev(0.1, 0.0))
+    assert v.severity == "info" and not v.wake and v.screen == "jev"
+    # Below the hint it is left as Jev scored it.
+    v = screen(p.db, cfg, "watcher:hw", "box-c: fan slow", "critical", jev=_FakeJev(0.9, 2.0))
+    assert v.severity == "high" and "capped" not in v.reason
+    # A line without a hint keeps today's behaviour: Jev may raise it.
+    v = screen(p.db, cfg, "watcher:hw", "box-d: all fine", jev=loud)
+    assert v.severity == "critical" and v.wake and "capped" not in v.reason
 
 
 def _settle_routine_raise(db, cid):
