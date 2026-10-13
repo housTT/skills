@@ -31867,6 +31867,7 @@ DURABLE_EXEMPT = {
     ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",
     ("archive.py", "os.replace(tmp, dest / tar_name)"): "the tarball is synced before the rename and its directory after",
     ("archive.py", "os.replace(part, to)"): "a big file's copy is synced before the rename and its directory after",
+    ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before its rename",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
