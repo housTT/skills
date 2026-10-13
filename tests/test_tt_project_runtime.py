@@ -13928,8 +13928,14 @@ def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm, service, web
     unit = service._unit_text(p)
-    assert f"WatchdogSec={dm.WATCHDOG_S}\n" in unit and "NotifyAccess=main" in unit and "Restart=always" in unit
-    assert dm.WATCHDOG_S > dm.HEARTBEAT_STALE_S
+    assert "NotifyAccess=main" in unit and "Restart=always" in unit and "WatchdogSignal=SIGUSR1\n" in unit
+    # systemd's own watchdog is the backstop: past ttp.watchdog's third backed-off wait (15, 30, 60 min).
+    from ttp import watchdog
+    assert f"WatchdogSec={service.backstop_s(p)}\n" in unit and service.backstop_s(p) > 4 * watchdog.HANG_S
+    assert watchdog.settings(p)["hang_s"] == watchdog.HANG_S >= dm.WATCHDOG_S > dm.HEARTBEAT_STALE_S
+    units = {path.name: text for path, text in service._watchdog_units(p).items()}
+    assert "OnUnitActiveSec=5min" in units[f"{service.unit_name(p)}-watchdog.timer"]
+    assert "-m ttp.watchdog" in units[f"{service.unit_name(p)}-watchdog.service"]
     addr, cleanup = _short_sock_path("notify.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(addr)
@@ -13974,25 +13980,182 @@ def _stuck_daemon(env, monkeypatch, age):
 
 
 def test_the_watchdog_ends_a_stuck_daemon_after_two_looks_and_says_so(env, monkeypatch):
-    from ttp import watchdog
-    from ttp.daemon import WATCHDOG_S
-    p, proc = _stuck_daemon(env, monkeypatch, age=WATCHDOG_S + 100)
+    from ttp import service, watchdog
+    p, proc = _stuck_daemon(env, monkeypatch, age=watchdog.HANG_S + 100)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "cron", "watchdog": True})
     now = time.time()
     try:
         # A stale heartbeat alone (a laptop just woke from sleep) is only noted.
         assert watchdog.check(p, now=now) == "stale"
         assert watchdog.check(p, now=now + watchdog.CONFIRM_S / 2) == "stale", "a second look too soon"
         assert proc.poll() is None
-        assert watchdog.check(p, now=now + watchdog.CONFIRM_S, grace_s=5) == "restarted"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S, grace_s=5, dump_wait_s=0) == "restarted"
         assert proc.wait(timeout=10) is not None
     finally:
         proc.kill()
         proc.wait()
     assert not (p.state / "watchdog.json").exists()
-    msg = p.db.one("SELECT kind, severity, text FROM messages WHERE ref LIKE 'watchdog:%'")
-    assert msg["kind"] == "info" and msg["severity"] == "low" and "restarted it" in msg["text"], dict(msg)
+    msg = p.db.one("SELECT kind, severity, text FROM messages WHERE ref='daemon-hang'")
+    assert msg["kind"] == "alert" and msg["severity"] == "normal" and "restarted it" in msg["text"], dict(msg)
+    assert "cron service starts a new daemon" in msg["text"]
+    # An old daemon that registered no stack dump is not sent SIGUSR1 (its default action ends it).
+    assert "did not register a stack dump" in pathlib.Path(p.db.kv("daemon_hang")["dump"]).read_text()
     assert "watchdog: daemon pid=" in (p.logs / "daemon.log").read_text()
     assert watchdog.check(p) == "not running"
+
+
+_HUNG_TICK = """import sys
+sys.path.insert(0, sys.argv[2])
+from pathlib import Path
+from ttp.daemon import register_stack_dump
+state = Path(sys.argv[1])
+assert register_stack_dump(state)
+(state / "stub.ready").write_text("1")
+
+
+def tick():
+    while True:
+        pass
+
+
+tick()
+"""
+
+
+def test_a_daemon_hung_inside_a_tick_is_dumped_restarted_alerted_once_and_cleared(env, monkeypatch, tmp_path):
+    from ttp import alerts, service, watchdog
+    p = make(env)
+    stub = tmp_path / "stubs" / "hung_daemon.py"
+    stub.parent.mkdir()
+    stub.write_text(_HUNG_TICK)
+    proc = subprocess.Popen([sys.executable, "-I", str(stub), str(p.state), str(RUNTIME)])
+    live = {proc.pid}
+    monkeypatch.setattr(watchdog, "_is_daemon", lambda pid: pid in live and _alive_child(pid, proc))
+    monkeypatch.setattr(watchdog, "_alive", lambda pid: pid in live and _alive_child(pid, proc))
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    calls = []
+
+    def systemctl(*args, timeout):
+        calls.append(args)
+        if args[0] == "restart":   # systemd ends the hung daemon and starts a new one (this test process)
+            proc.kill()
+            proc.wait()
+            (p.state / "daemon.pid").write_text(str(os.getpid()))
+            live.add(os.getpid())
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(watchdog, "_systemctl", systemctl)
+    try:
+        deadline = time.time() + 30
+        while not (p.state / "stub.ready").exists() and time.time() < deadline:
+            time.sleep(0.1)
+        assert (p.state / "stub.ready").exists(), "the stub daemon never started"
+        (p.state / "daemon.pid").write_text(str(proc.pid))
+        (p.state / "daemon.start").write_text(json.dumps({"pid": proc.pid, "started": time.time() - 3600,
+                                                          "stacks": True}))
+        hb = p.state / "heartbeat"
+        hb.write_text(json.dumps({"pid": proc.pid, "started": time.time() - 3600}))
+        old = time.time() - watchdog.HANG_S - 100
+        os.utime(hb, (old, old))
+        now = time.time()
+        assert watchdog.check(p, now=now) == "stale"
+        assert proc.poll() is None and not calls
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S) == "restarted"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert calls == [("restart", f"{service.unit_name(p)}.service")]
+    rec = p.db.kv("daemon_hang")
+    dump = pathlib.Path(rec["dump"])
+    assert dump.parent == p.state / "incidents" and rec["restarted"] and rec["pid"] == proc.pid
+    text = dump.read_text()
+    assert "most recent call first" in text and "in tick" in text and "hung_daemon.py" in text, text
+    alerts_sent = p.db.q("SELECT severity, text FROM messages WHERE ref='daemon-hang' AND kind='alert'")
+    assert len(alerts_sent) == 1 and alerts_sent[0]["severity"] == "normal"
+    assert "demo" in alerts_sent[0]["text"] and str(dump) in alerts_sent[0]["text"]
+    assert "restarted it" in alerts_sent[0]["text"]
+    assert alerts.holds(p.db, "daemon-hang", now, now)
+    # The new daemon is in its first tick: the incident stays open, nothing is sent again.
+    (p.state / "daemon.start").write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+    assert watchdog.check(p) == "ok" and p.db.kv("daemon_hang")
+    # It completes one: the incident ends and the alert clears itself.
+    (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+    assert watchdog.check(p) == "ok" and not p.db.kv("daemon_hang")
+    closed = alerts.sweep(p.db)
+    assert [ep["key"] for ep in closed] == ["daemon-hang"]
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='daemon-hang' AND kind='alert'")) == 1
+
+
+def _alive_child(pid, proc):
+    return pid != proc.pid or proc.poll() is None
+
+
+@pytest.mark.parametrize("start_ok", [True, False], ids=["escalated", "start-failed"])
+def test_a_restart_that_times_out_is_escalated_and_reported(env, monkeypatch, start_ok):
+    from ttp import service, watchdog
+    p, proc = _stuck_daemon(env, monkeypatch, age=watchdog.HANG_S + 100)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    calls = []
+
+    def systemctl(*args, timeout):
+        calls.append((args[0], timeout))
+        if args[0] == "restart":
+            raise subprocess.TimeoutExpired(["systemctl"], timeout)
+        return subprocess.CompletedProcess(args, 0 if start_ok or args[0] != "start" else 1, "", "no such unit")
+
+    monkeypatch.setattr(watchdog, "_systemctl", systemctl)
+    now = time.time()
+    try:
+        assert watchdog.check(p, now=now) == "stale"
+        found = watchdog.check(p, now=now + watchdog.CONFIRM_S, dump_wait_s=0)
+        assert proc.wait(timeout=10) is not None, "the escalation kills the hung pid"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert calls == [("restart", watchdog.RESTART_TIMEOUT_S), ("stop", watchdog.STOP_TIMEOUT_S),
+                     ("start", watchdog.RESTART_TIMEOUT_S)]
+    how = p.db.kv("daemon_hang")["how"]
+    assert f"timed out after {watchdog.RESTART_TIMEOUT_S} s" in how and f"killed pid {proc.pid}" in how, how
+    msg = p.db.one("SELECT severity, text FROM messages WHERE ref='daemon-hang'")
+    assert "timed out" in msg["text"]
+    if start_ok:
+        assert found == "restarted" and msg["severity"] == "normal"
+    else:
+        assert found == "restart failed" and msg["severity"] == "high" and "could not restart" in msg["text"]
+
+
+def test_a_daemon_that_hangs_again_soon_backs_off_and_escalates_once(env, monkeypatch):
+    from ttp import watchdog
+    p, proc = _stuck_daemon(env, monkeypatch, age=0)
+    p.set_config("watchdog.restarts", 2)
+    restarts = []
+    monkeypatch.setattr(watchdog, "_restart", lambda p, pid, grace_s: (restarts.append(pid) or True, "stub"))
+    hang = watchdog.HANG_S
+
+    def looks(age, now):
+        old = now - age
+        os.utime(p.state / "heartbeat", (old, old))
+        (p.state / "watchdog.json").unlink(missing_ok=True)
+        first = watchdog.check(p, now=now, dump_wait_s=0)
+        return first, watchdog.check(p, now=now + watchdog.CONFIRM_S, dump_wait_s=0)
+
+    t = time.time() - 10000   # every look in the past: a heartbeat's age is never read below 0
+    try:
+        assert looks(hang + 100, t) == ("stale", "restarted")
+        # Hung again soon after: the next restart waits twice as long, not a tight loop.
+        assert looks(hang + 300, t + 1200) == ("stale", "stale")
+        assert len(restarts) == 1
+        assert looks(2 * hang + 100, t + 2400) == ("stale", "restarted")
+        highs = p.db.q("SELECT text FROM messages WHERE ref='daemon-hang' AND severity='high'")
+        assert len(highs) == 1 and "hung 2 times" in highs[0]["text"], highs
+        # A third hang in the same window waits four times as long and escalates no more.
+        assert looks(2 * hang + 300, t + 4800) == ("stale", "stale")
+        assert looks(4 * hang + 100, t + 6000) == ("stale", "restarted")
+        assert len(p.db.q("SELECT id FROM messages WHERE ref='daemon-hang' AND severity='high'")) == 1
+        assert len(restarts) == 3
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_the_watchdog_leaves_a_daemon_that_ticks_again_alone(env, monkeypatch):
@@ -14014,7 +14177,8 @@ def test_the_watchdog_leaves_a_daemon_that_ticks_again_alone(env, monkeypatch):
     finally:
         proc.kill()
         proc.wait()
-    assert not p.db.one("SELECT id FROM messages WHERE ref LIKE 'watchdog:%'")
+    assert not p.db.one("SELECT id FROM messages WHERE ref='daemon-hang'")
+    assert not (p.state / "incidents").exists(), "a fresh heartbeat triggers no dump"
 
 
 def test_launchd_and_cron_run_the_watchdog_and_old_installs_get_it(env, monkeypatch):

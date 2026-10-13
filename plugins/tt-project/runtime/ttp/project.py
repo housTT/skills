@@ -254,6 +254,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
     # does not name the check, before the coordinator is asked once whether the pause is still right.
     "heal": {"escalate": "user", "paused_quiet_s": 21600},
+    # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
+    # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
+    # and the `restarts`-th in that window sends one high alert.
+    "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
     # A conflicting merge queues one harness task a day at most (at once when the last one landed its

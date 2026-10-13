@@ -70,13 +70,14 @@ CLEARED_TEXT = {
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
     "network": "The hosts the queued work waits on answer again; it resumes by itself.",
+    "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 USER_BLOCKERS = ("network",)
 CLEARED_SEVERITY = {"network": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
-STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind")
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -202,6 +203,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool((db.kv("network_outage") or {}).get("alerted"))
     if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
         return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
+    if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
+        return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
                           "AND finalized>=? LIMIT 1", (since,))
@@ -225,7 +228,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "machine", "machine-change", "network", "deploy", "deploy-behind")
+                                         "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang")
 
 
 def _since(ep: dict) -> float:

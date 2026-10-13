@@ -12,6 +12,7 @@ Invariants:
 """
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import json
 import os
@@ -103,6 +104,8 @@ HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a wat
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
+STACKS_FILE = "daemon-stacks.log"   # SIGUSR1 appends every thread's stack here (register_stack_dump)
+STACKS_MAX_BYTES = 1 << 20          # a longer one is started afresh when the daemon starts
 RESULT_FILE = "result.json"
 NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
 NOTIFIES_PER_RUN = 3
@@ -537,6 +540,7 @@ class Daemon:
         self.p.db.x("DELETE FROM kv WHERE key=?", (CLEAN_STOP_KEY,))
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
+        self._stacks = register_stack_dump(self.p.state)
         self._mark_start()
         try:   # a project made before home zones gets one, once (timefmt.migrate)
             if timefmt.migrate(self.p, log=lambda m: log(self.p, m)):
@@ -616,7 +620,8 @@ class Daemon:
         try:
             (self.p.state / "daemon.start").write_text(json.dumps(
                 {"pid": os.getpid(), "host": hostname(), "started": self._started, "tick_errors": self._tick_errors,
-                 "progress": self._progressed or None, "receipt": self.identity}))
+                 "progress": self._progressed or None, "receipt": self.identity,
+                 "stacks": bool(getattr(self, "_stacks", None))}))
         except OSError:
             pass
 
@@ -740,6 +745,9 @@ class Daemon:
         self._progressed = time.time()
         if not self._healthy:
             self._healthy = True
+            hang = self.p.db.kv("daemon_hang")   # ttp.watchdog restarted a hung daemon: this one ticks
+            if hang and hang.get("pid") != os.getpid():
+                self.p.db.set_kv("daemon_hang", None)
             try:
                 head = subprocess.run(["git", "-C", str(self.p.harness), "rev-parse", "HEAD"], capture_output=True,
                                       text=True, timeout=30)
@@ -7735,6 +7743,26 @@ def start_marker(p: Project) -> dict | None:
         return info if isinstance(info, dict) else None
     except (OSError, ValueError):
         return None
+
+
+_STACK_FILE: list = []   # the one file faulthandler writes to, kept open while it is registered
+
+
+def register_stack_dump(state: Path):
+    """SIGUSR1 makes this process append every thread's stack to state/STACKS_FILE (faulthandler: it
+    works while the main thread is stuck, with no py-spy). ttp.watchdog sends it to a hung daemon;
+    the systemd unit's WatchdogSignal too. Returns the open file, or None where it cannot."""
+    path = state / STACKS_FILE
+    try:
+        big = path.exists() and path.stat().st_size > STACKS_MAX_BYTES
+        f = open(path, "w" if big else "a")
+        faulthandler.register(signal.SIGUSR1, file=f, all_threads=True)
+    except (OSError, ValueError, AttributeError, RuntimeError):
+        return None
+    for old in _STACK_FILE:
+        old.close()
+    _STACK_FILE[:] = [f]
+    return f
 
 
 def sd_notify(msg: str, addr: str | None) -> bool:

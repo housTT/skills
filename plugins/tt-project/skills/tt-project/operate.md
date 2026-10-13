@@ -71,10 +71,15 @@
 
 ## Health
 
-- Daemon not running → its service restarts it. "Stuck" (up but no completed tick for 10 min) → its
-  watchdog restarts it (systemd `WatchdogSec`; launchd and cron run `ttp.watchdog` every 5 min). Only a
-  service installed before the watchdog needs `ttp restart <name>` (which adds it); still down →
-  `ttp logs <name>`.
+- Daemon not running → its service restarts it. Hung (alive, but its heartbeat untouched for
+  `watchdog.hang_s`, 900 s by default, never below 600) → `ttp.watchdog`, run every 5 min (a systemd
+  user timer, a launchd agent or the crontab entry), sends it SIGUSR1, saves its thread stacks under
+  `state/incidents/`, restarts it through its service (`systemctl --user restart` with a 60 s timeout,
+  then stop, kill and start) and sends one `daemon-hang` alert naming the dump and the restart's
+  outcome; it clears once a daemon ticks again. Each restart within `watchdog.window_s` (6 h) doubles
+  the next wait; the `watchdog.restarts`-th (3) sends one high alert. systemd's `WatchdogSec` is only
+  the backstop. Only a service installed before the watchdog needs `ttp restart <name>` (which adds
+  it); still down → `ttp logs <name>`.
 - Only one daemon runs per project (a lock file), whatever starts it.
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;

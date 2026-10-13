@@ -21,13 +21,14 @@ from . import credits, heal, identity, obligations, pushq, release, responsibili
 from . import schedule as sched
 from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
-                     WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake)
+                     WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result, task_outcome)
 from .project import Project, durable_write
 from .providers import get_provider
 from .providers.base import FUNDS_RE
+from .watchdog import settings as watchdog_settings
 from .runner import stop_runs
 from .service import down_note, installed
 
@@ -580,7 +581,7 @@ def state_payload(p: Project, db: DB) -> dict:
                     "zone": timefmt.zone_name(p.raw_config())},   # the web app shows every time in it
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
         "gates": {k: {**g, "detail": gate_detail(g, now, tz)} for k, g in db.kv("gates", {}).items()},
-        "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
+        "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,

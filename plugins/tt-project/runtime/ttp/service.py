@@ -7,9 +7,11 @@ a login session and starts at boot. Where linger is refused, a crontab watchdog 
 every 5 minutes) restarts the daemon instead. macOS: a launchd agent with KeepAlive and the
 project folder as working directory (never `/` or the home folder).
 
-A daemon that is alive but stuck (no tick progress for WATCHDOG_S) is restarted too: systemd by
-WatchdogSec (the daemon pings it after each tick and between the steps of a long one), launchd and cron by `ttp.watchdog`, run every
-5 minutes, which ends it so the service starts a new one.
+A daemon that is alive but hung (no tick progress for config `watchdog.hang_s`) is dumped and
+restarted by `ttp.watchdog` (see there), run every 5 minutes: by a systemd user timer, a second
+launchd agent or the crontab entry. systemd's WatchdogSec (the daemon pings it after each tick and
+between the steps of a long one) is the backstop behind it, set past the watchdog's backed-off waits;
+its WatchdogSignal=SIGUSR1 leaves the stacks in state/daemon-stacks.log before systemd kills it.
 """
 from __future__ import annotations
 
@@ -81,8 +83,52 @@ def install(p: Project) -> str:
     return _install_cron(p)
 
 
+def _watchdog_unit(p: Project, ext: str) -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}-watchdog.{ext}"
+
+
+def backstop_s(p: Project) -> int:
+    """systemd's own WatchdogSec: past ttp.watchdog's third backed-off wait, so it acts only where the
+    watchdog timer does not run."""
+    from .watchdog import settings
+    return int(4 * settings(p)["hang_s"] + 300)
+
+
+def _watchdog_units(p: Project) -> dict[Path, str]:
+    """A timer that runs `ttp.watchdog` every 5 minutes, and the oneshot service it starts."""
+    env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
+    return {_watchdog_unit(p, "service"): f"""[Unit]
+Description=tt-project watchdog for {p.name}
+
+[Service]
+Type=oneshot
+WorkingDirectory={p.base}
+ExecStart={' '.join(shlex.quote(a) for a in watchdog_argv(p))}
+{env}
+TimeoutStartSec=300
+""", _watchdog_unit(p, "timer"): f"""[Unit]
+Description=Run the tt-project watchdog for {p.name} every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+"""}
+
+
+def _write_watchdog_units(p: Project) -> bool:
+    """Write the watchdog timer units where they differ; whether any changed."""
+    changed = False
+    for path, text in _watchdog_units(p).items():
+        if not path.exists() or path.read_text(errors="replace") != text:
+            durable_write(path, text)
+            changed = True
+    return changed
+
+
 def _unit_text(p: Project) -> str:
-    from .daemon import WATCHDOG_S
     env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
     return f"""[Unit]
 Description=tt-project daemon for {p.name}
@@ -96,7 +142,8 @@ ExecStart={' '.join(shlex.quote(a) for a in daemon_argv(p))}
 Restart=always
 RestartSec=10
 KillMode=process
-WatchdogSec={WATCHDOG_S}
+WatchdogSec={backstop_s(p)}
+WatchdogSignal=SIGUSR1
 NotifyAccess=main
 
 [Install]
@@ -107,11 +154,14 @@ WantedBy=default.target
 def _install_systemd(p: Project) -> str:
     _unit(p).parent.mkdir(parents=True, exist_ok=True)
     durable_write(_unit(p), _unit_text(p))
+    _write_watchdog_units(p)
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
         return "systemd failed (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
-    return f"systemd user unit {unit_name(p)}"
+    w = _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
+    return f"systemd user unit {unit_name(p)}" + (" with a watchdog timer" if w.returncode == 0 else
+                                                   f" (watchdog timer failed: {w.stderr.strip()[:200]})")
 
 
 def _install_launchd(p: Project) -> str:
@@ -190,6 +240,10 @@ def uninstall(p: Project) -> str:
             _agent(p, wd).unlink(missing_ok=True)
         done.append("launchd")
     unit = _unit(p)
+    if _watchdog_unit(p, "timer").exists():
+        _run("systemctl", "--user", "disable", "--now", _watchdog_unit(p, "timer").name)
+    for ext in ("timer", "service"):
+        _watchdog_unit(p, ext).unlink(missing_ok=True)
     if unit.exists():
         _run("systemctl", "--user", "disable", "--now", unit.name)
         unit.unlink()
@@ -217,7 +271,7 @@ def installed(p: Project) -> dict | None:
     found = None
     unit = _unit(p)
     if unit.exists():
-        found = {"kind": "systemd", "watchdog": "WatchdogSec=" in unit.read_text(errors="replace")}
+        found = {"kind": "systemd", "watchdog": _watchdog_unit(p, "timer").exists()}
     elif sys.platform == "darwin" and _agent(p).exists():
         found = {"kind": "launchd", "watchdog": _agent(p, watchdog=True).exists()}
     elif shutil.which("crontab"):
@@ -230,11 +284,11 @@ def installed(p: Project) -> dict | None:
 
 def down_note(p: Project) -> str:
     """What happens to a daemon that is down or stuck, naming a step only where the harness has none."""
-    from .daemon import WATCHDOG_S
+    from .watchdog import settings
     svc = installed(p)
     if svc and svc["watchdog"]:
         return (f"its {svc['kind']} service restarts it by itself (a stuck one after "
-                f"{WATCHDOG_S // 60} min without a tick)")
+                f"{int(settings(p)['hang_s'] // 60)} min without a tick)")
     if svc:
         return (f"its {svc['kind']} service restarts it if it exits, but predates the watchdog for a stuck "
                 f"one: `ttp restart {p.name}` restarts it and adds the watchdog")
@@ -248,9 +302,13 @@ def refresh(p: Project) -> None:
     """Bring an installed service up to date with this runtime (a service installed before the
     watchdog existed gets it) without starting or stopping anything."""
     unit = _unit(p)
-    if unit.exists() and unit.read_text(errors="replace") != _unit_text(p):
-        durable_write(unit, _unit_text(p))
-        _run("systemctl", "--user", "daemon-reload")
+    if unit.exists():
+        changed = unit.read_text(errors="replace") != _unit_text(p)
+        if changed:
+            durable_write(unit, _unit_text(p))
+        if _write_watchdog_units(p) or changed:
+            _run("systemctl", "--user", "daemon-reload")
+            _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
     if sys.platform == "darwin" and _agent(p).exists() and not _agent(p, watchdog=True).exists():
         _install_launchd_watchdog(p)
     if shutil.which("crontab"):
