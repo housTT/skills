@@ -341,6 +341,8 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         row["daemon_state"] = daemon
         tid = _holder(db, state)
         row["merge_pending"] = bool(tid and not at_target)
+        r = db.one("SELECT value FROM kv WHERE key='paused'")
+        row["paused"] = bool(r and r["value"] in ("true", "1"))
         auto, _ = db.kv(KV_AUTO)
         if auto.get("outcome") == "failed" and _concerns(auto, target, commit):
             row["upgrade_error"] = auto.get("why") or "the last upgrade failed"
@@ -351,8 +353,11 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             from .release import STALE_S, task_activity
             task, last = task_activity(db, tid)
             row["merge_owner"] = f"harness task #{tid}"
-            if task and last:
-                row["takeover_at"] = now if task["status"] == "blocked" else last + STALE_S
+            if task and last:   # a paused project's task cannot run: its merge is taken over (deploy.py) now
+                row["takeover_at"] = now if task["status"] == "blocked" or row["paused"] else last + STALE_S
+        elif row["paused"] and not at_target:
+            # Nothing upgrades a paused project by itself: the host-side takeover merges its files now.
+            row.update(merge_pending=True, merge_owner="the host-side takeover (project paused)", takeover_at=now)
         if not pid:
             if not at_target:
                 return done(PENDING, *_behind(name, db, state, files, now, where))

@@ -4158,8 +4158,13 @@ class Daemon:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and
         the web app say so while it is. With upgrade.auto on, and no push or upgrade in flight, start
         this project's own `ttp upgrade` once per strictly newer release; it restarts this daemon,
-        keeping workers. The same version from another commit is only shown."""
+        keeping workers. The same version from another commit is only shown. A project that was paused is
+        checked on its first tick after the resume: the upgrade the pause held back starts then."""
         now = time.time()
+        paused = bool(self.p.db.kv("paused", False))
+        if getattr(self, "_release_paused", False) and not paused:
+            self._release_due = 0.0
+        self._release_paused = paused
         if now < self._release_due:
             return
         self._release_due = now + release.CHECK_S

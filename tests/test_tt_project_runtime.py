@@ -12616,6 +12616,53 @@ def test_a_host_upgrade_takes_over_from_the_named_task_past_its_deploy_deadline(
     assert p.db.task(tid)["status"] == "cancelled" and release.fenced(p, tid) and restarts == [1]
 
 
+def test_a_paused_project_gets_the_files_only_upgrade_and_stays_paused(env, monkeypatch, capsys):
+    """A paused project's merge task never runs, so a host-side takeover named a superseded task, deferred
+    to the open one with exit 75 on every try and the project stayed on an old release. Now a clean merge
+    lands without that task: the files merge, the task is superseded, the daemon restarts, and the pause,
+    config and the rest of the queue stay as they were."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    other = p.db.add_task("unrelated work", "x")
+    p.db.set_paused(True)
+    cfg, charter = p.config(), p.charter_path.read_text()
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--take-over-from", str(tid - 1)])      # the replay named an older task
+    out = capsys.readouterr().out
+    assert f"demo is paused: merged its files without harness task #{tid}" in out and restarts == [1]
+    assert p.db.task(tid)["status"] == "cancelled" and release.fenced(p, tid) and not release.finish_holder(p)
+    assert p.db.kv("paused") is True and p.db.task(other)["status"] == "queued"
+    assert p.config() == cfg and p.charter_path.read_text() == charter
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 1
+
+
+def test_a_paused_project_whose_merge_needs_its_task_upgrades_when_resumed(env, monkeypatch, capsys):
+    """The merge conflicts and only the project's own harness task may resolve it: the host-side upgrade
+    of a paused project exits 75 saying so, supersedes nothing and queues nothing; the open task is
+    retargeted to the release and finishes it once the project is resumed."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    p.db.set_paused(True)
+    _next_release(env)
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    for argv in (["upgrade", "demo", "--take-over-from", str(tid)], ["upgrade", "demo"]):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 75 and "demo paused; upgrades when resumed" in capsys.readouterr().out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [tid]
+    assert p.db.task(tid)["status"] == "queued" and not release.fenced(p, tid) and not restarts
+    assert "bbbb2222" in p.db.task(tid)["spec"] and release.finish_holder(p)["task"] == tid
+    assert _git_out(p.harness, "rev-parse", "HEAD") == head and p.db.kv("paused") is True
+
+
 def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
     """The once-a-day merge task limit counted from the last task's creation, also for a host-side
     upgrade: a project with local edits trailed each release by up to a day. Now a host-side upgrade
@@ -12677,6 +12724,19 @@ def test_a_conflict_after_a_merge_task_that_landed_queues_the_next_one_at_once(e
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo", *argv])
     assert e.value.code == 75 and len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+
+
+def test_check_release_runs_on_the_first_tick_after_a_resume(env, monkeypatch):
+    """A paused project skips its automatic upgrade; once resumed it starts it at once, not up to an hour
+    later at its next hourly release check."""
+    p, d, launches = _release_daemon(env, monkeypatch)
+    p.db.set_paused(True)
+    d.check_release()
+    d.check_release()
+    assert not launches
+    p.db.set_paused(False)
+    d.check_release()
+    assert launches == [p.base]
 
 
 def test_check_release_escalates_a_stuck_finish_task_once_across_restarts(env, monkeypatch):
@@ -50272,6 +50332,83 @@ def test_a_stuck_project_alert_pages_again_only_when_it_gets_worse(env, tmp_path
     ep = p.db.one("SELECT * FROM alerts WHERE cleared IS NULL")
     assert ep['severity'] == 'high' and 'tt-project 0.5.2 ' in ep['text']
     assert 'tt-project 0.5.2 ' in p.db.one("SELECT text FROM messages WHERE id=?", (ep['message'],))['text']
+
+
+def _paused_behind(tmp_path, name='gamma'):
+    """A registered project, paused, one release behind, whose template merge task is queued and never ran."""
+    from ttp import release
+    base, db = _deploy_project(tmp_path, name, '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (time.time() - 3600, time.time() - 3600, tid))
+    db.set_paused(True)
+    return base, db, tid
+
+
+def test_a_paused_projects_deferred_takeover_is_one_low_note_and_upgrades_when_resumed(env, tmp_path):
+    """Replays a paused project behind a release: its merge task could never run, the host-side takeover
+    exited 75 on every try, no takeover.log was under its own logs, and after_push paged 'missed takeover'
+    for every release. Now the paused project is taken over at once; a takeover that defers (exit 75) is
+    logged in that project's own logs/takeover.log, gets one low note and no page and is not retried, and
+    once the project is resumed its own upgrade runs and the check closes."""
+    from ttp import deploy, overview, project
+    p = make(env)
+    _deploy_lib('0.5.0')
+    ttp = project.HOME_DIR / 'lib' / 'current' / 'bin' / 'ttp'
+    ttp.parent.mkdir(parents=True, exist_ok=True)
+    ttp.write_text("import sys\nprint('upgrade not applied: gamma paused; upgrades when resumed')\nsys.exit(75)\n")
+    base, db, tid = _paused_behind(tmp_path)
+    now = time.time()
+    report = deploy.record(p, overview.deployed(names=['gamma']), now)
+    assert report['rc'] == 0 and report['projects'][0]['outcome'] == 'pending'
+    rec = p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']
+    assert rec['takeover_at'] <= now + 1, "a paused project's merge task cannot run: no 6 h wait"
+    pages, page = _deploy_pager(p)
+    t = rec['due'] + 1
+    for _ in range(40):                                  # well past every try and settle time
+        deploy.tick(p, page, t)
+        for child in deploy._children.values():
+            child.wait()
+        t += deploy.PROBE_S
+    log = base / 'state' / 'logs' / 'takeover.log'
+    text = log.read_text()
+    assert text.count(f'ttp upgrade gamma --take-over-from {tid}') == 1, 'tried once, not retried while paused'
+    assert 'takeover ended: exit 75 (deferred' in text and 'gamma paused; upgrades when resumed' in text
+    notes = p.db.q("SELECT severity, text FROM messages WHERE direction='out' AND text LIKE '%upgrades when resumed%'")
+    assert len(notes) == 1 and notes[0]['severity'] == 'low'
+    assert not pages and not p.db.q('SELECT * FROM alerts') and not deploy.holds(p.db, '0.5.0', t)
+    assert p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['outcome'] == 'pending'
+    assert not (p.logs / 'takeover.log').exists()
+    db.set_paused(False)                                 # resumed: its own merge task takes the upgrade on
+    deploy.tick(p, page, t)
+    rec = p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']
+    assert rec['outcome'] == 'pending' and rec['due'] >= t + deploy.RESUME_GRACE_S - 1 and not pages
+    assert 'gamma was resumed' in log.read_text()
+    _deploy_catch_up(base, db, '0.5.0', DEPLOY_C, t + 600)
+    deploy.tick(p, page, t + 700)
+    assert p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['closed'] and not pages
+    assert len(p.db.q("SELECT id FROM messages WHERE direction='out' AND text LIKE '%upgrades when resumed%'")) == 1
+
+
+def test_a_paused_project_upgraded_by_the_takeover_closes_and_stays_paused(env, tmp_path, monkeypatch):
+    """The files-only takeover of a paused project lands the release (its daemon restarts, still paused):
+    the check closes with no page and no pause note, and the end is in the project's takeover log."""
+    from ttp import deploy, overview
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db, tid = _paused_behind(tmp_path)
+    now = time.time()
+    deploy.record(p, overview.deployed(names=['gamma']), now)
+    due = p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['due']
+    launched = _fake_takeovers(monkeypatch, deploy, lambda name: _deploy_catch_up(base, db, '0.5.0', DEPLOY_C, due + 30))
+    pages, page = _deploy_pager(p)
+    deploy.tick(p, page, due + 1)
+    for child in deploy._children.values():
+        child.wait()
+    deploy.tick(p, page, due + 1 + deploy.PROBE_S)
+    assert launched == [('gamma', tid)] and not pages
+    assert p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['closed'] and db.kv('paused') is True
+    assert not p.db.q("SELECT id FROM messages WHERE text LIKE '%upgrades when resumed%'")
+    assert 'takeover ended: exit 0' in (base / 'state' / 'logs' / 'takeover.log').read_text()
 
 
 def test_a_repeat_merge_owner_keeps_its_first_takeover_deadline(env, tmp_path):

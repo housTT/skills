@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from . import overview, project, timefmt
 from .db import SEVERITY_RANK
@@ -27,6 +28,8 @@ TAKEOVERS = "deploy_takeovers"   # project name -> the host-side takeover attemp
 TAKEOVER_TRIES = 3
 TAKEOVER_SETTLE_S = 300          # after an attempt ends, its daemon has this long to report the release
 TAKEOVER_TIMEOUT_S = 900         # an attempt running this long is over (stopped, when this daemon started it)
+RESUME_GRACE_S = 6 * 3600        # a paused project's upgrade, once it is resumed, is its own again for this long
+PAUSED_NOTE = "{name} paused; upgrades when resumed"
 _children: dict[str, subprocess.Popen] = {}   # this daemon's own attempts, by project name
 
 
@@ -95,8 +98,8 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
 
 def _failing(db, recs: list, now: float) -> bool:
     takeovers = db.kv(TAKEOVERS) or {}
-    return any(rec and not rec.get("closed") and _takeover(None, rec, *assess(rec, _probe(rec, now), now),
-                                                           dict(takeovers.get(rec["name"]) or {}), now)[0] == "failed"
+    return any(rec and not rec.get("closed") and _judge(None, rec, _probe(rec, now), dict(takeovers.get(rec["name"]) or {}),
+                                                        now)[0] == "failed"
                for rec in recs)
 
 
@@ -130,32 +133,59 @@ def _vnum(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v or ""))
 
 
+def _judge(p, rec: dict, row: dict, t: dict, now: float, start: bool = False) -> tuple[str, str, str]:
+    """assess, then _takeover: the outcome of one probe `row` of `rec`."""
+    return _takeover(p, rec, *assess(rec, row, now, p), t, now, start, paused=bool(row.get("paused")))
+
+
 def _owner_task(rec: dict) -> int | None:
     m = re.fullmatch(r"harness task #(\d+)", str(rec.get("owner") or ""))
     return int(m[1]) if m else None
 
 
+def takeover_log(p, name: str) -> Path:
+    """The takeover log of project `name`: its own state/logs/takeover.log, where whoever looks into its
+    upgrade looks; this (reporting) project's logs only when its folder is unknown."""
+    d = ((project.load_registry().get("projects") or {}).get(name) or {}).get("dir")
+    return Path(str(d)) / project.FOLDER / "state" / "logs" / "takeover.log" if d else p.logs / "takeover.log"
+
+
+def _log(p, name: str, line: str) -> None:
+    """One line of what the takeover did, or why it did not, in `name`'s takeover log (best effort)."""
+    try:
+        path = takeover_log(p, name) if p is not None else None
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as log:
+                log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+    except OSError:
+        pass
+
+
 def launch_takeover(p, name: str, task: int | None) -> subprocess.Popen:
     """Start the installed release's host-side `ttp upgrade <name>`, taking the merge over from harness task
     `task` (past its deadline), in a session of its own: a restart of this daemon leaves it running. Its
-    output goes to this project's logs/takeover.log."""
+    output goes to `name`'s own logs/takeover.log (takeover_log)."""
     from .release import installed
     ttp = installed() / "bin" / "ttp"
     if not ttp.is_file():
         raise FileNotFoundError(f"no installed release at {ttp}")
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PROJECT", "TTP_TASK", "TTP_RUN_DIR")}
     argv = [sys.executable, str(ttp), "upgrade", name] + (["--take-over-from", str(task)] if task else [])
-    p.logs.mkdir(parents=True, exist_ok=True)
-    with open(p.logs / "takeover.log", "a") as log:
-        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {' '.join(argv[3:])}\n")
+    path = takeover_log(p, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as log:
+        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {' '.join(argv[3:])} (host-side takeover "
+                  f"by {p.name})\n")
         log.flush()
         return subprocess.Popen(argv, cwd=str(p.base), env=env, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
 
 
-def _reap(name: str, t: dict, now: float) -> None:
+def _reap(name: str, t: dict, now: float, p=None) -> None:
     """Record the end of `name`'s running attempt: its exit code when this daemon started it, else once its
-    process is gone (a restart or a reboot in between). An attempt past TAKEOVER_TIMEOUT_S is over."""
+    process is gone (a restart or a reboot in between). An attempt past TAKEOVER_TIMEOUT_S is over. The end
+    goes to its takeover log too (exit 75: deferred, nothing changed; its output above says why)."""
     pid = int(t.get("pid") or 0)
     if not pid:
         return
@@ -178,31 +208,60 @@ def _reap(name: str, t: dict, now: float) -> None:
             return
         rc = "timed out" if late else "unknown (it ended while this daemon was down)"
     t.update(pid=None, ended=now, rc=rc if isinstance(rc, str) else f"exit {rc}")
+    _log(p, name, f"takeover ended: {t['rc']}" + (" (deferred: nothing was changed)" if t["rc"] == "exit 75" else ""))
 
 
 def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: float,
-              start: bool = False) -> tuple[str, str, str]:
+              start: bool = False, paused: bool = False) -> tuple[str, str, str]:
     """A merge past its takeover deadline is taken over, not only reported: a host-side `ttp upgrade` runs
     (`start`, by the daemon's tick; started from the first probe past the deadline, also after a restart or
     a reboot), up to TAKEOVER_TRIES times, TAKEOVER_SETTLE_S apart. Meanwhile it is pending; it fails (and
     pages) only once every try ended and the project's own daemon still does not report the release.
+    A `paused` project's upgrade merges its files and restarts it, still paused; one that defers (exit 75:
+    the merge needs its harness task) is parked, not retried: pending ("paused"), one low note, and once
+    the project is resumed its own task and daemon get RESUME_GRACE_S before the takeover is due again.
     `t` is the project's attempt record, updated in place."""
+    name = rec["name"]
+    if t.get("noted") and not paused:       # resumed: the upgrade is the project's own again, for a while
+        t.pop("noted", None)
+        t.pop("parked", None)
+        t["tries"] = 0
+        rec["due"] = max(float(rec.get("due") or 0), now + RESUME_GRACE_S)
+        if p is not None:
+            _log(p, name, f"{name} was resumed: its own merge task and daemon take the upgrade on; the takeover "
+                          f"is due again at {timefmt.long(rec['due'], p)} if it is still behind")
+        if outcome == "failed" and kind == "missed":
+            return "pending", "", f"resumed; its own upgrade runs now; {reason}"
     if outcome != "failed" or kind != "missed" or rec.get("restart"):
         return outcome, kind, reason
     tries = int(t.get("tries") or 0)
     if t.get("pid"):
         return "pending", "", f"host-side takeover running (try {tries} of {TAKEOVER_TRIES}); {reason}"
+    if paused and (t.get("parked") or (tries and t.get("rc") == "exit 75")):
+        if p is not None and not t.get("parked"):
+            t["parked"] = now
+            _log(p, name, PAUSED_NOTE.format(name=name) + f": the takeover deferred (exit 75: the merge needs its "
+                          f"harness task, which runs only once {name} is resumed); not retried while it is paused")
+        if p is not None and not t.get("noted"):
+            t["noted"] = now
+            p.db.post("out", PAUSED_NOTE.format(name=name) + f" (tt-project {rec['target']}: its template merge "
+                      f"needs its own harness task; nothing to do).", kind="info", severity="low")
+        return "pending", "paused", f"{PAUSED_NOTE.format(name=name)}; {reason}"
     if tries and now < float(t.get("ended") or 0) + TAKEOVER_SETTLE_S:
         return "pending", "", f"host-side takeover ended ({t.get('rc')}); its daemon is checked again; {reason}"
     if tries >= TAKEOVER_TRIES:
+        if p is not None and not t.get("gave_up"):
+            t["gave_up"] = now
+            _log(p, name, f"takeover not retried: tried {tries} time{'s' if tries > 1 else ''}, last {t.get('rc')}")
         return "failed", kind, (f"{reason}; host-side takeover tried {tries} time{'s' if tries > 1 else ''}, "
-                                f"last {t.get('rc')} (see logs/takeover.log)")
+                                f"last {t.get('rc')} (see {name}'s logs/takeover.log)")
     if not start:
         return "pending", "", f"host-side takeover due now; {reason}"
     try:
         child = launch_takeover(p, rec["name"], _owner_task(rec))
     except OSError as e:
         t.update(tries=TAKEOVER_TRIES, ended=None, rc=f"could not start ({e})")   # a new release tries again
+        _log(p, rec["name"], f"takeover could not start: {e}")
         return "failed", kind, f"{reason}; host-side takeover could not start: {e}"
     _children[rec["name"]] = child
     t.update(tries=tries + 1, pid=child.pid, started=now, ended=None, rc=None)
@@ -303,9 +362,11 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 rec.update(owner=row.get("merge_owner"), takeover_at=min([at] + earlier) if at else at)
                 rec["due"] = rec["takeover_at"] + GRACE_S if rec["takeover_at"] else now
             if not same and not rec.get("restart"):
-                takeovers.setdefault(row["name"], {})["tries"] = 0     # a new release gets its own tries
-            outcome, kind, reason = _takeover(p, rec, *assess(rec, row, now, p),
-                                              takeovers.setdefault(row["name"], {}), now)
+                t = takeovers.setdefault(row["name"], {})
+                t["tries"] = 0     # a new release gets its own tries (a paused project: its own files-only try)
+                t.pop("parked", None)
+                t.pop("gave_up", None)
+            outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(row["name"], {}), now)
             row["outcome"] = outcome
             if outcome == "done" and not old:
                 rows.append(row)
@@ -315,7 +376,7 @@ def record(p, report: dict, now: float | None = None) -> dict:
             if outcome == "failed":
                 rec.pop("closed", None)
                 failed.append((rec, kind, reason, _mark(rec, kind, now)))
-            elif outcome == "pending" and not was_pending:
+            elif outcome == "pending" and not was_pending and kind != "paused":
                 at = timefmt.long(max(rec["takeover_at"], now), p)
                 pending.append(f"{row['name']}: restart onto the new files pending, owner {rec['owner']}, "
                                f"re-checked {at}" if rec.get("restart") else
@@ -352,15 +413,15 @@ def tick(p, alert, now: float | None = None) -> None:
         changed = before != {k: bool(r.get("closed")) for k, r in checks.items()}
         takeovers = p.db.kv(TAKEOVERS) or {}
         for name, t in takeovers.items():
-            _reap(name, t, now)
+            _reap(name, t, now, p)
         failing: list = []
         for key, rec in checks.items():
             if rec.get("closed") or now < float(rec.get("next_probe") or 0):
                 continue
             rec["next_probe"] = now + PROBE_S
             changed = True
-            outcome, kind, reason = _takeover(p, rec, *assess(rec, _probe(rec, now), now, p),
-                                              takeovers.setdefault(rec["name"], {}), now, start=True)
+            outcome, kind, reason = _judge(p, rec, _probe(rec, now), takeovers.setdefault(rec["name"], {}), now,
+                                           start=True)
             _settle(rec, outcome, now)
             if outcome == "failed" and _mark(rec, kind, now):
                 failing.append((rec, kind, reason))

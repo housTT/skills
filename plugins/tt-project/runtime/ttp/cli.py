@@ -3294,7 +3294,11 @@ def cmd_upgrade(a) -> None:
         holder = release.finish_holder(p, clean=True)
         tid = holder["task"] if holder else None
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
-        took = False
+        took, parked = False, None
+        if tid and not mine and a.apply is None and not a.auto and not own and p.db.kv("paused", False):
+            # A paused project's merge task cannot run: the merge is tried here, files only, and the task
+            # is superseded only once it merged cleanly; a conflict leaves it to finish after the resume.
+            parked, holder, tid = holder, None, None
         if tid and not mine and a.apply is None and not a.auto and not own:
             took = _take_over_finish(p, holder,     # a blocked or idle task cannot hold off a host-side upgrade
                                      overdue=getattr(a, "take_over_from", None) == tid)
@@ -3316,7 +3320,7 @@ def cmd_upgrade(a) -> None:
         if a.apply is not None:
             _apply_upgrade(p, a.apply)
         else:
-            _upgrade(p, a.auto, explicit=not a.auto and not own, took_over=took)
+            _upgrade(p, a.auto, explicit=not a.auto and not own, took_over=took, parked=parked)
     except SystemExit as e:
         if a.auto and e.code and (p.db.kv(release.KV_AUTO) or {}).get("outcome") == "running":
             release.finish(p, "failed", why=f"exit {e.code}; see logs/upgrade.log")
@@ -3359,10 +3363,13 @@ def _take_over_finish(p: Project, holder: dict, overdue: bool = False) -> bool:
     return True
 
 
-def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: bool = False) -> None:
+def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: bool = False,
+             parked: dict | None = None) -> None:
     """`explicit`: run by hand on the host, not --auto and not from one of the project's runs. A conflict
     then queues the merge task once the last one ended upgrade.merge_retry_h ago (`took_over`: at once,
-    the last one was just superseded), not only once a day."""
+    the last one was just superseded), not only once a day. `parked`: the project is paused and this finish
+    task holds the merge: a clean merge supersedes it and lands (the daemon restarts, still paused); a
+    conflict retargets it and exits 75, the task finishing it once the project is resumed."""
     from . import release
     from .project import HOME_DIR
     src = HOME_DIR / "lib" / "current"
@@ -3390,6 +3397,11 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     _snapshot_upstream(p, src, new_v, new_c, ident)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
+    if problem and parked:      # the open task is retargeted (exit 75); nothing is queued while paused
+        print(f"{p.name} paused; upgrades when resumed: the merge needs harness task #{parked['task']}, which "
+              f"runs once {p.name} is resumed. Nothing else was changed.")
+        _retarget_upgrade_task(p, parked, False)
+        sys.exit(75)
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
@@ -3457,6 +3469,10 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                    f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
     if hasattr(os, "sync"):
         os.sync()       # a reboot right after must not leave the files git just wrote empty
+    if parked:      # merged without its worker: the paused project's finish task has nothing left to do
+        release.fence(p, parked["task"], f"{new_v} ({new_c})")
+        print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
+              f"(superseded); the daemon restarts and the project stays paused")
     release.clear_stuck(p)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
