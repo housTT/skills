@@ -51,7 +51,8 @@ Reads code only; never touches a device. Every count must survive
    - `Status legend`: one bullet per status value used, defined for this run's targets.
    - `Findings`: three to six bullets a reader acts on, each with its numbers: launches per
      inference as the validator's range and the tighter executable range when known, status counts
-     where they matter, the port blockers that decide the outcome.
+     where they matter, the port blockers that decide the outcome. For a Quasar target, how many
+     `✅` rest on a TTsim run, a release document, or test markers alone (target-status.md).
    - `Cleanup found on the way` (only when there is one): inefficiencies in the model code noticed
      while tracing, with the call site and what would remove them.
    - `Open items`: `unverified` rows, runtime-dependent launches, measurements not run yet.

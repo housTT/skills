@@ -75,7 +75,10 @@ several cores, `in0_num_blocks_w > 1`).
 1. Find the Quasar tests that call this kernel op: the model's Quasar op tests, the Quasar unit
    tests under `tests/ttnn/**/quasar/`, and the rows of `tests/scripts/quasar/*.yaml`. Read each
    candidate test: its parameters, markers and comments.
-2. Decide:
+2. Read the release documents at the pinned SHA (`releases/<version>/*milestones-and-tests*.md`)
+   for the tests found and for any end-to-end model run on Quasar. They record what was run on a
+   simulated Quasar for a release, so they outrank test comments (see "Sources of evidence").
+3. Decide:
 
 | Status | When | Evidence names |
 |---|---|---|
@@ -101,6 +104,24 @@ several cores, `in0_num_blocks_w > 1`).
   cite both; a comment elsewhere saying "fixed" does not override a live reproducer without a run.
 - A failure applies to every row with the same kernel op key. A failure for another factory,
   layout or dtype does not.
+
+## Sources of evidence
+
+Strongest first; a stronger source decides over a weaker one for the same kernel op key:
+
+1. A TTsim run of this analysis (`kernel_tests.py`); the evidence starts with `TTsim run:`.
+2. A release document at the pinned SHA. A test it lists as passing gives `✅`; one it lists as not
+   supported gives `❌`, unless a later milestone of the same or a later document verifies it. An
+   end-to-end run it records as verified gives `✅` to every kernel op key that run launches,
+   traced through the model it ran: same op, factory, layout and dtype, whatever its batch or grid.
+   When that run needed an environment workaround on this path (a forced program route, a debug
+   mask over a known hazard), the status is `⚠️` and the evidence names the workaround. The
+   evidence starts with `Release <version> <milestone>:`.
+3. Test markers and comments, as in the table above.
+4. The fork code alone (`⚠️` for a usable factory, `❌` for a missing one).
+
+A release record that contradicts a marker at the pinned SHA (a test listed as passing but marked
+`xfail`) gives `⚠️` citing both. `summary.md` says how many `✅` rest on each source.
 
 ## Quasar facts to verify at the pinned commit
 
