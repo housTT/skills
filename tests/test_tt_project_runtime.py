@@ -34181,6 +34181,102 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     assert feature_blocks(text, {"x"}) == "a\nb\n"
     assert feature_blocks(text, {"x", "y"}) == "a\nb\nc\n"
 
+
+def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small(env, monkeypatch):
+    import inspect, json as _json, re as _re
+    from ttp import machines, prompts
+    from ttp.prompts import feature_blocks, worker_features, worker_system
+    p = make(env)
+    monkeypatch.setattr(machines, "load", lambda: {})
+    src = (p.harness / "prompts" / "worker.md").read_text()
+    code, question = {"kind": "code", "title": "t"}, {"kind": "question", "title": "t"}
+    # The rules a code or a question task reads on every call stay under their budgets (they had
+    # grown to 20.5k chars for every task, shared clusters, device runners and remote drivers included).
+    rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
+    assert len(rules["code"]) <= 13_500, len(rules["code"])
+    assert len(rules["question"]) <= 10_000, len(rules["question"])
+    every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
+    assert len(every) <= 17_000, len(every)
+    for t in (None, code, question):
+        system = worker_system(p, t)
+        assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
+        assert len(system) <= 16_000, len(system)
+    # Every fence names a feature worker_features can turn on, and each opens and closes once.
+    known = set(_re.findall(r'on\.add\("(\w+)"\)', inspect.getsource(worker_features))) | {"harness"}
+    opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
+    closes = _re.findall(r"<!-- /ttp:if (!?)(\w+) -->", src)
+    assert opens and sorted(opens) == sorted(closes)
+    assert {n for _, n in opens} <= known, {n for _, n in opens} - known
+    # Safety rules every task keeps, whatever is on.
+    for text in rules.values():
+        assert "Stop only processes you started, by their pid" in text
+        assert "change ledger" in text and "`ttp lock <resource> -- <command>`" in text
+        assert "No `result.json`, no credit" in text and "NEVER poll, sleep-wait" in text
+
+    def rendered(task):
+        return worker_system(p, task)
+    # PR rules: only kinds that may deliver; every other task is told it never touches a PR.
+    for kind in ("code", "review"):
+        assert "NEVER mark a PR ready for review" in rendered({"kind": kind})
+    for kind in ("question", "work", "plan", "harness"):
+        s = rendered({"kind": kind})
+        assert "NEVER mark a PR ready for review" not in s and "Never open, update or close a pull request" in s
+    # Waiting detail (drivers, on_pass_cmd, wake tiers) only for kinds that can wait.
+    assert "on_pass_cmd" in rendered(code) and "Prefer `on_pass_cmd`" in rendered(code)
+    for t in (question, {"kind": "plan"}):
+        s = rendered(t)
+        assert "on_pass_cmd" not in s and "wake_tier" not in s
+        assert "`waiting` when a resource is busy" in s, "the waiting basics stay for every kind"
+    # Harness-only rules only for harness tasks.
+    assert "only this project's own harness" in rendered({"kind": "harness"})
+    assert "only this project's own harness" not in rendered(code)
+    assert "--purpose harness" in rendered({"kind": "harness"}) and "--purpose harness" not in rendered(code)
+    # Nothing configured: no device, runner, remote-driver or cluster rules.
+    for marker in ("TTP_NO_DEVICE=1", "ttp devq submit", "ttp detach --remote", "## Shared clusters", "needs_deep"):
+        assert marker not in rendered(code), marker
+    # A device lock, a device task, a device machine named in the charter, or this host being one.
+    p.set_config("device", {"locks": ["box-device"]})
+    assert "TTP_NO_DEVICE=1" in rendered(code) and "needs_deep" in rendered(code)
+    p.set_config("device", {})
+    assert "TTP_NO_DEVICE=1" in rendered({"kind": "code", "labels": _json.dumps(["needs_device"])})
+    assert "TTP_NO_DEVICE=1" not in rendered(code)
+    monkeypatch.setattr(machines, "load", lambda: {"box1": {"tags": ["device"]},
+                                                    "hpc1": {"tags": ["slurm"]}})
+    assert "TTP_NO_DEVICE=1" not in rendered(code), "a device machine no one names is not this project's"
+    charter = p.charter_path.read_text()
+    p.charter_path.write_text(charter + "\n## Resources\n- box1 for tests.\n")
+    assert "TTP_NO_DEVICE=1" in rendered(code) and "## Shared clusters" not in rendered(code)
+    assert "ttp detach --remote" not in rendered(code), "a charter machine alone needs no remote driver"
+    # A task naming a machine gets the remote-driver rules; a question cannot wait, so it does not.
+    named = {"kind": "code", "title": "run the suite on box1"}
+    assert "ttp detach --remote" in rendered(named)
+    assert "ttp detach --remote" not in rendered({**named, "kind": "question"})
+    # A Slurm machine named in the charter, or Resources mentioning a cluster, brings the cluster rules.
+    p.charter_path.write_text(charter + "\n## Resources\n- hpc1 nodes n1, n2.\n")
+    assert "## Shared clusters" in rendered(code)
+    p.charter_path.write_text(charter + "\n## Resources\n- The lab's Slurm cluster, nodes n1 and n2.\n")
+    monkeypatch.setattr(machines, "load", lambda: {})
+    assert "## Shared clusters" in rendered(code) and "TTP_NO_DEVICE=1" not in rendered(code)
+    p.charter_path.write_text(charter)
+    assert "## Shared clusters" not in rendered(code)
+    # Device runners bring the device, devq and (for a runner on another host) remote rules.
+    p.set_config("device", {"runners": {"r1": {"command": "true"}}})
+    s = rendered(code)
+    assert "ttp devq submit" in s and "TTP_DEVQ_TIMEOUT_S" in s and "TTP_NO_DEVICE=1" in s
+    assert "ttp detach --remote" not in s
+    p.set_config("device", {"runners": {"r1": {"host": "box9", "command": "true"}}})
+    assert "ttp detach --remote" in rendered(code)
+    assert "ttp devq submit" not in rendered(question), "a question never waits on a runner"
+    p.set_config("device", {})
+    # This machine tagged `device` brings the device rules for every task.
+    monkeypatch.setattr(machines, "load", lambda: {"here1": {"tags": ["device"]}})
+    monkeypatch.setenv("TTP_HOST", "here1")
+    assert "TTP_NO_DEVICE=1" in rendered(question)
+    # The daemon renders the prompt for the task it starts.
+    assert "task" in inspect.signature(worker_system).parameters
+    assert prompts.worker_system is worker_system
+
+
 # --- PRs leave draft only with the user's recorded approval ---------------------------------------
 
 HEAD = "a" * 40   # the head commit pr-watch read and the fake gh reports, unless a test moves it

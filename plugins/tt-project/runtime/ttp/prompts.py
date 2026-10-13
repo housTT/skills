@@ -19,9 +19,12 @@ from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_pus
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
 
 
-def _read(p: Project, name: str) -> str:
+def _read(p: Project, name: str, on: set[str] | None = None) -> str:
+    """Harness prompt `name`, without its fences; `on`: also without the blocks of features not in it."""
     f = p.harness / "prompts" / name
-    return strip_markers(f.read_text()) if f.exists() else ""
+    if not f.exists():
+        return ""
+    return strip_markers(f.read_text()) if on is None else feature_blocks(f.read_text(), on)
 
 
 def strip_markers(text: str) -> str:
@@ -354,11 +357,68 @@ def worker_context(p: Project) -> tuple[str, list[dict], dict]:
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS)
 
 
-def worker_system(p: Project) -> str:
-    """The part of a worker's prompt shared by every task, whatever its kind or tier, until the
-    charter or memory changes: sent as the system prompt where the agent allows it, so the provider
-    caches it across all the project's workers. Nothing about the task may go in here."""
-    parts = [restrictions_block(p), _read(p, "worker.md")]
+# Task kinds whose workers never hand off `waiting` on a job of their own, so their prompt leaves out
+# the detail of detached drivers, `on_pass_cmd` and wakes; the `waiting` basics stay.
+NO_WAIT_KINDS = ("question", "plan")
+# Task kinds that may publish a branch or a pull request.
+PR_KINDS = ("code", "review")
+
+
+def _named(alias: str, text: str) -> bool:
+    return bool(re.search(rf"(?<![\w.-]){re.escape(alias)}(?![\w-])", text))
+
+
+def worker_features(p: Project, task: dict | None = None) -> set[str]:
+    """The features whose fenced rules worker.md carries for `task` (feature_blocks): its kind's
+    (`harness`, `prs`, `wait`), and the project's or task's devices, device runners (`devq`), jobs on
+    other machines (`remote`) and shared clusters (`clusters`). No task: a `work` task's."""
+    from . import machines
+    cfg = p.config()
+    kind = (task or {}).get("kind") or "work"
+    on = {kind} if kind == "harness" else set()
+    if kind in PR_KINDS:
+        on.add("prs")
+    if kind not in NO_WAIT_KINDS:
+        on.add("wait")
+    try:
+        known = machines.load()
+    except Exception:
+        known = {}
+    charter = p.charter_path.read_text() if p.charter_path.exists() else ""
+    resources = " ".join(re.findall(r"(?ms)^## Resources\b.*?(?=^## |\Z)", charter))
+    task_text = " ".join(str((task or {}).get(k) or "") for k in ("title", "spec", "labels"))
+    # Machines this project may use (the charter names them) and the ones this task names.
+    used = {a: m for a, m in known.items() if _named(a, charter) or _named(a, task_text)}
+    tags = {a: machines.tag_list(m.get("tags")) for a, m in used.items()}
+    runners = (cfg.get("device") or {}).get("runners") or {}
+    runners = runners if isinstance(runners, dict) else {}
+    if runners:
+        on.add("devq")
+    try:
+        here = machines.device_host(known)
+    except Exception:
+        here = False
+    from .effort import device_task
+    from .locks import device_locks
+    holds = bool(task) and device_task(task)
+    if runners or here or device_locks(cfg) or holds or any("device" in t for t in tags.values()):
+        on.add("device")
+    # A job on another machine: the task names one, a device task's project uses one, or a runner is remote.
+    if any(_named(a, task_text) for a in known) or (holds and used) or any(
+            (r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
+        on.add("remote")
+    if re.search(r"\b(slurm|cluster)", resources, re.I) or any(
+            {"slurm", "cluster"} & set(t) for t in tags.values()):
+        on.add("clusters")
+    return on
+
+
+def worker_system(p: Project, task: dict | None = None) -> str:
+    """The part of a worker's prompt shared by every task of the same shape (kind, devices, machines
+    it names) until the charter or memory changes: sent as the system prompt where the agent allows
+    it, so the provider caches it across the project's workers. Only worker_features() may read the
+    task; nothing else about it goes in here."""
+    parts = [restrictions_block(p), _read(p, "worker.md", worker_features(p, task))]
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
     charter, mem, use = worker_context(p)

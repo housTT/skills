@@ -4017,7 +4017,7 @@ class Daemon:
             self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
             try:
-                system = worker_system(self.p)
+                system = worker_system(self.p, task)
                 note = {"spec_sha": spec_digest(task)}
                 if wake:
                     note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
