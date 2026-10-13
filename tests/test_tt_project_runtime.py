@@ -37600,6 +37600,51 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
     assert "Review only" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
 
 
+def test_kept_off_inherits_no_push_from_the_tasks_it_continues(env, monkeypatch):
+    # A continuation (a `continue:` task, or a fix of a review's findings) keeps the nearest ancestor's
+    # no_push: its review is review only too. A chain without the marker stays pushable; a cycle ends.
+    from ttp import push, pushq
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "work")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    d = p.config()["delivery"]
+
+    def code(title, spec="", labels=None, result=None):
+        tid = p.db.add_task(title, spec, kind="code", origin="coordinator", labels=labels)
+        if result:
+            p.db.update_task(tid, result=json.dumps(result))
+        return p.db.task(tid)
+
+    root = code("notes", "Write the notes.\nno_push: notes stay local\n")
+    cont = code("continue: notes", "Go on.", labels=[f"continues:{root['id']}"])
+    fix = code("Fix review #9: notes", "", labels=[f"continues:{cont['id']}", "review_fix:9"])
+    why = push.kept_off(fix, {"a.py": 1}, d, p)
+    assert "notes stay local" in why and f"#{root['id']} (which it continues)" in why, why
+    assert "notes stay local" in push.kept_off(cont, None, d, p)
+    assert push.kept_off(fix, None, d) == ""   # without the project only its own marker counts
+    flagged = code("tool", "", result={"status": "done", "summary": "ok", "no_push": "a local tool"})
+    assert "a local tool" in push.kept_off(code("more", "", labels=[f"continues:{flagged['id']}"]), None, d, p)
+    # The nearest ancestor's reason wins; the task's own marker before any.
+    mid = code("mid", "no_push: nearer", labels=[f"continues:{root['id']}"])
+    assert "nearer" in push.kept_off(code("leaf", "", labels=[f"continues:{mid['id']}"]), None, d, p)
+    assert "its spec" in push.kept_off(code("own", "no_push: mine", labels=[f"continues:{root['id']}"]), None, d, p)
+    # No marker anywhere in the chain: pushable. A cycle of continues labels ends.
+    plain = code("plain", "Just code.")
+    assert push.kept_off(code("next", "", labels=[f"continues:{plain['id']}"]), None, d, p) == ""
+    a = code("loop a", "")
+    b = code("loop b", "", labels=[f"continues:{a['id']}"])
+    p.db.update_task(a["id"], labels=json.dumps([f"continues:{b['id']}"]))
+    assert push.kept_off(p.db.task(a["id"]), None, d, p) == ""
+    # End to end: the review of a fix of a no_push task is review only; that of a plain chain pushes.
+    _, _, _, (rev,) = _finish_code(env, p, "fix of notes", {"b.py": 3},
+                                   labels=[f"continues:{root['id']}", "review_fix:9"])
+    assert "Review only" in rev["spec"] and "notes stay local" in rev["spec"], rev["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(rev["labels"]) and "ttp push` from" not in rev["spec"]
+    _, _, _, (rev,) = _finish_code(env, p, "fix of plain", {"c.py": 3}, labels=[f"continues:{plain['id']}"])
+    assert "ttp push` from" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+
+
 def test_allow_protected_push_branch_lets_reviews_push_to_main_and_without_it_they_never_git_push(env, monkeypatch, capsys):
     from ttp import cli, push, pushq
     from ttp.project import config_problems

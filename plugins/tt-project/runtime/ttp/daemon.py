@@ -6349,7 +6349,7 @@ class Daemon:
                        f"(delivery.own_push), so it lands on {d.get('push_branch')} like any other change.")
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
-        off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d)
+        off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d, self.p)
         # A push branch no push can ever reach (main/master without allow_protected_push_branch, or a
         # code repo without the remote) makes every review review only: a push step there would only
         # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
@@ -6595,7 +6595,7 @@ class Daemon:
                     pb = str(d.get("push_branch") or "").strip()
                     why = "nothing may be pushed (delivery.push_allowed is off)" if not d.get("push_allowed", True) \
                         else "there is no push branch (delivery.push_branch)" if not pb else \
-                        push.kept_off(code, worktree.diff_lines(self.p, [code["branch"]]), d) \
+                        push.kept_off(code, worktree.diff_lines(self.p, [code["branch"]]), d, self.p) \
                         or push.push_branch_problem(pb, self.p.root, push.allow_protected(d)).removeprefix(
                             "delivery.push_branch: ")
                     if not why:
