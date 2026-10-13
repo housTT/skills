@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, unblock, upstream, watchdup, worktree
+from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -280,7 +280,7 @@ MUTE_CHARS = 200
 # resources and memory changes are always shown whole; so is the machine ledger on a turn whose
 # events concern a machine.
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger", "tried")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
@@ -709,6 +709,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                    else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS) if k < FINISHED_DETAIL else "")
         lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}" + (f" — {summary}" if summary else ""))
     section("finished", lines)
+    said = " ".join(str(e["text"] or "") for e in events)
+    if msg_ids:
+        said += " " + " ".join(str(m["text"] or "") for m in db.q(
+            f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids)))
+    lines = tried.digest_lines(db, p, now, said)
+    section("tried", lines, "\n".join(lines[1:]), f"## Tried work: {len(lines) - 1} ledger lines (as last turn)")
     recurring = sched.with_costs(db)
     lines = ["## Recurring"] if recurring else []
     for s in recurring:
@@ -1138,6 +1144,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup['id']}")
+                # Work this project already tried, shelved or landed (tried.py): a reworded title with
+                # the same parameters still matches; force passes only with the difference stated.
+                hit = tried.match(db, title, a.get("spec") or "", p, skip=a.get("continues"))
+                if hit and not (a.get("force") and tried.differs(a.get("spec") or "", hit)):
+                    raise ValueError(tried.rejection(hit, p))
+                if hit:
+                    notes.append(f"task_add {title[:80]!r}: forced past {tried.describe(hit, p)}")
                 if not a.get("force"):
                     same = similar_task(db, title, a.get("spec") or "", skip=a.get("continues"))
                     if same:

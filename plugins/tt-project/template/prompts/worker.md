@@ -147,6 +147,8 @@ never write to a run folder named in earlier context):
  "pr": "URL if you opened or updated one",
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
+ "outcome": "only when it applies: landed, kept, shelved or rejected (the work's result, for the tried-work ledger)",
+ "tried": [{"title": "each separate lever or option you tried", "outcome": "kept | shelved | rejected", "result": "the number or bound reached"}],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 

@@ -5715,6 +5715,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     _resources(p, "- box-c")
     ml.add_change("box-c", "disabled auto power cycle", "enable it", "other", expires="6h")
     tid = db.add_task("open work", "s", origin="user")
+    shelf = db.add_task("tile size lever", "s", origin="user")
+    db.update_task(shelf, status="done", result=json.dumps({"status": "done", "summary": "Shelved: no gain."}))
     ask = db.post("out", "Which board should the soak use?", kind="ask")
     ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
               (time.time(), "daemon", "observation", "normal", "a new thing happened", "queued"))
@@ -8504,6 +8506,85 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
     assert p.db.one("SELECT id FROM tasks WHERE title=?", (near["title"],))
 
 
+def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_day(env):
+    # Replays a coordinator re-queuing, hours later, two levers it had finished that day (one shelved,
+    # one landed as a kept iteration) under reworded titles with the same bounds.
+    p = make(env)
+    from datetime import datetime
+    from ttp import coordinator as coord, timefmt, tried
+    db = p.db
+    now = time.time()
+    midnight = datetime.fromtimestamp(now, timefmt.tzinfo(p)).replace(hour=0, minute=0, second=0).timestamp()
+    shelved = db.add_task("lever: fuse the norm into the matmul (upper bound 1.8x)",
+                          "Fuse the layer norm into the matmul before it. Upper bound 1.8x on the block; "
+                          "stop at 1.3x or above. Measure on the standard scene.", kind="code", origin="user")
+    db.update_task(shelved, status="done", attempts=1, result=json.dumps(
+        {"status": "done", "summary": "Shelved: the fused norm reached 1.05x of the 1.8x bound. Not worth it."}))
+    kept = db.add_task("lever: double-buffer the tile loads (bound 1.4x)",
+                       "Load the next tile while the current one computes. Bound 1.4x end to end.",
+                       kind="code", origin="user")
+    db.update_task(kept, status="done", attempts=1, result=json.dumps(
+        {"status": "done", "summary": "Kept as iteration 7: 1.22x end to end against the 1.4x bound."}))
+    db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'work')", (kept,))
+    many = db.add_task("sweep three kernels", "Try three kernel levers.", origin="user")
+    db.update_task(many, status="done", attempts=1, result=json.dumps(
+        {"status": "done", "summary": "One kept, two shelved.",
+         "tried": [{"title": "lever: vectorize the softmax", "outcome": "shelved", "result": "1.02x of the 1.5x bound"}]}))
+    for i, t in enumerate((shelved, kept, many)):   # earlier today, in the home zone
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (midnight + (now - midnight) * (0.3 + 0.1 * i), t))
+
+    got = {e["id"]: e for e in tried.entries(db, p) if e["title"].startswith("lever: fuse")
+           or e["title"].startswith("lever: double")}
+    assert got[shelved]["outcome"] == "shelved" and got[kept]["outcome"] == "landed"
+    assert "1.05x" in got[shelved]["result"] and got[shelved]["key"] == tried.subject_key("fuse norm matmul lever bound upper")
+
+    again = [{"type": "task_add", "title": "Retry norm/matmul fusion, up to 1.8x", "kind": "code",
+              "spec": "Fuse layer norm with the matmul in front of it; the ceiling is 1.8x and the stop line 1.3x."},
+             {"type": "task_add", "title": "Double buffering for tile loads, bound 1.4x", "kind": "code",
+              "spec": "Prefetch the next tile during compute of the current one; 1.4x bound."},
+             {"type": "task_add", "title": "vectorise softmax lever up to 1.5x", "spec": "SIMD softmax, bound 1.5x."}]
+    problems = coord.apply(p, again)
+    assert len(problems) == 3, problems
+    assert problems[0].startswith(f"task_add: already tried: task #{shelved} 'lever: fuse the norm") and \
+        "was shelved today at" in problems[0] and "1.05x" in problems[0], problems[0]
+    assert problems[1].startswith(f"task_add: already tried: task #{kept} 'lever: double-buffer") and \
+        "was landed today at" in problems[1] and "1.22x" in problems[1], problems[1]
+    assert problems[2].startswith(f"task_add: already tried: task #{many} 'lever: vectorize the softmax' was shelved"), problems[2]
+    assert all(f"differs from #" in x and "force: true" in x for x in problems)
+    # force alone does not pass; force with the difference stated does, and is noted.
+    assert coord.apply(p, [{**again[0], "force": True}])[0].startswith(f"task_add: already tried: task #{shelved}")
+    assert db.q("SELECT COUNT(*) n FROM tasks")[0]["n"] == 3
+    forced = {**again[0], "force": True, "spec": again[0]["spec"] + f" Differs from #{shelved}: a new fused kernel."}
+    assert coord.apply(p, [forced]) == []
+    assert any(f"forced past task #{shelved}" in n and "shelved today" in n for n in db.kv(coord.NOTES_KEY))
+    # Genuinely different follow-ups go through: another subject, or the same lever with new bounds.
+    assert coord.apply(p, [{"type": "task_add", "title": "profile DRAM bandwidth of the attention block",
+                            "spec": "Measure DRAM read bandwidth per attention head on the standard scene and "
+                                    "report the top hotspots."},
+                           {"type": "task_add", "title": "lever: triple-buffer the tile loads (bound 2.1x)",
+                            "kind": "code", "spec": "Three tile buffers so loads overlap two computes. Bound 2.1x."}]) == []
+    # The digest shows today's results before the coordinator queues anything.
+    text = coord.digest(p, {}, [], [])
+    section = text.split("## Tried work")[1].split("\n## ")[0]
+    assert f"#{shelved} shelved" in section and f"#{kept} landed" in section and "1.05x" in section, section
+    assert len(section.splitlines()) <= tried.DIGEST_ROWS + 1
+
+
+def test_tried_work_ledger_skips_reviews_and_cancelled_tasks_that_never_ran(env):
+    p = make(env)
+    from ttp import tried
+    db = p.db
+    never = db.add_task("tune the cache size", "s", origin="user")
+    db.update_task(never, status="cancelled")
+    ran = db.add_task("tune the cache size again", "s", origin="user")
+    db.update_task(ran, status="cancelled", attempts=1)
+    rev = db.add_task("review #5", "s", kind="review", origin="user")
+    db.update_task(rev, status="done")
+    assert [e["id"] for e in tried.entries(db, p)] == [ran]
+    assert tried.entries(db, p)[0]["outcome"] == "cancelled"
+    assert tried.params("bound 1.50x, 2026-10-12 12:19 PDT, #42, fp16, 3e-4") == {"1.5", "0.0003"}
+
+
 def test_actions_schema_lists_every_action_key_apply_reads():
     # A provider that enforces the schema strictly drops a key it does not list, so every key apply()
     # (or a helper it hands the action to) reads must be a property of ACTIONS_SCHEMA's action items.
@@ -8557,14 +8638,18 @@ def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env)
     assert coord.apply(p, [again])[0].startswith(f"task_add: near duplicate of task #{old}")
     assert coord.apply(p, [{**again, "continues": old}]) == []
     assert p.db.task(old)["status"] == "cancelled"
-    # Done recently: still compared. Done long ago: may be redone.
+    # Done within the tried-work ledger's days: still compared. Done before them: may be redone.
+    from ttp import tried
     done = p.db.add_task("compact the cache", "Compact the build cache and drop entries unused for a month.",
                          origin="user")
     p.db.update_task(done, status="done")
     redo = {"type": "task_add", "title": "compact the build cache",
             "spec": "Compact the build cache and drop entries unused for a month."}
-    assert coord.apply(p, [redo])[0].startswith(f"task_add: near duplicate of task #{done} (done)")
+    assert coord.apply(p, [redo])[0].startswith(f"task_add: already tried: task #{done} 'compact the cache' "
+                                                f"was finished today")
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (coord.SIMILAR_DONE_DAYS + 1) * 86400, done))
+    assert coord.apply(p, [redo])[0].startswith(f"task_add: already tried: task #{done}")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (tried.LEDGER_DAYS + 1) * 86400, done))
     assert coord.apply(p, [redo]) == []
 
 
