@@ -172,7 +172,8 @@ never write to a run folder named in earlier context):
   bounded backoff; write a failed marker only for a non-transient failure or once retries run out. A wait
   for a device or box checks it live (its broker's status), never a readiness marker file.
   When only checking the outcome is left, name that check as `on_pass_cmd`: once `retry_when`
-  passes the daemon runs it model-free from the project root (600 s by default). Exit 0 with a
+  passes the daemon runs it model-free from the project root with your HOME (600 s by default;
+  prefer absolute paths). Exit 0 with a
   `done` or `needs_review` hand-off written to `$TTP_RESULT` ends the task; anything else wakes it
   with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and may
   not act as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`

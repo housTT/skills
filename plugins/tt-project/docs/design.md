@@ -72,7 +72,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    a new spec starts the count over: the next run is at the task's own wake tier.
    A passed probe needs no model run when the hand-off says what comes next: an `on_pass` (the
    final hand-off, applied when the run's own detached checks passed on its head) or an
-   `on_pass_cmd`, run from the project root and killed after `waiting.on_pass_timeout_s`; its exit 0
+   `on_pass_cmd`, run from the project root with the owner's HOME once its run has ended, and killed
+   after `waiting.on_pass_timeout_s`; its exit 0
    with a `done` or `needs_review` hand-off at `$TTP_RESULT` ends the task; a failed or overrun
    command wakes it at its own tier, anything else wakes it as usual.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.

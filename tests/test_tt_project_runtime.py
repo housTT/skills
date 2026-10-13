@@ -25257,6 +25257,98 @@ def test_a_failed_on_pass_cmd_wakes_the_task_at_its_own_tier(env, monkeypatch, t
     assert res["wake_tier"] == wake and res["escalated_wake"] is True, res
 
 
+_OWNER_HOME_CHECK = ("python3 -c \"import os, pwd, sys; "
+                     "sys.exit(os.path.expanduser('~') != pwd.getpwuid(os.getuid()).pw_dir)\" && "
+                     """printf '{"status":"done","summary":"home checked"}'""" + _TO_RESULT)
+
+
+@pytest.mark.parametrize("daemon_home", ["unset", "worker dir", "missing", "another user's"])
+def test_an_on_pass_cmd_runs_with_the_owners_home_whatever_the_daemon_inherited(env, monkeypatch, tmp_path,
+                                                                                 daemon_home):
+    """A daemon started without HOME, from a worker's folder, a sandbox or another user's shell must not
+    make `~` in a hook mean somewhere else: the hook sees the owner's home and runs from the project root."""
+    import pwd
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    if os.getuid() == 0 and daemon_home == "another user's":
+        pytest.skip("root owns every directory")
+    worker = p.base / "worktrees" / "t1"
+    worker.mkdir(parents=True)
+    home = {"worker dir": str(worker), "missing": str(tmp_path / "gone"), "another user's": "/"}.get(daemon_home)
+    if home is None:
+        monkeypatch.delenv("HOME", raising=False)
+    else:
+        monkeypatch.setenv("HOME", home)
+    seen = tmp_path / "seen"
+    tid, _ = _on_pass_cmd_task(p, tmp_path, f'echo "$PWD $USER" > {seen}; ' + _OWNER_HOME_CHECK)
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done", (task["status"], json.loads(task["result"]).get("woke"))
+    assert seen.read_text().split() == [str(p.root), pwd.getpwuid(os.getuid()).pw_name]
+
+
+def test_an_on_pass_cmd_keeps_a_real_inherited_home_and_sees_the_runs_output(env, monkeypatch, tmp_path):
+    """A real home (the user's own directory, outside the project's folder) is kept, so `~` in the hook
+    finds a file the job wrote there; and the hook runs only once the run that named it has ended."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    home = tmp_path / "userhome"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    d = dmod.Daemon(p.base)
+    out = home / ".local" / "state" / "canary" / "out.bin"
+    check = ("python3 -c \"import os, sys; sys.exit(not os.path.exists(os.path.expanduser("
+             "'~/.local/state/canary/out.bin')))\" && "
+             """printf '{"status":"done","summary":"output found"}'""" + _TO_RESULT)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, check)
+    run = p.db.one("SELECT id FROM runs WHERE task=?", (tid,))["id"]
+    p.db.x("UPDATE runs SET status='running', ended=NULL WHERE id=?", (run,))
+    _settle_probe(d, tid)
+    assert tid not in d._on_pass and "woke" not in json.loads(p.db.task(tid)["result"])
+    assert f"on_pass_cmd waits for run {run} to finish" in (p.logs / "daemon.log").read_text()
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"frames")
+    p.db.x("UPDATE runs SET status='ok', ended=? WHERE id=?", (time.time(), run))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done", (task["status"], json.loads(task["result"]).get("woke"))
+    assert json.loads(task["result"])["summary"] == "output found"
+
+
+def test_a_failed_on_pass_cmd_logs_its_exit_output_home_and_cwd(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, "echo file not found; exit 3")
+    _settle_on_pass(d, tid)
+    home = os.environ["HOME"]
+    woke = json.loads(p.db.task(tid)["result"])["woke"]
+    logged = (p.logs / "daemon.log").read_text()
+    for text in (woke, logged):
+        assert "exit 3" in text and "file not found" in text, text
+        assert f"HOME={home}" in text and f"cwd={p.root}" in text, text
+
+
+def test_owner_home_replaces_only_a_home_that_is_not_the_users_own(env, monkeypatch, tmp_path):
+    import pwd
+    from ttp.project import command_env, owner_home
+    p = make(env)
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    assert owner_home(p, {"HOME": str(mine)}) == str(mine)
+    for bad in ({}, {"HOME": ""}, {"HOME": "relative"}, {"HOME": str(tmp_path / "gone")},
+                {"HOME": str(p.base / "state")}):
+        assert owner_home(p, bad) == real, bad
+    env_ = command_env(p, {"PATH": "/usr/bin"})
+    assert env_["HOME"] == real and env_["USER"] == env_["LOGNAME"] == pwd.getpwuid(os.getuid()).pw_name
+    assert command_env(p, {"PATH": "/usr/bin", "USER": "kept"})["USER"] == "kept"
+
+
 def test_an_on_pass_cmd_that_records_needs_review_is_the_hand_off_without_a_model_run(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import daemon as dmod

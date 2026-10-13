@@ -949,16 +949,47 @@ def in_run(env=None) -> bool:
     return any(env.get(k) for k in ("TTP_RUN_ID", "TTP_RUN_DIR", NOTE_RUN_ENV))
 
 
+def _account() -> tuple[str, str]:
+    """This user's name and home from the password database ("" where it has none)."""
+    import pwd
+    try:
+        pw = pwd.getpwuid(os.getuid())
+    except (KeyError, OSError):
+        return "", ""
+    return pw.pw_name, pw.pw_dir
+
+
+def owner_home(p: Project, env: dict | None = None) -> str:
+    """The home a command the daemon runs for `p` gets: the inherited HOME when it is a real home
+    (an existing directory of this user's, outside the project's harness folder), else this user's
+    home from the password database. A daemon started from a sandbox, a worker or another user's
+    shell must not make `~` in a hook mean somewhere else."""
+    home = (os.environ if env is None else env).get("HOME") or ""
+    try:
+        real = (os.path.isabs(home) and os.path.isdir(home) and os.stat(home).st_uid == os.getuid()
+                and not Path(home).resolve().is_relative_to(p.base.resolve()))
+    except OSError:
+        real = False
+    return home if real else (_account()[1] or home)
+
+
 def command_env(p: Project, base: dict | None = None) -> dict[str, str]:
     """The environment of a shell command the daemon runs for `p` (command schedule, heal check and
-    fix, start_when/retry_when, until_probe, pause end_when, after_push), as a worker's commands see
-    it: TTP_PROJECT set, this runtime importable and `ttp` first on PATH. Run it with cwd p.root (an
-    after_push in its own checkout), so `ttp lock` resolves the project whatever the daemon inherited."""
+    fix, start_when/retry_when, until_probe, pause end_when, after_push, a hand-off's on_pass_cmd), as a
+    worker's commands see it: TTP_PROJECT set, this runtime importable, `ttp` first on PATH, and HOME
+    the project owner's (owner_home), USER and LOGNAME set. Run it with cwd p.root (an after_push in its
+    own checkout), so `ttp lock` resolves the project whatever the daemon inherited."""
     from .providers.base import service_path
     env = dict(os.environ if base is None else base)
     dirs = [str(p.harness / "bin"), *service_path().split(":"), *env.get("PATH", "").split(":")]
+    user = _account()[0]
+    for k in ("USER", "LOGNAME"):
+        if user and not env.get(k):
+            env[k] = user
     # This runtime only: an inherited PYTHONPATH may name another install's.
-    return {**env, "TTP_PROJECT": str(p.base), "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+    home = owner_home(p, env)
+    return {**env, **({"HOME": home} if home else {}), "TTP_PROJECT": str(p.base),
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
             "PATH": ":".join(dict.fromkeys(d for d in dirs if d))}
 
 

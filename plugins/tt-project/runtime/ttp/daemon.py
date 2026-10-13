@@ -5850,9 +5850,10 @@ class Daemon:
 
     def _start_on_pass(self, task: dict, now: float) -> bool | str | None:
         """A passed probe of a hand-off naming an `on_pass_cmd`: run that command model-free from the
-        project root, in the background, and keep the task asleep while it runs (_poll_on_pass settles
-        it). True when it runs (or already ran from an earlier pass of the same probe), None when the
-        hand-off names none, else why it was not run."""
+        project root with the owner's HOME (command_env), only once the run that named it has ended,
+        in the background, and keep the task asleep while it runs (_poll_on_pass settles it). True when
+        it runs (or already ran from an earlier pass of the same probe, or waits for its run to end),
+        None when the hand-off names none, else why it was not run."""
         tid = task["id"]
         if tid in self._on_pass:
             return True
@@ -5868,6 +5869,9 @@ class Daemon:
         if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
                 or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
+        if r["status"] == "running":
+            log(self.p, f"task {tid} on_pass_cmd waits for run {r['id']} to finish")
+            return True   # only after its run ended and wrote its outputs; a later pass of the probe runs it
         # Notes an earlier try queued (its daemon restarted before settling it) go out before this one.
         self._file_queued_notes(r["id"], tid, Path(r["dir"]))
         out = Path(r["dir"]) / ON_PASS_DIR
@@ -5883,7 +5887,8 @@ class Daemon:
             proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
                                     stderr=subprocess.STDOUT, start_new_session=True,
                                     env=env)
-        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd)
+        where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
+        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
                               blocked_reason=f"its probe passed; running its on_pass_cmd model-free "
@@ -5898,7 +5903,7 @@ class Daemon:
         the task at once at its own tier; anything else wakes it as any passed probe does. Either way
         the wake carries the command's exit and the end of its output."""
         db = self.p.db
-        for tid, (proc, started, timeout, out, run_id, cmd) in list(self._on_pass.items()):
+        for tid, (proc, started, timeout, out, run_id, cmd, where) in list(self._on_pass.items()):
             rc = proc.poll()
             if rc is None and now - started < timeout:
                 continue
@@ -5937,13 +5942,16 @@ class Daemon:
                     self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
                 log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")
                 continue
-            log(self.p, f"task {tid} on_pass_cmd did not record done: {why or 'its run is gone'}")
+            # Self-explaining: what it ran with goes next to its exit and output.
+            log(self.p, f"task {tid} on_pass_cmd did not record done: {why or 'its run is gone'} "
+                        f"(ran with {where}); the end of its output:\n{tail}")
             # A command that failed or overran is a real failure a light wake could only pass on:
             # wake at the task's own tier, as failed checks do.
             failed = rc is None or rc != 0
             tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
             self._wake_waiting(task, f"probe passed; its on_pass_cmd did not record done "
-                                     f"({why or 'its run is gone'}); the end of its output:\n{tail}", now,
+                                     f"({why or 'its run is gone'}; ran with {where}); "
+                                     f"the end of its output:\n{tail}", now,
                                extra={"wake_tier": tier, "escalated_wake": True} if failed else None)
 
     def _sweep_on_pass_notes(self, now: float) -> None:
