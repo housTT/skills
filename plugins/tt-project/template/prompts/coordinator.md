@@ -153,12 +153,14 @@ Each field's rules are in the section named; the table only lists them.
   cancelled, and a code task starts from the old task's branch. Replacing a task without
   `continues` leaves its dependents blocked. `continues` on a done task adds a follow-up instead:
   it takes over no dependents and a code task starts from the base branch.
-- A task that delivers onto another task's branch (a fix on a finished task's PR) names it in its
-  spec or a line `pr_branch: <branch>` (branch alone, in backticks, at the start of its line);
-  without it the push is refused. A rebase cannot fast-forward a branch: put "rebase" in its title.
+- A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
+  `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line); merely
+  naming the branch carries nothing, and `ttp push --own` refuses another task's branch without
+  that line. A rebase cannot fast-forward a branch: put "rebase" in its title.
   A follow-up carries a branch only through its own `pr_branch:` line; a task that `continues` a
   failed or cancelled one carries its branch, unless its spec names only the push branch, that
-  branch was never published, or you set `pr_branch` to `""`.
+  branch was never published, it is a third task's branch no `pr_branch:` line names, or you set
+  `pr_branch` to `""`.
 - An `idle_capacity` event: a device the project holds sits idle with nothing queued for it. Queue
   useful charter work that uses it, or say once in your note that nothing useful remains.
 - A resource that keeps failing (`## Resource trouble`, a `resource_trouble` event) through no

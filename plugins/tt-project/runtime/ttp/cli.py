@@ -1329,12 +1329,16 @@ def cmd_push(a) -> None:
     a `--result <marker>` probe (0 once finished or dead, 1 while running). `--own` publishes the
     task's own `ttp/t<id>-...` branch under its own name instead, as it is: checks run on HEAD, no
     rebase or bump, never the push branch or a shared one; with no push branch set, that is also the
-    default once the branch is on the remote. Inside a run, a worktree on another task's branch is
-    refused (push.resolve). `--queue` lists the push queue
+    default once the branch is on the remote. `--own-branch` publishes the task's own branch even when
+    it carries a pr_branch. Inside a run, a worktree on another task's branch is
+    refused (push.resolve), and so is publishing onto another task's branch the task only inherited. `--queue` lists the push queue
     (`delivery.push_queue`). Exit codes are in `push.py`."""
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result)))
+    if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
+        a.own = True
+        os.environ[push.OWN_BRANCH_ENV] = "1"
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
                                          if (c := Project(d)).exists()), None)
@@ -4399,6 +4403,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="publish the checked-out branch under its name, as it is (checks, no rebase): this task's "
                         "ttp/t<id>-... branch, or another named branch as a fast-forward only; "
                         "never delivery.push_branch, main or the default branch")
+    s.add_argument("--own-branch", action="store_true",
+                   help="as --own, but publish this task's own ttp/t<id>-... branch under its own name, never "
+                        "onto a pr_branch it carries")
     s.add_argument("--queue", action="store_true",
                    help="push nothing: list the push queue's entries and its last 10 batches")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself

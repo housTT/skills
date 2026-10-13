@@ -1206,11 +1206,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # Done work is not taken over: the new task is a follow-up that starts fresh
                     # (a code task from the delivery branch tip, not the old branch).
                     old = None
-                # A task on another branch carries it (worktree on it, `ttp push --own` onto it): one a
-                # `pr_branch: <branch>` line names, else a finished task's work branch the spec names.
-                # Failed or cancelled work is continued then (taken over); done work is not. A follow-up
-                # carries only a branch its own `pr_branch:` line names: a branch it merely mentions
-                # (the work it lands elsewhere) would make `ttp push` refuse it.
+                # A task on another branch carries it (worktree on it, `ttp push --own` onto it) only
+                # when a `pr_branch: <branch>` line names it. A finished task's work branch the spec
+                # merely mentions is never carried (`ttp push --own` would change another task's
+                # branch): failed or cancelled work is continued then (taken over); done work is not,
+                # and the coordinator is told how to carry it on purpose.
                 spec_text = a.get("spec") or ""
                 given = None if review else SPEC_PR_BRANCH.search(spec_text)
                 carried = None if review or given or followup else _named_branch(db, spec_text)
@@ -1222,7 +1222,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
-                onto = given.group("branch") if given else carried[1] if carried and not taken else ""
+                onto = given.group("branch") if given else ""
                 # A rebase of that branch cannot fast-forward it: it delivers on its own branch.
                 rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
@@ -1232,13 +1232,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
                 # it says it carries none (`pr_branch: ""`), names only the push branch to land on, or
                 # that branch was never published (`ttp push --own` cannot create it) and it does not
-                # name it.
+                # name it, or it is another task's branch no `pr_branch:` line of it or of the work it
+                # takes over names (push.foreign_owner).
                 inherited = push.pr_branch_of(p, old) if old and not onto else ""
                 unpublished = False
-                if inherited and not (a.get("pr_branch") == "" or _lands_on_push_branch(cfg, spec_text, inherited)):
+                foreign = push.foreign_owner(p, {"id": None, "spec": spec_text, "labels": json.dumps(labels)},
+                                             inherited) if inherited else None
+                if inherited and not (a.get("pr_branch") == "" or foreign is not None
+                                      or _lands_on_push_branch(cfg, spec_text, inherited)):
                     unpublished = not names_branch(spec_text, inherited) and push.never_published(
                         p.root, cfg.get("delivery") or {}, inherited)
-                if inherited and (a.get("pr_branch") == "" or unpublished
+                if inherited and (a.get("pr_branch") == "" or unpublished or foreign is not None
                                   or _lands_on_push_branch(cfg, spec_text, inherited)):
                     labels.append(worktree.NO_PR_BRANCH)
                 try:
@@ -1279,14 +1283,18 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} rebases {onto}: it starts from that branch on its own "
                                  f"branch and delivers there with `ttp push --own` (a rebase cannot fast-forward "
                                  f"{onto}); its review publishes that new branch")
+                elif carried and taken:
+                    notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: continues "
+                                 f"#{old['id']}, so `ttp push --own` publishes onto it")
                 elif carried:
-                    how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
-                    notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
-                                 f"so `ttp push --own` publishes onto it")
+                    notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]} but carries "
+                                 f"no branch: only a `pr_branch: {carried[1]}` line in its spec makes it deliver "
+                                 f"onto another task's branch")
                 if worktree.NO_PR_BRANCH in labels:
+                    why = (" (never published)" if unpublished else f" (#{foreign}'s branch, and no `pr_branch: "
+                           f"{inherited}` line names it)" if foreign is not None else "")
                     notes.append(f"task_add: #{new_id} continues #{old['id']} but not its branch {inherited}"
-                                 f"{' (never published)' if unpublished else ''}: it delivers to the push "
-                                 f"branch with `ttp push`")
+                                 f"{why}: it delivers to the push branch with `ttp push`")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if pr_ask:
@@ -1990,8 +1998,7 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 # one that exists nowhere and on_carried sends the task back to its own branch.
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
-SPEC_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?P<q>[`'\"]?)"
-                            r"(?P<branch>[A-Za-z0-9][\w./-]*[\w-])(?P=q)(?=[.,;:]?(?:[ \t]|$))", re.M)
+SPEC_PR_BRANCH = worktree.SPEC_PR_BRANCH
 
 
 def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:

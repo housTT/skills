@@ -282,6 +282,17 @@ def valid_branch(name: str) -> bool:
     return _VALID_BRANCHES[name]
 
 
+# A spec line naming the branch a task delivers onto (coordinator: task_add labels it; push: --own
+# publishes onto another task's branch only for a task whose spec has one).
+SPEC_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?P<q>[`'\"]?)"
+                            r"(?P<branch>[A-Za-z0-9][\w./-]*[\w-])(?P=q)(?=[.,;:]?(?:[ \t]|$))", re.M)
+
+
+def spec_names_pr_branch(spec: str, branch: str) -> bool:
+    """Whether `spec` has a `pr_branch:` line (SPEC_PR_BRANCH) naming `branch`."""
+    return any(m.group("branch") == branch for m in SPEC_PR_BRANCH.finditer(spec or ""))
+
+
 # A task that carries no branch, even one the task it continues carries (push.pr_branch_of): a redo
 # of a mislabelled task that lands on the push branch.
 NO_PR_BRANCH = "no_pr_branch"

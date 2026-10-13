@@ -1110,7 +1110,8 @@ class Daemon:
             deploy.tick(self.p, self.alert)
         except Exception:
             log(self.p, "checking pending deploys failed\n" + traceback.format_exc())
-        push.tend(self.p)
+        for line in push.tend(self.p):
+            log(self.p, line)
         try:
             detach.tend(self.p)
         except Exception:

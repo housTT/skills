@@ -36141,11 +36141,12 @@ def test_a_pr_fix_task_publishes_onto_the_prs_branch_whether_it_is_free_or_held(
         push.own_target(p, path)
 
 
-def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
-    """A task_add whose spec names another task's work branch (ttp/t<id>-...) and says nothing of which
-    branch it carries gets `pr_branch:<branch>` (done work) or continues the task (failed or cancelled
-    work), so `ttp push --own` accepts the branch. One that already carries a branch is left alone, and
-    a name that matches no task's branch, or a live task's, is not labelled."""
+def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branch_line(env):
+    """A task_add whose spec names a done task's work branch (ttp/t<id>-...) carries it only with a
+    `pr_branch:` line naming it: a mere mention (a plan or follow-up citing earlier work) carries
+    nothing and the coordinator is told so. Failed or cancelled work is continued instead, so `ttp push
+    --own` accepts the branch. One that already carries a branch is left alone, and a name that matches
+    no task's branch, or a live task's, is not labelled."""
     p = make(env)
     from ttp import coordinator as coord
 
@@ -36155,12 +36156,19 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
     src = p.db.add_task("Speed up the loader", "s", kind="code")
     b = f"ttp/t{src}-speed-up-the-loader"
     p.db.update_task(src, status="done", branch=b)
-    # (a) Done work: labelled with the branch, and the coordinator is told.
+    # (a) Done work merely named (a plan task citing earlier work): no label, and the coordinator is told why.
+    for kind, title, spec in (("code", "Profile the decoder", f"Profile the decoder the way `{b}` did."),
+                              ("plan", "Plan the cache work", f"Plan the cache work; {b} has the loader part."),
+                              ("question", "Why is it slow", f"Explain why reads stay slow after {b}?")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": kind, "spec": spec}]) == [], kind
+        new = p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+        assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], kind
+        assert any(f"#{new} names #{src}'s branch {b} but carries no branch" in n
+                   for n in p.db.kv(coord.NOTES_KEY)), kind
+    # Only a `pr_branch:` line naming it carries it.
     assert coord.apply(p, [{"type": "task_add", "title": "Fix the PR's CI", "kind": "code",
-                            "spec": f"CI fails on the PR from branch `{b}`. Fix it there."}]) == []
-    new = p.db.one("SELECT id FROM tasks WHERE title=?", ("Fix the PR's CI",))["id"]
+                            "spec": f"pr_branch: {b}\nCI fails on the PR from branch `{b}`. Fix it there."}]) == []
     assert labels("Fix the PR's CI") == [f"pr_branch:{b}"]
-    assert any(f"#{new} names #{src}'s branch {b}: labelled pr_branch:{b}" in n for n in p.db.kv(coord.NOTES_KEY))
     # A never-started task's branch is the name worktree.ensure would give it.
     idle = p.db.add_task("Tidy the docs", "s", kind="code")
     p.db.update_task(idle, status="cancelled")
@@ -36334,6 +36342,149 @@ def test_own_push_refuses_a_pr_branch_that_exists_nowhere(env, monkeypatch):
     assert target("feature/local") == ("origin", "feature/local")
 
 
+def test_push_own_prints_its_target_before_it_pushes(env, monkeypatch, capsys):
+    """`ttp push --own` prints the remote branch it publishes to before it pushes anything, in the
+    foreground and detached (the line is also the detached push's log's first word on it)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    t = p.db.add_task("Speed it up", "s", kind="code")
+    own = f"ttp/t{t}-speed-it-up"
+    p.db.update_task(t, status="running", branch=own)
+    _git_out(repo, "checkout", "-q", "-b", own)
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(t))
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0
+    out = capsys.readouterr()
+    said = f"ttp push: --own target: origin/{own}"
+    assert said in out.out, out
+    assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp("push", "--own", "--detach") == 0
+    out = capsys.readouterr().out
+    assert out.index(said) < out.index("marker: "), out
+    marker = pathlib.Path(next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("marker: ")))
+    probe = next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("retry_when: "))
+    assert _probe_until_done(p, probe).returncode == 0
+    log = marker.with_suffix(".log").read_text()
+    assert said in log and _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD"), log
+
+
+def test_own_push_refuses_another_tasks_branch_it_only_inherited(env, monkeypatch, capsys):
+    """A reported case, replayed: a plan task whose worktree started from a finished task's branch
+    carried `pr_branch:<that branch>` without its spec asking for it, so `ttp push --own` targeted the
+    other task's branch. Such an inherited branch of another task is refused, saying how to deliver
+    instead (`ttp push --own-branch`, which publishes the own branch under its own name); a spec line
+    `pr_branch: <branch>`, a continuation of the branch's owner and a review of an authorized task
+    still publish onto it."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    src = p.db.add_task("Profile the loader", "s", kind="code")
+    theirs = f"ttp/t{src}-profile-the-loader"
+    p.db.update_task(src, status="done", branch=theirs)
+    _git_out(repo, "checkout", "-q", "-b", theirs)
+    _commit(repo, "theirs.txt", "theirs\n")
+    _git_out(repo, "push", "-q", "origin", theirs)
+    shipped = _git_out(origin, "rev-parse", theirs)
+
+    def task(title, spec="s", kind="plan", labels=(), on=None):
+        t = p.db.add_task(title, spec, kind=kind, labels=list(labels))
+        own = f"ttp/t{t}-{title.lower().replace(' ', '-')}"
+        p.db.update_task(t, status="running", branch=on or own)
+        _git_out(repo, "checkout", "-q", "-B", on or own, theirs)
+        _commit(repo, f"t{t}.txt", "work\n")
+        monkeypatch.setenv("TTP_TASK", str(t))
+        return t, on or own
+
+    # The plan task on its own branch, labelled with the other task's branch: refused, nothing pushed.
+    plan, own = task("Plan the cache", labels=[f"pr_branch:{theirs}"])
+    with pytest.raises(ValueError, match="only inherited") as e:
+        push.own_target(p, repo)
+    assert f"task #{src}'s branch" in str(e.value) and "ttp push --own-branch --detach" in str(e.value)
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2
+    assert "only inherited" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", theirs) == shipped
+    # --own-branch publishes the task's own branch under its own name.
+    assert _ttp("push", "--own-branch") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")
+    assert _git_out(origin, "rev-parse", theirs) == shipped
+    monkeypatch.delenv(push.OWN_BRANCH_ENV)
+    # A worktree on the other task's branch itself (it started there): refused too.
+    task("Plan again", labels=[f"pr_branch:{theirs}"], on=theirs)
+    with pytest.raises(ValueError, match="only inherited"):
+        push.own_target(p, repo)
+    # Inherited through a continued task that only inherited it: refused.
+    mid = p.db.add_task("Middle step", "s", kind="code", labels=[f"pr_branch:{theirs}"])
+    p.db.update_task(mid, status="failed")
+    task("Pick up the middle", kind="code", labels=[f"continues:{mid}", f"pr_branch:{theirs}"])
+    with pytest.raises(ValueError, match="only inherited"):
+        push.own_target(p, repo)
+    # Allowed: a spec line naming it, a continuation of its owner, a review of an authorized task.
+    named, _ = task("Fix its CI", spec=f"pr_branch: {theirs}\nFix CI there.", kind="code",
+                    labels=[f"pr_branch:{theirs}"])
+    assert push.own_target(p, repo) == ("origin", theirs)
+    task("Finish the loader", kind="code", labels=[f"continues:{src}", f"pr_branch:{theirs}"])
+    assert push.own_target(p, repo) == ("origin", theirs)
+    rev = p.db.add_task(f"Review #{named}: Fix its CI", "s", kind="review", depends_on=[named],
+                        labels=[f"pr_branch:{theirs}"])
+    monkeypatch.setenv("TTP_TASK", str(rev))
+    _git_out(repo, "checkout", "-q", f"ttp/t{named}-fix-its-ci")
+    assert push.own_target(p, repo) == ("origin", theirs)
+
+
+def test_a_continuation_does_not_inherit_a_third_tasks_branch_its_spec_does_not_name(env):
+    """A task_add continuing a task that only inherited another task's ttp/t<id>-... branch carries
+    no branch (no_pr_branch) unless its own spec has a `pr_branch:` line naming it."""
+    p = make(env)
+    from ttp import coordinator as coord, worktree
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    b = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", branch=b)
+    mid = p.db.add_task("Plan the cache", "s", kind="plan", labels=[f"pr_branch:{b}"])
+    p.db.update_task(mid, status="failed")
+
+    def labels(title):
+        return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+
+    assert coord.apply(p, [{"type": "task_add", "title": "Plan it again", "kind": "plan", "continues": mid,
+                            "spec": "Redo the cache plan."}]) == []
+    assert worktree.NO_PR_BRANCH in labels("Plan it again")
+    assert coord.apply(p, [{"type": "task_add", "title": "Fix the loader PR", "kind": "code", "continues": mid,
+                            "spec": f"pr_branch: {b}\nFix the PR."}]) == []
+    assert f"pr_branch:{b}" in labels("Fix the loader PR") and worktree.NO_PR_BRANCH not in labels("Fix the loader PR")
+
+
+def test_the_daemon_clears_push_markers_of_dead_runs_and_logs_it(env):
+    """A push marker left `running` by a run that died (its run lock free: killed, crashed, rebooted)
+    is recorded as failed by the daemon's sweep (push.tend), which returns a line for its log; a
+    finished marker past KEEP_S is removed, and a live push (its lock held) is left alone."""
+    from ttp import push, locks
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    dead = folder / "t603-20261013-022410-57783.json"
+    dead.write_text(json.dumps({"id": dead.stem, "status": "running", "task": "603", "pid": 57783,
+                                "target": "origin/ttp/t598-plan", "started": time.time() - 3600}))
+    live = folder / "t604-20261013-022410-57784.json"
+    live.write_text(json.dumps({"id": live.stem, "status": "running", "task": "604", "pid": os.getpid(),
+                                "target": "origin/ttp/t604-x", "started": time.time()}))
+    old = folder / "t1-20260101-000000-1.json"
+    old.write_text(json.dumps({"id": old.stem, "status": "pushed", "ended": 0}))
+    os.utime(old, (time.time() - push.KEEP_S - 60,) * 2)
+    held = locks.try_take([push._run_lock(live)], "test", "test")
+    try:
+        lines = push.tend(p)
+        assert push.tend(p) == [], "a marker is reported once"
+    finally:
+        held.close()
+    assert json.loads(dead.read_text())["status"] == "failed"
+    assert json.loads(live.read_text())["status"] == "running"
+    assert not old.exists()
+    assert any(f"cleared stale push marker {dead.name} of task 603 (origin/ttp/t598-plan)" in ln for ln in lines), lines
+    assert any("removed 1 finished push marker" in ln for ln in lines), lines
+    assert not [ln for ln in lines if live.name in ln]
+
+
 def test_own_push_refuses_a_task_branch_other_than_the_one_its_run_was_given(env, monkeypatch, capsys):
     """A worktree that left the branch its task's run was given (the row's branch) for another of the
     task's own ttp/t<id>-... branches is refused by `ttp push --own`, naming both branches: it would
@@ -36394,7 +36545,8 @@ def test_a_review_publishes_the_pr_branch_its_subject_carries_and_nothing_else(e
     src = p.db.add_task("Fix the mask", "s", kind="code")
     b = f"ttp/t{src}-fix-the-mask"
     p.db.update_task(src, status="done", branch=b)
-    pub = p.db.add_task("Publish the mask fix", "s", kind="code", labels=[f"pr_branch:{b}"])
+    pub = p.db.add_task("Publish the mask fix", f"pr_branch: {b}\nPublish it.", kind="code",
+                        labels=[f"pr_branch:{b}"])
     p.db.update_task(pub, status="done", branch=b)
     by_title = p.db.add_task(f"Review #{pub}: Publish the mask fix", "s", kind="review", labels=["review_only"])
     by_dep = p.db.add_task("Check the publish", "s", kind="review", depends_on=[pub])

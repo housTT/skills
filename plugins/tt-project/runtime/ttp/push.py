@@ -1160,15 +1160,19 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
     Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched) is refused.
+    Another task's ttp/t<id>-... branch the task only inherited is refused (foreign_pr_branch).
+    With `--own-branch` (OWN_BRANCH_ENV) the task's own checked-out ttp/t<id>-... branch is published
+    under its own name, never onto a pr_branch it carries.
     In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
-    onto = _labelled(p, task, "pr_branch") if task else ""
+    as_is = bool(m and task and m.group(1) == task and os.environ.get(OWN_BRANCH_ENV))
+    onto = _labelled(p, task, "pr_branch") if task and not as_is else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
-    if m and task and m.group(1) == task and not notes and (why := _switched(p, task, branch)):
+    if m and task and m.group(1) == task and not notes and not as_is and (why := _switched(p, task, branch)):
         raise ValueError(why)
     carried = bool(m and onto and m.group(1) == task and not notes)
     if m and task and m.group(1) != task and not carried and not notes:
@@ -1189,6 +1193,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
     if remote_less(repo):
         remote = LOCAL
+    if task and not notes and (why := foreign_pr_branch(p, task, branch, f"{remote}/{branch}")):
+        raise ValueError(why)
     base = str(d.get("base_ref") or "").strip()
     if branch in PROTECTED or branch in (shared, base, base.partition("/")[2]):
         raise ValueError(f"--own never pushes to a shared branch ({branch})")
@@ -1202,6 +1208,59 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
 
 
 LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
+OWN_BRANCH_ENV = "TTP_PUSH_OWN_BRANCH"   # `ttp push --own-branch`: the own branch under its own name
+
+
+def say_target(repo: Path, remote: str, branch: str) -> None:
+    """Print where `ttp push --own` publishes, before it pushes anything."""
+    here = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() or "HEAD"
+    where = f"local branch {branch}" if remote == LOCAL else f"{remote}/{branch}"
+    print(f"ttp push: --own target: {where}" + (f" (from {here})" if here != branch else ""), flush=True)
+
+
+def foreign_owner(p: Project, row: dict | None, branch: str) -> int | None:
+    """The id of the other task whose ttp/t<id>-... `branch` is, when `row` (a task, or one about to
+    be added) only inherits it, else None. It does not when it, or a task it continues (failed,
+    cancelled or blocked work it took over), owns the branch or has a `pr_branch:` line naming it in
+    its spec (worktree.SPEC_PR_BRANCH), or is the daemon's fix of open findings on a PR the project
+    opened from that branch (`pr_fix:` with `pr_branch:<branch>`). A branch of no known task is
+    nobody's here: None."""
+    m = OWN_BRANCH.fullmatch(branch or "")
+    if not m or not row:
+        return None
+    owner, seen, t = int(m.group(1)), set(), row
+    while t and t.get("id") not in seen:
+        seen.add(t.get("id"))
+        labels = _labels(t)
+        if t.get("id") == owner or worktree.spec_names_pr_branch(str(t.get("spec") or ""), branch) \
+                or (f"pr_branch:{branch}" in labels and any(x.startswith("pr_fix:") for x in labels)):
+            return None
+        c = continues_id(t)
+        t = p.db.task(c) if c is not None else None
+    return owner if p.db.task(owner) else None
+
+
+def foreign_pr_branch(p: Project, task: str, branch: str, where: str) -> str:
+    """Why `ttp push --own` by task `task` must not publish onto `branch` (at `where`), or "": it is
+    another task's branch (foreign_owner) the task, and every code task it reviews, only inherited (a
+    pr_branch label, a task it continues or a branch its worktree started on). The answer says how
+    to deliver instead: on the task's own branch, under its own name."""
+    t = _task_row(p, task)
+    if not t:
+        return ""
+    owners = [foreign_owner(p, r, branch) for r in [t] + _reviewed(p, task)]
+    if not owners or None in owners:
+        return ""
+    own = str(t.get("branch") or "")
+    if not ((mo := OWN_BRANCH.fullmatch(own)) and mo.group(1) == str(t["id"])):
+        own = f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}"
+    return (f"--own would push to {where}, task #{owners[0]}'s branch, which task #{task} only inherited "
+            f"(a pr_branch label, a task it continues or the branch its worktree started on) and its spec "
+            f"names in no `pr_branch:` line: not pushing, another task's branch is not this task's to "
+            f"change. Deliver on this task's own branch instead: commit on {own} (`git switch -c {own}` "
+            f"if it is not checked out) and run `ttp push --own-branch --detach`, which publishes it under "
+            f"its own name. If the work must go onto {branch}, hand off blocked saying so: the coordinator "
+            f"adds a task whose spec has the line `pr_branch: {branch}`")
 
 
 def remote_less(repo: Path) -> bool:
@@ -2510,6 +2569,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     global last_ff, last_reach, last_after, pending_after
     last_ff, last_reach, last_after, pending_after = [], None, None, None
     if own:   # delivery.push_exclude_paths guards the push branch only
+        say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
         # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
         base = own_base(p, repo, remote)
@@ -2610,7 +2670,8 @@ LOG_TAIL = 20
 KEEP_S = 30 * 86400        # finished markers and logs older than this go when the next push starts
 QUEUED_S = 900             # a queued push the daemon has not started by then is recorded as failed
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.
-QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES")
+QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES",
+             OWN_BRANCH_ENV)
 
 
 def _run_lock(marker: Path) -> Path:
@@ -2648,18 +2709,22 @@ def _forget_lock(marker: Path) -> None:
         pass
 
 
-def _prune(folder: Path, now: float) -> None:
+def _prune(folder: Path, now: float) -> int:
+    """Remove finished markers (and their logs and lock files) older than KEEP_S; how many went."""
+    n = 0
     for marker in folder.glob("*.json"):
         try:
             old = now - marker.stat().st_mtime > KEEP_S
         except OSError:
             continue
         if old and _read(marker).get("status") not in ("running", "queued"):
+            n += 1
             for f in (marker, marker.with_suffix(".log"), _run_lock(marker)):
                 try:
                     f.unlink()
                 except OSError:
                     pass
+    return n
 
 
 def _tail(path: str | None, n: int = LOG_TAIL) -> str:
@@ -2753,6 +2818,8 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
+    if own:
+        say_target(top, remote, branch)
     if _git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         print("ttp push: uncommitted changes; commit first", file=sys.stderr)
         return REFUSED
@@ -2927,28 +2994,44 @@ def _settle(marker: Path) -> dict:
     return m
 
 
-def tend(p: Project) -> None:
-    """The daemon's part, each tick: start the queued pushes and record the dead ones as failed."""
+def tend(p: Project) -> list[str]:
+    """The daemon's part, each tick: start the queued pushes and clear the stale markers: one whose
+    push died (its run lock free, no outcome written: a killed run, a crash, a reboot) or that was
+    queued and never started is recorded as failed, so nothing counts or waits on it as running any
+    more, and finished markers older than KEEP_S go (_prune). Returns a line per marker it cleared,
+    for the daemon's log."""
     folder = p.state / DETACHED
+    cleared: list[str] = []
     for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        before = _read(marker).get("status")
         try:
-            _tend_one(p, marker)
+            m = _tend_one(p, marker)
         except Exception as e:   # a malformed marker: recorded as failed, never aborts the daemon's tick
             _malformed(marker, e)
+            m = _read(marker)
+        if before in ("running", "queued") and m.get("status") == "failed":
+            task = f" of task {m['task']}" if m.get("task") else ""
+            cleared.append(f"cleared stale push marker {marker.name}{task} ({m.get('target') or 'no target'}): "
+                           f"{m.get('reason') or 'recorded as failed'}")
+    if folder.is_dir():
+        gone = _prune(folder, time.time())
+        if gone:
+            cleared.append(f"removed {gone} finished push marker(s) older than {KEEP_S // 86400} days")
+    return cleared
 
 
-def _tend_one(p: Project, marker: Path) -> None:
+def _tend_one(p: Project, marker: Path) -> dict:
     m = _settle(marker)
     landed.record_push(p, marker, m)
     if m.get("status") != "queued" or m.get("kind") == "batch":
-        return
+        return m
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")
     if lock is None:
-        return
+        return m
     try:
         m = _read(marker)
         if m.get("status") != "queued":
-            return
+            return m
         env = {**os.environ, **(m.get("env") or {})}
         env.update(git_fsync_env(env))
         try:
@@ -2960,6 +3043,7 @@ def _tend_one(p: Project, marker: Path) -> None:
             write_json(marker, m)
     finally:
         lock.close()
+    return _read(marker)
 
 
 def _malformed(marker: Path, e: Exception) -> None:
