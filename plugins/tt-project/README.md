@@ -186,7 +186,9 @@ prolonged whole-box outage.
   `delivery.push_branch` and no push-queue approval. So is the review of a change that must not
   reach the push branch: every file its diff since the base changes matches
   `delivery.push_exclude_paths`, its hand-off sets `no_push` (true or the reason), or its spec has
-  a line starting `no_push:` (the reason follows). Prose is never read as a ban: free text cannot
+  a line starting `no_push:` (the reason follows). A continuation (a fix of a review's
+  findings, a `continue:` task) inherits the nearest ancestor's `no_push` unless it says
+  `no_push: false` (or its hand-off sets `no_push` false). Prose is never read as a ban: free text cannot
   tell a ban from a sentence that reports, quotes or conditions one. The review's spec says why, its fix and re-review
   stay review only, and the push queue ignores its approval. Every review is review only while
   `delivery.push_branch` can never be pushed to: it names main or master, which `ttp push` always

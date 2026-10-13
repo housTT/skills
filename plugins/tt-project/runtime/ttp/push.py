@@ -1648,7 +1648,8 @@ def kept_off(task: dict, changes: dict | None, d: dict, p: Project | None = None
     of its diff since the base (`changes`, worktree.diff_lines) matches `delivery.push_exclude_paths`,
     or its own or (with `p`) the nearest task it continues (a fix of a review's findings, a `continue:`
     task) says so: a hand-off that sets `no_push` (true or the reason), or a spec with a line starting
-    `no_push:` (the reason follows; false/no/0 does not count). Prose in the spec or hand-off summary
+    `no_push:` (the reason follows; false/no/0 does not count). An explicit false (hand-off `no_push`
+    false, or `no_push: false`) on the nearest task ends the walk: it may reach the branch. Prose in the spec or hand-off summary
     is never read as a ban. Its review is then review only: no `ttp push` and no push-queue approval."""
     globs = exclude_list(d.get("push_exclude_paths"))
     if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
@@ -1657,25 +1658,29 @@ def kept_off(task: dict, changes: dict | None, d: dict, p: Project | None = None
     first = task
     while task and task.get("id") not in seen:
         seen.add(task.get("id"))
-        if why := _no_push_of(task, "its" if task is first else f"#{task['id']} (which it continues): its"):
+        why = _no_push_of(task, "its" if task is first else f"#{task['id']} (which it continues): its")
+        if why is not None:
             return why
         c = continues_id(task) if p else None
         task = p.db.task(c) if c is not None else None
     return ""
 
 
-def _no_push_of(task: dict, whose: str) -> str:
-    """kept_off's reason from `task`'s own hand-off or spec marker (`whose` starts it), or ""."""
+def _no_push_of(task: dict, whose: str) -> str | None:
+    """kept_off's reason from `task`'s own hand-off or spec marker (`whose` starts it), "" when it
+    explicitly says no_push false (ends the walk), or None when it says nothing."""
     result = load_result(task.get("result"))
     flag = result.get("no_push")
-    if flag not in (None, False, "", 0):
+    explicit = flag is False or flag == 0 or str(flag).strip().lower() in ("false", "no", "0")
+    if flag not in (None, False, "", 0) and not explicit:
         return f"{whose} hand-off says it must not reach the push branch" + (
             f" ({str(flag)[:200]})" if isinstance(flag, str) else "")
     for m in _NO_PUSH_MARKER.finditer(str(task.get("spec") or "")):
         why = m.group(1).strip("`\"' ")
         if why.lower() not in ("false", "no", "0"):
             return f"{whose} spec says it must not reach the push branch" + (f" ({why[:200]})" if why else "")
-    return ""
+        explicit = True
+    return "" if explicit else None
 
 
 def pr_branch_of(p: Project, task: dict | None) -> str:

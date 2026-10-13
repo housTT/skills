@@ -37600,6 +37600,33 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
     assert "Review only" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
 
 
+def test_kept_off_explicit_no_push_false_in_a_continuation_ends_the_walk(env, monkeypatch):
+    # `no_push: false` in a continuation's spec, or no_push false in its hand-off, lifts the
+    # ancestor's ban for it and for its own continuations; silence still inherits.
+    from ttp import push, pushq
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "work")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    d = p.config()["delivery"]
+
+    def code(title, spec="", labels=None, result=None):
+        tid = p.db.add_task(title, spec, kind="code", origin="coordinator", labels=labels)
+        if result:
+            p.db.update_task(tid, result=json.dumps(result))
+        return p.db.task(tid)
+
+    root = code("notes", "no_push: notes stay local\n")
+    lifted = code("continue: notes", "Go on.\nno_push: false\n", labels=[f"continues:{root['id']}"])
+    assert push.kept_off(lifted, None, d, p) == ""
+    assert push.kept_off(code("fix", "", labels=[f"continues:{lifted['id']}"]), None, d, p) == ""
+    for flag in (False, "false", 0):
+        h = code("handed", "", labels=[f"continues:{root['id']}"],
+                 result={"status": "done", "summary": "ok", "no_push": flag})
+        assert push.kept_off(h, None, d, p) == "", flag
+    assert "notes stay local" in push.kept_off(code("quiet", "", labels=[f"continues:{root['id']}"]), None, d, p)
+
+
 def test_kept_off_inherits_no_push_from_the_tasks_it_continues(env, monkeypatch):
     # A continuation (a `continue:` task, or a fix of a review's findings) keeps the nearest ancestor's
     # no_push: its review is review only too. A chain without the marker stays pushable; a cycle ends.
