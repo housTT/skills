@@ -503,6 +503,7 @@ class Daemon:
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
         self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str]] = {}
+        self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._boot_woken = False
@@ -5870,8 +5871,13 @@ class Daemon:
                 or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
         if r["status"] == "running":
-            log(self.p, f"task {tid} on_pass_cmd waits for run {r['id']} to finish")
-            return True   # only after its run ended and wrote its outputs; a later pass of the probe runs it
+            # Only after its run ended and wrote its outputs; a later pass of the probe runs it.
+            # Asleep meanwhile: an expired timer must not leave it ready for a model run.
+            self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + PROBE_EVERY_S))
+            if (tid, r["id"]) not in self._on_pass_waits:
+                self._on_pass_waits.add((tid, r["id"]))
+                log(self.p, f"task {tid} on_pass_cmd waits for run {r['id']} to finish")
+            return True
         # Notes an earlier try queued (its daemon restarted before settling it) go out before this one.
         self._file_queued_notes(r["id"], tid, Path(r["dir"]))
         out = Path(r["dir"]) / ON_PASS_DIR

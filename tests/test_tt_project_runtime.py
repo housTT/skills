@@ -55721,3 +55721,24 @@ def test_an_outage_check_whose_resource_is_paused_neither_escalates_nor_reports_
     p.db.set_kv("paused_resources", {})
     assert "paused" not in heal.run(d, "svc", spec, now + 3 * heal.OUTAGE_S + 60)[0]
     assert "box-a:down" in ml.conditions()
+
+
+def test_an_on_pass_cmd_waiting_for_its_running_run_keeps_an_expired_task_asleep(env, monkeypatch, tmp_path):
+    """A probe that passes while the run that named the on_pass_cmd still runs defers the command; a task
+    whose timer already ran out must not be left ready for a model run, and the wait is logged once."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, "exit 0")
+    run = p.db.one("SELECT id FROM runs WHERE task=?", (tid,))["id"]
+    p.db.x("UPDATE runs SET status='running', ended=NULL WHERE id=?", (run,))
+    task = p.db.task(tid)
+    now = time.time()
+    p.db.update_task(tid, not_before=now - 60)
+    for _ in range(3):
+        assert d._start_on_pass(p.db.task(tid), now) is True
+    assert tid not in d._on_pass
+    assert p.db.task(tid)["not_before"] >= now + dmod.PROBE_EVERY_S - 1
+    assert not _ready(p, tid), "a model run must not start while its on_pass_cmd waits"
+    assert (p.logs / "daemon.log").read_text().count(f"on_pass_cmd waits for run {run} to finish") == 1
+    assert task["status"] == "queued"
