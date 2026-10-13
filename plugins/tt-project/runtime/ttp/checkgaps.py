@@ -105,6 +105,8 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
         return None
     try:
         receipt = json.loads((run_dir / FAILURE).read_text())
+        if receipt.get("purpose", "candidate") != "candidate" or not receipt.get("check"):
+            return None   # a harness run opens no check gap; a run that failed no check has none to own
         check = push.check_list([receipt["check"]])[0]
         path = Path(receipt["worktree"])
         head = receipt["head"]

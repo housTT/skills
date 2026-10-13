@@ -1232,6 +1232,8 @@ def _note_to(a, run_dir: str) -> None:
     if far and targets is not None and (far.get("ssh") or far["host"]) not in targets:
         die(f"project {a.to} runs on another machine, and upstream.forward_to does not send notes there. "
             f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
+    if not far and not local_project(a.to) and a.to == upstream.MAINTAINERS:
+        return _note_upstream(a, me)
     if not far and not local_project(a.to):
         die(f"unknown project {a.to}; `ttp list` shows the projects on this machine")
     if not a.text.strip():
@@ -1264,6 +1266,28 @@ def _note_to(a, run_dir: str) -> None:
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
           + (f"; this machine's daemon sends it on to {far.get('ssh') or far['host']}" if far else ""))
+
+
+def _note_upstream(a, me) -> None:
+    """`ttp note --to tt-project` (no project of that name here): a lesson for tt-project's maintainers,
+    filed in the user's upstream inbox as an `upstream: ...` follow-up of this run would be."""
+    from . import upstream
+    if not a.text.strip():
+        die("empty note")
+    try:
+        text = upstream.note_text(a.text)
+    except upstream.NoteTooLong as e:
+        die(f"not sent: {e}. Nothing was filed or cut. Shorten it, with the question or request first, "
+            f"or put the whole text in the hand-off as a follow-up titled `upstream: ...`")
+    task = os.environ.get("TTP_TASK") or ""
+    note = {"title": "upstream: " + upstream.cut_title(text), "spec": text}
+    try:
+        got = upstream.append(me.name, int(task) if task.isdigit() else None, [note])
+    except OSError as e:
+        die(f"not sent: this run cannot write the upstream inbox ({e.strerror or e}). Put the note in the "
+            f"hand-off as a follow-up titled `upstream: ...`; this project's daemon files it")
+    print(f"note for tt-project's maintainers " + ("filed in" if got else "already in")
+          + f" the upstream inbox as {upstream.fingerprint(note['title'], text)}; stored {upstream.receipt(text)}")
 
 
 def cmd_upstream(a) -> None:
@@ -1611,7 +1635,7 @@ def cmd_checks(a) -> None:
     except OSError as e:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
-    passed, failed, failure, rc = True, None, None, None
+    passed, failed, failure, rc, scope_error = True, None, None, None, None
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     start = log.stat().st_size if log.exists() else 0
@@ -1627,7 +1651,7 @@ def cmd_checks(a) -> None:
                                             base)
         except push.ScopeError as e:
             out.write(f"{e}\n")
-            todo, skipped, passed, failed = [], [], False, str(e.check)
+            todo, skipped, passed, failed, scope_error = [], [], False, str(e.check), e.check
         # A harness run qualifies the head only through a harness check: one skipped by if_exists or
         # if_changed leaves the untagged checks and extras (or nothing) to pass, which is no qualification.
         unqualified = (purpose == "harness" and passed
@@ -1674,14 +1698,25 @@ def cmd_checks(a) -> None:
             text = f.read().decode("utf-8", errors="replace")
         env_problem = push.env_problem(text, top) if failed in todo else None
         also = bool(env_problem) and push.test_failures(text)
-        if failed in todo and rc is not None and purpose == "candidate":   # a harness run opens no check gap
+        ran, output = failed in todo and rc is not None, text
+        if ran:
             with open(log, "rb") as f:
                 f.seek(check_start)
                 output = f.read().decode("utf-8", errors="replace")
-            failure = push.applicability_failure(Path(top), head, push.Check(failed) if not isinstance(failed, push.Check)
-                                          else failed, rc, output, base)
-            if failure:
-                write_json(Path(run_dir) / "check_failure.json", failure)
+        check = scope_error or (push.Check(failed) if ran and not isinstance(failed, push.Check) else
+                                failed if ran else None)
+        if ran and purpose == "candidate":   # a harness run opens no check gap
+            failure = push.applicability_failure(Path(top), head, check, rc, output, base)
+        # Every failed run leaves its receipt (a refusing selector or any failing check too), so a
+        # missing one never reads as no failure; only the gap kinds above can open a check gap.
+        kind = ("check_failed" if ran else "scope_error" if scope_error else "harness_skipped" if unqualified
+                else "none_apply")
+        write_json(Path(run_dir) / "check_failure.json", {
+            **(failure or {"kind": kind, "sig": push.check_sig(check) if check else "",
+                           "check": check.config() if check else None, "targets": [], "head": head,
+                           "base": base, "worktree": top, "rc": rc if ran else None,
+                           "output": output[-8000:], "unrelated": False}),
+            "purpose": purpose, **({"env_problem": env_problem} if env_problem else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      "purpose": purpose, **({"not_run": not_run} if not_run else {}),
@@ -4404,7 +4439,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("note", help="(inside a run) append a progress note, or send one to another project")
     s.add_argument("text")
     s.add_argument("--to", metavar="PROJECT",
-                   help="also file the note in the inbox of another project, as this worker's")
+                   help="also file the note in the inbox of another project, as this worker's; tt-project: an "
+                        "`upstream: ...` note for its maintainers")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
     s.set_defaults(fn=cmd_note)

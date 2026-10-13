@@ -28,6 +28,8 @@ project's daemon files it, in order, as the limit allows; one that waits OUTBOX_
 to its coordinator once, and only a full outbox (OUTBOX_MAX notes) refuses a note.
 A worker whose sandbox cannot write the inbox leaves the note in its run's directory instead
 (QUEUED_FILE); its project's daemon files it, with the run's project and task, when the run ends.
+`ttp note --to tt-project`, with no project of that name on the machine, files an undirected
+`upstream: ...` note for tt-project's maintainers, as a hand-off follow-up would be (`append`).
 
 Reading over ssh needs the reader to reach the writer, which a laptop behind NAT does not allow. So
 each daemon also forwards this machine's own notes: a thread (never the tick itself) pipes the new
@@ -94,6 +96,15 @@ def reader_path() -> Path:
 
 def is_note(f) -> bool:
     return isinstance(f, dict) and str(f.get("title") or "").strip().lower().startswith("upstream:")
+
+
+MAINTAINERS = "tt-project"   # `ttp note --to` this name (no project of it here): an `upstream: ...` note
+
+
+def cut_title(text: str, chars: int = 80) -> str:
+    """A note's first words as its title, cut at a word within `chars`."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= chars else (text[:chars].rsplit(" ", 1)[0] or text[:chars]) + " …"
 
 
 def fingerprint(title: str, spec: str) -> str:

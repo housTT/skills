@@ -29217,6 +29217,25 @@ def test_a_note_to_another_project_is_refused_when_it_cannot_be_delivered(env, m
     assert [n["to"] for n in _upstream_inbox(env)] == ["far"]
 
 
+def test_a_note_to_tt_project_is_filed_as_an_upstream_note(env, monkeypatch, capsys):
+    """`ttp note --to tt-project` with no such project here is a lesson for the maintainers: it lands
+    in the upstream inbox as an `upstream: ...` follow-up would, never refused as an unknown project."""
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    text = "checks left no receipt after a refusing selector; " + "detail " * 20
+    assert _note(cli, "--to", upstream.MAINTAINERS, text) == 0
+    out = capsys.readouterr().out
+    (note,) = _upstream_inbox(env)
+    assert upstream.is_note(note) and "to" not in note and note["project"] == "demo" and note["task"] == 57
+    assert note["spec"] == " ".join(text.split()) and len(note["title"]) < 100
+    assert f"filed in the upstream inbox as {note['fp']}" in out and upstream.receipt(note["spec"]) in out
+    assert _note(cli, "--to", upstream.MAINTAINERS, text) == 0
+    assert "already in the upstream inbox" in capsys.readouterr().out and len(_upstream_inbox(env)) == 1
+    assert _note(cli, "--to", upstream.MAINTAINERS, "x" * (upstream.SPEC_CHARS + 1)) != 0
+    assert "not sent" in capsys.readouterr().err and len(_upstream_inbox(env)) == 1
+
+
 def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch, capsys):
     from ttp import cli, upstream
     from ttp.cli import bootstrap
@@ -52167,6 +52186,59 @@ def test_checks_record_unmatched_selector_without_approving_or_dropping_mandator
     assert record["commands"] == mandatory + ["python3 -m compileall -q scripts"]
     failure = json.loads((run / "check_failure.json").read_text())
     assert failure["kind"] == "selector_missing" and failure["head"] == record["head"]
+
+
+def test_every_failed_checks_run_leaves_a_receipt_that_opens_no_gap_unless_classified(env, monkeypatch):
+    """A mandatory selector that refuses the exact head in its own words (not the coverage-gap
+    diagnostic) still fails the run and leaves check_failure.json; so do any failing check, a run where
+    nothing applied and a harness run, and none of those receipts opens a check gap."""
+    from ttp import checkgaps, cli
+    p = make(env)
+    (p.root / "scripts").mkdir()
+    _commit_files(p.root, {"scripts/select.py": "import subprocess\n"
+        "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+        "print('Unreviewed delivery identity: ' + head)\nraise SystemExit(1)\n"}, "selector")
+    selector = "python3 scripts/select.py"
+    p.set_config("delivery.push_checks", [selector, "git diff --check"])
+    head = _git_out(p.root, "rev-parse", "HEAD").strip()
+    run = env["tmp"] / "refusal-run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+
+    def failed_run(*args) -> dict:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["checks", *args])
+        assert exc.value.code == 1
+        assert json.loads((run / "checks.json").read_text())["passed"] is False
+        return json.loads((run / "check_failure.json").read_text())
+
+    receipt = failed_run()
+    assert receipt["kind"] == "check_failed" and receipt["check"] == selector and receipt["rc"] == 1
+    assert receipt["head"] == head and receipt["purpose"] == "candidate" and receipt["unrelated"] is False
+    assert f"Unreviewed delivery identity: {head}" in receipt["output"]
+    assert json.loads((run / "checks.json").read_text())["commands"] == [selector, "git diff --check"]
+    review = {"status": "failed", "review_failure": "check_only", "summary": "checks failed"}
+    assert checkgaps.wait(p, {"id": 1}, review, run, p.config()) is None
+    assert not p.db.kv(checkgaps.KEY, {}), "a refusal is the head's failure, never a gap to wait on"
+    p.set_config("delivery.push_checks", [{"run": "true", "if_exists": "absent/**"}])
+    receipt = failed_run()
+    assert receipt["kind"] == "none_apply" and receipt["check"] is None and receipt["head"] == head
+    assert checkgaps.wait(p, {"id": 1}, review, run, p.config()) is None
+    # A harness run's receipt says so, and a missing target in it still opens no gap.
+    p.set_config("delivery.push_checks", [])
+    receipt = failed_run("--", "false")
+    assert receipt["kind"] == "check_failed" and receipt["check"] == "false"
+    (run / "check_failure.json").write_text(json.dumps({**receipt, "purpose": "harness", "rc": 4,
+        "check": "python3 -m pytest tests/test_absent.py",
+        "output": "ERROR: file or directory not found: tests/test_absent.py"}))
+    p.set_config("delivery.push_checks", ["python3 -m pytest tests/test_absent.py"])
+    assert checkgaps.wait(p, {"id": 1}, review, run, p.config()) is None
+    assert not p.db.kv(checkgaps.KEY, {})
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks"])
+    assert not (run / "check_failure.json").exists(), "a pass erases the failed receipt"
 
 
 def test_applicability_retry_start_failure_remains_retryable(env, monkeypatch):
