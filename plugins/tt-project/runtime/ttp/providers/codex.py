@@ -38,7 +38,7 @@ import sys
 from pathlib import Path
 
 from . import register
-from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, status_check,
+from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, request_rejected, status_check,
                    stderr_tail, strict_schema, drop_nulls)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
@@ -251,6 +251,9 @@ class Codex(Provider):
             u.auth_failed = True
         elif LIMIT_RE.search(blob):
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
+        # Only the failed turn's own error event, on a run that wrote nothing: never stderr alone.
+        if errors and request_rejected(u.error) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited):
+            u.request_error = True
         return u
 
     def account(self) -> str:

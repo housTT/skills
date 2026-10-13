@@ -28,6 +28,19 @@ FUNDS_RE = re.compile(r"(out of credits|insufficient (credits|balance|funds)|spe
                       r"credit balance)", re.I)
 
 
+# The API rejected the request itself (a 400, an invalid request or schema): a retry sends the same
+# request and fails the same way. Matched only on a failed run's typed error (an error event or its
+# terminal result), never on stderr or the agent's text; an account error keeps its own recovery.
+REQUEST_RE = re.compile(r"(invalid[ _-]?request|invalid[ _-](json[ _-])?schema|bad request|"
+                        r"(status|http|error)[\" :=]*400\b)", re.I)
+ACCOUNT_RE = re.compile(r"(\b(401|402|403|429)\b|authentication|permission_error|billing|rate[ _]limit|overloaded)", re.I)
+
+
+def request_rejected(text: str) -> bool:
+    return bool(text and REQUEST_RE.search(text) and not (
+        ACCOUNT_RE.search(text) or AUTH_RE.search(text) or LIMIT_RE.search(text) or FUNDS_RE.search(text)))
+
+
 # Strict output pads absent optional fields with null. These schedule fields also have an
 # explicit-null operation; clear_fields distinguishes that operation from padding. Sparse
 # legacy actions without clear_fields retain their original explicit-null semantics.
@@ -176,6 +189,7 @@ class RunUsage:
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""
     error: str = ""
+    request_error: bool = False      # a failed run's typed error: the API rejected the request (request_rejected)
     session_id: str = ""
     extra: dict = field(default_factory=dict)
 

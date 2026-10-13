@@ -117,7 +117,7 @@ def spent_last_hour(db: DB, provider: str, now: float) -> float:
     return max(total, 0.0)
 
 
-WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff")
+WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff", "request_error")
 
 
 def wasted(run: dict) -> bool:

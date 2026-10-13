@@ -1967,6 +1967,10 @@ class Daemon:
             status = "limit"
         if usage.auth_failed and not slept_auth:
             status = "auth"
+        if status == "failed" and usage.request_error and not failed_resume:
+            # The API rejected the request itself (a 400 or a bad schema): a retry, at any tier, fails
+            # the same way. The task fails at once (_finish_worker); a resume still starts fresh.
+            status = "request_error"
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
         if net_lost:
             self.hold_offline(r["provider"], f"run {r['id']} could not reach its API")

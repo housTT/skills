@@ -39130,7 +39130,7 @@ def test_a_long_sleep_is_one_event_and_one_low_alert_a_day(env):
     assert len(p.db.q("SELECT id FROM events WHERE kind='host_slept'")) == 2 and len(alerts()) == 1
 
 
-def _finished_run(d, lines, *, slept_s=0.0, provider="claude", note=None, tier="standard"):
+def _finished_run(d, lines, *, slept_s=0.0, provider="claude", note=None, tier="standard", stderr="", rc=1):
     """A worker run on `provider` whose stream is `lines`, finished by the daemon."""
     db = d.p.db
     tid = db.add_task("build", "", kind="work", tier=tier, priority=3, budget_usd=8.0, labels=[])
@@ -39142,9 +39142,9 @@ def _finished_run(d, lines, *, slept_s=0.0, provider="claude", note=None, tier="
     run_dir.mkdir(parents=True)
     db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
     (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
-    (run_dir / "stderr.log").write_text("")
+    (run_dir / "stderr.log").write_text(stderr)
     d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
-                 {"rc": 1, "started": time.time() - 600 - slept_s, "ended": time.time(), "stopped": None,
+                 {"rc": rc, "started": time.time() - 600 - slept_s, "ended": time.time(), "stopped": None,
                   "slept_s": slept_s})
     return db.one("SELECT * FROM runs WHERE id=?", (rid,)), db.task(tid)
 
@@ -39153,6 +39153,109 @@ NOT_LOGGED_IN = [{"type": "assistant", "error": "authentication_failed",
                   "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Not logged in"}]}},
                  {"type": "result", "subtype": "success", "is_error": True, "result": "Not logged in · Please run /login",
                   "num_turns": 3, "total_cost_usd": 0.5, "usage": {"input_tokens": 1, "output_tokens": 1}}]
+
+
+# A successful, priced run per provider, and stderr or stream noise that must not change its outcome:
+# an MCP server's own HTTP errors on stderr, and a rate-limit event the CLI got past.
+OK_RUNS = {
+    "claude": [{"type": "system", "subtype": "init", "session_id": "s1", "model": "opus"},
+               {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "done"}],
+                                                 "usage": {"input_tokens": 10, "output_tokens": 5}}},
+               {"type": "result", "subtype": "success", "is_error": False, "result": "done", "total_cost_usd": 0.4,
+                "session_id": "s1", "usage": {"input_tokens": 10, "output_tokens": 5}}],
+    "codex": [{"type": "thread.started", "thread_id": "th1"},
+              {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+              {"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 500}}],
+    "cursor": [{"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+               {"type": "result", "subtype": "success", "is_error": False, "result": "done", "session_id": "c1",
+                "usage": {"inputTokens": 1000, "outputTokens": 500, "cacheReadTokens": 0, "cacheWriteTokens": 0}}],
+}
+NOISY_STDERR = {"401": "MCP server tools: HTTP 401 Unauthorized\n", "400": "MCP server tools: HTTP 400 Bad Request\n"}
+REJECTED_LIMIT_EVENT = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}}
+# A failed run whose typed error is a schema rejection (HTTP 400, invalid request), with nothing priced.
+SCHEMA_400 = ('API Error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+              '"message":"output_format.schema: Invalid schema: unsupported keyword"}}')
+REJECTED_RUNS = {
+    "claude": [{"type": "assistant", "error": "invalid_request",
+                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": SCHEMA_400}]}},
+               {"type": "result", "subtype": "success", "is_error": True, "result": SCHEMA_400, "total_cost_usd": 0,
+                "usage": {"input_tokens": 0, "output_tokens": 0}}],
+    "codex": [{"type": "thread.started", "thread_id": "th1"},
+              {"type": "turn.failed", "error": {"message": "unexpected status 400 Bad Request: Invalid schema for "
+                                                           "response_format 'codex_output_schema'"}}],
+    "cursor": [{"type": "result", "subtype": "error", "is_error": True, "result": SCHEMA_400}],
+}
+NOISE_CASES = {**{f"{prov}-{code}": (prov, OK_RUNS[prov], line) for prov in OK_RUNS for code, line in NOISY_STDERR.items()},
+               "claude-rejected-limit-event": ("claude", [REJECTED_LIMIT_EVENT, *OK_RUNS["claude"]], "")}
+
+
+def _parsed(provider, tmp_path, lines, stderr=""):
+    from ttp.providers import get_provider
+    (tmp_path / "out.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (tmp_path / "err.log").write_text(stderr)
+    return get_provider(provider).parse(tmp_path / "out.jsonl", tmp_path / "err.log")
+
+
+@pytest.mark.parametrize("case", list(NOISE_CASES))
+def test_a_successful_priced_run_with_noisy_stderr_or_a_rejected_limit_event_stays_ok(env, case, tmp_path):
+    # Replays the probe cases of a review that found a shared classifier marking these runs auth,
+    # limit or a request error: the parse, then the run's status, the breaker and the limit hold.
+    provider, lines, stderr = NOISE_CASES[case]
+    u = _parsed(provider, tmp_path, lines, stderr)
+    assert not (u.auth_failed or u.limited or u.request_error) and (u.cost_usd or u.output_tokens), u
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, _ = _finished_run(d, lines, provider=provider, stderr=stderr, rc=0)
+    assert run["status"] == "ok", run["status"]
+    assert not alerts.breaker(p.db, provider) and p.db.kv(f"limited:{provider}") is None
+    assert not p.db.q("SELECT id FROM messages WHERE ref IN (?, ?)", (f"auth:{provider}", f"limit:{provider}"))
+
+
+@pytest.mark.parametrize("provider", list(REJECTED_RUNS))
+def test_a_failed_run_with_a_typed_schema_400_fails_its_task_at_once_without_a_raised_retry(env, provider):
+    p = make(env)
+    from ttp import alerts, effort
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, task = _finished_run(d, REJECTED_RUNS[provider], provider=provider, tier="light")
+    assert run["status"] == "request_error", run["status"]
+    assert task["status"] == "failed" and task["attempts"] == 1, "a schema rejection was queued for a retry"
+    result = json.loads(task["result"])
+    assert result["status"] == "request_error" and "400" in result["summary"], result
+    assert effort.retry_tier(p.db, task) is None, "a requeued schema rejection would retry at a raised tier"
+    assert not alerts.breaker(p.db, provider) and p.db.kv(f"limited:{provider}") is None
+
+
+@pytest.mark.parametrize("provider", list(REJECTED_RUNS))
+def test_a_request_error_needs_a_typed_error_on_a_failed_unpriced_run(provider, tmp_path):
+    assert _parsed(provider, tmp_path, REJECTED_RUNS[provider]).request_error
+    # A 400 on stderr alone, on a run that failed and wrote nothing, is no typed rejection.
+    assert not _parsed(provider, tmp_path, [], "Error: HTTP 400 Bad Request: invalid request\n").request_error
+    # A typed 400 on a run that also did priced work: the error may not be the request's.
+    priced = [x for x in OK_RUNS[provider] if x.get("type") != "result"] + REJECTED_RUNS[provider]
+    if provider == "claude":
+        priced[-1] = {**priced[-1], "total_cost_usd": 0.3, "usage": {"input_tokens": 10, "output_tokens": 5}}
+    elif provider == "cursor":
+        priced[-1] = {**priced[-1], "usage": {"inputTokens": 1000, "outputTokens": 500}}
+    assert not _parsed(provider, tmp_path, priced).request_error
+
+
+def test_a_typed_error_naming_an_account_limit_stays_a_limit_not_a_request_error(tmp_path):
+    lines = [{"type": "assistant", "error": "rate_limit",
+              "message": {"content": [{"type": "text", "text": "API Error: 429 rate_limit_error"}]}},
+             {"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 400 rate limit reached"}]
+    u = _parsed("claude", tmp_path, lines)
+    assert u.limited and not u.request_error
+
+
+def test_a_resume_that_fails_on_a_typed_400_still_starts_fresh(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, task = _finished_run(d, REJECTED_RUNS["claude"], note={"resumes": {"session": "old"}})
+    assert run["status"] == "failed" and task["status"] == "queued" and int(task["attempts"] or 0) == 0
 
 
 def test_logged_out_after_a_long_sleep_is_lost_to_the_sleep(env):

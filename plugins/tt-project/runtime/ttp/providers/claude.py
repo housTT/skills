@@ -31,7 +31,7 @@ from pathlib import Path
 from . import register
 from ..budget import Window
 from .base import (AUTH_RE, LIMIT_RE, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints, cli_output,
-                   find_binary, status_check, strict_schema, drop_nulls)
+                   find_binary, request_rejected, status_check, strict_schema, drop_nulls)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -301,6 +301,7 @@ class Claude(Provider):
         last_text = ""
         saw_result = False
         rejected = ""
+        typed: list[str] = []   # assistant `error` events and a failed result's errors and message
         # One API message streams as several events (one per content block), each repeating its
         # usage: count every message id once, at its highest reading.
         per_msg: dict[str, dict[str, int]] = {}
@@ -316,6 +317,9 @@ class Claude(Provider):
                     rejected = f"rate limit rejected: {info.get('rateLimitType') or 'unknown'}"
             elif t == "assistant":
                 msg = ev.get("message") or {}
+                if ev.get("error"):
+                    typed.append(f"{ev['error']}: " + " ".join(str(b.get("text") or "") for b in msg.get("content") or []
+                                                         if isinstance(b, dict) and b.get("type") == "text"))
                 us = msg.get("usage") or {}
                 ident = str(msg.get("id") or f"event-{n}")
                 seen = per_msg.setdefault(ident, {})
@@ -342,6 +346,9 @@ class Claude(Provider):
                 u.structured = drop_nulls(ev.get("structured_output"))
                 if ev.get("is_error"):
                     u.error = f"{ev.get('subtype')}: {str(ev.get('result'))[:300]}"
+                    typed += [str(e) for e in ev.get("errors") or []] + [str(ev.get("result") or "")]
+                else:
+                    typed = []   # the CLI got past the errors it streamed
                 u.extra["subtype"] = ev.get("subtype")
                 u.session_id = ev.get("session_id", u.session_id)
         if not saw_result:
@@ -369,6 +376,10 @@ class Claude(Provider):
         hit = LIMIT_RE.search(blob)
         if (rejected or hit) and (u.error or not u.cost_usd) and not u.auth_failed:
             u.limited, u.limit_note = True, rejected or hit.group(0)
+        # Only a run that failed and spent nothing: a priced run's error was not the request.
+        cause = next((t for t in typed if request_rejected(t)), "")
+        if cause and (u.error or not saw_result) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited):
+            u.request_error, u.error = True, cause[:400]
         return u
 
     def account(self) -> str:
