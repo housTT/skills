@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.6.1"
+    assert claude["version"] == codex["version"] == "0.6.2"
 
 
 def test_shared_setup_is_step_by_step():
@@ -921,6 +921,30 @@ def test_kernel_tests_check_lists_uncollected_plan_nodes(tmp_path):
     r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"), "--pytest-cmd", cmd)
     assert r.returncode == 3
     assert "NOT COLLECTED: u.py::pass_c" in r.stdout and "1 of 2 plan nodes collected" in r.stdout
+
+
+def test_kernel_tests_check_fixes_one_added_param_prefix(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a[device_params0]"])
+    (tmp_path / "collected.txt").write_text("t.py::pass_a[quasar-device_params0]")
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"),
+                   "--pytest-cmd", cmd, "--fix-node-ids")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "UPDATED: t.py::pass_a[device_params0] -> t.py::pass_a[quasar-device_params0]" in r.stdout
+    assert read(run / "op_table.csv")[0]["quasar-bf16:tests"] == "t.py::pass_a[quasar-device_params0]"
+    assert read(run / "kernel_tests_plan_quasar-bf16.csv")[0]["node_id"] == "t.py::pass_a[quasar-device_params0]"
+
+
+def test_kernel_tests_check_does_not_guess_ambiguous_param_prefix(tmp_path):
+    run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a[device_params0]"])
+    (tmp_path / "collected.txt").write_text(
+        "t.py::pass_a[quasar-device_params0]\nt.py::pass_a[wormhole-device_params0]")
+    run_script("kernel_tests.py", "plan", str(run))
+    r = run_script("kernel_tests.py", "check", str(run), "--tt-metal", str(tmp_path / "tt-metal"),
+                   "--pytest-cmd", cmd, "--fix-node-ids")
+    assert r.returncode == 3
+    assert "NOT COLLECTED: t.py::pass_a[device_params0]" in r.stdout
+    assert read(run / "op_table.csv")[0]["quasar-bf16:tests"] == "t.py::pass_a[device_params0]"
 
 
 def test_kernel_tests_run_resumes(tmp_path):

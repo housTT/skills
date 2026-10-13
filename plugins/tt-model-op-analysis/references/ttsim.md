@@ -96,8 +96,10 @@ Node IDs come from collection, not from reading the parametrize decorators:
 - tt-metal's `pytest.ini` adds `-vvs`, so `-q` still prints a tree; `--verbosity=-1` prints ids.
 - Ids are relative to the tt-metal checkout root, exactly as pytest prints them.
 
-`kernel_tests.py check` does all of this and `run` refuses a node that is not collected, so a
-wrong ID never becomes a result. A `not found` is fixed in `<target>:tests`, not recorded.
+`kernel_tests.py check --fix-node-ids` does all of this. It repairs exactly one unambiguous prefix
+added by collection, while ambiguous mismatches still stop. `run` refuses a node that is not
+collected, so a wrong ID never becomes a result. A remaining `not found` is fixed in
+`<target>:tests`, not recorded.
 
 ### Run time
 

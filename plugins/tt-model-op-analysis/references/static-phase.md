@@ -24,10 +24,11 @@ Reads code only; never touches a device. Every count must survive
 4. **Source status.** Load `<plugin-root>/references/target-status.md` and fill the source's
    `<t>:status` and `<t>:evidence`. For a Quasar source fill `<t>:tests` with the node ids of the
    tests that decide each status, in the form pytest prints them, including the ids fixtures add
-   (ttsim.md, "Node IDs"), and set `<t>:test_result` to `not run`. These ids are not checked
-   here: `kernel_tests.py check` confirms them by collection before any TTsim run
-   (measured-destination.md, step 3). Research subagents follow the subagent contract in
-   dispatch-tracing.md.
+   (ttsim.md, "Node IDs"), and set `<t>:test_result` to `not run`. Never derive parametrized ids
+   only from decorators: repository conftest hooks may add an architecture prefix. The measured
+   phase runs `kernel_tests.py check --fix-node-ids`, which safely normalizes a single added prefix
+   and stops on ambiguous mismatches before any TTsim run (measured-destination.md, step 3).
+   Research subagents follow the subagent contract in dispatch-tracing.md.
 5. **Re-check evidence.** Reopen the pinned source for every `verified` row and every status. A
    status follows its definition in target-status.md; Quasar targets decide per kernel op (device
    op, factory, layout, dtype) from the Quasar tests and fork code. Dispatch uncertainty

@@ -18,12 +18,13 @@ Quasar source's entry test is its own item (measured-source.md).
    write new tests.
 3. `python3 <plugin-root>/scripts/kernel_tests.py plan <run dir> --target <target>` lists the unique
    node ids with the statuses of the rows that cite them. Then
-   `python3 <plugin-root>/scripts/kernel_tests.py check <run dir> --target <target> --tt-metal <checkout> --pytest-cmd "<interpreter> -m pytest"`
+   `python3 <plugin-root>/scripts/kernel_tests.py check <run dir> --target <target> --tt-metal <checkout> --pytest-cmd "<interpreter> -m pytest" --fix-node-ids`
    (with `--env-json <file>` for a batch with its own environment) collects each test file of the
-   plan on the host and lists every node id pytest does not find, with the collected ids of the
-   same test function. Correct each one in `op_table.csv` `<target>:tests`, or in the script that
-   wrote that column, rerun `plan` and `check` until all are collected; `run` refuses a node that
-   is not collected (exit code 3). Then
+   plan on the host. The fix flag rewrites a parametrized node id only when exactly one collected
+   id for the same function differs by an added prefix, such as `quasar-`, then regenerates the
+   plan. It lists every remaining mismatch with the collected ids of the same test function.
+   Correct ambiguous mismatches in `op_table.csv` `<target>:tests`, or in the script that wrote
+   that column, and rerun `plan` and `check`; `run` refuses an uncollected node (exit code 3). Then
    `python3 <plugin-root>/scripts/measurements.py list <run dir> --pending` shows the items not
    yet done (`<target>:kernel-tests ❌`, `<target>:kernel-tests ⚠️`, `<target>:kernel-tests ✅`)
    with node counts and an estimate; a node whose result is `error` or `timeout` counts as not

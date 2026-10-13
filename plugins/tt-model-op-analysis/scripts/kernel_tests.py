@@ -149,22 +149,26 @@ def _selects(node: str, collected: set[str]) -> bool:
     return any(c == node or c.startswith((f"{node}[", f"{node}::")) for c in collected)
 
 
-def not_collected(nodes: list[str], pytest_cmd: str, tt_metal: pathlib.Path, env: dict) -> int:
-    """Print the nodes pytest does not collect, with the collected ids of the same test function.
-
-    Each file is collected in its own process, as `run` executes it: a conftest hook such as
-    pytest_make_parametrize_id renames the ids of every file in a session once it is loaded.
-    Collection imports ttnn but starts no simulator, so files are collected in parallel.
-    """
+def _collection(nodes: list[str], pytest_cmd: str, tt_metal: pathlib.Path,
+                env: dict) -> tuple[dict[str, tuple[set[str], str]], list[str]]:
+    """Collect each test file once and return its output plus missing plan nodes."""
     files = sorted({n.split("::", 1)[0] for n in nodes})
     if not files:
-        return 0
+        return {}, []
     with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
         found = dict(zip(files, pool.map(lambda f: _collect(f, pytest_cmd, tt_metal, env), files)))
     missing = [n for n in nodes if not _selects(n, found[n.split("::", 1)[0]][0])]
+    return found, missing
+
+
+def _same_function(node: str, collected: set[str]) -> list[str]:
+    return sorted(c for c in collected if c.split("[", 1)[0] == node.split("[", 1)[0])
+
+
+def _print_missing(missing: list[str], found: dict[str, tuple[set[str], str]]) -> None:
     for node in missing:
         collected, text = found[node.split("::", 1)[0]]
-        same_function = sorted(c for c in collected if c.split("[", 1)[0] == node.split("[", 1)[0])
+        same_function = _same_function(node, collected)
         print(f"NOT COLLECTED: {node}")
         if same_function:
             print(f"  collected: {', '.join(same_function)}")
@@ -172,11 +176,57 @@ def not_collected(nodes: list[str], pytest_cmd: str, tt_metal: pathlib.Path, env
             print("  collected: none of this function")
         else:
             print("  the file collected nothing:\n" + "\n".join(text.splitlines()[-10:]))
+
+
+def _added_prefix_match(node: str, collected: set[str]) -> str | None:
+    """Return one collected ID that only prefixes the requested parametrization."""
+    if "[" not in node or not node.endswith("]"):
+        return None
+    function, parameter = node.rsplit("[", 1)
+    parameter = parameter[:-1]
+    matches = []
+    for candidate in _same_function(node, collected):
+        candidate_parameter = candidate.rsplit("[", 1)[1][:-1]
+        if candidate.startswith(f"{function}[") and candidate_parameter.endswith(f"-{parameter}"):
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _fix_node_ids(run_dir: pathlib.Path, target: str, missing: list[str],
+                  found: dict[str, tuple[set[str], str]]) -> dict[str, str]:
+    replacements = {}
+    for node in missing:
+        replacement = _added_prefix_match(node, found[node.split("::", 1)[0]][0])
+        if replacement:
+            replacements[node] = replacement
+    if not replacements:
+        return replacements
+    run_info = _run_json(run_dir)
+    rows = read_csv(run_dir / "op_table.csv")
+    column = f"{target}:tests"
+    for row in rows:
+        row[column] = "; ".join(replacements.get(node, node) for node in _tests(row[column]))
+    write_csv(run_dir / "op_table.csv", op_table_columns(*run_targets(run_info)), rows)
+    plan(run_dir, target)
+    for old, new in replacements.items():
+        print(f"UPDATED: {old} -> {new}")
+    return replacements
+
+
+def not_collected(nodes: list[str], pytest_cmd: str, tt_metal: pathlib.Path, env: dict) -> int:
+    """Print the nodes pytest does not collect, with the collected ids of the same test function.
+
+    Each file is collected in its own process, as `run` executes it: a conftest hook such as
+    pytest_make_parametrize_id renames the ids of every file in a session once it is loaded.
+    Collection imports ttnn but starts no simulator, so files are collected in parallel.
+    """
+    found, missing = _collection(nodes, pytest_cmd, tt_metal, env)
+    _print_missing(missing, found)
     return len(missing)
 
 
 def check(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, pytest_cmd: str | None,
-          env_json: pathlib.Path | None) -> int:
+          env_json: pathlib.Path | None, fix_node_ids: bool = False) -> int:
     target = _target(_run_json(run_dir), target)
     problem = mismatch(run_dir, tt_metal)
     if problem:
@@ -186,7 +236,13 @@ def check(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, pyt
     if environment is None:
         return EXIT_ENVIRONMENT
     nodes = [p["node_id"] for p in read_csv(_plan_path(run_dir, target))]
-    missing = not_collected(nodes, pytest_cmd or _default_pytest(tt_metal), tt_metal, environment[0])
+    found, missing_nodes = _collection(nodes, pytest_cmd or _default_pytest(tt_metal), tt_metal, environment[0])
+    if fix_node_ids and missing_nodes:
+        replacements = _fix_node_ids(run_dir, target, missing_nodes, found)
+        nodes = [replacements.get(node, node) for node in nodes]
+        missing_nodes = [node for node in nodes if not _selects(node, found[node.split("::", 1)[0]][0])]
+    _print_missing(missing_nodes, found)
+    missing = len(missing_nodes)
     print(f"{len(nodes) - missing} of {len(nodes)} plan nodes collected")
     if missing:
         print(f"Fix them in op_table.csv {target}:tests (or the script that writes it), then rerun plan and check")
@@ -297,6 +353,8 @@ def main() -> int:
         p.add_argument("--tt-metal", type=pathlib.Path, required=True)
         p.add_argument("--pytest-cmd", help="default: <tt-metal>/python_env/bin/python -m pytest when present")
         p.add_argument("--env-json", type=pathlib.Path, help="environment for this batch instead of run.json")
+    p_check.add_argument("--fix-node-ids", action="store_true",
+                         help="repair one unambiguous prefix added to a parametrized pytest id")
     p_run.add_argument("--timeout", type=int, help="seconds per node; default: no limit")
     p_run.add_argument("--rerun", action="store_true")
     p_run.add_argument("--only", help="run only plan nodes whose id contains this text")
@@ -306,7 +364,7 @@ def main() -> int:
     if args.cmd == "plan":
         return plan(args.run_dir, args.target)
     if args.cmd == "check":
-        return check(args.run_dir, args.target, args.tt_metal, args.pytest_cmd, args.env_json)
+        return check(args.run_dir, args.target, args.tt_metal, args.pytest_cmd, args.env_json, args.fix_node_ids)
     if args.cmd == "run":
         return run(args.run_dir, args.target, args.tt_metal, args.timeout, args.pytest_cmd, args.rerun, args.only,
                    args.env_json, args.status, args.entry)
