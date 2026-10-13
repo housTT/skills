@@ -343,7 +343,9 @@ def landed(db, tid: int, version: str, commit: str) -> bool:
     that failed, and the once-a-day limit does not hold it back."""
     t = db.one("SELECT status, spec FROM tasks WHERE id=?", (int(tid),))
     m = t and re.search(r"^Target release: tt-project (\S+) \((\S+)\)\s*$", t["spec"] or "", re.M)
-    return bool(m and t["status"] == "done" and ((version, commit) == m.groups() or is_newer(version, m[1])))
+    known = commit not in ("", "unknown", None)     # no git on either side records "unknown": proves nothing
+    return bool(m and t["status"] == "done" and ((known and (version, commit) == m.groups())
+                                                 or is_newer(version, m[1])))
 
 
 def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why: str) -> None:

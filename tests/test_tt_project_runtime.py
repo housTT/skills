@@ -12041,13 +12041,16 @@ def _next_release(env, newer=True):
                                lambda m: f'__version__ = "{m[1]}.{m[2]}.{int(m[3]) + 1}"', init.read_text(), 1))
 
 
-def _deferred_conflict(env, monkeypatch, name="demo", newer=True):
-    """A project whose template merge conflicts again within a day of its last harness task (done)."""
+def _deferred_conflict(env, monkeypatch, name="demo", newer=True, source=None):
+    """A project whose template merge conflicts again within a day of its last harness task (done).
+    `source` forces the source commit the harness records (as "unknown" outside a git checkout)."""
     import shutil
     from ttp import cli
     if name != "demo":      # one project per repository
         shutil.copytree(env["repo"], env["tmp"] / f"repo-{name}", symlinks=True)
         env = {**env, "repo": env["tmp"] / f"repo-{name}"}
+    if source is not None:
+        monkeypatch.setattr(cli, "source_commit", lambda: source)
     p = make(env, name)
     from ttp import service
     monkeypatch.setattr(service, "restart", lambda p: pytest.fail("a conflicting upgrade restarted the daemon"))
@@ -12109,6 +12112,38 @@ def test_a_same_version_conflict_from_another_commit_is_a_failure_nothing_retrie
     assert e.value.code == 1 and "deferred" not in out and "nothing retries it" in out
     assert "retries only a newer version" in out and "rerun `ttp upgrade demo` after" in out
     assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
+
+
+@pytest.mark.parametrize("newer", [True, False])
+def test_an_unknown_source_commit_never_proves_the_last_merge_task_landed(env, monkeypatch, capsys, newer):
+    """Installed with no git (a plugin cache, an archive), the harness and the merge task's target both
+    record "unknown": that match proved the task landed, so every conflicting upgrade queued another
+    merge task, past the once-a-day limit and the same-version 'nothing retries' rule."""
+    from ttp import cli
+    p, first = _deferred_conflict(env, monkeypatch, newer=newer, source="unknown")
+    assert cli.recorded_commit(p.harness / "runtime") == "unknown"
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == (75 if newer else 1), out
+    assert ("upgrade deferred" in out) if newer else ("nothing retries it" in out and "deferred" not in out)
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
+
+
+def test_landed_counts_an_exact_target_match_only_with_a_known_commit(tmp_path):
+    from ttp import release
+    from ttp.db import DB
+    db = DB(tmp_path / "t.db")
+    def task(target):
+        tid = db.add_task(kind="harness", title=release.UPGRADE_TASK_TITLE,
+                          spec=f"merge it\n\nTarget release: tt-project {target}\n")
+        db.update_task(tid, status="done")
+        return tid
+    assert not release.landed(db, task("0.2.1 (unknown)"), "0.2.1", "unknown")
+    assert release.landed(db, task("0.2.1 (abc123def456)"), "0.2.1", "abc123def456")
+    assert not release.landed(db, task("0.2.1 (abc123def456)"), "0.2.1", "fff000fff000")
+    assert release.landed(db, task("0.2.1 (unknown)"), "0.2.2", "unknown"), "a newer version still landed"
 
 
 def test_a_deploy_counts_deferred_upgrades_and_still_reports_a_real_failure(env, monkeypatch, tmp_path):
