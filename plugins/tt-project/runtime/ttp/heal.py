@@ -27,8 +27,13 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   Moving escalation to the coordinator closes an earlier user alert with its reason. Adding a
   known fault that covers the current confirmed failure does the same, without claiming recovery.
 
-An outage check whose `resource` this project paused (its own pause or a shared one) is not escalated
-and reports nothing to the machine ledger while the pause lasts: the outage is known here.
+An outage check whose `resource` this project paused (its own pause or a shared one) is not fixed,
+alerts nobody and reports nothing to the machine ledger while the pause lasts. It stays silent for
+the whole pause when the user set it, or when the pause's reason names the check: that outage is known
+here. Any other pause (this project's or another project's, for a different reason) keeps it silent
+only for the project's `heal.paused_quiet_s` (6 h) of the outage under it; then the coordinator, never
+the user, is asked once per stretch (outage start and pause) whether the pause is still right. Nothing
+here lifts a pause; lifting it restores the normal handling above.
 
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
@@ -99,6 +104,7 @@ FIXED_KEY = "heal_fixed"        # kv: [{"at", "name"}] successful fixes, last 7 
 LABEL = "heal:"                 # task label of a check's self-fix task
 UNKNOWN_RCS = (75, 255)
 OUTAGE_S = 3600                 # a whole box or resource serving nothing this long is never kept quiet
+PAUSED_QUIET_S = 21600          # heal.paused_quiet_s default: an outage under a pause it is not known by
 LOCK_WAIT_S = 30                # how long a fix waits for its resource lock before it is deferred
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
@@ -503,6 +509,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st["resource_paused"] = paused
     else:
         st.pop("resource_paused", None)
+        st.pop("pause_asked", None)
     if rc == 0:
         was = st.get("status")
         nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported")
@@ -531,7 +538,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                 st["status"] = "unhealthy"
                 st.setdefault("since", st["unknown_since"])
                 if paused:
-                    return _paused_outage(db, name, st, paused, now)
+                    return _paused_outage(host, name, st, paused, now)
                 if st.get("task") or st.get("escalated"):
                     return _escalated(host, name, spec, st, now)
                 if st["route_only"]:
@@ -559,7 +566,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
     if paused:
-        return _paused_outage(db, name, st, paused, now)
+        return _paused_outage(host, name, st, paused, now)
     if st.get("task") or st.get("escalated"):
         return _escalated(host, name, spec, st, now)
     if pending:
@@ -680,14 +687,55 @@ def _paused_resource(db: Any, spec: dict) -> str:
         return ""
 
 
-def _paused_outage(db: Any, name: str, st: dict, res: str, now: float) -> tuple[str, float | None]:
-    """An outage check whose own resource is paused: the outage is known here, so no fix, no escalation,
-    nothing reported to the machine ledger, and an earlier user alert clears."""
+def _pause_names(pause: dict, name: str) -> bool:
+    """The user set the pause, or its recorded reason names the check: the outage is known by it."""
+    if pause.get("by") == "user":
+        return True
+    return bool(re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", str(pause.get("reason") or ""), re.I))
+
+
+def _paused_quiet_s(host: Any) -> float:
+    v = ((getattr(host, "cfg", None) or {}).get("heal") or {}).get("paused_quiet_s")
+    try:
+        return max(0.0, float(v)) if v is not None and not isinstance(v, bool) else PAUSED_QUIET_S
+    except (TypeError, ValueError):
+        return PAUSED_QUIET_S
+
+
+def _paused_outage(host: Any, name: str, st: dict, res: str, now: float) -> tuple[str, float | None]:
+    """An outage check whose own resource is paused: no fix, no user alert (an earlier one clears) and
+    nothing reported to the machine ledger. Under a pause it is not known by (_pause_names), the
+    coordinator is asked once per stretch after heal.paused_quiet_s (module doc); the pause stays."""
     from . import alerts
+    db = host.p.db
     alerts.close_key(db, STATE_KEY + name, f"{res} is paused", now)
     st.pop("alerted", None)
+    try:
+        pause = db.paused_resources().get(res) or {}
+    except Exception:
+        pause = {}
+    if _pause_names(pause, name):
+        _save(db, name, st)
+        return f"unhealthy ({res} paused: not escalated)", None
+    start = max(float(st.get("since") or now), float(pause.get("since") or 0))
+    quiet = _paused_quiet_s(host)
+    if now - start < quiet:
+        _save(db, name, st)
+        return f"unhealthy ({res} paused: not escalated)", None
+    fp = f"{STATE_KEY}{name}:paused:{start:.0f}"
+    if st.get("pause_asked") != fp and not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        reason = str(pause.get("reason") or "no recorded reason")
+        who = f"project {pause['project']}" if pause.get("project") else str(pause.get("by") or "this project")
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", "observation", fp, "normal",
+              f"Outage of {res} under a pause set for {reason} for {(now - start) / 3600:.0f} h: is the pause "
+              f"still right? Heal check {name} still fails (last check: {(st.get('last_out') or '')[:300]}); "
+              f"the pause ({who}) keeps it from being fixed, alerted or reported to the machine ledger. "
+              f"Lift the pause if its reason no longer holds, or keep it with a reason naming {name} so the "
+              f"check stays quiet under it.", "queued"))
+    st["pause_asked"] = fp
     _save(db, name, st)
-    return f"unhealthy ({res} paused: not escalated)", None
+    return f"unhealthy ({res} paused: coordinator asked)", None
 
 
 def escalate_to(host: Any, spec: dict) -> str:

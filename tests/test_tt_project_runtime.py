@@ -55892,6 +55892,68 @@ def test_an_outage_check_whose_resource_is_paused_neither_escalates_nor_reports_
     assert "box-a:down" in ml.conditions()
 
 
+def _paused_outage_setup(env, pause):
+    from ttp import heal
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, resource="box-a-device", outage=True, fix=None, grace_s=0)
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv("paused_resources", {"box-a-device": {"since": now, **pause}})
+    return p, d, spec, now, heal
+
+
+def _pause_asks(p):
+    return p.db.q("SELECT fingerprint, severity, text FROM events WHERE fingerprint LIKE 'heal:svc:paused:%'")
+
+
+@pytest.mark.parametrize("pause", [{"reason": "box out", "by": "user"},
+                                   {"reason": "svc down: vendor repair", "by": "coordinator"},
+                                   {"reason": "waiting on SVC repair", "by": "coordinator", "project": "gamma"}])
+def test_an_outage_under_a_user_pause_or_one_naming_the_check_stays_silent_for_the_whole_pause(env, pause):
+    from ttp import machine_ledger as ml
+    p, d, spec, now, heal = _paused_outage_setup(env, pause)
+    for dt in (0, heal.PAUSED_QUIET_S, 2 * heal.PAUSED_QUIET_S, 7 * 86400):
+        assert heal.run(d, "svc", spec, now + dt) == ("unhealthy (box-a-device paused: not escalated)", None)
+    assert _pause_asks(p) == [] and ml.conditions() == {}
+    assert not p.db.q("SELECT id FROM messages WHERE kind IN ('alert', 'ask')")
+    assert "box-a-device" in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("project", [None, "gamma"])
+def test_an_outage_under_a_pause_for_another_reason_asks_the_coordinator_once_after_the_cap(env, project):
+    from ttp import machine_ledger as ml
+    pause = {"reason": "firmware soak", "by": "coordinator", **({"project": project} if project else {})}
+    p, d, spec, now, heal = _paused_outage_setup(env, pause)
+    quiet = heal.PAUSED_QUIET_S
+    for dt in (0, quiet / 2, quiet - 60):
+        assert heal.run(d, "svc", spec, now + dt)[0] == "unhealthy (box-a-device paused: not escalated)"
+    assert _pause_asks(p) == []
+    assert heal.run(d, "svc", spec, now + quiet)[0] == "unhealthy (box-a-device paused: coordinator asked)"
+    for dt in (quiet + 1800, 3 * quiet, 7 * 86400):   # the same stretch: nothing more
+        heal.run(d, "svc", spec, now + dt)
+    asks = _pause_asks(p)
+    assert len(asks) == 1 and asks[0]["text"].startswith(
+        "Outage of box-a-device under a pause set for firmware soak for 6 h: is the pause still right?")
+    assert ml.conditions() == {}, "no machine-ledger down report while paused"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    assert not p.db.q("SELECT id FROM messages WHERE kind IN ('alert', 'ask')"), "never the user"
+    assert "box-a-device" in p.db.paused_resources(), "the pause is never lifted here"
+    # The pause lifted: the same outage gets its normal handling and reports the machine down.
+    p.db.set_kv("paused_resources", {})
+    assert "paused" not in heal.run(d, "svc", spec, now + 7 * 86400 + 60)[0]
+    assert "box-a:down" in ml.conditions()
+    assert "pause_asked" not in heal.state(p.db, "svc")
+
+
+def test_an_outage_under_a_pause_for_another_reason_follows_the_projects_quiet_cap(env):
+    p, d, spec, now, heal = _paused_outage_setup(env, {"reason": "firmware soak", "by": "coordinator"})
+    d.cfg["heal"] = {**(d.cfg.get("heal") or {}), "paused_quiet_s": 3600}
+    for dt in (0, 3599):
+        assert heal.run(d, "svc", spec, now + dt)[0] == "unhealthy (box-a-device paused: not escalated)"
+    assert heal.run(d, "svc", spec, now + 3600)[0] == "unhealthy (box-a-device paused: coordinator asked)"
+    assert "for 1 h" in _pause_asks(p)[0]["text"]
+
+
 def test_an_on_pass_cmd_waiting_for_its_running_run_keeps_an_expired_task_asleep(env, monkeypatch, tmp_path):
     """A probe that passes while the run that named the on_pass_cmd still runs defers the command; a task
     whose timer already ran out must not be left ready for a model run, and the wait is logged once."""

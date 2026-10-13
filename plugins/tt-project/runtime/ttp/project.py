@@ -247,7 +247,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
-    "heal": {"escalate": "user"},
+    # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
+    # does not name the check, before the coordinator is asked once whether the pause is still right.
+    "heal": {"escalate": "user", "paused_quiet_s": 21600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
     # A conflicting merge queues one harness task a day at most (at once when the last one landed its
