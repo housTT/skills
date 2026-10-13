@@ -19114,6 +19114,21 @@ def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim
     assert "workers see" in coord.memory_budget_line(p)
 
 
+def test_worker_digest_counts_each_policy_separator_and_stays_within_its_budget(env):
+    """Many short worker policies, joined by blank lines, fill the digest to its budget and never
+    past it: each separator between kept items is counted."""
+    p = make(env)
+    from ttp.prompts import WORKER_MEMORY_CHARS, worker_context, worker_system
+    policies = "".join(f"- Run test {i:04}.\n" for i in range(2000))
+    p.charter_path.write_text("# Charter\n\n## Goals\nShip it.\n\n## Policies\n" + policies)
+    system = worker_system(p)
+    block = system[system.index("# CHARTER"):]
+    text, mem, use = worker_context(p)
+    assert use["charter_dropped"] > 0 and not mem
+    assert len(block) <= WORKER_MEMORY_CHARS, len(block)
+    assert len(block) > WORKER_MEMORY_CHARS - 300, len(block)   # filled, not stopped early
+
+
 def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
     p = make(env)
     from ttp import coordinator as coord

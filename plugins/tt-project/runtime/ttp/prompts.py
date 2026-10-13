@@ -343,9 +343,10 @@ def worker_context(p: Project) -> tuple[str, list[dict], dict]:
         kept = []
         used += len(h) + 3
         for item in _items(b):
-            if for_workers(item) and used + len(item) + 1 <= WORKER_MEMORY_CHARS:
+            sep = 2 if kept else 0   # the blank line before every kept item but the first
+            if for_workers(item) and used + sep + len(item) <= WORKER_MEMORY_CHARS:
                 kept.append(item)
-                used += len(item) + 1
+                used += sep + len(item)
             else:
                 dropped += 1
         if kept:
