@@ -887,3 +887,10 @@ def test_the_no_device_pytest_plugin_deselects_device_tests_only_under_ttp_no_de
         r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
                            cwd=tmp_path, env={**env, "TTP_DEVICE_MARKERS": "hw"}, capture_output=True, text=True)
         assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == {"test_cpu"}, r.stdout
+
+
+def test_worker_prompt_detached_driver_retries_transient_faults():
+    text = (PLUGIN / "template/prompts/worker.md").read_text()
+    assert "Retry transient faults" in text
+    assert "bounded backoff" in text
+    assert "Prefer `on_pass_cmd` to a light-wake `next_step`" in text

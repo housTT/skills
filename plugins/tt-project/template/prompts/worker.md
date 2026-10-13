@@ -178,6 +178,11 @@ never write to a run folder named in earlier context):
   exit code and writes the first non-zero one into the marker, so the next run sees the refusal.
   Size each step's timeout to that tool's limits before starting.
   Under `set -e`, write that marker from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`).
+  Retry transient faults (a busy device, a recovering broker, an ssh stall) inside the driver with
+  bounded backoff, each wait at most the tool's default job timeout; write a failed marker only for
+  a non-transient failure or once retries run out. Each failed marker costs a wake.
+  Prefer `on_pass_cmd` to a light-wake `next_step` whenever the check is mechanical: a verified job
+  then costs no wake, a failed one costs one.
   For a job on another machine (a device job goes through a device runner instead, when your task
   header lists them; see below), start its driver there with `ttp detach --remote <ssh alias> <name>
   -- <command...>` (also a chain that only drives it over ssh: a local driver dies when this host
