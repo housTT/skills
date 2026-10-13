@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -1251,6 +1251,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     ids = ", ".join(f"#{r['id']}" for r in started.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
+                # A head a review already accepted under the same checks keeps that verdict
+                # (reviewreuse): another review of it runs only when forced with a reason.
+                head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
+                prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg)) if head else None
+                if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
+                    raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
+                if prior:
+                    labels.append(reviewreuse.FORCED_LABEL)
+                    notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which accepted "
+                                 f"{head[:12]}: {clip(a.get('reason'), 200)}")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 followup = old if old and old["status"] == "done" else None
                 if followup:
@@ -2085,6 +2095,15 @@ def _covered(db, deps: list, spec: str) -> set[int]:
         if names_branch(spec, r["branch"]):
             ids.add(r["id"])
     return ids
+
+
+def _reviewed_head(p, deps: list, spec: str) -> str | None:
+    """The head a review with these dependencies and spec would review as it starts (worktree.reviewed_head)."""
+    try:
+        return worktree.reviewed_head(p, {"id": None, "spec": spec,
+                                          "depends_on": json.dumps([d for d in deps if isinstance(d, int)])})
+    except Exception:
+        return None
 
 
 def _auto_reviews(db, covered: set[int]) -> dict[int, dict]:

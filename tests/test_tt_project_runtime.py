@@ -24526,7 +24526,7 @@ def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(e
              "VALUES(?,1,'b',?,'origin/proj','pushed',0,0)", (again, head))
     done = _finish_fix(env, s.p, fix)
     assert not s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND status NOT IN ('failed','done')")
-    assert f"Review #{again} was already queued" in done["text"]
+    assert f"Review #{again} already accepted this head" in done["text"]
     # Without either, the daemon reviews it as before.
     s.p.db.x("DELETE FROM push_queue")
     _finish_fix(env, s.p, fix)
@@ -60458,3 +60458,110 @@ def test_web_app_renders_a_trend_only_when_the_chain_has_one():
     assert none == "" and null == ""
     assert "<polyline" in html and "tok_s" in html and "run 9" in html and "10:30 PDT" in html
     assert "12 tok/s" in html and "+1.5" in html and html.index("run 9") < html.index("run 7"), html
+
+
+def _reuse_daemon(p, monkeypatch):
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(k["task"]["id"]) or 0)
+    return d, started
+
+
+def _reuse_review(p, tid, title="Review it"):
+    return p.db.add_task(title, "Review the change.", kind="review", tier="light", origin="coordinator",
+                         provider="claude", budget_usd=8.0, depends_on=[tid])
+
+
+def test_a_review_of_an_already_accepted_head_reuses_its_verdict_with_no_run(env, monkeypatch):
+    from ttp import reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    key = reviewreuse.check_key(d.cfg)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    assert started == [first]
+    assert reviewreuse.recorded(p.db.task(first)) == (head, key), "the head it starts on is recorded"
+    p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "looks right"}))
+    again = _reuse_review(p, tid, "Review it again")
+    user = p.db.add_task("use it", "build on it", origin="coordinator", depends_on=[again])
+    d.dispatch()
+    assert started == [first], "no second run for the same head"
+    t = p.db.task(again)
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and res["reused_review"] == first and res["reviewed_head"] == head
+    assert "looks right" in res["summary"]
+    assert f"review #{first}" in p.db.task(user)["spec"], "the dependent gets the evidence"
+    (e,) = p.db.q("SELECT status, text FROM events WHERE kind='task_done' AND task=?", (again,))
+    assert e["status"] == "handled" and "no run" in e["text"]
+    # A third review of it points at the first, and the daemon queues none for the code task.
+    assert reviewreuse.accepted(p.db, head, key)["id"] == first
+    assert d._auto_review(p.db.task(tid), "made it") == (first, False)
+
+
+def test_a_new_head_or_other_checks_get_their_own_review(env, monkeypatch):
+    from ttp import reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
+    _commit_file(path, "b")
+    new = _git_out(path, "rev-parse", "HEAD")
+    second = _reuse_review(p, tid, "Review the new head")
+    d.dispatch()
+    assert started == [first, second] and p.db.task(second)["status"] != "done"
+    assert reviewreuse.recorded(p.db.task(second))[0] == new
+    p.db.update_task(second, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
+    d.cfg = dict(d.cfg, delivery=dict(d.cfg.get("delivery") or {}, push_checks=["pytest -q"]))
+    third = _reuse_review(p, tid, "Review under the new checks")
+    d.dispatch()
+    assert started == [first, second, third], "other checks: the earlier verdict does not cover them"
+
+
+def test_an_earlier_failed_or_changes_needed_review_is_not_reused(env, monkeypatch):
+    from ttp import reviewreuse
+    from ttp.db import CHANGES_NEEDED
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    failed = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(failed, status="failed", result=json.dumps({"status": "failed", "summary": "broken"}))
+    asked = _reuse_review(p, tid, "Review it again")
+    d.dispatch()
+    p.db.update_task(asked, status="failed", result=json.dumps({"status": CHANGES_NEEDED, "summary": "fix x"}))
+    third = _reuse_review(p, tid, "Review it once more")
+    d.dispatch()
+    assert started == [failed, asked, third]
+    assert reviewreuse.accepted(p.db, head, reviewreuse.check_key(d.cfg)) is None
+
+
+def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
+    from ttp import coordinator as coord, reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
+    add = {"type": "task_add", "title": f"Review #{tid} again", "kind": "review", "spec": "check it",
+           "depends_on": [tid]}
+    problems = coord.apply(p, [add])
+    assert len(problems) == 1 and f"review #{first}" in problems[0] and "force" in problems[0]
+    assert len(coord.apply(p, [dict(add, force=True)])) == 1, "force needs a reason"
+    assert coord.apply(p, [dict(add, force=True, reason="the first review skipped the docs")]) == []
+    forced = p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
+    assert reviewreuse.FORCED_LABEL in json.loads(forced["labels"])
+    p.db.update_task(forced["id"], provider="claude")
+    d.dispatch()
+    assert started == [first, forced["id"]], "a forced review runs"

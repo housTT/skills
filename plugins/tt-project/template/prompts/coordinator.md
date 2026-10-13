@@ -91,7 +91,9 @@ Each field's rules are in the section named; the table only lists them.
   worker. On yes, set `providers.claude.plugin_dirs` (a JSON list) in that same turn.
 - NEVER add a duplicate or redo work tried, shelved or landed (`## Tried work`). task_add rejects
   a match with open or 14-day work, naming it: update or continue it; if the work really differs,
-  resend with `force: true` and `differs from #<id>: <how>` in the spec.
+  resend with `force: true` and `differs from #<id>: <how>` in the spec. A review of a head a
+  review already accepted under the same checks is rejected with that review's id: its verdict
+  stands. Force one only with `force: true` and a `reason`.
 - On a plan, unused capacity is lost at each reset: when slots are free and the plan is below its
   line, add independent tasks that run side by side.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`; the

@@ -74,6 +74,7 @@ from . import refwaits
 from . import release
 from . import responsibilities
 from . import reviewcap
+from . import reviewreuse
 from . import runner
 from . import schedule as sched
 from . import service
@@ -2909,7 +2910,10 @@ class Daemon:
         review = self._auto_review(dict(task, **upd), summary, add=plain) \
             if new == "done" and task["kind"] == "code" else None
         if review:
-            text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else "was already queued.")
+            known = None if review[1] else db.task(review[0])
+            text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else
+                                                 "already accepted this head: no new review." if known and
+                                                 known["status"] == "done" else "was already queued.")
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
         # Upstream notes and deferred follow-ups are not fixes: they stay with the coordinator.
@@ -4212,6 +4216,8 @@ class Daemon:
             if why:
                 continue
             review_pick = None
+            if task["kind"] == "review" and self._reuse_review(task):
+                continue
             if task["kind"] == "review":
                 task, review_pick = self._size_review(task)
             picked = self._pick_effort(task, provider)
@@ -6640,6 +6646,10 @@ class Daemon:
                             (tip,)) if tip else None
             if passed:
                 return passed["task"], False
+            # Or one accepted it without the push queue (review only, an own push): its verdict stands.
+            prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg)) if tip else None
+            if prior:
+                return prior["id"], False
             if not add:
                 return None
             changes = worktree.diff_lines(self.p, [branch]) if branch else None
@@ -6800,6 +6810,33 @@ class Daemon:
                 extra["verified_through"] = m["sha"]
         except Exception as e:
             log(self.p, f"task {task['id']}: verified-through marker not recorded: {e}")
+
+    def _reuse_review(self, task: dict) -> bool:
+        """A review about to start whose head (worktree.reviewed_head) a review already accepted under
+        the same checks takes that verdict and closes with no run (reviewreuse.reuse): True. Else it
+        records the head and check set it starts on, so a later review of that head can reuse it; a
+        review forced past an accepted one runs. False whenever it runs."""
+        db = self.p.db
+        try:
+            sha = worktree.reviewed_head(self.p, task)
+        except Exception as e:
+            log(self.p, f"review {task['id']}: its head was not read, so it is not checked for reuse: {e}")
+            return False
+        if not sha:
+            return False
+        key = reviewreuse.check_key(self.cfg)
+        labels = json.loads(task["labels"] or "[]")
+        prior = None if reviewreuse.FORCED_LABEL in labels else reviewreuse.accepted(db, sha, key, skip=task["id"])
+        if not prior:
+            db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
+            return False
+        with db.tx():
+            text = reviewreuse.reuse(db, task, prior, sha, key)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "task_done", "normal", text[:coord.EVENT_CHARS], "handled",
+                  task["id"]))
+        log(self.p, f"review {task['id']}: reused the verdict of review #{prior['id']} on {sha[:12]}; no run")
+        return True
 
     def _precheck_line(self, task: dict, head: str, checks: Path) -> str:
         """The review spec's line on the checks _precheck started on the code task's head."""
