@@ -2675,27 +2675,59 @@ def set_when(db, tid: int, probe: str | None, p=None) -> str:
 
 def cmd_prune(a) -> None:
     """One sweep over finished tasks' worktrees, with the daemon's checks: clear build and cache
-    directories, move small untracked leftovers to the task's last run directory, remove the worktree
-    when nothing is lost. Branches stay. --dry-run changes nothing and lists what would happen."""
-    from . import worktree
+    directories, archive hand-off artifacts and large untracked files (state/archive/tasks/<id>/),
+    move small untracked leftovers to the task's last run directory, clear a stale `git worktree
+    add` lock, and remove the worktree when nothing is lost. Branches stay. Prints each worktree's
+    outcome (the reason for each one kept), how many went and the space freed. --dry-run changes
+    nothing and lists what would happen. --archived <task> lists a task's archive; with --restore
+    <dir> it extracts the archived files there."""
+    from . import archive, worktree
     p = need(a.name, sys.argv[1:])
+    if getattr(a, "archived", None) is not None:
+        m = archive.manifest(p, a.archived)
+        if not m:
+            sys.exit(f"task #{a.archived} has no archive under {archive.task_dir(p, a.archived)}")
+        if getattr(a, "restore", None):
+            got = archive.restore(p, a.archived, Path(a.restore).expanduser())
+            print(f"restored {len(got)} file(s) of task #{a.archived} to {a.restore}")
+            return
+        print(f"task #{a.archived}: branch {m.get('branch') or '?'} at {str(m.get('head') or '?')[:12]}, "
+              f"archive {archive.task_dir(p, a.archived)}")
+        for e in m.get("files") or []:
+            where = archive.resolve(p, e["path"], a.archived) or {}
+            print(f"  {e['path']}  {e['size'] / 1e6:.1f} MB  {e['stored']}"
+                  + ("  (hand-off artifact)" if e.get("named") else "")
+                  + (f"  {where['location']}" if where.get("location") else ""))
+        return
     dry = getattr(a, "dry_run", False)
     disk = p.config().get("disk", {})
     before = shutil.disk_usage(p.worktrees).free if p.worktrees.is_dir() else 0
     res = worktree.sweep(p, names=disk.get("cache_dirs"), leftovers_max_mb=disk.get("worktree_leftovers_max_mb"),
-                         dry_run=dry)
+                         archive_max_mb=disk.get("worktree_archive_max_mb"), dry_run=dry)
     for r in res:
         cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
-        mv = r.get("moved")
+        mv, ar = r.get("moved"), r.get("archived")
         moved = (f"{'would move' if dry else 'moved'} {mv['files']} untracked file(s) ({mv['bytes'] / 1e6:.1f} MB) "
                  f"to {mv['to']}; " if mv else "")
+        if ar:
+            moved += (f"{'would archive' if dry else 'archived'} {ar['files']} file(s) ({ar['bytes'] / 1e6:.1f} MB)"
+                      + (f" to {ar['dir']}" if ar.get("dir") else "")
+                      + (f", {'would drop' if dry else 'dropped'} {ar['dropped']} over the cap "
+                         f"({ar['dropped_bytes'] / 1e6:.1f} MB, listed in the manifest)" if ar["dropped"] else "")
+                      + "; ")
+        if r.get("unlocked") is not None:
+            moved += f"{'would clear' if dry else 'cleared'} its stale lock ({r['unlocked'] or 'no reason'}); "
         print(f"#{r['task']} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
                                                    + (r["branch"] or "?") + " kept"
                                                    if r["why"] is None else f"kept: {r['why']}") + cleared)
     if not res:
         print("no finished task's worktree to tidy")
-    elif before and not dry:
-        print(f"freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB")
+        return
+    gone = sum(1 for r in res if r["why"] is None)
+    line = f"{'would remove' if dry else 'removed'} {gone} worktree(s), kept {len(res) - gone}"
+    if before and not dry:
+        line += f"; freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB"
+    print(line)
 
 
 def cmd_memory(a) -> None:
@@ -4264,6 +4296,9 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--json", action="store_true")
         if name == "prune":
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
+            s.add_argument("--archived", type=int, metavar="TASK",
+                           help="list what the sweep archived from this task's worktree (and where)")
+            s.add_argument("--restore", metavar="DIR", help="with --archived: extract the task's archived files here")
         if name == "logs":
             s.add_argument("--bytes", type=int, default=6000)
         if name == "doctor":

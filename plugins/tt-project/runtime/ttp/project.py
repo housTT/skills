@@ -221,7 +221,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # files totalling at most worktree_leftovers_max_mb (0 = never) has them moved to its last run's
     # worktree-leftovers/ first. Branches are never deleted.
     "disk": {"min_free_pct": 5, "min_free_gb": 150, "resume_free_gb": None, "worktree_retention_days": None,
-             "cache_dirs": None, "worktree_leftovers_max_mb": 50},
+             "cache_dirs": None, "worktree_leftovers_max_mb": 50,
+             "worktree_archive_max_mb": 200},
     # Workers and reviewers run with the project's Python venv active (VIRTUAL_ENV, PATH), so a
     # fresh task worktree does not rebuild one. "auto" finds .venv or venv in the project root; a
     # path (absolute, or relative to the project root) names one; "" turns it off. A working

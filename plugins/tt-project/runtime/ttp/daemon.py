@@ -160,6 +160,7 @@ COORD_BLOCKED_KEY = "coordinator_blocked"   # kv: {since, why} while the coordin
 RELAYED_KEY = "relayed_issues"              # kv: {"last": ts of the last relay, "ids": {issue id: ts}}
 DISK_RESUME = 1.2        # the guard ends once free space is this many times its threshold
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
+DISK_SWEEP_EVERY_S = 900  # under the disk guard, finished tasks' worktrees are swept at most this often
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
 DISK_DU_TOP = 6          # the biggest top-level directories it names
 KV_WORKTREES_LOGGED = "worktrees_logged"   # task -> the keep reason the daemon log last gave
@@ -416,6 +417,7 @@ class Daemon:
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
+        self._disk_swept = 0.0   # when the disk guard last swept finished tasks' worktrees
         self._disk_free: float | None = None
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
@@ -4105,25 +4107,41 @@ class Daemon:
         # A machine's own threshold keeps the DISK_RESUME rule: the project's resume point was set
         # against its own threshold and could hold a shared disk that others keep near full forever.
         resume_gb = None if mine else disk_resume_gb(cfg)
-        worst = None   # (margin, path, free, total, threshold, resume point)
-        for path in {self.p.base.resolve(), self.p.worktrees.resolve()}:
-            try:
-                u = shutil.disk_usage(path)
-            except OSError:
-                continue
-            need = min(pct / 100 * u.total, gb * 1e9)
-            resume = need * DISK_RESUME if resume_gb is None else max(need, resume_gb * 1e9)
-            if resume >= u.total:   # a resume point the disk can never reach would hold it forever
-                resume = need * DISK_RESUME
-            margin = u.free - (resume if self._disk_low else need)
-            if worst is None or margin < worst[0]:
-                worst = (margin, path, u.free, u.total, need, resume)
+
+        def measure(held: bool):
+            worst = None   # (margin, path, free, total, threshold, resume point)
+            for path in {self.p.base.resolve(), self.p.worktrees.resolve()}:
+                try:
+                    u = shutil.disk_usage(path)
+                except OSError:
+                    continue
+                need = min(pct / 100 * u.total, gb * 1e9)
+                resume = need * DISK_RESUME if resume_gb is None else max(need, resume_gb * 1e9)
+                if resume >= u.total:   # a resume point the disk can never reach would hold it forever
+                    resume = need * DISK_RESUME
+                margin = u.free - (resume if held else need)
+                if worst is None or margin < worst[0]:
+                    worst = (margin, path, u.free, u.total, need, resume)
+            return worst
+        worst = measure(self._disk_low)
         if worst is None:
             return
         _, path, free, total, need, resume = worst
         self._disk_free = free
         low = need > 0 and worst[0] < 0
         now = time.time()
+        swept = None
+        if low and now - self._disk_swept >= DISK_SWEEP_EVERY_S:
+            # Free what finished tasks hold first; held work is released once free space is back above
+            # the guard itself (not the resume point: the sweep, not a hovering disk, freed it).
+            self._disk_swept = now
+            swept = self._disk_sweep()
+            if swept["removed"]:
+                again = measure(False)
+                if again is not None:
+                    _, path, free, total, need, resume = again
+                    self._disk_free = free
+                    low = need > 0 and again[0] < 0
         db = self.p.db
         info = {"path": str(path), "free_gb": round(free / 1e9, 1), "total_gb": round(total / 1e9, 1),
                 "threshold_gb": round(need / 1e9, 1), "resume_gb": round(resume / 1e9, 1), "low": low,
@@ -4142,16 +4160,41 @@ class Daemon:
             log(self.p, f"disk low: {free / 1e9:.1f} GB free under {path} (guard {need / 1e9:.1f} GB); "
                         f"only questions and plans start. {usage}")
             source = f"machine {mine[0]}'s min_free_gb" if mine else "disk.min_free_gb"
+            done = (f"Swept finished tasks' worktrees: {swept['removed']} removed, {swept['kept']} kept, "
+                    f"{swept['freed'] / 1e9:.1f} GB freed; `ttp prune {self.p.name} --dry-run` lists why each is kept."
+                    if swept else f"Finished tasks' worktrees are removed as they end; `ttp prune {self.p.name}` "
+                                  f"sweeps now and lists the ones kept.")
             self.alert("disk", f"Only {free / 1e9:.1f} GB free under {path} (guard: {need / 1e9:.0f} GB, the smaller "
                                f"of {pct:g}% of the disk and {gb:g} GB from {source}). {usage} New tasks other than "
                                f"questions and plans are held until {resume / 1e9:.0f} GB are free; running "
-                               f"work, questions, plans and replies continue. Finished tasks' worktrees are removed as "
-                               f"they end; `ttp prune {self.p.name}` sweeps now and lists the ones kept. A shared disk "
+                               f"work, questions, plans and replies continue. {done} A shared disk "
                                f"that others keep near full by design takes its own threshold: `ttp machines add "
                                f"<alias> --min-free-gb N`.", "high", every_s=0)
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def _disk_sweep(self) -> dict:
+        """The disk guard's own sweep of finished tasks' worktrees (prune_worktrees, forced: kept ones
+        are looked at again), model-free; check_disk runs it at most every DISK_SWEEP_EVERY_S while
+        the disk is low. Logs and returns {"removed", "kept", "freed" (bytes)}."""
+        try:
+            before = shutil.disk_usage(self.p.worktrees.resolve()).free
+        except OSError:
+            before = None
+        try:
+            res = self.prune_worktrees(every_s=0, force=True)
+        except Exception:
+            log(self.p, "disk guard sweep: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            res = []
+        removed = sum(1 for r in res if r.get("why") is None)
+        try:
+            freed = max(shutil.disk_usage(self.p.worktrees.resolve()).free - before, 0) if removed and before else 0
+        except OSError:
+            freed = 0
+        log(self.p, f"disk guard sweep: {removed} finished task worktree(s) removed, {len(res) - removed} kept, "
+                    f"{freed / 1e9:.1f} GB freed")
+        return {"removed": removed, "kept": len(res) - removed, "freed": freed}
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
@@ -4630,21 +4673,23 @@ class Daemon:
             return False
         return task["kind"] not in DISK_LIGHT_KINDS or (self._disk_free or 0) < DISK_FLOOR_GB * 1e9
 
-    def prune_worktrees(self, every_s: float = 300) -> None:
+    def prune_worktrees(self, every_s: float = 300, force: bool = False) -> list[dict]:
         """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and
         at once when a task finished since the last sweep. `disk.worktree_retention_days` delays
         removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
         before). A worktree kept for a reason is checked again when its task changes or after
-        KEEP_RECHECK_S. Branches are never deleted."""
+        KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep). Branches are never deleted.
+        Returns the sweep's results."""
         now = time.time()
         cfg = self.cfg.get("disk", {})
         days = cfg.get("worktree_retention_days")
         if days is not None and float(days) <= 0:
-            return
+            return []
         latest = self.p.db.one("SELECT MAX(updated) m FROM tasks WHERE status IN (%s)"
                                % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)["m"] or 0
-        if (now - self._last_prune < every_s and latest <= self._pruned_upto) or not self.p.worktrees.is_dir():
-            return
+        if (now - self._last_prune < every_s and latest <= self._pruned_upto and not force) \
+                or not self.p.worktrees.is_dir():
+            return []
         self._last_prune, self._pruned_upto = now, latest
         days = float(days or 0)
 
@@ -4654,9 +4699,21 @@ class Daemon:
         db = self.p.db
         logged = db.kv(KV_WORKTREES_LOGGED) or {}      # task -> the keep reason last logged
         dirty = db.kv(KV_WORKTREES_DIRTY) or {}        # task -> its kept tracked changes
-        for r in worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"), skip=recent,
-                                leftovers_max_mb=cfg.get("worktree_leftovers_max_mb")):
+        results = worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"),
+                                 skip=(lambda task: False) if force else recent,
+                                 leftovers_max_mb=cfg.get("worktree_leftovers_max_mb"),
+                                 archive_max_mb=cfg.get("worktree_archive_max_mb"))
+        for r in results:
             key = str(r["task"])
+            if r.get("unlocked") is not None:
+                log(self.p, f"worktree {r['path']} of task {r['task']}: cleared its stale lock "
+                            f"({r['unlocked'] or 'no reason'})" + (", half-made, removed" if r.get("half") else ""))
+            if r.get("archived"):
+                ar = r["archived"]
+                log(self.p, f"worktree {r['path']} of task {r['task']}: archived {ar['files']} file(s) "
+                            f"({ar['bytes'] / 1e6:.1f} MB) to {ar['dir']}"
+                            + (f"; dropped {ar['dropped']} over the cap ({ar['dropped_bytes'] / 1e6:.1f} MB), "
+                               f"listed in its manifest" if ar["dropped"] else ""))
             if r["cleared"]:
                 log(self.p, f"worktree {r['path']} of task {r['task']}: removed {', '.join(r['cleared'][:10])}")
             if r.get("moved"):
@@ -4686,6 +4743,7 @@ class Daemon:
             memo = {k: v for k, v in memo.items() if (self.p.worktrees / f"t{k}").exists()}
             if memo != (db.kv(name) or {}):
                 db.set_kv(name, memo or None)
+        return results
 
     def _uncommitted(self, r: dict, prev: dict | None) -> dict:
         """A finished task's worktree holds modified tracked files: raise it to the coordinator once

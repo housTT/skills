@@ -13942,7 +13942,8 @@ def test_a_kept_worktree_is_logged_once_and_tracked_changes_raise_one_event(env,
 def test_untracked_leftovers_move_to_the_last_run_and_the_worktree_goes(env, monkeypatch):
     """A finished worktree whose only dirty entries are untracked files under the size limit: they move
     to <last run dir>/worktree-leftovers/ with their relative paths, the worktree goes, the branch
-    stays. Over the limit it stays, logged once. Running and queued tasks' worktrees are untouched."""
+    stays. Over the limit they go to the task's archive instead and the worktree goes too. Running and
+    queued tasks' worktrees are untouched."""
     p = make(env)
     _no_grace(monkeypatch)
     from ttp import worktree
@@ -13968,18 +13969,22 @@ def test_untracked_leftovers_move_to_the_last_run_and_the_worktree_goes(env, mon
     (running / "notes.md").write_text("mine")
     dry = {r["task"]: r for r in worktree.sweep(p, dry_run=True)}
     assert dry[tid]["why"] is None and dry[tid]["moved"]["files"] == 2 and path.exists()
-    assert "over the 50 MB limit" in dry[big_id]["why"] and open_id not in dry and run_id not in dry
+    assert dry[big_id]["why"] is None and dry[big_id]["archived"]["files"] == 1 and big.exists()
+    assert open_id not in dry and run_id not in dry
     d = Daemon(p.base)
     d.prune_worktrees()
     Daemon(p.base).prune_worktrees(every_s=0)
     dest = p.runs / "r2" / worktree.LEFTOVERS_DIR
     assert (dest / "tmp" / "sub" / "out.txt").read_text() == "scratch" and (dest / "notes.md").read_text() == "notes"
     assert not path.exists() and _git_out(p.root, "rev-parse", branch) == head, "the branch was lost"
-    assert big.exists() and (big / "huge.bin").stat().st_size == 51 * 10**6
+    assert not big.exists()
+    from ttp import archive
+    assert [(e["path"], e["size"], e["stored"]) for e in archive.manifest(p, big_id)["files"]] == [
+        ("huge.bin", 51 * 10**6, "tar")]
     assert (open_ / "notes.md").read_text() == "mine" and (running / "notes.md").read_text() == "mine"
     log = (p.logs / "daemon.log").read_text()
     assert log.count(f"task {tid}: moved 2 untracked file(s)") == 1 and f"task {tid} (done) removed" in log
-    assert log.count(f"task {big_id} kept: uncommitted untracked files only") == 1, log
+    assert log.count(f"task {big_id}: archived 1 file(s) (51.0 MB)") == 1, log
     assert not p.db.q("SELECT id FROM events WHERE kind=?", (worktree.DIRTY_EVENT,))
     # The limit is a setting; at 0 nothing moves.
     t0, p0, _ = _code_task(p, "limit off")
@@ -14023,7 +14028,7 @@ def test_a_tracked_file_in_a_cache_named_directory_is_never_cleared(env):
     assert (path / "build" / "script.sh").exists() and (path / "build" / "out.o").exists()
 
 
-def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env, monkeypatch):
+def test_an_untracked_file_in_a_tracked_build_directory_is_archived_not_lost(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
     from ttp import worktree
@@ -14034,8 +14039,12 @@ def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env, 
     _git_out(path, *_IDENT, "commit", "-qm", "tools")
     (path / "tools" / "build" / "new.cmake").write_text("uncommitted work\n")
     (res,) = worktree.sweep(p)
-    assert (path / "tools" / "build" / "new.cmake").read_text() == "uncommitted work\n", "uncommitted work was lost"
-    assert res["cleared"] == [] and "uncommitted" in res["why"] and path.exists()
+    # The cache sweep leaves a tracked build directory alone; the new file is archived, not deleted.
+    assert res["cleared"] == [] and res["why"] is None and not path.exists()
+    assert _archived(p, tid) == {"tools/build/new.cmake": (False, "tar")}
+    from ttp import archive
+    assert archive.restore(p, tid, env["tmp"] / "back") == ["tools/build/new.cmake"]
+    assert (env["tmp"] / "back" / "tools" / "build" / "new.cmake").read_text() == "uncommitted work\n"
 
 
 def _handoff(p, tid, artifacts):
@@ -14047,7 +14056,7 @@ def _handoff(p, tid, artifacts):
     (d / "result.json").write_text(json.dumps({"status": "done", "summary": "s", "artifacts": artifacts}))
 
 
-def test_ignored_hand_off_artifacts_keep_the_worktree_and_other_ignored_files_do_not(env, monkeypatch):
+def test_ignored_hand_off_artifacts_are_archived_and_other_ignored_files_are_not(env, monkeypatch):
     # `git worktree remove` deletes ignored files, and workers often leave their hand-off there.
     p = make(env)
     _no_grace(monkeypatch)
@@ -14076,11 +14085,21 @@ def test_ignored_hand_off_artifacts_keep_the_worktree_and_other_ignored_files_do
     t3, hidden, _ = _code_task(p, "untracked")
     (hidden / "new.py").write_text("uncommitted work\n")
     res = {r["task"]: r for r in worktree.sweep(p)}
-    assert (path / "tmp" / "out" / "new.mp4").read_bytes() == b"video", "a hand-off artifact was lost"
-    assert (path / "build" / "model.pt").exists(), "a hand-off artifact in a cache directory was cleared"
-    assert res[tid]["why"].startswith("hand-off artifacts inside: tmp/out/new.mp4, tmp/NEXT.md, build/model.pt")
-    assert not other.exists() and res[t2]["why"] is None, "an ignored file nobody handed off kept the worktree"
-    assert (hidden / "new.py").exists() and "uncommitted" in res[t3]["why"]
+    assert not path.exists() and res[tid]["why"] is None
+    assert _archived(p, tid) == {"tmp/out/new.mp4": (True, "tar"), "tmp/NEXT.md": (True, "tar"),
+                                 "build/model.pt": (True, "tar")}, "a hand-off artifact was lost"
+    from ttp import archive
+    archive.restore(p, tid, env["tmp"] / "back")
+    assert (env["tmp"] / "back" / "tmp" / "out" / "new.mp4").read_bytes() == b"video"
+    assert (env["tmp"] / "back" / "build" / "model.pt").read_bytes() == b"weights"
+    assert not other.exists() and res[t2]["why"] is None and archive.manifest(p, t2) is None, \
+        "an ignored file nobody handed off was archived"
+    assert not hidden.exists() and _archived(p, t3) == {"new.py": (False, "tar")}
+
+
+def _archived(p, tid):
+    from ttp import archive
+    return {e["path"]: (e["named"], e["stored"]) for e in (archive.manifest(p, tid) or {}).get("files", [])}
 
 
 def _ignore_tmp(p):
@@ -14090,7 +14109,7 @@ def _ignore_tmp(p):
     exclude.write_text("tmp/\n")
 
 
-def test_another_tasks_hand_off_keeps_the_worktree_it_left_files_in(env, monkeypatch):
+def test_another_tasks_hand_off_in_a_worktree_is_archived_with_it(env, monkeypatch):
     # Later tasks often write their logs into an earlier task's worktree; removing it deletes them.
     p = make(env)
     _no_grace(monkeypatch)
@@ -14110,12 +14129,139 @@ def test_another_tasks_hand_off_keeps_the_worktree_it_left_files_in(env, monkeyp
     # Relative to the tt-project folder; a bare tmp/stray.log is B's own, not A's or C's.
     _handoff(p, tb, [f"worktrees/t{ta}/tmp/b.log (the drive log)", "tmp/stray.log"])
     res = {r["task"]: r for r in worktree.sweep(p)}
-    assert (a / "tmp" / "b.log").exists(), "another task's hand-off artifact was lost"
-    assert res[ta]["why"] == "hand-off artifacts inside: tmp/b.log"
+    assert not a.exists() and res[ta]["why"] is None
+    assert _archived(p, ta) == {"tmp/b.log": (True, "tar")}, "another task's hand-off artifact was lost"
+    from ttp import archive
+    found = archive.resolve(p, str(a / "tmp" / "b.log"))
+    assert found["task"] == ta and found["location"].endswith("files.tar.gz:tmp/b.log")
+    assert archive.resolve(p, "tmp/b.log", task_id=ta)["sha256"] == found["sha256"]
+    assert archive.resolve(p, str(a / "tmp" / "stray.log")) is None
     assert not c.exists() and res[tc]["why"] is None
 
 
-def test_a_glob_hand_off_entry_keeps_the_worktree(env, monkeypatch):
+def test_large_untracked_files_are_archived_under_the_cap_and_listed_above_it(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import archive, worktree
+    tid, path, _ = _code_task(p, "big outputs")
+    _commit_file(path, "tracked")
+    (path / "out").mkdir()
+    (path / "out" / "small.bin").write_bytes(b"s" * 400_000)
+    (path / "out" / "large.bin").write_bytes(b"l" * 3_000_000)
+    (path / "out" / "named.bin").write_bytes(b"n" * 2_000_000)
+    _handoff(p, tid, ["out/named.bin (the result)"])
+    (dry,) = worktree.sweep(p, archive_max_mb=1, leftovers_max_mb=0.1, dry_run=True)
+    assert dry["archived"] == {"files": 2, "bytes": 2_400_000, "dropped": 1, "dropped_bytes": 3_000_000}
+    assert path.exists() and archive.manifest(p, tid) is None, "a dry run changed something"
+    (res,) = worktree.sweep(p, archive_max_mb=1, leftovers_max_mb=0.1)
+    assert res["why"] is None and not path.exists() and res["archived"]["dropped"] == 1
+    # A named artifact is archived whatever its size; unnamed files only up to the cap, the rest listed.
+    assert _archived(p, tid) == {"out/named.bin": (True, "tar"), "out/small.bin": (False, "tar"),
+                                 "out/large.bin": (False, "dropped")}
+    m = {e["path"]: e for e in archive.manifest(p, tid)["files"]}
+    import hashlib
+    assert m["out/large.bin"]["sha256"] == hashlib.sha256(b"l" * 3_000_000).hexdigest()
+    assert m["out/large.bin"]["size"] == 3_000_000 and archive.manifest(p, tid)["branch"]
+    assert sorted(archive.restore(p, tid, env["tmp"] / "back")) == ["out/named.bin", "out/small.bin"]
+    assert (env["tmp"] / "back" / "out" / "named.bin").read_bytes() == b"n" * 2_000_000
+    assert worktree.sweep(p, archive_max_mb=1) == [], "a second sweep found something"
+
+
+def test_a_stale_initializing_lock_is_cleared_but_a_live_or_foreign_lock_is_not(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    t_stale, stale, branch = _code_task(p, "stale lock")
+    t_live, live, _ = _code_task(p, "live lock")
+    t_user, user, _ = _code_task(p, "someone's lock")
+    for path, reason in ((stale, "initializing"), (live, "initializing"), (user, "kept for a bisect")):
+        _git_out(p.root, "worktree", "lock", "--reason", reason, str(path))
+    real = worktree._users
+    monkeypatch.setattr(worktree, "_users", lambda path: [4242] if path == live else real(path))
+    res = {r["task"]: r for r in worktree.sweep(p)}
+    assert res[t_stale]["unlocked"] == "initializing" and res[t_stale]["why"] is None and not stale.exists()
+    assert _git_out(p.root, "branch", "--list", branch).strip(), "the branch went with the worktree"
+    assert res[t_live]["held"] and res[t_live]["why"] == "process 4242 runs in it" and live.exists()
+    assert res[t_user]["why"].startswith("locked (kept for a bisect)") and user.exists()
+    assert "locked" in _git_out(p.root, "worktree", "list", "--porcelain").split(str(live))[1].split("\n\n")[0]
+
+
+def test_a_finished_review_frees_the_reviewed_worktree_without_the_grace(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    tid, path, _ = _code_task(p, "reviewed change")
+    (path / "notes.md").write_text("review notes\n")
+    _handoff(p, tid, ["notes.md"])
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+    p.db.update_task(review, status="running", depends_on=str(tid))
+    (res,) = worktree.sweep(p)
+    assert res["held"] and path.exists(), "the grace did not hold a fresh finished worktree"
+    p.db.update_task(review, status="failed")   # a failed review ends the review just as a pass does
+    (res,) = worktree.sweep(p)
+    assert res["why"] is None and not path.exists()
+    assert _archived(p, tid) == {"notes.md": (True, "tar")}
+
+
+def test_open_and_running_tasks_worktrees_are_never_touched(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    kept = {}
+    for status in ("queued", "running", "waiting", "blocked", "needs_review"):
+        tid, path, _ = _code_task(p, status, status=status)
+        (path / "work.txt").write_text("in progress\n")
+        _git_out(p.root, "worktree", "lock", "--reason", "initializing", str(path))
+        kept[tid] = path
+    done, fin, _ = _code_task(p, "finished")
+    p.db.update_task(done, status="done")
+    assert [r["task"] for r in worktree.sweep(p)] == [done]
+    for tid, path in kept.items():
+        assert (path / "work.txt").read_text() == "in progress\n" and _archived(p, tid) == {}
+    assert str(kept[next(iter(kept))]) in _git_out(p.root, "worktree", "list")
+    assert all("locked" in _git_out(p.root, "worktree", "list", "--porcelain").split(str(path))[1].split("\n\n")[0]
+               for path in kept.values())
+
+
+def test_the_disk_guard_sweeps_finished_worktrees_and_releases_held_work(env, monkeypatch):
+    import collections
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import daemon as dm
+    from ttp import worktree
+    usage = collections.namedtuple("usage", "total used free")
+    free = {"gb": 40}   # a 1000 GB disk: the guard is at 50 GB
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 0, free["gb"] * 1e9))
+    real = worktree.remove
+
+    def remove(p, task_id):
+        real(p, task_id)
+        free["gb"] += 15   # the finished worktree held 15 GB
+    monkeypatch.setattr(worktree, "remove", remove)
+    t_old, old, _ = _code_task(p, "old output")
+    (old / "result.bin").write_bytes(b"r")
+    _handoff(p, t_old, ["result.bin"])
+    alerts = lambda: p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='disk'")  # noqa: E731
+    code = p.db.add_task("build it", "s", kind="code", tier="light", origin="user")
+    d = dm.Daemon(p.base)
+    d.dispatch()
+    assert not old.exists() and _archived(p, t_old) == {"result.bin": (True, "tar")}
+    assert p.db.kv("disk_low") is None and not alerts(), "the sweep freed enough, yet the guard held"
+    assert p.db.q("SELECT id FROM runs WHERE task=?", (code,)), "held work was not released"
+    assert "disk guard sweep: 1 finished task worktree(s) removed, 0 kept, 15.0 GB freed" in (
+        p.logs / "daemon.log").read_text()
+    # Still low after a sweep that freed nothing: one alert, and no second sweep inside the rate limit.
+    free["gb"] = 20
+    d._disk_swept = 0.0   # the last sweep is past the rate limit
+    d.check_disk()
+    assert p.db.kv("disk_low") and len(alerts()) == 1
+    assert "0 removed, 0 kept, 0.0 GB freed" in p.db.one("SELECT text FROM messages WHERE ref='disk'")["text"]
+    calls = []
+    monkeypatch.setattr(d, "_disk_sweep", lambda: calls.append(1) or {"removed": 0, "kept": 0, "freed": 0})
+    d.check_disk()
+    assert calls == [] and len(alerts()) == 1
+
+
+def test_a_glob_hand_off_entry_is_archived_before_the_worktree_goes(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
     from ttp import worktree
@@ -14132,9 +14278,9 @@ def test_a_glob_hand_off_entry_keeps_the_worktree(env, monkeypatch):
     _handoff(p, ta, ["tmp/px_*.pt (weights)"])
     _handoff(p, tb, ["tmp/px_*.pt"])
     res = {r["task"]: r for r in worktree.sweep(p)}
-    assert (a / "tmp" / "px_1.pt").exists() and (a / "tmp" / "px_2.pt").exists()
-    assert res[ta]["why"].startswith("hand-off artifacts inside: tmp/px_")
-    assert not b.exists() and res[tb]["why"] is None
+    assert not a.exists() and res[ta]["why"] is None and res[ta]["archived"]["files"] == 2
+    assert _archived(p, ta) == {"tmp/px_1.pt": (True, "tar"), "tmp/px_2.pt": (True, "tar")}
+    assert not b.exists() and res[tb]["why"] is None and not res[tb].get("archived")
 
 
 def test_a_finished_worktree_stays_while_a_detached_push_runs_in_it(env, monkeypatch):
@@ -14353,8 +14499,14 @@ def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys, monkeypatch):
     (dirty / "new.txt").write_text("unsaved")
     cli.main(["prune", "demo"])
     out = capsys.readouterr().out
-    assert not clean.exists() and dirty.exists()
-    assert f"removed, branch {branch} kept" in out and f"#{t_dirty} (done): kept: uncommitted" in out, out
+    assert not clean.exists() and not dirty.exists()
+    assert f"removed, branch {branch} kept" in out and f"#{t_dirty} (done): archived 1 file(s)" in out, out
+    assert "removed 2 worktree(s), kept 0; freed" in out, out
+    cli.main(["prune", "demo"])
+    assert "no finished task's worktree to tidy" in capsys.readouterr().out
+    cli.main(["prune", "demo", "--archived", str(t_dirty)])
+    out = capsys.readouterr().out
+    assert "new.txt" in out and "files.tar.gz:new.txt" in out, out
 
 
 def _local_only_events(p):

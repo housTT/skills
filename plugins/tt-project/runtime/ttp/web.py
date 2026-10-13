@@ -526,6 +526,21 @@ def attention(db: DB, now: float) -> list[dict]:
     return alerts.needs_you(db, now)
 
 
+def archived_files(p: Project, task_id: int | None) -> list[dict]:
+    """The files the worktree sweep archived from a task's worktree (archive.resolve), so a run's
+    hand-off artifacts are still found once its worktree is gone: path, size, sha256, where."""
+    from . import archive
+    if task_id is None:
+        return []
+    m = archive.manifest(p, task_id) or {}
+    out = []
+    for e in (m.get("files") or [])[:200]:
+        where = archive.resolve(p, str(e.get("path") or ""), task_id) or {}
+        out.append({"path": e.get("path"), "size": e.get("size"), "sha256": e.get("sha256"),
+                    "stored": e.get("stored"), "named": bool(e.get("named")), "location": where.get("location", "")})
+    return out
+
+
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tz = timefmt.zone(p)
@@ -646,13 +661,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, rows)
             if url.path.startswith("/api/run/"):
                 run_id = int(url.path.rsplit("/", 1)[-1])
-                r = db.one("SELECT dir FROM runs WHERE id=?", (run_id,))
+                r = db.one("SELECT dir, task FROM runs WHERE id=?", (run_id,))
                 if not r:
                     return self._send(404, {"error": "no run"})
                 d = Path(r["dir"])
                 tail = lambda n: (d / n).read_text(errors="replace")[-8000:] if (d / n).exists() else ""  # noqa: E731
                 return self._send(200, {"progress": tail("progress.md"), "result": tail("result.json"),
-                                        "stderr": tail("stderr.log")})
+                                        "stderr": tail("stderr.log"), "archived": archived_files(p, r["task"])})
             return self._send(404, {"error": "unknown endpoint"})
         finally:
             db.close()
