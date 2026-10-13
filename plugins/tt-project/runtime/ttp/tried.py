@@ -24,6 +24,7 @@ import re
 import time
 from collections import Counter
 from datetime import datetime
+from functools import lru_cache
 
 from . import timefmt
 from .db import load_result
@@ -37,6 +38,7 @@ RESULT_CHARS = 100
 COMMON_SHARE = 0.15        # a title word or parameter in this share of the ledger (and at least
 COMMON_MIN = 4             # COMMON_MIN entries) is the project's own vocabulary: it says nothing alike
 TITLE_CHARS = 80
+BEFORE_CHARS = 80         # text before a number its bound-word and name checks look at
 
 _STOP = set("a an the of to for and or in on at by with from into vs via is be as it its this that".split())
 # Words that say how work is queued, not what it is.
@@ -62,6 +64,8 @@ _BOUND_BEFORE = re.compile(r"\b(bound|ceiling|cap|limit|target|threshold|up to|a
 # work is, so left out of its words and parameters.
 _BOILERPLATE = re.compile(r"^\W*(restrictions?|binding restrictions|rules|constraints|return|hand-?off)\b", re.I)
 _DIFFERS = re.compile(r"\b(differ\w*|unlike|instead of)\b", re.I)
+_NAME_BEFORE = re.compile(r"\b[A-Za-z]*[A-Z][\w-]*\s$")
+_LIST_DOT = re.compile(r"\.(?:\s|$)")
 
 
 def _stem(w: str) -> str:
@@ -71,10 +75,11 @@ def _stem(w: str) -> str:
     return w
 
 
-def words(text: str) -> set[str]:
+@lru_cache(maxsize=4096)
+def words(text: str) -> frozenset[str]:
     """Stemmed content words, numbers left out (they are parameters, see params)."""
-    return {_stem(w) for w in re.findall(r"[a-z][a-z0-9_]*", (text or "").lower())
-            if w not in _STOP and w not in _GENERIC and len(w) > 1}
+    return frozenset(_stem(w) for w in re.findall(r"[a-z][a-z0-9_]*", (text or "").lower())
+                     if w not in _STOP and w not in _GENERIC and len(w) > 1)
 
 
 def subject_key(title: str) -> str:
@@ -82,33 +87,38 @@ def subject_key(title: str) -> str:
     return " ".join(sorted(words(title)))[:120]
 
 
+@lru_cache(maxsize=4096)
 def content(spec: str) -> str:
     """The spec without its boilerplate paragraphs (Restrictions, Return)."""
     return "\n\n".join(b for b in re.split(r"\n\s*\n", spec or "") if not _BOILERPLATE.match(b))
 
 
-def params(text: str) -> set[str]:
+@lru_cache(maxsize=4096)
+def params(text: str) -> frozenset[str]:
     """The numbers a title or spec names that measure something (bounds, sizes, rates), normalised
     (1.50 -> 1.5): decimals, numbers with a unit (1.4x, 20%, 8 ms) and integers after a bound word
     (bound 2, batch 32). Dates, times, task references, versions (0.2.300, LTX-2.5, Python 3.12),
-    counts and list numbering are not."""
+    counts and list numbering are not. Linear in the text: each check looks only at the
+    BEFORE_CHARS before the number (its patterns end there), and results are cached, since task_add
+    compares one spec with the whole ledger."""
     text = _VERSION.sub(" ", _DATES.sub(" ", text or ""))
     out = set()
     for m in _NUMBER.finditer(text):
         n, unit = m.group(1), m.group(2)
-        before = text[: m.start()]
-        bound = _BOUND_BEFORE.search(before)
-        if not (unit or re.search(r"[.e]", n, re.I) or bound):
-            continue
-        if not (unit or bound) and re.search(r"\b[A-Za-z]*[A-Z][\w-]*\s$", before):
-            continue   # 'LTX 2.5', 'Python 3.12': a name's version
-        if not unit and re.match(r"\.(?:\s|$)", text[m.end():]) and "." not in n:
-            continue   # '2.' numbering a list
+        if not unit:
+            before = text[max(0, m.start() - BEFORE_CHARS): m.start()]
+            bound = _BOUND_BEFORE.search(before)
+            if not (bound or "." in n or "e" in n.lower()):
+                continue
+            if not bound and _NAME_BEFORE.search(before):
+                continue   # 'LTX 2.5', 'Python 3.12': a name's version
+            if _LIST_DOT.match(text, m.end()) and "." not in n:
+                continue   # '2.' numbering a list
         try:
             out.add(f"{float(n):g}")
         except ValueError:
             pass
-    return out
+    return frozenset(out)
 
 
 def _jaccard(a: set, b: set) -> float:

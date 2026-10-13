@@ -8614,6 +8614,42 @@ def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_
     assert tried.params("LTX-2.5 e2e timing with the LTX 2.3 VAE, Python 3.12") == set()
 
 
+def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
+    # task_add checks every new task against the whole ledger: with long specs full of numbers, a
+    # check that rescans the text before each number (or redoes each entry per comparison) took ~1 min.
+    import random
+    p = make(env)
+    from ttp import tried
+    rng = random.Random(7)
+    vocab = [f"{a}{b}" for a in ("dec", "enc", "vae", "tile", "conv", "cache", "queue", "fab") for b in ("ode", "er", "ing", "path")]
+
+    def long_spec(i):
+        lines = [f"{n}. Stage {i} {rng.choice(vocab)} {rng.choice(vocab)}: at most {rng.randint(10, 900)} s, "
+                 f"batch {rng.randint(1, 64)}, {rng.random() * 3:.2f}x, {rng.randint(1, 99)}% of LTX 2.{n % 9}."
+                 for n in range(1, 120)]
+        return f"Goal: speed up stage {i}.\n\n" + "\n".join(lines)[:8000]
+
+    for i in range(tried.LEDGER_ROWS):
+        t = p.db.add_task(f"stage {i}: {rng.choice(vocab)} {rng.choice(vocab)} lever", long_spec(i), origin="user")
+        p.db.update_task(t, status="done", attempts=1)
+    new_spec = long_spec(9999)
+    assert len(new_spec) >= 7900
+    for f in (tried.params, tried.words, tried.content):
+        getattr(f, "cache_clear", lambda: None)()   # from cold
+    start = time.monotonic()
+    tried.match(p.db, "stage 9999: fabing vaeer lever", new_spec, p)
+    assert time.monotonic() - start < 10, "tried.match scales with the square of spec length or ledger size"
+    # The daemon keeps each entry's words and parameters: the next task_add reads only its own spec.
+    start = time.monotonic()
+    tried.match(p.db, "stage 10000: tileer cacheode lever", long_spec(10000), p)
+    assert time.monotonic() - start < 1, "tried.match recomputes every ledger entry per check"
+    start = time.monotonic()
+    big = tried.params(" ".join(new_spec for _ in range(8)))
+    assert big and time.monotonic() - start < 2, "params rescans the text before each number"
+    # The window before a number keeps the bound and name checks' results.
+    assert tried.params(("filler words " * 50) + "at most 600 and LTX 2.5 and 7 items") == {"600"}
+
+
 def test_tried_work_ledger_skips_reviews_and_cancelled_tasks_that_never_ran(env):
     p = make(env)
     from ttp import tried
