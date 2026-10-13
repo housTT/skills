@@ -57008,3 +57008,56 @@ def test_start_after_accepts_a_space_and_the_home_zone_abbreviation(env):
         coordinator.parse_start_after("2026-10-13 16:00 EDT", now=now, tz=tz)
     with pytest.raises(ValueError, match=r"2026-10-13T16:00-07:00"):
         coordinator.parse_start_after("2026-10-13 16:00 PST", now=now, tz=tz)
+
+
+def test_archiving_a_named_directory_of_many_files_takes_linear_time(tmp_path, monkeypatch):
+    # A hand-off that named a directory of ~300k files kept a daemon's first tick busy for hours:
+    # store() and _split() looked each file up in lists of all of them. 200k names stay well under a
+    # few seconds with set lookups; the list scans took minutes.
+    from ttp import archive
+    n = 200_000
+    named = [f"tmp/out/{i:06d}.txt" for i in range(n)]
+    others = [f"build/{i:06d}.o" for i in range(n // 2)] + named[: n // 2]
+    monkeypatch.setattr(archive, "files_of", lambda root, rels: named if rels == ["tmp/out"] else others)
+    monkeypatch.setattr(archive, "sha256", lambda f, progress=None: "0" * 64)
+    t0 = time.monotonic()
+    with monkeypatch.context() as m:
+        m.setattr(pathlib.Path, "lstat", lambda self: types.SimpleNamespace(st_size=1))
+        named_files, keep, dropped, sizes = archive._split(tmp_path, ["tmp/out"], ["build"], cap_mb=0.05)
+    assert len(named_files) == n and len(keep) == n + 50_000 and len(dropped) == n // 2 - 50_000
+    new = archive._entries(tmp_path, keep + dropped, sizes, set(named_files), set(dropped), set(), "files.tar.gz")
+    assert time.monotonic() - t0 < 20
+    assert sum(e["named"] for e in new) == n and sum(e["stored"] == "dropped" for e in new) == len(dropped)
+    assert all(e["archive"] == "files.tar.gz" for e in new if e["stored"] == "tar")
+
+
+def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
+
+    def step_that_blocks():   # a step stuck in a call with no timeout, still telling the watchdogs it moves
+        for _ in range(20):
+            time.sleep(0.05)
+            d._progress()
+    d.lift_boot_pause = step_that_blocks
+    d._watch_ticks(every_s=0.05)
+    try:
+        d.tick()
+        d._tick_ended()
+    finally:
+        d.stopping = True
+    daemon_log = (p.logs / "daemon.log").read_text()
+    assert "tick overrun: running 0 min, in step step_that_blocks" in daemon_log
+    stacks = (p.logs / dm.TICK_STACKS).read_text()
+    assert "in step step_that_blocks" in stacks and "step_that_blocks" in stacks.split("in step", 1)[1].split("\n", 1)[1]
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+    assert told and "in step step_that_blocks" in told["text"] and dm.TICK_STACKS in told["text"]
+    # Once per tick: a later look at the same tick and a quick next tick add nothing.
+    assert d.check_overrun(time.time() + 3600) is None
+    d._tick_began = time.time()
+    assert d.check_overrun() is None
+    d._tick_ended()
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")) == 1

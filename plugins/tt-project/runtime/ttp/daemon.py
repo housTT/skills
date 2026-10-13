@@ -103,6 +103,11 @@ LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
+# A tick still running this long gets every thread's stack written to TICK_STACKS (faulthandler) and,
+# once it ends, an alert: a slow step that keeps telling the watchdogs it moves is never restarted.
+TICK_OVERRUN_S = 900
+TICK_STACKS = "tick-stacks.log"   # under logs/; also written on SIGUSR2, where ptrace is not allowed
+TICK_STACKS_MAX = 2_000_000   # bytes before the file is rotated to <name>.1
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 STACKS_FILE = "daemon-stacks.log"   # SIGUSR1 appends every thread's stack here (register_stack_dump)
 STACKS_MAX_BYTES = 1 << 20          # a longer one is started afresh when the daemon starts
@@ -473,6 +478,9 @@ class Daemon:
         self.identity = identity.capture(boot=self.boot, started=self._started)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
+        self._tick_began = 0.0   # when the running tick started (0: between ticks)
+        self._step_name = ""     # the tick step running now
+        self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S
         self._last_prune = 0.0
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
@@ -567,10 +575,12 @@ class Daemon:
         self.sync_schedules(start=True)
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
+        self._watch_ticks()
         self.check_integrity(start=True)
         while not self.stopping:
             try:
                 self.tick()
+                self._tick_ended()
                 self._beat()
                 try:
                     service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
@@ -756,6 +766,66 @@ class Daemon:
             except (OSError, subprocess.SubprocessError):
                 pass
 
+    def _stacks_file(self):
+        """logs/TICK_STACKS opened for appending, rotated once past TICK_STACKS_MAX."""
+        path = self.p.logs / TICK_STACKS
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.stat().st_size > TICK_STACKS_MAX:
+                path.replace(path.with_name(path.name + ".1"))
+        except OSError:
+            pass
+        return open(path, "a")
+
+    def _watch_ticks(self, every_s: float = 30) -> None:
+        """A thread that dumps every thread's stack when a tick overruns (check_overrun), and SIGUSR2
+        for a dump on demand: a py-spy or gdb attach needs ptrace, which hardened hosts refuse."""
+        try:
+            self._sig_stacks = self._stacks_file()   # kept open: faulthandler writes to its fd
+            faulthandler.register(signal.SIGUSR2, file=self._sig_stacks, all_threads=True)
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            pass   # no SIGUSR2 (Windows) or no logs/: the overrun dump still works
+
+        def watch() -> None:
+            while not self.stopping:
+                time.sleep(every_s)
+                try:
+                    self.check_overrun()
+                except Exception:   # never in the way of the tick
+                    log(self.p, "tick watch error: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        threading.Thread(target=watch, daemon=True, name="tick-watch").start()
+
+    def check_overrun(self, now: float | None = None) -> dict | None:
+        """Once per tick that has run TICK_OVERRUN_S: log it with the step it is in, and append every
+        thread's stack to logs/TICK_STACKS. Runs on the watch thread (files only, never the database)."""
+        now = time.time() if now is None else now
+        began = self._tick_began
+        if not began or now - began < TICK_OVERRUN_S or (self._overrun or {}).get("began") == began:
+            return None
+        path = self.p.logs / TICK_STACKS
+        with self._stacks_file() as fh:
+            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} tick running {int((now - began) // 60)} min, "
+                     f"in step {self._step_name or '(before the steps)'}\n")
+            fh.flush()
+            faulthandler.dump_traceback(file=fh, all_threads=True)
+        self._overrun = {"began": began, "step": self._step_name, "stacks": str(path)}
+        log(self.p, f"tick overrun: running {int((now - began) // 60)} min, in step {self._step_name or '(none yet)'}; "
+                    f"every thread's stack is in {path}")
+        return self._overrun
+
+    def _tick_ended(self) -> None:
+        """After a tick: alert once when it overran (check_overrun), naming the step and its stacks."""
+        began, self._tick_began = self._tick_began, 0.0
+        o = self._overrun
+        if not o or o.get("began") != began or o.get("alerted"):
+            return
+        o["alerted"] = True
+        mins = int((time.time() - began) // 60)
+        log(self.p, f"tick overrun over: the tick took {mins} min")
+        self.alert("tick-overrun", f"A daemon tick took {mins} min, in step {o['step'] or '(none)'}: no worker "
+                                   f"started and no message was handled meanwhile. Every thread's stack while it "
+                                   f"ran is in {o['stacks']}.", severity="normal")
+
     def _progress(self) -> None:
         """A tick step finished: tell systemd's WatchdogSec and `ttp.watchdog` the daemon still moves,
         so a long tick (a first tick that fetches and adds many worktrees, several slow watchers) is
@@ -775,6 +845,7 @@ class Daemon:
             pass
 
     def tick(self) -> None:
+        self._tick_began, self._step_name = time.time(), ""
         self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
@@ -786,6 +857,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity,
                      self.sync_schedules, self.lint_charter, self.tend_holds):
+            self._step_name = step.__name__
             step()
             self._progress()
         self._idle.update(self.cfg, self._has_work)
@@ -810,6 +882,7 @@ class Daemon:
             if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
+            self._step_name = step.__name__
             step()
             self._progress()
 
