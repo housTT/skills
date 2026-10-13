@@ -445,19 +445,55 @@ ROOT_RELATIVE_HARNESS_BIN = re.compile(r"(?<![\w$}/.%~-])(?:[\w.-]+/)*harness/bi
 ROOT_RELATIVE_HARNESS_BIN_ALLOW: dict[tuple[str, str], str] = {}
 
 
-def shipped_text_files():
-    """Tracked plugin files that decode as text: prompts, skills, runtime .py and scripts."""
+SKIP_BUILD_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist", ".git"}
+
+
+def shipped_inventory(root=PLUGIN):
+    """(source, relative paths) of the plugin's shipped files: `git ls-files` when the plugin is
+    tracked in a git checkout (the same check as cli._checkout_commit), else a walk of the
+    directory without caches, *.pyc and build output (an exported tree, a copy, no git)."""
+    import os
     import subprocess
-    out = subprocess.run(["git", "ls-files", "-z", "--", "."], cwd=PLUGIN, capture_output=True,
-                         text=True, check=True).stdout
-    for rel in sorted(filter(None, out.split("\0"))):
-        path = PLUGIN / rel
+
+    def git(*args):
+        try:
+            r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout if r.returncode == 0 else ""
+    if git("ls-files", "--", "runtime/ttp/__init__.py").strip():
+        return "git ls-files", sorted(filter(None, git("ls-files", "-z", "--", ".").split("\0")))
+    rels = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_BUILD_DIRS and not d.endswith(".egg-info")]
+        for f in filenames:
+            if not f.endswith((".pyc", ".pyo")):
+                rels.append(os.path.relpath(os.path.join(dirpath, f), root).replace(os.sep, "/"))
+    return "directory walk", sorted(rels)
+
+
+def shipped_text_files(root=PLUGIN):
+    """Shipped plugin files that decode as text: prompts, skills, runtime .py and scripts."""
+    for rel in shipped_inventory(root)[1]:
+        path = root / rel
         if not path.is_file():
             continue
         try:
             yield rel, path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+
+
+def test_shipped_inventory_without_git(tmp_path):
+    import shutil
+    copy = tmp_path / "tt-project"
+    shutil.copytree(PLUGIN, copy, ignore=shutil.ignore_patterns(".git"))
+    (copy / "runtime" / "ttp" / "__pycache__").mkdir(exist_ok=True)
+    (copy / "runtime" / "ttp" / "__pycache__" / "cli.cpython-312.pyc").write_bytes(b"\0")
+    source, rels = shipped_inventory(copy)
+    assert source == "directory walk"
+    assert "runtime/ttp/cli.py" in rels and "template/bin/ttp" in rels
+    assert not [r for r in rels if "__pycache__" in r or r.endswith(".pyc")]
 
 
 def test_root_relative_harness_bin_pattern():
@@ -477,9 +513,11 @@ def test_shipped_text_never_uses_root_relative_harness_bin_paths():
     """Workers run in tt-project/worktrees/<task>, where `tt-project/harness/bin/...` does not
     resolve; shipped prompts, skills, runtime strings and scripts must use
     "$TTP_PROJECT/harness/bin/..." or a path anchored on the project root instead."""
+    source, _ = shipped_inventory()
     files = dict(shipped_text_files())
     # The scan must reach runtime code and suffixless scripts, not only prompt files.
-    assert "runtime/ttp/cli.py" in files and "template/bin/ttp" in files
+    missing = [r for r in ("runtime/ttp/cli.py", "template/bin/ttp") if r not in files]
+    assert not missing, f"shipped-file inventory from {source} of {PLUGIN} lacks {missing} ({len(files)} files)"
     hits = []
     for rel, text in files.items():
         for n, line in enumerate(text.splitlines(), 1):
