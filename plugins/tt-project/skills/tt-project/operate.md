@@ -84,7 +84,9 @@
   the coordinator's digest show free space. A machine whose entry in the machines list has
   `min_free_gb` uses that instead of `disk.min_free_gb` (for a shared disk that other services keep
   near full by design) and resumes at 1.2× it. The alert, and the digest while low, say how much of
-  the used space is this project's own data and name the biggest top-level directories (`du -x -d 1`,
+  the used space is this project's own data (its `state/` and `worktrees/` folders, measured per
+  subfolder; the biggest consumers named, e.g. "run worktrees: 2, 9.5 GB"; a measurement cut short
+  gives the partial total it reached and says so) and name the biggest top-level directories (`du -x -d 1`,
   stopped after 30 s and killed; never from / or a home folder, nor over a network or FUSE mount:
   those show as unknown), so a full shared disk is not taken for project growth.
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
@@ -120,6 +122,11 @@
   the task's branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.
   When the disk guard holds work, the daemon sweeps first (at most every 15 min), and releases the
   held work if free space is back above the guard; the alert says what the sweep freed.
+  Git worktrees a worker made inside its run directory (`state/runs/<id>/<name>`, found with `git
+  worktree list` of the project's repo and of each such folder's own repo) are swept the same way
+  once their run has ended: kept while the run is live, its task is open, it ended under the grace
+  above, it has hand-off artifacts not yet archived, uncommitted changes, or a lock; then `git
+  worktree remove` and `git worktree prune`. Worktrees elsewhere are never touched.
   `ttp prune <name>` sweeps now (`--dry-run` lists what it would do) and reports worktrees removed,
   GB freed and why each other one was kept. Each keep reason is logged once.
 - Workers and reviewers run with the project's Python venv active (`VIRTUAL_ENV`, `PATH`; their

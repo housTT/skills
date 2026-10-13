@@ -365,11 +365,12 @@ def disk_usage_line(b: dict, used: float) -> str:
     consumers (run and task worktrees, state/ subfolders), then the biggest top-level directories. A
     du cut short gives the partial total it measured, said to be partial."""
     gb = lambda n: f"{n / 1e9:.1f} GB"   # noqa: E731
+    amount = lambda n: gb(n) if n >= 1e8 else f"{n / 1e6:.1f} MB"   # noqa: E731  (never a bare 0.0 GB)
     parts = []
     if b.get("own_bytes") is not None:
-        size = gb(b["own_bytes"]) if b.get("own_complete") else (
-            f"at least {gb(b['own_bytes'])} (partial: what du measured within {DISK_DU_TIMEOUT_S // 2} s)")
-        biggest = ", ".join(f"{label}: {n}, {gb(v)}" if n is not None else f"{label} {gb(v)}"
+        size = amount(b["own_bytes"]) if b.get("own_complete") else (
+            f"at least {amount(b['own_bytes'])} (partial: what du measured within {DISK_DU_TIMEOUT_S // 2} s)")
+        biggest = ", ".join(f"{label}: {n}, {amount(v)}" if n is not None else f"{label} {amount(v)}"
                             for label, v, n in b.get("own_consumers") or [])
         parts.append(f"This project's own data (state/ and worktrees/) is {size} of the {gb(used)} used on "
                      f"{b['mount']}" + (f" ({biggest})" if biggest else ""))

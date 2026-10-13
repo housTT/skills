@@ -15778,7 +15778,12 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     with open(other / "blob", "wb") as fh:  # far bigger than the repo and runtime copy can grow
         for _ in range(32):
             fh.write(os.urandom(1 << 20))
-    (p.root / "build.bin").write_bytes(os.urandom(1 << 20))
+    (p.root / "build.bin").write_bytes(os.urandom(1 << 20))   # the code repo is not the project's own data
+    wt = p.runs / "7" / "wt"     # a worktree a worker left in its run directory
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /nowhere\n")
+    (wt / "big.bin").write_bytes(os.urandom(3 << 20))
+    (p.runs / "7" / "log.txt").write_bytes(os.urandom(1 << 20))
     usage = collections.namedtuple("usage", "total used free")
     monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 960e9, 40e9))
     b = dm.disk_breakdown(p, p.base)
@@ -15786,10 +15791,18 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     top = dict(b["top"])
     assert top[str(other)] >= 32 << 20 and top[str(env["repo"])] >= 1 << 20, top
     assert next(iter(top)) == str(other), "the biggest directory comes first"
-    assert (1 << 20) <= b["own_bytes"] < top[str(other)]
+    assert (4 << 20) <= b["own_bytes"] < top[str(other)]
+    assert b["own_folders"] == [str(p.state.resolve())] + ([str(p.worktrees.resolve())] if p.worktrees.is_dir() else [])
+    cons = {label: (n, count) for label, n, count in b["own_consumers"]}
+    assert cons["run worktrees"][1] == 1 and (3 << 20) <= cons["run worktrees"][0] < (4 << 20), cons
+    assert (1 << 20) <= cons["state/runs (other run files)"][0] < (2 << 20), cons
+    assert b["own_consumers"][0][0] == "run worktrees", "the biggest consumer comes first"
     dm.Daemon(p.base).check_disk()
     text = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='disk'")["text"]
-    assert f"This project's own data is 0.0 GB of the 960.0 GB used on {env['tmp']}" in text, text
+    mb = b["own_bytes"] / 1e6
+    assert (f"This project's own data (state/ and worktrees/) is {mb:.1f} MB of the 960.0 GB used on "
+            f"{env['tmp']} (run worktrees: 1, ") in text, text
+    assert "0.0 GB of" not in text and "or more" not in text, text
     assert f"biggest top-level directories: {other} 0.0 GB" in text, text
     assert "--min-free-gb" in text
     assert "This project's own data" in coord.digest(p, {}, [], [])
@@ -15802,15 +15815,24 @@ def test_the_disk_breakdown_keeps_what_du_measured_before_its_time_ran_out(env, 
 
     def slow(cmd, timeout):
         assert timeout <= dm.DISK_DU_TIMEOUT_S
-        if "-s" in cmd:
-            return f"{5 * 10 ** 6}\t{cmd[-1]}\n".encode(), True
+        if cmd[-1] == str(p.state.resolve()):   # cut short: only the archive was finished
+            return f"{5 * 10 ** 6}\t{p.state.resolve() / 'archive'}\n".encode(), False
+        if cmd[-1] != str(dm._mount_of(p.base)):
+            return b"", True
         return f"{700 * 10 ** 6}\t/data/scratch\n".encode(), False
     monkeypatch.setattr(dm, "_run_bounded", slow)
     b = dm.disk_breakdown(p, p.base)
-    assert b["top"] == [("/data/scratch", 700 * 10 ** 6 * 1024)] and not b["complete"] and b["own_complete"]
+    assert b["top"] == [("/data/scratch", 700 * 10 ** 6 * 1024)] and not b["complete"] and not b["own_complete"]
+    assert b["own_bytes"] == 5 * 10 ** 6 * 1024
     line = dm.disk_usage_line(b, 900e9)
-    assert line == (f"This project's own data is 5.1 GB of the 900.0 GB used on {env['tmp']}; biggest top-level "
-                    f"directories (du stopped after {dm.DISK_DU_TIMEOUT_S} s; partial): /data/scratch 716.8 GB."), line
+    assert line == (f"This project's own data (state/ and worktrees/) is at least 5.1 GB (partial: what du measured "
+                    f"within {dm.DISK_DU_TIMEOUT_S // 2} s) of the 900.0 GB used on {env['tmp']} (state/archive 5.1 GB); "
+                    f"biggest top-level directories (du stopped after {dm.DISK_DU_TIMEOUT_S} s; partial): "
+                    "/data/scratch 716.8 GB."), line
+    assert "or more" not in line
+    monkeypatch.setattr(dm, "_run_bounded", lambda cmd, timeout: (b"", False))   # du printed nothing at all
+    line = dm.disk_usage_line(dm.disk_breakdown(p, p.base), 900e9)
+    assert "this project's own data (state/ and worktrees/) was not measured" in line and " 0.0 GB" not in line, line
 
 
 def test_disk_scans_never_walk_root_home_or_network_mounts(env, monkeypatch, tmp_path):
