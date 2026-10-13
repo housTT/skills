@@ -45,6 +45,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
 | `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, prefill/TTFT optimization, trace warmup/reuse and allocation validation, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
+| `tt-train-bringup` | Training bring-up in tt-train on one chip: plan (kernel inventory, freeze map, roofline target, memory budget), composite bring-up with a forward-and-every-gradient PCC harness, then an optimisation loop that classifies every op (useful math, layout, glue, wasted, dispatch), costs it with training multiplicity and fixes it until the roofline target is met. Requires `tt-autodebug`. See [`plugins/tt-train-bringup/README.md`](plugins/tt-train-bringup/README.md) |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 | `tt-buddy` | A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal. Device runs need [`tt-device-mcp`](https://github.com/tenstorrent/tt-device-mcp). See [`plugins/tt-buddy/README.md`](plugins/tt-buddy/README.md) |
 
@@ -106,8 +107,9 @@ codex plugin add tt-review-skills@tenstorrent-skills
 codex plugin add tt-debug-tools@tenstorrent-skills
 codex plugin add tt-buddy@tenstorrent-skills
 # tt-buddy ships session hooks: trust them in Codex with /hooks, then t.
-# Model bring-up also requires tt-autodebug:
+# Model bring-up and training bring-up also require tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
+codex plugin add tt-train-bringup@tenstorrent-skills
 ```
 
 You can also select plugins under **Tenstorrent Skills** in the Plugins Directory.
@@ -130,10 +132,11 @@ Choose any optional plugins you want:
 /plugin install tt-buddy@tenstorrent-skills
 ```
 
-For model bring-up, install `tt-autodebug` above and then:
+For model bring-up or training bring-up, install `tt-autodebug` above and then:
 
 ```text
 /plugin install tt-model-bringup@tenstorrent-skills
+/plugin install tt-train-bringup@tenstorrent-skills
 ```
 
 Adding the marketplace does not bulk-install the optional plugins. Codex marks the finder as
