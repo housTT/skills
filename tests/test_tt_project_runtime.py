@@ -14884,6 +14884,29 @@ def test_same_content_big_artifacts_are_stored_once(env, monkeypatch):
     assert (restored / "copy.out").read_bytes() == b"S" * 5000
 
 
+def test_hard_linked_small_files_are_archived_and_restored_in_full(env):
+    """Review #1791: tarfile wrote the second of two hard-linked files as a link member, which the
+    tarball check refused (the worktree was kept forever) and restore skipped (the copy was lost)."""
+    import hashlib
+    import json
+    import os
+    p = make(env)
+    from ttp import archive, worktree
+    t, (wt,) = _big_artifact_runs(p, [b"L" * 5000], name="a.out")
+    os.link(wt / "a.out", wt / "b.out")
+    (wt.parent / "result.json").write_text(json.dumps({"artifacts": [str(wt / "a.out"), str(wt / "b.out")]}))
+    assert [r["why"] for r in worktree.sweep(p)] == [None] and not wt.exists()
+    files = archive.manifest(p, t)["files"]
+    assert sorted(e["path"] for e in files) == ["a.out", "b.out"] and {e["stored"] for e in files} == {"tar"}
+    d = archive.task_dir(p, t)
+    (tar,) = {e["archive"] for e in files}
+    archive._check_tar(d / tar, files)
+    assert all(e["sha256"] == hashlib.sha256(b"L" * 5000).hexdigest() for e in files)
+    back = env["tmp"] / "back"
+    assert sorted(archive.restore(p, t, back)) == ["a.out", "b.out"]
+    assert (back / "a.out").read_bytes() == (back / "b.out").read_bytes() == b"L" * 5000
+
+
 def test_an_archive_path_holding_other_content_is_never_overwritten(env, monkeypatch):
     import hashlib
     import json

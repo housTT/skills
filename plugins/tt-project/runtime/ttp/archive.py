@@ -346,6 +346,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
             with tarfile.open(tmp, "w:gz", compresslevel=1) as tar:
                 for f in small:
                     progress()
+                    tar.inodes = {}   # a hard-linked file is stored in full, never as a link member
                     tar.add(str(root / f), arcname=f, recursive=False)
             with open(tmp, "rb") as fh:
                 os.fsync(fh.fileno())
