@@ -75,6 +75,16 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.
 
+## Maintainer checklist (liveness, progress, deploys)
+
+- Accept a deploy only through `ttp deployed`: every project's daemon reports the release by its
+  own receipt. An installer exit, the files' version or a fresh heartbeat is not a deploy.
+- Never accept "no tests collected" as a pass, and never blanket-skip a check. Fix where the
+  check's applicability is declared; a related change that lacks its test still fails.
+- Wait on an upstream fix with a probe (`ttp deployed`, a version check) as `retry_when`, never
+  `blocked`. A hand-off is done only once the consumer acknowledged it and recovered.
+- See "Liveness, progress and deploys" in `docs/design.md`.
+
 ## CPU-only runs never open a device
 
 - The daemon sets `TTP_NO_DEVICE=1` for a task run that holds no device (not tagged `needs_device`,

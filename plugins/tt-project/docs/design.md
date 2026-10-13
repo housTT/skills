@@ -116,6 +116,58 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
   could advance it was dropped: it took ordinary waits, backoffs and review and fix stacks for stuck
   owners and raised high events that woke the coordinator.
 
+## Liveness, progress and deploys
+
+A project once stayed busy for days, finishing tasks with a fresh heartbeat, while its daemon ran
+a release many versions old behind an upgrade task that could never finish, and its deploys still
+counted as successes. Each claim below needs its own evidence and one owner.
+
+- Liveness is not progress. A fresh heartbeat, busy workers and finished tasks say the daemon
+  runs, not that the user's goal moves. Progress is a durable outcome: an obligation's 2 h
+  durable-progress clock per owner, and a milestone with a due time that raises one
+  `obligation_overdue` episode however busy the project is. The last completed tick is kept apart
+  from the heartbeat, which a long tick's steps also touch for the watchdogs.
+- Files are not running code. The daemon captures a runtime identity receipt once, at startup
+  (`identity.py`): version, source commit, runtime path, pid, process start, boot id and instance
+  id. Nothing re-reads files or infers it from git later. Status, overview and the web app show it;
+  a running version that differs from the files reads "restart pending", no receipt "unverified".
+- Deferred is not deployed. A deploy is accepted only by `ttp deployed [<version>]`: exit 0 once
+  every project `ttp list` shows here reports that version and commit by its receipt and has
+  completed a tick since, 1 while any is pending (one line each with owner and resume time), 2
+  when it cannot tell. A deferred merge or a restart not yet done is pending, never success.
+  `--after-push` records pending merges that have an owner and takeover time instead of paging.
+- A project's own task cannot block a host-side upgrade. An explicit host-side `ttp upgrade` takes
+  over the finish lock of an upgrade task blocked, or with no run or update, for 6 h
+  (`release.STALE_S`). It fences that task by generation, so its later `--apply` is refused, and
+  keeps the upgrade lock, push protection, ancestry checks and local edits. A finish task stuck
+  that long sends one durable escalation to the maintainers' upstream inbox.
+- One owner per gap. A check whose named target is missing becomes one gap keyed by its signature,
+  with one repair task (`checkgaps.py`). Dependent tasks wait on it with a probe and rerun
+  model-free once the check config changes; they are not blocked, and they spawn no fix and
+  re-review pairs. A related change that lacks the test still fails. "No tests collected" is never a
+  pass, and nothing is skipped wholesale.
+- A cross-project hand-off is done only when the consumer acknowledged it and has recovered: its
+  own daemon runs the fix by its receipt and the original condition rechecks clean. Filing a note
+  or pushing the fix is not closure. Planned: tracking each note through resolve, release, wake,
+  acknowledgement and recovery under one fingerprint, with a probe for "the fix runs here" that a
+  task waiting on it can use. Until then a worker waits on an upstream fix with `ttp deployed` or a
+  version probe as `retry_when`, never `blocked`.
+
+Accepted gap: there is no fast-fail for a schema 400. When a provider rejects the coordinator
+action schema (HTTP 400), the turn gets one ordinary retry, bounded by the coordinator turn timeout
+sized to provider and effort (`coordlimits.turn_timeout`). Prevention is the strict-valid action
+schema and its recursive strict-rules test, which catch a schema 400 before release. Three
+fast-fail attempts were retired after failed reviews: their changes to the provider parse callers
+and the live supervisor parse broke recovered-success handling and the timeout, budget and STOP
+checks. Any future attempt must leave the provider parse callers and the runner's watch loop as
+they are.
+
+Precedents:
+- Kubernetes Deployment `progressDeadlineSeconds`: a stalled rollout is reported apart from pod health.
+- Prometheus `*_build_info`: a process exports the version and revision it runs.
+- systemd `sd_notify`: the service itself reports readiness and status, not its unit file.
+- Transactional outbox: a state change and its message commit together; consumers deduplicate.
+
 ## Why the coordinator is tool-less
 
 A default headless Claude Code run carries tens of thousands of tokens of built-in context. A
