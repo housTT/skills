@@ -99,6 +99,12 @@
   Unnamed untracked files are archived smallest first up to `disk.worktree_archive_max_mb` (200) per
   task; the rest are only listed there and deleted. `state/archive/tasks/MANIFEST.md` gets one line
   per archive. `ttp prune <name> --archived <id>` lists one (with `--restore <dir>`: extracts it).
+  Archiving is all or nothing: one that would not leave the disk guard's threshold free on `state/`'s
+  filesystem (1 GB once the disk is already below it) archives nothing and keeps the worktree, saying
+  the sizes; a failure part way removes what it wrote and keeps the worktree as it was. Removals are
+  done at once, but the daemon archives at most one worktree per tick step (the rest on the next
+  ticks); `ttp prune` archives them all. Known gap: a kill between moving a big file and finalizing
+  the manifest is finished by the next sweep (the manifest lists it as pending until then).
   One with modified tracked files is kept and raised to the coordinator once per content (event
   `worktree_uncommitted`); `ttp status` counts them and the web app lists them in the feed. Under the
   disk guard, and with `ttp prune --patch-tracked`, a done or cancelled task's tracked changes are

@@ -14191,6 +14191,150 @@ def test_tracked_changes_are_saved_as_a_verified_patch_only_when_asked(env, monk
     assert (env["tmp"] / "again" / "tracked.txt").read_text() == "changed\n"
     assert f"task {tid} (done)" in (archive.task_dir(p, tid).parent / "MANIFEST.md").read_text()
 
+def _no_pending_or_temp(p, tid):
+    from ttp import archive
+    d = archive.task_dir(p, tid)
+    m = archive.manifest(p, tid) or {}
+    assert not [x.name for x in d.rglob("*") if x.name.endswith((".tmp", ".part"))] if d.is_dir() else True
+    assert not [e for e in (m.get("files") or []) + (m.get("patches") or []) if e.get("pending")], m
+
+
+def test_a_failed_archive_write_leaves_no_temp_file_or_patch_and_the_worktree_as_it_was(env, monkeypatch):
+    # The disk guard sweeps when space is short: a tarball cut off by ENOSPC must not stay behind.
+    import errno
+    import tarfile
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import archive, worktree
+    tid, path, _ = _code_task(p, "out of space")
+    _commit_file(path, "tracked")
+    (path / "tracked.txt").write_text("changed\n")
+    (path / "a.bin").write_bytes(b"a" * 1000)
+    (path / "b.bin").write_bytes(b"b" * 1000)
+    _handoff(p, tid, ["a.bin", "b.bin"])
+    calls = []
+
+    def full(self, name, *a, **kw):
+        calls.append(name)
+        if len(calls) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return add(self, name, *a, **kw)
+    add = tarfile.TarFile.add
+    monkeypatch.setattr(tarfile.TarFile, "add", full)
+    (res,) = worktree.sweep(p, patch_tracked=True)
+    assert res["why"].startswith("error:") and "No space left" in res["why"], res
+    assert path.exists() and (path / "a.bin").read_bytes() == b"a" * 1000 and (path / "b.bin").exists()
+    assert (path / "tracked.txt").read_text() == "changed\n"
+    d = archive.task_dir(p, tid)
+    assert not list(d.glob("*.tar.gz*")) and not list(d.glob("tracked*.patch")), sorted(x.name for x in d.iterdir())
+    _no_pending_or_temp(p, tid)
+    assert archive.resolve(p, str(path / "a.bin")) is None
+    monkeypatch.setattr(tarfile.TarFile, "add", add)
+    (res,) = worktree.sweep(p, patch_tracked=True)
+    assert res["why"] is None and not path.exists() and set(_archived(p, tid)) == {"a.bin", "b.bin"}
+    assert [e["file"] for e in archive.manifest(p, tid)["patches"]] == ["tracked.patch"]
+
+
+def test_an_archive_that_does_not_fit_in_free_space_is_skipped_with_the_sizes(env, monkeypatch):
+    import collections
+    import shutil
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import archive, worktree
+    tid, path, _ = _code_task(p, "no room")
+    (path / "out.bin").write_bytes(b"o" * 3_000_000)
+    _handoff(p, tid, ["out.bin"])
+    usage = collections.namedtuple("usage", "total used free")
+    real = shutil.disk_usage
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10**12, 10**12 - 2_000_000, 2_000_000))
+    (res,) = worktree.sweep(p, reserve_bytes=1_000_000)
+    assert res["why"].startswith("archiving skipped") and "3.1 MB" in res["why"] and "2.0 MB are free" in res["why"], res
+    assert (path / "out.bin").exists() and archive.manifest(p, tid) is None and "archived" not in res
+    # The disk guard's threshold stays free; while free space is already below it, RESERVE_FLOOR_MB does.
+    floor = archive.RESERVE_FLOOR_MB * 1e6
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10**12, 0, 200e9))
+    assert archive.room(path, 1_000_000, 150e9) is None and archive.room(path, 60e9, 150e9)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10**12, 0, floor + 2e6))
+    assert archive.room(path, 1_000_000, 150e9) is None and "must stay free" in archive.room(path, 3e6, 150e9)
+    monkeypatch.setattr(shutil, "disk_usage", real)
+    (res,) = worktree.sweep(p)
+    assert res["why"] is None and _archived(p, tid) == {"out.bin": (True, "tar")}
+
+
+def test_a_kill_after_moving_a_big_file_is_recovered_by_the_next_sweep(env, monkeypatch):
+    # Known gap, recovered later: the process dies between the big file's move and the final manifest.
+    import os
+    from pathlib import Path
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import archive, worktree
+    monkeypatch.setattr(archive, "TAR_MAX_MB", 0.001)   # files over 1 KB are "big": moved, not tarred
+    tid, path, _ = _code_task(p, "killed mid-archive")
+    (path / "big.bin").write_bytes(b"B" * 5000)
+    (path / "small.txt").write_text("s")
+    _handoff(p, tid, ["big.bin", "small.txt"])
+    pid = os.fork()
+    if pid == 0:   # the child is killed (no finally, no cleanup) as it would write the final manifest
+        try:
+            real = archive.write_json
+
+            def killed(target, data):
+                if not any(e.get("pending") for e in data.get("files") or []):
+                    os._exit(9)
+                real(target, data)
+            archive.write_json = killed
+            archive.store(p, p.db.task(tid), path, ["big.bin", "small.txt"], [], 200)
+        finally:
+            os._exit(1)
+    assert os.waitpid(pid, 0)[1] >> 8 == 9
+    m = archive.manifest(p, tid)
+    assert all(e.get("pending") for e in m["files"]) and not (path / "big.bin").exists()
+    assert (archive.task_dir(p, tid) / "files" / "big.bin").exists() and (path / "small.txt").exists()
+    (res,) = worktree.sweep(p)
+    assert res["why"] is None and not path.exists(), res
+    _no_pending_or_temp(p, tid)
+    found = archive.resolve(p, str(path / "big.bin"))
+    assert found["stored"] == "file" and Path(found["location"]).read_bytes() == b"B" * 5000
+    assert archive.resolve(p, "small.txt", task_id=tid)["stored"] == "tar"
+    # small.txt's tarball was in place before the kill, so it is kept, and archived again from the worktree.
+    assert set(archive.restore(p, tid, env["tmp"] / "back")) == {"big.bin", "small.txt"}
+
+
+def test_the_daemon_archives_one_worktree_per_step_within_its_budget_and_finishes_later(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    clean, clean_path, _ = _code_task(p, "nothing to keep")
+    heavy = []
+    for i in range(3):
+        tid, path, _ = _code_task(p, f"output {i}")
+        for f in ("one.bin", "two.bin"):
+            (path / f).write_bytes(f"{i}{f}".encode() * 100)
+        _handoff(p, tid, ["one.bin", "two.bin"])
+        heavy.append((tid, path))
+    d = Daemon(p.base)
+    ticks = []
+    d._progress = lambda: ticks.append(1)
+    first = {r["task"]: r for r in d.prune_worktrees(every_s=0)}
+    assert first[clean]["why"] is None and not clean_path.exists(), "cheap removals are not held back"
+    assert sum(1 for r in first.values() if r.get("archived")) == 1
+    assert sorted(t for t, r in first.items() if r.get("deferred")) == [heavy[1][0], heavy[2][0]]
+    assert len(ticks) >= 4 + 2 * 2, ticks   # per worktree looked at, and per file hashed and tarred
+    assert "kept: archiving deferred" not in (p.logs / "daemon.log").read_text()
+    # Over the time budget no archiving starts; the deferred ones stay for the next tick.
+    monkeypatch.setattr(dmod, "HEARTBEAT_STALE_S", 0)
+    again = d.prune_worktrees()
+    assert again and all(r.get("deferred") for r in again) and all(path.exists() for _, path in heavy[1:])
+    monkeypatch.undo()
+    _no_grace(monkeypatch)
+    d.prune_worktrees()   # the default every_s would wait: deferred work runs at the next tick anyway
+    d.prune_worktrees()
+    assert not any(path.exists() for _, path in heavy)
+    assert all(set(_archived(p, tid)) == {"one.bin", "two.bin"} for tid, _ in heavy)
+    assert d.prune_worktrees() == [] and d._prune_more is None
+
+
 def test_a_stale_initializing_lock_is_cleared_but_a_live_or_foreign_lock_is_not(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
