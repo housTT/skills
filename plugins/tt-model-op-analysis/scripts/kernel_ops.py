@@ -30,7 +30,10 @@ def _tests(cell: str) -> list[str]:
     return [t.strip() for t in cell.split(";") if t.strip()]
 
 
-def aggregate(rows: list[dict], source: str, destinations: list[str], measured: dict[str, int]) -> list[dict]:
+def aggregate(rows: list[dict], source: str, destinations: list[str], measured: dict[str, int],
+              node_results: dict[str, dict[str, str]] | None = None) -> list[dict]:
+    """node_results maps a target to {node id: result} from its kernel_test_results file."""
+    node_results = node_results or {}
     groups: dict[tuple[str, str, str], list[dict]] = {}
     for row in rows:
         groups.setdefault((row["device_op"], row["program_factory"], row["op_code"]), []).append(row)
@@ -54,9 +57,14 @@ def aggregate(rows: list[dict], source: str, destinations: list[str], measured: 
             entry[f"{t}:statuses"] = "; ".join(f"{s} {statuses[s]}" for s in STATUS_ORDER if statuses[s])
             if t in TEST_TARGETS:
                 entry[f"{t}:tests"] = "; ".join(sorted({x for m in members for x in _tests(m[f"{t}:tests"])}))
-                entry[f"{t}:test_results"] = "; ".join(sorted(
-                    {f"{x}: {m[f'{t}:test_result']}" for m in members for x in _tests(m[f"{t}:tests"])
-                     if m[f"{t}:test_result"] != "not run"}))
+                if t in node_results:
+                    # A row's result is the worst of its nodes; each node shows only its own run.
+                    results = {f"{x}: {node_results[t][x]}" for m in members for x in _tests(m[f"{t}:tests"])
+                               if x in node_results[t]}
+                else:
+                    results = {f"{x}: {m[f'{t}:test_result']}" for m in members for x in _tests(m[f"{t}:tests"])
+                               if m[f"{t}:test_result"] != "not run"}
+                entry[f"{t}:test_results"] = "; ".join(sorted(results))
         out.append(entry)
     known = {code for (_, _, code) in groups}
     for code, count in measured.items():
@@ -80,7 +88,12 @@ def main() -> int:
     measured = args.measured or (pathlib.Path(run["measured_ops"]) if run.get("measured_ops") else None)
     counts = measured_counts(measured, int(run.get("measured_inferences", 1)))
     source, destinations = run_targets(run)
-    out = aggregate(rows, source, destinations, counts)
+    node_results = {}
+    for t in (source, *destinations):
+        path = args.run_dir / f"kernel_test_results_{t}.csv"
+        if t in TEST_TARGETS and path.exists():
+            node_results[t] = {r["node_id"]: r["result"] for r in read_csv(path)}
+    out = aggregate(rows, source, destinations, counts, node_results)
     write_csv(args.run_dir / "kernel_ops.csv", kernel_ops_columns(source, destinations), out)
     print(f"{len(out)} kernel ops")
     return 0

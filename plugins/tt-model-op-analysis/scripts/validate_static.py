@@ -1,13 +1,12 @@
 """Gate for a model-op-analysis run: schema, row ids, status values, call sites and launch totals.
 
-Prints `OK` and the launch totals per target when the run passes. Warnings (repeated boilerplate
-evidence) are printed but do not fail the gate.
+Prints `OK` and the launch totals per target when the run passes. Warnings (evidence a reader
+cannot scan: row-number prefixes, overlong text) are printed but do not fail the gate.
 """
 
 from __future__ import annotations
 
 import argparse
-import collections
 import json
 import pathlib
 import re
@@ -16,13 +15,13 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
     ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
-    NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, SOURCE_TARGETS, STATUS_VALUES, TARGETS,
-    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets,
+    NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, ROW_PREFIX, SOURCE_TARGETS, STATUS_VALUES, TARGETS,
+    TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
 )
 
 CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
-# Evidence copied into this many rows (and at least half the table) says nothing row-specific.
-BOILERPLATE_MIN_ROWS = 5
+# Evidence is the decisive fact and its <file>:<line>; longer text is a walkthrough, not evidence.
+MAX_EVIDENCE_CHARS = 300
 GRID_KEYWORDS = ("automatic", "none")
 # A pytest node id: path, then ::-separated names, with an optional [parametrize id] that may hold
 # any character except the ';' this column uses as a separator.
@@ -169,14 +168,17 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
                 elif result in RESULT_STATUS and status != RESULT_STATUS[result]:
                     errors.append(f"{where}: {target}:test_result '{result}' requires status {RESULT_STATUS[result]}")
 
-    # Evidence decided per kernel op must differ by row. Blackhole and Wormhole evidence and unchanged
-    # Quasar as a destination legitimately repeat (one CI job, one global blocker).
-    row_specific = ["dispatch_evidence"] + [
-        f"{t}:evidence" for t in targets if t == "quasar-bf16" or (t == "quasar" and t == source)]
-    for column in row_specific:
-        for text, count in collections.Counter(r[column].strip() for r in ops).items():
-            if text and count >= max(BOILERPLATE_MIN_ROWS, len(ops) / 2):
-                warnings.append(f"op_table.csv {column}: the same text in {count} of {len(ops)} rows: '{text[:80]}'")
+    for column in ["dispatch_evidence"] + [f"{t}:evidence" for t in targets]:
+        # A TTsim result prepended by kernel_tests.py is not part of the written evidence.
+        written = {r["id"]: split_evidence(r[column])[1] for r in ops}
+        prefixed = [i for i, text in written.items() if ROW_PREFIX.match(text)]
+        if prefixed:
+            warnings.append(f"op_table.csv {column}: rows {', '.join(prefixed)} start with 'Row <n>'; "
+                            "rows with one signature share one evidence text")
+        long = [i for i, text in written.items() if len(text) > MAX_EVIDENCE_CHARS]
+        if long:
+            warnings.append(f"op_table.csv {column}: rows {', '.join(long)} exceed {MAX_EVIDENCE_CHARS} characters; "
+                            "keep the decisive fact and its <file>:<line>")
 
     op_ids = {r["id"] for r in ops}
     for n, row in enumerate(rows["port_blockers.csv"], 1):

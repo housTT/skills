@@ -29,17 +29,19 @@ state or earlier conversations.
    cannot be uploaded; say why.
 4. **Check.** For each picked run, `python3 <plugin-root>/scripts/validate_static.py <run dir>` must
    print `OK`, and `kernel_ops.csv` and `summary.md` must exist. Otherwise say what is missing and
-   that the `model-op-analysis` skill finishes the run; skip that run.
+   that the `model-op-analysis` skill finishes the run; skip that run. Pass on the validator's
+   warnings (overlong or row-prefixed evidence) in the report: the sheet shows that text as is.
 5. **Drive folder.** Only for runs without a `drive_url`: ask for the Drive folder (link or name).
    A run with a `drive_url` refreshes its existing spreadsheet; say which.
 6. **Upload.** For each run, follow `<plugin-root>/references/drive-upload.md`. It records the
    spreadsheet URL in `run.json` (`drive_url`).
-7. **Report.** One line per run: the spreadsheet link, created or refreshed, and the totals read
-   back from the sheet against `summary.md`.
+7. **Report.** One line per run: the spreadsheet link, created or refreshed, and whether the
+   counts read back from the sheet match `expected`.
 
 ## Rules
 
-- Never edit the run's CSVs or `summary.md`; the sheet is a copy of them.
+- Never edit the run's CSVs or `summary.md`. The sheet is a view of them built by `sheet_spec.py`:
+  it may drop, merge and shorten, never add or reword.
 - Counts and totals in the sheet come from the CSVs and the validator output, never retyped.
 - Sheet row = CSV `id` + 1; read the rows back before and after any targeted write.
 - Never trash or delete a Drive file the user did not name.

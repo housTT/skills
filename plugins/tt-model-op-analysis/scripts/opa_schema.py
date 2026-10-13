@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import pathlib
+import re
 
 # A run analyses one source implementation on one profile and, optionally, projects its kernel ops
 # onto destinations. A destination is a profile running the same code, or `quasar-bf16`: the code
@@ -37,6 +38,22 @@ PORT_BLOCKERS_COLUMNS = ("id", "blocker", "affected_ids", "evidence", "required_
 HOST_OPS_COLUMNS = ("id", "host_work", "when", "counts_as_host_op", "reason")
 HOST_OP_VALUES = ("yes", "no")
 MATCH_KEY = ("stage", "ttnn_api", "device_op", "program_factory")
+
+# kernel_tests.py prefixes a row's evidence with its TTsim result; the written evidence follows the
+# separator. Only that prefix is split off, so a quoted C++ `||` in the evidence stays intact.
+TTSIM_PREFIX = "TTsim run: "
+EVIDENCE_SEPARATOR = " || "
+# A row number or stage at the start of evidence repeats what the table already shows.
+ROW_PREFIX = re.compile(r"^Row \d+\b(?:\s*\([^)]*\))?[\s:.,-]*")
+
+
+def split_evidence(text: str) -> tuple[str, str]:
+    """(TTsim result or '', written evidence) of an evidence cell."""
+    text = text.strip()
+    if text.startswith(TTSIM_PREFIX) and EVIDENCE_SEPARATOR in text:
+        measured, written = text.split(EVIDENCE_SEPARATOR, 1)
+        return measured, written.strip()
+    return "", text
 
 
 def run_targets(run: dict) -> tuple[str, list[str]]:

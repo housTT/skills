@@ -33,15 +33,29 @@ Reads code only; never touches a device. Every count must survive
    exact variant. Apply the same status to rows sharing the target-relevant signature unless
    row-specific evidence distinguishes them.
 6. **Gate.** Run `python3 <plugin-root>/scripts/validate_static.py <run dir>`. Fix and rerun until
-   it prints `OK`. Resolve every warning or say in `summary.md` why the repeated text is correct.
-   No output, summary or upload before that.
+   it prints `OK`. Resolve every warning (shorten the evidence, drop row-number prefixes). No
+   output, summary or upload before that.
 7. **Kernel ops and summary.** Run `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`. Write
-   `summary.md`, starting with the per-kernel-op table from `kernel_ops.csv` (kernel op, launches,
-   op-table rows, statuses per target), then: model, implementation, test, SHA, source and every
-   destination with the question each answers, launches per inference per profile as the range the validator printed,
-   count of each status per target, top port blockers, open `unverified` items. End with a "How to read this" section: every column of
-   every CSV and every status value used, in plain words, including what each destination
-   assumes. Update `summary.md` whenever a destination or a measurement is added.
+   `summary.md` for a reader who opens it cold; the spreadsheet's Info tab is this file plus the
+   run details from `run.json` and counts computed from the CSVs, so do not repeat those here.
+   A `#` title, the per-kernel-op table from `kernel_ops.csv` (kernel op, launches, op-table rows,
+   statuses per target), then these `##` sections in this order, as `- Label: text` bullets or
+   short paragraphs:
+   - `Method`: one paragraph: what was traced, from which entry test, how statuses were decided,
+     what was run and what was not.
+   - `Targets`: one bullet per target: the question it answers (for a destination, what it
+     assumes) and the profile facts that change dispatch (grid, dtypes, batch).
+   - `Status legend`: one bullet per status value used, defined for this run's targets.
+   - `Findings`: three to six bullets a reader acts on, each with its numbers: launches per
+     inference as the validator's range and the tighter executable range when known, status counts
+     where they matter, the port blockers that decide the outcome.
+   - `Cleanup found on the way` (only when there is one): inefficiencies in the model code noticed
+     while tracing, with the call site and what would remove them.
+   - `Open items`: `unverified` rows, runtime-dependent launches, measurements not run yet.
+
+   No section that explains CSV columns: the sheet headers are readable and `schemas.md` defines
+   them. Define a term only where a reader cannot infer it. Update `summary.md` whenever a
+   destination or a measurement is added.
 
 ## Rules
 

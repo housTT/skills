@@ -25,7 +25,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.4.1"
+    assert claude["version"] == codex["version"] == "0.5.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -258,11 +258,18 @@ def test_host_op_flag_values(tmp_path):
     assert "counts_as_host_op 'maybe' not in" in out
 
 
-def test_repeated_destination_evidence_warns(tmp_path):
+def test_shared_evidence_passes_and_fake_or_long_evidence_warns(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
     rows = [op_row(i, 1, port_ev="same text") for i in range(1, 6)]
-    result = validate(make_static_run(tmp_path, rows, [trace_row(1, 5, 1)]))
+    result = validate(make_static_run(tmp_path / "a", rows, [trace_row(1, 5, 1)]))
+    assert result.returncode == 0 and "WARNING" not in result.stdout, result.stdout
+    rows = [op_row(1, 1, port_ev="Row 1 (encoder 1): fork x"), op_row(2, 1, port_ev="x" * 301),
+            op_row(3, 1, port_ev="TTsim run: t.py::a hang || " + "y" * 290)]
+    result = validate(make_static_run(tmp_path / "b", rows, [trace_row(1, 3, 1)]))
     assert result.returncode == 0, result.stdout
-    assert "WARNING: op_table.csv quasar-bf16:evidence: the same text in 5 of 5 rows" in result.stdout
+    assert "quasar-bf16:evidence: rows 1 start with 'Row <n>'" in result.stdout
+    assert "quasar-bf16:evidence: rows 2 exceed 300 characters" in result.stdout
 
 
 def test_blackhole_destination_needs_its_trace(tmp_path):
@@ -277,29 +284,85 @@ def test_blackhole_destination_needs_its_trace(tmp_path):
     assert validate(run).returncode == 0
 
 
-def test_sheet_spec_layout(tmp_path):
-    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
-    write_rows(run / "changes_op_table.csv", [{"change": "added", "key": "k", "column": "", "old": "", "new": ""}])
-    result = run_script("sheet_spec.py", str(run), "--info-sheet-id", "7", "--first-sheet-id", "20")
+def sheet(run: pathlib.Path, *args: str) -> dict:
+    result = run_script("sheet_spec.py", str(run), *args)
     assert result.returncode == 0, result.stderr
-    spec = json.loads(result.stdout)
-    assert spec["info"] == {"sheetId": 7, "title": "Info"}
-    assert spec["summary"] == {"sheetId": 20, "title": "Summary"}
-    assert [(t["tab"], t["sheetId"]) for t in spec["tabs"]] == [
-        ("Op table", 21), ("Call trace", 22), ("Port blockers", 23), ("Host ops", 24), ("Changes: Op table", 25)]
-    headers = spec["tabs"][0]["headers"]
-    assert "Call site (file:line)" in headers
-    assert "Quasar, BF16 projection: evidence and gap" in headers
-    assert spec["tabs"][2]["headers"][3] == "Evidence"
+    return json.loads(result.stdout)
+
+
+def tab(spec: dict, title: str) -> list[list]:
+    return next(t["values"] for t in spec["tabs"] if t["title"] == title)
+
+
+def test_sheet_spec_layout(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1), op_row(2, 2)], [trace_row(1, 1, 3)])
+    write_rows(run / "changes_op_table.csv", [{"change": "added", "key": "k", "column": "", "old": "", "new": ""}])
+    spec = sheet(run, "--info-sheet-id", "7", "--first-sheet-id", "20")
+    assert [(t["title"], t["sheetId"]) for t in spec["tabs"]] == [
+        ("Info", 7), ("Op table", 20), ("Call trace", 21), ("Port blockers", 22), ("Host ops", 23),
+        ("Changes: Op table", 24)]
     reqs = spec["requests"]
-    assert reqs[0]["updateSheetProperties"]["properties"] == {"sheetId": 7, "title": "Info"}
+    info = reqs[0]["updateSheetProperties"]["properties"]
+    assert (info["sheetId"], info["title"]) == (7, "Info")
+    assert info["gridProperties"]["columnCount"] >= 3
     added = [(r["addSheet"]["properties"]["title"], r["addSheet"]["properties"]["index"]) for r in reqs if "addSheet" in r]
-    assert added == [("Summary", 1), ("Op table", 2), ("Call trace", 3), ("Port blockers", 4), ("Host ops", 5),
-                     ("Changes: Op table", 6)]
+    assert added == [("Op table", 1), ("Call trace", 2), ("Port blockers", 3), ("Host ops", 4), ("Changes: Op table", 5)]
     assert not any("autoResizeDimensions" in r for r in reqs)
     wrapped = {r["repeatCell"]["range"]["sheetId"] for r in reqs
                if "repeatCell" in r and r["repeatCell"]["cell"]["userEnteredFormat"].get("wrapStrategy") == "WRAP"}
-    assert wrapped == {7, 20, 21, 22, 23, 24, 25}
+    assert wrapped == {7, 20, 21, 22, 23, 24}
+    assert tab(spec, "Port blockers")[0][3] == "Evidence"
+
+
+def test_sheet_spec_op_table_is_a_compact_view(tmp_path):
+    rows = [op_row(1, 1, call_site="models/demos/x/tt/model.py:11; ttnn/cpp/ttnn/operations/a/b.cpp:5",
+                   port_ev="Row 1 (encoder 1): fork x at ttnn/cpp/ttnn/operations/q/c.cpp:9"),
+            op_row(2, 2, port_ev="fork y")]
+    spec = sheet(make_static_run(tmp_path, rows, [trace_row(1, 1, 3)]))
+    ops = tab(spec, "Op table")
+    headers = ops[0]
+    assert headers[:4] == ["#", "Stage", "ttnn API", "Device op / program factory"]
+    # one value in every row: dropped from the table, stated once on Info
+    for dropped in ("Origin (static / measured)", "P150: evidence and gap", "Launch condition"):
+        assert dropped not in headers
+    # status and launch columns stay even when constant
+    assert "P150: status" in headers and "P150: launches per inference" in headers
+    row = dict(zip(headers, ops[1]))
+    assert row["Device op / program factory"] == "prim::op1 / Op1Factory"
+    assert row["Call site (file:line)"] == "tt/model.py:11; a/b.cpp:5"
+    assert row["Quasar, BF16 projection: evidence and gap"] == "fork x at q/c.cpp:9"
+    info = tab(spec, "Info")
+    assert ["P150: evidence and gap", "entry test passes in CI"] in info
+    assert ["Origin (static / measured)", "static"] in info
+
+
+def test_sheet_spec_counts_are_formulas_with_expected_values(tmp_path):
+    rows = [op_row(1, 3, port="❌", port_ev="fails"),
+            op_row(2, 1, launch_condition="skipped when the buffer does not move")]
+    spec = sheet(make_static_run(tmp_path, rows, [trace_row(1, 1, 4)]))
+    info = tab(spec, "Info")
+    counts = next(i for i, r in enumerate(info) if r[:1] == ["Counts"])
+    by_name = {r[0]: (i + 1, r) for i, r in enumerate(info) if r and i > counts}
+    row_number, row = by_name["All rows"]
+    assert row[1].startswith("=COUNTA(") and row[2].startswith("=SUM(")
+    assert spec["expected"][f"Info!B{row_number}"] == 2 and spec["expected"][f"Info!C{row_number}"] == 4
+    row_number, _ = by_name["Launch condition: always"]
+    assert spec["expected"][f"Info!C{row_number}"] == 3
+    row_number, _ = by_name["Quasar, BF16 projection: ❌"]
+    assert spec["expected"][f"Info!B{row_number}"] == 1
+    assert "Quasar, BF16 projection: n/a" not in by_name
+    row_number, row = by_name["Call trace launches (P150)"]
+    assert row[2].startswith("=SUMPRODUCT(") and spec["expected"][f"Info!C{row_number}"] == 4
+
+
+def test_sheet_spec_info_reads_summary_sections(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    (run / "summary.md").write_text("# M kernel op analysis\n\n| a | b |\n|---|---|\n\n## Findings\n\n"
+                                    "- Launches: **120** per inference\n- plain bullet\n\n1. first\n")
+    info = tab(sheet(run), "Info")
+    assert info[0] == ["M kernel op analysis"]
+    assert ["Findings"] in info and ["Launches", "'120 per inference"] in info
+    assert ["", "plain bullet"] in info and ["'1.", "first"] in info
 
 
 TENSOR_FIELDS = ["W_PAD[LOGICAL]", "Z_PAD[LOGICAL]", "Y_PAD[LOGICAL]", "X_PAD[LOGICAL]",
@@ -636,6 +699,16 @@ def test_kernel_ops_aggregates_by_device_op_and_factory(tmp_path):
     assert got[2]["origin"] == "measured" and got[2]["op_code"] == "TilizeDeviceOperation"
 
 
+def test_kernel_ops_shows_only_results_of_nodes_that_ran(tmp_path):
+    tests = {"quasar-bf16:tests": "t.py::ran; t.py::not_run", "quasar-bf16:test_result": "hang"}
+    run = make_static_run(tmp_path, [op_row(1, 1, port="❌", **tests)], [trace_row(1, 1, 1)])
+    write_rows(run / "kernel_test_results_quasar-bf16.csv",
+               [{"id": "1", "node_id": "t.py::ran", "op_table_ids": "1", "result": "hang", "duration_s": "900",
+                 "log": "x", "environment": "run.json"}])
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    assert read(run / "kernel_ops.csv")[0]["quasar-bf16:test_results"] == "t.py::ran: hang"
+
+
 def measured_seq(path, codes):
     return measured_table(path, [(c, "") for c in codes])
 
@@ -786,16 +859,58 @@ def test_same_commit_rejects_local_changes(tmp_path):
     assert r.returncode == 1 and "modified" in r.stdout
 
 
-def test_sheet_spec_puts_kernel_ops_in_summary(tmp_path):
+def test_sheet_spec_view_keeps_meaning(tmp_path):
+    rows = [op_row(1, 1, call_site="models/a1/tt/model.py:1", dispatch_evidence="picks X if (a || b) at x.cpp:1",
+                   port_ev="TTsim run: t.py::a hang || Row 1: fork x"),
+            op_row(2, 1, call_site="models/a2/tt/model.py:1", dispatch_evidence="picks X if (a || b) at x.cpp:1")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 2, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"by": "user", "date": "2026-10-01", "result": "pass"}
+    (run / "run.json").write_text(json.dumps(data))
+    spec = sheet(run)
+    ops = tab(spec, "Op table")
+    # different call sites that shorten alike are still shown per row, not reported as constant
+    assert "Call site (file:line)" in ops[0]
+    info = tab(spec, "Info")
+    assert ["Dispatch evidence", "picks X if (a || b) at x.cpp:1"] in info
+    assert ["Entry test passes", "by: user; date: 2026-10-01; result: pass"] in info
+    row = dict(zip(ops[0], ops[1]))
+    assert row["Quasar, BF16 projection: evidence and gap"] == "TTsim run: t.py::a hang\nfork x"
+
+
+def test_sheet_spec_summary_wrapped_bullets_and_later_tables(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    (run / "summary.md").write_text("# T\n\n| k | v |\n|---|---|\n| skip | me |\n\n## Findings\n\n"
+                                    "- Launches: 2 per inference, which\n  wraps here.\n\n| a | b |\n|---|---|\n| x | 1 |\n")
+    info = tab(sheet(run), "Info")
+    assert ["Launches", "'2 per inference, which wraps here."] in info
+    assert ["x", 1] in info and ["skip", "me"] not in info
+
+
+def test_kernel_tests_apply_keeps_quoted_or_in_evidence():
+    sys.path.insert(0, str(SCRIPTS))
+    from opa_schema import split_evidence
+    assert split_evidence("picks X if (a || b)") == ("", "picks X if (a || b)")
+    assert split_evidence("TTsim run: t hang || picks X if (a || b)") == ("TTsim run: t hang", "picks X if (a || b)")
+
+
+def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
+    rows = [op_row(1, 1, device_op="prim::a", program_factory="F", op_code="A", port_ev="same"),
+            op_row(2, 2, device_op="prim::a", program_factory="F", op_code="A", port_ev="same",
+                   stage="s1 m1 conv"),
+            op_row(3, 1, device_op="prim::a", program_factory="F", op_code="A", port_ev="other")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 4)])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
-    write_rows(run / "kernel_test_results_quasar-bf16.csv",
-               [{"id": "1", "node_id": "t.py::a", "op_table_ids": "1", "result": "pass", "duration_s": "1", "log": "x"}])
-    spec = json.loads(run_script("sheet_spec.py", str(run)).stdout)
-    assert [t["tab"] for t in spec["tabs"]] == ["Op table", "Kernel tests (Quasar, BF16 projection)", "Call trace",
-                                                "Port blockers", "Host ops"]
-    assert spec["summary_tables"][0]["csv"] == "kernel_ops.csv"
-    assert "Quasar, BF16 projection: statuses (rows)" in spec["summary_tables"][0]["headers"]
+    spec = sheet(run)
+    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Kernel ops", "Op table"]
+    kernel = tab(spec, "Kernel ops")
+    row = dict(zip(kernel[0], kernel[1]))
+    assert row["Device op / program factory"] == "prim::a / F"
+    assert row["Stages"] == "encoder, s1" and row["Launches (P150)"] == 4
+    assert row["Quasar, BF16 projection: evidence and gap"] == "rows 1, 2: same\nrow 3: other"
+    assert "P150: evidence and gap" not in kernel[0]
+    assert kernel[-1][0] == "Total" and kernel[-1][4] == "=SUM(E2:E2)"
+    assert spec["expected"]["'Kernel ops'!E3"] == 4
 
 
 # Final-review fixes
@@ -1023,7 +1138,7 @@ def test_sheet_spec_one_tab_per_kernel_test_target(tmp_path):
     write_rows(run / "kernel_test_results_quasar-bf16.csv",
                [{"id": "1", "node_id": "t.py::a", "op_table_ids": "1", "result": "pass", "duration_s": "1",
                  "log": "x", "environment": "run.json"}])
-    tabs = [t["tab"] for t in json.loads(run_script("sheet_spec.py", str(run)).stdout)["tabs"]]
+    tabs = [t["title"] for t in sheet(run)["tabs"]]
     assert "Kernel tests (Quasar, BF16 projection)" in tabs
 
 

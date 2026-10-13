@@ -21,7 +21,7 @@ write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`
 | `call_site` | every call site as `<path>:<line>` at the pinned SHA, `; `-separated; add the C++ dispatch line (`<file>.cpp:<line>`) when the launch comes from inside a composite |
 | `launch_condition` | exactly `always`, or the runtime condition under which the launch happens (`skipped when the new buffer lands at the same address`) |
 | `confidence` | `verified` \| `unverified`: whether the dispatch chain to this factory is fully followed (`dispatch-tracing.md`) |
-| `dispatch_evidence` | file and function that select the device op and factory, and every runtime-dependent alternative |
+| `dispatch_evidence` | file and function that select the device op and factory, and every runtime-dependent alternative; at most 300 characters, shared by rows with one dispatch chain |
 | `grid_dependency` | the hardcoded grid, shard spec or program config this op depends on, with its value and `<file>:<line>` (`8x4 CoreGrid, <model>.py:<line>`); `automatic` when derived from the device grid; `none` when the op uses no core grid (interleaved DRAM) |
 
 Then, for the source and then each destination in `run.json` order, the columns from
@@ -34,7 +34,7 @@ Then, for the source and then each destination in `run.json` order, the columns 
 | `<t>:tests` | quasar, quasar-bf16 | pytest node ids of the Quasar kernel-op tests that decide the status, `; `-separated |
 | `<t>:test_result` | quasar, quasar-bf16 | `not run` until `kernel_tests.py` runs them; then `pass`, `fail`, `hang`, `error`, `xfail` or `skip` |
 | `<t>:status` | all | `✅`, `⚠️`, `❌`, `n/a`, defined per target in `target-status.md` |
-| `<t>:evidence` | all | evidence for this target's status only |
+| `<t>:evidence` | all | evidence for this target's status only: the decisive fact and its `<file>:<line>`, at most 300 characters, no row-number prefix; rows with one signature share it (`target-status.md`) |
 
 Do not add rows for calls proven to launch no device operation. Record those decisions in the
 inventory and in `call_trace.csv` notes or `summary.md`. If launch versus no-launch cannot be
@@ -86,7 +86,7 @@ kernel op), `static_launches` (traced launches of these rows), `static_launches_
 codes, not factories, so the measured count is per op code and repeats on every kernel op that
 shares it), then per target (source, then destinations) `<t>:statuses` (count of each status over
 its rows), and for Quasar targets `<t>:tests` and `<t>:test_results`. Written by `kernel_ops.py`;
-the Summary starts with this table.
+`summary.md` starts with this table and the spreadsheet shows it as the Kernel ops tab.
 
 ## kernel_tests_plan_<target>.csv and kernel_test_results_<target>.csv (TTsim)
 

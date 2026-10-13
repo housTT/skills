@@ -27,15 +27,16 @@ import time
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from opa_schema import TEST_TARGETS, op_table_columns, read_csv, run_targets, write_csv  # noqa: E402
+from opa_schema import (  # noqa: E402
+    EVIDENCE_SEPARATOR, TEST_TARGETS, TTSIM_PREFIX, op_table_columns, read_csv, run_targets, split_evidence,
+    write_csv,
+)
 from same_commit import mismatch  # noqa: E402
 
 KERNEL_TEST_COLUMNS = ("id", "node_id", "op_table_ids", "result", "duration_s", "log", "environment")
 PLAN_COLUMNS = ("id", "node_id", "op_table_ids", "row_statuses", "kind")
 SEVERITY = ("hang", "error", "fail", "xfail", "pass", "skip", "not run")
 FAILING = ("hang", "fail", "xfail")
-# Separates the TTsim result from the static evidence, so apply can be repeated.
-EVIDENCE_SEPARATOR = " || "
 
 
 def _run_json(run_dir: pathlib.Path) -> dict:
@@ -191,8 +192,8 @@ def apply(run_dir: pathlib.Path, target: str | None) -> int:
         if outcome == "pass" or outcome in FAILING:
             row[f"{target}:status"] = "✅" if outcome == "pass" else "❌"
             summary = "; ".join(f"{n} {results[n]}" for n in nodes if n in results)
-            static = row[f"{target}:evidence"].split(EVIDENCE_SEPARATOR, 1)[-1]
-            row[f"{target}:evidence"] = f"TTsim run: {summary}{EVIDENCE_SEPARATOR}{static}"
+            static = split_evidence(row[f"{target}:evidence"])[1]
+            row[f"{target}:evidence"] = f"{TTSIM_PREFIX}{summary}{EVIDENCE_SEPARATOR}{static}"
     write_csv(run_dir / "op_table.csv", op_table_columns(*run_targets(run_info)), rows)
     print(f"applied {len(results)} results")
     return 0

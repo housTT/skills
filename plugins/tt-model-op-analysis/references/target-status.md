@@ -118,7 +118,7 @@ Memory placement alone may differ.
 
 Before finishing, group rows by the target-relevant signature (operation semantics, factory,
 layout, dtype and sharding). Equal signatures must have equal statuses unless the evidence states
-the row-specific distinction. `quasar-bf16` evidence, and `quasar` evidence for a Quasar source, is
-row-specific: text
-copied unchanged into many rows says nothing a reader can check, and the validator warns about it
-(and about repeated `dispatch_evidence`).
+the row-specific distinction. Rows with one signature share one evidence text, written once and
+copied: the decisive fact and its `<file>:<line>` in one sentence of at most 300 characters, never
+prefixed with the row number or stage (the sheet shows both). Put what distinguishes a row in its
+own text. The validator warns about `Row <n>` prefixes and longer text.
