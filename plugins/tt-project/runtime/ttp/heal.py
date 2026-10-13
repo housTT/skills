@@ -5,16 +5,23 @@
 A command schedule may carry a `heal` block in its payload (harness/schedules.json or schedule_set):
 
     "heal": {"check": "<probe>", "fix": "<safe command>", "resource": "<lock>", "grace_s": 300,
-             "settle_s": 60, "max_fixes": 3, "window_h": 1, "timeout_s": 120}
+             "settle_s": 60, "max_fixes": 3, "window_h": 1, "timeout_s": 120, "unknown_cap_s": 3600}
 
 `check` exits 0 healthy, 1 unhealthy, 75 or 255 unknown (the codes of start_when); any other exit,
 or a timeout, is unknown too and reported as an error of the schedule. Each run of the schedule:
 - healthy: the check's state clears (and an open outage alert with it);
-- unknown: nothing changes and nothing is fixed;
+- unknown: nothing changes and nothing is fixed. A check without `outage` that stays unknown for
+  `unknown_cap_s` (0: never) without a break says so once, through escalate_to(): "user" gets one normal
+  alert `heal-unknown:<name>`, "coordinator" one high observation (`heal:<name>:unknown:<since>`), each
+  with the last check output and the blocker (exit code and last output line). The next healthy or
+  unhealthy result ends that stretch, so a later one can say so again;
 - unhealthy within `grace_s` of the first unhealthy run: tolerated (automatic recovery may still
   happen); the check runs again when the grace ends;
 - unhealthy past grace: the fix runs (under `ttp lock <resource>` when set; a busy or paused lock
-  defers it uncounted, but a lock that stays busy, not paused, past `window_h` escalates as below;
+  defers it uncounted, but a lock that stays busy, not paused, past `window_h` escalates as below; a fix
+  that has waited on a pause for `unknown_cap_s` says so once, naming the pause, who set it and that lifting
+  it lets the fix run: a pause the user set (or of unknown origin) gets one low feed line and no ask,
+  any other one high coordinator observation (`heal:<name>:paused:<since>`); never a lift of the pause;
   a fix that itself exits 75 counts like any other) and the check runs again `settle_s` later. Healthy then: one low feed line and a digest
   record ("fixed X, n today"), no coordinator wake.
 - the fix failed, did not help, `max_fixes` per `window_h` is used up, or there is no fix: one
@@ -116,7 +123,7 @@ ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out
                       r"temporary failure in name resolution|kex_exchange_identification|"
                       r"ssh: connect to host|connection closed by .* port", re.I)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
-DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
+DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
 OPEN = ("queued", "running", "waiting", "needs_review")
 # Every key a block takes, with its JSON type. validate() accepts exactly these keys, and the coordinator's
 # structured-output schema (coordinator.HEAL_SCHEMA) is built from these types, so a new key reaches both.
@@ -151,7 +158,7 @@ def validate(block: Any, where: str = "heal") -> dict:
     if unknown:
         raise ValueError(f"{where}: unknown key(s) {', '.join(unknown)}; use {', '.join(sorted(allowed))}")
     out = {**DEFAULTS, **block}
-    for k in ("grace_s", "settle_s", "max_fixes", "window_h", "timeout_s"):
+    for k in DEFAULTS:
         v = out[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
             raise ValueError(f"{where}: `{k}` is a number, 0 or more")
@@ -548,12 +555,17 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                 return _escalate(host, name, spec, st, now, f"its check could not tell for {dark / 60:.0f} min "
                                                             f"(exit {rc}): the box or resource may be unreachable")
             again = float(st["unknown_since"]) + window
+        told = ""
+        cap = float(spec.get("unknown_cap_s", DEFAULTS["unknown_cap_s"]) or 0)
+        if not spec.get("outage") and cap and not st.get("unknown_told") and now - float(st["unknown_since"]) >= cap:
+            st["unknown_told"] = now   # once per stretch: the next healthy or unhealthy result ends it
+            told = "; " + _tell_unknown(host, name, spec, st, rc, out, now)
         _save(db, name, st)
         if rc in UNKNOWN_RCS:
-            return f"ok (unknown, rc {rc})", again
-        return f"error: heal check exited {rc}: {out[-150:]}", again
-    st.pop("unknown_since", None)
-    st.pop("route_only", None)
+            return f"ok (unknown, rc {rc}{told})", again
+        return f"error: heal check exited {rc}{told}: {out[-150:]}", again
+    for key in ("unknown_since", "route_only", "unknown_told"):
+        st.pop(key, None)
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
     down = now - float(since)
@@ -585,7 +597,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         return _escalate(host, name, spec, st, now,
                          f"{len(fixes)} fixes in {spec['window_h']:g} h used up its cap ({spec['max_fixes']})")
     # Recorded before the fix runs: a restart in the middle still counts it, and rechecks next.
-    deferred = st.pop("deferred_since", None)
+    deferred, deferred_on, told = (st.pop(k, None) for k in ("deferred_since", "deferred_on", "deferred_told"))
     st.update(fixes=fixes + [now], phase="fixing", fix_started=now)
     _save(db, name, st)
     frc, fout = run_fix(spec, cwd, env)
@@ -594,10 +606,18 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         # Only the lock exits 75 here (run_fix): the fix never started. Not counted; try again next run.
         st.update(fixes=fixes, phase=None)
         res = spec["resource"]
-        if "is paused" in fout:   # a pause is the user's; it waits however long it lasts
+        if "is paused" in fout:   # it waits however long the pause lasts, but says so once past unknown_cap_s
+            st.update(deferred_on="paused", deferred_since=deferred if deferred and deferred_on == "paused" else now)
+            cap = float(spec.get("unknown_cap_s", DEFAULTS["unknown_cap_s"]) or 0)
+            note = ""
+            if told:
+                st["deferred_told"] = told
+            elif cap and now - float(st["deferred_since"]) >= cap:
+                st["deferred_told"] = now
+                note = "; " + _tell_paused(host, name, spec, st, res, now)
             _save(db, name, st)
-            return f"unhealthy (fix deferred: {res} paused)", None
-        st["deferred_since"] = deferred or now
+            return f"unhealthy (fix deferred: {res} paused{note})", None
+        st["deferred_since"] = deferred if deferred and deferred_on != "paused" else now
         if now - float(st["deferred_since"]) >= window:
             return _escalate(host, name, spec, st, now, f"its fix could not get the lock {res} for "
                                                         f"{(now - float(st['deferred_since'])) / 3600:.1f} h: it stayed busy")
@@ -674,6 +694,64 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
                    + f" {name} still fails and its {how}. Last check: {last}", "high")
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
+
+
+def _observe(db: Any, fp: str, text: str, now: float) -> None:
+    """Queue one high observation for the coordinator under `fp`, unless one is already there."""
+    if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", "observation", fp, "high", text, "queued"))
+
+
+def _tell_unknown(host: Any, name: str, spec: dict, st: dict, rc: int, out: str, now: float) -> str:
+    """A check without `outage` that stayed unknown for unknown_cap_s: one message to escalate_to()
+    with its last output and what blocks it. Returns who was told."""
+    last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
+    blocker = (f"exit {rc}" + (", only its route failing" if st.get("route_only") else "")
+               + (f": {last[:200]}" if last else ""))
+    text = (f"Heal check {name} could not tell for {(now - float(st['unknown_since'])) / 60:.0f} min ({blocker}); "
+            f"nothing is fixed or escalated on it until it can. Last check: {(out or '(no output)')[-300:]}")
+    if escalate_to(host, spec) == "coordinator":
+        _observe(host.p.db, f"{STATE_KEY}{name}:unknown:{float(st['unknown_since']):.0f}",
+                 text + " Repair the check or what blocks it within the charter.", now)
+        return "coordinator told"
+    host.alert(f"heal-unknown:{name}", text, "normal", every_s=0)
+    return "user told"
+
+
+def _pause_of(host: Any, res: str) -> dict:
+    """The pause entry ({"reason", "since", "by", "project"}) holding the lock `res`, else {}."""
+    try:
+        paused = host.p.db.paused_resources()
+        if res in paused:
+            return paused[res]
+        from . import locks as lk
+        cfg = getattr(host, "cfg", None) or {}
+        return next((v for k, v in paused.items() if lk.canonical(cfg, k) == lk.canonical(cfg, res)), {})
+    except Exception:
+        return {}
+
+
+def _tell_paused(host: Any, name: str, spec: dict, st: dict, res: str, now: float) -> str:
+    """A fix deferred on a paused resource for unknown_cap_s: a pause the user set gets one low line
+    and no ask; any other (this project's own, or another project's shared one) one coordinator
+    observation. Both name the pause, who set it and what lifting it allows. Returns who was told."""
+    pz = _pause_of(host, res)
+    by = str(pz.get("by") or "")
+    user = by in ("", "user")   # a pause of unknown origin is treated as the user's: never lifted on our word
+    who = "the user" if user else by + (f" of project {pz['project']}" if pz.get("project") else "")
+    text = (f"Heal check {name} has failed since {timefmt.long(float(st.get('since') or now), host.p)} and its fix "
+            f"has waited {(now - float(st['deferred_since'])) / 3600:.1f} h on {res}, paused by {who}"
+            + (f" ({pz['reason']})" if pz.get("reason") else "")
+            + (f" since {timefmt.long(float(pz['since']), host.p)}" if pz.get("since") else "")
+            + f". Lifting the pause lets its fix run: {spec.get('fix')}.")
+    if user:
+        host.p.db.post("out", text, chat=None, kind="info", severity="low", ref=STATE_KEY + name)
+        return "user's pause: told"
+    _observe(host.p.db, f"{STATE_KEY}{name}:paused:{float(st['deferred_since']):.0f}",
+             text + " Lift the pause once its reason is over, or repair the check another way within the charter.",
+             now)
+    return "coordinator told"
 
 
 def _paused_resource(db: Any, spec: dict) -> str:

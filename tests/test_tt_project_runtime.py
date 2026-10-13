@@ -46885,7 +46885,7 @@ def test_heal_fix_runs_under_its_lock_and_waits_out_a_pause(env):
     spec, now = _heal_spec(p), time.time()
     p.db.set_kv(PAUSED_RESOURCES_KEY, {"dev-x": {"reason": "user hold", "since": now}})
     assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x paused)"
-    assert heal.run(d, "svc", spec, now + 7200)[0] == "unhealthy (fix deferred: dev-x paused)"   # a pause never escalates
+    assert heal.run(d, "svc", spec, now + 1800)[0] == "unhealthy (fix deferred: dev-x paused)"   # waits out the pause
     assert not up.exists() and heal.state(p.db, "svc")["fixes"] == []
     assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
     p.db.set_kv(PAUSED_RESOURCES_KEY, {})
@@ -46915,6 +46915,129 @@ def test_heal_lock_busy_past_window_escalates(env, monkeypatch):
     status = heal.run(d, "svc", spec, now + 3600)[0]
     assert "could not get the lock dev-x for 1.0 h" in status, status
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def _heal_told(p):
+    """What a heal check has told anyone: user alerts and lines, asks, and coordinator observations."""
+    return (p.db.q("SELECT kind, severity, ref, text FROM messages WHERE kind IN ('alert','info','ask') ORDER BY id"),
+            p.db.q("SELECT fingerprint, severity, text FROM events WHERE kind='observation' ORDER BY id"))
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_cap(env, escalate):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300, escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    assert spec["unknown_cap_s"] == 3600
+    dark = dict(spec, check="echo probing; echo 'dev-x is paused (bench work)'; exit 75")
+    for t in (0, 30 * 60, 59 * 60):
+        assert heal.run(d, "svc", dark, now + t) == ("ok (unknown, rc 75)", None)
+    assert _heal_told(p) == ([], [])
+
+    def stretch(start, n):
+        status = heal.run(d, "svc", dark, start + 61 * 60)[0]
+        assert status == f"ok (unknown, rc 75; {escalate} told)", status
+        heal.run(d, "svc", dark, start + 180 * 60)   # the same stretch: nothing more
+        msgs, events = _heal_told(p)
+        if escalate == "user":
+            assert events == [] and [(m["kind"], m["severity"], m["ref"]) for m in msgs] == \
+                [("alert", "normal", "heal-unknown:svc")] * n
+            text = msgs[-1]["text"]
+        else:
+            assert msgs == [] and [(e["fingerprint"], e["severity"]) for e in events][-1] == \
+                (f"heal:svc:unknown:{start:.0f}", "high") and len(events) == n
+            text = events[-1]["text"]
+        assert "could not tell for 61 min (exit 75: dev-x is paused (bench work))" in text and "probing" in text
+        assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+
+    stretch(now, 1)
+    # A healthy result ends the stretch; a new one can escalate again.
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 200 * 60) == ("ok (healthy)", None)
+    up.unlink()
+    assert heal.run(d, "svc", dark, now + 201 * 60)[0] == "ok (unknown, rc 75)"
+    stretch(now + 201 * 60, 2)
+    # So does an unhealthy one (here within its grace).
+    assert heal.run(d, "svc", spec, now + 400 * 60)[0] == "unhealthy (0 s, grace 300 s)"
+    assert "unknown_told" not in heal.state(p.db, "svc")
+    assert heal.run(d, "svc", dark, now + 401 * 60)[0] == "ok (unknown, rc 75)"
+    stretch(now + 401 * 60, 3)
+
+
+def test_heal_unknown_cap_is_validated_and_zero_turns_it_off(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="unknown_cap_s"):
+        heal.validate({"check": "true", "unknown_cap_s": -1})
+    p, d, up = _heal_setup(env, unknown_cap_s=0)
+    spec, now = _heal_spec(p), time.time()
+    for t in (0, 3600, 10 * 3600):
+        assert heal.run(d, "svc", dict(spec, check="exit 255"), now + t) == ("ok (unknown, rc 255)", None)
+    assert _heal_told(p) == ([], [])
+
+
+def test_heal_outage_check_unknown_keeps_its_outage_escalation_not_the_unknown_cap(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=3000, unknown_cap_s=600)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 75)", now + 3000)
+    assert heal.run(d, "svc", dark, now + 11 * 60) == ("ok (unknown, rc 75)", now + 3000)
+    assert _heal_told(p) == ([], [])
+    assert "could not tell for 50 min" in heal.run(d, "svc", dark, now + 3000)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert _heal_told(p) == ([], []) and "unknown_told" not in heal.state(p.db, "svc")
+
+
+@pytest.mark.parametrize("by", ["user", "coordinator"])
+def test_heal_fix_deferred_on_a_pause_past_the_cap_tells_once_by_who_set_it(env, monkeypatch, by):
+    from ttp import heal
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p, d, up = _heal_setup(env, resource="dev-x")
+    spec, now = _heal_spec(p), time.time()
+    pause = {"dev-x": {"reason": "bench work", "since": now - 600, "by": by}}
+    p.db.set_kv(PAUSED_RESOURCES_KEY, pause)
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused (bench work); hand the task back"))
+    for t in (0, 30 * 60, 59 * 60):
+        assert heal.run(d, "svc", spec, now + t)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert _heal_told(p) == ([], [])
+    who = "user's pause: told" if by == "user" else "coordinator told"
+    assert heal.run(d, "svc", spec, now + 61 * 60)[0] == f"unhealthy (fix deferred: dev-x paused; {who})"
+    for t in (120, 600):   # the same pause: nothing more
+        assert heal.run(d, "svc", spec, now + t * 60)[0] == "unhealthy (fix deferred: dev-x paused)"
+    msgs, events = _heal_told(p)
+    if by == "user":
+        assert events == [] and [(m["kind"], m["severity"], m["ref"]) for m in msgs] == [("info", "low", "heal:svc")]
+        text = msgs[0]["text"]
+        assert "paused by the user (bench work)" in text
+    else:
+        assert msgs == [] and [(e["fingerprint"], e["severity"]) for e in events] == [(f"heal:svc:paused:{now:.0f}", "high")]
+        text = events[0]["text"]
+        assert "paused by coordinator (bench work)" in text
+    assert "waited 1.0 h on dev-x" in text and f"Lifting the pause lets its fix run: touch {up}" in text
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'") and heal.state(p.db, "svc")["fixes"] == []
+    assert p.db.kv(PAUSED_RESOURCES_KEY) == pause   # never lifted here
+    # The fix running ends the stretch; a later pause stretch can tell again.
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (0, "fixed"))
+    assert heal.run(d, "svc", spec, now + 700 * 60)[0] == "unhealthy (fixed; rechecking)"
+    assert not {"deferred_since", "deferred_on", "deferred_told"} & set(heal.state(p.db, "svc"))
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused (bench work); hand the task back"))
+    st = heal.state(p.db, "svc")
+    p.db.set_kv(heal.STATE_KEY + "svc", {k: v for k, v in st.items() if k not in ("phase", "fixes")})
+    assert heal.run(d, "svc", spec, now + 701 * 60)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert heal.run(d, "svc", spec, now + 762 * 60)[0].endswith(f"; {who})")
+    assert sum(map(len, _heal_told(p))) == 2
+
+
+def test_heal_paused_then_busy_lock_restarts_the_deferral_clock(env, monkeypatch):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused; hand the task back"))
+    heal.run(d, "svc", spec, now)
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x stayed busy for 30 s. Hand the task back"))
+    assert heal.run(d, "svc", spec, now + 3000)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.run(d, "svc", spec, now + 3700)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert "could not get the lock" in heal.run(d, "svc", spec, now + 3000 + 3600)[0]
 
 
 def test_heal_timeout_is_capped_below_the_daemon_watchdog(env):
@@ -47007,12 +47130,13 @@ def test_heal_outage_check_that_stays_unknown_escalates_without_fixing(env):
     assert [e["key"] for e in alerts.sweep(p.db)] == ["heal:svc"]
     st = heal.state(p.db, "svc")
     assert st["status"] == "healthy" and not {"unknown_since", "task", "escalated", "alerted"} & set(st)
-    # Without outage, a check that stays unknown never fixes or escalates however long it lasts.
+    # Without outage, a check that stays unknown never fixes; past unknown_cap_s it only says so once.
     plain = dict(spec, outage=False, check="exit 255")
     p.db.set_kv(heal.STATE_KEY + "svc", {})
     up.unlink()
-    for dt in (0, 3600, 10 * 3600):
-        assert heal.run(d, "svc", plain, now + 2000 + dt) == ("ok (unknown, rc 255)", None)
+    assert heal.run(d, "svc", plain, now + 2000) == ("ok (unknown, rc 255)", None)
+    for dt in (3600, 10 * 3600):
+        assert heal.run(d, "svc", plain, now + 2000 + dt)[0].startswith("ok (unknown, rc 255")
     assert not up.exists() and p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
 
 
