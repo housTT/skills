@@ -36496,7 +36496,7 @@ def test_own_push_refuses_a_task_branch_other_than_the_one_its_run_was_given(env
     carried = f"ttp/t{owner}-first-fix"
     _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{carried}")
     theirs = _git_out(origin, "rev-parse", carried)
-    tid = p.db.add_task("Follow up", "s", kind="code", labels=[f"pr_branch:{carried}"])
+    tid = p.db.add_task("Follow up", f"pr_branch: {carried}", kind="code", labels=[f"pr_branch:{carried}"])
     p.db.update_task(tid, status="running", branch=carried)
     monkeypatch.setenv("TTP_TASK", str(tid))
     _git_out(repo, "checkout", "-q", "-B", carried, theirs)
