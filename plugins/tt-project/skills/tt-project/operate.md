@@ -34,7 +34,7 @@
 | `ttp doctor <name>` / `ttp doctor --scheduler` | providers, accounts, Jev, notifications, web / the installed runtime's command-watcher lifecycle (reports at exit 1, an `"error": true` line repaired and reopening, a clean run closing all) in a scratch project, each tick in a fresh process: no model, $0, exit 1 on a failed step; run it after an upgrade instead of the repository's tests, which are not installed |
 | `ttp alerts <name> --after N` | alerts since a message id |
 | `ttp alerts <name> --ack <id> --why "<reason>"` | acknowledge the keyed alert episode of a message id shown by `ttp alerts`: closes it if its condition is over, else moves it to the feed, quiet until it clears; a live outage (logout, network, disk, machine, whole-box heal) is refused; keeps history, retries leave the original receipt unchanged, unknown ids are refused |
-| `ttp stats [<name>] [--days N] [--json]` | context re-read (cache-read) tokens per run and per $, by role, task kind, tier and effort, and the runs that re-read most |
+| `ttp stats [<name>] [--days N] [--tools] [--json]` | context re-read (cache-read) tokens per run and per $, by role, task kind, tier and effort, and the runs that re-read most; `--tools`: the runs' tool output by category, with the share that is file reads |
 | `ttp audit [<name>] [--hours N] [--json]` | the daily review's self-efficiency audit: every ask with its blocking reason and answer, failed, lost, retried and continued runs, idle wakes, $ per done task by kind and tier, review-loop spend per change, stuck work and overrides held past their end |
 | `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; a local view forward needs no ask) |
 

@@ -44,6 +44,9 @@
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.
 - Run builds and test suites as `ttp clip -- <command>`: the full output goes to a file and you
   get the failures (or head and tail) and its path. Read only the part you need.
+- Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read
+  with offset and limit). Do not re-read a range you already read: every line read is paid for
+  again on each later call.
 - Qualify a harness-preparation commit with `ttp checks --purpose harness`, never by adding its own
   SHA to a publication whitelist. That pass never counts for a PR, an `on_pass` or a push.
 

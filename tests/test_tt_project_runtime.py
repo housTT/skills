@@ -34956,6 +34956,68 @@ def test_worker_hook_lets_targeted_and_other_runs_through(env, monkeypatch, tmp_
     assert not denied("pytest tests -m slow")
 
 
+def test_worker_hook_reminds_about_wide_file_reads_and_never_denies(env, monkeypatch, tmp_path):
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE])
+    (repo / "big.py").write_text("x = 1\n" * 1000)
+    (repo / "small.py").write_text("x = 1\n" * 100)
+
+    def hint(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(repo)})
+        assert not out or "permissionDecision" not in out["hookSpecificOutput"], cmd
+        return (out or {}).get("hookSpecificOutput", {}).get("additionalContext")
+    for cmd in ("sed -n '1,400p' big.py", "sed -ne '1,350p' big.py", "sed -n '100,$p' big.py",
+                "sed -n '1,100p;500,800p' big.py", "sed -n -e 1,999p big.py", "cat big.py", "cat -n big.py 2>&1",
+                "cat small.py big.py", "nl big.py", "head -n 500 big.py", "head -500 big.py", "tail -n +600 big.py",
+                "tail -n 400 big.py", "git status && cat big.py", f"cat {repo}/big.py 2>/dev/null"):
+        h = hint(cmd)
+        assert h and "big.py" in h and "`grep -n`" in h and "still runs" in h, cmd
+    assert "about 400 lines" in hint("sed -n '1,400p' big.py") and "about 1000 lines" in hint("cat big.py")
+    for cmd in ("sed -n '1,200p' big.py", "sed -n '900,1400p' big.py", "cat small.py", "head big.py",
+                "head -n 300 big.py", "tail -n +800 big.py", "cat big.py | grep x", "sed -n '1,999p' big.py | head",
+                "cat big.py > copy.py", "cat big.py >> copy.py", "ttp clip -- cat big.py", "grep -n x big.py",
+                "sed -i 's/x/y/' big.py", "sed 's/x/y/' big.py", "sed -n '/def/p' big.py", "cat missing.py",
+                "echo 'cat big.py'", "head -c 99999 big.py", "tail -f big.py", "wc -l big.py"):
+        assert hint(cmd) is None, cmd
+    # A guard's refusal still wins over the reminder; other tools and runs outside the harness get nothing.
+    assert denied("cat big.py; " + SUITE)
+    assert hook.pre_tool_use({"tool_name": "Read", "tool_input": {"file_path": "big.py"}, "cwd": str(repo)}) == (None, None)
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "cat big.py"},
+                              "cwd": str(repo)}) == (None, None)
+
+
+def test_stats_tools_reports_the_file_read_share_of_tool_output(env, tmp_path, capsys):
+    from ttp import budget as bud
+    p = make(env)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    calls = [("a", "Bash", {"command": "sed -n '1,400p' src/x.py"}, "r" * 400),
+             ("b", "Bash", {"command": "cd src && cat -n y.py 2>&1"}, [{"type": "text", "text": "c" * 200}]),
+             ("c", "Read", {"file_path": "z.py"}, "z" * 100),
+             ("d", "Bash", {"command": "grep -n foo src/x.py"}, "g" * 100),
+             ("e", "Bash", {"command": "sed -i 's/a/b/' src/x.py"}, ""),
+             ("f", "Bash", {"command": "git log --oneline | head -5"}, "l" * 200)]
+    with open(run_dir / "output.jsonl", "w") as f:
+        for i, name, inp, out in calls:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": i, "name": name, "input": inp}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": i, "content": out}]}}) + "\n")
+        f.write("not json\n")
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+           (None, "worker", "claude", "opus", time.time(), "done", str(run_dir), "x"))
+    s = bud.tool_output_stats(p.db, p.runs, 7)
+    cats = {g["category"]: g for g in s["categories"]}
+    assert s["runs"] == 1 and s["chars"] == 1000 and s["file_read_share"] == 0.7
+    assert cats["file read (Bash)"]["chars"] == 600 and cats["file read (Bash)"]["calls"] == 2
+    assert cats["file read (Read)"]["chars"] == 100 and cats["search"]["chars"] == 100
+    assert cats["other bash"]["chars"] == 200 and cats["other bash"]["calls"] == 2
+    assert "file reads 70%" in bud.tool_output_text(s)
+    from ttp import cli
+    cli.main(["stats", "demo", "--tools"])
+    assert "file read (Bash): 2 calls" in capsys.readouterr().out
+
+
 def test_worker_hook_full_suite_guard_follows_the_projects_checks_and_has_an_escape_hatch(env, monkeypatch, tmp_path):
     hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE])
     assert denied(SUITE)

@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import credits
@@ -779,6 +782,87 @@ def reread_text(s: dict) -> str:
               f"{t['minutes']} min, ${t['usd']:.2f}): {m(t['cache_read'])} {t['title']}".rstrip() for t in s["top"]]
     return "\n".join(lines)
 
+
+# What a tool's output was, for `tool_output_stats`
+SEARCH_COMMANDS = {"grep", "egrep", "rg", "ag", "find", "fd", "ls", "git-grep"}
+
+
+def tool_category(name: str, inp: dict) -> str:
+    """'file read (Read)', 'file read (Bash)' (cat, sed -n, head, tail or nl of a file), 'search',
+    'other bash' or 'other'."""
+    from . import hook
+    if name == "Read":
+        return "file read (Read)"
+    if name in ("Grep", "Glob", "LS"):
+        return "search"
+    if name != "Bash":
+        return "other"
+    cmd = str(inp.get("command") or "")
+    try:
+        argvs = hook._segments(hook._split(cmd)[0])
+    except Exception:
+        return "other bash"
+    names = [os.path.basename(a[0]) + ("-grep" if a[:2] == ["git", "grep"] else "") for a in argvs]
+    for argv, n in zip(argvs, names):
+        files = [w for w in argv[1:] if not w.startswith("-")]
+        if n in ("cat", "nl", "head", "tail") and files \
+                or n == "sed" and not any(w.startswith(("-i", "--in-place")) for w in argv) \
+                and any(w in ("--quiet", "--silent") or re.fullmatch(r"-[nEsrzu]*n[nEsrzu]*e?", w) for w in argv):
+            return "file read (Bash)"
+    return "search" if names and names[0] in SEARCH_COMMANDS else "other bash"
+
+
+def _result_chars(block: dict) -> int:
+    c = block.get("content")
+    if isinstance(c, list):
+        return sum(len(str(x.get("text") or "")) for x in c if isinstance(x, dict))
+    return len(str(c or ""))
+
+
+def tool_output_stats(db: DB, runs_dir: Path, days: float = 7, now: float | None = None) -> dict:
+    """Characters of tool output the runs started in the last `days` took into their context, by
+    category (tool_category), from each run's transcript. Every character stays in the context and is
+    re-read on each later call, so the file-read share is what narrow reads cut."""
+    now = now or time.time()
+    by: dict[str, dict[str, int]] = {}
+    runs = 0
+    for r in db.q("SELECT id, dir FROM runs WHERE started>=?", (now - days * 86400,)):
+        out = (Path(r["dir"]) if r["dir"] else runs_dir / str(r["id"])) / "output.jsonl"
+        try:
+            lines = out.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        runs += 1
+        uses: dict[str, str] = {}
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            msg = e.get("message") if isinstance(e, dict) else None
+            for b in msg.get("content") or [] if isinstance(msg, dict) and isinstance(msg.get("content"), list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("id"):
+                    uses[b["id"]] = tool_category(str(b.get("name") or ""), b.get("input") if isinstance(b.get("input"), dict) else {})
+                elif b.get("type") == "tool_result":
+                    g = by.setdefault(uses.get(b.get("tool_use_id"), "other"), {"calls": 0, "chars": 0})
+                    g["calls"] += 1
+                    g["chars"] += _result_chars(b)
+    total = sum(g["chars"] for g in by.values())
+    cats = sorted(({"category": k, **v, "share": round(v["chars"] / total, 3) if total else 0.0} for k, v in by.items()),
+                  key=lambda g: -g["chars"])
+    return {"days": days, "runs": runs, "chars": total, "categories": cats,
+            "file_read_share": round(sum(g["chars"] for g in cats if g["category"].startswith("file read"))
+                                     / total, 3) if total else 0.0}
+
+
+def tool_output_text(s: dict) -> str:
+    lines = [f"Tool output, last {s['days']:g} days: {s['runs']} run transcripts, {s['chars'] / 1e6:.2f} M chars; "
+             f"file reads {s['file_read_share']:.0%}"]
+    lines += [f"  {g['category']}: {g['calls']} calls, {g['chars'] / 1e6:.2f} M chars ({g['share']:.0%})"
+              for g in s["categories"]]
+    return "\n".join(lines)
 
 
 def _note(raw) -> dict:

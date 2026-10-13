@@ -410,6 +410,12 @@ def test_worker_prompt_quotes_log_tail_before_diagnosing_a_failed_job():
         assert part in text, part
 
 
+def test_worker_prompt_asks_for_narrow_file_reads():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("`grep -n` first", "only the ranges you need", "Do not re-read a range you already read"):
+        assert part in text, part
+
+
 def test_worker_prompt_ci_wait_wakes_on_a_hung_job():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("`ttp ci --repo <owner/repo> --branch <branch>`", "exits 0 when a job hangs", "`hung:` line",

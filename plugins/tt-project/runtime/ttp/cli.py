@@ -1047,6 +1047,10 @@ def cmd_stats(a) -> None:
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp stats <name>`")
+    if a.tools:
+        s = bud.tool_output_stats(p.db, p.runs, a.days)
+        print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
+        return
     s = bud.reread_stats(p.db, a.days, top=a.top)
     print(json.dumps(s, indent=1) if a.json else bud.reread_text(s))
 
@@ -4446,6 +4450,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", nargs="?")
     s.add_argument("--days", type=float, default=7)
     s.add_argument("--top", type=int, default=10)
+    s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stats)
 

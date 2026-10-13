@@ -29,6 +29,10 @@ It also denies a Bash call that runs one of the project's configured pytest chec
 same tree (full_suite). Focused runs pass, and so does `TTP_ALLOW_FULL_SUITE=1`; each refusal is
 logged to the run's refusals.jsonl.
 
+A Bash call that would print more than WIDE_READ_LINES lines of one file (sed -n with a big range,
+cat of a large file) gets a reminder to grep first and read narrow ranges, as added context; it is
+never denied (wide_read). `ttp stats --tools` shows how much of the runs' tool output is file reads.
+
 It fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
@@ -496,9 +500,159 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
-        return None, None
+        hint = wide_read(commands, str(payload.get("cwd") or os.getcwd()))
+        return ({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": hint}}
+                if hint else None), None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"tt-project: {why}."}}, None
+
+
+# A command that prints more than this many lines of one file gets a reminder (never a refusal):
+# every line read stays in the context and is paid for again on each later call.
+WIDE_READ_LINES = 300
+# Line counts stop here: a bigger file is "more than this", which is all the reminder needs.
+COUNT_MAX_BYTES = 32 << 20
+# stdout sent to a file (`> f`, `>> f`, `1> f`, `&> f`), not `2>&1` or `2> f`
+STDOUT_REDIRECT_RE = re.compile(r"(?:^|[^\d<>&])>|(?:^|\s)1>|&>")
+SED_RANGE_RE = re.compile(r"^\s*(\d+|\$)\s*(?:,\s*(\d+|\$|\+\d+)\s*)?p\s*$")
+
+
+def _line_count(path: str, cwd: str) -> int | None:
+    f = Path(os.path.expanduser(path))
+    f = f if f.is_absolute() else Path(cwd) / f
+    try:
+        if not f.is_file():
+            return None
+        n, ends_nl = 0, True
+        with open(f, "rb") as fh:
+            read = 0
+            while read < COUNT_MAX_BYTES:
+                b = fh.read(1 << 20)
+                if not b:
+                    break
+                read += len(b)
+                n += b.count(b"\n")
+                ends_nl = b.endswith(b"\n")
+        return n + (not ends_nl)
+    except OSError:
+        return None
+
+
+def _sed_lines(args: list[str], cwd: str) -> list[tuple[str, int]]:
+    """(file, lines printed) of `sed -n 'a,bp' file`: only print-only scripts are counted."""
+    quiet, scripts, files, i = False, [], [], 0
+    while i < len(args):
+        a = args[i]
+        short = re.fullmatch(r"-([nEsrzu]*)(e?)", a)
+        if a.startswith(("-i", "--in-place")):
+            return []
+        if a in ("--quiet", "--silent") or short and "n" in short[1]:
+            quiet = True
+        if a == "--expression" or short and short[2]:
+            scripts.append(args[i + 1] if i + 1 < len(args) else "")
+            i += 1
+        elif a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+        elif a.startswith("-"):
+            pass
+        elif not scripts:
+            scripts.append(a)
+        else:
+            files.append(a)
+        i += 1
+    if not quiet or len(files) != 1:
+        return []
+    ranges = []
+    for part in ";".join(scripts).replace("\n", ";").split(";"):
+        if not part.strip():
+            continue
+        m = SED_RANGE_RE.match(part)
+        if not m:
+            return []
+        ranges.append(m.groups())
+    if not ranges:
+        return []
+    n = _line_count(files[0], cwd)
+    if n is None:
+        return []
+    out = 0
+    for a, b in ranges:
+        start = n if a == "$" else int(a)
+        end = start if b is None else n if b == "$" else start + int(b[1:]) if b.startswith("+") else int(b)
+        out += max(0, min(end, n) - start + 1)
+    return [(files[0], out)]
+
+
+def _count_arg(args: list[str]) -> tuple[str | None, list[str]]:
+    """head/tail: the -n value as written (default "10") and the file arguments."""
+    count, files, i = "10", [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--lines"):
+            count = args[i + 1] if i + 1 < len(args) else count
+            i += 1
+        elif a.startswith("--lines="):
+            count = a.split("=", 1)[1]
+        elif re.fullmatch(r"-n[+-]?\d+", a):
+            count = a[2:]
+        elif re.fullmatch(r"-\d+", a):
+            count = a[1:]
+        elif a in ("-c", "--bytes", "-f", "--follow", "-F") or a.startswith(("-c", "--bytes")):
+            return None, []
+        elif not a.startswith("-"):
+            files.append(a)
+        i += 1
+    return count, files
+
+
+def _printed(argv: list[str], cwd: str) -> list[tuple[str, int]]:
+    """(file, about how many of its lines the command prints) for sed -n, cat, nl, head and tail."""
+    name, args = os.path.basename(argv[0]), argv[1:]
+    if name == "sed":
+        return _sed_lines(args, cwd)
+    if name in ("cat", "nl"):
+        return [(f, n) for f in args if not f.startswith("-") and f != "-"
+                for n in [_line_count(f, cwd)] if n is not None]
+    if name in ("head", "tail"):
+        count, files = _count_arg(args)
+        out = []
+        for f in files if count is not None else []:
+            n = _line_count(f, cwd)
+            m = re.fullmatch(r"([+-]?)(\d+)", count)
+            if n is None or not m:
+                continue
+            k = int(m[2])
+            want = (n - k if m[1] == "-" else k) if name == "head" else (n - k + 1 if m[1] == "+" else k)
+            out.append((f, max(0, min(n, want))))
+        return out
+    return []
+
+
+def wide_read(commands: str, cwd: str) -> str | None:
+    """A reminder when a command shows more than WIDE_READ_LINES lines of one file: sed -n with a
+    big range, cat or nl of a large file, head/tail with a large count. Output piped on or written
+    to a file is not shown, so it does not count."""
+    worst = ("", 0)
+    try:
+        for line in commands.split("\n"):
+            for s, e, sep in _pieces(line):
+                piece = line[s:e]
+                bare = re.sub(r"'[^']*'|\"[^\"]*\"", "", piece)
+                if sep.startswith("|") or STDOUT_REDIRECT_RE.search(bare) or re.search(r"\bttp\s+clip\b", bare):
+                    continue
+                for argv in _segments(piece)[:1]:
+                    for f, n in _printed(argv, cwd):
+                        if n > worst[1]:
+                            worst = (f, n)
+    except Exception:
+        return None
+    if worst[1] <= WIDE_READ_LINES:
+        return None
+    f, n = worst
+    return (f"tt-project: this prints about {n} lines of {f}, and every line stays in your context, paid for "
+            "again on each later call. Find the part you need with `grep -n` first, then read narrow ranges "
+            "(`sed -n 'a,bp'`, or Read with offset and limit); do not re-read a range you already have. "
+            "This is a reminder: the command still runs.")
 
 
 # Full runs of the project's required checks go through `ttp checks`, which reuses a pass recorded
