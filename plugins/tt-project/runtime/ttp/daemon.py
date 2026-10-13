@@ -284,12 +284,64 @@ def _mount_of(path: Path) -> Path:
     return p
 
 
+def _measured(sizes: dict[str, int], root: Path) -> int:
+    """Bytes du measured under `root`: its own line once du finished it, else the outermost finished
+    entries below it (du prints a directory once its whole subtree is counted)."""
+    if str(root) in sizes:
+        return sizes[str(root)]
+    done: list[Path] = []
+    for k in sorted(sizes, key=lambda k: len(Path(k).parts)):
+        q = Path(k)
+        if root in q.parents and not any(d in q.parents for d in done):
+            done.append(q)
+    return sum(sizes[str(d)] for d in done)
+
+
+def own_usage(p: Project, dev: int, nets: list[Path], timeout: float) -> dict:
+    """What this project's own folders on the filesystem `dev` hold: state/ (du -x -d 3, so each run
+    directory and a worktree a worker made in it show) and worktrees/ (du -x -d 1, each task's), within
+    `timeout` in all. What du measured before it was stopped counts (_measured). Returns {"bytes"
+    (None: nothing measured), "complete", "folders" (the ones looked at), "consumers": [(label,
+    bytes, count or None)] biggest first: run worktrees, task worktrees, each other state/ subfolder}."""
+    deadline = time.monotonic() + timeout
+    roots = []
+    for d, depth in ((p.state.resolve(), 3), (p.worktrees.resolve(), 1)):
+        try:
+            if os.stat(d).st_dev == dev and not any(d == r or r in d.parents for r, _ in roots):
+                roots.append((d, depth))
+        except OSError:
+            continue
+    total, complete, any_line, consumers = 0, True, False, []
+    run_wts = [d.resolve() for d in worktree.run_worktree_dirs(p)]
+    for d, depth in roots:
+        if not _scan_ok(d, nets):
+            complete = False
+            continue
+        sizes, done = _du(["-x", "-d", str(depth), str(d)], deadline - time.monotonic())
+        complete = complete and done
+        any_line = any_line or bool(sizes)
+        total += _measured(sizes, d)
+        if d == p.state.resolve():
+            wt_bytes = sum(_measured(sizes, w) for w in run_wts)
+            if run_wts:
+                consumers.append(("run worktrees", wt_bytes, len(run_wts)))
+            for sub in sorted({Path(k).relative_to(d).parts[0] for k in sizes if d in Path(k).parents}):
+                n = _measured(sizes, d / sub) - (wt_bytes if d / sub == p.runs.resolve() else 0)
+                consumers.append((f"state/{sub}" + (" (other run files)" if sub == p.runs.name else ""), n, None))
+        else:
+            kids = [k for k in sizes if Path(k).parent == d]
+            consumers.append(("task worktrees", sum(sizes[k] for k in kids), len(kids)))
+    consumers = sorted((c for c in consumers if c[1] > 0), key=lambda c: -c[1])[:DISK_DU_TOP]
+    return {"bytes": total if any_line else None, "complete": complete and any_line,
+            "folders": [str(d) for d, _ in roots], "consumers": consumers}
+
+
 def disk_breakdown(p: Project, path: Path, timeout: float = DISK_DU_TIMEOUT_S) -> dict:
     """What fills the filesystem holding `path`, so a full shared disk is not taken for project growth:
-    this project's own data on it (its root, and its worktrees wherever they are) and the biggest
-    top-level directories (du -x -d 1). The project gets at most half of `timeout`; each du keeps
-    what it measured when stopped. Never scans / or a home folder, nor anything holding a network
-    or FUSE mount (see _scan_ok): those come back unknown."""
+    this project's own data on it (its state/ and worktrees/ folders, by subfolder, see own_usage) and
+    the biggest top-level directories (du -x -d 1). The project gets at most half of `timeout`; each
+    du keeps what it measured when stopped. Never scans / or a home folder, nor anything holding a
+    network or FUSE mount (see _scan_ok): those come back unknown."""
     deadline = time.monotonic() + timeout
     mount = _mount_of(path)
     nets = network_mounts()
@@ -297,39 +349,33 @@ def disk_breakdown(p: Project, path: Path, timeout: float = DISK_DU_TIMEOUT_S) -
         dev = os.stat(mount).st_dev
     except OSError:
         return {"mount": str(mount), "top": [], "complete": False, "own_bytes": None, "own_complete": False}
-    roots = []
-    for d in (p.root.resolve(), p.worktrees.resolve()):
-        try:
-            if os.stat(d).st_dev == dev and not any(d == r or r in d.parents for r in roots):
-                roots.append(d)
-        except OSError:
-            continue
-    own, own_done = 0, True
-    for d in roots:
-        if not _scan_ok(d, nets):
-            own_done = False
-            continue
-        sizes, done = _du(["-x", "-s", str(d)], min(deadline - time.monotonic(), timeout / 2))
-        own += sum(sizes.values())
-        own_done = own_done and done and bool(sizes)
+    own = own_usage(p, dev, nets, timeout / 2)
+    mine = {"own_bytes": own["bytes"], "own_complete": own["complete"], "own_consumers": own["consumers"],
+            "own_folders": own["folders"]}
     if not _scan_ok(mount, nets):
-        return {"mount": str(mount), "top": [], "complete": False, "top_skipped": True,
-                "own_bytes": own if roots else None, "own_complete": own_done}
+        return {"mount": str(mount), "top": [], "complete": False, "top_skipped": True, **mine}
     sizes, done = _du(["-x", "-d", "1", str(mount)], deadline - time.monotonic())
     sizes = {k: v for k, v in sizes.items() if Path(k) != mount}   # the total line
     top = sorted(sizes.items(), key=lambda kv: -kv[1])[:DISK_DU_TOP]
-    return {"mount": str(mount), "top": top, "complete": done, "own_bytes": own if roots else None,
-            "own_complete": own_done}
+    return {"mount": str(mount), "top": top, "complete": done, **mine}
 
 
 def disk_usage_line(b: dict, used: float) -> str:
-    """One sentence for the guard alert: this project's share of the used space, then the biggest
-    top-level directories."""
+    """One sentence for the guard alert: this project's share of the used space and its biggest
+    consumers (run and task worktrees, state/ subfolders), then the biggest top-level directories. A
+    du cut short gives the partial total it measured, said to be partial."""
     gb = lambda n: f"{n / 1e9:.1f} GB"   # noqa: E731
     parts = []
     if b.get("own_bytes") is not None:
-        partial = "" if b.get("own_complete") else " or more (du stopped early)"
-        parts.append(f"This project's own data is {gb(b['own_bytes'])}{partial} of the {gb(used)} used on {b['mount']}")
+        size = gb(b["own_bytes"]) if b.get("own_complete") else (
+            f"at least {gb(b['own_bytes'])} (partial: what du measured within {DISK_DU_TIMEOUT_S // 2} s)")
+        biggest = ", ".join(f"{label}: {n}, {gb(v)}" if n is not None else f"{label} {gb(v)}"
+                            for label, v, n in b.get("own_consumers") or [])
+        parts.append(f"This project's own data (state/ and worktrees/) is {size} of the {gb(used)} used on "
+                     f"{b['mount']}" + (f" ({biggest})" if biggest else ""))
+    elif b.get("own_folders"):
+        parts.append(f"{gb(used)} used on {b['mount']}; this project's own data (state/ and worktrees/) was not "
+                     f"measured: du printed nothing within {DISK_DU_TIMEOUT_S // 2} s or the folder is not scanned")
     else:
         parts.append(f"{gb(used)} used on {b['mount']}")
     if b.get("top"):
@@ -436,6 +482,7 @@ class Daemon:
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
+        self._run_kept: dict[str, tuple[float, str]] = {}   # run worktree path -> (checked, why kept)
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
         self._disk_swept = 0.0   # when the disk guard last swept finished tasks' worktrees
         self._disk_free: float | None = None
@@ -4715,7 +4762,7 @@ class Daemon:
         more, self._prune_more = self._prune_more, None
         force = force or more == "force"
         if (now - self._last_prune < every_s and latest <= self._pruned_upto and not force and not more) \
-                or not self.p.worktrees.is_dir():
+                or not (self.p.worktrees.is_dir() or self.p.runs.is_dir()):
             return []
         self._last_prune, self._pruned_upto = now, latest
         days = float(days or 0)
@@ -4727,11 +4774,16 @@ class Daemon:
         def failed(task: dict) -> bool:   # a forced sweep still skips a recent failure, or it retries it every tick
             memo = self._kept.get(task["id"])
             return recent(task) and str(memo[2] or "").startswith("error:")
+
+        def run_skip(w: dict) -> bool:   # a run directory's kept worktree: the same rechecks, by path
+            memo = self._run_kept.get(str(w["path"]))
+            return bool(memo) and now - memo[0] < KEEP_RECHECK_S and (
+                not force or str(memo[1] or "").startswith("error:"))
         db = self.p.db
         logged = db.kv(KV_WORKTREES_LOGGED) or {}      # task -> the keep reason last logged
         dirty = db.kv(KV_WORKTREES_DIRTY) or {}        # task -> its kept tracked changes
         results = worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"),
-                                 skip=failed if force else recent,
+                                 skip=failed if force else recent, skip_run=run_skip,
                                  leftovers_max_mb=cfg.get("worktree_leftovers_max_mb"),
                                  archive_max_mb=cfg.get("worktree_archive_max_mb"),
                                  patch_tracked=force,   # the disk guard's sweep also frees tracked changes as patches
@@ -4742,6 +4794,9 @@ class Daemon:
         if any(r.get("deferred") for r in results):
             self._prune_more = "force" if force else "plain"
         for r in results:
+            if "run" in r:
+                self._run_swept(r, logged, now)
+                continue
             key = str(r["task"])
             if r.get("unlocked") is not None:
                 log(self.p, f"worktree {r['path']} of task {r['task']}: cleared its stale lock "
@@ -4781,10 +4836,34 @@ class Daemon:
         if kept != (db.kv("worktrees_kept") or {}):
             db.set_kv("worktrees_kept", kept or None)
         for name, memo in ((KV_WORKTREES_LOGGED, logged), (KV_WORKTREES_DIRTY, dirty)):
-            memo = {k: v for k, v in memo.items() if (self.p.worktrees / f"t{k}").exists()}
+            memo = {k: v for k, v in memo.items() if (self.p.worktrees / f"t{k}").exists()
+                    or (k.startswith("/") and Path(k).is_dir())}
             if memo != (db.kv(name) or {}):
                 db.set_kv(name, memo or None)
         return results
+
+    def _run_swept(self, r: dict, logged: dict, now: float) -> None:
+        """Log one sweep result for a worktree inside a run directory (worktree.run_worktrees) and
+        remember a kept one: rechecked after KEEP_RECHECK_S, a held one every sweep. `logged` (path ->
+        the keep reason last logged) gives each reason one log line."""
+        key, what = r["path"], f"worktree {r['path']} of run {r['run'] or '?'}" + (
+            f" (task {r['task']})" if r["task"] else "")
+        if r.get("archived"):
+            ar = r["archived"]
+            log(self.p, f"{what}: archived {ar['files']} file(s) ({ar['bytes'] / 1e6:.1f} MB) to {ar['dir']}")
+        if r.get("moved"):
+            log(self.p, f"{what}: moved {r['moved']['files']} untracked file(s) to {r['moved']['to']}")
+        if r.get("deferred"):
+            self._run_kept[key] = (0, r["why"])
+        elif r["why"] is None:
+            self._run_kept.pop(key, None)
+            logged.pop(key, None)
+            log(self.p, f"{what} removed; branch {r['branch'] or '?'} kept")
+        else:
+            if logged.get(key) != r["why"]:
+                logged[key] = r["why"]
+                log(self.p, f"{what} kept: {r['why']}")
+            self._run_kept[key] = (0 if r.get("held") else now, r["why"])
 
     def _uncommitted(self, r: dict, prev: dict | None) -> dict:
         """A finished task's worktree holds modified tracked files: raise it to the coordinator once

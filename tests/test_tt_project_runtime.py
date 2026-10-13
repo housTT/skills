@@ -14761,6 +14761,84 @@ def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys, monkeypatch):
     assert "new.txt" in out and "files.tar.gz:new.txt" in out, out
 
 
+def _run_worktree(p, task, status="done", ended_ago=7 * 3600):
+    """A run of `task` whose worker made its own git worktree at state/runs/<run id>/wt, as workers do."""
+    import time as _t
+    now = _t.time()
+    rid = p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+                 (task, "worker", now - ended_ago - 60, None if status == "running" else now - ended_ago, status))
+    wt = p.runs / str(rid) / "wt"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    _git_out(p.root, "worktree", "add", "-q", "--detach", str(wt))
+    return rid, wt
+
+
+def test_run_directory_worktrees_go_when_finished_and_clean_and_stay_with_a_reason(env, monkeypatch):
+    """Worktrees a worker made in its run directory are found from git's records and swept like task
+    worktrees: a clean one of a finished run goes (artifacts archived first); a live run's, an open
+    task's, a dirty one and one that ended under the grace stay, each with its reason."""
+    import json
+    from pathlib import Path
+    p = make(env)
+    from ttp import archive, worktree
+    (p.root / ".git" / "info").mkdir(exist_ok=True)
+    (p.root / ".git" / "info" / "exclude").write_text("*.out\n")
+    done = p.db.add_task("finished", "s", kind="experiment", tier="light", origin="user")
+    p.db.update_task(done, status="done")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (1.0, done))
+    waiting = p.db.add_task("waits", "s", kind="experiment", tier="light", origin="user")
+    p.db.update_task(waiting, status="waiting")
+    clean_run, clean = _run_worktree(p, done)
+    art_run, art = _run_worktree(p, done)
+    (art / "result.out").write_text("the figure")
+    (p.runs / str(art_run) / "result.json").write_text(json.dumps({"status": "done", "artifacts": [str(art / "result.out")]}))
+    _, live = _run_worktree(p, done, status="running")
+    _, open_ = _run_worktree(p, waiting)
+    _, dirty = _run_worktree(p, done)
+    (dirty / "README.md").write_text("edited, never committed")
+    _, recent = _run_worktree(p, done, ended_ago=600)
+    found = {w["path"] for w in worktree.run_worktrees(p)}
+    assert found == {w.resolve() for w in (clean, art, live, open_, dirty, recent)}, found
+    dry = {Path(r["path"]): r for r in worktree.sweep(p, dry_run=True)}
+    assert dry[clean.resolve()]["why"] is None and clean.exists(), "a dry run removed it"
+    res = {Path(r["path"]): r for r in worktree.sweep(p)}
+    assert res[clean.resolve()]["why"] is None and not clean.exists()
+    assert res[clean.resolve()]["run"] == clean_run and res[clean.resolve()]["task"] == done
+    assert res[art.resolve()]["why"] is None and not art.exists()
+    assert res[art.resolve()]["archived"]["files"] == 1 and archive.manifest(p, done)["files"][0]["path"] == "result.out"
+    assert "is still going" in res[live.resolve()]["why"] and res[live.resolve()]["held"]
+    assert f"task #{waiting} (waiting) is still open" in res[open_.resolve()]["why"]
+    assert "uncommitted changes" in res[dirty.resolve()]["why"]
+    assert "ended under 1 h ago" in res[recent.resolve()]["why"]
+    assert all(w.exists() for w in (live, open_, dirty, recent))
+    listed = _git_out(p.root, "worktree", "list")
+    assert str(clean) not in listed and str(art) not in listed and str(dirty) in listed
+    assert (p.runs / str(clean_run)).is_dir(), "the run directory itself stays"
+
+
+def test_the_end_of_run_sweep_removes_a_finished_runs_worktree_and_ttp_prune_lists_the_kept(env, monkeypatch, capsys):
+    import time as _t
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import cli
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("job", "s", kind="experiment", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    rid, wt = _run_worktree(p, tid, status="running")
+    d = Daemon(p.base)
+    assert wt.exists() and not d.prune_worktrees(every_s=0) == [] and wt.exists(), "a live run's worktree went"
+    cli.main(["prune", "demo", "--dry-run"])
+    out = capsys.readouterr().out
+    assert f"run {rid}'s worktree {wt.resolve()} (#{tid}) (running): kept: its run #{rid} is still going" in out, out
+    p.db.x("UPDATE runs SET status='done', ended=? WHERE id=?", (_t.time(), rid))
+    p.db.update_task(tid, status="done")
+    res = d.prune_worktrees(every_s=0)
+    assert not wt.exists() and [r["why"] for r in res if r.get("run") == rid] == [None]
+    assert str(wt) not in _git_out(p.root, "worktree", "list")
+    log = (p.logs / "daemon.log").read_text()
+    assert f"worktree {wt.resolve()} of run {rid} (task {tid}) removed" in log, log[-2000:]
+
+
 def _local_only_events(p):
     return p.db.q("SELECT text, task FROM events WHERE kind='local_only'")
 

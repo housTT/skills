@@ -103,13 +103,13 @@ def git_timeout(p: Project, scale: float = 1.0) -> float:
     return min(float(w.get("git_timeout_max_s") or 900), base * max(1.0, load) * scale)
 
 
-def _records(p: Project) -> dict[str, dict]:
-    """Path -> `git worktree list --porcelain`'s record of each worktree of the repository ({"path",
-    "branch", "locked": its reason ("" when it has none) or None, "prunable": bool}). Raises when git
-    fails or times out: an unknown record is no missing one."""
+def _records(p: Project, repo: Path | None = None) -> dict[str, dict]:
+    """Path -> `git worktree list --porcelain`'s record of each worktree of the repository (`repo`,
+    default the project's) ({"path", "branch", "locked": its reason ("" when it has none) or None,
+    "prunable": bool}). Raises when git fails or times out: an unknown record is no missing one."""
     out: dict[str, dict] = {}
     rec: dict | None = None
-    for line in _git(p.root, "worktree", "list", "--porcelain", timeout=git_timeout(p)).splitlines() + [""]:
+    for line in _git(repo or p.root, "worktree", "list", "--porcelain", timeout=git_timeout(p)).splitlines() + [""]:
         key, _, val = line.partition(" ")
         if key == "worktree":
             rec = {"path": val, "branch": "", "locked": None, "prunable": False}
@@ -130,9 +130,9 @@ def _record_of(records: dict[str, dict], path: Path) -> dict | None:
     return records.get(want) or records.get(str(path))
 
 
-def _registered(p: Project, path: Path) -> dict | None:
+def _registered(p: Project, path: Path, repo: Path | None = None) -> dict | None:
     """git's record of the worktree at `path` (see _records), or None when git has none there."""
-    return _record_of(_records(p), path)
+    return _record_of(_records(p, repo), path)
 
 
 def _whole(p: Project, path: Path, rec: dict, branch: str) -> bool:
@@ -169,15 +169,16 @@ def _whole(p: Project, path: Path, rec: dict, branch: str) -> bool:
         raise RuntimeError(f"worktree {path} left as it is: {e}") from e
 
 
-def _clear_partial(p: Project, path: Path, rec: dict | None) -> None:
+def _clear_partial(p: Project, path: Path, rec: dict | None, repo: Path | None = None) -> None:
     """Remove what an unfinished `git worktree add` left at `path` so it can be made again: a half-made
     registered worktree (`rec`, which _whole found half-made), or git's record of one whose directory is
     gone. A directory git does not know holding more than a `.git` file is never deleted: it is not
-    ours."""
+    ours. `repo`: the repository it belongs to (default the project's)."""
+    repo = repo or p.root
     if rec and not rec["prunable"]:
-        _git(p.root, "worktree", "remove", "--force", "--force", str(path), check=False, timeout=git_timeout(p))
-    _git(p.root, "worktree", "prune", check=False, timeout=git_timeout(p))
-    if path.is_dir() and not _registered(p, path):
+        _git(repo, "worktree", "remove", "--force", "--force", str(path), check=False, timeout=git_timeout(p))
+    _git(repo, "worktree", "prune", check=False, timeout=git_timeout(p))
+    if path.is_dir() and not _registered(p, path, repo):
         if any(c.name != ".git" for c in path.iterdir()):
             raise RuntimeError(f"{path} exists, is no worktree of this repository and is not empty")
         shutil.rmtree(path)
@@ -520,10 +521,89 @@ def remove(p: Project, task_id: int, force: bool = False) -> None:
     Ignored files go with it (sweep archives hand-off artifacts first). No --force: git itself then
     refuses a worktree with changes or with submodules, whose commits may live only in the worktree's
     own git directory. `force` only once its tracked changes are in a verified archived patch."""
-    path = p.worktrees / f"t{task_id}"
+    remove_path(p.root, p.worktrees / f"t{task_id}", force)
+
+
+def remove_path(repo: Path, path: Path, force: bool = False) -> None:
+    """remove() for the worktree at `path` of the repository `repo`, then `git worktree prune` there."""
     if path.exists():
-        _git(p.root, "worktree", "remove", *(["--force"] if force else []), str(path))
-    _git(p.root, "worktree", "prune", check=False)
+        _git(repo, "worktree", "remove", *(["--force"] if force else []), str(path))
+    _git(repo, "worktree", "prune", check=False)
+
+
+def _repo_of(path: Path) -> Path | None:
+    """The repository whose linked worktree is at `path`, read from its `.git` file (gitdir: <common
+    dir>/worktrees/<name>, whose commondir file names the common dir) without running git; None when
+    `path` holds no linked worktree of a non-bare repository."""
+    try:
+        text = (path / ".git").read_text()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gd = Path(text[len("gitdir:"):].strip())
+    gd = gd if gd.is_absolute() else path / gd
+    try:
+        common = (gd / (gd / "commondir").read_text().strip()).resolve()
+    except OSError:
+        common = gd.parent.parent.resolve()
+    return common.parent if common.name == ".git" else None
+
+
+def run_worktree_dirs(p: Project) -> list[Path]:
+    """Run directories' subfolders holding a `.git` file (state/runs/<id>/<name>/.git): the linked
+    worktrees workers made there, found by listing two levels without running git."""
+    if not p.runs.is_dir():
+        return []
+    runs = p.runs.resolve()
+    try:
+        dirs = [d.path for d in os.scandir(runs) if d.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+    out = []
+    for d in dirs:
+        try:
+            out += [Path(k.path) for k in os.scandir(d)
+                    if k.is_dir(follow_symlinks=False) and os.path.isfile(os.path.join(k.path, ".git"))]
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def run_worktrees(p: Project) -> list[dict]:
+    """The git worktrees inside run directories (state/runs/<run id>/...), which workers make for
+    themselves and which neither a task's end nor the task-worktree sweep knew of. Found from git's
+    records (`git worktree list`) of the project's repository and of each repository that a `.git`
+    file directly in a run directory's subfolder points to; nothing else is scanned. One whose
+    directory is gone is left to `git worktree prune`. Each is {"path", "repo", "run" (its runs row,
+    None when no run of this project owns the folder), "rec" (git's record, see _records)}; a
+    repository whose git fails is skipped."""
+    if not p.runs.is_dir():
+        return []
+    runs = p.runs.resolve()
+    repos = {p.root.resolve()} | {r for r in map(_repo_of, run_worktree_dirs(p)) if r is not None}
+    out = []
+    for repo in sorted(repos):
+        try:
+            recs = _records(p, repo)
+        except Exception:
+            continue
+        for rec in recs.values():
+            if rec["prunable"]:
+                continue
+            path = Path(rec["path"]).resolve()
+            try:
+                rel = path.relative_to(runs)
+            except ValueError:
+                continue
+            if len(rel.parts) < 2:
+                continue
+            name = rel.parts[0]
+            run = p.db.one("SELECT * FROM runs WHERE id=?", (int(name),)) if name.isdigit() else None
+            if run and run["dir"] and Path(run["dir"]).resolve() != runs / name:
+                run = None
+            out.append({"path": path, "repo": repo, "run": dict(run) if run else None, "rec": rec})
+    return sorted(out, key=lambda w: str(w["path"]))
 
 
 def keep_reason(path: Path) -> str | None:
@@ -762,10 +842,11 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
 FINISH_GRACE_S = 3600
 
 
-def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str | None:
-    """Why a finished task's worktree must stay untouched for now, or None."""
+def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Path | None = None) -> str | None:
+    """Why a finished task's worktree (or another worktree of the task, at `path`) must stay
+    untouched for now, or None."""
     from .push import running
-    path = (p.worktrees / f"t{task['id']}").resolve()
+    path = (path or p.worktrees / f"t{task['id']}").resolve()
     if any(Path(m.get("repo") or "/").resolve() == path for m in running(p)):
         return "a detached `ttp push` runs in it"
     user = needed_by(task, open_tasks)
@@ -776,6 +857,30 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str |
         return "the coordinator has not yet seen how it ended"
     if now - float(task["updated"] or now) < FINISH_GRACE_S and not review_over(p, task):
         return f"it ended under {FINISH_GRACE_S // 60} min ago; kept for a review"
+    return None
+
+
+def run_held(p: Project, w: dict, task: dict | None, open_tasks: list[dict], now: float,
+             older_than_s: float = 0) -> str | None:
+    """Why the worktree `w` in a run directory (see run_worktrees) must stay for now, or None: no run
+    of this project owns it, its run is still going, its task is still open, its run ended under
+    FINISH_GRACE_S (or `older_than_s`) ago, or the task's own worktree would be held (held_by)."""
+    from .db import TERMINAL_TASK_STATES
+    from .push import running
+    run = w["run"]
+    if run is None:
+        return "no run of this project owns its folder"
+    if run["status"] == "running" or not run["ended"]:
+        return f"its run #{run['id']} is still going"
+    if task and task["status"] not in TERMINAL_TASK_STATES:
+        return f"its task #{task['id']} ({task['status']}) is still open"
+    age, grace = now - float(run["ended"]), max(FINISH_GRACE_S, older_than_s)
+    if age < grace:
+        return f"its run #{run['id']} ended under {grace / 3600:g} h ago"
+    if task:
+        return held_by(p, task, open_tasks, now, path=w["path"])
+    if any(Path(m.get("repo") or "/").resolve() == w["path"] for m in running(p)):
+        return "a detached `ttp push` runs in it"
     return None
 
 
@@ -833,9 +938,12 @@ def _users(path: Path) -> list[int]:
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
           skip=lambda task: False, leftovers_max_mb: float | None = None, archive_max_mb: float | None = None,
           patch_tracked: bool = False, archive_limit: int | None = None, deadline: float | None = None,
-          reserve_bytes: float = 0, progress=lambda: None, dry_run: bool = False) -> list[dict]:
+          reserve_bytes: float = 0, progress=lambda: None, dry_run: bool = False,
+          skip_run=lambda w: False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run or process still
-    going: clear their build and cache directories, then remove each one whose removal loses nothing
+    going, and the worktrees workers made inside finished runs' directories (run_worktrees; reported
+    with `run` set, kept while run_held says so; `skip_run(w)` leaves one out): clear their build and
+    cache directories, then remove each one whose removal loses nothing
     (see keep_reason). A worktree that may still be wanted (see held_by: an unfinished task needs it,
     the coordinator has not seen the finish yet, or it ended under FINISH_GRACE_S ago and its review
     is not over) is left as it is, and reported with `held` set.
@@ -867,7 +975,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     import time
     from . import archive
     from .db import TERMINAL_TASK_STATES
-    if not p.worktrees.is_dir():
+    if not p.worktrees.is_dir() and not p.runs.is_dir():
         return []
     p.state.mkdir(parents=True, exist_ok=True)
     fd = os.open(p.state / "prune.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -890,26 +998,43 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         deferred = "archiving deferred to a later sweep (each daemon tick step archives at most one worktree)"
         open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
-        for path in sorted(p.worktrees.iterdir()):
+        targets: list[tuple[Path, dict | None, dict | None]] = []   # (path, task, run worktree or None)
+        for path in sorted(p.worktrees.iterdir()) if p.worktrees.is_dir() else []:
             m = re.fullmatch(r"t(\d+)", path.name)
             task = p.db.task(int(m.group(1))) if m else None
             if (not task or task["status"] not in TERMINAL_TASK_STATES
                     or now - float(task["updated"] or now) < older_than_s or skip(task)
                     or p.db.one("SELECT id FROM runs WHERE task=? AND status='running' LIMIT 1", (task["id"],))):
                 continue
-            if records is None:
-                try:
-                    records = _records(p)
-                except Exception:
-                    records = {}
-            rec = _record_of(records, path)
+            targets.append((path, task, None))
+        for w in run_worktrees(p):
+            tid = (w["run"] or {}).get("task")
+            if not skip_run(w):
+                targets.append((w["path"], p.db.task(tid) if tid else None, w))
+        for path, task, w in targets:
+            if w is not None:
+                rec = w["rec"]
+            else:
+                if records is None:
+                    try:
+                        records = _records(p)
+                    except Exception:
+                        records = {}
+                rec = _record_of(records, path)
             lock = rec["locked"] if rec else None
             half = lock is not None and lock.startswith(HARNESS_LOCKS) and not (path / ".git").is_file()
             if not half and not is_git(path):
                 continue
-            res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
-                   "updated": task["updated"], "cleared": []}
-            why = held_by(p, task, open_tasks, now)
+            if w is None:
+                res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
+                       "updated": task["updated"], "cleared": []}
+                why = held_by(p, task, open_tasks, now)
+            else:
+                run = w["run"] or {}
+                res = {"task": task["id"] if task else None, "run": run.get("id"), "path": str(path),
+                       "branch": rec["branch"] or (task or {}).get("branch"),
+                       "status": (task or run).get("status") or "?", "updated": run.get("ended"), "cleared": []}
+                why = run_held(p, w, task, open_tasks, now, older_than_s)
             users = [] if why else _users(path)
             if users:
                 why = f"process {users[0]} runs in it" + (f" (+{len(users) - 1} more)" if len(users) > 1 else "")
@@ -918,7 +1043,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 continue
             progress()
             try:
-                if not dry_run and archive.task_dir(p, task["id"]).is_dir():
+                if not dry_run and task and archive.task_dir(p, task["id"]).is_dir():
                     archive.recover(p, task["id"])
                 if lock is not None:
                     if not lock.startswith(HARNESS_LOCKS):
@@ -928,20 +1053,21 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                     res["unlocked"] = lock
                     if not dry_run:
                         if half:
-                            _clear_partial(p, path, rec)
+                            _clear_partial(p, path, rec, w["repo"] if w else None)
                         else:
-                            _git(p.root, "worktree", "unlock", str(path), timeout=git_timeout(p))
+                            _git(w["repo"] if w else p.root, "worktree", "unlock", str(path), timeout=git_timeout(p))
                     if half:
                         out.append({**res, "why": None, "half": True})
                         continue
                 entries = handoff_paths(p) if entries is None else entries
-                arts = handoff_artifacts(p, task["id"], path, entries=entries)
+                tid = task["id"] if task else None
+                arts = handoff_artifacts(p, tid, path, entries=entries)
                 res["cleared"] = [] if dry_run else clear_caches(path, names, keep=arts)
                 info = inspect(path)
                 why = info["why"]
                 others: list[str] = []
                 patch = None
-                if info["dirty"] == "tracked" and patch_tracked and task["status"] in ("done", "cancelled") \
+                if info["dirty"] == "tracked" and patch_tracked and task and task["status"] in ("done", "cancelled") \
                         and _git(path, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/heads", "refs/remotes",
                                  check=False).strip():
                     if not costly_ok():
@@ -951,7 +1077,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                     res["patched"] = info["tracked"]
                     untracked = _git(path, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
                     untracked = [u for u in untracked if u]
-                    arts += handoff_artifacts(p, task["id"], path, ignored=set(untracked), entries=entries)
+                    arts += handoff_artifacts(p, tid, path, ignored=set(untracked), entries=entries)
                     others = [u for u in untracked if not any(u == a or u.startswith(a + "/") for a in arts)]
                     why = None
                 elif info["dirty"] == "tracked":
@@ -961,10 +1087,11 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                            f"(disk.worktree_leftovers_max_mb)")
                 elif info["dirty"] == "untracked":
                     untracked = info["untracked"]
-                    arts += handoff_artifacts(p, task["id"], path, ignored=set(untracked), entries=entries)
+                    arts += handoff_artifacts(p, tid, path, ignored=set(untracked), entries=entries)
                     others = [u for u in untracked if not any(u == a or u.startswith(a + "/") for a in arts)]
                     why = None
-                    size, run = (_size(path, others), last_run_dir(p, task["id"])) if others else (0, None)
+                    home = p.runs / str(w["run"]["id"]) if w else last_run_dir(p, task["id"])
+                    size, run = (_size(path, others), home) if others else (0, None)
                     if others and size <= limit * 1e6 and run is not None:
                         res["moved"] = {"files": len(others), "bytes": size, "to": str(run / LEFTOVERS_DIR)}
                         if not dry_run:
@@ -973,6 +1100,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 if why is None:
                     others += [f for f in _small_logs(path) if f not in others and not any(
                         f == a or f.startswith(a + "/") for a in arts)]
+                if why is None and (arts or others or patch) and task is None:
+                    why = f"no task to archive its {len(arts) + len(others)} file(s) under"
                 if why is None and (arts or others or patch) and not costly_ok():
                     out.append({**res, "why": deferred, "deferred": True})
                     continue
@@ -998,7 +1127,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                     why = keep_reason(path)
                 res["why"] = why
                 if why is None and not dry_run:
-                    remove(p, task["id"], force=bool(patch))
+                    if w is not None:
+                        remove_path(w["repo"], path, force=bool(patch))
+                    else:
+                        remove(p, task["id"], force=bool(patch))
             except Exception as e:
                 res["why"] = f"error: {e}"[:300]
             out.append(res)

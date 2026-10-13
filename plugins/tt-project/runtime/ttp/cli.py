@@ -2674,7 +2674,8 @@ def set_when(db, tid: int, probe: str | None, p=None) -> str:
 
 
 def cmd_prune(a) -> None:
-    """One sweep over finished tasks' worktrees, with the daemon's checks: clear build and cache
+    """One sweep over finished tasks' worktrees and the worktrees workers left in finished runs'
+    directories (state/runs/<id>/...), with the daemon's checks: clear build and cache
     directories, archive hand-off artifacts and large untracked files (state/archive/tasks/<id>/),
     move small untracked leftovers to the task's last run directory, clear a stale `git worktree
     add` lock, and remove the worktree when nothing is lost. Branches stay. Prints each worktree's
@@ -2728,7 +2729,9 @@ def cmd_prune(a) -> None:
             moved += f"{'would save' if dry else 'saved'} its {len(r['patched'])} changed tracked file(s) as a verified patch; "
         if r.get("unlocked") is not None:
             moved += f"{'would clear' if dry else 'cleared'} its stale lock ({r['unlocked'] or 'no reason'}); "
-        print(f"#{r['task']} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
+        who = (f"run {r['run'] or '?'}'s worktree {r['path']}" + (f" (#{r['task']})" if r["task"] else "")
+               if "run" in r else f"#{r['task']}")
+        print(f"{who} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
                                                    + (r["branch"] or "?") + " kept"
                                                    if r["why"] is None else f"kept: {r['why']}") + cleared)
     if not res:
