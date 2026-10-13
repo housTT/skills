@@ -155,6 +155,13 @@ Each field's rules are in the section named; the table only lists them.
   cancelled, and a code task starts from the old task's branch. Replacing a task without
   `continues` leaves its dependents blocked. `continues` on a done task adds a follow-up instead:
   it takes over no dependents and a code task starts from the base branch.
+- Continue chains (`continues` and `continue:` follow-ups) are capped per lineage (`chains`: hops,
+  failed or no-progress hops in a row, dollars) and while their area is under `review_area_cap`.
+  The daemon queues a done hop's sole `continue:` follow-up itself when the hop made progress (new
+  commits or new metrics) and no cap applies: do not add it again. A refused hop (a
+  `continue_cap` event) needs a re-plan: narrow, change the approach, or stop and report what is
+  left. Only a task_add whose `reason` names what changed (a new approach, a rescoped spec, new
+  evidence), sent in a raised-effort turn, passes the cap.
 - A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
   `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
   without it `ttp push --own` refuses that branch. A rebase cannot fast-forward a branch: put "rebase" in its title.

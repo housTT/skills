@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, budgetkind, chaincap, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -831,6 +831,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"- [{tag}] {x[:RESEND_CHARS if RESEND_MARK in x else 500]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
+    for x in chaincap.notices(db):
+        lines.append(f"- [continue hop queued by the daemon (progress, under the chain caps): nothing to decide] "
+                     f"{x[:800]}")
     if not msg_ids and not event_ids and not rejected:
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
@@ -1159,11 +1162,12 @@ def _clock(ts: float, where=None) -> str:
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
-          turn: int | None = None, messages: list[int] | None = None) -> list[str]:
+          turn: int | None = None, messages: list[int] | None = None, high_effort: bool = False) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
-    that fails here stays approved for a retry, see _charter_approval).
+    that fails here stays approved for a retry, see _charter_approval). `high_effort`: a raised turn,
+    where a task_add's `reason` may take a continue chain past its cap (chaincap).
 
     A turn cut off before its database transaction commits is applied again from its output. Its
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
@@ -1201,13 +1205,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"duplicate of open task #{dup['id']}")
                 # Work this project already tried, shelved or landed (tried.py): a reworded title with
                 # the same parameters still matches; force passes only with the difference stated.
-                hit = tried.match(db, title, a.get("spec") or "", p, skip=a.get("continues"))
+                # A hop of a continue chain repeats its earlier hops' titles, not their work.
+                try:
+                    skip = {str(t["id"]) for t in chaincap.chain(db, int(a["continues"]))} \
+                        if a.get("continues") is not None else set()
+                except (TypeError, ValueError):
+                    skip = set()
+                skip.add(str(a.get("continues")))
+                hit = tried.match(db, title, a.get("spec") or "", p, skip=skip)
                 if hit and not (a.get("force") and tried.differs(a.get("spec") or "", hit)):
                     raise ValueError(tried.rejection(hit, p))
                 if hit:
                     notes.append(f"task_add {title[:80]!r}: forced past {tried.describe(hit, p)}")
                 if not a.get("force"):
-                    same = similar_task(db, title, a.get("spec") or "", skip=a.get("continues"))
+                    same = similar_task(db, title, a.get("spec") or "", skip=skip)
                     if same:
                         raise ValueError(f"near duplicate of task #{same['id']} ({same['status']}) "
                                          f"'{same['title'][:120]}': update or continue it; if this is new work, say "
@@ -1268,6 +1279,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"{head[:12]}: {clip(a.get('reason'), 200)}")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 followup = old if old and old["status"] == "done" else None
+                if old:   # a continue chain over its cap, or in an area under review_area_cap (chaincap)
+                    if past := chaincap.check_add(p, cfg, old["id"], a.get("reason"), high_effort):
+                        notes.append(past)
                 if followup:
                     # Done work is not taken over: the new task is a follow-up that starts fresh
                     # (a code task from the delivery branch tip, not the old branch).
@@ -1925,13 +1939,17 @@ def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     return (tj >= 0.7 and sj >= 0.45) or (tj >= 0.4 and sj >= 0.7)
 
 
+def _skips(skip: Any) -> set[str]:
+    return {str(x) for x in skip} if isinstance(skip, (set, list, tuple)) else {str(skip)}
+
+
 def similar_task(db, title: str, spec: str, skip: Any = None) -> dict | None:
     """An open task, or one done in the last SIMILAR_DONE_DAYS, that a new task_add would repeat.
-    Failed and cancelled ones may be redone; `skip` is the task the new one continues."""
+    Failed and cancelled ones may be redone; `skip` is the task the new one continues (or its lineage)."""
     since = time.time() - SIMILAR_DONE_DAYS * 86400
     for t in db.q("SELECT id, title, spec, status FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
                   "OR (status='done' AND COALESCE(updated, created, 0) >= ?) ORDER BY id DESC", (since,)):
-        if str(t["id"]) != str(skip) and looks_same(title, spec, t["title"] or "", t["spec"] or ""):
+        if str(t["id"]) not in _skips(skip) and looks_same(title, spec, t["title"] or "", t["spec"] or ""):
             return t
     return None
 
@@ -2217,6 +2235,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # An area whose reviews keep failing across stacks needs a re-plan, not another fix round.
     if any(r["kind"] == reviewcap.REVIEW_AREA_EVENT for r in rows):
         add(reviewcap.TRIGGER)
+    # A continue chain at its cap: another hop needs a reason that names what changed (chaincap).
+    if any(r["kind"] == chaincap.CAP_EVENT for r in rows):
+        add(chaincap.TRIGGER)
     # Holds that wait on nothing anyone will act on (anchors.py): the daemon raises each new set once.
     if any(r["kind"] == anchors.STALE_EVENT for r in rows):
         add(anchors.TRIGGER)

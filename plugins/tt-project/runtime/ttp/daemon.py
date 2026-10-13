@@ -38,6 +38,7 @@ from . import awake
 from . import budget as bud
 from . import budgetkind
 from . import cachettl
+from . import chaincap
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -2438,7 +2439,9 @@ class Daemon:
             return
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
-                               turn=r.get("id"), messages=note.get("messages") or [])
+                               turn=r.get("id"), messages=note.get("messages") or [],
+                               high_effort=bool(note.get("unblock")))
+        chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         if ids:
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
@@ -2972,10 +2975,19 @@ class Daemon:
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
-        routine = (review is not None and plain) or fix is not None
+        # A done hop whose only proposal is the next `continue:` hop, with progress and under the
+        # chain caps: the daemon queues it, and the next digest says so (chaincap).
+        hop = self._auto_continue(dict(task, **upd), fups) \
+            if new == "done" and not approval and not notes and sev == "normal" and not review and not fix else None
+        if hop:
+            folded.add(id(fups[0]))
+            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})."
+        routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
+        if hop:
+            chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
             data = json.dumps({"plain": True}) if outcome == "review" and plain else None
@@ -4812,13 +4824,21 @@ class Daemon:
                 live[key] = {"branch": b, "head": head, "ahead": ahead, "since": (told.get(key) or {}).get("since", now)}
                 if key not in told:
                     log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
+                    # A hop whose continuation the daemon queued: the next hop carries on from it, so
+                    # the notice goes to the next digest without a turn of its own (chaincap).
+                    folded = chaincap.auto_continued(db, t["id"])
                     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                          (now, f"task:{t['id']}", "local_only", "normal",
                           f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
                           f"{'' if ahead == 1 else 's'} ahead of every remote ({t['title']}). Nothing pushes it "
                           f"automatically: deliver it as the charter allows, or cancel the task if the work is "
                           f"not wanted. If it already landed as another commit (re-landed), a task records that "
-                          f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.", "queued", t["id"]))
+                          f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.",
+                          "handled" if folded else "queued", t["id"]))
+                    if folded:
+                        chaincap.add_notice(db, f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} "
+                                                f"commit{'' if ahead == 1 else 's'} ahead of every remote; its "
+                                                f"continuation carries on from it.")
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
 
@@ -7010,6 +7030,18 @@ class Daemon:
         info = _read_checks_pid(out)
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+
+    def _auto_continue(self, task: dict, fups: list[dict]) -> tuple[int, str] | None:
+        """chaincap.auto_hop for a done task whose only proposal is one `continue:` follow-up; None
+        otherwise or when it cannot be read (the coordinator decides then)."""
+        if len(fups) != 1 or upstream.is_note(fups[0]) or fups[0].get("start_after") or fups[0].get("start_when") \
+                or not chaincap.CONT_TITLE.match(str(fups[0]["title"])):
+            return None
+        try:
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0])
+        except Exception:
+            log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return None
 
     def _review_area(self, review: dict) -> dict | None:
         """reviewcap.area for a review failing now; None when it cannot be read (a fix still follows)."""

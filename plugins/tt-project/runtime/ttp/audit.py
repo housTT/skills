@@ -8,7 +8,8 @@ the project could have saved. Model-free; the review grades it.
 - worker runs that failed (a reboot, sleep, lost network or a resume is not a failure), runs lost
   to those causes apart (one a later run resumed kept its work: not counted as lost), tasks run
   again after a failed attempt, and tasks that continue an earlier one (`continues:<id>`), with the
-  spend of each;
+  spend of each; and per continue chain (chaincap), its hops and spend, the hops the daemon
+  queued and the hops a cap refused or a reason passed;
 - coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py), with the saving;
@@ -29,7 +30,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, ends, turngate, unblock
+from . import budget, chaincap, ends, turngate, unblock
 from .db import DB, continues_id
 from .project import Project
 
@@ -312,6 +313,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"tasks continued from an earlier one: {len(cont)}: " + ", ".join(
             f"#{t['id']} {_short(t['title'], 50)} continues #{t['of']} (${t['of_usd']:.2f} + ${t['usd']:.2f})"
             for t in cont[:TOP]) + _more(cont))
+    if chains := chaincap.audit_line(db, since, TOP):
+        out.append(chains)
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else

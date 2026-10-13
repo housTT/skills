@@ -42124,6 +42124,136 @@ def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
     assert reviewcap.area(p, p.config(), p.db.task(s4["id"])) is None
 
 
+def _cont(title):
+    return {"status": "done", "summary": f"{title}: part done",
+            "followups": [{"title": f"continue: {title}", "spec": f"Carry on with {title} from its branch."}]}
+
+
+def _hop(env, p, tid, files, result):
+    """Run queued task `tid`: commit `files` (name -> lines) on its branch, then hand off `result`."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    for name, lines in files.items():
+        (path / name).write_text("".join(f"{tid} {i}\n" for i in range(lines)))
+    if files:
+        _git_out(path, "add", ".")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f"hop {tid}")
+    p.db.update_task(tid, status="running", branch=branch)
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+
+
+def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordinator_turn(env):
+    p = make(env)
+    from ttp import audit, chaincap
+    from ttp import coordinator as coord
+    root, _, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and not reviews
+    assert done["status"] == "handled" and f"Continue hop #{hop1['id']} queued by the daemon (1 new commit)" in done["text"]
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "a hop with progress woke the coordinator"
+    assert [t["id"] for t in chaincap.chain(p.db, hop1["id"])] == [root, hop1["id"]]
+    # The next hop commits too: queued again, though its title repeats the earlier hops'.
+    _hop(env, p, hop1["id"], {"b.py": 5}, _cont("feature, part 2"))
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop1["id"],))
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'")
+    digest = coord.digest(p, {}, [], [])
+    assert "continue hop queued by the daemon" in digest and f"Continue hop #{hop2['id']}" in digest
+    # A local-only notice for a hop the daemon continued is folded into the digest too.
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t1 = p.db.task(hop1["id"])
+    d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
+    lo = p.db.one("SELECT * FROM events WHERE kind='local_only'")
+    assert lo["status"] == "handled" and any("exists only on this machine" in n for n in chaincap.notices(p.db))
+    chaincap.clear_notices(p.db, time.time())
+    assert chaincap.notices(p.db) == []
+    # A hop with no new commit and no new evidence goes to the coordinator.
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() + 2, hop2["id"]))
+    _hop(env, p, hop2["id"], {}, _cont("feature, part 3"))
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (hop2["id"],)), "a hop without progress was continued"
+    assert p.db.one("SELECT status FROM events WHERE task=? AND kind='task_done'", (hop2["id"],))["status"] == "queued"
+    assert p.db.one("SELECT status FROM events WHERE task=? AND kind='followup_proposed'", (hop2["id"],))["status"] == "queued"
+    # New passing evidence is progress: a metric that is new or changed against the previous hop's.
+    ch = chaincap.chain(p.db, hop2["id"])
+    assert chaincap.progress(p, ch, 2) == ""
+    p.db.update_task(hop2["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
+    assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == "new evidence: passed"
+    p.db.update_task(hop1["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
+    assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == ""
+    line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
+    assert f"#{root} feature: 2 hops to #{hop2['id']}" in line and "2 auto" in line
+
+
+def _chain(p, n, status="done"):
+    """A root code task and `n` `continue:` hops after it, all `status`: their ids."""
+    ids = [p.db.add_task("parser", "s", kind="code", origin="coordinator")]
+    for i in range(n):
+        ids.append(p.db.add_task(f"continue: parser {i}", "s", kind="code", parent=ids[-1]))
+    for i in ids:
+        p.db.update_task(i, status=status)
+    return ids
+
+
+def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_what_changed(env):
+    p = make(env)
+    from ttp import audit, chaincap
+    from ttp import coordinator as coord
+    p.set_config("chains.max_hops", 2)
+    root, _, tip = _chain(p, 2)
+    act = {"type": "task_add", "title": "continue: parser, next", "spec": "carry on", "kind": "code", "continues": tip}
+    problems = coord.apply(p, [act])
+    assert any("refused" in x and "chains.max_hops is 2" in x for x in problems), problems
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tip,))
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (chaincap.CAP_EVENT,))
+    assert ev["status"] == "queued" and json.loads(ev["data"])["root"] == root and "Re-plan" in ev["text"]
+    labels, _ = coord.effort_triggers(p.db, p.config(), [ev["id"]], None)
+    assert chaincap.TRIGGER in labels
+    coord.apply(p, [act])
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.CAP_EVENT,))) == 1, "one event per lineage and hop"
+    why = "new approach: parse the header once instead of per line"
+    problems = coord.apply(p, [dict(act, reason=why)])
+    assert any("only in a high-effort turn" in x for x in problems), "a routine turn passed the cap"
+    problems = coord.apply(p, [dict(act, reason="keep going, it is almost there")], high_effort=True)
+    assert any("does not name what changed" in x for x in problems)
+    assert coord.apply(p, [dict(act, reason=why)], high_effort=True) == []
+    (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
+    assert p.db.one("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))
+    assert any("past its cap" in x for x in p.db.kv(coord.NOTES_KEY))
+    line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
+    assert f"#{root} parser: 3 hops to #{new['id']}" in line and "1 refused" in line and "1 overridden" in line
+    # Dollars and failed hops in a row cap a lineage too.
+    p.set_config("chains.max_hops", 0)
+    ids = _chain(p, 2)
+    p.db.x("UPDATE tasks SET spent_usd=25 WHERE id IN (?,?)", ids[:2])
+    assert "chains.max_usd is $40" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-1]))
+    ids = _chain(p, 2, status="failed")
+    assert "2 failed or no-progress hops" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-1]))
+    assert chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-2])) == ""
+
+
+def test_a_continue_hop_in_an_area_under_review_area_cap_is_refused(env):
+    p = make(env)
+    from ttp import chaincap, reviewcap
+    from ttp import coordinator as coord
+    root, tip = _chain(p, 1)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "task:9", reviewcap.REVIEW_AREA_EVENT, "normal", "area", json.dumps({"root": root, "tasks": [root]}),
+            "handled"))
+    problems = coord.apply(p, [{"type": "task_add", "title": "continue: parser again", "spec": "s", "kind": "code",
+                                "continues": tip}])
+    assert any(f"review area of #{root}" in x for x in problems), problems
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tip,))
+    assert p.db.one("SELECT 1 FROM events WHERE kind=?", (chaincap.CAP_EVENT,))
+    # Past the review window the area no longer holds it.
+    p.db.x("UPDATE events SET ts=? WHERE kind=?", (time.time() - reviewcap.AREA_WINDOW_S - 60, reviewcap.REVIEW_AREA_EVENT))
+    assert chaincap.refusal(p, p.config(), chaincap.chain(p.db, tip)) == ""
+
+
 def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_the_changes_overlap(env):
     """A lineage with one failed review was capped because 12 failures of a separate lineage had the
     same main file. Then the plain main-file fallback came back at 2 failures in the review's own

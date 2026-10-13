@@ -225,6 +225,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # from the daemon (sweep_reviews), which only queues reviews and never closes a task.
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
                "area_fail_cap": 3, "blocked_long_h": 12, "sweep_after_s": 1800},
+    # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
+    # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
+    # review.area_fail_cap, is refused unless its `reason` names what changed in a high-effort turn.
+    # With auto, a done hop with progress whose only proposal is the next `continue:` hop gets it
+    # queued by the daemon, with no coordinator turn.
+    "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
