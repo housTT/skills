@@ -26,7 +26,11 @@ The code runs as written on that profile, as source or as a destination.
 - `✅`: the entry test passes on this profile, either in a CI workflow that runs it on this
   profile (name the workflow file and job) or in a passing run recorded in `run.json`
   `entry_test_passes`. Every op the test launches is then covered. A dedicated op test on this
-  profile with the same variant also counts.
+  profile with the same variant also counts. A passing `source:tracy` run is such a recorded run;
+  when no CI workflow runs the test on this profile, the evidence says so and names the local run
+  ("No CI workflow runs the entry test on P100; it passed on a local P100 under Tracy (<pass
+  line>, <date>) ..."). It replaces a `⚠️` that only said no passing run was found
+  (measured-source.md, step 5).
 - `⚠️`: the profile is reached only through a branch the entry test does not run on this profile,
   or no passing run exists for this profile.
 - Branch-dependent rows (a reshard that only P150 needs) are `n/a` with 0 launches on the other

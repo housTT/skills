@@ -4,19 +4,25 @@ Static rows whose op code appears in the measured run become `static+measured`. 
 the measured run shows become `measured` rows, inserted after the static row that ran just before
 their first launch, so the table stays in execution order. Launch counts are divided by the number
 of inferences in the measured window. Re-running replaces earlier measured rows.
+
+With --entry-pass the entry test passed in the measured run, so the source profile has a recorded
+passing run (references/target-status.md): it is added to run.json `entry_test_passes` and every
+source `⚠️` row is decided again from what the run launched.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import json
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    LAUNCH_PROFILES, NOT_TRACED, TEST_TARGETS, op_table_columns, read_csv, run_targets, write_csv,
+    ALWAYS, LAUNCH_PROFILES, NOT_TRACED, TARGET_LABELS, TEST_TARGETS, op_table_columns, read_csv, run_targets,
+    write_csv,
 )
 
 
@@ -83,28 +89,86 @@ def merge(rows: list[dict], measured: list[dict], source: str, destinations: lis
     return out
 
 
+def entry_pass_record(previous: dict, source: str, result: str, date: str) -> dict:
+    """entry_test_passes with this local run added; a CI record already there is kept."""
+    record = {k: v for k, v in previous.items() if k == "ci"}
+    record.update({"by": f"source:tracy on a local {source} device", "date": date, "result": result})
+    return record
+
+
+def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, inferences: int,
+                           entry_passes: dict) -> list[str]:
+    """Upgrade source `⚠️` rows the passing entry test covers; return warnings for `❌` rows it ran.
+
+    Only `⚠️` is revisited: it is what a profile gets while no passing run is recorded. `✅`, `❌`
+    and `n/a` rest on other evidence and stay.
+    """
+    label = TARGET_LABELS[source]
+    where = (f"in CI ({entry_passes['ci']}) and " if "ci" in entry_passes
+             else f"No CI workflow runs the entry test on {label}; it passed ")
+    passed = (f"{where}on a local {label} under Tracy ({entry_passes['result']}, {entry_passes['date']})")
+    counts = collections.Counter(m["op_code"] for m in measured if m["op_type"] == "tt_dnn_device")
+    static_launches: collections.Counter = collections.Counter()
+    for row in rows:
+        if row["origin"] != "measured":
+            static_launches[row["op_code"]] += int(row[f"{source}:launches"] or 0)
+    warnings = []
+    for row in rows:
+        status_col, evidence_col = f"{source}:status", f"{source}:evidence"
+        code = row["op_code"]
+        ran = counts[code] / inferences
+        if row["origin"] == "measured":
+            continue
+        if row[status_col] == "❌" and ran:
+            warnings.append(f"row {row['id']}: {source} status is ❌ but the passing entry test launched {code}")
+        if row[status_col] != "⚠️":
+            continue
+        if not ran:
+            row[evidence_col] = f"{passed}, but launched no {code}; this branch did not run there."
+        elif row["launch_condition"].strip() != ALWAYS and ran < static_launches[code]:
+            # Tracy names the op code, not the call site, so a skipped conditional launch is not
+            # attributable to one row.
+            row[evidence_col] = (f"{passed}; it launched {code} {ran:g} of {static_launches[code]} potential times"
+                                 " per inference, so whether this conditional launch ran is not known.")
+        else:
+            row[status_col] = "✅"
+            row[evidence_col] = f"{passed}, launching {code} {ran:g}x per inference."
+    return warnings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
     parser.add_argument("measured_ops", type=pathlib.Path)
     parser.add_argument("--inferences", type=int, default=1,
                         help="forward passes inside the measured window (1 for a warm signposted window)")
+    parser.add_argument("--entry-pass", metavar="RESULT",
+                        help="the entry test passed in this run; RESULT is its pass line (for example the PCC)")
+    parser.add_argument("--date", default=datetime.date.today().isoformat(), help="date of the measured run")
     args = parser.parse_args()
     run_path = args.run_dir / "run.json"
     run = json.loads(run_path.read_text(encoding="utf-8"))
     op_path = args.run_dir / "op_table.csv"
     source, destinations = run_targets(run)
+    measured = read_csv(args.measured_ops)
     try:
-        merged = merge(read_csv(op_path), read_csv(args.measured_ops), source, destinations,
-                       args.measured_ops.name, args.inferences)
+        merged = merge(read_csv(op_path), measured, source, destinations, args.measured_ops.name, args.inferences)
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
+    if args.entry_pass:
+        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source,
+                                                     args.entry_pass, args.date)
+        for warning in decide_source_statuses(merged, measured, source, args.inferences, run["entry_test_passes"]):
+            print(f"WARNING: {warning}")
     write_csv(op_path, op_table_columns(source, destinations), merged)
     run["measured_ops"] = str(args.measured_ops)
     run["measured_inferences"] = args.inferences
-    run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    run_path.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"{len(merged)} rows, {sum(r['origin'] == 'measured' for r in merged)} measured-only")
+    if args.entry_pass:
+        statuses = collections.Counter(r[f"{source}:status"] for r in merged)
+        print(f"{source} statuses: " + ", ".join(f"{s} {n}" for s, n in statuses.items()))
     return 0
 
 

@@ -182,6 +182,15 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
             warnings.append(f"op_table.csv {column}: rows {', '.join(long)} exceed {MAX_EVIDENCE_CHARS} characters; "
                             "keep the decisive fact and its <file>:<line>")
 
+    if run.get("entry_test_passes"):
+        # A recorded pass covers every op the entry test launches (target-status.md).
+        stale = [r["id"] for r in ops if r["origin"] == "static+measured" and r[f"{source}:status"] == "⚠️"
+                 and r["launch_condition"].strip() == ALWAYS]
+        if stale:
+            warnings.append(f"op_table.csv {source}:status: rows {', '.join(stale)} ran in the measured entry test,"
+                            " which run.json records as passing, but are ⚠️; decide them again"
+                            " (merge_measured.py --entry-pass)")
+
     op_ids = {r["id"] for r in ops}
     for n, row in enumerate(rows["port_blockers.csv"], 1):
         if row["affected_ids"].strip() == "all":

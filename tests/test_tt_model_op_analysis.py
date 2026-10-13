@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.6.2"
+    assert claude["version"] == codex["version"] == "0.6.3"
 
 
 def test_shared_setup_is_step_by_step():
@@ -1098,6 +1098,54 @@ def test_merge_divides_by_inferences(tmp_path):
     bad = measured_seq(tmp_path / "m3.csv", ["A", "X", "X", "X"])
     r = run_script("merge_measured.py", str(run), str(bad), "--inferences", "2")
     assert r.returncode == 2 and "not divisible" in r.stdout
+
+
+def no_pass_row(i, code, **kw):
+    return op_row(i, 1, op_code=code, **{"p150:status": "⚠️", "p150:evidence": "no passing P150 run recorded"}, **kw)
+
+
+def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
+    rows = [no_pass_row(1, "A"), no_pass_row(2, "M", launch_condition="skipped when the address is reused"),
+            no_pass_row(3, "M", launch_condition="skipped when the address is reused"), no_pass_row(4, "B"),
+            op_row(5, 1, op_code="C", **{"p150:status": "❌", "p150:evidence": "TT_FATAL at x.cpp:1"})]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 5, 1)])
+    m = measured_seq(tmp_path / "m.csv", ["A", "M", "C"])
+    r = run_script("merge_measured.py", str(run), str(m), "--entry-pass", "PCC 0.99", "--date", "2026-10-13")
+    assert r.returncode == 0, r.stdout
+    assert "row 5: p150 status is ❌ but the passing entry test launched C" in r.stdout
+    got = {x["id"]: (x["p150:status"], x["p150:evidence"]) for x in read(run / "op_table.csv")}
+    assert got["1"] == ("✅", "No CI workflow runs the entry test on P150; it passed on a local P150 under Tracy"
+                               " (PCC 0.99, 2026-10-13), launching A 1x per inference.")
+    # one of two conditional launches ran; which one is not attributable
+    assert got["2"][0] == got["3"][0] == "⚠️" and "1 of 2 potential times" in got["2"][1]
+    assert got["4"][0] == "⚠️" and "launched no B" in got["4"][1]
+    assert got["5"] == ("❌", "TT_FATAL at x.cpp:1")
+    passes = json.loads((run / "run.json").read_text())["entry_test_passes"]
+    assert passes == {"by": "source:tracy on a local p150 device", "date": "2026-10-13", "result": "PCC 0.99"}
+    v = validate(run)
+    assert v.returncode == 0 and "WARNING" not in v.stdout, v.stdout
+
+
+def test_merge_entry_pass_keeps_ci_record(tmp_path):
+    run = make_static_run(tmp_path, [no_pass_row(1, "A")], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"ci": "perf.yaml: p150"}
+    (run / "run.json").write_text(json.dumps(data))
+    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99")
+    assert json.loads((run / "run.json").read_text())["entry_test_passes"]["ci"] == "perf.yaml: p150"
+    assert "in CI (perf.yaml: p150) and on a local P150" in read(run / "op_table.csv")[0]["p150:evidence"]
+
+
+def test_merge_without_entry_pass_leaves_statuses_and_validator_warns(tmp_path):
+    run = make_static_run(tmp_path, [no_pass_row(1, "A")], [trace_row(1, 1, 1)])
+    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A"])))
+    assert read(run / "op_table.csv")[0]["p150:status"] == "⚠️"
+    assert "WARNING" not in validate(run).stdout
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"by": "user", "date": "2026-10-13", "result": "pass"}
+    (run / "run.json").write_text(json.dumps(data))
+    v = validate(run)
+    assert v.returncode == 0 and "rows 1 ran in the measured entry test" in v.stdout, v.stdout
 
 
 def test_merge_with_blackhole_destination_validates(tmp_path):

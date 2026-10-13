@@ -35,12 +35,27 @@ not set row statuses.
    in Tracy become `static+measured`; op codes only Tracy shows become `measured` rows after the
    static row that ran just before them, with launches per inference, `call_site` and
    `grid_dependency` `not traced`, and no launch count on any destination.
+   When the entry test passed, add `--entry-pass "<pass line>"` (for example `PCC 0.990856`) and
+   `--date <YYYY-MM-DD>` of the run. The pass is then a recorded run (`target-status.md`): the
+   script adds it to `run.json` `entry_test_passes` and decides every source `⚠️` row again, since
+   that `⚠️` only said no passing run was found. A row the test launched becomes `✅`; a
+   conditional row whose op code ran fewer times than its static rows allow stays `⚠️` (Tracy does
+   not say which call site ran); a row it never launched stays `⚠️`. Each gets an evidence text
+   saying that no CI workflow runs the entry test on this profile and that it passed on a local
+   device under Tracy, with the pass line and date. `✅`, `❌` and `n/a` rows keep their status; a
+   `❌` row the test launched is printed as a warning to resolve by hand.
 6. For each `measured` row, fill every destination's status per `target-status.md` (kernel-op
    lookup) and, for Quasar targets, its `<t>:tests` column, then rerun `validate_static.py`.
 7. `python3 <plugin-root>/scripts/kernel_ops.py <run dir> --measured <run dir>/measured_ops.csv`
    shows static and measured launches per op code side by side. Explain every difference in
    `summary.md` (conditional moves, runtime reroutes, ops the static trace missed). Do not change
    static rows to match the measurement.
+8. After `--entry-pass`, rewrite every sentence in `summary.md` (and any port-blocker or host-op
+   text) that still says no passing source run exists or that the entry test is unverified on the
+   source: state that no CI workflow runs it on this profile and that it passed on a local device
+   under Tracy, with the pass line, and recount the source statuses from `kernel_ops.py`. Rerun
+   `validate_static.py`; it warns about measured, unconditional source rows still `⚠️` while
+   `entry_test_passes` is set.
 
 When Tracy cannot run or the test fails (no device, profiler build missing, test failure), record
 it with `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:tracy failed --note "<reason>"`

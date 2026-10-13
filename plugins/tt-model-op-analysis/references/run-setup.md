@@ -164,7 +164,9 @@ Root: current working directory unless the user names one; never inside the tt-m
 
 `entry_test_passes`, for a Blackhole or Wormhole source: where the entry test is shown to pass,
 either `{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}`
-for a run the user reports. It backs the `✅` rule in `target-status.md`.
+for a run the user reports or a passing Tracy run (`merge_measured.py --entry-pass` writes
+`"by": "source:tracy on a local <source> device"` and keeps a `ci` entry). It backs the `✅` rule in
+`target-status.md`.
 
 Measurements add: `measured_ops` (path of `measured_ops.csv`, set by `merge_measured.py`),
 `measured_inferences`, `ops_csv` (the raw Tracy report), `window` (`warm` or `cold`),
