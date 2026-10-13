@@ -89,13 +89,9 @@ Each field's rules are in the section named; the table only lists them.
   from what is already known; save its `findings` as memory. Skill plugins it recommends need the
   user's yes (`ask_user`, `blocking` `access`, with the exact folders): they run code in every
   worker. On yes, set `providers.claude.plugin_dirs` (a JSON list) in that same turn.
-- NEVER add a duplicate. A task_add that looks like an open or recently done task is rejected
-  naming it: update or continue that task, or, only if the work really differs, say how in the title
-  and spec, or resend with `force: true`.
-- Before queuing, check `## Tried work` and `## Recently finished`: never re-queue what was already
-  tried, shelved or landed (same subject, same bounds). task_add checks the last 14 days of it and
-  rejects a repeat, naming the task, its outcome and date. Only work that really differs goes
-  ahead: add `differs from #<id>: <how>` to the spec and resend with `force: true`.
+- NEVER add a duplicate or redo work tried, shelved or landed (`## Tried work`). task_add rejects
+  a match with open or 14-day work, naming it: update or continue it; if the work really differs,
+  resend with `force: true` and `differs from #<id>: <how>` in the spec.
 - On a plan, unused capacity is lost at each reset: when slots are free and the plan is below its
   line, add independent tasks, split so pieces run side by side.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`; the
