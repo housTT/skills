@@ -52,10 +52,12 @@ Run from the tt-metal checkout. Prefer its `python_env/bin/python` when present 
 the build; otherwise use the interpreter already proven to import that checkout's `ttnn`. Record the
 interpreter and working directory.
 
-Use `wormhole_b0`, `blackhole`, `quasar` or `trizor` as reported by discovery. For Quasar, inspect
-the pinned `scripts/run_safe_pytest.sh` and the kernel-op tests for the required NoC API setting; set
-`TT_METAL_QUASAR_NOC_API_VERSION=1` when that pinned source says TTsim does not implement the
-default API.
+Use `wormhole_b0`, `blackhole`, `quasar` or `trizor` as reported by discovery. Simulator
+workarounds change between tt-metal commits, so take them from the pinned
+`scripts/run_safe_pytest.sh` (`git show <sha>:scripts/run_safe_pytest.sh`), never from memory or an
+earlier run: add each variable it exports for TTsim (for example `TT_METAL_DISABLE_SFPLOADMACRO`),
+and for Quasar set `TT_METAL_QUASAR_NOC_API_VERSION=1` only when that script or the kernel-op tests
+say TTsim does not implement the default NoC API.
 
 Test-specific variables are evidence, not global defaults. Inspect the tests, their conftest,
 documented invocation and an applicable checked-in launch/task configuration. Add variables such as

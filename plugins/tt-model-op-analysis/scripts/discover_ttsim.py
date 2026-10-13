@@ -57,12 +57,11 @@ def _recommended_run(arch, build_dir, library, tt_metal_home):
         "TT_METAL_SIMULATOR": str(library),
         "TT_METAL_SIMULATOR_HOME": str(build_dir),
         "TT_METAL_SLOW_DISPATCH_MODE": "1",
-        "TT_METAL_DISABLE_SFPLOADMACRO": "1",
         "ARCH_NAME": arch,
         "CHIP_ARCH": arch,
     }
-    if arch == "quasar":
-        environment["TT_METAL_QUASAR_NOC_API_VERSION"] = "1"
+    # Simulator workarounds (SFPLOADMACRO, Quasar NoC API) change between tt-metal commits; the
+    # pinned scripts/run_safe_pytest.sh decides them, not this baseline (references/ttsim.md).
     return {
         "working_directory": str(tt_metal),
         "python": str(python) if python.is_file() else None,

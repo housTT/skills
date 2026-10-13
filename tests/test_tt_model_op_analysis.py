@@ -887,6 +887,20 @@ def test_sheet_spec_summary_wrapped_bullets_and_later_tables(tmp_path):
     assert ["x", 1] in info and ["skip", "me"] not in info
 
 
+def test_discover_ttsim_baseline_has_no_commit_specific_workarounds(tmp_path):
+    ttsim, tt_metal = tmp_path / "ttsim", tmp_path / "tt-metal"
+    (ttsim / "src" / "_out" / "release_qsr").mkdir(parents=True)
+    (ttsim / "make.py").write_text("")
+    tt_metal.mkdir()
+    result = run_script("discover_ttsim.py", "--ttsim-home", str(ttsim), "--tt-metal-home", str(tt_metal))
+    assert result.returncode == 0, result.stderr
+    quasar = next(a for a in json.loads(result.stdout)["checkouts"][0]["architectures"] if a["arch"] == "quasar")
+    environment = quasar["recommended_run"]["environment"]
+    assert environment["ARCH_NAME"] == "quasar" and environment["TT_METAL_SLOW_DISPATCH_MODE"] == "1"
+    assert "TT_METAL_DISABLE_SFPLOADMACRO" not in environment
+    assert "TT_METAL_QUASAR_NOC_API_VERSION" not in environment
+
+
 def test_kernel_tests_apply_keeps_quoted_or_in_evidence():
     sys.path.insert(0, str(SCRIPTS))
     from opa_schema import split_evidence
