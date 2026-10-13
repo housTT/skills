@@ -57399,3 +57399,121 @@ def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
     d._tick_ended()
     assert not (p.logs / dm.TICK_STACKS).exists()
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+
+
+def _verified_checks_repo(env, tmp_path, monkeypatch):
+    """A worktree whose project checks are one unscoped check and one scoped to src/**, each counting
+    its runs, with a push target at the first commit so the scope compares with it."""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    whole, scoped = tmp_path / "whole", tmp_path / "scoped"
+    p.set_config("delivery.push_checks", [f"sh -c 'echo x >> {whole}'",
+                                          {"run": f"sh -c 'echo x >> {scoped}'", "if_changed": "src/**"}])
+    p.set_config("delivery.push_branch", "origin/proj")
+    subprocess.run([*git, "remote", "add", "origin", str(tmp_path / "none.git")], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/proj", "HEAD"], check=True)
+    ran = lambda f: len(f.read_text().splitlines()) if f.exists() else 0
+    return p, repo, run, git, lambda: (ran(whole), ran(scoped))
+
+
+def _commit_in(git, repo, name, text):
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    subprocess.run([*git, "add", name], check=True)
+    subprocess.run([*git, "commit", "-qm", name], check=True)
+    return subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+
+def test_a_continuation_checks_only_the_commits_after_its_inherited_marker(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, push, verified
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    first = p.db.add_task("first hop", kind="code")
+    nxt = p.db.add_task("next hop", kind="code", labels=[f"continues:{first}"])
+    monkeypatch.setenv("TTP_TASK", str(first))
+    marked = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    cli.main(["checks"])
+    assert counts() == (1, 1)
+    assert verified.own(p.db, first, "checks")["sha"] == marked
+    # The next hop inherits the marker: its commit touches nothing under src/**, so the scoped check is
+    # verified through the marker; the unscoped one covers the whole tree and runs again.
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    monkeypatch.setenv("TTP_RUN_ID", "42")
+    head = _commit_in(git, repo, "notes.txt", "notes\n")
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 1), out
+    assert f"verified through {marked[:12]} (#{first}'s checks)" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["verified_through"] == marked and len(rec["verified"]) == 1
+    # Its own marker carries the verified check on, so the hop after it can skip it too.
+    assert len(verified.own(p.db, nxt, "checks")["commands"]) == 2
+    # The push gate never reads the marker: the scoped check still applies to the pushed head.
+    todo, _ = push.applicable(repo, head, push.check_list(p.config()["delivery"]["push_checks"]),
+                              lambda m: None, "origin/proj")
+    assert len(todo) == 2
+    # A commit after the marker under src/** runs the scoped check again.
+    _commit_in(git, repo, "src/b.py", "b = 1\n")
+    cli.main(["checks"])
+    assert counts() == (3, 2)
+
+
+def test_a_rewritten_history_falls_back_to_full_verification(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, prompts, verified
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    first = p.db.add_task("first hop", kind="code")
+    nxt = p.db.add_task("next hop", kind="code", labels=[f"continues:{first}"])
+    monkeypatch.setenv("TTP_TASK", str(first))
+    marked = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    cli.main(["checks"])
+    assert counts() == (1, 1)
+    line = prompts.verified_line(p, p.db.task(nxt), str(repo))
+    assert f"verified through {marked[:12]}" in line and f"git log {marked[:12]}..HEAD" in line
+    # The marker's commit is rewritten away (an amend, as a rebase would): not an ancestor any more.
+    (repo / "src/a.py").write_text("a = 2\n")
+    subprocess.run([*git, "commit", "-qa", "--amend", "-m", "src/a.py"], check=True)
+    _commit_in(git, repo, "notes.txt", "notes\n")
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 2), "a marker that is no longer an ancestor still skipped a check"
+    assert "no longer an ancestor" in out and "full verification" in out
+    assert "verified" not in json.loads((run / "checks.json").read_text())
+    line = prompts.verified_line(p, p.db.task(nxt), str(repo))
+    assert "no longer an ancestor" in line and "Verify the whole change" in line
+    # A task that continues nothing gets no marker line.
+    assert prompts.verified_line(p, p.db.task(first), str(repo)) == ""
+    assert verified.scope(p.db, p.db.task(first), repo, marked) is None
+
+
+def test_a_passing_review_marks_the_reviewed_head_for_the_tasks_that_continue_it(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, verified
+    from ttp.daemon import Daemon
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "root", repo)
+    d = Daemon(p.base)
+    d.p = p
+    code = p.db.add_task("first hop", kind="code")
+    review = p.db.add_task(f"Review #{code}: first hop", kind="review", depends_on=[code],
+                           labels=[f"auto_review:{code}"])
+    reviewed = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    extra = {}
+    d._mark_verified(p.db.task(review), {"entries": [{"branch": "b", "head": reviewed}]}, extra)
+    assert extra["verified_through"] == reviewed
+    assert verified.own(p.db, code, "review") == {**verified.own(p.db, code, "review"), "sha": reviewed,
+                                                   "review": review, "kind": "review"}
+    # A fix that continues the review inherits the reviewed head: its review covers only what came after.
+    fix = p.db.add_task("fix", kind="code", labels=[f"continues:{review}"])
+    head = _commit_in(git, repo, "src/b.py", "b = 1\n")
+    line = d._verified_review_line(p.db.task(fix), head)
+    assert f"verified through {reviewed[:12]} (#{code}'s review)" in line
+    assert f"git log {reviewed[:12]}..{head[:12]}" in line and "push checks still run in full" in line
+    # Rewritten: the review covers the whole change.
+    subprocess.run([*git, "reset", "-q", "--hard", "HEAD~2"], check=True)
+    head = _commit_in(git, repo, "src/c.py", "c = 1\n")
+    assert "review the whole change" in d._verified_review_line(p.db.task(fix), head)
+    # A code task with no lineage has no marker line; the hand-off line shows the marker.
+    assert d._verified_review_line(p.db.task(code), head) == ""
+    p.db.update_task(review, status="done", result=json.dumps({"summary": "passed", **extra}))
+    assert f"verified through {reviewed[:12]}" in coord.digest(p, {}, [], []).split("## Recently finished")[1]
