@@ -5725,7 +5725,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     from ttp import screen as scr
     db = p.db
     scr.mute(db, "watcher:hw", "tray dropped", 24, why="known; handled by the hardware team " + "x" * 300)
-    _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 900) for i in range(10)]
+    # Past the coordinator's memory budget, so the memory_budget section is shown.
+    _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 1300) for i in range(10)]
               + [("fact", "OLD-FACT")])
     coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
     from ttp import machine_ledger as ml
