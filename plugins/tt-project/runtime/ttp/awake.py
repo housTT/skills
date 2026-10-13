@@ -28,6 +28,9 @@ KV = "idle_sleep"           # what `ttp status` and the web app show: {"daemon",
 POWER_EVERY_S = 15.0
 MODES = ("auto", "on", "off")
 LID_LINE = "the lid is closed: work pauses while the Mac sleeps"
+BATTERY = "on battery power"   # IdleHold's why when work wants the hold but the Mac is not on AC power
+BATTERY_LINE = f"idle sleep: not held: {BATTERY} (keep-awake holds only on AC power, so work pauses if the Mac sleeps)"
+LID_BATTERY_LINE = f"the lid is closed {BATTERY}: work pauses while the Mac sleeps (keep-awake holds only on AC power)"
 
 
 def mode(cfg: dict) -> str:
@@ -109,7 +112,7 @@ class IdleHold:
         work = has_work()
         self._lid_closed = bool(work) and self._lid_sleeps()
         if work and not why and not self._on_ac():
-            why = "on battery power"
+            why = BATTERY
         if not work or why:
             self._stop()
             self._show(held=False, why=why if work else "")
@@ -176,7 +179,14 @@ def line(state: dict | None, daemon_pid: int | None) -> str:
     if not state or not daemon_pid or state.get("daemon") != daemon_pid:
         return ""
     if state.get("lid_closed"):
-        return LID_LINE
+        return LID_BATTERY_LINE if state.get("why") == BATTERY else LID_LINE
     if state.get("held"):
         return f"idle sleep: held while there is work (caffeinate pid {state.get('pid')})"
+    if state.get("why") == BATTERY:
+        return BATTERY_LINE
     return f"idle sleep: not held: {state['why']}" if state.get("why") else ""
+
+
+def pause_line(text: str) -> bool:
+    """`text` (from line()) says that work pauses now: the lid is closed and the Mac sleeps."""
+    return text in (LID_LINE, LID_BATTERY_LINE)

@@ -43743,7 +43743,8 @@ def test_closed_lid_that_sleeps_the_mac_is_recorded_while_there_is_work(env, lid
     h, power, shown = _idle_hold(ac=ac, lid=lid)
     h.update({}, lambda: True)
     assert bool(shown and shown[-1] and shown[-1].get("lid_closed")) is says
-    assert (awake.line(shown[-1], 777) == awake.LID_LINE) is says
+    assert awake.pause_line(awake.line(shown[-1], 777)) is says
+    assert ("battery" in awake.line(shown[-1], 777)) is (says and not ac), "a lid closed on battery says so"
     assert [c.argv for c in _FakeCaffeinate.started] == ([["caffeinate", "-i", "-s", "-w", "777"]] if ac else []), \
         "the lid changes what status says, not what is held"
     h.update({}, lambda: False)
@@ -43818,7 +43819,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     p.db.set_kv("daemon", {"pid": pid, "host": p.db.kv("daemon")["host"], "started": time.time()})
     p.db.set_kv(awake.KV, {"daemon": pid, "held": False, "pid": None, "why": "on battery power"})
     assert "idle sleep: not held: on battery power" in status_text(p)
-    assert web.health(p, p.db)["idle_sleep"] == "idle sleep: not held: on battery power"
+    assert web.health(p, p.db)["idle_sleep"] == awake.BATTERY_LINE
     p.db.set_kv(awake.KV, {"daemon": pid + 1, "held": True, "pid": 5, "why": ""})
     assert "idle sleep" not in status_text(p), "another daemon's leftover record is not shown"
 
@@ -43843,6 +43844,59 @@ def test_closed_lid_says_work_pauses_in_status_and_web_instead_of_just_woke(env)
     assert h["idle_sleep"] == awake.LID_LINE, "with a run working and nothing held, the sleep line says it"
     p.db.set_kv(awake.KV, {"daemon": pid, "held": True, "pid": 5, "why": ""})
     assert "lid is closed" not in status_text(p), "it clears once the lid opens"
+
+
+def test_battery_power_is_named_as_why_keep_awake_is_not_held(env):
+    from ttp import awake
+    h, power, shown = _idle_hold(ac=False)
+    h.update({}, lambda: True)
+    assert _FakeCaffeinate.started == [] and shown[-1]["why"] == awake.BATTERY
+    assert awake.line(shown[-1], 777) == awake.BATTERY_LINE
+    assert "AC power" in awake.BATTERY_LINE and not awake.pause_line(awake.BATTERY_LINE), \
+        "an open lid on battery works until the Mac sleeps"
+    power["lid"] = {"closed": True, "causes_sleep": True}
+    h._fresh()
+    h.update({}, lambda: True)
+    assert awake.line(shown[-1], 777) == awake.LID_BATTERY_LINE and awake.pause_line(awake.LID_BATTERY_LINE)
+    assert "battery" in awake.LID_BATTERY_LINE and "battery" not in awake.LID_LINE
+    assert awake.pause_line(awake.LID_LINE) and not awake.pause_line("")
+
+
+def test_closed_lid_on_battery_pauses_work_in_web_and_status(env):
+    p = make(env)
+    from ttp import awake, web
+    from ttp.cli import status_text
+    pid = os.getpid()
+    p.db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": time.time()})
+    p.db.set_kv("settle_until", time.time() + 200)
+    p.db.set_kv(awake.KV, {"daemon": pid, "held": False, "pid": None, "why": awake.BATTERY, "lid_closed": True})
+    text = status_text(p)
+    assert text.count(awake.LID_BATTERY_LINE) == 1 and "just woke" not in text, text
+    h = web.health(p, p.db)
+    assert awake.LID_BATTERY_LINE in h["why_idle"] and h["idle_sleep"] == ""
+    p.db.set_kv(awake.KV, {"daemon": pid, "held": False, "pid": None, "why": awake.BATTERY})
+    h = web.health(p, p.db)
+    assert h["idle_sleep"] == awake.BATTERY_LINE and awake.BATTERY_LINE not in h["why_idle"]
+
+
+@pytest.mark.parametrize("state,says,not_says", [
+    ({"held": False, "why": "on battery power"}, "not held because the Mac was on battery power:", "closed lid"),
+    ({"held": False, "why": "on battery power", "lid_closed": True}, "on battery power and the lid was closed",
+     "closed lid"),
+    ({"held": False, "why": "off by config (runner.prevent_idle_sleep)"},
+     "not held: off by config (runner.prevent_idle_sleep)", "battery"),
+    ({"held": True, "why": "", "lid_closed": True}, "not a closed lid", "battery"),
+    (None, "not a closed lid", "battery"),
+])
+def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state, says, not_says):
+    p = make(env)
+    from ttp import awake
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.set_kv(awake.KV, state and {"daemon": os.getpid(), "pid": None, **state})
+    _slept(d, 1000)
+    [al] = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='host_slept'")
+    assert says in al["text"] and not_says not in al["text"], al["text"]
 
 
 def test_idle_sleep_config_key_is_known_and_checked(env):

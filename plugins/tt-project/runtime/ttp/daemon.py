@@ -1194,8 +1194,8 @@ class Daemon:
                  (woke, "host", "host_slept", "normal", _sleep_text(data), json.dumps(data), "record"))
         self.alert("host_slept",
                    f"{hostname()} slept for {slept / 60:.0f} min and the project stood still meanwhile"
-                   f"{f' (runs {_ids(runs)} paused)' if runs else ''}. Keep-awake stops idle and maintenance sleep, "
-                   f"not a closed lid. To keep working the project needs one of: the lid open, power "
+                   f"{f' (runs {_ids(runs)} paused)' if runs else ''}. {_sleep_cause(db.kv(awake.KV))} "
+                   f"To keep working the project needs one of: the lid open, power "
                    f"plus an external display (clamshell mode), or an always-on host.",
                    "low", every_s=86400)
 
@@ -7353,6 +7353,19 @@ def _resolves(host: str) -> bool:
     t.start()
     t.join(REACH_TIMEOUT_S)
     return bool(ok)
+
+
+def _sleep_cause(state: dict | None) -> str:
+    """Why keep-awake did not stop a sleep, from the awake.KV record made before it (_check_sleep runs
+    before the tick's IdleHold.update, so the record still shows the state the host slept in)."""
+    state = state or {}
+    why = state.get("why") or ""
+    if why == awake.BATTERY:
+        lid = " and the lid was closed" if state.get("lid_closed") else ""
+        return f"Keep-awake was not held because the Mac was on battery power{lid}: it holds only on AC power."
+    if why:
+        return f"Keep-awake was not held: {why}."
+    return "Keep-awake stops idle and maintenance sleep, not a closed lid."
 
 
 def _sleep_text(d: dict) -> str:

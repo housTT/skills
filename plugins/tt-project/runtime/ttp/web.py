@@ -355,7 +355,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         stops.append("no new starts near the plan line: " + "; ".join(g.get("reasons") or []))
     settle = float(db.kv("settle_until", 0) or 0)
     sleep_line = awake.line(db.kv(awake.KV), (db.kv("daemon", {}) or {}).get("pid")) if alive else ""
-    if sleep_line == awake.LID_LINE:
+    if awake.pause_line(sleep_line):
         stops.append(sleep_line)   # says why, where the wake line below would only say that it slept
     elif settle > now and alive:
         stops.append(f"the host just woke from sleep; new work starts at {at(settle, now, tz)} if it stays awake")
@@ -434,7 +434,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY), tz),
-        "idle_sleep": "" if sleep_line == awake.LID_LINE and (held or not running) else sleep_line,   # said once
+        "idle_sleep": "" if awake.pause_line(sleep_line) and (held or not running) else sleep_line,   # said once
         "release": release.line(p, db, cfg),
         "runtime": runtime_receipt(p, db, alive, now, tz),
         "schedules_broken": sched.broken_line(db),
