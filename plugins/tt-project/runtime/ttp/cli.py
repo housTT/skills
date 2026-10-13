@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -367,7 +368,7 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True).stdout.strip()
 
 
-SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit `ttp setup` installed this runtime from
+SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit (or content hash) `ttp setup` installed this runtime from
 
 
 def _checkout_commit(root: Path) -> str:
@@ -395,11 +396,28 @@ def recorded_commit(runtime: Path) -> str:
         return "unknown"
 
 
+def content_hash(runtime: Path) -> str:
+    """'sha-<12 hex>' over the sorted relative paths and bytes of the files under `runtime` (no
+    __pycache__, *.pyc or SOURCE_COMMIT): the identity of a runtime installed from no git checkout."""
+    h = hashlib.sha256()
+    for f in sorted(runtime.rglob("*"), key=lambda x: x.relative_to(runtime).as_posix()):
+        rel = f.relative_to(runtime)
+        if "__pycache__" in rel.parts or f.suffix == ".pyc" or rel.as_posix() == f"ttp/{SOURCE_FILE}" \
+                or not f.is_file():
+            continue
+        data = f.read_bytes()
+        h.update(f"{rel.as_posix()}\0{len(data)}\0".encode() + data)
+    return "sha-" + h.hexdigest()[:12]
+
+
 def source_commit() -> str:
-    """The git commit this runtime came from: recorded at install, else read from the plugin checkout."""
+    """The git commit this runtime came from: recorded at install, else read from the plugin checkout,
+    else (a plugin cache or archive, no git) a content hash of the runtime."""
     got = recorded_commit(RUNTIME)
     if got == "unknown" and (PLUGIN_ROOT / "template").is_dir():   # a harness copy is not the plugin
         got = _checkout_commit(PLUGIN_ROOT)
+        if got == "unknown":
+            got = content_hash(RUNTIME)
     return got
 
 

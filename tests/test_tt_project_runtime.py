@@ -11175,8 +11175,10 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
         return subprocess.run([str(tmp_path / "bin" / "ttp"), "--version"], capture_output=True, text=True,
                               timeout=60).stdout.strip()
 
-    out, got = setup()                                   # not a git checkout
-    assert got == "unknown" and f"ttp {__version__} (unknown) installed" in out
+    out, got = setup()                                   # not a git checkout: a content hash of runtime/
+    assert re.fullmatch(r"sha-[0-9a-f]{12}", got) and f"ttp {__version__} ({got}) installed" in out
+    assert version() == f"ttp {__version__} ({got})"
+    assert setup()[1] == got                             # stable across installs of the same files
     subprocess.run(["git", "init", "-q", str(plugin)], check=True)
     _git_out(plugin, "add", "-A")
     _git_out(plugin, *ident, "commit", "-qm", "one")
@@ -11311,6 +11313,43 @@ def test_ship_runtime_never_replaces_a_newer_or_equal_remote_install(env, monkey
         assert shipped[0].startswith("rm -rf") and shipped[-1].endswith("bin/ttp setup >/dev/null")
     else:
         assert launcher == "~/.tt-project/lib/current/bin/ttp" and not shipped
+
+
+def test_a_runtime_from_no_git_checkout_gets_a_stable_content_hash_its_consumers_accept(env, tmp_path):
+    """A plugin installed from a cache or archive records 'sha-<12 hex>' over runtime/'s files, not
+    'unknown': a receipt with it is verified, `ttp deployed` matches it, and a finish task that targeted
+    it counts as landed."""
+    import shutil
+    from ttp import cli, identity, overview, release
+    rt = tmp_path / "runtime"
+    shutil.copytree(RUNTIME, rt, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "SOURCE_COMMIT"))
+    h = cli.content_hash(rt)
+    assert re.fullmatch(r"sha-[0-9a-f]{12}", h)
+    (rt / "ttp" / "__pycache__").mkdir(exist_ok=True)
+    (rt / "ttp" / "__pycache__" / "x.cpython.pyc").write_bytes(b"compiled")
+    (rt / "ttp" / "SOURCE_COMMIT").write_text(h + "\n")
+    assert cli.content_hash(rt) == h                     # bytecode and the recorded identity do not count
+    (rt / "ttp" / "new.py").write_text("")
+    assert cli.content_hash(rt) != h                     # a new file does
+    (rt / "ttp" / "new.py").unlink()
+    (rt / "ttp" / "__init__.py").write_text((rt / "ttp" / "__init__.py").read_text() + "# edited\n")
+    edited = cli.content_hash(rt)
+    assert edited != h                                   # and so does an edit
+    # identity: a receipt with a content hash is verified
+    rec = identity.capture(mod=_fake_runtime(tmp_path / "rcpt", "9.9.1", commit=h))
+    assert rec["provenance"] == "verified" and rec["commit"] == h, rec
+    # `ttp deployed`: the hash is the deploy's commit; a runtime with other files is not this deploy
+    _deploy_lib("0.5.0", commit=h)
+    _, a = _deploy_project(tmp_path, "alpha", "0.5.0", commit=h)
+    r = overview.deployed()
+    assert r["rc"] == 0 and r["commit"] == h, r["text"]
+    assert overview.deployed(target="0.5.0", commit=edited)["rc"] == 1
+    a.close()
+    # release.landed: a finish task targeting a hashed release landed once the harness runs it
+    p = make(env)
+    tid = p.db.add_task("Finish", f"merge it\n\nTarget release: tt-project 0.5.0 ({h})\n", kind="harness")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert release.landed(p.db, tid, "0.5.0", h) and not release.landed(p.db, tid, "0.5.0", edited)
 
 
 def test_version_shows_the_source_commit(env, capsys):
