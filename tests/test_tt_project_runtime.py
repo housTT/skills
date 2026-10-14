@@ -20639,9 +20639,11 @@ def test_worker_digest_counts_each_policy_separator_and_stays_within_its_budget(
 
 
 
-def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_cap(env, monkeypatch):
+def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_cap(env, monkeypatch, tmp_path):
     """A large charter and memory still give a worker prompt (system plus per-task rules, not the
-    spec) of at most 28k chars for a code task and 24k for a question, every restriction verbatim."""
+    spec) of at most 28k chars for a code task and 24k for a question, every restriction verbatim.
+    The prompt names the test's temp folder several times; it is measured with a fixed 64-char stand-in
+    for it (a typical pytest temp path), so the size does not depend on the host, user or run number."""
     from ttp import machines
     from ttp.prompts import charter_restrictions, worker_prompt
     p = make(env)
@@ -20658,8 +20660,8 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     for kind, cap in (("code", 28_000), ("question", 24_000)):
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
-        assert spec in prompt
-        size = len(prompt) - len(spec)
+        assert spec in prompt and str(tmp_path) in prompt
+        size = len(prompt.replace(str(tmp_path), "T" * 64)) - len(spec)
         assert size <= cap, (kind, size)
         assert "\n" + charter_restrictions(charter) + "\n" in prompt
         for r in rules:
