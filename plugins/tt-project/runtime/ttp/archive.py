@@ -187,8 +187,9 @@ def _write_new(path: Path, data: bytes) -> None:
 def _check_blob(f: Path, e: dict, progress=lambda: None) -> None:
     """Raise Conflict unless `f` is a regular file with the entry's size and sha256."""
     if f.is_symlink() or not f.is_file() or f.stat().st_size != e.get("size") or sha256(f, progress) != e.get("sha256"):
-        raise Conflict(f"{f} does not hold {e.get('path')} (sha256 {str(e.get('sha256'))[:12]}); "
-                       f"nothing overwritten, the worktree is kept")
+        # The outcome first: callers cut the reason, and a state path can be long (macOS temp dirs).
+        raise Conflict(f"nothing overwritten, the worktree is kept: {f} does not hold {e.get('path')} "
+                       f"(sha256 {str(e.get('sha256'))[:12]})")
 
 
 def _check_tar(f: Path, entries: list[dict], progress=lambda: None) -> None:
@@ -206,7 +207,7 @@ def _check_tar(f: Path, entries: list[dict], progress=lambda: None) -> None:
                         h.update(block)
                 ok = h.hexdigest() == e["sha256"]
             if not ok:
-                raise Conflict(f"{f} does not hold {e['path']} as listed; the worktree is kept")
+                raise Conflict(f"nothing overwritten, the worktree is kept: {f} does not hold {e['path']} as listed")
 
 
 def _same_fs(a: Path, b: Path) -> bool:

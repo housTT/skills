@@ -294,7 +294,9 @@ def _short_tmp():
         base = tempfile.mkdtemp(prefix="ts", dir=os.environ.get("TTP_TEST_SHORT_TMP_ROOT") or "/tmp")
     except OSError:   # a sandbox that refuses /tmp: the default temp root
         base = tempfile.mkdtemp(prefix="ts")
-    yield base
+    # Named without links, as shorttmp.root() names it: macOS /tmp is a link to /private/tmp, and tests
+    # compare paths under the root with this one.
+    yield os.path.realpath(base)
     shutil.rmtree(base, ignore_errors=True)
 
 
@@ -15429,6 +15431,43 @@ def test_an_archive_path_holding_other_content_is_never_overwritten(env, monkeyp
     import inspect
     code = inspect.getsource(archive)
     assert "os.replace(" not in code and "durable_write(" not in code and code.count("os.rename(") == 1
+
+
+def test_an_archive_conflict_reason_survives_a_long_state_path(tmp_path):
+    """A sweep cuts an error to 300 characters; under a long state path (macOS temp dirs) the path
+    filled them and the reason lost 'nothing overwritten'. The outcome comes first."""
+    from ttp import archive
+    deep = tmp_path.joinpath(*["d" * 60] * 5)
+    deep.mkdir(parents=True)
+    f = deep / archive.blob("ab" * 32)
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"something else")
+    with pytest.raises(archive.Conflict) as e:
+        archive._check_blob(f, {"path": "model.out", "size": 5, "sha256": "cd" * 32})
+    assert "nothing overwritten, the worktree is kept" in f"error: {e.value}"[:300]
+
+
+@pytest.mark.parametrize("dst", ["link-to-file", "dangling-link", "through-linked-dir"])
+def test_archive_placement_never_writes_through_a_link(tmp_path, dst):
+    """Write-once placement under a linked path (macOS /var -> /private/var): a link at the
+    destination is refused, never followed, and a linked parent folder still never replaces a file."""
+    from ttp import archive
+    src, kept = tmp_path / "src.bin", tmp_path / "kept.bin"
+    src.write_bytes(b"new")
+    kept.write_bytes(b"old")
+    if dst == "through-linked-dir":
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "obj").write_bytes(b"old")
+        (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+        target, kept = tmp_path / "linked" / "obj", real / "obj"
+    else:
+        target = tmp_path / "obj"
+        target.symlink_to(kept if dst == "link-to-file" else tmp_path / "absent")
+    with pytest.raises(FileExistsError):
+        archive._place(src, target)
+    assert src.read_bytes() == b"new" and kept.read_bytes() == b"old"
+    assert not (tmp_path / "absent").exists()
 
 
 def test_big_artifacts_are_copied_across_filesystems_and_renamed_without_hard_links(env, monkeypatch):
@@ -35089,6 +35128,7 @@ def test_an_orphan_queued_marker_is_cleared_by_the_probe_and_after_a_restart_or_
 def test_a_sandboxed_probe_never_calls_live_host_checks_killed(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, detach, push, runner
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "pid_ns", lambda: "pid:[host]")   # macOS has none to record
     monkeypatch.setattr(push, "_boxed", lambda: True)
     started = tmp_path / "started"
     cli.main(["checks", "--detach", "--", "sh", "-c", f"touch {started}; sleep 30"])
@@ -55522,7 +55562,9 @@ def test_budget_change_never_shows_the_account_in_clear(env, monkeypatch):
     assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash(ACCT_BILLED)
 
 
-@pytest.mark.parametrize("queued", [False, True], ids=["direct", "daemon-queued"])
+@pytest.mark.parametrize("queued", [False, pytest.param(True, marks=pytest.mark.skipif(
+    sys.platform != "linux", reason="a launcher finds itself boxed only by its Linux PID namespace or cgroup "
+    "(/proc); other hosts are never boxed and take the direct path"))], ids=["direct", "daemon-queued"])
 def test_detached_checks_temp_survives_worker_cleanup(env, tmp_path, monkeypatch, queued):
     from ttp import cli, detach, push, runner
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -55649,15 +55691,32 @@ def test_foreground_checks_keep_worker_temporary_environment(env, tmp_path, monk
 
 
 def test_sandboxed_detached_checks_without_daemon_refused_before_launch(env, tmp_path, monkeypatch, capsys):
-    from ttp import cli
+    from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.delenv("TTP_PROJECT")
+    monkeypatch.setattr(push, "pid_ns", lambda: "pid:[host]")   # a PID namespace on every OS (macOS has none)
     monkeypatch.setenv("TTP_PIDNS", "pid:[disposable-command]")
     with pytest.raises(SystemExit) as refused:
         cli.main(["checks", "--detach", "--", "true"])
     assert refused.value.code == 2
     assert "need a project daemon" in capsys.readouterr().err
     assert not (run / cli.CHECKS_PID).exists() and not (run / cli.CHECKS_TMP).exists()
+
+
+def test_detached_checks_start_directly_where_there_is_no_pid_namespace(env, tmp_path, monkeypatch, capsys):
+    """macOS has no /proc: no PID namespace or cgroup to tell a sandbox by, so a launcher is never
+    boxed, even with a run's markers set, and starts its checks itself instead of queueing them."""
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "pid_ns", lambda: None)
+    monkeypatch.setattr(push, "cgroup", lambda: None)
+    monkeypatch.setenv("TTP_PIDNS", "pid:[run]")
+    monkeypatch.setenv("TTP_CGROUP", "0::/run")
+    assert push._boxed() is False
+    _detached_checks(run, capsys, "true")
+    assert not list((p.state / detach.QUEUE).glob("*.json")), "queued for a daemon instead of started"
+    assert _wait_precheck(run) == "0" and cli._read_checks_pid(run)["pidns"] is None
+    assert cli._checks_result(run) == 0
 
 
 @pytest.mark.parametrize('linked', ['run', 'ancestor', 'lock'])
@@ -55771,9 +55830,10 @@ def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys
 
 @pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
 def test_check_output_queued_checks_after_restart_without_run_env(env, tmp_path, monkeypatch, capsys, run_env):
-    from ttp import cli, detach, shorttmp
+    from ttp import cli, detach, push, shorttmp
     from ttp.daemon import Daemon
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, 'pid_ns', lambda: 'pid:[host]')   # a PID namespace on every OS (macOS has none)
     monkeypatch.setenv('TTP_PIDNS', 'disposable-command')
     cli.main(['checks', '--detach', '--', _check_output_paths_command()])
     assert 'queued' in capsys.readouterr().out
