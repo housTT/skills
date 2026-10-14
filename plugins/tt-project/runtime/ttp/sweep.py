@@ -276,7 +276,9 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
         prev = state.get("items") or {}
         if not holdloops.flagged(db) and all(_carries(i, state, outs, now) and not loop(db, i, prev.get(i["key"]))
                                              for i in live):
-            return None   # nothing a sweep would ask for: every item keeps a valid, not-yet-due outcome
+            # Every item keeps a valid, not-yet-due outcome: only a pending signal calls for a sweep.
+            sigs = _signals(db, state, live, now)
+            return "; ".join(sigs)[:300] if sigs else None
         return f"every {every / 3600:g}h"
     if since < min(every, _cfg(cfg, "blocker_sweep_min_gap_h", MIN_GAP_H) * 3600):
         return None
@@ -498,7 +500,7 @@ def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
         for n, batch in enumerate(batches):
             payload = json.dumps({**data, "items": [i["key"] for i in batch], "snapshot": batch})
             text = (f"Blocker sweep {data.get('sweep', 0)}: {len(batch)} stuck item(s) in this batch. "
-                    "Record one `sweep` outcome for each.")
+                    "Record one `sweep` outcome for each item not marked CARRIED.")
             if n == 0:
                 db.x("UPDATE events SET data=?, text=? WHERE id=?", (payload, text, event_id))
             else:

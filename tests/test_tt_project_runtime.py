@@ -58351,3 +58351,23 @@ def test_the_blocker_sweep_timing_keys_are_known_config_keys():
     for key in ("blocker_sweep_h", "blocker_sweep_min_gap_h", "review_backlog_h"):
         assert unknown_key_hint(f"coordinator.{key}") is None, key
     assert unknown_key_hint("coordinator.blocker_sweep_hh")
+
+
+def test_blocker_sweep_interval_with_every_item_carried_still_starts_on_a_pending_signal(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    a = db.add_task("waits on a repair")
+    db.update_task(a, status="blocked", blocked_reason="r")
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": a, "outcome": "still_blocked", "until_probe": "test -e /x",
+                            "start_after": "2d"}]) == []
+    assert sweep.due(db, cfg, now + 7 * 3600) is None
+    db.set_kv(sweep.SIGNAL_KEY, [{"ts": now + 3600, "why": "ask #5 resolved"}])
+    assert sweep.due(db, cfg, now + 3 * 3600) == "ask #5 resolved"
+    assert sweep.due(db, cfg, now + 7 * 3600) == "ask #5 resolved"
+    eid = sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    sweep.prepare(db, eid, cfg, now)
+    assert "for each item not marked CARRIED" in db.one("SELECT text FROM events WHERE id=?", (eid,))["text"]

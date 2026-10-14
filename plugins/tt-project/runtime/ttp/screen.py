@@ -649,8 +649,8 @@ def mute_ages(m: dict, now: float | None = None) -> list[str]:
 
 
 def expire_mutes(db: DB, now: float | None = None, where: Any = None) -> list[dict]:
-    """End the mutes whose time is up, queuing one summary observation event for each. Clock times
-    are in the zone of `where` (the project; None is UTC)."""
+    """End the mutes whose time is up, recording one summary observation event for each (queued only
+    when observations were muted). Clock times are in the zone of `where` (the project; None is UTC)."""
     now = time.time() if now is None else now
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
@@ -668,7 +668,7 @@ def expire_mutes(db: DB, now: float | None = None, where: Any = None) -> list[di
 def end_mute(db: DB, source: str, match: str, probe: str, why: str, now: float | None = None,
              where: Any = None) -> dict | None:
     """End the active mute of `source` and `match` whose `end_when` is still `probe` (it passed),
-    queuing its one summary event with `why`; None when no such mute is left."""
+    recording its one summary event with `why` as handled; None when no such mute is left."""
     now = time.time() if now is None else now
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
