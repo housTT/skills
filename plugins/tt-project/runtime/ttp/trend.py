@@ -6,7 +6,9 @@ A chain is a task with its `continues:` successors, fix and re-review tasks (rev
 `parent`, so a plan that spawned many follow-ups does not join them all). Each run's hand-off may carry
 `metrics` {name: value}; numeric values (a number, or a number and a unit such as "12.5 ms") form one
 series per name, oldest first, with each point's run, time in the project's home zone and delta.
-A series needs at least two points: a chain without one gets no trend.
+Hashes and ids are not metrics: a value that looks like a commit hash, or a name such as
+reviewed_head, pushed_sha or task_id, is skipped. A series has one unit: points with another unit are
+dropped. A series needs at least two points: a chain without one gets no trend.
 """
 from __future__ import annotations
 
@@ -23,7 +25,9 @@ LOOKBACK_S = 14 * 86400   # tasks this recent are searched for chain links
 MAX_POINTS = 30           # the latest points of a series
 MAX_SERIES = 4            # the series with the most points
 MAX_CACHE = 5000
-NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([A-Za-z%µ][\w%/µ.]*)?\s*$")
+NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([A-Za-z%µ][A-Za-z%µ/]{0,11})?\s*$")
+HEX = re.compile(r"^[0-9a-fA-F]+$")
+ID_NAME = re.compile(r"^(reviewed_head|pushed|rebased_)|commit|(^|_)(sha|head|id)$|_range$", re.I)
 
 _cache: dict[int, list] = {}   # ended run id -> its numeric metrics; a hand-off never changes after
 
@@ -35,6 +39,9 @@ def numeric(value) -> tuple[float, str] | None:
     if isinstance(value, (int, float)):
         return (float(value), "") if value == value else None
     if isinstance(value, str) and (m := NUMBER.match(value)):
+        compact = value.strip()
+        if m.group(2) and HEX.match(compact) or 7 <= len(compact) <= 40 and HEX.match(compact) and not compact.isdigit():
+            return None   # a commit hash such as 4ea0610c2d90 or 1e5abc, not a number with a unit
         return float(m.group(1)), m.group(2) or ""
     return None
 
@@ -46,7 +53,7 @@ def metrics_of(result: dict) -> list[tuple[str, float, str]]:
         return []
     out = []
     for name, v in m.items():
-        if (n := numeric(v)) is not None:
+        if not ID_NAME.search(str(name)) and (n := numeric(v)) is not None:
             out.append((str(name)[:60], n[0], n[1][:20]))
     return out
 
@@ -100,7 +107,8 @@ def trend(db: DB, chain: list[int], where, runs: list[dict] | None = None) -> li
         seen_tasks.update([r["task"]] if got else [])
         for name, value, unit in got:
             s = series.setdefault(name, {"name": name, "unit": unit, "points": []})
-            s["points"].append({"run": r["id"], "task": r["task"], "ts": r["ended"] or r["started"], "value": value})
+            s["points"].append({"run": r["id"], "task": r["task"], "ts": r["ended"] or r["started"], "value": value,
+                                "unit": unit})
     # A task whose run folders are gone still has its last hand-off: one point at its last update.
     marks = ",".join("?" * len(chain))
     for t in db.q(f"SELECT id,updated,result FROM tasks WHERE id IN ({marks}) AND result LIKE '%\"metrics\"%'", chain):
@@ -109,10 +117,13 @@ def trend(db: DB, chain: list[int], where, runs: list[dict] | None = None) -> li
         last = max((r["id"] for r in runs if r["task"] == t["id"]), default=None)
         for name, value, unit in metrics_of(load_result(t["result"])):
             s = series.setdefault(name, {"name": name, "unit": unit, "points": []})
-            s["points"].append({"run": last, "task": t["id"], "ts": t["updated"], "value": value})
+            s["points"].append({"run": last, "task": t["id"], "ts": t["updated"], "value": value, "unit": unit})
     out = []
     for s in series.values():
-        pts = sorted(s["points"], key=lambda x: (x["ts"] or 0, x["run"] or 0))[-MAX_POINTS:]
+        units = [x["unit"] for x in s["points"] if x["unit"]]
+        s["unit"] = max(units, key=units.count) if units else ""   # the most common unit; a bare number fits any
+        pts = [x for x in s["points"] if x.pop("unit") in ("", s["unit"])]
+        pts = sorted(pts, key=lambda x: (x["ts"] or 0, x["run"] or 0))[-MAX_POINTS:]
         if len(pts) < 2:
             continue
         prev = None

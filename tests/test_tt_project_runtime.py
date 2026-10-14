@@ -60372,6 +60372,42 @@ def test_web_task_rows_show_their_chains_metric_trend(env, tmp_path):
     assert trend.numeric("45/45") is None and trend.numeric(True) is None and trend.numeric("3.5%") == (3.5, "%")
 
 
+def test_metric_trend_skips_hashes_and_ids_and_keeps_one_unit_per_series(env, tmp_path):
+    """Commit hashes are not numbers with a unit (4ea0610c2d90 is not 4 'ea0610c2d90'), hash and id
+    fields such as a review's reviewed_head are no series, and a series does not mix '12 ms' with '1.2 s'."""
+    from ttp import trend
+    for v in ("4ea0610c2d90", "1e5abc", "c08b42f5", "deadbeef", "4EA0610C", "12 ms2"):
+        assert trend.numeric(v) is None, v
+    assert trend.numeric("10.5 tok/s") == (10.5, "tok/s") and trend.numeric("3.5%") == (3.5, "%")
+    assert trend.numeric("12 ms") == (12.0, "ms") and trend.numeric("2 GB/s") == (2.0, "GB/s")
+    assert trend.numeric(7) == (7.0, "") and trend.numeric(1e3) == (1000.0, "") and trend.numeric("1e3") == (1000.0, "")
+    assert trend.metrics_of({"metrics": {"reviewed_head": "1234567", "pushed_sha": 1234567, "head": 1, "task_id": 5,
+                                         "commit_count": 3, "rebased_onto": 2, "test_range": 4, "overhead": 2}}) == \
+        [("overhead", 2.0, "")]
+    p = make(env)
+    from ttp.web import state_payload
+    trend._cache.clear()
+    now = time.time()
+
+    def run(task, n, metrics, ended):
+        d = tmp_path / f"run{task}-{n}"
+        d.mkdir()
+        (d / "result.json").write_text(json.dumps({"status": "done", "summary": "s", "metrics": metrics}))
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,'worker','claude',?,?,'done',?)",
+               (task, ended - 60, ended, str(d)))
+    work = p.db.add_task("speed up decode", "s", kind="code", origin="user")
+    review = p.db.add_task("Review #%d: speed up decode" % work, "s", kind="review", origin="user",
+                           labels=[f"continues:{work}"])
+    run(work, 1, {"latency": "12 ms", "head": "4ea0610c2d90"}, now - 7200)
+    run(work, 2, {"latency": "1.2 s"}, now - 3600)
+    run(review, 1, {"reviewed_head": "4ea0610c2d90", "latency": "11 ms"}, now - 1800)
+    run(review, 2, {"reviewed_head": "1e5abc", "pushed_sha": "2345678"}, now - 600)
+    got = json.loads(json.dumps(state_payload(p, p.db), default=str))["tasks"]
+    got = {t["id"]: t for t in got}[review]["trend"]
+    assert [(s["name"], s["unit"]) for s in got] == [("latency", "ms")], got
+    assert [x["value"] for x in got[0]["points"]] == [12.0, 11.0], got
+
+
 def test_web_app_renders_a_trend_only_when_the_chain_has_one():
     import shutil
     import subprocess
