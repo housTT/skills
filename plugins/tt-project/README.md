@@ -57,7 +57,7 @@ Claude Code (a branch or tag goes after `#`):
 ```bash
 claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#smartonTT/tt-project-dogfood-1'
 claude plugin install tt-project@tenstorrent-skills
-claude plugin details tt-project    # Skills (2): tt-project, tt-project-harness
+claude plugin details tt-project    # Skills (3): setup-box, tt-project, tt-project-harness
 "$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
 ```
 
@@ -111,7 +111,7 @@ claude plugin marketplace update tenstorrent-skills && claude plugin update tt-p
 ```
 
 Uninstall: stop every project (`ttp list` names them), then remove the shortcut, the plugin and
-the per-user files (project registry, saved keys and the installed `ttp`):
+the per-user files (project registry, saved keys, ttp's cache and the installed `ttp`):
 
 ```bash
 ttp stop <name> --kill          # each project: ends its daemon and workers, removes its service
@@ -119,7 +119,7 @@ ttp setup --no-shortcut
 claude plugin marketplace remove tenstorrent-skills
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 rm -rf ~/.cursor/plugins/local/tt-project
-rm -rf ~/.tt-project ~/.local/bin/ttp
+rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its

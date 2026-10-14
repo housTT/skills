@@ -153,6 +153,11 @@ def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
                 f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
                 "bin/ttp\" setup", "ttp new ", "ttp stop <name> --kill"):
         assert cmd in section, cmd
+    # `claude plugin details` lists the skills the plugin ships, sorted.
+    skills = sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
+    assert f"# Skills ({len(skills)}): {', '.join(skills)}\n" in section
+    # Uninstall removes every per-user path ttp writes, its cache included.
+    assert '"${XDG_CACHE_HOME:-$HOME/.cache}/ttp"' in section
 
 
 def test_runtime_is_standard_library_only_and_python39_compatible():
