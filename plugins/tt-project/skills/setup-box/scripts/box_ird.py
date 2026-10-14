@@ -303,7 +303,7 @@ def cmd_status(ctx: Ctx, args) -> int:
     for rid, r in sorted(mine.items(), key=lambda kv: int(kv[0])):
         c = read_claim(ctx.alias, rid)
         if c is None:
-            who = "no claim"
+            who = "no claim"  # listed only: no cleanup path touches it
         else:
             who = (f"claim project={c.get('project')!r} task={c.get('task')!r} "
                    f"{'live' if claim_live(c, args.ttl) else 'stale'} expires={c.get('expires', '?')}")

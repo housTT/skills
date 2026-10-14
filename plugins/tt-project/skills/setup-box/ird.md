@@ -45,12 +45,26 @@ $S ird release <box-alias> <id>         # right after the run
   busy ones (`alloc`).
 - `reserve` runs `ird reserve --cluster <pool> --timeout <hh:mm:ss> [--machine <m>]
   [--ssh-port <p>] --no-shell <arch>`. Every flag goes before the arch: some `ird` builds reject a
-  flag after it and silently never reserve. `box.py` then checks that a new reservation of yours
-  appears, and fails if none does. Reserves sharing a state dir run one at a time. If several
-  new reservations of yours match the request (another task reserved at once), it claims none and
-  says so: check `status`, retry with `--machine`, and release what you do not use.
-- `--wait` (default 270 s) caps how long `ird reserve` may take. On a timeout the reservation may
-  still land: check `$S ird status <box-alias>` before reserving again.
+  flag after it and silently never reserve. Reserves sharing a state dir run one at a time.
+- The outcome comes from `ird list`, never from `ird reserve`'s exit code alone: `ird` can exit
+  non-zero after the reservation completed, or be cut off. `box.py` snapshots your reservations
+  first, diffs a fresh `ird list` after the reserve and claims the one new reservation (claim
+  written before anything is reported). A non-zero exit with a new reservation is a success with a
+  warning; no new reservation is a failure. If several new reservations of yours could be this
+  one (another task reserved at once), it narrows by `--ssh-port` and the machine `ird` says it
+  reserved; if still several, it claims and releases none and says so: check `status`, retry with
+  `--machine`, and release by hand what is yours and unused.
+- The machine is the one in the new `ird list` row, not the one asked for: `ird` may place the
+  reservation elsewhere. Then `reserve` warns `asked for <A>, ird reserved <B>` and everything
+  after (claim, ssh block, the printed line) uses `<B>`. Names are compared ignoring case and a
+  site prefix or domain suffix, since `ird list-machines` and `ird list` may print them differently.
+- `ird` may print stderr lines about the management host's environment (changing ownership of
+  your home directory, skipping a CA bundle while rehashing certificates). They say nothing about
+  the reservation: `reserve` shows them as `warning: ird: ...`.
+- `--wait` (default 270 s) caps how long `ird reserve` may take. On a timeout, Ctrl-C, SIGTERM or
+  SIGHUP, `reserve` diffs `ird list` again and releases a reservation that landed (claiming it
+  first), then exits 1 (timeout) or 130 (signal). One can still land after it exits: check
+  `$S ird status <box-alias>` before reserving again.
 - Set `--timeout` to the run's expected length plus a small margin.
 - It prints `reserved <id> machine=<m> port=<p> expires=<time>`. Put the id and expiry in the
   task's hand-off (`jobs` in SKILL.md), and release before the hand-off unless the run continues.
@@ -88,6 +102,8 @@ Host <machine>
 - `release --stale [--dry-run]` releases only your own reservations with a stale claim of this
   project (left by a run that died), and drops claims whose reservation has ended. It skips the
   rest and says why. Release the others by hand if they are yours.
+- No path of `box.py ird` or `ird_e2e.sh` releases, extends or reboots a reservation without a
+  claim of this tool: `status` lists it as `no claim`, and every cleanup leaves it alone.
 
 ## Unwedge a machine
 
@@ -132,7 +148,11 @@ The steps: list and pick a free, non-draining machine; reserve it (every flag be
 `--wait 120`); check the managed ssh block and ssh in through `ProxyJump`; clone the repo into a
 per-run worktree under `workdir_root`, add a file, build it, run `tt-smi -s`; extend once with
 `change-timeout` and check the new expiry; release and check the id is gone from `ird list`.
-On any failure or Ctrl-C a trap releases the reservation this run made, and only that one.
+Before reserving it snapshots your reservations. On exit, any failure, Ctrl-C or SIGTERM a trap
+diffs them again and releases every new one this run claimed; a new one without this run's claim
+is left alone and named in the report. The report's `reservation:` line gives the real id and
+machine, and `released:` what happened to each. `reserve` warnings (machine, exit code, stderr
+noise) are copied into the report.
 Exit 0 pass, 1 a step failed, 2 bad usage, 130 interrupted.
 
 ## Exit codes

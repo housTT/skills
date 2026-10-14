@@ -29,6 +29,9 @@ prompt template or skill.
 }
 ```
 
+Box entries always sit inside the `{"version": 1, "boxes": {...}}` wrapper; a file of bare entries
+fails `box.py site check` with `missing version/boxes wrapper`.
+
 | Field | Needed | What |
 |---|---|---|
 | `boxes` key | yes | the box's `ttp machines` alias, also its ssh config alias |
