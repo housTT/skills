@@ -25,15 +25,15 @@ TIMEOUT="00:30:00" EXTEND_MIN=15
 usage() { sed -n '4,5p' "$0" | sed 's/^# *//'; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --box) BOX=${2:-}; shift 2 ;;
-    --mgmt) MGMT=${2:-}; shift 2 ;;
-    --pool) POOL=${2:-}; shift 2 ;;
-    --arch) ARCH=${2:-}; shift 2 ;;
-    --workdir) WORKDIR=${2:-}; shift 2 ;;
-    --repo) REPO=${2:-}; shift 2 ;;
-    --timeout) TIMEOUT=${2:-}; shift 2 ;;
-    --extend-min) EXTEND_MIN=${2:-}; shift 2 ;;
-    --site) SITE_IN=${2:-}; shift 2 ;;
+    --box) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; BOX=${2:-}; shift 2 ;;
+    --mgmt) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; MGMT=${2:-}; shift 2 ;;
+    --pool) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; POOL=${2:-}; shift 2 ;;
+    --arch) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; ARCH=${2:-}; shift 2 ;;
+    --workdir) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; WORKDIR=${2:-}; shift 2 ;;
+    --repo) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; REPO=${2:-}; shift 2 ;;
+    --timeout) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; TIMEOUT=${2:-}; shift 2 ;;
+    --extend-min) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; EXTEND_MIN=${2:-}; shift 2 ;;
+    --site) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; usage; }; SITE_IN=${2:-}; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;

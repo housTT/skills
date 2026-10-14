@@ -2134,3 +2134,11 @@ def test_setup_box_ird_e2e_is_shellcheck_clean():
         pytest.skip("shellcheck not installed")
     r = subprocess.run([sc, str(IRD_E2E)], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout
+
+
+@pytest.mark.parametrize("flag", ["--box", "--site", "--extend-min"])
+def test_setup_box_ird_e2e_value_flag_without_value_exits_2(flag):
+    import subprocess
+    r = subprocess.run(["bash", str(IRD_E2E), "--dry-run", flag], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 2
+    assert "needs a value" in r.stderr
