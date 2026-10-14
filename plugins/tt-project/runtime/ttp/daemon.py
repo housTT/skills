@@ -78,6 +78,7 @@ from . import service
 from . import settinghold
 from . import sweep
 from . import timefmt
+from . import ttr
 from . import turngate
 from . import unblock
 from . import upstream
@@ -877,7 +878,7 @@ class Daemon:
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.clear_git_locks,
-                     self.sync_schedules, self.lint_charter, self.tend_holds):
+                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr):
             self._step_name = step.__name__
             step()
             self._progress()
@@ -1098,6 +1099,23 @@ class Daemon:
             self._ends.tick()
         except Exception:
             log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
+
+    def record_ttr(self) -> None:
+        """Machine incidents for time to recover (ttr.observe), model-free, every ttr.OBSERVE_S. It runs
+        while the project is paused too, so a recovery then is recorded when it happens."""
+        now = time.time()
+        if now - getattr(self, "_ttr_at", 0.0) < ttr.OBSERVE_S:
+            return
+        self._ttr_at = now
+        try:
+            opened, ended = ttr.observe(self.p, now)
+        except Exception:
+            log(self.p, "recording machine incidents failed\n" + traceback.format_exc())
+            return
+        for alias in opened:
+            log(self.p, f"ttr: {alias} incident opened")
+        for alias in ended:
+            log(self.p, f"ttr: {alias} incident ended")
 
     def route_machines(self, every_s: float = 60) -> None:
         """Shared machines (machine_ledger): run this project's ledger probes, then send the pages due
@@ -3486,6 +3504,14 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in quiet))
             except Exception as e:   # nor must the machine ledger
                 log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                recover = ttr.review_lines(self.p)
+                if recover:
+                    spec += (f"\n\nTime to recover per machine (last {ttr.REVIEW_DAYS} d; `ttp ttr` for more):\n"
+                             + "\n".join(f"- {line}" for line in recover))
+            except Exception as e:   # nor must the incident report
+                log(self.p, f"ttr lines failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             noisy = watchdup.review_lines(db)
             if noisy:

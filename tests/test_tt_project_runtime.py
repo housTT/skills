@@ -58494,3 +58494,144 @@ def test_blocker_sweep_interval_with_every_item_carried_still_starts_on_a_pendin
     db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
     sweep.prepare(db, eid, cfg, now)
     assert "for each item not marked CARRIED" in db.one("SELECT text FROM events WHERE id=?", (eid,))["text"]
+
+
+def test_ttr_records_one_incident_per_machine_from_conditions_outages_and_heal_checks(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    p = make(env, "alpha")
+    for a in ("box-a", "box-b", "box-c", "box-d"):
+        mm.add(a)
+    _resources(p, "Machines: box-a, box-c")
+    t0 = 1_800_000_000.0
+    # A co-tenant's down condition on a watched machine opens one incident, from its first report.
+    ml.report("other", "box-a", "down", "no ping", now=t0)
+    assert ttr.observe(p, t0 + 30) == (["box-a"], [])
+    assert ttr.observe(p, t0 + 90) == ([], []), "still down: no second incident"
+    # A machine its own heal check reports is watched too (box-b is not in Resources); box-d is watched by nobody.
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0 + 60,
+                                               "machine_reported": ["box-b", "down"]})
+    ml.report("other", "box-d", "down", now=t0)
+    # A known outage opens one as well.
+    ml.set_outage("box-c", "fan repair", "other", expires="1d", now=t0 + 100)
+    assert ttr.observe(p, t0 + 120) == (["box-b", "box-c"], [])
+    rows = {r["alias"]: r for r in p.db.q("SELECT * FROM ttr_incidents")}
+    assert set(rows) == {"box-a", "box-b", "box-c"}
+    assert (rows["box-a"]["kind"], rows["box-a"]["started"]) == ("down", t0)
+    assert "no ping" in rows["box-a"]["cause"] and "other" in rows["box-a"]["cause"]
+    assert (rows["box-b"]["kind"], rows["box-b"]["cause"], rows["box-b"]["started"]) == ("down", "heal check box-b-up", t0 + 60)
+    assert (rows["box-c"]["kind"], rows["box-c"]["started"]) == ("outage", t0 + 100)
+    # Healthy again: each ends once, at the tick that sees it.
+    ml.report("other", "box-a", "down", cleared=True, now=t0 + 600)
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "healthy"})
+    ml.clear_outage("box-c")
+    assert ttr.observe(p, t0 + 660) == ([], ["box-a", "box-b", "box-c"])
+    assert ttr.observe(p, t0 + 720) == ([], [])
+    assert [r["ended"] for r in p.db.q("SELECT ended FROM ttr_incidents ORDER BY alias")] == [t0 + 660] * 3
+    # Down again with an old first report: a new incident that starts no earlier than the last one ended.
+    ml.report("other", "box-a", "held", now=t0 + 800)
+    p.db.x("UPDATE ttr_incidents SET ended=? WHERE alias='box-a'", (t0 + 900,))   # (a late end, for the bound)
+    assert ttr.observe(p, t0 + 950) == (["box-a"], [])
+    r = p.db.one("SELECT * FROM ttr_incidents WHERE alias='box-a' AND ended IS NULL")
+    assert (r["kind"], r["started"]) == ("held", t0 + 900)
+    # A condition nobody reported for CONDITION_GONE_S is over.
+    assert ttr.observe(p, t0 + 800 + ml.CONDITION_GONE_S) == ([], ["box-a"])
+
+
+def test_ttr_keeps_an_open_incident_across_a_daemon_restart_and_never_duplicates_it(env):
+    import sqlite3
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import ttr
+    from ttp.daemon import Daemon
+    from ttp.db import DB
+    p = make(env, "alpha")
+    mm.add("box-a")
+    _resources(p, "Machines: box-a")
+    start = time.time() - 300
+    ml.report("other", "box-a", "down", now=start)
+    Daemon(p.base).record_ttr()
+    assert [(r["alias"], r["started"], r["ended"]) for r in p.db.q("SELECT * FROM ttr_incidents")] == \
+        [("box-a", start, None)]
+    # A restart (a new daemon, a new database handle) mid-incident keeps the open row and adds none.
+    d = Daemon(p.base)
+    d.record_ttr()
+    assert ttr.observe(type("P", (), {"db": DB(p.db.path), "name": p.name, "charter_path": p.charter_path})(),
+                       time.time()) == ([], [])
+    assert p.db.one("SELECT COUNT(*) AS n FROM ttr_incidents")["n"] == 1
+    # The database itself refuses a second open incident for a machine.
+    with pytest.raises(sqlite3.IntegrityError):
+        p.db.x("INSERT INTO ttr_incidents(alias, kind, started) VALUES('box-a', 'down', 1)")
+    # Recovered while the daemon was stopped: the next daemon ends it once.
+    ml.report("other", "box-a", "down", cleared=True)
+    Daemon(p.base).record_ttr()
+    Daemon(p.base).record_ttr()
+    rows = p.db.q("SELECT * FROM ttr_incidents")
+    assert len(rows) == 1 and rows[0]["ended"] is not None and rows[0]["ended"] >= start + 300
+
+
+def test_ttr_report_math_lines_in_the_home_zone_and_the_daily_review(env):
+    from ttp import daemon as dm
+    from ttp import timefmt
+    from ttp import ttr
+    p = make(env, "alpha")
+    timefmt.set_home(p, "America/Los_Angeles")
+    now = 1_783_000_000.0   # 2026-07-02 (PDT)
+    for i, ttr_s in enumerate((60, 120, 180, 600, 3600)):
+        start = now - 86400 * (i + 1)
+        p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','c',?,?)",
+               (start, start + ttr_s))
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','old',?,?)",
+           (now - 40 * 86400, now - 39 * 86400))   # ended before the window
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started) VALUES('box-a','held','broker hold',?)",
+           (now - 7200,))
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-b','outage','repair',?,?)",
+           (now - 3 * 86400, now - 3 * 86400 + 5400))
+    got = ttr.report(p.db, now=now)
+    a = got["box-a"]
+    assert (a["incidents"], a["recovered"], a["median_s"], a["p90_s"], a["max_s"]) == (6, 5, 180, 3600, 3600)
+    assert [(o["kind"], o["open_s"]) for o in a["open"]] == [("held", 7200)]
+    assert (a["last"]["kind"], a["last"]["ended"]) == ("held", None)
+    assert ttr._p90([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) == 9 and ttr._p90([5]) == 5
+    assert list(ttr.report(p.db, "box-b", now=now)) == ["box-b"]
+    assert ttr.report(p.db, days=2, now=now)["box-a"]["incidents"] == 3   # 60 s, 120 s and the open one
+    zone = timefmt.home(p)
+    (la, lb) = ttr.lines(p.db, zone, now=now)
+    assert la.startswith("box-a: 6 incidents in 30 d; TTR median 3 min, p90 1.0 h, max 1.0 h; open: held since ")
+    assert "PDT (2.0 h)" in la
+    assert lb.startswith("box-b: 1 incident in 30 d; TTR median 1.5 h") and "PDT, recovered in 1.5 h (repair)" in lb
+    # The daily review carries one line per machine with an incident in its window.
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    p.db.x("UPDATE ttr_incidents SET started=started+?, ended=ended+?", (time.time() - now,) * 2)
+    assert d._schedule_llm({"name": "daily-review", "budget_usd_day": None, "last_run": None,
+                            "description": "review"}, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Time to recover per machine (last 7 d" in spec
+    assert "- box-a: 6 incidents in 7 d" in spec and "- box-b: 1 incident in 7 d" in spec
+
+
+def test_ttr_cli_reports_json_and_text_for_one_machine(env, capsys):
+    from ttp import cli
+    from ttp import ttr
+    p = make(env, "alpha")
+    now = time.time()
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','x',?,?)",
+           (now - 1000, now - 400))
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-b','down','y',?,?)",
+           (now - 1000, now - 900))
+    cli.main(["ttr", "alpha", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["zone"] and out["days"] == 30 and set(out["machines"]) == {"box-a", "box-b"}
+    a = out["machines"]["box-a"]
+    assert (a["incidents"], a["median_s"], a["p90_s"], a["max_s"], a["open"]) == (1, 600, 600, 600, [])
+    cli.main(["ttr", "alpha", "box-b", "--days", "1"])
+    text = capsys.readouterr().out
+    assert text.startswith("box-b: 1 incident in 1 d; TTR median 2 min") and "box-a" not in text
+    cli.main(["ttr", "alpha", "box-c"])
+    assert capsys.readouterr().out.strip() == "no machine incidents in 30 d on box-c"
+    assert ttr.lines(p.db, "UTC", "box-c") == []

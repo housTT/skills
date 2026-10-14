@@ -1096,6 +1096,21 @@ def cmd_audit(a) -> None:
         print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
 
 
+def cmd_ttr(a) -> None:
+    """Time to recover per machine (ttr.py): incidents, median, p90 and max TTR, open ones, the last one."""
+    from . import ttr
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp ttr <name>`")
+    if a.json:
+        print(json.dumps({"zone": timefmt.home(p), "days": a.days,
+                          "machines": ttr.report(p.db, a.alias, a.days)}, indent=1))
+        return
+    got = ttr.lines(p.db, timefmt.home(p), a.alias, a.days)
+    print("\n".join(got) if got else f"no machine incidents in {a.days:g} d"
+          + (f" on {a.alias}" if a.alias else ""))
+
+
 def cmd_spend_today(a) -> None:
     """This machine's projects' spend in [since, until) by provider and account key, and its other
     Claude Code sessions as estimated (globalcap.answer): what another machine's global daily total
@@ -4815,6 +4830,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("ttr", help="time to recover per machine: incidents, median, p90 and max TTR, open ones")
+    s.add_argument("name", nargs="?")
+    s.add_argument("alias", nargs="?", help="only this machine")
+    s.add_argument("--days", type=float, default=30, help="the window: incidents open now or ended within it")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ttr)
 
     s = sub.add_parser("spend-today", help="this machine's tt-project spend today, by provider and account "
                                            "(for the global daily cap)")

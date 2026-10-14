@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, raised REAL NOT NULL, last REAL,
   message INTEGER, severity TEXT, text TEXT, cleared REAL, cleared_why TEXT);
 CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
+
+-- Time to recover (ttr.py): one row per machine incident; rows are only added, each end written once.
+CREATE TABLE IF NOT EXISTS ttr_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL, kind TEXT NOT NULL, cause TEXT,
+  started REAL NOT NULL, ended REAL);
+CREATE UNIQUE INDEX IF NOT EXISTS ttr_open ON ttr_incidents(alias) WHERE ended IS NULL;
+CREATE INDEX IF NOT EXISTS ttr_alias ON ttr_incidents(alias, started);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
