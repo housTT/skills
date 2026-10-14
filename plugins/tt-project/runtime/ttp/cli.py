@@ -2336,6 +2336,44 @@ def cmd_landed(a) -> None:
     sys.exit(landed.run(p, a))
 
 
+def cmd_ack_wait(a) -> None:
+    """`ttp ack-wait probe|settle --from <project> --hash <h>`: wait model-free for another project's
+    reply to a note (ackwait.py). probe: 0 once the reply is in this machine's inbox, 1 while not, 2
+    when it cannot tell. settle (an on_pass_cmd): write the hand-off quoting the reply to $TTP_RESULT."""
+    from . import ackwait
+    p = here()
+    if not p:
+        print("ttp ack-wait: no project here (run it in a project or with TTP_PROJECT set)")
+        sys.exit(ackwait.CANNOT)
+    if a.frm == p.name or not (local_project(a.frm) or remote_entry(a.frm)):
+        print(f"ttp ack-wait: {a.frm!r} is not another project of this user's; `ttp list` shows them")
+        sys.exit(ackwait.CANNOT)
+    try:
+        n = ackwait.find(p.name, a.frm, a.hash)
+    except ValueError as e:
+        print(f"ttp ack-wait: {e}")
+        sys.exit(ackwait.CANNOT)
+    except OSError as e:
+        print(f"ttp ack-wait: cannot read the inbox: {e}")
+        sys.exit(ackwait.CANNOT)
+    if not n:
+        print(f"no reply from {a.frm} naming {a.hash.strip().lower()} yet")
+        sys.exit(ackwait.WAITING)
+    if a.action == "probe":
+        print(f"{a.frm} replied: note {n['fp']}")
+        sys.exit(ackwait.FOUND)
+    out = os.environ.get("TTP_RESULT")
+    if not out:
+        die("ttp ack-wait settle is an on_pass_cmd: it writes the hand-off to $TTP_RESULT, which is not set",
+            ackwait.CANNOT)
+    write_json(Path(out), ackwait.handoff(n, a.frm, a.hash.strip().lower(), a.status))
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
+    if run_dir:
+        durable_append(Path(run_dir) / "progress.md",
+                       f"{time.strftime('%H:%M:%S')} {a.frm} replied to {a.hash.strip().lower()}: note {n['fp']}\n")
+    print(f"{a.frm} replied (note {n['fp']}); hand-off {a.status} written to {out}")
+
+
 def cmd_detach(a) -> None:
     """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
 
@@ -4656,6 +4694,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--task", type=int, help="the task whose landing to look for")
     s.add_argument("--onto", help="the branch to look on (default: delivery.push_branch)")
     s.set_defaults(fn=cmd_landed)
+
+    s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
+                                        "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "
+                                        "(an on_pass_cmd: writes the hand-off quoting the reply to $TTP_RESULT)")
+    s.add_argument("action", choices=["probe", "settle"])
+    s.add_argument("--from", dest="frm", required=True, metavar="PROJECT", help="the project that replies")
+    s.add_argument("--hash", required=True, help="the note's id or sha256 prefix, as `ttp note --to` printed it; "
+                                                 "the reply names it")
+    s.add_argument("--status", choices=["done", "needs_review"], default="done", help="settle: the hand-off's status")
+    s.set_defaults(fn=cmd_ack_wait)
 
     s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="*", metavar="RC",

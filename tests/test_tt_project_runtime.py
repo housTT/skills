@@ -25581,6 +25581,64 @@ def test_an_on_pass_cmd_records_obligation_progress_and_receipts_with_note_conte
     assert [e["text"] for e in o["owners"][str(tid)]["evidence"]][:1] == ["job checked"]
 
 
+def _ack_wait(cli, *args):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["ack-wait", *args])
+    return e.value.code
+
+
+def test_ack_wait_probe_passes_only_on_the_named_projects_reply_naming_the_hash(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+    from ttp.project import register
+    p = make(env)
+    for name in ("second", "third"):
+        (env["tmp"] / name).mkdir()
+        register(name, {"host": "testhost", "dir": str(env["tmp"] / name)})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please confirm the new probe works"
+    assert upstream.send(p.name, 4, "second", request) == "sent"
+    fp, sha = upstream.note_id("second", request), upstream.receipt(request).split()[-1]
+    probe = ["probe", "--from", "second", "--hash", fp]
+    assert _ack_wait(cli, *probe) == 1, "the request itself is no reply"
+    upstream.send("third", 1, p.name, f"re {fp}: not ours")
+    upstream.send("second", 1, "third", f"re {fp}: to another project")
+    upstream.send("second", 1, p.name, "an unrelated note")
+    assert _ack_wait(cli, *probe) == 1
+    upstream.send("second", 9, p.name, f"Re {fp.upper()} and {sha}: works here")
+    assert _ack_wait(cli, *probe) == 0 and _ack_wait(cli, "probe", "--from", "second", "--hash", sha) == 0
+    assert _ack_wait(cli, "probe", "--from", "nowhere", "--hash", fp) == 2, "an unknown project never replies"
+    assert _ack_wait(cli, "probe", "--from", p.name, "--hash", fp) == 2
+    assert _ack_wait(cli, "probe", "--from", "second", "--hash", "xyz") == 2
+    assert _ack_wait(cli, "probe", "--from", "second", "--hash", "abc1234") == 2, "too short to name one note"
+    assert _ack_wait(cli, "settle", "--from", "second", "--hash", fp) == 2, "settle writes $TTP_RESULT only"
+    assert "not set" in capsys.readouterr().err
+
+
+def test_ack_wait_ends_a_waiting_task_model_free_once_the_reply_arrives(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "second").mkdir()
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    fp = upstream.note_id("second", "please confirm")
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, f"ttp ack-wait settle --from second --hash {fp}",
+                                     probe=f"ttp ack-wait probe --from second --hash {fp}")
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "queued" and not _ready(p, tid) and tid not in d._on_pass
+    upstream.send("second", 2, p.name, f"confirmed {fp}: the probe passes here")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["blocked_reason"], res, (run_dir / "on_pass" / "on_pass.log").read_text())
+    assert res["run_status"] == "model-free" and "another project's data" in res["summary"]
+    assert "the probe passes here" in res["summary"] and res["metrics"]["reply_note"]
+    assert f"second replied to {fp}" in (run_dir / "progress.md").read_text()
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
 def test_on_pass_note_context_preserves_deferred_delivery(env, monkeypatch, capsys):
     from ttp import cli, upstream
     from ttp.project import register
