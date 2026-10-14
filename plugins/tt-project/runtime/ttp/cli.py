@@ -3743,6 +3743,13 @@ def stale_install_warning(cwd: Path | None = None) -> str:
     return ""
 
 
+def new_project_defaults_lines() -> list[str]:
+    """The defaults a new project gets, with the account-level budget settings applied."""
+    from .project import DEFAULT_CONFIG
+    budget = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
+    return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -3791,7 +3798,7 @@ def cmd_setup(a) -> None:
         print(line)
     from .project import DEFAULT_CONFIG
     print("defaults for new projects:")
-    for ln in defaults_lines(DEFAULT_CONFIG["budget"], bool((load_secrets().get("jev") or {}).get("key"))):
+    for ln in new_project_defaults_lines():
         print("  " + ln)
 
 
@@ -4020,6 +4027,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
               f"(superseded); the daemon restarts and the project stays paused")
     release.clear_stuck(p)
+    keep_note = _keep_light_coordinator(p)
+    if keep_note:
+        print(keep_note)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     res = service.restart(p)
@@ -4035,6 +4045,31 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               f"restarted and running work was kept."
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="alert", severity="low")
+
+
+def _keep_light_coordinator(p: Project) -> str:
+    """Since coordinator.model_tier an unset coordinator.model follows the standard tier. A project that
+    overrides a provider's light-tier model to make its coordinator cheaper keeps that model: model_tier
+    is set to "" for it (once; an explicit model_tier is the project's own choice). Returns the note."""
+    try:
+        raw = p.raw_config()
+    except Exception:
+        return ""
+    coord = raw.get("coordinator")
+    if isinstance(coord, dict) and "model_tier" in coord:
+        return ""
+    provs = raw.get("providers")
+    if not isinstance(provs, dict) or not any(
+            isinstance(v, dict) and isinstance(((v.get("tiers") or {}).get("light") or {}), dict)
+            and ((v.get("tiers") or {}).get("light") or {}).get("model") for v in provs.values()):
+        return ""
+    try:
+        p.set_config("coordinator.model_tier", "")
+    except Exception:
+        return ""
+    return ("upgrade note: this project overrides the light-tier model, so coordinator.model_tier was set to "
+            "\"\" and its coordinator keeps the light-tier model; `ttp config %s coordinator.model_tier "
+            "standard` makes it follow the standard tier" % p.name)
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:
