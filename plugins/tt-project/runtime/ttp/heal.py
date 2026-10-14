@@ -746,7 +746,9 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
             "Find the cause and repair it within the charter's restrictions, then make sure the check "
             f"passes (`ttp heal test {name}`). If the fix command itself is wrong, correct the heal block "
             "in harness/schedules.json. Report what you changed. Hand off blocked only for a missing "
-            "credential or a step the charter forbids.")
+            "credential or a step the charter forbids. Under a recorded known outage or known_fault, the check "
+            "ending at exit 75 (known outage, unknown) is the expected end state: do not try to force a pass; "
+            "hand off once the check reports the known outage.")
         tid = db.add_task(f"Self-fix: heal check {name} failing", spec_text, kind="work", priority=1,
                           origin="daemon", labels=[LABEL + name])
     else:

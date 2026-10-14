@@ -49390,6 +49390,8 @@ def test_mute_heal_and_lock_holder_times_show_the_home_zone_on_a_utc_box(env, ut
                    {"since": now - 7200, "last_rc": 1}, now, "the fix exited 1")
     spec = p.db.one("SELECT spec FROM tasks WHERE title LIKE 'Self-fix: heal check svc%'")["spec"]
     assert re.search(r"Unhealthy since \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T\.", spec), spec
+    assert "exit 75 (known outage, unknown) is the expected end state" in spec, spec
+    assert "do not try to force a pass" in spec, spec
     p.set_config("shared_resources", ["board"])
     slots = {"own": p.state / "locks" / "dev.0.lock", "shared": shared.root() / "board" / "board.0.lock"}
     held = []
