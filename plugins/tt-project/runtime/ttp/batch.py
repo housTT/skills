@@ -1389,8 +1389,9 @@ def alive(marker: Path) -> bool:
     return False
 
 
-def summary(marker: Path) -> int:
-    """`ttp push --result <marker>` for a batch marker: 0 once it finished (or died), 1 while it runs."""
+def summary(marker: Path, pushed_only: bool = False) -> int:
+    """`ttp push --result <marker>` for a batch marker: 0 once it finished (or died), 1 while it runs.
+    With `pushed_only`: 0 only when it pushed or landed, `push.NOT_PUSHED` when it finished without."""
     m = push._read(marker)
     bid = m.get("id") or Path(marker).stem
     live = alive(Path(marker))
@@ -1403,7 +1404,7 @@ def summary(marker: Path) -> int:
     outcome = m.get("outcome")
     if not outcome:
         print(f"ttp push: batch {bid} ended without an outcome (killed, crashed or rebooted); log: {m.get('log')}")
-        return 0
+        return push.NOT_PUSHED if pushed_only else 0
     sha = m.get("pushed_sha")
     head = f"batch {bid}: {outcome}" + (f", {str(sha)[:10]}" if sha else "") \
         + (f" as {m['version']}" if sha and m.get("version") else "") + f" to {m.get('target')}" \
@@ -1429,4 +1430,4 @@ def summary(marker: Path) -> int:
         tail = push._tail(m.get("log"))
         if tail:
             print(tail)
-    return 0
+    return push.NOT_PUSHED if pushed_only and outcome not in ("pushed", "landed") else 0

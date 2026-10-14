@@ -63035,3 +63035,18 @@ def test_task_show_prints_spec_handoff_and_findings(env, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["task", p.name, "show", "99999"])
     assert e.value.code != 0 and "no task #99999" in capsys.readouterr().err
+
+
+def test_push_result_pushed_flag_on_batch_markers(tmp_path, capsys):
+    from ttp import push
+    done = tmp_path / "b1.json"
+    done.write_text(json.dumps({"kind": "batch", "id": "b1", "phase": "finished", "outcome": "failed",
+                                "target": "proj", "log": "x.log"}))
+    ok = tmp_path / "b2.json"
+    ok.write_text(json.dumps({"kind": "batch", "id": "b2", "phase": "finished", "outcome": "pushed",
+                              "pushed_sha": "a" * 40, "target": "proj", "log": "x.log"}))
+    dead = tmp_path / "b3.json"
+    dead.write_text(json.dumps({"kind": "batch", "id": "b3", "phase": "running", "target": "proj"}))
+    assert push.result(done) == 0 and push.result(done, pushed_only=True) == push.NOT_PUSHED
+    assert push.result(ok, pushed_only=True) == 0
+    assert push.result(dead, pushed_only=True) == push.NOT_PUSHED

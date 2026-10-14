@@ -3269,7 +3269,7 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
     if _read(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
-        return batch.summary(marker)
+        return batch.summary(marker, pushed_only)
     try:
         m = _settle(marker)
         since = {"queued": "queued", "running": "started"}.get(m.get("status"))
