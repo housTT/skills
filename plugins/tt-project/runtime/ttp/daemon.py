@@ -65,6 +65,7 @@ from . import locks
 from . import machine_ledger
 from . import netwait
 from . import obligations
+from . import pageto
 from . import machines
 from . import prguard
 from . import projpause
@@ -206,6 +207,7 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
+PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
@@ -3500,8 +3502,13 @@ class Daemon:
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
             scr.settle_receipts(self.p.db, source, started, ())   # and its errors are repaired
             scr.settle_mutes(self.p.db, source, started)   # and so are its muted conditions' clocks
+            if self.p.db.kv(PAGED_KEY + s["name"]):   # a line paged again later is a new episode
+                self.p.db.set_kv(PAGED_KEY + s["name"], {})
             return "ok (0 observations)"
         n, subjects = 0, set()
+        paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
+        reported: set[str] = set()
+        filed = 0
         for obs in _observations(text):
             body = obs.get("text", "")
             # Its own failure lines ("error": true) are errors, not reports.
@@ -3511,6 +3518,14 @@ class Daemon:
             whole = obs.get("whole") is True
             if not error and obs.get("machine") and obs.get("condition"):
                 self._machine_condition(obs, body)   # an info line reaches the machine ledger too
+            if not error and obs.get("to") is not None:
+                target = self._page_target(s["name"], obs)
+                if target is not None:   # another project's: a note to it, not an observation here
+                    k = f"{target}\t{_line_key(obs, body)}"
+                    reported.add(k)
+                    filed += self._page_line(s["name"], target, obs, body, paged, k, rewake, filed)
+                    n += 1
+                    continue
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None,
@@ -3519,10 +3534,46 @@ class Daemon:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
             n += 1
+        if ok:   # a line no longer reported is over: its recurrence pages again
+            paged = {k: v for k, v in paged.items() if k in reported}
+        if paged != (self.p.db.kv(PAGED_KEY + s["name"]) or {}):
+            self.p.db.set_kv(PAGED_KEY + s["name"], paged)
         if ok:
             scr.settle_receipts(self.p.db, source, started, subjects)
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         return f"ok ({n} observations)"
+
+    def _page_target(self, name: str, obs: dict) -> str | None:
+        """The other local project a line's `to` names (pageto.resolve), else None: the line is then a
+        normal observation here, and an unknown target is logged."""
+        target, why = pageto.resolve(obs.get("to"), obs.get("machine"))
+        if target is None:
+            log(self.p, f"watcher {name}: line not paged ({why}); observed here instead")
+        return target if target != self.p.name else None
+
+    def _page_line(self, name: str, target: str, obs: dict, body: str, paged: dict, k: str,
+                   rewake: float | None, filed: int) -> int:
+        """File one line to `target` as a daemon note, once per key (`k`) and again after `rewake`
+        seconds (None: never) or on every run with "repeat": true. Returns 1 if it filed a note."""
+        now = time.time()
+        last = paged.get(k)
+        if last and obs.get("repeat") is not True and (rewake is None or now - float(last["at"]) < rewake):
+            return 0
+        if filed >= pageto.PER_RUN:
+            log(self.p, f"watcher {name}: {pageto.PER_RUN} notes this run; the rest go on a later run")
+            return 0
+        sev = obs.get("severity") if obs.get("severity") in upstream.NOTE_SEVERITIES else "normal"
+        # Its first send's time keeps a later episode's note apart from this one's in the inbox (upstream.send).
+        first = float(last["first"]) if last else now
+        again = f" (still reported: note {int(last['n']) + 1})" if last else ""
+        text = f"Watcher {name} of project {self.p.name}, reporting since {timefmt.long(first, self.p)}: {body}{again}"
+        got = upstream.send(self.p.name, None, target, text, sev, now=now, sender="daemon")
+        if got not in ("sent", "duplicate"):
+            log(self.p, f"watcher {name}: note to {target}: {got}; retried on its next run")
+            return 0
+        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1}
+        log(self.p, f"watcher {name}: paged {target}: {text[:200]}")
+        return 1
 
     def _machine_condition(self, obs: dict, body: str) -> None:
         """A watcher saw a shared machine down or held (or no longer: `cleared`): tell its recovery owner."""
@@ -7968,6 +8019,14 @@ def _explicit_clear(payload: str | None) -> bool:
         return (json.loads(payload or "{}") or {}).get("issue_lifecycle") == scr.EXPLICIT_CLEAR
     except (ValueError, AttributeError):
         return False
+
+
+def _line_key(obs: dict, body: str) -> str:
+    """What dedupes a paged line: its `key`, else its whitespace-normalized text."""
+    key = obs.get("key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    return "text:" + hashlib.sha256(" ".join(body.split()).encode()).hexdigest()[:16]
 
 
 def _observations(text: str) -> list[dict]:

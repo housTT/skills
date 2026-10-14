@@ -63920,3 +63920,123 @@ def test_landing_alert_clears_without_approvals_and_is_not_raised_while_paused(e
     assert alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
     s.p.db.x("UPDATE push_queue SET status='withdrawn' WHERE status IN ('approved','batched')")
     assert not alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
+
+
+def _peer(env, name):
+    """Another project registered on this machine (only its folder: enough to be a note's target)."""
+    from ttp.project import register
+    d = env["repo"].parent / f"peer-{name}"
+    d.mkdir(exist_ok=True)
+    register(name, {"host": "testhost", "dir": str(d)})
+
+
+def _notes_to(name):
+    from ttp import upstream
+    if not upstream.path().exists():
+        return []
+    return [n for n in upstream._lines(upstream.path().read_bytes())[0] if n.get("to") == name]
+
+
+def test_command_watcher_to_pages_another_project_once_per_key_until_rewake(env, monkeypatch):
+    from ttp import daemon as dm
+    run, issues, p = _json_watcher(env, monkeypatch)
+    _peer(env, "ops")
+    line = {"text": "box-a: held (cause A)", "severity": "high", "key": "hold:A", "to": "ops"}
+    run("hw", line)
+    run("hw", dict(line, text="box-a: held (cause A, still)"))   # the same key: no second note
+    notes = _notes_to("ops")
+    assert len(notes) == 1 and notes[0]["from"] == "daemon" and notes[0]["severity"] == "high"
+    assert "Watcher hw of project demo, reporting since" in notes[0]["spec"] and "(cause A)" in notes[0]["spec"]
+    assert not issues("hw") and not p.db.q("SELECT id FROM events WHERE kind='observation'"), "paged and observed"
+    run("hw", line, dict(line, key="hold:B", text="box-a: held (cause B)"))   # a new cause: its own note
+    assert len(_notes_to("ops")) == 2
+    # rewake_after_h (the screen's default, 6 h) applies as for observations.
+    paged = p.db.kv(dm.PAGED_KEY + "hw")
+    p.db.set_kv(dm.PAGED_KEY + "hw", {k: dict(v, at=v["at"] - 7 * 3600) for k, v in paged.items()})
+    run("hw", line, dict(line, key="hold:B", text="box-a: held (cause B)"))
+    notes = _notes_to("ops")
+    assert len(notes) == 4 and all("still reported: note 2" in n["spec"] for n in notes[2:])
+    # A cause no longer reported is over; its recurrence (a later minute) pages again. "repeat": true
+    # pages every run.
+    run("hw", line)
+    real = time.time
+    monkeypatch.setattr(dm.time, "time", lambda: real() + 120)
+    run("hw", dict(line, key="hold:B", text="box-a: held (cause B)"))
+    assert len(_notes_to("ops")) == 5 and "still" not in _notes_to("ops")[-1]["spec"]
+    run("hw", dict(line, repeat=True))
+    run("hw", dict(line, repeat=True))
+    assert len(_notes_to("ops")) == 7
+    run("hw")   # a clean run clears it all
+    assert not p.db.kv(dm.PAGED_KEY + "hw")
+
+
+def test_command_watcher_to_unknown_or_own_project_is_observed_here(env, monkeypatch):
+    run, issues, p = _json_watcher(env, monkeypatch)
+    for to in ("nope", "demo", 5, ""):
+        run("hw", {"text": f"box-a: held ({to})", "severity": "high", "to": to})
+        assert f"box-a: held ({to})" in issues("hw")
+    assert not _notes_to("nope") and not _notes_to("demo")
+    log = (p.logs / "daemon.log").read_text()
+    assert "no project 'nope' on this machine" in log and "observed here instead" in log
+
+
+def test_command_watcher_to_machine_owner_resolves_outage_then_recovery_owner(env, monkeypatch):
+    from ttp import machine_ledger as ml, machines as mm, pageto
+    run, issues, _ = _json_watcher(env, monkeypatch)
+    mm.add("box-a", tags="device")
+    line = {"text": "box-a: held", "severity": "high", "key": "a", "machine": "box-a", "to": pageto.OWNER}
+    run("hw", line)   # no owner set: observed here
+    assert "box-a: held" in issues("hw") and not _notes_to("ops")
+    _peer(env, "ops")
+    _peer(env, "repair")
+    mm.set_recovery("box-a", "ops")
+    run("hw", dict(line, key="b", text="box-a: held (b)"))
+    assert len(_notes_to("ops")) == 1
+    ml.set_outage("box-a", "board swap", "demo", "2d", owner="repair")   # a known outage's owner project first
+    run("hw", dict(line, key="c", text="box-a: held (c)"))
+    assert len(_notes_to("repair")) == 1 and len(_notes_to("ops")) == 1
+    ml.set_outage("box-a", "board swap", "demo", "2d", owner="a vendor ticket")   # not a project: the recovery owner
+    run("hw", dict(line, key="d", text="box-a: held (d)"))
+    assert len(_notes_to("ops")) == 2
+    assert pageto.resolve(pageto.OWNER, None)[0] is None and pageto.resolve(pageto.OWNER, "box-z")[0] is None
+
+
+def test_heal_to_pages_another_project_once_per_episode_instead_of_escalating(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="`to`"):
+        heal.validate({"check": "true", "to": 5})
+    p, d, up = _heal_setup(env, fix=None, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    for i in range(3):
+        assert "ops told" in heal.run(d, "svc", spec, now + 10 + i)[0]
+    notes = _notes_to("ops")
+    assert len(notes) == 1 and notes[0]["severity"] == "high" and "Heal check svc of project demo, unhealthy since" in notes[0]["spec"]
+    assert _heal_told(p) == ([], [])
+    up.touch()   # healthy ends the episode; the next one pages again
+    heal.run(d, "svc", spec, now + 30)
+    up.unlink()
+    _heal_to_self_fix_failed(p, d, up, spec, now + 200)
+    heal.run(d, "svc", spec, now + 210)
+    assert len(_notes_to("ops")) == 2
+    # An unknown target escalates as without `to`.
+    lost = dict(spec, to="nope")
+    up.touch()
+    heal.run(d, "svc", lost, now + 300)
+    up.unlink()
+    _heal_to_self_fix_failed(p, d, up, lost, now + 400)
+    assert "alerted" in heal.run(d, "svc", lost, now + 410)[0]
+
+
+def test_heal_to_gets_the_unknown_stretch_message_too(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, unknown_cap_s=600, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    heal.run(d, "svc", dark, now)
+    assert "ops told" in heal.run(d, "svc", dark, now + 700)[0]
+    heal.run(d, "svc", dark, now + 800)
+    notes = _notes_to("ops")
+    assert len(notes) == 1 and "could not tell" in notes[0]["spec"] and _heal_told(p) == ([], [])
