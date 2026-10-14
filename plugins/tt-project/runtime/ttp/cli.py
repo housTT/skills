@@ -1809,6 +1809,12 @@ def cmd_checks(a) -> None:
                         f"delivery.push_checks entry runs it on this head")
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
+            if todo and purpose == "candidate" and push.fast_path(Path(top), base, head, push.fast_globs(p.config() if p else None)):
+                todo = fast = push.fast_checks(base)
+                said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
+                        "only the whitespace and CRLF checks run (delivery.checks_fast_globs sets the paths)")
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
             selected = list(todo)
         except push.ScopeError as e:
             out.write(f"{e}\n")

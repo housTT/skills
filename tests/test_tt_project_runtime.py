@@ -62749,3 +62749,45 @@ def test_ttp_checks_pass_stdout_names_checks_log(env, tmp_path, monkeypatch, cap
     out = capsys.readouterr().out
     assert "(recorded)" in out and f"(full output: {run / 'checks.log'})" in out
     assert "$ test -f a.txt" in (run / "checks.log").read_text()
+
+
+def _fast_repo(tmp_path, files):
+    import subprocess as sp
+    g = lambda *a: sp.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    g("init", "-q")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    g("add", "-A"); g("commit", "-qm", "base")
+    base = g("rev-parse", "HEAD")
+    for name, body in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(body)
+    g("add", "-A"); g("commit", "-qm", "change")
+    return base, g("rev-parse", "HEAD")
+
+
+def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "data/x/y.csv": b"1,2\n"})
+    assert push.fast_path(tmp_path, base, head, push.fast_globs(None))
+    assert not push.fast_path(tmp_path, base, head, push.fast_globs({"delivery": {"checks_fast_globs": []}}))
+    assert not push.fast_path(tmp_path, base, head, [])
+    assert not push.fast_path(tmp_path, "", head, push.FAST_GLOBS)
+    assert push.fast_globs({"delivery": {"checks_fast_globs": ["*.rst"]}}) == ["*.rst"]
+
+
+def test_checks_fast_path_falls_back_for_code_manifest_or_script(tmp_path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "tests/test_a.py": b"x\n"})
+    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+
+
+def test_checks_fast_checks_flag_crlf_and_trailing_whitespace(tmp_path):
+    import subprocess as sp
+    from ttp import push
+    for body, rc in ((b"ok\n", 0), (b"crlf\r\n", 1), (b"trail \n", 1)):
+        d = tmp_path / str(rc) / str(len(body)); d.mkdir(parents=True)
+        base, head = _fast_repo(d, {"n.md": body})
+        rcs = [sp.run(c, shell=True, cwd=d, executable="/bin/bash", capture_output=True).returncode
+               for c in push.fast_checks(base)]
+        assert (max(rcs) != 0) == bool(rc), (body, rcs)

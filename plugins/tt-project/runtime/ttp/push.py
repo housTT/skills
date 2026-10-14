@@ -1028,6 +1028,35 @@ def whitespace_check(base: str) -> str:
     return f"git diff --check {shlex.quote(base)} HEAD -- . {LOG_EXCLUDE}"
 
 
+# `ttp checks` fast path: a diff touching only these paths skips the heavy checks. Override with
+# delivery.checks_fast_globs (a list; an empty list turns the fast path off). Matched with fnmatch
+# against the repo-relative path, so `*` also crosses `/`.
+FAST_GLOBS = ["*.md", "*.txt", "data/*", "docs/*"]
+
+
+def fast_globs(cfg: dict | None) -> list[str]:
+    v = ((cfg or {}).get("delivery") or {}).get("checks_fast_globs")
+    return FAST_GLOBS if v is None else [str(g) for g in v] if isinstance(v, list) else FAST_GLOBS
+
+
+def fast_path(repo: Path, base: str, head: str, globs: list[str]) -> bool:
+    """True when `base`..`head` changes at least one path and every one matches `globs`."""
+    import fnmatch
+    if not base or not globs:
+        return False
+    r = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", "-z", "--no-renames", base, head],
+                       capture_output=True, text=True)
+    paths = [x for x in r.stdout.split("\0") if x]
+    return r.returncode == 0 and bool(paths) and all(any(fnmatch.fnmatchcase(x, g) for g in globs) for x in paths)
+
+
+def fast_checks(base: str) -> list[str]:
+    """The checks of the fast path: the whitespace check and a CRLF check on the added lines."""
+    q = shlex.quote(base)
+    return [whitespace_check(base),
+            f"! git diff {q} HEAD -- . {LOG_EXCLUDE} | grep -q \"$(printf '^+.*\\r$')\""]
+
+
 def unexcluded_log_checks(checks: list[str]) -> list[str]:
     """Checks running `git diff --check` that do not leave out `*.log` files: committed run logs
     would fail them. They stay as configured; `ttp doctor` names them."""
