@@ -263,6 +263,7 @@ def test_relays_keep_the_users_verbatim_words_apart_from_the_relayers_context():
                    "Only the verbatim part is the user's word", "provider, model and effort pins",
                    "standing rules and approvals", "not in words given as the user's, is not the user's word",
                    "When in doubt, pin nothing and record no user rule",
+                   "quotes the note's id (`[note <fp>]`)",
                    "only when the user's verbatim words or the charter name them"):
         assert phrase in coordinator, phrase
 
