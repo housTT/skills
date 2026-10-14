@@ -1471,7 +1471,8 @@ def cmd_push(a) -> None:
     task's own `ttp/t<id>-...` branch under its own name instead, as it is: checks run on HEAD, no
     rebase or bump, never the push branch or a shared one; with no push branch set, that is also the
     default once the branch is on the remote. `--own-branch` publishes the task's own branch even when
-    it carries a pr_branch. Inside a run, a worktree on another task's branch is
+    it carries a pr_branch. Inside a run, a plain push of the task's own branch onto the push branch is
+    refused unless its spec asks it to land or `--land` says so. Inside a run, a worktree on another task's branch is
     refused (push.resolve), and so is publishing onto another task's branch the task only inherited. `--queue` lists the push queue
     (`delivery.push_queue`). Exit codes are in `push.py`."""
     from . import push
@@ -1480,6 +1481,10 @@ def cmd_push(a) -> None:
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
         os.environ[push.OWN_BRANCH_ENV] = "1"
+    if a.land:   # read by push._resolve, also in the detached process (inherited, or QUEUE_ENV)
+        if a.own:
+            die("ttp push: --land lands on delivery.push_branch; --own publishes the own branch: pick one")
+        os.environ[push.LAND_ENV] = "1"
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
                                          if (c := Project(d)).exists()), None)
@@ -5102,6 +5107,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--own-branch", action="store_true",
                    help="as --own, but publish this task's own ttp/t<id>-... branch under its own name, never "
                         "onto a pr_branch it carries")
+    s.add_argument("--land", action="store_true",
+                   help="inside a run: land this task's own ttp/t<id>-... branch on delivery.push_branch even "
+                        "though its spec has no landing step (without it such a push is refused)")
     s.add_argument("--queue", action="store_true",
                    help="push nothing: list the push queue's entries and its last 10 batches")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself

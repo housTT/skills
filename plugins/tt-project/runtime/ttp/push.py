@@ -1302,6 +1302,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
 
 LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
 OWN_BRANCH_ENV = "TTP_PUSH_OWN_BRANCH"   # `ttp push --own-branch`: the own branch under its own name
+LAND_ENV = "TTP_PUSH_LAND"   # `ttp push --land`: a task lands its own branch though its spec has no landing step
 
 
 def say_target(repo: Path, remote: str, branch: str) -> None:
@@ -1598,7 +1599,9 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
     under its own name as with --own, and with no push_branch set this task's
     own branch, once on the remote, is the default target (published as with --own). A branch based
     on a branch outside the flow work lands by (foreign_base) is never rebased onto the push target:
-    once on the remote as a fast-forward it is pushed there as with --own, else it is refused."""
+    once on the remote as a fast-forward it is pushed there as with --own, else it is refused. Inside a
+    run, the task's own ttp/t<id>-... branch lands on the push branch only when its spec asks it to
+    land (_told_to_land) or `--land` (LAND_ENV) says so; else it is refused, naming `--own`."""
     if own:
         return (*own_target(p, repo), True)
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
@@ -1639,7 +1642,26 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                 return remote, branch, True
         raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
+    if m and task and m.group(1) == task and not os.environ.get(LAND_ENV) and not _told_to_land(p, task, d):
+        raise ValueError(f"task #{task}'s spec does not ask it to land on {remote}/{push_to}, and a plain "
+                         f"`ttp push` from its own branch {branch} would. Publish {branch} under its own name "
+                         f"with `ttp push --own --detach`; only if the spec does ask to land on the push "
+                         f"branch, say so with `ttp push --land --detach`")
     return remote, push_to, False
+
+
+def _told_to_land(p: Project, task: str, d: dict) -> bool:
+    """Whether task `task` may land its own branch on the push branch with a plain `ttp push`: its
+    spec or title has a landing step (settinghold.lands; a `no_push:` line never does), or it is a
+    review. A task the project has no row of is not gated (nothing to read)."""
+    from . import settinghold
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return True
+    if not t or t.get("kind") == "review":
+        return True
+    return settinghold.lands(t, str(d.get("push_branch") or ""))
 
 
 def _commit_of(repo: Path, ref: str) -> str:
@@ -2811,7 +2833,7 @@ KEEP_S = 30 * 86400        # finished markers and logs older than this go when t
 QUEUED_S = 900             # a queued push the daemon has not started by then is recorded as failed
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.
 QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES",
-             OWN_BRANCH_ENV)
+             OWN_BRANCH_ENV, LAND_ENV)
 
 
 def _run_lock(marker: Path) -> Path:

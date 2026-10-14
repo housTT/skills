@@ -23433,6 +23433,50 @@ def test_push_refuses_a_worktree_on_another_tasks_branch_at_once(env, monkeypatc
     assert push.resolve(p, repo) == ("origin", "proj", False)
 
 
+def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says_so(env, monkeypatch, capsys):
+    # Replays the upstream note: from a task worktree on ttp/t<id>-..., whose spec allows pushing only that
+    # branch, `ttp push --detach` targeted the push branch. It is refused at once, naming --own and --land.
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(own_only))
+    for args in (["push"], ["push", "--detach"]):
+        assert _ttp(*args) == 2, args
+        captured = capsys.readouterr()
+        assert "pushing" not in captured.out and "origin/proj" not in captured.out, captured.out
+        assert "does not ask it to land on origin/proj" in captured.err and "ttp push --own --detach" in captured.err \
+            and "ttp push --land --detach" in captured.err, captured.err
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # --own publishes the own branch, never the push branch.
+    assert push.resolve(p, repo, True) == ("origin", f"ttp/t{own_only}-fix", True)
+    # --land is the explicit target: it lands, also in the detached process (QUEUE_ENV).
+    assert push.LAND_ENV in push.QUEUE_ENV
+    monkeypatch.setenv(push.LAND_ENV, "1")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv(push.LAND_ENV)
+    assert _ttp("push", "--land", "--own") != 0
+    # A spec with a landing step lands as before; a `no_push:` line or a negated step never counts.
+    for spec, lands in (("Then land it with `ttp push`.", True), ("Land it on the push branch.", True),
+                        ("Run `ttp push`.\nno_push: experiment only", False), ("Do not run `ttp push`.", False)):
+        p.db.conn.execute("UPDATE tasks SET spec=? WHERE id=?", (spec, own_only))
+        p.db.conn.commit()
+        try:
+            got = push.resolve(p, repo)
+        except ValueError as e:
+            got = str(e)
+        assert (got == ("origin", "proj", False)) is lands, (spec, got)
+    # A review lands from its own branch as before; outside a run nothing is gated.
+    review = p.db.add_task("review", kind="review")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{review}-review")
+    monkeypatch.setenv("TTP_TASK", str(review))
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv("TTP_TASK")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+
+
 def test_push_defaults_to_the_tasks_own_branch_on_the_remote_without_a_push_branch(env, monkeypatch, capsys):
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])

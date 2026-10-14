@@ -33,7 +33,8 @@
 - Only when the delivery policy line says "code tasks may land on <branch> with ttp push=True"
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch.
 - Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
-  `git push` to a shared branch.
+  `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
+  words, add `--land`.
 - It refuses uncommitted changes, rebases onto the project's target branch, runs the project's
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
 - Its checks can outlast a tool call: run `ttp push --detach`. It pushes in a process of its own,
