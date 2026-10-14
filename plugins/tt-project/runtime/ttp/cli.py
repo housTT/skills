@@ -2381,10 +2381,7 @@ def cmd_lock(a) -> None:
             wait_dir = None
             print(f"ttp lock: not under the run's agent; waiting for {a.resource} without the run's cap",
                   file=sys.stderr, flush=True)
-        if timeout and time.time() - started > timeout:
-            _end_wait()
-            die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
-                f"`waiting`, waiting_for `{a.resource}`, retry_when `ttp lock --probe {a.resource}`", 75)
+        # Noted before any give-up: a wait that ends at once under load still shows as a wait, not a stall.
         if time.time() - told >= 120:
             ahead = len(lk.queued(where, res)) - 1
             line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
@@ -2398,6 +2395,10 @@ def cmd_lock(a) -> None:
                 except OSError:
                     pass
             told = time.time()
+        if timeout and time.time() - started > timeout:
+            _end_wait()
+            die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
+                f"`waiting`, waiting_for `{a.resource}`, retry_when `ttp lock --probe {a.resource}`", 75)
         time.sleep(poll_s(3))
 
 def cmd_landed(a) -> None:
