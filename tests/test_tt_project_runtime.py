@@ -43981,6 +43981,70 @@ def test_devq_health_gate_refusal_skips_the_job_after_health_wait(devq_dir, tmp_
     assert m["attempts"] == 0 and not (tmp_path / "ran").exists()
 
 
+def _gone(pid, timeout=10):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_devq_stops_a_job_whose_output_matches_a_wedge_pattern_and_frees_the_device(devq_dir, tmp_path):
+    d, pidf = devq_dir, tmp_path / "pid"
+    t0 = time.time()
+    _devq_submit(d, {}, "hang-1", f"echo $$ > {pidf}; echo warming up; "
+                 "echo 'TIMEOUT: device timeout, potential hang detected, the device is unrecoverable'; sleep 120",
+                 timeout_s=300)
+    _devq_submit(d, {}, "next-1", "echo fine")
+    m = _devq_marker(d, "hang-1")
+    assert m["status"] == "wedged" and m["rc"] is None, m
+    assert m["wedge"]["pattern"] == "potential hang detected" and "the device is unrecoverable" in m["wedge"]["line"]
+    assert "wedged: output matched" in m["reason"]
+    assert time.time() - t0 < 60, "stopped early, not at its 300 s limit"
+    assert _gone(int(pidf.read_text())), "the wedged job's process group was stopped"
+    assert _devq_marker(d, "next-1")["status"] == "done", "the device went to the next job"
+    assert not list((d / "running").iterdir()), "no job lock left behind"
+    assert "kind=wedged" in (d / "drops.log").read_text()
+    probe = _devq("probe", d, "hang-1")
+    assert probe.returncode == 0 and "wedged" in probe.stdout and "recover the device" in probe.stdout
+
+
+def test_devq_wedge_patterns_spare_a_clean_job_and_a_job_overrides_them(devq_dir, tmp_path):
+    d = devq_dir
+    _devq_submit(d, {}, "clean-1", "echo step 1; sleep 0.3; echo step 2 ok")
+    _devq_submit(d, {}, "off-1", "echo 'potential hang detected'; sleep 0.3; echo done anyway", wedge_patterns=[])
+    _devq_submit(d, {}, "own-1", "echo 'MYHANG at 3'; sleep 120", wedge_patterns=["MY[H]ANG"], timeout_s=300)
+    clean, off, own = (_devq_marker(d, j) for j in ("clean-1", "off-1", "own-1"))
+    assert (clean["status"], clean["rc"]) == ("done", 0) and "wedge" not in clean
+    assert pathlib.Path(clean["log"]).read_text().split("\n")[1] == "step 2 ok"
+    assert (off["status"], off["rc"]) == ("done", 0), "[] turns the check off for that job"
+    assert own["status"] == "wedged" and own["wedge"] == {"pattern": "MY[H]ANG", "line": "MYHANG at 3"}
+    assert not list((d / "running").iterdir()), "no job lock left behind"
+    bad = _devq("submit", d, json.dumps(DEVQ_FAST), json.dumps({"id": "bad-1", "cmd": "true", "wedge_patterns": ["("]}))
+    assert bad.returncode == 2 and "not a regex" in bad.stderr
+
+
+def test_devq_wedge_patterns_default_config_check_and_partial_lines(tmp_path):
+    from ttp import devq
+    assert devq.settings({})["wedge_patterns"] == devq.WEDGE_PATTERNS and devq.WEDGE_PATTERNS
+    assert devq.config_problems("r", {"wedge_patterns": []}) == []
+    assert any("not a regex" in x for x in devq.config_problems("r", {"wedge_patterns": ["a(", "ok"]}))
+    assert devq.config_problems("r", {"wedge_patterns": "x"})
+    log, pats = tmp_path / "log", [re.compile(x) for x in devq.WEDGE_PATTERNS]
+    log.write_bytes(b"ok\nRead 0xffffffff over PCIe ID 0: the board sh")
+    at, hit = devq.scan_wedge(log, 0, pats)
+    assert (at, hit) == (3, None), "a line not yet ended waits for its end"
+    with open(log, "ab") as f:
+        f.write(b"ould be reset.\nmore\n")
+    at, hit = devq.scan_wedge(log, at, pats)
+    assert hit == ("the board should be reset", "Read 0xffffffff over PCIe ID 0: the board should be reset.")
+    assert devq.wedge_patterns({"wedge_patterns": ["x"]}, devq.settings({})) == ["x"]
+    assert devq.wedge_patterns({}, devq.settings({"wedge_patterns": []})) == []
+
+
 def test_devq_probe_exit_codes(devq_dir):
     import fcntl
     d = devq_dir
