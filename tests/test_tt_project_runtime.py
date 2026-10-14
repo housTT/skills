@@ -49139,26 +49139,26 @@ def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_c
 
 def test_heal_check_marks_a_known_owned_state_with_one_output_line():
     from ttp import heal
-    assert heal.known_run(75, "probing\nttp-heal: known trays: power work on the box\n") == \
-        ("trays", "power work on the box")
+    assert heal.known_run(75, "probing\nttp-heal: known recovery: power work on the box\n") == \
+        ("recovery", "power work on the box")
     assert heal.known_run(1, "  ttp-heal: known the user: resource paused (bench)  ") == \
         ("the user", "resource paused (bench)")
-    assert heal.known_run(255, "ttp-heal: known trays: x") is None, "only on exit 75 or 1"
-    assert heal.known_run(0, "ttp-heal: known trays: x") is None
-    assert heal.known_run(75, "ttp-heal: known trays:") is None, "it needs a reason"
+    assert heal.known_run(255, "ttp-heal: known recovery: x") is None, "only on exit 75 or 1"
+    assert heal.known_run(0, "ttp-heal: known recovery: x") is None
+    assert heal.known_run(75, "ttp-heal: known recovery:") is None, "it needs a reason"
     assert heal.known_run(75, "ttp-heal: known : why") is None, "and an owner"
-    assert heal.known_run(75, "it says ttp-heal: known trays: x inline") is None, "only a line of its own counts"
+    assert heal.known_run(75, "it says ttp-heal: known recovery: x inline") is None, "only a line of its own counts"
 
 
 def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_line_is_unknown_again(env):
     from ttp import heal
     p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=3600, escalate="coordinator")
     spec, now = _heal_spec(p), time.time()
-    owned = dict(spec, check="echo 'ttp-heal: known trays: power work on the box'; exit 75")
+    owned = dict(spec, check="echo 'ttp-heal: known recovery: power work on the box'; exit 75")
     for t in (0, 61 * 60, 300 * 60):
-        assert heal.run(d, "svc", owned, now + t) == ("ok (known, trays: power work on the box)", None)
+        assert heal.run(d, "svc", owned, now + t) == ("ok (known, recovery: power work on the box)", None)
     assert heal.describe({"name": "svc"}, spec, p.db, now + 300 * 60).startswith(
-        "svc: known (trays: power work on the box);")
+        "svc: known (recovery: power work on the box);")
     assert heal.summary(p.db, now + 300 * 60)["unknown"] == 1
     # Exit 1 with the line: past its grace, still no fix and no task.
     bad = dict(spec, check="echo 'ttp-heal: known the user: resource paused'; exit 1")
