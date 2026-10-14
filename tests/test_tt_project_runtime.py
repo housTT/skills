@@ -47590,13 +47590,15 @@ def _hold_check(p, holder):
 
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
 def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outage(env, escalate):
-    from ttp import heal
+    from ttp import alerts, heal
     from ttp import machine_ledger as ml
     from ttp import machines as mm
+    from ttp import schedule as sched
     mm.add("box-a", tags="device")
     p, d, up = _heal_setup(env)
     holder = p.root / "holder"
     spec = {**_hold_check(p, holder), "escalate": escalate}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": spec})
     now = time.time()
     ml.set_outage("box-a", "unrelated repair", "user", "1d", now=now)
     ceiling = heal.UNTENANTED_HOLD_S
@@ -47620,19 +47622,21 @@ def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outag
     assert "held with no holder" in text and "unrelated repair" in text and "box-a" in text
     # Unknown runs without the line keep the page; a run that answers without it clears it.
     heal.run(d, "svc", {**spec, "check": "exit 75"}, now + ceiling + 1000)
-    assert heal.hold_paged(p.db, "svc")
+    assert alerts.sweep(p.db, now + ceiling + 1001) == [] and "hold_since" in heal.state(p.db, "svc")
     holder.touch()
     heal.run(d, "svc", {**spec, "check": "exit 1"}, now + ceiling + 1200)
-    assert not heal.hold_paged(p.db, "svc")
+    assert "hold_since" not in heal.state(p.db, "svc")
     if escalate == "user":
-        assert p.db.one("SELECT cleared FROM alerts WHERE key='heal-hold:svc'")["cleared"] is not None
+        assert [e["key"] for e in alerts.sweep(p.db, now + ceiling + 1201)] == ["heal-hold:svc"]
+        assert p.db.one("SELECT cleared_why FROM alerts WHERE key='heal-hold:svc'")["cleared_why"] == \
+            "condition cleared"
     # The project's heal.untenanted_hold_s sets the ceiling.
     d.cfg.setdefault("heal", {})["untenanted_hold_s"] = 600
     holder.unlink()
     t1 = now + 2 * ceiling
     heal.run(d, "svc", spec, t1)
     heal.run(d, "svc", spec, t1 + 600)
-    assert heal.hold_paged(p.db, "svc")
+    assert len(pages()[0 if escalate == "user" else 1]) == 2
 
 
 def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):
@@ -47648,7 +47652,7 @@ def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):
     plain = heal.validate({"check": "echo 'known outage: standing down'; exit 75", "machine": "box-a", "grace_s": 0})
     for t in (now, now + 3600, now + 5 * heal.UNTENANTED_HOLD_S):
         heal.run(d, "svc", plain, t)
-    assert not heal.hold_paged(p.db, "svc") and "hold_since" not in heal.state(p.db, "svc")
+    assert "hold_since" not in heal.state(p.db, "svc")
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")
     # An untenanted hold on a resource the user paused is known: quiet too.
     spec = {**_hold_check(p, p.root / "holder"), "resource": "box-a-device"}
@@ -47656,7 +47660,47 @@ def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):
     t0 = now + 6 * heal.UNTENANTED_HOLD_S
     for t in (t0, t0 + heal.UNTENANTED_HOLD_S + 60):
         heal.run(d, "svc", spec, t)
-    assert not heal.hold_paged(p.db, "svc")
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")
+
+
+@pytest.mark.parametrize("ender", ["schedule disabled", "schedule deleted", "escalate coordinator", "user pause"])
+def test_heal_hold_page_ends_like_the_heal_alert(env, ender):
+    """The untenanted-hold page shares the heal alert's lifecycle (cleared_why): the sweep ends it once the
+    check has no enabled schedule with a heal block, escalation moves to the coordinator or the user pauses
+    its resource, and the next run does not page the user again."""
+    from ttp import alerts, heal
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    p, d, up = _heal_setup(env)
+    spec = {**_hold_check(p, p.root / "holder"), "resource": "box-a-device"}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": spec})
+    now, ceiling = time.time(), heal.UNTENANTED_HOLD_S
+    for t in (now, now + ceiling):
+        heal.run(d, "svc", spec, t)
+
+    def page():
+        return p.db.one("SELECT * FROM alerts WHERE key='heal-hold:svc' ORDER BY id DESC LIMIT 1")
+
+    assert page()["cleared"] is None
+    assert alerts.sweep(p.db, now + ceiling + 1) == [] and page()["cleared"] is None   # still held: kept
+    if ender == "schedule disabled":
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    elif ender == "schedule deleted":
+        p.db.x("DELETE FROM schedules WHERE name='svc'")
+    elif ender == "escalate coordinator":
+        p.set_config("heal.escalate", "coordinator")
+        d.cfg = p.config()
+    else:
+        coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    assert [e["key"] for e in alerts.sweep(p.db, now + ceiling + 2)] == ["heal-hold:svc"]
+    why = {"schedule disabled": "the check has no enabled schedule with a heal block",
+           "schedule deleted": "the check has no enabled schedule with a heal block",
+           "escalate coordinator": "escalation moved to coordinator",
+           "user pause": "box-a-device is paused (by the user)"}[ender]
+    assert page()["cleared_why"] == why
+    if ender in ("escalate coordinator", "user pause"):   # the hold goes on: no second user page
+        heal.run(d, "svc", spec, now + ceiling + 300)
+        assert len(p.db.q("SELECT id FROM alerts WHERE key='heal-hold:svc'")) == 1
 
 
 def test_heal_broker_preset_reports_a_hold_with_no_holder(env, tmp_path):

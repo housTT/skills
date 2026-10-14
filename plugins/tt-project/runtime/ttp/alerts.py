@@ -184,9 +184,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
         return heal.holds(db, arg, now)
-    if kind == "heal-hold":   # an untenanted hold's page lasts until a check run no longer reports it
+    if kind == "heal-hold":   # an untenanted hold's page: the heal alert's lifecycle (heal.cleared_why)
         from . import heal
-        return heal.hold_paged(db, arg)
+        return heal.cleared_why(db, arg, now, hold=True) is None
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
@@ -351,9 +351,9 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
         for ep in db.q("SELECT * FROM alerts WHERE cleared IS NULL ORDER BY id"):
             kind, _, arg = ep["key"].partition(":")
             why = "no longer reported" if not _checkable(ep["key"]) else "condition cleared"
-            if kind == "heal":
+            if kind in ("heal", "heal-hold"):
                 from . import heal
-                why = heal.cleared_why(db, arg, now)
+                why = heal.cleared_why(db, arg, now, hold=kind == "heal-hold")
                 if why is None:
                     continue
             elif holds(db, ep["key"], _since(ep), now):
@@ -363,7 +363,7 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 # A status line clears as quietly as it was raised.
                 sev = CLEARED_SEVERITY.get(kind) or ("normal" if _urgent(ep["severity"]) else "low")
                 text = "Cleared: " + CLEARED_TEXT[kind].format(arg=arg)
-            if kind == "heal" and why != "condition cleared":
+            if kind in ("heal", "heal-hold") and why != "condition cleared":
                 text, sev = f"Cleared: {ep['key']} user alert: {why}.", "low"
             closed.append(_close(db, ep, now, why, text, sev))
     return closed

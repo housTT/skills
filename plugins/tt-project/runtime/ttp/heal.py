@@ -58,9 +58,11 @@ no tenant, so queued work cannot use it. Seen on every run (any exit code, 75 in
 `heal.untenanted_hold_s` (UNTENANTED_HOLD_S), it pages once per stretch, whatever else keeps the check
 quiet: a known machine outage, a check standing down with 75, a known fault or an observation mute. The
 page is a keyed high alert `heal-hold:<name>` to the user, or with `escalate` "coordinator" one high
-observation; a run that answers (0 or 1) without the line ends the stretch and clears the alert. Only a
-pause of the check's `resource` that the user set, or whose reason names the check, keeps it quiet. An
-outage keeps silencing everything else the check reports.
+observation. Only a pause of the check's `resource` that the user set, or whose reason names the check,
+keeps it quiet. The alert lives like the check's `heal:<name>` one (cleared_why with `hold`): the sweep
+clears it once a run answers (0 or 1) without the line, the check loses its enabled schedule or heal
+block, escalation moves to the coordinator or such a pause covers it. An outage keeps silencing
+everything else the check reports.
 
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
 the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
@@ -541,7 +543,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if rc == 0:
         was = st.get("status")
         nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported",
-                                  "hold_since", "hold_paged")
+                                  "hold_since")
                if k in st}
         _save(db, name, {**nxt, "status": "healthy"})
         t = db.task(int(st["task"])) if st.get("task") else None
@@ -786,24 +788,18 @@ def _untenanted_s(host: Any) -> float:
 
 def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: str, now: float) -> None:
     """Track a device held with no tenant (module doc) and page once it outlasts heal.untenanted_hold_s,
-    whatever outage, fault or mute keeps the rest of the check quiet. Changes `st`; its caller saves it."""
+    whatever outage, fault or mute keeps the rest of the check quiet. The alert's open episode keeps
+    repeats quiet and the alerts sweep ends it (cleared_why with `hold`). Changes `st`; its caller saves it."""
     db = host.p.db
     if not untenanted(out):
-        if rc in (0, 1) and st.pop("hold_since", None) is not None and st.pop("hold_paged", None):
-            from . import alerts
-            alerts.close_key(db, HOLD_KEY + name, "the hold has a tenant again or ended", now)
+        if rc in (0, 1):
+            st.pop("hold_since", None)
         return
     since = float(st.setdefault("hold_since", now))
     ceiling = _untenanted_s(host)
-    if st.get("hold_paged") or now - since < ceiling:
+    if now - since < ceiling or _hold_known(db, spec, name):
         return
     res = str(spec.get("resource") or "")
-    try:
-        pause = (db.paused_resources() or {}).get(res) if res else None
-    except Exception:
-        pause = None
-    if pause and _pause_names(pause, name):
-        return   # the user paused it, or the pause names this check: the hold is known
     what = machine_of(spec) or res or "its device"
     try:
         from . import machine_ledger
@@ -815,7 +811,6 @@ def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: s
             + (f"The known outage of {what} ({known.get('why') or 'no reason given'}) does not cover an "
                f"untenanted hold. " if known else "")
             + f"Find who holds it and release it, or record why it must stay. Last check (exit {rc}): {out[-300:]}")
-    st["hold_paged"] = now
     if escalate_to(host, spec) == "coordinator":
         fp = f"{HOLD_KEY}{name}:{since:.0f}"
         if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -825,9 +820,16 @@ def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: s
     host.alert(HOLD_KEY + name, text, "high")
 
 
-def hold_paged(db: DB, name: str) -> bool:
-    """The untenanted-hold page of check `name` is still live (alerts: `heal-hold:<name>`)."""
-    return bool(state(db, name).get("hold_paged"))
+def _hold_known(db: Any, spec: dict, name: str) -> str:
+    """Why a pause keeps the check's untenanted hold quiet: its `resource` is paused by the user or with a
+    reason naming the check (_pause_names); else ""."""
+    res = str(spec.get("resource") or "")
+    try:
+        pause = (db.paused_resources() or {}).get(res) if res else None
+    except Exception:
+        pause = None
+    return f"{res} is paused ({'by the user' if pause.get('by') == 'user' else 'naming the check'})" \
+        if pause and _pause_names(pause, name) else ""
 
 
 def _paused_resource(db: Any, spec: dict) -> str:
@@ -907,13 +909,19 @@ def _known_fault(spec: dict, st: dict, now: float) -> bool:
                      or now - float(st.get("since", now)) < min(OUTAGE_S, spec["grace_s"] or OUTAGE_S)))
 
 
-def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
-    """Live reason the check's user alert ended; None while it still needs the user."""
+def cleared_why(db: DB, name: str, now: float | None = None, hold: bool = False) -> str | None:
+    """Live reason the check's user alert ended (with `hold`, its untenanted-hold page `heal-hold:<name>`);
+    None while it still needs the user."""
     now = time.time() if now is None else now
     row = db.one("SELECT payload FROM schedules WHERE name=? AND enabled=1", (name,))
     spec = of(json.loads(row["payload"] or "{}")) if row else None
     st = state(db, name)
-    if not spec or st.get("status") == "healthy":
+    if hold:
+        if not spec:
+            return "the check has no enabled schedule with a heal block"
+        if "hold_since" not in st:
+            return "condition cleared"
+    elif not spec or st.get("status") == "healthy":
         return "condition cleared"
     escalation = spec.get("escalate")
     if not escalation:
@@ -931,6 +939,8 @@ def cleared_why(db: DB, name: str, now: float | None = None) -> str | None:
                 continue
     if escalation == "coordinator":
         return "escalation moved to coordinator"
+    if hold:
+        return _hold_known(db, spec, name) or None
     if _known_fault(spec, st, now):
         return f"known_fault applies to current failure: {spec['known_fault']}"
     return None
