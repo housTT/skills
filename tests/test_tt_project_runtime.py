@@ -44043,7 +44043,7 @@ def test_detach_inside_a_pid_namespace_that_ends_with_the_command_still_runs_the
     # load, so only the namespace's end stops it.
     for name, pidns, nap in (("bare", "", 300), ("job", push.pid_ns(), 1)):
         r = subprocess.run([*box, sys.executable, str(TTP), "detach", name, "--", "sh", "-c", f"sleep {nap}; echo done; exit 5"],
-                           env={**e, "TTP_PIDNS": pidns}, cwd=str(p.root), capture_output=True, text=True, timeout=30)
+                           env={**e, "TTP_PIDNS": pidns}, cwd=str(p.root), capture_output=True, text=True, timeout=180)   # ttp startup alone took >30 s at host load 187
         assert r.returncode == 0, r
     bare = _check_until_ended(p, run_dir / "bare.rc")
     assert "gone without an exit code (it " in bare.stdout and (run_dir / "bare.lost").exists(), bare
