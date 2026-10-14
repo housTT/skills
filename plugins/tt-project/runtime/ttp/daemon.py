@@ -3557,6 +3557,13 @@ class Daemon:
         seconds (None: never) or on every run with "repeat": true. Returns 1 if it filed a note."""
         now = time.time()
         last = paged.get(k)
+        ep = _line_episode(obs)
+        if last and ep and last.get("episode") not in (None, ep):
+            last = None   # another episode of a keyed line: a new note, as a new issue would be (screen)
+        elif last:
+            ep = ep or last.get("episode")   # none changes nothing; one paged without adopts the first it sees
+            if ep:
+                last["episode"] = ep
         if last and obs.get("repeat") is not True and (rewake is None or now - float(last["at"]) < rewake):
             return 0
         if filed >= pageto.PER_RUN:
@@ -3571,7 +3578,8 @@ class Daemon:
         if got not in ("sent", "duplicate"):
             log(self.p, f"watcher {name}: note to {target}: {got}; retried on its next run")
             return 0
-        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1}
+        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1,
+                    **({"episode": ep} if ep else {})}
         log(self.p, f"watcher {name}: paged {target}: {text[:200]}")
         return 1
 
@@ -8027,6 +8035,14 @@ def _line_key(obs: dict, body: str) -> str:
     if isinstance(key, str) and key.strip():
         return key.strip()
     return "text:" + hashlib.sha256(" ".join(body.split()).encode()).hexdigest()[:16]
+
+
+def _line_episode(obs: dict) -> str | None:
+    """A keyed line's `episode`, as the screen keeps it (screen.screen), else None."""
+    key, ep = obs.get("key"), obs.get("episode")
+    if not (isinstance(key, str) and key.strip() and isinstance(ep, str)):
+        return None
+    return ep.strip()[:scr.EPISODE_MAX] or None
 
 
 def _observations(text: str) -> list[dict]:

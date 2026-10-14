@@ -64040,3 +64040,46 @@ def test_heal_to_gets_the_unknown_stretch_message_too(env):
     heal.run(d, "svc", dark, now + 800)
     notes = _notes_to("ops")
     assert len(notes) == 1 and "could not tell" in notes[0]["spec"] and _heal_told(p) == ([], [])
+
+
+def test_heal_to_pages_again_once_a_known_run_or_a_fresh_episode_ends_the_last_one(env):
+    """Its page marks clear wherever the unknown stretch or the episode they belong to ends: a known,
+    owned run (`ttp-heal: known`) and a fresh episode after a long unknown stretch."""
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    owned = dict(spec, check="echo 'ttp-heal: known repair: board swap'; exit 75")
+    heal.run(d, "svc", dark, now)
+    assert "ops told" in heal.run(d, "svc", dark, now + 700)[0]
+    assert "known" in heal.run(d, "svc", owned, now + 800)[0]   # ends that stretch
+    heal.run(d, "svc", dark, now + 900)
+    assert "ops told" in heal.run(d, "svc", dark, now + 1600)[0]
+    assert len([n for n in _notes_to("ops") if "could not tell" in n["spec"]]) == 2
+    _heal_to_self_fix_failed(p, d, up, spec, now + 1700)
+    assert "ops told" in heal.run(d, "svc", spec, now + 1710)[0]
+    heal.run(d, "svc", dict(dark, unknown_cap_s=0), now + 1800)   # a long unknown stretch, its task over
+    _heal_to_self_fix_failed(p, d, up, spec, now + 3000)   # back unhealthy: a fresh episode
+    assert "ops told" in heal.run(d, "svc", spec, now + 3010)[0]
+    assert len([n for n in _notes_to("ops") if "still fails" in n["spec"]]) == 2
+
+
+def test_command_watcher_to_pages_a_keyed_lines_new_episode_again(env, monkeypatch):
+    """A keyed line's `episode` works for a paged line as for an observed one: another episode pages
+    again; the same one, or none, does not; a key paged without one adopts the first it sees."""
+    run, _, _ = _json_watcher(env, monkeypatch)
+    _peer(env, "ops")
+    line = {"text": "job 7 failed", "severity": "high", "key": "job-fail", "episode": "7", "to": "ops"}
+    run("hw", line)
+    run("hw", dict(line, text="job 8 failed", episode="8"))
+    assert [n["spec"].split(": ", 1)[1] for n in _notes_to("ops")] == ["job 7 failed", "job 8 failed"]
+    run("hw", dict(line, text="job 8 failed (still)", episode="8"))
+    run("hw", dict(line, text="job 8 failed (still)", episode=None))
+    assert len(_notes_to("ops")) == 2
+    plain = {"text": "box-a: held", "severity": "high", "key": "hold", "to": "ops"}
+    run("hw", plain)
+    run("hw", dict(plain, text="box-a: held (since boot 1)", episode="boot 1"))   # adopted: no note
+    assert len(_notes_to("ops")) == 3
+    run("hw", dict(plain, text="box-a: held (since boot 2)", episode="boot 2"))
+    assert len(_notes_to("ops")) == 4

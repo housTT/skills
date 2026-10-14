@@ -631,7 +631,8 @@ def known_outage(spec: dict, now: float) -> tuple[str, dict] | None:
 
 def _fresh(st: dict, *also: str) -> None:
     """Start a new unhealthy episode: grace again, no task, nothing escalated (module doc). Keeps `fixes`."""
-    for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", *also):
+    for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", "paged", "paged_unknown",
+                *also):
         st.pop(key, None)
 
 
@@ -642,7 +643,7 @@ def _quiet_outage(host: Any, name: str, st: dict, known: tuple[str, dict], now: 
     alias, rec = known
     until = timefmt.long(float(rec["until"]), host.p)
     alerts.close_key(db, STATE_KEY + name, f"known outage of {alias} until {until}: {rec.get('why') or ''}", now)
-    for key in ("task", "escalated", "alerted", "observed", "phase"):
+    for key in ("task", "escalated", "alerted", "observed", "phase", "paged"):
         st.pop(key, None)
     st["known_outage"] = alias
     _save(db, name, st)
@@ -723,7 +724,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             st["task"] = keep
     owned = known_run(rc, out)
     if owned:   # a known, owned state: ends the unknown stretch; no cap message, fix or task
-        for key in ("unknown_since", "route_only", "unknown_told"):
+        for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown"):
             st.pop(key, None)
         st["known_run"] = f"{owned[0]}: {owned[1]}"[:300]
         _save(db, name, st)
