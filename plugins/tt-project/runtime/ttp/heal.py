@@ -691,7 +691,11 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if known:
         st["known_outage"] = known[0]
     elif st.pop("known_outage", None):   # the known outage ended: a check still failing gets its grace,
+        t = db.task(int(st["task"])) if st.get("task") else None
+        keep = st.get("task") if t is not None and t["status"] in OPEN else None   # no second task
         _fresh(st, "unknown_since", "route_only")   # an unknown one a new stretch
+        if keep:
+            st["task"] = keep
     owned = known_run(rc, out)
     if owned:   # a known, owned state: ends the unknown stretch; no cap message, fix or task
         for key in ("unknown_since", "route_only", "unknown_told"):

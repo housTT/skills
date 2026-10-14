@@ -49718,6 +49718,27 @@ def test_heal_known_machine_outage_keeps_the_check_quiet_then_grace_after_it(env
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
 
 
+def test_heal_known_outage_end_keeps_a_still_open_self_fix_task(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, grace_s=0, machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "2h", now=now)
+    heal.run(d, "svc", spec, now + 10)
+    tid = p.db.add_task("open self-fix", kind="code") if hasattr(p.db, "add_task") else None
+    assert tid
+    st = heal.state(p.db, "svc")
+    st["task"] = tid
+    heal._save(p.db, "svc", st)
+    ml.clear_outage("box-a")
+    heal.run(d, "svc", spec, now + 60)
+    heal.run(d, "svc", spec, now + 120)
+    assert heal.state(p.db, "svc")["task"] == tid
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] <= 1
+
+
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
 def test_heal_unknown_check_under_a_known_machine_outage_tells_no_one(env, escalate):
     from ttp import heal
