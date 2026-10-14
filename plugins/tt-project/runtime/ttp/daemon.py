@@ -5361,7 +5361,8 @@ class Daemon:
             log(self.p, "setup question asked of the user: " + ", ".join(settinghold.SETTINGS))
 
     def _hold_probe(self, task: dict, probe: str, now: float) -> str:
-        """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, else ''."""
+        """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, or once a
+        `ttp detach --check` exited detach.FAILED_RC (the jobs ended, one failed: the why says so), else ''."""
         tid = task["id"]
         self._drop_stale_probe(tid, probe)
         got = self._probe_rc.get(tid)
@@ -5369,12 +5370,14 @@ class Daemon:
             if got[0] == 0:
                 self._probe_rc.pop(tid, None)
                 return "its when probe passed"
+            if detach.failed_check(probe, got[0]):   # the jobs it waits on ended: over, and the why says one failed
+                self._probe_rc.pop(tid, None)
+                return (f"the detached job its when probe waits on ended but failed or left no exit code "
+                        f"(exit {got[0]}): {probe[:300]}")
             if got[0] not in NOT_YET_RCS:
                 fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
                 if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
                     why = got[0] if isinstance(got[0], str) else f"exit {got[0]}"
-                    if detach.failed_check(probe, got[0]):
-                        why += ": a detached job it waits on failed or left no exit code"
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                                 "VALUES(?,?,?,?,?,?,?,?)",
                                 (now, "daemon", "hold_probe_broken", fp, "normal",

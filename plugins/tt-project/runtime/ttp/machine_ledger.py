@@ -68,7 +68,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ends, machines, project
+from . import detach, ends, machines, project
 
 LEDGER = "machine-changes.json"
 ROUTES = "machine-routes.json"
@@ -238,7 +238,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         for k in was:
             c[k] = new[k]
         if "expires" in was:
-            for k in ("probe_passed", "page"):
+            for k in ("probe_passed", "probe_job_failed", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
@@ -251,6 +251,8 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
     now = time.time() if now is None else now
     if c.get("closed") or c.get("kind") == POWER_CYCLE:   # a power cycle has nothing to undo: it closes itself
         return ""
+    if c.get("probe_job_failed"):
+        return f"the detached job its until-probe waits on ended but failed (exit {c['probe_job_failed']})"
     if c.get("probe_passed"):
         return "its until-probe passed"
     if float(c.get("expires") or 0) <= now:
@@ -703,14 +705,17 @@ class Probes:
             del self._procs[cid]
             if rc is None:
                 ends._kill(proc)
-            elif rc == 0:
-                passed.append((cid, probe))
+            elif rc == 0 or detach.failed_check(probe, rc):   # the jobs it waits on ended, even if one failed
+                passed.append((cid, probe, rc))
         if passed:
+            ids = {(cid, probe): rc for cid, probe, rc in passed}
             with _locked():
                 doc = _read(LEDGER, {"next": 1, "changes": []})
                 for c in doc.get("changes", []):
-                    if (c.get("id"), c.get("probe")) in passed and not c.get("closed"):   # not a probe an edit replaced
+                    if (c.get("id"), c.get("probe")) in ids and not c.get("closed"):   # not a probe an edit replaced
                         c["probe_passed"] = now
+                        if ids[(c["id"], c["probe"])]:
+                            c["probe_job_failed"] = ids[(c["id"], c["probe"])]
                 _write(LEDGER, doc)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
@@ -724,7 +729,7 @@ class Probes:
             self._probed[cid] = now
             try:
                 self._procs[cid] = (subprocess.Popen(c["probe"], shell=True, cwd=str(self.p.root),
-                                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                     env=project.command_env(self.p), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                                      stderr=subprocess.DEVNULL, start_new_session=True), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")

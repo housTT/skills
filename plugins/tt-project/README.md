@@ -501,7 +501,7 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   code 0, 4 once all ended but one wrote another exit code or is gone without one (it prints `job
   finished rc=N` per job), and 1 while any runs. On 4 the daemon never treats the wait as passed: the
   hand-off's `on_pass_cmd` decides model-free, else the task wakes at once at its own tier with that
-  output; a `start_when` on it raises `deferral_job_failed` instead of starting. `ttp detach` records what the job asks for (`--cores`, `--devices`,
+  output; a `start_when` on it raises `deferral_job_failed` instead of starting. Other probes on it (a `when:` hold, an `until_probe`, a pause or mute `end_when`, a machine change's `--until-probe`) take 4 as over and say the job failed. `ttp detach` records what the job asks for (`--cores`, `--devices`,
   `--mem-gb`, else `-j N`-style flags in its command); the daemon samples the CPU time of the job's own
   process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one

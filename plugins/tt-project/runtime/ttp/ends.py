@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import timefmt
+from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
 CHARTER_HISTORY = "CHARTER.history.md"   # harness file: charter sections retired or replaced
@@ -270,6 +271,8 @@ class Ends:
                 why = f"expired {shown(end['expires'], self.p)}"
             elif end.get("probe") and rc[1] == end["probe"] and rc[0] == 0:
                 why = "its until_probe passed"
+            elif end.get("probe") and rc[1] == end["probe"] and failed_check(end["probe"], rc[0]):
+                why = f"the detached job its until_probe waits on ended but failed or left no exit code (exit {rc[0]})"
             if why:
                 try:
                     retire(self.p, item, why, now)

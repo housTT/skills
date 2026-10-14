@@ -27952,6 +27952,87 @@ def test_a_failed_detached_job_wakes_its_task_at_once_with_its_rc_never_as_a_pas
     assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='probe_never_passes'", (tid,))
 
 
+
+def test_a_failed_detached_job_pages_a_machine_change_s_undo_at_once(env):
+    """A ledger entry `--until-probe "ttp detach --check <rc>"` is overdue once the job ended, even when
+    it failed (exit 4), not only after PROBE_END_S; its overdue reason says the job failed."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    jobs = p.root / "jobs"
+    jobs.mkdir()
+    (jobs / "bench.rc").write_text("3\n")
+    now = time.time()
+    c = ml.add_change("box-a", "paused the queue for the bench", "resume it", p.name,
+                      until_probe=f"ttp detach --check {jobs / 'bench.rc'}", now=now)
+    probes = ml.Probes(p)
+    probes.tick(now)
+    assert probes._procs[c["id"]][0].wait(timeout=30) == 4
+    probes.tick(now + 1)
+    [got] = ml.changes()
+    assert got["probe_passed"] and got["probe_job_failed"] == 4, got
+    assert ml.overdue(got, now + 1).startswith("the detached job its until-probe waits on ended but failed")
+
+
+def test_a_failed_detached_job_retires_a_charter_until_probe(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    probe = _ended_jobs(tmp_path, bench=3)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Leave the queue alone.",
+                            "until": "the bench ended", "until_probe": probe}], turn=5) == []
+    e, now = ends.Ends(p), time.time()
+    assert e.tick(now) == []
+    e._procs[next(iter(e._procs))][0].wait(30)
+    retired = e.tick(now + 1)
+    assert len(retired) == 1 and "ended but failed or left no exit code (exit 4)" in retired[0], retired
+    assert "Leave the queue alone." not in p.charter_path.read_text()
+    assert not p.db.kv(ends.BROKEN_KEY), "a failed job is not a broken probe"
+
+
+def test_a_failed_detached_job_ends_a_pause_and_a_mute_not_as_a_broken_probe(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    from ttp import screen as scr
+    probe = _ended_jobs(tmp_path, bench=3)
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": probe,
+                            "reason": "bench"},
+                           {"type": "observation_mute", "source": "watcher:hw", "match": "held", "end_when": probe,
+                            "why": "bench running"}]) == []
+    now = time.time()
+    pe, me = pauseends.PauseEnds(p), pauseends.MuteEnds(p)
+    for ends_ in (pe, me):
+        ends_.tick(now)
+        for proc, _, _ in list(ends_._procs.values()):
+            proc.wait(30)
+    assert pe.tick(now + 1) == ["board"] and me.tick(now + 1) == ["watcher:hw 'held'"]
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")
+    assert "ended but failed" in ev["text"] and "broken" not in ev["text"], ev["text"]
+    assert scr.mutes(p.db) == []
+    ended = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation'")]
+    assert any(t.startswith("mute ended") and "ended but failed" in t for t in ended), ended
+    assert not any("broken" in t for t in ended), ended
+
+
+def test_a_failed_detached_job_releases_a_when_hold_saying_it_failed(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = _hold_task(p)
+    probe = _ended_jobs(tmp_path, bench=3)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": f"when:{probe}"}]) == []
+    d.sweep_holds()
+    d._probes[tid][0].wait(30)
+    d.probe_waiting()
+    d.sweep_holds()
+    task = p.db.task(tid)
+    assert task["status"] == "queued" and "waits:" not in task["labels"], task
+    [why] = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released'")]
+    assert "ended but failed or left no exit code (exit 4)" in why, why
+    assert not p.db.q("SELECT id FROM events WHERE kind='hold_probe_broken'")
+
 def test_a_failed_detached_job_lets_the_on_pass_cmd_decide_model_free(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import daemon as dmod
