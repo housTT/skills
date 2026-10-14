@@ -55,9 +55,10 @@ the same tags and tells the user. With only one allowed machine it has to ask in
 
 Check `ttp secret show`. No Jev entry → tell the user, in plain words:
 
-> Jev is a cheap decision model. The project uses it to screen logs and alerts before waking an
-> LLM. It is optional: without it everything still works, screening just costs more. To add a
-> key, run `ttp secret jev` in a terminal and paste it there (not in this chat).
+> Jev is an optional add-on: a cheap decision model the project uses to screen logs and alerts
+> before waking an LLM. It is off until you save a key; from then on it sends log and alert text
+> to an outside paid service. Without it everything still works, screening just costs more. To add
+> a key, run `ttp secret jev` in a terminal and paste it there (not in this chat).
 
 - OpenRouter users: `ttp secret jev --via openrouter`.
 - The key is saved once per user and shared by all their projects on that machine.
@@ -75,6 +76,8 @@ ttp new <name> [--dir <root>] [--host <ssh-alias>] --describe-file <brief.md>
 - The daemon installs as a service: systemd user unit (+ linger) or launchd; cron fallback.
 - Print the `tt-project://…` line and the verified web app link from the output. For a remote
   project the command already opened the kept local forward and checked the link through it.
+- Relay the defaults lines it prints (spending caps, the 90% plan line, free Codex resets, Jev) in
+  plain words, once; the user changes any with `ttp config <name> KEY VALUE`.
 - A `web app: NOT AVAILABLE (…)` line (exit 3) means the project was created but its web app did
   not answer after repair. Say what it names as broken; give no link.
 

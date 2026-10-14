@@ -166,7 +166,8 @@ and preferences you add later become part of the project's charter and memory.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file. A temporary entry carries its end (a time, a plain-language condition or a probe); the daemon retires it to the archive or `CHARTER.history.md` once that passes and says so.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
-  With Jev enabled, new observations are screened by a cheap decision model first.
+  With Jev enabled (see [Jev](#jev-optional-add-on)), new observations are screened by a cheap
+  decision model first.
 
 Keyed alerts keep their history when closed. `ttp alerts <project>` shows their message IDs;
 `ttp alerts <project> --ack <id> --why "<reason>"` acknowledges that message's episode with the
@@ -188,10 +189,20 @@ prolonged whole-box outage.
   last stretch, none new while those are all busy or the running ones alone would reach it. At the
   line nothing new starts until the window resets; the rest stays yours. Running work is never
   stopped.
+- The 90% line is the default (`budget.reserve_pct` 10). If you share the plan with your own
+  interactive chats, the project may use all but 10% of each window, so only that 10% is left for
+  you. To keep more, raise the reserve: `ttp config <name> budget.reserve_pct 30` keeps 30%.
+- Free Codex window resets (an account's `rateLimitResetCredits`) are used automatically, at most one
+  per window, earliest-expiring first: when a window holds work at the line and resets more than
+  `budget.reset_credit_min_hours` (12) from now, or when a reset expires within
+  `budget.reset_credit_expiry_hours` (48) and a window is at least `budget.reset_credit_expiry_use_pct`
+  (50) % used. Projects on one machine sharing an account never use two for one window.
+  `ttp config <name> budget.reset_credits_auto false` turns it off.
 - In that last stretch deep tasks run at the standard tier. `ttp status` and the web app say when
   the line holds new starts back. You get an alert only when the project reaches the line, once
   per window; it clears by itself when the window resets.
-- Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
+- Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default
+  (`budget.daily_usd`, `budget.weekly_usd`). A new run
   starts only if its budget fits in what is left of both caps. A plan account whose successful
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
   The caps count only spend made on an account that was billed by use at the time: after a switch
@@ -297,8 +308,9 @@ prolonged whole-box outage.
   keeps its wording through template upgrades without merge conflicts.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
-  those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.
-  Empty (the default) follows the tier. The model names one of `core_provider`'s models.
+  those pin the coordinator alone. Unset, it takes its tier's effort and the model of
+  `coordinator.model_tier` (standard by default; "" uses its own tier's), so the cheaper light-tier
+  model does not move the coordinator. The model names one of `core_provider`'s models.
   `coordinator.turn_timeouts_s.<provider>.<effort>` sizes the turn after effort is resolved:
   low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
   and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.
@@ -419,6 +431,32 @@ prolonged whole-box outage.
   on a usage-billed account). A usage-billed account with a budget day or a global cap shows
   `today $1.20 this project, $85 of $1000 global - resets in 6.5 h` instead, with
   `(1 machine stale)` when a machine's answer is old.
+
+## Model tiers
+
+Each task runs at a tier: light, standard or deep. The default model and effort per provider
+(`providers.<name>.tiers.<tier>`):
+
+| Provider | light | standard | deep |
+|---|---|---|---|
+| Claude | `sonnet`, low effort | `opus`, high | `opus`, max |
+| Codex | the account's default model, low effort | default, high | default, xhigh |
+| Cursor | `auto` | `auto` | `auto` |
+
+Light runs on a cheaper model where the provider's CLI names one without a version. Codex names
+its cheaper models only by version, so light keeps the default model at low effort; set
+`providers.codex.tiers.light.model` to pin one. Cursor's `auto` already picks per request. A
+project overrides any entry, for example `ttp config <name> providers.claude.tiers.light.model opus`.
+A task's own model or effort pin wins over its tier. A failed light try is retried at standard,
+on the standard model.
+
+## Jev (optional add-on)
+
+Jev is a cheap outside decision model that screens watcher observations, picks task tiers and rates
+coordinator turns. It is optional and off until you save a key (`ttp secret jev`); from then on it
+is on in every project of yours on that machine (`jev.enabled` `auto`). While on, it sends log and
+alert text, task specs and coordinator digests to an outside paid service. Turn it off for one
+project with `ttp config <name> jev.enabled false`. Without a key, screening is rules-only.
 
 ## Parallel work
 

@@ -26,8 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "core_provider": "claude",
     "providers": {
         # Tiers name a difficulty class, never a model version: aliases resolve at run time and
-        # the project (or the user) pins versions only when it has a reason to.
-        "claude": {"tiers": {"light": {"model": "opus", "effort": "low"},
+        # the project (or the user) pins versions only when it has a reason to. Light runs on the
+        # provider's cheaper model where its CLI names one without a version (Claude: sonnet); Codex
+        # has no such alias (light keeps the account's default model at low effort) and Cursor's
+        # `auto` already picks per request. A task's own model/effort pin wins over its tier, and a
+        # failed light try retries a tier up, on the standard model.
+        "claude": {"tiers": {"light": {"model": "sonnet", "effort": "low"},
                              "standard": {"model": "opus", "effort": "high"},
                              "deep": {"model": "opus", "effort": "max"}}},
         "codex": {"tiers": {"light": {"model": "", "effort": "low"},
@@ -125,7 +129,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
                "hosts": {}},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
-    # model / effort, when set, override the coordinator tier's for the coordinator only.
+    # model / effort, when set, override the coordinator tier's for the coordinator only. Unset, the
+    # coordinator runs its tier's effort on model_tier's model ("" = its own tier's), so the cheaper
+    # light-tier model for workers does not move the coordinator.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
     # "" keeps those at the coordinator's usual effort. A task failing repeat_fails_24h times in
     # 24 h makes one, and so do its external waits when their reason, probe or owner changes, and once
@@ -134,7 +140,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp detach` jobs or `ttp lock` resources counts only past live_waits_max waits on the same ones
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
     # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never raise a turn.
-    "coordinator": {"tier": "light", "model": "", "effort": "", "unblock_effort": "high",
+    "coordinator": {"tier": "light", "model": "", "model_tier": "standard", "effort": "", "unblock_effort": "high",
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
                     # Jev's check (coordcheck) runs only on new failed or blocked tasks, high or

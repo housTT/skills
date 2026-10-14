@@ -518,6 +518,30 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     return p
 
 
+def _usd(v) -> str:
+    return f"${float(v):g}"
+
+
+def defaults_lines(budget: dict, jev_key: bool, name: str = "<name>") -> list[str]:
+    """The spending and Jev defaults `ttp setup` and `ttp new` state, from the budget they apply."""
+    b, reserve = budget, float(budget.get("reserve_pct", 10))
+    out = [f"spending caps (usage-billed accounts): {_usd(b.get('daily_usd'))}/day and {_usd(b.get('weekly_usd'))}/week "
+           f"per project, {_usd(b.get('global_daily_usd'))}/day across all projects "
+           f"(budget.daily_usd, budget.weekly_usd, budget.global_daily_usd; 0 turns the global cap off)",
+           f"subscription plans: used up to {100 - reserve:g}% of each window (budget.reserve_pct {reserve:g}); "
+           f"if you share the plan with your own chats, only that {reserve:g}% is left for them: raise "
+           f"budget.reserve_pct to keep more",
+           "free Codex window resets: used automatically, at most one per window (budget.reset_credits_auto)",
+           f"change one: ttp config {name} KEY VALUE"]
+    if jev_key:
+        out.append("Jev (optional add-on): on, a key is saved. It sends log and alert text to an outside paid "
+                   f"service; `ttp config {name} jev.enabled false` turns it off for a project")
+    else:
+        out.append("Jev (optional add-on): off. It turns on only once you save a key (`ttp secret jev`), and then "
+                   "sends log and alert text to an outside paid service")
+    return out
+
+
 def cmd_new(a) -> None:
     if not NAME_RE.match(a.name):
         die("project names use letters, digits, '.', '_' and '-' (max 63)")
@@ -540,6 +564,8 @@ def cmd_new(a) -> None:
     _wait_for_daemon(p)
     print(MARKER.format(name=a.name, host=hostname(), dir=p.root))
     print(f"created {a.name} in {p.base} · daemon via {how}")
+    for ln in defaults_lines(p.config()["budget"], bool((load_secrets().get("jev") or {}).get("key")), a.name):
+        print(ln)
     from . import weblink
     line, rc = weblink.local(p, weblink.link(p))
     print(line)
@@ -3660,6 +3686,8 @@ def cmd_secret(a) -> None:
             die(f"the key did not work ({msg}); not saved. Use --force to save anyway.")
         save_secret("jev", {"via": a.via, "key": key, **({"url": a.url} if a.url else {})})
         print(f"saved Jev key for this user ({a.via}; check: {msg})")
+        print("Jev (optional add-on) is now on in your projects on this machine: it sends log and alert text "
+              "to an outside paid service. `ttp config <name> jev.enabled false` turns it off for a project.")
     elif a.kind == "slack":
         tok = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("Slack bot token (xoxb-…): ")
         from .slack import Slack
@@ -3755,6 +3783,10 @@ def cmd_setup(a) -> None:
     line = shortcut.remove() if a.no_shortcut else shortcut.install()
     if line:
         print(line)
+    from .project import DEFAULT_CONFIG
+    print("defaults for new projects:")
+    for ln in defaults_lines(DEFAULT_CONFIG["budget"], bool((load_secrets().get("jev") or {}).get("key"))):
+        print("  " + ln)
 
 
 def cmd_upgrade(a) -> None:

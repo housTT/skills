@@ -1444,6 +1444,9 @@ class Daemon:
             # coordinator.model / coordinator.effort pin the coordinator, so moving its tier's model
             # (say light to a cheaper one for workers) does not move the coordinator with it.
             c = self.cfg.get("coordinator") or {}
+            mtier = str(c.get("model_tier") or "")
+            if mtier in tiers:
+                model = tiers[mtier].get("model", "")
             model = str(c.get("model") or "") or model
             effort = str(c.get("effort") or "") or effort
             if unblock and not str(c.get("effort") or ""):

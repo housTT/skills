@@ -1316,9 +1316,9 @@ def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_ret
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
     now = time.time()
-    for effort, cost in (("high", 3.0), ("high", 5.0), ("low", 1.0)):   # measured worker runs per tier
+    for model, effort, cost in (("opus", "high", 3.0), ("opus", "high", 5.0), ("sonnet", "low", 1.0)):   # per tier
         p.db.x("INSERT INTO runs(role,provider,model,effort,status,started,ended,cost_usd) "
-               "VALUES('worker','claude','opus',?,'ok',?,?,?)", (effort, now - 3600, now - 3500, cost))
+               "VALUES('worker','claude',?,?,'ok',?,?,?)", (model, effort, now - 3600, now - 3500, cost))
     d = Daemon(p.base)
     d.jev = _EffortJev(0.2)
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
@@ -32448,10 +32448,17 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
             assert argv[argv.index("--model") + 1] == row["model"], "the CLI got another model than recorded"
         return row
 
-    # Unset: the coordinator follows its tier, as before.
+    # Unset: the coordinator keeps the standard tier's model at its own tier's effort, so the cheaper
+    # light-tier model of workers does not move it.
+    standard = p.config()["providers"]["claude"]["tiers"]["standard"]
+    assert p.config()["coordinator"]["model_tier"] == "standard" and light["model"] != standard["model"]
     d = Daemon(p.base)
     row = run(d, "coordinator")
-    assert (row["model"], row["effort"]) == (light.get("model", ""), light.get("effort", ""))
+    assert (row["model"], row["effort"]) == (standard["model"], light["effort"])
+    # model_tier "" follows its own tier.
+    p.set_config("coordinator.model_tier", "")
+    row = run(Daemon(p.base), "coordinator")
+    assert (row["model"], row["effort"]) == (light["model"], light["effort"])
     # The light tier moves; a pinned coordinator stays put, workers follow the tier.
     p.set_config("providers.claude.tiers.light.model", "cheap-model")
     p.set_config("providers.claude.tiers.light.effort", "low")
@@ -32467,6 +32474,66 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     d = Daemon(p.base)
     row = run(d, "coordinator")
     assert (row["model"], row["effort"]) == ("pinned-model", "low")
+
+
+def test_the_light_tier_runs_a_cheaper_model_that_pins_config_and_retries_move_off(env):
+    """Light is the provider's cheaper model (Claude: sonnet) where its CLI names one without a version;
+    standard and deep keep theirs. A task pin wins, a failed light try retries on the standard model, and
+    a project overrides the mapping in its config."""
+    from ttp.project import DEFAULT_CONFIG
+    from ttp.daemon import Daemon
+    from ttp import effort
+    tiers = {k: v["tiers"] for k, v in DEFAULT_CONFIG["providers"].items()}
+    assert tiers["claude"] == {"light": {"model": "sonnet", "effort": "low"},
+                               "standard": {"model": "opus", "effort": "high"},
+                               "deep": {"model": "opus", "effort": "max"}}
+    # Codex names its cheaper models only by version: light keeps the default model at low effort.
+    assert tiers["codex"] == {"light": {"model": "", "effort": "low"}, "standard": {"model": "", "effort": "high"},
+                              "deep": {"model": "", "effort": "xhigh"}}
+    assert {t["model"] for t in tiers["cursor"].values()} == {"auto"}
+    p = make(env)
+
+    def run(tier, **pin):
+        tid = p.db.add_task(f"t {tier} {pin}", "s", kind="code", tier="light", origin="user", **pin)
+        rid = Daemon(p.base).start_run("worker", "go", "claude", tier, str(p.root), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        row = p.db.one("SELECT model, effort FROM runs WHERE id=?", (rid,))
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        assert argv[argv.index("--model") + 1] == row["model"]
+        return row["model"], row["effort"]
+
+    assert run("light") == ("sonnet", "low")
+    assert run("light", model="opus") == ("opus", "low"), "a task's model pin lost to the tier default"
+    # A failed light try is picked up a tier and so leaves the cheap model.
+    t = p.db.add_task("Fix it", "x", kind="code", tier="light", origin="coordinator")
+    p.db.update_task(t, attempts=1, result=json.dumps({"status": "failed", "summary": "no"}))
+    picked = effort.pick(p.db, p.config(), p.db.task(t), "claude", None)
+    assert picked and picked["tier"] == "standard" and picked["by"] == "retry"
+    assert run(picked["tier"]) == ("opus", "high")
+    # A project's own mapping wins over the default.
+    p.set_config("providers.claude.tiers.light.model", "haiku")
+    assert run("light") == ("haiku", "low")
+    assert run("standard") == ("opus", "high")
+
+
+def test_spending_caps_default_to_100_a_day_200_a_week_and_200_global(env, tmp_path):
+    """The documented defaults, and the lines `ttp setup` prints about them and about Jev."""
+    from ttp.project import DEFAULT_CONFIG
+    from ttp import cli
+    b = DEFAULT_CONFIG["budget"]
+    assert (b["daily_usd"], b["weekly_usd"], b["global_daily_usd"]) == (100.0, 200.0, 200.0)
+    assert b["reserve_pct"] == 10 and b["reset_credits_auto"] is True
+    r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin")],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = " ".join(r.stdout.split())
+    assert "$100/day and $200/week per project, $200/day across all projects" in out
+    assert "used up to 90% of each window (budget.reserve_pct 10)" in out and "only that 10% is left" in out
+    assert "free Codex window resets: used automatically, at most one per window" in out
+    assert "Jev (optional add-on): off. It turns on only once you save a key" in out
+    assert "sends log and alert text to an outside paid service" in out
+    on = " ".join(cli.defaults_lines(b, True, "demo"))
+    assert "Jev (optional add-on): on" in on and "outside paid service" in on and "jev.enabled false" in on
 
 
 def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monkeypatch):

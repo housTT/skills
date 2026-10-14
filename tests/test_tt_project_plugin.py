@@ -1352,3 +1352,19 @@ def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
     assert "box.py migrate check" in text and "ttp note --to <project>" in text
     assert "Never edit another project's harness" in text
     assert "nothing to turn on" in text and "released\n   right after" in text
+
+
+def test_readme_documents_the_product_defaults():
+    """Caps, the plan line and its reserve, free Codex resets, light-tier models and Jev as an add-on."""
+    text = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    flat = " ".join(text.split())
+    assert "$100 per 24 hours and $200 per 7 days per project by default" in flat
+    assert "Global daily cap (usage-billed, $200/day by default)" in flat
+    assert "The 90% line is the default (`budget.reserve_pct` 10)" in flat
+    assert "only that 10% is left for you" in flat and "raise the reserve" in flat
+    assert "Free Codex window resets" in flat and "used automatically, at most one per window" in flat
+    tiers = text.split("## Model tiers", 1)[1].split("\n## ", 1)[0]
+    assert "`sonnet`" in tiers and "A task's own model or effort pin wins over its tier" in " ".join(tiers.split())
+    jev = " ".join(text.split("## Jev (optional add-on)", 1)[1].split("\n## ", 1)[0].split())
+    assert "optional and off until you save a key" in jev
+    assert "sends log and alert text" in jev and "outside paid service" in jev
