@@ -2998,11 +2998,12 @@ def cmd_heal(a) -> None:
 
 def cmd_obligation(a) -> None:
     """`ttp obligation add|attach|progress|receipt|drop|list`: urgent deliverables owed to the user (obligations.py).
-    Inside a run, progress and receipts go to the run's file and the daemon files them for its task."""
+    Inside a run, progress and receipts go to the run's file and the daemon files them for its task; so
+    do a task's on_pass_cmd's (note-only context: the waiting run's directory)."""
     from . import obligations as ob
     if a.milestone and a.action != "receipt":
         die("--milestone is for a checked milestone receipt")
-    run_dir = os.environ.get("TTP_RUN_DIR")
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
     if run_dir and a.action in ("progress", "receipt"):
         task = os.environ.get("TTP_TASK") or ""
         if not task.isdigit():

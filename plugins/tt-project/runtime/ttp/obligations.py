@@ -312,8 +312,10 @@ def file_runs(p, now: float | None = None) -> list[str]:
     db = p.db
     seen = dict(_load(db)["runs"])
     out: list[str] = []
+    # A queued task's runs too: its on_pass_cmd writes to the run it waits on, however old.
     runs = db.q("SELECT id, task, dir, started FROM runs WHERE dir IS NOT NULL AND task IS NOT NULL "
-                "AND (status='running' OR started>=?)", (now - RUN_FILES_DAYS * 86400,))
+                "AND (status='running' OR started>=? OR task IN (SELECT id FROM tasks WHERE status='queued'))",
+                (now - RUN_FILES_DAYS * 86400,))
     for r in runs:
         f = Path(r["dir"]) / RUN_FILE
         try:

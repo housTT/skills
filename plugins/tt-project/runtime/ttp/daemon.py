@@ -6029,6 +6029,11 @@ class Daemon:
             if r and r["dir"]:
                 # Its notes were acknowledged when sent: they go out whatever it ends with.
                 self._file_queued_notes(run_id, tid, Path(r["dir"]))
+                try:   # and its obligation records, while its task is still queued (file_runs reads those)
+                    for line in obligations.file_runs(self.p, now):
+                        log(self.p, f"obligation record refused: {line}")
+                except Exception:
+                    log(self.p, "obligations: filing an on_pass_cmd's records failed\n" + traceback.format_exc())
             task = db.task(tid)
             prev = load_result(task["result"]) if task else {}
             if not task or task["status"] != "queued" or prev.get("status") != "waiting" \

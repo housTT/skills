@@ -25556,6 +25556,31 @@ def test_an_on_pass_cmd_can_send_notes_with_only_note_context(env, monkeypatch, 
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+def test_an_on_pass_cmd_records_obligation_progress_and_receipts_with_note_context(env, monkeypatch, tmp_path):
+    """`ttp obligation progress|receipt` in an on_pass_cmd go to the waiting run's file, filed for its task
+    when it settles, however old that run; user-only obligation actions stay refused."""
+    from ttp import daemon as dmod, obligations as ob
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    cmd = ("set -e; ttp obligation progress \"$OID\" 'job checked'; "
+           "ttp obligation receipt \"$OID\" 'docs/report.md'; "
+           "if ttp obligation add 'should refuse'; then exit 10; fi; "
+           "printf '{\"status\":\"done\",\"summary\":\"delivered\"}' > \"$TTP_RESULT\"")
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd)
+    p.db.x("UPDATE runs SET started=?, ended=? WHERE task=?",
+           (time.time() - 30 * 86400, time.time() - 30 * 86400 + 60, tid))
+    oid = ob.add(p, "the urgent report", [tid])
+    monkeypatch.setenv("OID", oid)
+    _settle_on_pass(d, tid)
+    output = (run_dir / "on_pass" / "on_pass.log").read_text()
+    assert p.db.task(tid)["status"] == "done", (p.db.task(tid)["result"], output)
+    assert "not inside a run" in output and f"recorded for task #{tid}" in output
+    o = ob.get(p.db, oid)
+    assert o["receipt"] and o["receipt"]["evidence"] == "docs/report.md", o
+    assert [e["text"] for e in o["owners"][str(tid)]["evidence"]][:1] == ["job checked"]
+
+
 def test_on_pass_note_context_preserves_deferred_delivery(env, monkeypatch, capsys):
     from ttp import cli, upstream
     from ttp.project import register
