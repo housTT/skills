@@ -67,6 +67,7 @@ from . import netwait
 from . import obligations
 from . import machines
 from . import prguard
+from . import projpause
 from . import push
 from . import pushq
 from . import refwaits
@@ -879,12 +880,13 @@ class Daemon:
                      self.prune_worktrees, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.clear_git_locks, self.heal_harness_git,
-                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr):
+                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
             self._step_name = step.__name__
             step()
             self._progress()
         self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
+            self.deliver_outbound()   # the long-pause alert, and what was posted before, still reach Slack
             return
         self._refresh_meters()
         self.update_gates()
@@ -5553,6 +5555,22 @@ class Daemon:
               "queued", task["id"]))
         log(self.p, f"task {task['id']} {kind}; raised to the coordinator")
 
+    def alert_long_pause(self) -> None:
+        """Model-free, run while paused: a pause found with no record is recorded as by unknown, and one
+        lasting longer than budget.paused_alert_s raises one normal alert per pause (projpause), reminded
+        at most once a day and cleared once the project resumes."""
+        db = self.p.db
+        if not db.kv("paused", False):
+            return
+        if projpause.adopt_unknown(db):
+            log(self.p, "project found paused with no record of who paused it: recorded as by unknown")
+        due = projpause.alert_due(db, self.cfg)
+        if due:
+            key, info = due
+            self.alert(key, f"Project {self.p.name} has been {projpause.describe(info, self.p)}. No new model "
+                            f"runs start until it resumes: `ttp resume {self.p.name}` or the web app.",
+                       severity="normal")
+
     def lift_boot_pause(self) -> None:
         """A `ttp pause --until-reboot` ends on the first tick on another boot than the one it recorded
         (schedules and probes do not run while paused, so nothing else would lift it). A plain pause stays."""
@@ -5565,7 +5583,7 @@ class Daemon:
             return
         if self.boot == "unknown" or self._this_boot(rec.get("boot")):
             return
-        db.set_paused(False)
+        db.set_paused(False, by="daemon", via="host reboot", reason="the pause was set until the host reboots")
         since = timefmt.long(float(rec.get("since") or 0), self.p)
         log(self.p, f"pause lifted: set until reboot at {since}, now on boot {self.boot}")
         db.post("out", f"The project pause set until the host reboots ({since}) was lifted: the host has booted since. "

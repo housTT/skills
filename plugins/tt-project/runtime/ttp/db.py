@@ -413,9 +413,17 @@ class DB:
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
 
-    def set_paused(self, on: bool, boot: str | None = None) -> None:
-        """Pause or resume the whole project. With boot (this host's boot id) the pause lasts until the
-        daemon first ticks on another boot (Daemon.lift_boot_pause); any other pause or resume ends that."""
+    def set_paused(self, on: bool, boot: str | None = None, by: str = "unknown", reason: str = "",
+                   via: str = "", end: str = "") -> None:
+        """Pause or resume the whole project, recording who (`by`: user, coordinator, daemon, a run or
+        another project), through what (`via`) and why (projpause: required unless by the user). With
+        boot (this host's boot id) the pause lasts until the daemon first ticks on another boot
+        (Daemon.lift_boot_pause); any other pause or resume ends that."""
+        from . import projpause
+        if on:
+            projpause.pause(self, by, reason, via=via, end=end or ("until reboot" if boot else ""))
+        else:
+            projpause.resume(self, by, via=via, reason=reason)
         self.set_kv("paused", bool(on))
         if on and boot:
             self.set_kv(PAUSE_BOOT_KEY, {"boot": boot, "since": time.time()})

@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -654,6 +654,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
     section("host", lines)
     lines = []
+    if pause := projpause.current(db, now):
+        lines.append(f"## Project {projpause.describe(pause, p, now)}: no new runs start until it resumes")
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")

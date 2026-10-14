@@ -28305,7 +28305,7 @@ def test_a_pause_until_reboot_is_lifted_on_the_first_tick_of_a_new_boot_only(env
     cli.main(["pause", "demo", "--until-reboot"])
     assert "until the host reboots" in capsys.readouterr().out
     assert p.db.kv("paused") and p.db.kv("pause_until_boot")["boot"] == "boot-a"
-    assert "(paused until reboot)" in status_text(p)
+    assert "(paused until reboot by the user (CLI) since " in status_text(p)
     # The same boot (a daemon restart): the pause stays.
     Daemon(p.base).tick()
     assert p.db.kv("paused") and p.db.kv("pause_until_boot")
@@ -28332,6 +28332,156 @@ def test_a_pause_until_reboot_is_lifted_on_the_first_tick_of_a_new_boot_only(env
     assert "boot id cannot be read" in capsys.readouterr().err and not p.db.kv("paused")
     with pytest.raises(SystemExit):
         cli.main(["pause", "demo", "--resource", "board", "--until-reboot"])
+
+
+def _pause_events(p):
+    return [json.loads(r["data"]) for r in p.db.q("SELECT data FROM events WHERE kind='project_pause' ORDER BY id")]
+
+
+def test_every_project_pause_path_records_who_and_why(env, monkeypatch, capsys):
+    p = make(env)
+    other = pathlib.Path(env["repo"]).parent / "other"
+    other.mkdir()
+    from ttp import cli, runner, projpause
+    from ttp.daemon import Daemon
+    # The user at the CLI: no reason is fine and recorded as such.
+    cli.main(["pause", "demo"])
+    info = projpause.current(p.db)
+    assert info["by"] == "user" and info["via"] == "CLI" and info["reason"] == projpause.NO_REASON, info
+    assert _pause_events(p)[-1]["action"] == "pause" and _pause_events(p)[-1]["by"] == "user"
+    cli.main(["resume", "demo"])
+    assert projpause.current(p.db) is None and p.db.kv(projpause.INFO_KEY) is None
+    ev = _pause_events(p)[-1]
+    assert ev["action"] == "resume" and ev["by"] == "user" and ev["paused"]["by"] == "user", ev
+    # The coordinator (a run of this project): a reason is required.
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('coordinator','claude',?,'running')",
+                 (time.time(),))
+    monkeypatch.setenv("TTP_RUN_ID", str(rid))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    with pytest.raises(SystemExit):
+        cli.main(["pause", "demo"])
+    assert "needs a reason" in capsys.readouterr().err and not p.db.kv("paused", False)
+    cli.main(["pause", "demo", "--reason", "the user asked in chat"])
+    info = projpause.current(p.db)
+    assert info["by"] == "coordinator" and info["reason"] == "the user asked in chat", info
+    cli.main(["resume", "demo"])
+    assert _pause_events(p)[-1]["by"] == "coordinator"
+    # A worker run, and a run of another project.
+    wid = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')",
+                 (time.time(),))
+    monkeypatch.setenv("TTP_RUN_ID", str(wid))
+    cli.main(["pause", "demo", "--reason", "host maintenance"])
+    assert projpause.current(p.db)["by"] == f"worker run {wid}"
+    cli.main(["resume", "demo"])
+    monkeypatch.setenv("TTP_PROJECT", str(other))
+    cli.main(["pause", "demo", "--reason", "shared board update"])
+    assert projpause.current(p.db)["by"].startswith("project "), projpause.current(p.db)
+    cli.main(["resume", "demo"])
+    for var in ("TTP_RUN_ID", "TTP_PROJECT"):
+        monkeypatch.delenv(var)
+    # ttp drain pauses with a reason of its own.
+    p.db.x("UPDATE runs SET status='ok'")
+    cli.main(["drain", "demo"])
+    info = projpause.current(p.db)
+    assert info["by"] == "user" and info["via"] == "ttp drain" and "drain" in info["reason"], info
+    cli.main(["resume", "demo"])
+    # A pause until reboot is lifted by the daemon, recorded as such.
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-a")
+    cli.main(["pause", "demo", "--until-reboot", "--reason", "kernel update"])
+    assert projpause.current(p.db)["end"] == "until reboot"
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-b")
+    Daemon(p.base).tick()
+    ev = _pause_events(p)[-1]
+    assert ev["action"] == "resume" and ev["by"] == "daemon" and ev["paused"]["reason"] == "kernel update", ev
+    # The database API refuses a non-user pause without a reason.
+    with pytest.raises(ValueError):
+        p.db.set_paused(True, by="daemon")
+    assert not p.db.kv("paused", False)
+
+
+@needs_sockets
+def test_web_api_project_pause_records_the_user_and_reason(env):
+    p = make(env)
+    from ttp import web, projpause
+    port = _start_web(p)
+
+    def post(body):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/pause", method="POST", data=json.dumps(body).encode(),
+                                     headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+        for _ in range(50):
+            try:
+                return urllib.request.urlopen(req, timeout=5).status
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("the web app did not start")
+    assert post({"paused": True, "reason": "firmware update"}) == 200
+    info = projpause.current(p.db)
+    assert info["by"] == "user" and info["via"] == "web app" and info["reason"] == "firmware update", info
+    state = web.state_payload(p, p.db)
+    assert state["pause"]["text"].startswith("paused by the user (web app) since ") and "firmware update" in state["pause"]["text"]
+    assert "paused by the user (web app)" in state["health"]["why_idle"]
+    assert post({"paused": False}) == 200
+    assert projpause.current(p.db) is None and _pause_events(p)[-1]["via"] == "web app"
+
+
+def test_an_unrecorded_project_pause_shows_paused_by_unknown(env):
+    p = make(env)
+    from ttp import coordinator as coord, projpause
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    p.set_config("home_timezone", "America/Los_Angeles")
+    p.db.set_kv("paused", True)   # an old pause, or a raw write: nobody recorded who
+    out = status_text(p)
+    assert "paused by unknown since " in out and ("PDT" in out or "PST" in out), out
+    Daemon(p.base).tick()
+    ev = _pause_events(p)
+    assert len(ev) == 1 and ev[0]["by"] == "unknown", ev
+    Daemon(p.base).tick()
+    assert len(_pause_events(p)) == 1   # recorded once
+    assert "## Project paused by unknown since " in coord.digest(p, {}, [], [])
+
+
+def test_a_long_project_pause_alerts_once_after_the_threshold_and_clears_on_resume(env):
+    p = make(env)
+    from ttp import alerts, projpause
+    from ttp.daemon import Daemon
+
+    def alerts_out():
+        return p.db.q("SELECT * FROM messages WHERE direction='out' AND ref LIKE 'paused:%' ORDER BY id")
+    p.db.set_paused(True, by="coordinator", reason="board firmware update")
+    Daemon(p.base).tick()
+    assert alerts_out() == []   # not before the threshold
+    since = time.time() - projpause.DEFAULT_ALERT_S - 60
+    p.db.set_kv(projpause.INFO_KEY, {**p.db.kv(projpause.INFO_KEY), "since": since})
+    Daemon(p.base).tick()
+    Daemon(p.base).tick()
+    out = alerts_out()
+    assert len(out) == 1 and out[0]["kind"] == "alert" and out[0]["severity"] == "normal", out
+    assert "demo" in out[0]["text"] and "the coordinator" in out[0]["text"] and "board firmware update" in out[0]["text"]
+    assert any(m["id"] == out[0]["id"] for m in alerts.needs_you(p.db, time.time()))
+    # Resuming clears it at once, and says so once.
+    p.db.set_paused(False, by="user", via="CLI")
+    ep = p.db.one("SELECT * FROM alerts WHERE key=?", (out[0]["ref"],))
+    assert ep["cleared"] and "resumed by the user" in ep["cleared_why"], ep
+    assert not any(m["id"] == out[0]["id"] for m in alerts.needs_you(p.db, time.time()))
+    Daemon(p.base).tick()
+    assert [m["kind"] for m in alerts_out()] == ["alert", "resolved"]
+
+
+def test_the_long_pause_alert_threshold_is_configurable(env):
+    p = make(env)
+    from ttp import projpause
+    from ttp.daemon import Daemon
+    assert projpause.alert_s({"budget": {}}) == 4 * 3600 and p.config()["budget"]["paused_alert_s"] == 4 * 3600
+    p.set_config("budget.paused_alert_s", 3600)
+    p.db.set_paused(True, by="user")
+    p.db.set_kv(projpause.INFO_KEY, {**p.db.kv(projpause.INFO_KEY), "since": time.time() - 2 * 3600})
+    p.set_config("budget.paused_alert_s", 0)   # off
+    Daemon(p.base).tick()
+    assert not p.db.q("SELECT id FROM messages WHERE ref LIKE 'paused:%'")
+    p.set_config("budget.paused_alert_s", 3600)
+    Daemon(p.base).tick()
+    assert len(p.db.q("SELECT id FROM messages WHERE ref LIKE 'paused:%'")) == 1
 
 
 def test_drain_pauses_and_exits_once_runs_end_or_fails_at_its_timeout(env, monkeypatch, capsys):

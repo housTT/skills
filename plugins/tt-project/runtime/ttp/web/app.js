@@ -224,11 +224,13 @@ async function refresh() {
     : svc.watchdog ? `Its watchdog restarts it after ${Math.round((st.watchdog_s || 600) / 60)} min without a tick.`
     : `Its service predates the watchdog: <code>ttp restart ${esc(st.project.name)}</code> restarts it and adds one.`;
   banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. ${fix}` : "",
+          st.pause ? `This project is ${esc(st.pause.text)}. No new model runs start until it resumes.` : "",
           disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
           h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of them are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
   text($("#pname"), st.project.name);
   text($("#daemon"), st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped"));
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
+  $("#daemon").title = st.pause ? st.pause.text : "";
   text($("#spend"), h.spend.headline || `24h ${money(h.spend.spent_24h)}`);
   $("#spend").title = h.spend.detail || "all providers";
   const needs = st.tasks.filter((t) => t.status === "blocked").length + (st.attention || []).length;
@@ -287,7 +289,11 @@ async function refresh() {
   if (document.activeElement !== $("#daily")) $("#daily").value = cfg.budget ? cfg.budget.daily_usd : "";
   if (document.activeElement !== $("#weekly")) $("#weekly").value = cfg.budget ? cfg.budget.weekly_usd : "";
   text($("#pause"), st.paused ? "Resume project" : "Pause project");
-  $("#pause").onclick = async () => { await api("/api/pause", { paused: !st.paused }); refresh(); };
+  $("#pause").onclick = async () => {
+    const reason = st.paused ? "" : window.prompt("Why pause the project? (shown in status and the alert)", "");
+    if (reason === null) return;
+    await api("/api/pause", { paused: !st.paused, reason }); refresh();
+  };
   R.tick();
 }
 window.setSched = async (name, body) => { await api(`/api/schedule/${encodeURIComponent(name)}`, body); refresh(); };

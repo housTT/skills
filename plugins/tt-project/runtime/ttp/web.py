@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, obligations, pushq, release, responsibilities, timefmt, waits
+from . import credits, heal, identity, obligations, projpause, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
 from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -343,8 +343,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     stops = []
     if not alive:
         stops.append(f"the daemon is not running: {down_note(p)}")
-    if db.kv("paused", False):
-        stops.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
+    if pause := projpause.current(db, now):
+        stops.append(f"the project is {projpause.describe(pause, tz, now)} (`ttp resume {p.name}` or the web app)")
     for pp in paused_providers:
         stops.append(f"{pp['provider']} is paused until {at(pp['until'], now, tz)}: {pp['note']}")
     for prov, pg in sorted(gates.items(), key=lambda kv: kv[0] != core):
@@ -580,6 +580,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "project": {"name": p.name, "root": str(p.root), "config": p.config(),
                     "zone": timefmt.zone_name(p.raw_config())},   # the web app shows every time in it
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
+        "pause": {**pause, "text": projpause.describe(pause, tz, now)} if (pause := projpause.current(db, now)) else None,
         "gates": {k: {**g, "detail": gate_detail(g, now, tz)} for k, g in db.kv("gates", {}).items()},
         "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
@@ -736,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as e:
                         return self._send(400, {"error": str(e)})
                     return self._send(200, {"ok": True})
-                db.set_paused(bool(body.get("paused")))
+                db.set_paused(bool(body.get("paused")), by="user", via="web app", reason=str(body.get("reason") or ""))
                 return self._send(200, {"ok": True})
             if url.path == "/api/config":
                 from .coordinator import USER_SETTABLE

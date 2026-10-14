@@ -879,8 +879,9 @@ def status_text(p: Project) -> str:
     now = time.time()
     tz = timefmt.zone(p)
     counts = db.status_counts()
-    head = f"{p.name}: daemon {state}" + ((" (paused until reboot)" if db.kv("pause_until_boot") else " (paused)")
-                                          if db.kv("paused") else "")
+    from . import projpause
+    pause = projpause.current(db, now)
+    head = f"{p.name}: daemon {state}" + (f" ({projpause.describe(pause, p, now)})" if pause else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
@@ -3421,7 +3422,12 @@ def cmd_pause(a) -> None:
         if boot == "unknown":
             die("--until-reboot: this host's boot id cannot be read (no /proc/sys/kernel/random/boot_id "
                 "or kern.bootsessionuuid or kern.boottime); use a plain pause and resume it after the reboot")
-    p.db.set_paused(a.cmd == "pause", boot)
+    from . import projpause
+    by = projpause.caller(p)
+    try:
+        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or "")
+    except ValueError as e:
+        die(f"{e}: pass --reason")
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
                           + (" until the host reboots; the daemon lifts it on its first tick after boot" if boot else "")))
 
@@ -3444,7 +3450,10 @@ def cmd_drain(a) -> None:
     from . import hostcycle
     p = need(a.name, sys.argv[1:])
     if not p.db.kv("paused", False):
-        p.db.set_paused(True)
+        from . import projpause
+        p.db.set_paused(True, by=projpause.caller(p), via="ttp drain",
+                        reason=f"drain before a planned host cycle: {a.reboot}" if a.reboot
+                        else "drain: waiting for the runs in flight to end")
         print(f"{p.name} paused: no new model runs start")
     end = time.time() + max(0.0, a.wait)
     while True:
@@ -5256,7 +5265,8 @@ def main(argv: list[str] | None = None) -> None:
         s.add_argument("--resource", help=f"{name} only this resource: tasks using it wait, `ttp lock` refuses it"
                        if name == "pause" else f"{name} only this resource")
         if name == "pause":
-            s.add_argument("--reason", help="why, shown to workers, the coordinator and in status")
+            s.add_argument("--reason", help="why, shown to workers, the coordinator and in status; required "
+                                            "for a project pause from a run")
             s.add_argument("--until", help="with --resource: when it should end, a delay (2d) or an ISO time, at "
                                            "most 7 days ahead; this or --end-when is required")
             s.add_argument("--end-when", dest="end_when", metavar="PROBE",

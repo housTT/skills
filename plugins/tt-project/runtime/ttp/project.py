@@ -78,6 +78,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # A hold kept for the detached jobs of a done, failed or cancelled task raises a low alert
         # once it has held its resource this long (0 = never). Nothing is released automatically.
         "stale_hold_alert_s": 21600,
+        # A project paused this long raises one normal alert naming who paused it, why and since when,
+        # reminded at most once a day and cleared on resume (projpause; 0 = never).
+        "paused_alert_s": 14400,
         # A run that ends without reporting its cost is estimated from its tokens at the project's
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,

@@ -71,11 +71,12 @@ CLEARED_TEXT = {
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
     "network": "The hosts the queued work waits on answer again; it resumes by itself.",
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
+    "paused": "The project is no longer paused; new runs start again.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
-USER_BLOCKERS = ("network",)
-CLEARED_SEVERITY = {"network": "low"}
+USER_BLOCKERS = ("network", "paused")   # paused: a long project pause (projpause)
+CLEARED_SEVERITY = {"network": "low", "paused": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang")
 
@@ -213,6 +214,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool((db.kv("network_outage") or {}).get("alerted"))
     if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
         return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
+    if kind == "paused":   # the same project pause still lasts (projpause)
+        from . import projpause
+        return projpause.holds(db, arg)
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":
@@ -238,7 +242,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang")
+                                         "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused")
 
 
 def _since(ep: dict) -> float:
@@ -344,6 +348,18 @@ def close_key(db: DB, key: str, why: str, now: float | None = None) -> list[dict
     with db.tx():
         return [_close(db, ep, now, why, f"Cleared: {key} user alert: {why}.")
                 for ep in db.q("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id", (key,))]
+
+
+def clear_kind(db: DB, kind: str, why: str, now: float | None = None) -> list[dict]:
+    """Close the open episodes of condition `kind` at once (the project resumed), told as their
+    CLEARED_TEXT, rather than on the daemon's next sweep."""
+    now = time.time() if now is None else now
+    if not db.one("SELECT id FROM alerts WHERE key LIKE ? AND cleared IS NULL LIMIT 1", (f"{kind}:%",)):
+        return []
+    text = "Cleared: " + CLEARED_TEXT[kind].format(arg="") if kind in CLEARED_TEXT else None
+    with db.tx():
+        return [_close(db, ep, now, why, text, CLEARED_SEVERITY.get(kind, "low"))
+                for ep in db.q("SELECT * FROM alerts WHERE key LIKE ? AND cleared IS NULL ORDER BY id", (f"{kind}:%",))]
 
 
 def sweep(db: DB, now: float | None = None) -> list[dict]:
