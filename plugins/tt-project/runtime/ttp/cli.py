@@ -1524,6 +1524,30 @@ def _command_key(c) -> str:
     return c
 
 
+_PYTEST_PROG = re.compile(r"(?:\S*/)?(?:pytest|py\.test)")
+_PYTHON_PROG = re.compile(r"(?:\S*/)?python(?:3(?:\.\d+)?)?")
+
+
+def _same_run_key(c) -> str:
+    """_command_key, with a pytest run's program made one word: `pytest`, `py.test`,
+    `python3 -m pytest` and `<venv>/bin/python -m pytest` run the same tests, as every bare pytest
+    runs with the venv's python (push.venv_cmd). Only for telling an extra command already run."""
+    key = _command_key(c)
+    if not isinstance(c, str):
+        return key
+    try:
+        words = shlex.split(key)
+    except ValueError:
+        return key
+    if not words or not all(_PLAIN_WORD.fullmatch(w) for w in words):
+        return key   # shell syntax: compared as written
+    if _PYTEST_PROG.fullmatch(words[0]):
+        return shlex.join(["pytest", *words[1:]])
+    if len(words) > 2 and _PYTHON_PROG.fullmatch(words[0]) and words[1:3] == ["-m", "pytest"]:
+        return shlex.join(["pytest", *words[3:]])
+    return key
+
+
 def _commands_hash(cmds: list) -> str:
     import hashlib
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
@@ -1615,21 +1639,44 @@ def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
     command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
-    here, is dropped: it would run twice. One that only a scoped check matches stays, as that
-    check may be skipped on this head."""
+    here, is dropped: it would run twice (a pytest run in any spelling, _same_run_key). One that
+    only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
+    it once that check applies)."""
     if not extra:
         return [], []
     if len(extra) == 1 or all(any(ch.isspace() for ch in w) for w in extra):
         given = [w for w in extra if w.strip()]
     else:
         given = [shlex.join(extra)]
-    seen = {_command_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    seen = {_same_run_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
     mine, dropped = [], []
     for c in given:
-        key = _command_key(c)
+        key = _same_run_key(c)
         (dropped if key in seen else mine).append(c)
         seen.add(key)
     return mine, dropped
+
+
+def _ran_again(todo: list, own: list) -> tuple[list, list]:
+    """(the applicable checks to run, the extras dropped): an extra command that a scoped project
+    check applicable on this head (in `todo`) also runs is dropped, so it runs once."""
+    keys = {_same_run_key(c) for c in todo if any(c is o for o in own)}
+    keep, dropped = [], []
+    for c in todo:
+        (dropped if not any(c is o for o in own) and _same_run_key(c) in keys else keep).append(c)
+    return keep, dropped
+
+
+def _warn_broken_venvs(p: Project | None, top: str, say) -> None:
+    """Warn about each venv the checks may use whose python does not run, with the command that
+    makes it again (push.broken_venvs): its checks would otherwise fail at import, unexplained."""
+    from . import push, worktree
+    also = [p.root / n for n in worktree.VENV_NAMES] if p else []
+    if os.environ.get("VIRTUAL_ENV"):
+        also.append(Path(os.environ["VIRTUAL_ENV"]))
+    for venv, why in push.broken_venvs(top, also):
+        say(f"warning: the venv {venv} is broken ({why}), so checks run without its packages; "
+            f"make it again with: {push.venv_rebuild_cmd(venv)}")
 
 
 def cmd_checks(a) -> None:
@@ -1706,6 +1753,11 @@ def cmd_checks(a) -> None:
     if p:
         from . import worktree
         worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
+    # Every check, extras too, runs in the project's environment: its venv active (VIRTUAL_ENV, PATH)
+    # when this shell has none, as a run has (worktree.project_venv).
+    venv_vars = {}
+    if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
+        venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
     dirty, runtime_written = _checks_dirty(git)
     if dirty:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
@@ -1736,10 +1788,17 @@ def cmd_checks(a) -> None:
         for line in not_run:
             print(f"ttp checks: {line}")
             out.write(f"{line}\n")
+        _warn_broken_venvs(p, top, lambda m: (print(f"ttp checks: {m}"), out.write(f"{m}\n")))
         try:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base, candidate=purpose == "candidate")
+            todo, again = _ran_again(todo, own)
+            if again:
+                said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
+                        f"delivery.push_checks entry runs it on this head")
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
             selected = list(todo)
         except push.ScopeError as e:
             out.write(f"{e}\n")
@@ -1780,7 +1839,7 @@ def cmd_checks(a) -> None:
                     f"at {when} (recorded); --fresh runs them again")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
-        child_env = {"PWD": top, **(slot.env() if slot else {})}
+        child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         for c in [] if hit else todo:
             executed.append(c)
             out.write(f"$ {c}\n")
@@ -1788,9 +1847,9 @@ def cmd_checks(a) -> None:
             check_start = out.tell()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
-            proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=group, env={**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
-                                         **child_env},
+            env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
+            proc = subprocess.Popen(push.check_argv(c, top, env), cwd=top, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=group, env=env,
                                     pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             try:
                 rc = proc.wait()

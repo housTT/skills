@@ -729,17 +729,21 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
 - A bare pytest in a check (`pytest`, `py.test`, `python3 -m pytest`, also after `env` or
   `timeout <n>`) runs as `<venv>/bin/python -m pytest` when the repository has a `.venv/` or
-  `venv/` with pytest in it (in the worktree, else in its main checkout). The main checkout's venv
+  `venv/` with pytest in it (in the worktree, else in its main checkout, else the active venv: a
+  run's is the project's, and `ttp checks` activates the project's venv when none is). The main checkout's venv
   is not used when it has the project installed editable from the main checkout: a worktree's tests
   would import that code and could pass falsely. The check then runs as written and its output says
   why. A check that fails at import because a package is not installed is reported by `ttp checks`
   and `ttp doctor` as an environment problem, not as the head's code (as an environment problem
-  also, when tests failed too): point the check at a venv.
+  also, when tests failed too): point the check at a venv. Before it runs checks, `ttp checks` warns
+  of a venv whose `bin/python -c pass` fails (a dangling `.venv` link, or a venv made on another OS)
+  and prints the command that makes it again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An
-  added check that `delivery.push_checks` already runs on every head is dropped, and said, so it
-  never runs twice.
+  added check that `delivery.push_checks` already runs on every head, or through a scoped entry
+  that applies on this head, is dropped, and said, so it never runs twice. Spellings of one pytest
+  run (`pytest`, `python3 -m pytest`, `<venv>/bin/python -m pytest`) count as the same command.
 - In Claude Code workers and reviewers, a Bash call that runs one of the configured pytest checks
   in full (every path it names, or a directory above them, and no `-k`, `-m`, `--lf` or node id
   it does not have) is refused with a pointer to `ttp checks`, which reuses a recorded pass.

@@ -42632,6 +42632,95 @@ def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, t
     assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
 
 
+def _recording_venv(path, ran):
+    """A venv stand-in whose python records how it was called, with a pytest on its PATH."""
+    venv = _fake_venv(path)
+    (venv / "bin" / "python").write_text(f'#!/bin/sh\necho "$@" >> {ran}\n')
+    (venv / "bin" / "pytest").write_text(f"#!/bin/sh\necho venv-pytest >> {ran}\n")
+    for name in ("python", "pytest"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv
+
+
+def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_path, monkeypatch, capsys):
+    """Replays `ttp checks -- 'pytest -q --no-device-tests'` beside a project check that already runs
+    it: it ran twice, the second time with the pytest on PATH, whose python lacked the project's
+    packages, so it failed at import after the first run passed."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    ran = tmp_path / "ran"
+    venv = _recording_venv(p.root / ".venv", ran)
+    stub = tmp_path / "stub"   # the pytest PATH finds outside the venv: no project packages
+    stub.mkdir()
+    (stub / "pytest").write_text(f"#!/bin/sh\necho path-pytest >> {ran}\nexit 1\n")
+    (stub / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+    cmd = "pytest -q --no-device-tests"
+    # A scoped project check that applies on this head runs it: the extra is dropped, not run again.
+    p.set_config("delivery.push_checks", [{"run": cmd, "if_exists": "a.txt"}])
+    cli.main(["checks", "--fresh", "--", cmd])
+    out = capsys.readouterr().out
+    runs = lambda: [ln for ln in ran.read_text().splitlines() if ln != "-c pass"]   # not the venv probe
+    assert runs() == ["-m pytest -q --no-device-tests"], "once, with the project venv's python"
+    assert "a scoped delivery.push_checks entry runs it on this head" in out
+    # Another spelling of the same pytest run is the same command.
+    ran.unlink()
+    p.set_config("delivery.push_checks", [f"{venv}/bin/python -m pytest -q --no-device-tests"])
+    cli.main(["checks", "--fresh", "--", cmd])
+    assert len(runs()) == 1
+    assert "delivery.push_checks already runs it" in capsys.readouterr().out
+    # An extra pytest no project check runs still uses the project's venv, not the pytest on PATH.
+    ran.unlink()
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--fresh", "--", "pytest -q tests/x.py"])
+    assert runs() == ["-m pytest -q tests/x.py"]
+    # The same with the venv already active (a run's environment): VIRTUAL_ENV picks it.
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    assert push.venv_cmd("pytest -q", repo) == f"{shlex.quote(str(venv / 'bin' / 'python'))} -m pytest -q"
+    assert push.venv_cmd("pytest -q", repo, {}) == "pytest -q"
+    # Spellings of one pytest run; shell syntax stays as written.
+    keys = {cli._same_run_key(c) for c in ("pytest -q", "py.test -q", "python3 -m pytest -q",
+                                            "/x/.venv/bin/python -m pytest -q", ".venv/bin/pytest -q")}
+    assert keys == {"pytest -q"}
+    assert cli._same_run_key("pytest -q; true") == "pytest -q; true"
+    assert cli._same_run_key("python3 tools/pytest.py") == "python3 tools/pytest.py"
+
+
+def test_ttp_checks_warns_of_a_broken_venv_with_the_command_that_makes_it_again(env, tmp_path, monkeypatch, capsys):
+    """A project-root .venv link to a venv made on another OS (its python points at an interpreter
+    missing here) leaves the checks without its packages: ttp checks says so and how to rebuild it."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    (repo / ".gitignore").write_text(".venv\nvenv/\n")
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\n[project.optional-dependencies]\ntest = ["pytest"]\n')
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    real = _fake_venv(repo / "venv", python=False)
+    (real / "bin" / "python").symlink_to(tmp_path / "elsewhere" / "python3")
+    (repo / ".venv").symlink_to("venv")
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--fresh"])
+    out = capsys.readouterr().out
+    assert out.count("warning: the venv") == 1, out   # .venv and venv are one venv
+    assert f"python3 -m venv --clear {real} && {real}/bin/python -m pip install -e '{repo}[test]'" in out
+    assert "warning: the venv" in (run / "checks.log").read_text()
+    assert push.venv_cmd("pytest -q", repo) == "pytest -q"   # never the broken venv's python
+    # A link that dangles, and a python that does not run; a working venv is not named.
+    (repo / ".venv").unlink()
+    (repo / ".venv").symlink_to(tmp_path / "gone")
+    (real / "bin" / "python").unlink()
+    (real / "bin" / "python").write_text("#!/bin/sh\necho bad interpreter >&2\nexit 1\n")
+    (real / "bin" / "python").chmod(0o755)
+    found = dict(push.broken_venvs(repo))
+    assert "which is missing" in found[repo / ".venv"] and "bad interpreter" in found[repo / "venv"]
+    (real / "bin" / "python").unlink()
+    (real / "bin" / "python").symlink_to(sys.executable)
+    assert list(push.broken_venvs(repo)) == [(repo / ".venv", found[repo / ".venv"])]
+    assert push.venv_rebuild_cmd(tmp_path / "plain" / ".venv").endswith("-m pip install pytest")
+
+
 def test_ttp_checks_still_reads_a_checks_record_from_before_extras_were_split(env, tmp_path, monkeypatch):
     from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
