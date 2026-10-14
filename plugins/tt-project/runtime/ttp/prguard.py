@@ -659,8 +659,8 @@ def _checks_problem(cwd: str | None = None) -> str | None:
         return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
     if rec.get("fast_path"):
         return ("refused: the checks recorded for this run are a fast-path pass (docs/data-only diff; the "
-                "project's checks did not run), which never counts for a PR. Run `ttp checks --fresh` with "
-                "delivery.checks_fast_globs unset for this diff, or add a non-docs change. " + CHECKS_HOW)
+                "project's checks did not run), which never counts for a PR. Run `ttp checks --full`, "
+                "or set delivery.checks_fast_globs to [] to turn the fast path off. " + CHECKS_HOW)
     if not candidate_record(rec):
         return ("refused: the checks recorded for this run are a harness qualification (`ttp checks --purpose "
                 "harness`), which never counts for a PR. " + CHECKS_HOW)

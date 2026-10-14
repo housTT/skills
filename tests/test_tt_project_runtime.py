@@ -62781,11 +62781,15 @@ def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
     "CMakeLists.txt", "sub/CMakeLists.txt", "requirements.txt", "requirements-dev.txt", "constraints.txt",
     "plugins/x/skills/y/SKILL.md", "skills/y/notes.md", "plugins/x/prompts/p.md", "AGENTS.md", "CLAUDE.md",
     "docs/conf.py", "data/gen.py", "a.sh", "m.cmake", "Makefile", "c.cpp", "h.hpp", "x.js", "x.ts", "p.json",
-    "p.toml", "p.yaml", "p.yml", "p.cfg", "p.ini"])
+    "p.toml", "p.yaml", "p.yml", "p.cfg", "p.ini",
+    "data/gen.rs", "data/main.go", "data/run.pl", "data/x.sql", "data/Dockerfile", "docs/build.bash",
+    "tests/data/golden.txt", "test/fixture.md", "plugins/x/template/CHARTER.md", "plugins/x/templates/a.txt"])
 def test_checks_fast_path_never_takes_code_build_or_installed_content(tmp_path, path):
     from ttp import push
     base, head = _fast_repo(tmp_path, {path: b"x\n"})
-    assert not push.fast_path(tmp_path, base, head, [*push.FAST_GLOBS, "*"])
+    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+    if not path.startswith(("data/", "docs/build")):   # these are kept out by the extension allowlist alone
+        assert not push.fast_path(tmp_path, base, head, [*push.FAST_GLOBS, "*"])
     assert push.fast_path(tmp_path, base, head, ["*"], exclude=[])
 
 
@@ -62865,3 +62869,52 @@ def test_checks_fast_checks_flag_crlf_and_trailing_whitespace(tmp_path):
         rcs = [sp.run(c, shell=True, cwd=d, executable="/bin/bash", capture_output=True).returncode
                for c in push.fast_checks(base)]
         assert (max(rcs) != 0) == bool(rc), (body, rcs)
+
+
+def test_ttp_checks_full_runs_project_checks_and_prguard_accepts(env, tmp_path, monkeypatch, capsys):
+    from ttp import prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks", "--full"])
+    assert mark.exists() and "FAST PATH" not in capsys.readouterr().out
+    rec = json.loads((run / "checks.json").read_text())
+    assert "fast_path" not in rec and prguard.candidate_record(rec)
+    assert prguard._checks_problem(os.getcwd()) is None
+
+
+def test_ttp_checks_reuses_a_recorded_full_pass_over_the_fast_path(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks", "--full"])
+    capsys.readouterr()
+    run2 = tmp_path / "run2"
+    run2.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run2))
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "(recorded)" in out and "FAST PATH" not in out
+    assert "fast_path" not in json.loads((run2 / "checks.json").read_text())
+
+
+def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatch, capsys):
+    from ttp import prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks"])
+    msg = prguard._checks_problem(os.getcwd())
+    assert "ttp checks --full" in msg and "unset" not in msg
+
+
+def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, False)
+    p.set_config("delivery.push_checks", [{"run": f"echo scoped >> {mark}", "if_changed": "docs/*"}])
+    cli.main(["checks"])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists()
+
+
+def test_fast_config_keys_are_registered_and_validated(env):
+    from ttp import project
+    p = make(env)
+    for k in ("checks_fast_globs", "checks_fast_exclude"):
+        assert not project.unknown_key_hint(f"delivery.{k}")
+        p.set_config(f"delivery.{k}", [])
+    assert not [x for x in project.config_problems(p.config()) if "checks_fast" in x]
+    assert any("checks_fast_globs" in x for x in project.config_problems({"delivery": {"checks_fast_globs": "*.md"}}))
+    assert any("checks_fast_exclude" in x for x in project.config_problems({"delivery": {"checks_fast_exclude": 3}}))

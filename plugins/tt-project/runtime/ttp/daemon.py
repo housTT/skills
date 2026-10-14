@@ -6513,6 +6513,13 @@ class Daemon:
             return "unclear", problem
         head = _checked_head(run_dir, task)
         if not head:
+            try:
+                fp = json.loads((run_dir / prguard.CHECKS_FILE).read_text()).get("fast_path")
+            except (OSError, ValueError, AttributeError):
+                fp = False
+            if fp:
+                return "unclear", ("the checks were a fast-path pass (docs/data-only diff; the project's checks did "
+                                   "not run); run `ttp checks --full`")
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, full["on_pass"], head

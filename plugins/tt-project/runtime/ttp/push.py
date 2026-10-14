@@ -1031,7 +1031,7 @@ def whitespace_check(base: str) -> str:
 # `ttp checks` fast path: a diff touching only these paths skips the heavy checks. Override with
 # delivery.checks_fast_globs (a list; an empty list turns the fast path off). Matched with fnmatch
 # against the repo-relative path, so `*` also crosses `/`.
-FAST_GLOBS = ["*.md", "*.txt", "data/*", "docs/*"]
+FAST_GLOBS = ["*.md", "*.rst", "*.txt", "*.csv", "*.tsv"]
 # Paths that never take the fast path, whatever the globs say: code, scripts, manifests, build and
 # dependency files and agent-instruction or installed-content markdown. Override with
 # delivery.checks_fast_exclude (a list; it replaces these).
@@ -1039,7 +1039,9 @@ FAST_EXCLUDE = ["*.py", "*.sh", "*.c", "*.cc", "*.cpp", "*.h", "*.hpp", "*.js", 
                 "*.yaml", "*.yml", "*.cfg", "*.ini", "*.cmake", "CMakeLists.txt", "*/CMakeLists.txt", "Makefile",
                 "*/Makefile", "requirements*.txt", "*/requirements*.txt", "constraints*.txt",
                 "*/constraints*.txt", "SKILL.md", "*/SKILL.md", "AGENTS.md", "*/AGENTS.md", "CLAUDE.md",
-                "*/CLAUDE.md", "skills/*", "*/skills/*", "prompts/*", "*/prompts/*"]
+                "*/CLAUDE.md", "skills/*", "*/skills/*", "prompts/*", "*/prompts/*",
+                "tests/*", "*/tests/*", "test/*", "*/test/*", "template/*", "*/template/*", "templates/*",
+                "*/templates/*"]
 
 
 def fast_exclude(cfg: dict | None) -> list[str]:

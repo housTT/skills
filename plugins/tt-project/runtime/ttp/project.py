@@ -339,7 +339,8 @@ EXTRA_KEYS = {
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard"},
+                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard",
+                 "checks_fast_globs", "checks_fast_exclude"},   # the last two: `ttp checks` fast path (push.FAST_GLOBS),
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -574,6 +575,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
+    for k in ("checks_fast_globs", "checks_fast_exclude"):
+        v = delivery.get(k)
+        if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+            out.append(f"delivery.{k}: not a list of glob strings")
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     out += bump_problems(delivery.get("version_bump"))
     from .devq import config_problems as runner_problems

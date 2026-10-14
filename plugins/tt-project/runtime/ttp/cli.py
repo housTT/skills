@@ -1811,14 +1811,16 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             fcfg = p.config() if p else None
-            if todo and purpose == "candidate" and push.fast_path(Path(top), base, head, push.fast_globs(fcfg),
-                                                                 push.fast_exclude(fcfg)):
+            if todo and purpose == "candidate" and not a.full and not a.fresh \
+                    and not any(getattr(c, "if_changed", ()) for c in todo) \
+                    and not _recorded_pass(p, tree, todo, purpose) \
+                    and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
                 own_s = {str(c) for c in own}
                 fast_skipped = [str(c) for c in todo if str(c) in own_s]
                 fast_cmds = push.fast_checks(base)
                 todo = [c for c in todo if str(c) not in own_s] + fast_cmds
                 said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
-                        "only the whitespace and CRLF checks run (delivery.checks_fast_globs sets the paths, "
+                        "only the whitespace and CRLF checks run; `ttp checks --full` runs them all (delivery.checks_fast_globs sets the paths, "
                         "delivery.checks_fast_exclude the paths that never take it)"
                         + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
@@ -2267,7 +2269,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
-                                      *(["--fresh"] if a.fresh else []),
+                                      *(["--fresh"] if a.fresh else []), *(["--full"] if a.full else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
@@ -5193,6 +5195,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --gap: the push_checks fingerprint the waiter failed under")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
+    s.add_argument("--full", action="store_true",
+                   help="run the project's checks even for a docs/data-only diff (no fast path)")
     s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
                    help="harness: qualify a harness-preparation head with the purpose harness and untagged checks; "
                         "candidate gates are not run and the pass never counts for a PR or a push")
