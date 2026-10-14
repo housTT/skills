@@ -878,7 +878,7 @@ class Daemon:
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.prune_worktrees, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
-                     self.check_integrity, self.clear_git_locks,
+                     self.check_integrity, self.clear_git_locks, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr):
             self._step_name = step.__name__
             step()
@@ -4500,6 +4500,19 @@ class Daemon:
             coord.reraise_charter_changes(self.p)
         except Exception:
             log(self.p, "charter re-raise: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def heal_harness_git(self) -> None:
+        """Every harness_git.sweep_every_s, commit the charter and memory files a failed harness commit
+        left behind (Project.sweep_harness), moving aside any stale git lock first."""
+        now = time.time()
+        if now - getattr(self, "_harness_swept", 0.0) < self.p._harness_git_cfg("sweep_every_s"):
+            return
+        self._harness_swept = now
+        try:
+            self.p.clear_stale_git_locks(now)
+            self.p.sweep_harness()
+        except Exception:
+            log(self.p, "harness git sweep: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def check_integrity(self, start: bool = False) -> None:
         """On the first start of a new boot, check the harness for damage a power cut left and repair

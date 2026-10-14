@@ -8380,6 +8380,131 @@ def test_charter_and_memory_changes_are_committed_alone(env):
     assert "CHARTER.md" not in status and "MEMORY.md" not in status
 
 
+def _daemon_log_text(p):
+    f = p.logs / "daemon.log"
+    return f.read_text() if f.exists() else ""
+
+
+def _harness_dirty(p):
+    return subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True,
+                          text=True).stdout
+
+
+def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch):
+    p = make(env)
+    from ttp import project
+    gitdir = p.harness / ".git"
+    head = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True,
+                          text=True).stdout.strip()
+    # What a commit killed mid-way leaves behind.
+    left = [gitdir / "index.lock", gitdir / "HEAD.lock", gitdir / "next-index-123.lock",
+            gitdir / "refs" / "heads" / f"{head}.lock"]
+    old = time.time() - 3600
+    for f in left:
+        f.write_text("x\n")
+        os.utime(f, (old, old))
+    fresh = gitdir / "packed-refs.lock"
+    fresh.write_text("y\n")
+    # A git still running in the repo keeps even old locks in place.
+    monkeypatch.setattr(project, "git_running_in", lambda repo: True)
+    assert p.clear_stale_git_locks() == []
+    assert all(f.exists() for f in left) and "left alone" in _daemon_log_text(p)
+    monkeypatch.setattr(project, "git_running_in", lambda repo: False)
+    fresh.unlink()
+    p.add_memory("Locks a killed commit left are moved aside.")
+    assert not any(f.exists() for f in left)
+    kept = sorted(str(x.relative_to(gitdir / "ttp-stale-locks").parts[1:]) for x in
+                  (gitdir / "ttp-stale-locks").glob("*/**/*.lock"))
+    assert len(kept) == 4, kept   # backed up, never deleted
+    assert "moved stale lock file(s) aside" in _daemon_log_text(p)
+    assert "MEMORY.md" not in _harness_dirty(p), "the commit went through once the locks were gone"
+    # A fresh lock (a commit in progress elsewhere) is never touched.
+    fresh.write_text("y\n")
+    assert p.clear_stale_git_locks() == [] and fresh.exists()
+
+
+def test_git_running_in_sees_a_git_in_the_repo(env, tmp_path):
+    from ttp.project import git_running_in
+    p = make(env)
+    assert git_running_in(tmp_path) is False
+    proc = subprocess.Popen(["git", "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL)
+    try:
+        assert git_running_in(p.harness)
+    finally:
+        proc.communicate(b"x")
+
+
+def test_harness_commit_failure_is_logged_and_a_later_commit_sweeps_it(env, monkeypatch):
+    p = make(env)
+    from ttp import project
+    real = project.subprocess.run
+
+    def broken(argv, **kw):
+        if "commit" in argv:
+            return subprocess.CompletedProcess(argv, 128, "", "fatal: Unable to create 'index.lock': File exists.")
+        return real(argv, **kw)
+    monkeypatch.setattr(project.subprocess, "run", broken)
+    p.add_memory("This commit fails.")
+    log = _daemon_log_text(p)
+    assert "commit failed with exit 128" in log and "index.lock" in log, log
+    assert "MEMORY.md" in _harness_dirty(p)
+    monkeypatch.setattr(project.subprocess, "run", real)
+    # The writer's own commit is left alone for a minute; after that the sweep picks the files up.
+    assert p.sweep_harness() is False
+    assert p.sweep_harness(min_age_s=0) is True
+    assert _harness_dirty(p).strip() == "", _harness_dirty(p)
+    assert "sweep: committing" in _daemon_log_text(p)
+    # Unrelated harness files are never swept.
+    (p.harness / "prompts" / "scratch.md").write_text("a harness task's unfinished edit\n")
+    p.charter_path.write_text(p.charter_path.read_text() + "\nhand edit\n")
+    os.utime(p.charter_path, (time.time() - 120, time.time() - 120))
+    p.add_memory("A later commit heals the earlier failure.")
+    dirty = _harness_dirty(p)
+    assert "CHARTER.md" not in dirty and "prompts/scratch.md" in dirty, dirty
+    msgs = subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s", "-3"], capture_output=True,
+                          text=True).stdout
+    assert "earlier failed commit" in msgs
+
+
+def test_harness_commit_timeout_is_configurable_and_logged(env, monkeypatch):
+    p = make(env)
+    from ttp import project
+    from ttp.daemon import Daemon
+    seen = []
+    real = project.subprocess.run
+
+    def slow(argv, **kw):
+        seen.append(kw.get("timeout"))
+        if "commit" in argv:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return real(argv, **kw)
+    monkeypatch.setattr(project.subprocess, "run", slow)
+    p.add_memory("Default timeout.")
+    assert 120 in seen and "commit timed out after 120 s" in _daemon_log_text(p)
+    p.set_config("harness_git.timeout_s", 300)   # project.json is not swept: not charter or memory
+    seen.clear()
+    p.add_memory("Raised timeout.")
+    assert seen and set(seen) == {300}, seen
+    monkeypatch.setattr(project.subprocess, "run", real)
+    # The daemon's tick sweeps what the timed-out commits left, once per sweep_every_s.
+    d = Daemon(p.base)
+    old = time.time() - 120
+    for f in [p.memory_index, *p.memory_dir.glob("*.md")]:
+        os.utime(f, (old, old))
+    d.heal_harness_git()
+    assert "memory" not in _harness_dirty(p).lower()
+    p.add_memory("Swept on the next tick window only.")
+    for f in [p.memory_index, *p.memory_dir.glob("*.md")]:
+        os.utime(f, (old, old))
+    subprocess.run(["git", "-C", str(p.harness), "reset", "-q", "--soft", "HEAD~1"], check=True)
+    d.heal_harness_git()
+    assert "MEMORY.md" in _harness_dirty(p), "swept again before sweep_every_s"
+    d._harness_swept = 0.0
+    d.heal_harness_git()
+    assert "memory" not in _harness_dirty(p).lower()
+
+
 def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

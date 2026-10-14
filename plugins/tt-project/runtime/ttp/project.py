@@ -248,6 +248,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # retry_backoff_s (doubling), before it is blocked for the coordinator.
     "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
+    # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
+    # A lock file in its .git older than stale_lock_s while no git runs there (one a killed commit left)
+    # is moved aside under .git/ttp-stale-locks/ before committing. Every sweep_every_s the daemon
+    # commits charter and memory files a failed commit left uncommitted (see Project.sweep_harness).
+    "harness_git": {"timeout_s": 120, "stale_lock_s": 600, "sweep_every_s": 600},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     # same_subject_warn: a watcher that opens more issues than this on one subject in 24 h gets a log
@@ -777,25 +782,138 @@ class Project:
             return
         self.db.after_commit(lambda: self._git_commit(rel, message, gone))
 
-    def _git_commit(self, rel: list[str], message: str, gone: list[str] = ()) -> bool:
+    def _harness_git_cfg(self, key: str) -> float:
+        try:
+            v = float((self.read_config()[0].get("harness_git") or {}).get(key) or 0)
+        except (TypeError, ValueError, AttributeError):
+            v = 0
+        return v if v > 0 else DEFAULT_CONFIG["harness_git"][key]
+
+    def _git_log(self, msg: str) -> None:
+        """A line in the daemon's log, which every process of the project may append to."""
+        try:
+            self.logs.mkdir(parents=True, exist_ok=True)
+            with open(self.logs / "daemon.log", "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} harness git: {msg}\n")
+        except OSError:
+            pass
+
+    def clear_stale_git_locks(self, now: float | None = None) -> list[str]:
+        """Move aside the lock files a killed git left in the harness repo (.git/*.lock, including
+        index.lock and next-index-*.lock, and .git/refs/**/*.lock) older than harness_git.stale_lock_s,
+        when no git process runs in the repo. Each is kept under .git/ttp-stale-locks/<stamp>/, never
+        deleted. Returns the moved paths (relative to .git)."""
+        gitdir = self.harness / ".git"
+        if not gitdir.is_dir():
+            return []
+        now = time.time() if now is None else now
+        age = self._harness_git_cfg("stale_lock_s")
+        locks = []
+        for f in [*gitdir.glob("*.lock"), *(gitdir / "refs").glob("**/*.lock")]:
+            try:
+                if f.is_file() and now - f.stat().st_mtime > age:
+                    locks.append(f)
+            except OSError:
+                continue
+        if not locks:
+            return []
+        if git_running_in(self.harness):
+            self._git_log(f"{len(locks)} stale lock file(s) left alone: a git process runs in the repo")
+            return []
+        dest = gitdir / "ttp-stale-locks" / time.strftime("%Y%m%dT%H%M%S", time.localtime(now))
+        moved = []
+        for f in locks:
+            rel = f.relative_to(gitdir)
+            try:
+                (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                os.replace(f, dest / rel)
+                moved.append(str(rel))
+            except OSError as e:
+                self._git_log(f"could not move stale lock {rel} aside: {e}")
+        if moved:
+            self._git_log(f"moved stale lock file(s) aside to {dest.relative_to(self.harness)}: {', '.join(moved)}")
+        return moved
+
+    def _git_commit(self, rel: list[str], message: str, gone: list[str] = (), sweep: bool = True) -> bool:
+        """Commit these harness paths. A failure is logged with git's stderr and exit code; files it
+        leaves uncommitted are picked up by the next successful commit's sweep or the daemon's."""
         ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
         git = ["git", "-C", str(self.harness), *git_fsync_args()]
+        timeout = self._harness_git_cfg("timeout_s")
+        step = "ls-files"
+
+        def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+            r = subprocess.run([*git, *args], capture_output=True, text=True, timeout=timeout)
+            if check and r.returncode:
+                raise subprocess.CalledProcessError(r.returncode, args, r.stdout, r.stderr)
+            return r
+
+        self.clear_stale_git_locks()
         try:
             if gone:
-                gone = subprocess.run([*git, "ls-files", "--", *gone], capture_output=True, text=True,
-                                      timeout=30).stdout.split()
+                gone = run("ls-files", "--", *gone).stdout.split()
                 if gone:
-                    subprocess.run([*git, "rm", "-q", "--cached", "--", *gone], check=True, capture_output=True,
-                                   timeout=30)
+                    step = "rm"
+                    run("rm", "-q", "--cached", "--", *gone)
             if rel:
-                subprocess.run([*git, "add", "--", *rel], check=True, capture_output=True, timeout=30)
+                step = "add"
+                run("add", "--", *rel)
             if not (rel or gone):
                 return False
-            r = subprocess.run([*git, *ident, "commit", "-q", "-m", message[:200], "--", *rel, *gone],
-                               capture_output=True, timeout=30)
-            return r.returncode == 0
-        except (OSError, subprocess.SubprocessError):
+            step = "commit"
+            r = run(*ident, "commit", "-q", "-m", message[:200], "--", *rel, *gone, check=False)
+            if r.returncode:
+                if not run("status", "--porcelain", "--", *rel, *gone, check=False).stdout.strip():
+                    return True   # another process committed these already
+                raise subprocess.CalledProcessError(r.returncode, "commit", r.stdout, r.stderr)
+        except subprocess.TimeoutExpired:
+            self._git_log(f"{step} timed out after {timeout:g} s ({message[:80]!r}); harness_git.timeout_s sets it")
             return False
+        except subprocess.CalledProcessError as e:
+            err = " | ".join(((e.stderr or "") + (e.stdout or "")).strip().splitlines())[:500]
+            self._git_log(f"{step} failed with exit {e.returncode} ({message[:80]!r}): {err}")
+            return False
+        except OSError as e:
+            self._git_log(f"{step} could not run ({message[:80]!r}): {e}")
+            return False
+        if sweep:
+            self.sweep_harness()
+        return True
+
+    def sweep_harness(self, min_age_s: float = 60) -> bool:
+        """Commit the charter and memory files (CHARTER*, MEMORY.md, memory/) a failed commit left
+        uncommitted, so it heals itself. A file changed in the last `min_age_s` is left to the commit
+        its writer is about to make. True when it committed something."""
+        if not (self.harness / ".git").exists():
+            return False
+        try:
+            out = subprocess.run(["git", "-C", str(self.harness), "status", "--porcelain=v1", "-z", "--no-renames",
+                                  "--untracked-files=all", "--", ":(glob)CHARTER*", "MEMORY.md", "memory"],
+                                 capture_output=True, text=True, timeout=self._harness_git_cfg("timeout_s"))
+        except (OSError, subprocess.SubprocessError) as e:
+            self._git_log(f"sweep: status could not run: {e}")
+            return False
+        if out.returncode:
+            self._git_log(f"sweep: status failed with exit {out.returncode}: {out.stderr.strip()[:300]}")
+            return False
+        now = time.time()
+        rel, gone = [], []
+        for entry in filter(None, out.stdout.split("\0")):
+            path = entry[3:]
+            f = self.harness / path
+            try:
+                if now - f.stat().st_mtime < min_age_s:
+                    continue
+                rel.append(path)
+            except FileNotFoundError:
+                gone.append(path)
+            except OSError:
+                continue
+        if not (rel or gone):
+            return False
+        self._git_log(f"sweep: committing {len(rel) + len(gone)} file(s) a failed commit left: "
+                      + ", ".join([*rel, *gone])[:300])
+        return self._git_commit(rel, "harness: commit files an earlier failed commit left", gone, sweep=False)
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None) -> Path:
@@ -1119,6 +1237,38 @@ def git_fsync_config() -> list[tuple[str, str]]:
     if git_version() >= (2, 36):
         return [("core.fsync", "committed")]
     return [("core.fsyncObjectFiles", "true")]
+
+
+def git_running_in(repo: Path) -> bool:
+    """Whether a git process runs in `repo` (its working directory, or a `-C` naming it). Without
+    /proc any running git counts, to stay on the safe side."""
+    repo = Path(repo).resolve()
+    proc = Path("/proc")
+    if not (proc / "self").is_dir():
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return any(Path(c.strip()).name.startswith("git") for c in out.splitlines())
+    for d in proc.iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+            if not argv or not os.path.basename(argv[0]).startswith(b"git"):
+                continue
+            cwd = Path(os.readlink(d / "cwd"))
+        except OSError:
+            continue
+        dirs = [cwd] + [cwd / os.fsdecode(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == b"-C"]
+        for x in dirs:
+            try:
+                x = x.resolve()
+            except OSError:
+                continue
+            if x == repo or repo in x.parents:
+                return True
+    return False
 
 
 def git_fsync_args() -> list[str]:
