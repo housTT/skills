@@ -39,8 +39,8 @@ Other people share the cluster's nodes. Hold a node only while work runs on it.
 
 ### Last busy time
 
-`LastBusyTime` is when Slurm last saw the node busy. Many unrelated nodes sharing one
-`LastBusyTime`, to the second, usually means a controller event (a restart or reconfigure), not
+`scontrol show node` gives the last time Slurm saw the node busy. Many unrelated nodes sharing one
+last busy time, to the second, usually means a controller event (a restart or reconfigure), not
 jobs. A `--min-idle` check against it is then conservative (it may refuse a node that has been free
 longer), never unsafe. Where accounting is on, `sacct -N <node>` shows when the last real job on
 the node ended.
@@ -76,7 +76,7 @@ login node (`slurm.login`) over ssh.
 
 | Command | What |
 |---|---|
-| `survey <box> [--partition P] [--min-idle MIN]` | read-only (`sinfo` and `scontrol` only, never `sbatch`, `srun` or `salloc`): per partition (default: the site file's), node counts by state, every plain `IDLE` node with its `LastBusyTime`, minutes since then and why it is not takeable (a reservation, `demo_nodes`, `excluded_nodes`, under `--min-idle` when given), and the reservations on its nodes; ends with a note for each `LastBusyTime` that several nodes share |
+| `survey <box> [--partition P] [--min-idle MIN]` | read-only (`sinfo` and `scontrol` only, never `sbatch`, `srun` or `salloc`): per partition (default: the site file's), node counts by state, every plain `IDLE` node with its last busy time, minutes since then and why it is not takeable (a reservation, `demo_nodes`, `excluded_nodes`, under `--min-idle` when given), and the reservations on its nodes; ends with a note for each last busy time that several nodes share |
 | `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (minutes since the node was last busy) when given |
 | `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line; on a partition without a measured chip count the job also measures it |
 | `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc`, the measured chip count when the job took one, and the last 20 lines of `job.log`; exit 2 when `squeue` fails (state unknown: never treat that as ended) |
