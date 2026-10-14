@@ -1565,7 +1565,7 @@ def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", re
     (fake / "sinfo.txt").write_text("node07\n")
     tools = {
         "ssh": 'while [ "${1#-}" != "$1" ]; do shift 2; done; shift; exec bash -c "$*"',
-        "scontrol": 'case "$*" in *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
+        "scontrol": 'case "$*" in *partition*) cat "$FAKE/part.txt" 2>/dev/null;; *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
                     '{ echo "No reservations in the system"; exit 1; };; *) cat "$FAKE/node.txt";; esac',
         "sinfo": 'cat "$FAKE/sinfo.txt"',
         "squeue": 'cat "$FAKE/squeue.txt"',
@@ -1666,6 +1666,40 @@ def test_setup_box_slurm_submit_refuses_unsafe_jobs_and_prints_note_and_probe(tm
     assert subprocess.run(probe, shell=True, env=env).returncode == 1
     (fake / "squeue.txt").write_text("17\n")
     assert subprocess.run(probe, shell=True, env=env).returncode == 0
+
+
+def test_setup_box_slurm_submit_without_node_lets_slurm_place_the_job(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    co = str(tmp_path / "work" / "repo")
+    base = ["submit", "<box-alias>", "--partition", "p4", "--name", "t1", "--time", "30",
+            "--checkout", co, "--purpose", "smoke test", "--command", "true"]
+    (fake / "node.txt").write_text("NodeName=node07 State=ALLOCATED\n")  # no node is checked
+    site = json.loads((tmp_path / "boxes.json").read_text())
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["exclusive"] = False
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    r = run(*base)
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = (fake / "sbatch.args").read_text()
+    assert args.startswith("--parsable --nodes=1 --exclude=demo1,bad1 -p p4 --time=30 "), args
+    assert "-w" not in args.split() and "--exclusive" not in args
+    assert "node: assigned by Slurm" in r.stdout
+    note = next(ln for ln in r.stdout.splitlines() if ln.startswith("note: ttp note "))
+    assert "node assigned by Slurm" in note and "job 4242" in note
+    # A whole-node partition gets --exclusive, unless the partition already enforces it.
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["exclusive"] = True
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=NO State=UP\n")
+    assert run(*base).returncode == 0
+    assert "--nodes=1 --exclude=demo1,bad1 --exclusive -p p4" in (fake / "sbatch.args").read_text()
+    (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=EXCLUSIVE State=UP\n")
+    assert run(*base).returncode == 0
+    assert "--exclusive" not in (fake / "sbatch.args").read_text()
+    # --allow and --min-idle narrow a named node only.
+    (fake / "sbatch.args").unlink()
+    for extra in (["--allow", "node07"], ["--min-idle", "60"]):
+        r = run(*base, *extra)
+        assert r.returncode == 1 and "pass it as --node" in r.stdout, r.stdout
+    assert not (fake / "sbatch.args").exists()
 
 
 def test_setup_box_slurm_status_and_verify_clean(tmp_path):

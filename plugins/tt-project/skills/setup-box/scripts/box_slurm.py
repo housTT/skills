@@ -286,6 +286,24 @@ def cmd_check(args) -> int:
     return 0
 
 
+def _scheduler_placement(e: dict, login: str, part: dict) -> List[str]:
+    """sbatch options for a job Slurm places: one node, never the site file's demo or excluded
+    nodes, and --exclusive when the site file marks the partition whole-node only and the
+    partition does not already enforce it (OverSubscribe=EXCLUSIVE)."""
+    opts = ["--nodes=1"]
+    skip = [_name("node", n) for k in ("demo_nodes", "excluded_nodes") for n in (e.get(k) or [])]
+    if skip:
+        opts.append("--exclude=" + ",".join(dict.fromkeys(skip)))
+    if part.get("exclusive"):
+        r = _login(login, f"scontrol -o show partition {_name('partition', part['name'])}")
+        if r.returncode != 0:
+            raise Refused(f"scontrol show partition {part['name']} failed: "
+                          f"{(r.stderr or r.stdout).strip()[-300:]}")
+        if field(r.stdout, "OverSubscribe") != "EXCLUSIVE":
+            opts.append("--exclusive")
+    return opts
+
+
 def cmd_submit(args) -> int:
     command = args.command
     try:
@@ -309,14 +327,22 @@ def cmd_submit(args) -> int:
         for what, p in (("checkout", args.checkout), ("run dir", rundir)):
             if not _under(p, root):
                 raise Refused(f"{what} {p} is not under workdir_root {root} (shared storage)")
-        check_node(e, login, args.node, allow=args.allow, min_idle_min=args.min_idle,
-                   partition=args.partition)
+        if args.node:
+            check_node(e, login, args.node, allow=args.allow, min_idle_min=args.min_idle,
+                       partition=args.partition)
+            place = ["--exclusive", "-w", args.node]
+        else:
+            if args.allow is not None or args.min_idle > 0:
+                raise Refused("--allow and --min-idle check a named node: pick one with survey "
+                              "and pass it as --node")
+            place = _scheduler_placement(e, login, part)
     except (Refused, box.SiteError) as err:
         print(f"refused: {err}")
         return 1
+    node = args.node or "assigned by Slurm"
     log, rc, script = f"{rundir}/job.log", f"{rundir}/job.rc", f"{rundir}/job.sbatch"
     chips = None if box.chips_known(part) else f"{rundir}/job.chips"
-    sbatch = ["sbatch", "--parsable", "--exclusive", "-w", args.node, "-p", args.partition,
+    sbatch = ["sbatch", "--parsable", *place, "-p", args.partition,
               f"--time={args.time}", f"--job-name={args.name}"]
     # A job reusing --name must not leave an earlier job's count for status to print.
     remote = (f"mkdir -p {_rpath(rundir)} && rm -f {_rpath(rundir)}/job.chips && "
@@ -330,10 +356,12 @@ def cmd_submit(args) -> int:
         return 1
     start = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
     size = f"{part['chips']} chips" if chips is None else "chips not measured yet: the job records them"
-    print(f"job {job} node {args.node} partition {args.partition} ({size}, "
+    print(f"job {job} node {node} partition {args.partition} ({size}, "
           f"{part.get('board', '?')}) log {log} rc {rc}")
+    if not args.node:
+        print("node: assigned by Slurm; `status` shows it once the job runs")
     print("note: ttp note " + shlex.quote(
-        f"slurm alloc: cluster {args.box} job {job} node {args.node} start {start} "
+        f"slurm alloc: cluster {args.box} job {job} node {node} start {start} "
         f"limit {args.time} purpose: {args.purpose}"))
     probe = (f"ids=$(squeue -h -o %i -u \"$USER\") || exit 1; "
              f"printf '%s\\n' \"$ids\" | grep -qx {job} && exit 1; exit 0")
@@ -436,9 +464,9 @@ def register(sub) -> None:
     p.add_argument("node")
     p.add_argument("--partition")
     p.set_defaults(func=cmd_check)
-    p = sl.add_parser("submit", help="submit one self-ending batch job on an exclusive node")
+    p = sl.add_parser("submit", help="submit one self-ending batch job (Slurm places it unless --node)")
     _common(p)
-    p.add_argument("--node", required=True)
+    p.add_argument("--node", help="take this node (checked first); default: Slurm picks one")
     p.add_argument("--partition", required=True)
     p.add_argument("--time", help="expected run time plus a small margin (required)")
     p.add_argument("--name", required=True, help="job name; also the run dir under workdir_root/runs")

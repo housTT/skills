@@ -10,6 +10,11 @@ every rule and command in `slurm.md` applies. This page adds what is particular 
   decides them.
 - The site file maps each partition to its chips and board. Check it with `tt-smi -ls` inside the
   first job on each partition; until then leave `chips` out and let that job measure it (`slurm.md`).
+  Count the rows of its "All available boards" table, not the `/dev/tenstorrent` entries (a node of
+  32 chips may show 33 entries there).
+- `box.py slurm submit` without `--node` lets Slurm place the job on a free node of the partition.
+  Set `"exclusive": true` on such partitions in the site file; `submit` adds `--exclusive` only when
+  the partition does not already enforce it.
 - One-chip work: an exclusive node of the smallest board type, limited to one chip with
   `--devices 0` (`TT_VISIBLE_DEVICES`) or the test's mesh setting. Four-chip work: a node of a
   4-chip board type, or 4 chips of a larger node (`--devices 0,1,2,3`).
@@ -33,7 +38,7 @@ every rule and command in `slurm.md` applies. This page adds what is particular 
 - Release the node when the work ends, record the allocation (cluster, job id, node, start, end,
   purpose) with `ttp note`, and run `box.py slurm verify-clean`.
 - A project's charter may narrow these rules (which nodes, how long a node must have been idle):
-  pass them as `--allow` and `--min-idle`.
+  pick a node with `survey`, then pass `--node` with `--allow` and `--min-idle`.
 
 ## Reaching the login node
 
