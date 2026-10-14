@@ -34,6 +34,16 @@ with `<plugin-root>/skills/setup-box/scripts/box.py site check`. Its `route` pic
 All routes share `ssh-workflow.md` (aliases, jump host, detached jobs) and `agents.md` (agent CLIs
 and build/run recipes on the box).
 
+## Etiquette on shared machines
+
+- Get a box through its scheduler or reservation system; never ssh into a node you hold no
+  allocation or reservation for.
+- Never take a node or box that is allocated, drained, reserved or down, and never cancel, join or
+  share another user's allocation.
+- Reserve or allocate only for the run, release right after it, and re-reserve when needed. Never
+  auto-extend a reservation, and hold nothing idle.
+- A project's charter can narrow these rules (which machines, how long); it never widens them.
+
 ## Work on the box
 
 - The device task ssh-es to the box and edits, builds and runs in its own checkout or

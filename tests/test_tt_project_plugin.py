@@ -1096,3 +1096,18 @@ def test_setup_box_links_tt_buddy_instead_of_copying():
         assert ref in agents, ref
     for page in ("ird", "slurm", "exabox", "bare-metal", "migrate-off-sync"):
         assert (SKILLS / "setup-box" / f"{page}.md").is_file(), page
+
+
+def test_setup_box_states_company_etiquette_without_personal_policy():
+    # Company-wide practice only; a user's own limits belong in their charter (user msg #554).
+    skill = (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
+    for part in ("allocated, drained, reserved or down", "release right after it",
+                 "Never\n  auto-extend", "hold nothing idle", "charter can narrow these rules"):
+        assert part in skill, part
+    assert "IRD is reachable only from networks that can reach the IRD service" in \
+        (SKILLS / "setup-box" / "ird.md").read_text(encoding="utf-8")
+    pages = "\n".join(p.read_text(encoding="utf-8") for p in (SKILLS / "setup-box").rglob("*")
+                      if p.is_file() and p.suffix in (".md", ".py")).lower()
+    for banned in ("idle at least", "nodes the user listed", "nodes you listed", "machine list",
+                   "reservation cap", "reservation-cap"):
+        assert banned not in pages, banned
