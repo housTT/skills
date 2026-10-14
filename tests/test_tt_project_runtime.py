@@ -49333,6 +49333,58 @@ def test_an_outage_check_whose_only_route_failed_for_an_hour_reports_no_machine_
     assert ml.conditions() == {} and heal.state(p.db, "svc")["route_only"]
 
 
+def test_an_outage_check_with_ping_host_tells_a_box_that_is_off_from_its_own_route(env, monkeypatch):
+    """Upstream note: every ssh 255 counted as this project's route problem, so a box that was powered off
+    or rebooting got a self-fix task instead of an outage report. `ping_host` (and a `ping_peer`) tell them apart."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha")
+    p, d, _ = _heal_setup(env)
+    answers: dict = {}
+    pinged: list = []
+    monkeypatch.setattr(heal, "_pings", lambda h, cwd: pinged.append(h) or answers.get(h))
+    block = {"check": "echo 'ssh: connect to host box-a port 22: No route to host' >&2; exit 255",
+             "machine": "box-a", "outage": True, "grace_s": 0, "ping_host": "box-a", "ping_peer": "box-b"}
+    spec = heal.validate(block)
+    t0 = time.time()
+    # Both silent, the box answering, or ping unable to tell: still our own route, nothing reported.
+    for i, (box, peer) in enumerate(((False, False), (True, True), (None, True), (False, None))):
+        answers.update({"box-a": box, "box-b": peer})
+        heal.run(d, f"r{i}", spec, t0)
+        heal.run(d, f"r{i}", spec, t0 + 3700)
+        st = heal.state(p.db, f"r{i}")
+        assert st["route_only"] and "own route problem" in st["why"] and ml.conditions() == {}, (box, peer)
+    # The box silent while its peer answers: it is off or rebooting, an outage reported down.
+    answers.update({"box-a": False, "box-b": True})
+    heal.run(d, "off", spec, t0)
+    heal.run(d, "off", spec, t0 + 3700)
+    st = heal.state(p.db, "off")
+    assert not st["route_only"] and list(ml.conditions()) == ["box-a:down"]
+    assert "box-a does not answer ping while box-b does" in st["why"] and "ping: box-a" in st["last_out"]
+    # Without a peer, the box silent alone is enough.
+    heal.run(d, "off", heal.validate({**block, "ping_peer": None}), t0 + 3800)
+    assert not heal.state(p.db, "off")["route_only"]
+    # No ping without a route failure, nor without ping_host.
+    pinged.clear()
+    heal.run(d, "plain", heal.validate({**block, "check": "echo 'status: no answer'; exit 75"}), t0)
+    heal.run(d, "noping", heal.validate({**block, "ping_host": None, "ping_peer": None}), t0)
+    assert pinged == []
+    for bad in ({"ping_host": "-f"}, {"ping_host": "a b"}, {"ping_host": 3}, {"ping_peer": "box-b"}):
+        with pytest.raises(ValueError):
+            heal.validate({"check": "true", **bad})
+
+
+def test_heal_pings_reads_only_no_reply_as_silent(monkeypatch):
+    from ttp import heal
+    for platform, silent in (("linux", 1), ("darwin", 2)):
+        monkeypatch.setattr(heal.sys, "platform", platform)
+        for rc, want in ((0, True), (silent, False), (127, None), (68, None)):
+            monkeypatch.setattr(heal, "_exec", lambda argv, cwd, t, rc=rc: (rc, ""))
+            assert heal._pings("box-a", ".") is want, (platform, rc)
+
+
 def test_a_route_only_outage_check_is_not_an_outage_alert(env):
     from ttp import heal
     from ttp import schedule as sched

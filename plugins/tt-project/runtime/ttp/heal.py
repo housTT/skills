@@ -59,6 +59,13 @@ was refused or timed out, or the host or network unreachable: ROUTE_RE), the box
 escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
+Telling a box that is off from our own route: `ping_host` (a host name or address, pinged from the daemon's
+machine) and an optional `ping_peer` (another host on the same network). A run whose route failed then pings
+them: `ping_host` silent while `ping_peer` answers (or with no `ping_peer`, `ping_host` silent alone) means
+the box itself is off or rebooting: that run is an outage like any other unknown run, so the box is reported
+down past the window. Both silent, or `ping_host` answering, stays this project's route problem. Set them
+only for a box that answers ping when it is up.
+
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
 the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
 on a check without `outage`: its own grace, its fix, `known_fault` keeps it quiet, the ordinary self-fix
@@ -130,6 +137,8 @@ ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out
                       r"(host|network) is unreachable|could not resolve host(name)?|name or service not known|"
                       r"temporary failure in name resolution|kex_exchange_identification|"
                       r"ssh: connect to host|connection closed by .* port", re.I)
+HOST_RE = re.compile(r"[A-Za-z0-9_.:%\[\]][A-Za-z0-9_.:%\[\]-]*")   # one host name or address, never an option
+PING_S = 3                      # how long box_silent waits for each ping reply
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
 OPEN = ("queued", "running", "waiting", "needs_review")
@@ -138,7 +147,8 @@ OPEN = ("queued", "running", "waiting", "needs_review")
 _TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}
 KNOWN_FAULT_KEYS = ("why", "match", "until")   # known_fault as an object (module doc)
 COMMON_FIELDS: dict[str, dict] = {
-    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate"), _TEXT),
+    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate",
+                     "ping_host", "ping_peer"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
     "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
@@ -183,6 +193,12 @@ def validate(block: Any, where: str = "heal") -> dict:
         _validate_known(out["known_fault"], where)
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
+    for k in ("ping_host", "ping_peer"):
+        v = out.get(k)
+        if v is not None and not (isinstance(v, str) and HOST_RE.fullmatch(v)):
+            raise ValueError(f"{where}: `{k}` is one host name or address")
+    if out.get("ping_peer") and not out.get("ping_host"):
+        raise ValueError(f"{where}: `ping_peer` needs `ping_host`")
     if out.get("escalate") is not None and out["escalate"] not in ESCALATE:
         raise ValueError(f"{where}: `escalate` is one of {', '.join(ESCALATE)}")
     if out.get("condition") is not None and out["condition"] not in LEDGER_CONDITIONS:
@@ -432,6 +448,28 @@ def route_failed(rc: int, out: str) -> bool:
     return rc not in (0, 1) and (rc == ROUTE_RC or ROUTE_RE.search(out or "") is not None)
 
 
+def _pings(host: str, cwd: str) -> bool | None:
+    """The host answers one ping within PING_S: True, False when no reply came, None when ping itself failed
+    (not installed, a name that does not resolve: that tells nothing about the box)."""
+    darwin = sys.platform == "darwin"
+    wait = ["-t" if darwin else "-w", str(PING_S)]   # the whole run's deadline in seconds
+    rc = _exec(["ping", "-c", "1", *wait, host], cwd, PING_S + 5)[0]
+    return True if rc == 0 else False if rc == (2 if darwin else 1) else None
+
+
+def box_silent(spec: dict, cwd: str) -> str:
+    """After a route failure: why the box itself looks off (`ping_host` silent while `ping_peer`, if set,
+    answers), or "" when it may still be our route (no `ping_host`, it answers, the peer is silent too, or
+    ping could not tell)."""
+    box = spec.get("ping_host")
+    if not box or _pings(box, cwd) is not False:
+        return ""
+    peer = spec.get("ping_peer")
+    if peer and _pings(peer, cwd) is not True:
+        return ""
+    return f"{box} does not answer ping" + (f" while {peer} does" if peer else "") + ": it is off or rebooting"
+
+
 def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
     """Run the fix in its project's `env` (project.command_env), under `ttp lock <resource>` when it
     names one. 75 only from the lock (busy or paused): `ttp lock` passes its command's exit code on,
@@ -612,8 +650,12 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             return f"fixed ({n} today)", None
         return "ok (healthy)", None
     if rc != 1:
-        # route_only: every unknown run since unknown_since was only its route failing.
-        st["route_only"] = route_failed(rc, out) and bool(st.get("route_only", "unknown_since" not in st))
+        # route_only: every unknown run since unknown_since was only its route failing (and the box not silent).
+        route = route_failed(rc, out)
+        silent = box_silent(spec, cwd) if route else ""
+        if silent:
+            st["last_out"] = (out[-800:] + f"\nping: {silent}").strip()
+        st["route_only"] = route and not silent and bool(st.get("route_only", "unknown_since" not in st))
         st["unknown_since"] = st.get("unknown_since") or now
         again = None
         if spec.get("outage"):
@@ -633,7 +675,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                                      f"{dark / 60:.0f} min (exit {rc}): this project's own route problem, so the "
                                      f"machine is not reported down")
                 return _escalate(host, name, spec, st, now, f"its check could not tell for {dark / 60:.0f} min "
-                                                            f"(exit {rc}): the box or resource may be unreachable")
+                                                            f"(exit {rc}): " + (silent or "the box or resource may be "
+                                                                                "unreachable"))
             again = float(st["unknown_since"]) + window
         told = ""
         cap = float(spec.get("unknown_cap_s", DEFAULTS["unknown_cap_s"]) or 0)
