@@ -1216,13 +1216,26 @@ def test_setup_box_bare_remote_root_with_odd_characters_keeps_home():
 
 
 def test_setup_box_bare_check_shows_broker_queue_for_serving_box(tmp_path):
-    q = "running 1 queued 2 owners alice bob"
+    q = "running 1 queued 2 owners user-a user-b"
     env, _ = _bare_env(tmp_path, queue=q, machines={"<box-alias>": {"tags": ["serving"]}})
     r = _bare_check(tmp_path, env)
     assert f"broker queue (read-only, `tt-device-mcp status 0`): {q}" in r.stdout, r.stdout
     assert json.loads(_bare_check(tmp_path, env, "--json").stdout)["broker_queue"] == q
-    env2, _ = _bare_env(tmp_path / "b", queue=q) if (tmp_path / "b").mkdir() is None else None
+    (tmp_path / "b").mkdir()
+    env2, _ = _bare_env(tmp_path / "b", queue=q)
     assert "broker queue" not in _bare_check(tmp_path / "b", env2).stdout
+
+
+def test_setup_box_bare_check_bounds_a_hung_broker_queue_probe(tmp_path):
+    import time
+    env, _ = _bare_env(tmp_path, machines={"<box-alias>": {"tags": ["serving"]}})
+    shim = tmp_path / "bin" / "tt-device-mcp"
+    shim.write_text("#!/bin/bash\nsleep 40\n")
+    t0 = time.time()
+    r = _bare_check(tmp_path, env)
+    assert time.time() - t0 < 30, r.stdout
+    assert "ssh: ok" in r.stdout and "disk:" in r.stdout, r.stdout
+    assert "status timed out" in r.stdout, r.stdout
 
 
 def test_setup_box_bare_check_custom_lock_and_wrong_route(tmp_path):

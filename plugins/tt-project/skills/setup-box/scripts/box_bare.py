@@ -43,7 +43,11 @@ def probe_script(root: str, service: str = BROKER_SERVICE) -> str:
         'echo "df_path=$d"; '
         'echo "df_kb=$(df -Pk "$d" 2>/dev/null | awk \'NR==2{print $4}\')"; '
         f"if command -v {BROKER_CMD} >/dev/null 2>&1; then echo broker_cmd=yes; "
-        f"echo \"queue=$({BROKER_CMD} status 0 2>&1 | head -n 6 | tr '\\n' ' ' | cut -c1-300)\"; "
+        f"if [ \"$(systemctl is-active {shlex.quote(service)} 2>/dev/null)\" = active ]; then "
+        f"if command -v timeout >/dev/null 2>&1; then q=$(timeout 10 {BROKER_CMD} status 0 2>&1); "
+        f"else q=$({BROKER_CMD} status 0 2>&1); fi; "
+        "[ $? = 124 ] && q='status timed out'; "
+        "echo \"queue=$(echo \"$q\" | head -n 6 | tr '\\n' ' ' | cut -c1-300)\"; fi; "
         "else echo broker_cmd=no; fi; "
         f"echo \"broker_svc=$(systemctl is-active {shlex.quote(service)} 2>/dev/null)\""
     )
