@@ -148,13 +148,39 @@ def test_check_plan_invalid_or_missing_coverage_never_passes(tmp_path, case):
 def test_check_plan_absent_definition_commit_names_commit_and_repo(tmp_path):
     repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
     absent = "b" * 40
-    env = {**os.environ, "PYTHONPATH": str(RUNTIME)}
+    env = {**{k: v for k, v in os.environ.items() if k != "TTP_PROJECT"}, "PYTHONPATH": str(RUNTIME)}
     result = subprocess.run([sys.executable, "-m", "ttp", "check-plan", "--purpose", "harness",
                              "--definition-commit", absent, "--definition-path", "checks/harness-plan.json"],
                             cwd=repo, env=env, capture_output=True, text=True)
     assert result.returncode == 66
     assert f"definition commit {absent} is not in repository {repo.resolve()}" in result.stderr
     assert "Needed a single revision" not in result.stderr
+
+
+def test_check_plan_outside_the_harness_repo_says_where_it_runs(tmp_path, monkeypatch, capsys):
+    """Started in another repo's worktree or in a folder that is no git repo, check-plan fails with
+    an input error that names the problem (never git's raw error) and points to the project's own
+    repo when that one has the definition commit."""
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    subprocess.run(["git", "-C", str(other), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                    "--allow-empty", "-m", "init"], check=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    for where, said in ((other, f"definition commit {definition} is not in repository"),
+                        (plain, f"{plain} is not in a git repository")):
+        assert checkplan.run(where, definition, "plan.json", "harness") == checkplan.INPUT_ERROR
+        err = capsys.readouterr().err
+        assert said in err and "git failed" not in err and "it is in" not in err, err
+        monkeypatch.setenv("TTP_PROJECT", str(repo / "tt-project"))
+        assert checkplan.run(where, definition, "plan.json", "harness") == checkplan.INPUT_ERROR
+        assert f"it is in {repo.resolve()}" in capsys.readouterr().err
+        monkeypatch.delenv("TTP_PROJECT")
 
 
 def test_check_plan_keeps_all_required_commands_and_first_failure(tmp_path):
@@ -58760,7 +58786,7 @@ def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_
     assert push.recorded_checks(run) is None
     monkeypatch.setenv("TTP_TASK", "1")
     assert prguard._task_pass(head, str(repo)) is None
-    # The candidate default runs every entry: no harness pass is reused, the gate fails it.
+    # The candidate default runs every entry but harness-tagged ones: no harness pass is reused, the gate fails it.
     log.unlink()
     with pytest.raises(SystemExit) as exc:
         cli.main(["checks"])
@@ -58779,71 +58805,85 @@ def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypa
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
     _fake_check_plan_ttp(tmp_path, monkeypatch, log)
-    # The harness repo: it has the definition commit, so the candidate default runs the harness check.
-    plan = HARNESS_PLAN.replace("a" * 40, subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True,
-                                                         text=True).stdout.strip())
-    p.set_config("delivery.push_checks", [{"run": plan, "purpose": "harness"}, f"echo consumer >> {log}"])
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
     ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
     cli.main(["checks"])
-    assert ran() == 2
+    assert ran() == 1
     cli.main(["checks", "--purpose", "harness"])
-    assert ran() == 4, "a candidate pass was reused for a harness qualification"
+    assert ran() == 3, "a candidate pass was reused for a harness qualification"
     cli.main(["checks", "--purpose", "harness"])
-    assert ran() == 4 and "(recorded)" in capsys.readouterr().out
+    assert ran() == 3 and "(recorded)" in capsys.readouterr().out
     cli.main(["checks"])
-    assert ran() == 4, "the candidate pass on the same tree was not reused"
+    assert ran() == 3, "the candidate pass on the same tree was not reused"
     assert json.loads((run / "checks.json").read_text())["purpose"] == "candidate"
     assert cli._recorded_pass(p, subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True,
                                                 text=True).stdout.strip(), [], "other") is None
 
 
-def test_ttp_checks_skips_a_harness_check_of_another_repo(env, tmp_path, monkeypatch, capsys):
-    """A worktree of a repo other than the harness's (its definition commit is not there): the candidate
-    `ttp checks` passes on the repo's own checks and reports the harness check skipped, never passed;
-    `--purpose harness` still runs it, and with no other check nothing applies."""
-    from ttp import cli
+@pytest.mark.parametrize("repo_kind", ["other_repo", "harness_repo"])
+def test_ttp_checks_candidate_skips_harness_checks(env, tmp_path, monkeypatch, capsys, repo_kind):
+    """The candidate `ttp checks` (a code task's checks) never runs a `purpose: harness` entry, whether
+    or not the worktree's repo has its definition commit: it passes on the repo's own checks and
+    reports the harness check skipped, never passed. `--purpose harness` still runs it, and with no
+    other check nothing applies."""
+    from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
     _fake_check_plan_ttp(tmp_path, monkeypatch, log)
-    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    plan = HARNESS_PLAN if repo_kind == "other_repo" else HARNESS_PLAN.replace(
+        "a" * 40, subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
+    p.set_config("delivery.push_checks", [{"run": plan, "purpose": "harness"}, f"echo consumer >> {log}"])
     cli.main(["checks"])
     out = capsys.readouterr().out
-    assert log.read_text().split() == ["consumer"], "the other repo's harness check ran"
-    assert "definition commit aaaaaaaaaaaa is not in this repository" in out and "1 skipped" in out
+    assert log.read_text().split() == ["consumer"], "a candidate run ran the harness check"
+    assert push.HARNESS_ONLY in out and "1 check(s) passed" in out and "1 skipped" in out
     rec = json.loads((run / "checks.json").read_text())
-    assert rec["passed"] is True and rec["purpose"] == "candidate" and HARNESS_PLAN not in rec["commands"]
-    assert len(rec["skipped"]) == 1 and HARNESS_PLAN in rec["skipped"][0]
+    assert rec["passed"] is True and rec["purpose"] == "candidate" and rec["commands"] == [f"echo consumer >> {log}"]
+    assert len(rec["skipped"]) == 1 and plan in rec["skipped"][0]
     log.unlink()
     cli.main(["checks", "--purpose", "harness"])
     assert log.read_text().split() == ["plan", "consumer"], "a harness qualification skipped its check"
-    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    assert json.loads((run / "checks.json").read_text())["purpose"] == "harness"
+    p.set_config("delivery.push_checks", [{"run": plan, "purpose": "harness"}])
     with pytest.raises(SystemExit) as exc:
         cli.main(["checks"])
     assert exc.value.code == 1
     assert json.loads((run / "checks.json").read_text())["passed"] is False
 
 
-def test_push_own_skips_a_harness_check_of_another_repo_but_push_runs_it(env, monkeypatch, tmp_path):
+def test_candidate_harness_skip_never_hides_an_outside_scope_change(env, tmp_path):
+    """A candidate run that leaves out a harness check still sees a change outside every other check's
+    `if_changed` scope as outside_scope, and a run of only harness checks as nothing applying."""
+    from ttp import push
+    harness, scoped = push.check_list([{"run": HARNESS_PLAN, "purpose": "harness"},
+                                       {"run": "true", "if_changed": "src"}])
+    out = push.Skipped(push.skipped_line(scoped, "x"))
+    out.scoped = True
+    left = push.Skipped(push.skipped_line(harness, push.HARNESS_ONLY))
+    left.harness_only = True
+    assert push.outside_scope([harness, scoped], [left, out])
+    assert not push.outside_scope([harness], [left])
+
+
+def test_push_own_skips_harness_checks_but_push_runs_them(env, monkeypatch, tmp_path):
     from ttp import push
     log = tmp_path / "log"
     _fake_check_plan_ttp(tmp_path, monkeypatch, log)
-    checks = push.check_list([{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
     (tmp_path / "run").mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
     _git_out(repo, "checkout", "-q", "-b", "own")
     _commit(repo, "x.txt", "x\n")
-    said = []
-    assert push.publish(repo, "origin", "own", checks, say=said.append) == 0
-    assert log.read_text().split() == ["consumer"], said
-    assert any("is not in this repository" in m for m in said)
-    # The repo that has the definition commit runs it.
-    log.unlink()
     head = _git_out(repo, "rev-parse", "HEAD").strip()
     _commit(repo, "y.txt", "y\n")
-    mine = push.check_list([{"run": HARNESS_PLAN.replace("a" * 40, head), "purpose": "harness"}])
-    assert push.publish(repo, "origin", "own", mine, say=said.append) == 0
-    assert log.read_text().split() == ["plan"]
+    for plan in (HARNESS_PLAN, HARNESS_PLAN.replace("a" * 40, head)):   # another repo's plan, then this repo's
+        checks = push.check_list([{"run": plan, "purpose": "harness"}, f"echo consumer >> {log}"])
+        said = []
+        assert push.publish(repo, "origin", "own", checks, say=said.append) == 0
+        assert log.read_text().split() == ["consumer"], said
+        assert any(push.HARNESS_ONLY in m for m in said)
+        log.unlink()
+        _commit(repo, "z.txt", plan)
 
 
 def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, capsys):

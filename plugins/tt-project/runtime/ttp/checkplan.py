@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +36,35 @@ def _read_git(repo: Path, *args: str) -> bytes:
     if result.returncode:
         raise PlanError(GIT_ERROR, f"git failed ({result.returncode}): {result.stderr!r}")
     return result.stdout
+
+
+def _has(repo: Path, *args: str) -> bytes | None:
+    """Git's output, or None when git answers no (not a repository, no such object)."""
+    try:
+        result = _git(repo, *args)
+    except OSError as e:
+        raise PlanError(GIT_ERROR, f"git unavailable: {e}") from e
+    return None if result.returncode else result.stdout
+
+
+def _elsewhere(definition_commit: str, checked: Path | None = None) -> str:
+    """Where the definition commit is instead: the project's own repository (TTP_PROJECT's root),
+    when that is a git repository other than `checked` and has it; else nothing."""
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        return ""
+    root = Path(base).resolve()
+    root = root.parent if root.name == "tt-project" else root
+    try:
+        top = _has(root, "rev-parse", "--show-toplevel")
+        if top is None or (checked and Path(top.decode().strip()).resolve() == checked.resolve()):
+            return ""
+        top_path = Path(top.decode().strip())
+        if _has(top_path, "cat-file", "-e", f"{definition_commit}^{{commit}}") is None:
+            return ""
+    except PlanError:
+        return ""
+    return f"; it is in {top_path}: run it there, e.g. with `ttp checks --purpose harness`"
 
 
 def _path(path) -> bool:
@@ -97,17 +127,26 @@ def run(repo: Path, definition_commit: str | None, definition_path: str, purpose
         if not (at_head or _OID.fullmatch(definition_commit)) or not _path(definition_path):
             raise PlanError(INPUT_ERROR, "definition needs a full commit ID and exact repository path")
         # Paths are repository-relative: run from the top level even when started in a subdirectory.
-        repo = Path(_read_git(repo, "rev-parse", "--show-toplevel").decode().strip())
+        start = repo
+        try:
+            top = _git(repo, "rev-parse", "--show-toplevel")
+        except OSError as e:
+            raise PlanError(GIT_ERROR, f"git unavailable: {e}") from e
+        err = top.stderr if isinstance(top.stderr, bytes) else str(top.stderr or "").encode()
+        if top.returncode and b"not a git repository" not in err.lower():
+            raise PlanError(GIT_ERROR, f"git failed ({top.returncode}): {top.stderr!r}")
+        if top.returncode:
+            raise PlanError(INPUT_ERROR, f"{start} is not in a git repository; a check plan runs only in the "
+                                         f"repository that has its definition commit"
+                                         f"{_elsewhere(definition_commit) if definition_commit else ''}")
+        repo = Path(top.stdout.decode().strip())
         head = _read_git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
         if at_head:
             definition_commit = head
-        try:
-            found = _git(repo, "cat-file", "-e", f"{definition_commit}^{{commit}}")
-        except OSError as e:
-            raise PlanError(GIT_ERROR, f"git unavailable: {e}") from e
-        if found.returncode:
+        if _has(repo, "cat-file", "-e", f"{definition_commit}^{{commit}}") is None:
             raise PlanError(INPUT_ERROR, f"definition commit {definition_commit} is not in repository {repo}; "
-                                         "a purpose harness check runs only in the harness repo")
+                                         "a check plan runs only in the repository that has it (the harness's "
+                                         f"own){_elsewhere(definition_commit, repo)}")
         resolved = _read_git(repo, "rev-parse", "--verify", f"{definition_commit}^{{commit}}").decode().strip()
         if resolved != definition_commit:
             raise PlanError(IDENTITY_ERROR, "definition commit did not resolve exactly")

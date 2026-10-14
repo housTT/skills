@@ -63,7 +63,8 @@ class Check(str):
     of globs) scopes a check by what it covers: it is skipped on a head whose diff since the push
     target touches no matching path, and a head where every check is skipped that way changes
     nothing any check covers (`outside_scope`). `"purpose": "candidate"` or `"harness"` says which
-    `ttp checks --purpose` runs it (untagged: both); `ttp push` and the push queue run every entry."""
+    `ttp checks --purpose` runs it (untagged: both; `ttp push --own` is candidate); `ttp push` and the
+    push queue run every entry."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
     purpose = ""
@@ -193,8 +194,8 @@ class ScopeError(Exception):
 
 class Skipped(str):
     """A `skipped_line`; `scoped` when the check was skipped because the diff is outside its
-    `if_changed` scope."""
-    scoped = False
+    `if_changed` scope; `harness_only` when a candidate run left out a `purpose: harness` check."""
+    scoped = harness_only = False
 
 
 def skip_reason(repo: Path, head: str, check: Check, base: str = "") -> str | None:
@@ -250,8 +251,10 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
     """Every check was skipped because the change touches none of its `if_changed` paths: the change
     is outside what any check covers, as a docs-only change is when no checks are set. A check
     skipped by `if_exists` (its file is missing) says nothing about the change, so it keeps the
-    head unchecked (NONE_APPLY)."""
-    return bool(checks) and len(skipped) == len(checks) and all(getattr(s, "scoped", False) for s in skipped)
+    head unchecked (NONE_APPLY). A harness check a candidate run leaves out (HARNESS_ONLY) counts neither way."""
+    own = [s for s in skipped if not getattr(s, "harness_only", False)]
+    return (bool(own) and len(skipped) == len(checks)
+            and all(getattr(s, "scoped", False) for s in own))
 
 
 def check_argv(cmd: str, top: str | Path | None = None) -> list[str]:
@@ -665,35 +668,24 @@ def recorded_extras(recorded: dict | None, head: str, checks: list[Check]) -> li
     return [c for c in recorded.get("commands") or [] if c not in own]
 
 
-def foreign_harness_reason(repo: Path, check: Check) -> str | None:
-    """Why a `purpose: harness` check cannot apply in `repo`: the repository lacks its definition
-    commit, so the plan belongs to another repository (the harness's), e.g. when the project's
-    checks run in a worktree of a different repo. None for any other check, or when it has it."""
-    if getattr(check, "purpose", "") != "harness" or harness_plan_problem(str(check)):
-        return None
-    words = shlex.split(str(check))
-    sha = next((w.partition("=")[2] or words[i + 1] for i, w in enumerate(words)
-                if w.partition("=")[0] == "--definition-commit"), "")
-    if not sha or _git(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0:
-        return None
-    return f"its definition commit {sha[:12]} is not in this repository"
+HARNESS_ONLY = "purpose harness: it runs only with `ttp checks --purpose harness`, `ttp push` and the push queue"
 
 
 def applicable(repo: Path, head: str, checks: list[Check], say: Callable[[str], None],
-               base: str = "", foreign_harness: bool = False) -> tuple[list[Check], list[str]]:
+               base: str = "", candidate: bool = False) -> tuple[list[Check], list[str]]:
     """(checks to run on `head`, a `Skipped` line per check that does not apply there, each also said).
     `base` is the push target `if_changed` compares with. Callers treat "none to run" from a non-empty
-    list as a failure (NONE_APPLY), never as a pass, unless `outside_scope`. `foreign_harness` (the
-    candidate `ttp checks` and `ttp push --own`, never the push branch) also skips a harness check
-    whose definition commit `repo` lacks (foreign_harness_reason). Raises ScopeError."""
+    list as a failure (NONE_APPLY), never as a pass, unless `outside_scope`. `candidate` (the
+    candidate `ttp checks` and `ttp push --own`, never the push branch) also skips every `purpose:
+    harness` check (HARNESS_ONLY): its plan belongs to the harness repo, not the candidate's. Raises ScopeError."""
     todo, skipped = [], []
     for c in checks:
-        changed = _changed_reason(repo, head, c, base)
-        why = (changed or _scoped_exists_reason(repo, head, c, base)
-               or (foreign_harness_reason(repo, c) if foreign_harness else None))
+        harness_only = candidate and getattr(c, "purpose", "") == "harness"
+        changed = None if harness_only else _changed_reason(repo, head, c, base)
+        why = HARNESS_ONLY if harness_only else changed or _scoped_exists_reason(repo, head, c, base)
         if why:
             line = Skipped(skipped_line(c, why))
-            line.scoped = bool(changed)
+            line.scoped, line.harness_only = bool(changed), harness_only
             skipped.append(line)
             say(line)
         else:
@@ -2357,7 +2349,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     try:
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
-            todo, skipped = applicable(repo, head, checks, say, base or "", foreign_harness=True)
+            todo, skipped = applicable(repo, head, checks, say, base or "", candidate=True)
         except ScopeError as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED

@@ -1700,7 +1700,7 @@ def cmd_checks(a) -> None:
         try:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
-                                            base, foreign_harness=purpose == "candidate")
+                                            base, candidate=purpose == "candidate")
             selected = list(todo)
         except push.ScopeError as e:
             out.write(f"{e}\n")

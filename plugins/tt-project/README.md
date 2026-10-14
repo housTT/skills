@@ -697,7 +697,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   untagged entries plus the commands after `--`, lists candidate entries as `not run: candidate publication
   gate`, fails (exit 1) unless a harness entry ran or reused a recorded pass (one skipped by `if_exists`
   or `if_changed` does not count), and records a pass that never counts for a PR, an `on_pass` hand-off
-  or `ttp push --own`, and opens no check gap. `ttp push` and the push queue run every entry.
+  or `ttp push --own`, and opens no check gap. The candidate `ttp checks` (a code task's default) and
+  `ttp push --own` skip harness entries and report them skipped, never passed: the plan belongs to the
+  harness's own repo, not to the candidate's. `ttp push` and the push queue run every entry. Started
+  outside the repo that has its definition commit (or outside any git repo), `ttp check-plan` exits 66
+  and says so, naming the project's own repo when that one has the commit.
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.
