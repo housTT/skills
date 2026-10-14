@@ -30533,6 +30533,71 @@ def test_an_end_when_probe_prompts_the_coordinator_and_a_user_pause_is_left_alon
     assert "broken (exit 7)" in p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")[-1]["text"]
 
 
+
+def _settle_end_probes(owner, now):
+    """Tick `owner` (PauseEnds, Ends or MuteEnds) until its probes and their 255 checks are reaped."""
+    from ttp import ends
+    got = owner.tick(now)
+    for _ in range(200):
+        if not owner._procs:
+            break
+        for proc, _, _ in list(owner._procs.values()):
+            proc.fut.result(10) if isinstance(proc, ends._Confirming) else proc.wait(10)
+        got = got + owner.tick(now + 1)
+    return got
+
+
+def test_an_end_when_255_is_not_yet_only_when_ssh_cannot_reach_its_host(env, monkeypatch):
+    """A pause's end_when 255 counts as "host unreachable" only once ssh confirms each host it names is
+    silent (netwait.confirm, off the daemon's thread); one whose host answers is a broken probe."""
+    p = make(env)
+    from ttp import coordinator as coord, ends, netwait, pauseends
+    up, asked = set(), []
+    monkeypatch.setattr(netwait, "answers", lambda h, env=None: asked.append(h) or h in up)
+    probe = "true || ssh -o BatchMode=yes boxa 'test -e /tmp/ready'; exit 255"
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "end_when": probe, "reason": "flaky"}]) == []
+    pe = pauseends.PauseEnds(p)
+    now = time.time()
+    # The host does not answer: not yet, quietly.
+    assert _settle_end_probes(pe, now) == [] and asked == ["boxa"]
+    assert not p.db.one("SELECT id FROM events WHERE kind='pause_end_due'")
+    # The host answers, so the 255 came from the probe's own remote command: broken, reported once.
+    up.add("boxa")
+    assert _settle_end_probes(pe, now + pauseends.PROBE_EVERY_S + 5) == ["board"]
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")
+    assert "broken (exit 255 though ssh reaches boxa" in ev["text"], ev["text"]
+    assert set(p.db.paused_resources()) == {"board"}
+
+
+def test_an_end_probe_255_is_confirmed_off_the_tick_and_names_no_host_is_broken(env, monkeypatch):
+    """reap_probes never waits on the ssh check: the probe stays pending until it answers. A 255 from a
+    probe naming no ssh host is broken without any check; stop_probes drops a pending check."""
+    import threading
+    p = make(env)
+    from ttp import ends, netwait
+    gate = threading.Event()
+    monkeypatch.setattr(netwait, "answers", lambda h, env=None: gate.wait(10) and False)
+    procs, errs = {}, {}
+    pa = "true || ssh boxb true; exit 255"
+    procs["a"] = (ends.spawn_probe(p, pa, errs), time.time(), pa)
+    procs["b"] = (ends.spawn_probe(p, "exit 255", errs), time.time(), "exit 255")
+    for proc, _, _ in list(procs.values()):
+        proc.wait(10)
+    now = time.time()
+    t0 = time.monotonic()
+    got = ends.reap_probes(procs, errs, now, p)
+    assert time.monotonic() - t0 < 5 and got == {} and set(procs) == {"a", "b"}
+    procs["b"][0].fut.result(10)
+    got = ends.reap_probes(procs, errs, now, p)
+    assert got["b"][0] == "exit 255 from a probe that names no ssh host" and set(procs) == {"a"}
+    gate.set()
+    procs["a"][0].fut.result(10)
+    assert ends.reap_probes(procs, errs, now, p) == {"a": (255, pa, "")} and procs == {}
+    procs["c"] = (ends._Confirming(ends._confirm("exit 255", "", p), ""), now, "exit 255")
+    ends.stop_probes(procs, errs)
+    assert procs == {}
+
 def test_a_note_from_the_project_a_pause_waits_on_re_prompts_its_owner(env, monkeypatch, capsys):
     from ttp import cli, coordinator as coord
     from ttp.cli import bootstrap

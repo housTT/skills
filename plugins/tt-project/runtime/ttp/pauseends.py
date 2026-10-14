@@ -4,8 +4,8 @@
 
 A resource pause (`resource_pause`, `ttp pause --resource`) must say when it ends: `until` (a time
 at most MAX_UNTIL_S ahead) and/or `end_when` (a read-only shell probe like `retry_when`: exit 0 =
-over; 1, 75 or 255 = not yet). It may also name `report_from`, another project whose report it
-waits on. A coordinator pause of a resource with an enabled heal check gets that check's health
+over; 1, 75 or ssh's own 255 = not yet; a 255 whose host answers is broken, ends.reap_probes). It
+may also name `report_from`, another project whose report it waits on. A coordinator pause of a resource with an enabled heal check gets that check's health
 end (stored as `end_when: {heal, healthy_n, clean_s}`) unless it names a probe, which replaces it:
 the daemon lifts it without a model after HEALTHY_N consecutive healthy checks over CLEAN_S
 seconds; a gap longer than the check's freshness bound (a stopped daemon, a disabled check) starts
@@ -390,7 +390,7 @@ class PauseEnds:
             self.log(f"end_when probe of the pause of {key} could not start: {e}")
 
     def _reap(self, now: float) -> dict[str, tuple[Any, str, str]]:
-        return ends.reap_probes(self._procs, self._errs, now)
+        return ends.reap_probes(self._procs, self._errs, now, self.p)
 
     def stop(self) -> None:
         ends.stop_probes(self._procs, self._errs)
@@ -412,7 +412,7 @@ class MuteEnds:
         """Returns the mutes ("source 'match'") their probe ended this time."""
         from . import screen as scr
         now = time.time() if now is None else now
-        verdicts = ends.reap_probes(self._procs, self._errs, now)
+        verdicts = ends.reap_probes(self._procs, self._errs, now, self.p)
         if now - self._checked < CHECK_EVERY_S and not verdicts:
             return []
         self._checked = now

@@ -2,7 +2,8 @@
 
 A memory entry or a charter section recorded from temporary words ("while X", "until Y", "for
 now") carries an end: `expires` (a time), `until` (a plain-language condition) and/or
-`until_probe` (a shell probe like `start_when`: exit 0 = over; 1, 75 or 255 = not yet). The daemon
+`until_probe` (a shell probe like `start_when`: exit 0 = over; 1, 75 or 255 = not yet, a 255 only
+when ssh cannot reach the host it names: netwait.confirm, else the probe is broken). The daemon
 retires one whose time passed or whose probe exits 0: memory moves to memory/archive/, a charter
 section to CHARTER.history.md, and the user gets one low-severity alert. A condition only a model
 can judge (`until` alone, or a broken probe) is listed in the digest as possibly over, at most once
@@ -19,11 +20,12 @@ import signal
 import subprocess
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import detach, timefmt
+from . import detach, netwait, timefmt
 from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
@@ -308,7 +310,7 @@ class Ends:
             self.log(f"end probe for {key} could not start: {e}")
 
     def _reap(self, now: float) -> dict:
-        return reap_probes(self._procs, self._errs, now)
+        return reap_probes(self._procs, self._errs, now, self.p)
 
     def stop(self) -> None:
         stop_probes(self._procs, self._errs)
@@ -343,23 +345,61 @@ def _err_tail(errs: dict[int, Any], proc: subprocess.Popen) -> str:
         f.close()
 
 
-def reap_probes(procs: dict, errs: dict[int, Any], now: float) -> dict[str, tuple[Any, str, str]]:
+class _Confirming:
+    """A probe that exited 255, while netwait.confirm asks ssh whether the hosts it names answer."""
+
+    def __init__(self, fut: Future, err: str):
+        self.fut, self.err = fut, err
+
+
+_confirm_pool: ThreadPoolExecutor | None = None
+
+
+def _confirm(probe: str, err: str, p: Project | None) -> Future:
+    """netwait.confirm off the daemon's thread: in an outage each host check waits out its timeout."""
+    global _confirm_pool
+    if _confirm_pool is None:
+        _confirm_pool = ThreadPoolExecutor(4, thread_name_prefix="ttp-end-confirm")
+    env = command_env(p) if p is not None else None
+    return _confirm_pool.submit(netwait.confirm, probe, err, lambda h: netwait.answers(h, env))
+
+
+def reap_probes(procs: dict, errs: dict[int, Any], now: float,
+                p: Project | None = None) -> dict[str, tuple[Any, str, str]]:
     """{key: (exit code or "timeout", probe, stderr tail)} of the probes in `procs` that ended or
-    ran past PROBE_TIMEOUT_S (killed); the rest keep running."""
+    ran past PROBE_TIMEOUT_S (killed); the rest keep running. A 255 is "host unreachable" only once
+    netwait.confirm finds every host the probe names silent (the key stays in `procs` meanwhile);
+    otherwise its verdict is why it is broken (a string), never "not yet"."""
     out = {}
     for key, (proc, started, probe) in list(procs.items()):
+        if isinstance(proc, _Confirming):
+            if proc.fut.done():
+                del procs[key]
+                try:
+                    why = proc.fut.result()
+                except Exception:   # the check itself failed: keep the old reading
+                    why = ""
+                out[key] = (why or netwait.UNREACHABLE_RC, probe, proc.err)
+            continue
         rc = proc.poll()
         if rc is None and now - started < PROBE_TIMEOUT_S:
             continue
         del procs[key]
         if rc is None:
             _kill(proc)
-        out[key] = ("timeout" if rc is None else rc, probe, _err_tail(errs, proc))
+        err = _err_tail(errs, proc)
+        if rc == netwait.UNREACHABLE_RC:
+            procs[key] = (_Confirming(_confirm(probe, err, p), err), started, probe)
+            continue
+        out[key] = ("timeout" if rc is None else rc, probe, err)
     return out
 
 
 def stop_probes(procs: dict, errs: dict[int, Any]) -> None:
     for proc, _, _ in procs.values():
+        if isinstance(proc, _Confirming):
+            proc.fut.cancel()   # a check already running ends within its own timeout
+            continue
         _kill(proc)
         _err_tail(errs, proc)
     procs.clear()
