@@ -42903,6 +42903,25 @@ def test_a_daemon_queued_code_hop_whose_predecessor_already_landed_starts_at_onc
     assert not any(x.startswith("start_when:") for x in _labels(p, nxt["id"])) and _ready(p, nxt["id"])
 
 
+def test_a_daemon_queued_code_hop_waits_for_no_landing_where_its_review_pushes_nothing(env, monkeypatch):
+    """With no push branch (draft PRs, the default) or pushing off, the predecessor's commits never land
+    on a push branch: a landed: wait could never pass, so the hop starts at once, as before."""
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    p = make(env)
+    _git_out(env["repo"], "branch", "work")
+    for title, setup in (("parser", ()), ("widget", (("delivery.push_branch", "work"), ("delivery.push_allowed", False)))):
+        for key, val in setup:
+            p.set_config(key, val)
+        root, _, done, reviews = _finish_code(env, p, title, {f"{title}.py": 10}, result=_cont(title))
+        (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+        assert len(reviews) == 1 and hop["status"] == "queued"
+        assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"])), setup
+        assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"] and "land on the push" not in done["text"]
+        _settle_deferred(dmod.Daemon(p.base), hop["id"])
+        assert _ready(p, hop["id"]) and not _events(p, hop["id"], "deferral_probe_broken")
+
+
 def _chain(p, n, status="done"):
     """A root code task and `n` `continue:` hops after it, all `status`: their ids."""
     ids = [p.db.add_task("parser", "s", kind="code", origin="coordinator")]

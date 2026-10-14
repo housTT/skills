@@ -2994,12 +2994,14 @@ class Daemon:
         # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
         # no review stays with the coordinator, or its commits would never be reviewed or delivered.
         # With a review, the next hop starts once they landed: from the tip before that, it would lack
-        # them. Commits already on the push branch (another commit carries them) need no wait.
+        # them. Commits already on the push branch (another commit carries them) need no wait, and
+        # none is possible where the review delivers no push (no push branch, or pushing is off).
         changes = bool(ready) and not fix and task["kind"] == "code" and self._has_changes(task)
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
-        wait = changes and not landed_now
+        d = self.cfg.get("delivery") or {}
+        wait = changes and not landed_now and bool(d.get("push_branch")) and push_allowed(d)
         hop = self._auto_continue(dict(task, **upd), fups, ready, wait) \
-            if ready and not fix and (review or not wait) else None
+            if ready and not fix and (review or not changes or landed_now) else None
         if hop:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (

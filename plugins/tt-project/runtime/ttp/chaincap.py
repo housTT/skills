@@ -26,9 +26,9 @@ follow-up, in a lineage below every cap, that made progress gets the follow-up q
 with `continues` set (an AUTO_EVENT). The next hop starts from the base, not that task's branch, so a
 code task whose branch has changes gets its review queued first; without one the coordinator
 decides. That hop then waits (start_when `landed:#<task>`) until the reviewed commits are on the push
-branch, unless they already are. The notice, and a local_only notice for a branch its review still
-carries, go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else still
-goes to it.
+branch, unless they already are or nothing pushes there (no push branch, or pushing is off). The
+notice, and a local_only notice for a branch its review still carries, go to the next digest
+(NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
 """
 from __future__ import annotations
 
