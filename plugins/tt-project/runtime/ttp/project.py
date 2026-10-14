@@ -296,10 +296,11 @@ EXTRA_KEYS = {
     # mirror_remotes: {remote, branch} tables each push also sends the pushed commit to, fast-forward only.
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
+    # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s"},
+                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard"},
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -555,6 +556,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if own is not None and not isinstance(own, bool) and \
             str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):
         out.append(f"delivery.own_push: {own!r} is not one of {', '.join(OWN_PUSH_MODES)}; `ttp push --own` is off")
+    if not isinstance(delivery.get("plugin_version_guard", False), bool):
+        out.append(f"delivery.plugin_version_guard: {delivery['plugin_version_guard']!r} is not true or false; "
+                   "the plugin version guard is off")
     queue = delivery.get("push_queue", False)
     if not isinstance(queue, bool):
         out.append(f"delivery.push_queue: {queue!r} is not true or false; reviews push with ttp push")

@@ -797,6 +797,10 @@ prolonged whole-box outage.
   the charter says pushes there need no approval while the setting is off and nothing asks about
   it, the daemon itself asks the user once (a blocking restriction ask), once per push branch
   and charter wording, with no coordinator turn.
+- `delivery.plugin_version_guard: true` (off by default) is for a repository of plugins whose
+  installs upgrade only to a newer version: `ttp push` and the push queue then refuse a change that
+  edits `plugins/<name>/` while a manifest there (`.claude-plugin/plugin.json`,
+  `.codex-plugin/plugin.json`) keeps the version already on the push branch.
 - `delivery.fast_forward_also` (branch names, off by default) keeps more branches in step with
   the push branch, such as a `main` that holds the last good state: after each successful `ttp push`
   or push queue batch, each listed branch on the push remote is moved to the pushed commit, never

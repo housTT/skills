@@ -21082,8 +21082,16 @@ def _plugin_commit(path, version, name, text):
 
 def test_push_refuses_a_rebased_change_that_keeps_the_targets_plugin_version(env, monkeypatch, capsys):
     """Two batches both bumped 0.1.0 to 0.1.1: the second rebases cleanly onto the first, but it
-    must not land as 0.1.1 too, or an upgrade to strictly newer versions skips it."""
+    must not land as 0.1.1 too, or an upgrade to strictly newer versions skips it. The guard is
+    `delivery.plugin_version_guard`, off by default: not every project's repository holds plugins."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    from ttp.project import config_problems
+    assert any("plugin_version_guard" in x for x in config_problems({"delivery": {"plugin_version_guard": "yes"}}))
+    assert not any("plugin_version_guard" in x for x in config_problems({"delivery": {"plugin_version_guard": True}}))
+    from ttp import push as pushmod
+    assert [pushmod.version_guard(d) for d in ({}, None, {"plugin_version_guard": "yes"},
+                                              {"plugin_version_guard": True})] == [False, False, False, True]
+    p.set_config("delivery.plugin_version_guard", True)
     _plugin_commit(repo, "0.1.0", "base.txt", "base\n")
     _git_out(repo, "push", "-q", "origin", "HEAD:proj")
     _git_out(other, "pull", "-q", "origin", "proj")
@@ -21101,6 +21109,11 @@ def test_push_refuses_a_rebased_change_that_keeps_the_targets_plugin_version(env
 
     _commit(repo, "outside.txt", "not a plugin\n")
     assert _ttp_push() == 0, "a change outside plugins/ needs no bump"
+
+    p.set_config("delivery.plugin_version_guard", False)
+    _plugin_commit(repo, "0.1.2", "more.txt", "more\n")
+    assert _ttp_push() == 0, "with the guard off, a plugin change that keeps the version goes through"
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
 
 
 def test_push_needs_a_configured_target_and_checks(env, monkeypatch, capsys):

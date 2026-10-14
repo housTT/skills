@@ -997,9 +997,10 @@ class Batch:
 
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
-        version guard (push.stale_versions) comes first and runs no command."""
+        version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
+        runs no command."""
         self._checkout(head)
-        stale = push.stale_versions(self.wt, self.tip)
+        stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
         if stale:
             msg = (f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
                    f"{self.target}; bump it past that (in every manifest, plus a changeset where the "

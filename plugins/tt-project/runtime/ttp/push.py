@@ -1940,9 +1940,15 @@ def pushed_version(p: Project, repo: Path, rev: str) -> str | None:
     return ".".join(m.group(2, 3, 4)) if m else None
 
 
+def version_guard(d: dict) -> bool:
+    """Whether `delivery.plugin_version_guard` is on (only `true`; off by default)."""
+    return (d or {}).get("plugin_version_guard") is True
+
+
 def stale_versions(repo: Path, tip: str) -> list[str]:
     """Plugins under `plugins/<name>/` whose content HEAD changes since `tip` while a manifest
-    keeps tip's version, as "plugins/<name> <version>". Two changes that each bumped to the same
+    keeps tip's version, as "plugins/<name> <version>". Used only with `delivery.plugin_version_guard`
+    on, for a repository of plugins whose installs upgrade by version. Two changes that each bumped to the same
     version rebase onto each other cleanly; the second must take the next version, or installs
     that only upgrade to a strictly newer one skip it."""
     diff = _git(repo, "diff", "--name-only", "--no-renames", tip, "HEAD")
@@ -2227,7 +2233,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
          timed: Callable[[float], None] | None = None, exclude: list[str] | None = None,
-         allow: bool = False, check_run_dir: str | None = None) -> int:
+         allow: bool = False, check_run_dir: str | None = None, guard: bool = False) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
     touches nothing but docs goes through, and none that adds or modifies a file `exclude` matches
@@ -2255,7 +2261,8 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         say(f"{keep} is on {remote}; rebasing a detached copy, the branch stays as it is")
         _git(repo, "switch", "--detach", "--quiet")
     try:
-        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude, check_run_dir)
+        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude, check_run_dir,
+                       guard)
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -2481,7 +2488,7 @@ def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], Non
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
-            exclude: list[str] | None = None, check_run_dir: str | None = None) -> int:
+            exclude: list[str] | None = None, check_run_dir: str | None = None, guard: bool = False) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
@@ -2514,7 +2521,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if version_bump and (r := bump(repo, tip, version_bump, say)):
             return r
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-        if stale := stale_versions(repo, tip):
+        if guard and (stale := stale_versions(repo, tip)):
             say(f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
                 f"{upstream}; bump it past that (in every manifest, plus a changeset where the "
                 "repository wants one), commit, then rerun; not pushing")
@@ -2632,7 +2639,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
-                  exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output)
+                  exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output,
+                  guard=version_guard(d))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
         if rc == 0 and last_pushed and (mirrors := mirror_list(d.get("mirror_remotes"))):
