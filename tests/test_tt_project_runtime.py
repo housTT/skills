@@ -60138,6 +60138,63 @@ def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_
     assert prguard._checks_problem(str(repo)) is None and push.recorded_checks(run)["head"] == head
 
 
+def test_ttp_checks_purpose_harness_tolerates_harness_state_it_does_not_own(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
+    # Tracked state files other writers keep appending to while the worker's head is committed.
+    (repo / "state").mkdir()
+    for f in ("queue-wait.jsonl", "state/tasks.json", "project.json"):
+        (repo / f).write_text("{}\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "state"], check=True)
+    for f in ("queue-wait.jsonl", "state/tasks.json"):
+        with open(repo / f, "a") as fh:
+            fh.write('{"wait": 1}\n')
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 1
+    assert ("not counting uncommitted harness state files the runtime or other tasks write: "
+            "queue-wait.jsonl, state/tasks.json") in capsys.readouterr().out
+    # The candidate purpose is unchanged: they still block it.
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    assert e.value.code and "commit first" in capsys.readouterr().err
+    # The worker's own sources still block: an edited source, a staged state file, and project.json
+    # outside the project's harness repo.
+    for staged, path in ((False, "a.txt"), (True, "queue-wait.jsonl"), (False, "project.json")):
+        subprocess.run([*git, "checkout", "-q", "--", "."], check=True)
+        with open(repo / path, "a") as fh:
+            fh.write("more\n")
+        if staged:
+            subprocess.run([*git, "add", path], check=True)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--purpose", "harness", "--fresh"])
+        assert e.value.code and "commit first" in capsys.readouterr().err, path
+        subprocess.run([*git, "reset", "-q"], check=True)
+    assert ran() == 1
+    # In the project's own harness repo, the config, charter and memory the coordinator writes do not block.
+    h = ["git", "-C", str(p.harness), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*h, "add", "-A"], check=True)
+    subprocess.run([*h, "commit", "-qm", "base", "--allow-empty"], check=True)
+    monkeypatch.chdir(p.harness)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, "true"])
+    with open(p.memory_index, "a") as fh:
+        fh.write("- a lesson\n")
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 2
+    assert "harness state files the runtime or other tasks write: MEMORY.md, project.json" in capsys.readouterr().out
+    # A harness source the worker changed still blocks there.
+    with open(p.harness / "prompts" / "worker.md", "a") as fh:
+        fh.write("more\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--purpose", "harness", "--fresh"])
+    assert e.value.code and "commit first" in capsys.readouterr().err
+    assert ran() == 2
+
+
 def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

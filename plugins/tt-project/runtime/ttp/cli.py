@@ -1758,12 +1758,16 @@ def cmd_checks(a) -> None:
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
         venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
-    dirty, runtime_written = _checks_dirty(git)
+    own_harness = bool(p) and Path(top).resolve() == p.harness.resolve()
+    dirty, runtime_written, state = _checks_dirty(git, purpose == "harness", own_harness)
     if dirty:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
     if runtime_written:
         print("ttp checks: not counting runtime-written changes to tracked files the repository ignores: "
               + ", ".join(runtime_written))
+    if state:
+        print("ttp checks: not counting uncommitted harness state files the runtime or other tasks write: "
+              + ", ".join(state))
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     if a.detach:
         try:
@@ -1985,18 +1989,37 @@ def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
         print(f"ttp checks: could not record the verified-through marker: {e}", file=sys.stderr)
 
 
-def _checks_dirty(git: list[str]) -> tuple[bool, list[str]]:
+# Files in the project's own harness repo the runtime and other tasks write while a harness task runs.
+HARNESS_STATE_FILES = ("project.json", "schedules.json", "MEMORY.md")
+
+
+def _harness_state_path(path: str, own_harness: bool) -> bool:
+    """Whether `path` is harness state no worker's change owns: an append-only `.jsonl` record or a
+    file under a `state/` directory anywhere, and in the project's own harness repo its config,
+    schedules, charter and memory, which the coordinator and daemon write and commit themselves."""
+    parts = path.split("/")
+    if path.endswith(".jsonl") or "state" in parts[:-1]:
+        return True
+    return own_harness and (path in HARNESS_STATE_FILES or parts[0] == "memory"
+                            or (len(parts) == 1 and path.startswith("CHARTER")))
+
+
+def _checks_dirty(git: list[str], harness: bool = False,
+                  own_harness: bool = False) -> tuple[bool, list[str], list[str]]:
     """Whether the worktree has changes that block `ttp checks`, and the tracked files it tolerates:
     unstaged edits to tracked files the repository's ignore rules match (a log a running watcher keeps
     appending to), which no check is meant to read and which would otherwise force a fresh worktree
-    for every run. A staged edit, or any other change, still blocks."""
+    for every run. With `harness` (`--purpose harness`), also unstaged edits to harness state
+    (_harness_state_path), returned apart: a worker must not commit files another writer owns to
+    qualify its head, and the harness check binds every input it reads to the commit anyway.
+    A staged edit, or any other change, still blocks."""
     out = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--untracked-files=no"], capture_output=True,
                          text=True)
     if out.returncode:
-        return True, []
+        return True, [], []
     ignored = set(subprocess.run([*git, "ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
                                  capture_output=True, text=True).stdout.split("\0")) - {""}
-    blocking, tolerated, items = False, [], iter(out.stdout.split("\0"))
+    blocking, tolerated, state, items = False, [], [], iter(out.stdout.split("\0"))
     for e in items:
         if len(e) <= 3:
             continue
@@ -2004,9 +2027,11 @@ def _checks_dirty(git: list[str]) -> tuple[bool, list[str]]:
             next(items, None)   # a rename's or copy's source follows its new path
         if e[0] == " " and e[3:] in ignored:
             tolerated.append(e[3:])
+        elif e[0] == " " and harness and _harness_state_path(e[3:], own_harness):
+            state.append(e[3:])
         else:
             blocking = True
-    return blocking, sorted(tolerated)
+    return blocking, sorted(tolerated), sorted(state)
 
 
 def _harness_purpose(a) -> dict:

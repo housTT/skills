@@ -723,6 +723,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.
+  `ttp checks --purpose harness` also tolerates unstaged edits to harness state no worker's change
+  owns: `*.jsonl` records and files under a `state/` directory, and in the project's own harness repo
+  `project.json`, `schedules.json`, `CHARTER*`, `MEMORY.md` and `memory/`. It lists them; any other
+  uncommitted edit, or a staged one, still blocks.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
