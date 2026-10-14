@@ -49,6 +49,7 @@ from . import failover
 from . import gitlocks
 from . import grants
 from . import ends
+from . import harnesstree
 from . import heal
 from . import holdloops
 from . import pauseends
@@ -875,7 +876,7 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
-                     self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
+                     self.prune_worktrees, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.clear_git_locks,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr):
@@ -7166,9 +7167,21 @@ class Daemon:
                                blocked_reason=f"{WORKSPACE_RETRY_NOTE}: {t['blocked_reason'][10:].strip()}"[:400])
             log(self.p, f"task {t['id']} queued again: its workspace is retried ({t['blocked_reason'][:200]})")
 
+    def land_harness_worktrees(self) -> None:
+        """Merge the commits of harness tasks that worked in a worktree of their own, once their run ended
+        (harnesstree.sweep); one that git refused is tried again next tick."""
+        try:
+            running = {int(r["task"]) for r in self.p.db.q("SELECT task FROM runs WHERE status='running' "
+                                                            "AND task IS NOT NULL")}
+            for tid, got in harnesstree.sweep(self.p, running).items():
+                if got in ("merged", "conflict"):
+                    log(self.p, f"harness worktree of task {tid}: {got}")
+        except Exception:  # never in the way of the tick
+            log(self.p, "harness worktree landing error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
-        if task["kind"] == "harness":
-            return str(self.p.harness), None
+        if task["kind"] == "harness":   # its own worktree of the harness while another works there
+            return str(harnesstree.workdir(self.p, task["id"])), None
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):

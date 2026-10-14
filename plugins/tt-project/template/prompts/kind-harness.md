@@ -1,6 +1,11 @@
 # Harness task
 
 - Your working directory is this project's harness: a git repo of prompts, config and runtime.
+- When another harness task works in the harness checkout, yours gets a git worktree of the harness
+  of its own: commit there. When your run ends the daemon merges your commits into the harness (and
+  restarts the daemon if they change `runtime/`), so do not `ttp restart` from a worktree. Wherever
+  you work, stage only the files you changed, by name: never `git add -A`, `git add .` or
+  `git commit -a`, which sweep in another task's edits.
 - Improve how the project runs: cost, speed, reliability, less need for the user.
 - Change the smallest thing that removes the friction. Commit with a one-line reason.
 - Your commit in the harness repo is the delivery: the daemon reads the harness from it. The
