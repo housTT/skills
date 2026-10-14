@@ -28,7 +28,8 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 | Device runs (jobs, queueing, logs) | the `tt-buddy:run` skill |
 | Device runs through tt-device-mcp | the `tt-buddy:run` skill's `skills/run/mcp.md` |
 
-- When tt-buddy is not installed, ask the user to install it; do not reconstruct its recipes.
+- tt-buddy is a separate plugin, installed only by the user's choice. When it is missing, name it in
+  the hand-off as the plugin that holds these recipes; do not reconstruct them.
 - Device runs on a box with a device broker go through it (tt-device-mcp), never by opening the
   device directly.
 
