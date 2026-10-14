@@ -193,7 +193,10 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
     # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
     #   runs a reboot cut short or whose hand-off stood;
-    # - thrash: coordinator spend (decisions should be cents; dollars mean it is spinning);
+    # - thrash: spend on coordinator turns the daemon started by itself (events, schedules, idle
+    #   wakes, sweeps): decisions should be cents, dollars mean it is spinning. A turn started for
+    #   a user message or an ask answer (its note lists them) is the user's own work, not a loop;
+    #   the total signal still bounds it;
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     hour_ago = now - HOUR
@@ -201,7 +204,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     runs_h = db.q("SELECT role, status, cost_usd, note FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
     waste = sum(float(r["cost_usd"] or 0) for r in runs_h if wasted(r))
-    thrash = sum(float(r["cost_usd"] or 0) for r in runs_h if r["role"] == "coordinator")
+    coord_h = [r for r in runs_h if r["role"] == "coordinator"]
+    asked = sum(float(r["cost_usd"] or 0) for r in coord_h if user_turn(r))
+    thrash = sum(float(r["cost_usd"] or 0) for r in coord_h) - asked
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
     floor = float(b.get("hourly_floor_usd") or max(int(b.get("max_parallel_workers", 2)), 1) * per_task)
@@ -217,12 +222,13 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
     g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
                       "waste_1h": round(waste, 2), "waste_limit": round(waste_cap, 2),
-                      "coordinator_1h": round(thrash, 2)})
+                      "coordinator_1h": round(thrash, 2), "coordinator_user_1h": round(asked, 2)})
     if waste > waste_cap:
         _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
     if thrash > thrash_cap:
-        _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} in the last hour (limit ${thrash_cap:.0f})")
+        _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
+                         f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
     if last_h > ceiling:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
@@ -935,6 +941,12 @@ def reread_split_text(s: dict, tz=None) -> str:
               f"per run {m(g['per_run'][0])} -> {m(g['per_run'][1])} ({pct(g['per_run_pct'])}), "
               f"median {pct(g['median_pct'])}" for g in s["groups"]]
     return "\n".join(lines + ["", "Before:", reread_text(b, tz or "UTC"), "", "After:", reread_text(a, tz or "UTC")])
+
+
+def user_turn(run: dict) -> bool:
+    """A coordinator turn the daemon started for user messages (an ask's answer is one too): its
+    note lists them. A missing or unreadable note counts as a self-started turn."""
+    return bool(_note(run["note"]).get("messages"))
 
 
 def _note(raw) -> dict:

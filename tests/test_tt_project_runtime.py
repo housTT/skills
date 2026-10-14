@@ -4276,6 +4276,56 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
     assert g.level == "red" and any("failed or stalled" in r for r in g.reasons)
 
 
+def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
+    """The coordinator $/h guard sums only turns the daemon started on its own (events, schedules,
+    idle wakes, sweeps); a turn started for a user message or an ask answer is the user's own work."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    wins = [bud.Window("claude", "seven_day", 40)]
+
+    def turn(cost, messages, ago, events=()):
+        note = json.dumps({"messages": list(messages), "events": list(events),
+                           "triggers": ["user message"] if messages else []})
+        p.db.x("INSERT INTO runs(role,provider,effort,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator','claude','high','ok',?,?,?,?)", (now - ago - 60, now - ago, cost, note))
+        p.db.spend("claude", cost, "coordinator")
+
+    def coord_reasons():
+        g = bud.evaluate(p.db, p.config(), "claude", wins, now=now)
+        return g, [r for r in g.reasons if "coordinator spent" in r]
+
+    # (1) an hour of 12 user-message turns at high effort, $7.20 against a $4/h limit
+    for i in range(12):
+        turn(0.60, [100 + i], 60 + i * 250)
+    g, hit = coord_reasons()
+    assert not hit and g.level != "red", g.reasons
+    assert g.numbers["coordinator_1h"] == 0 and g.numbers["coordinator_user_1h"] == 7.2
+
+    # (3) a mixed hour: self-started turns under the limit do not trip it...
+    for i in range(6):
+        turn(0.60, [], 90 + i * 300, events=[i])
+    g, hit = coord_reasons()
+    assert not hit, g.reasons
+    # ...and trip it once the self-started share alone passes the limit
+    turn(0.60, [], 120, events=[99])
+    g, hit = coord_reasons()
+    assert hit and g.level == "red" and "$4.20" in hit[0], g.reasons
+
+    # (2) 40 self-wakes on the same digest within an hour still trip it
+    p.db.x("DELETE FROM runs")
+    for i in range(40):
+        turn(0.15, [], 30 + i * 80, events=[7])
+    g, hit = coord_reasons()
+    assert hit and g.level == "red", g.reasons
+    # an unreadable or missing note counts as self-started, never as the user's
+    p.db.x("DELETE FROM runs")
+    for note in (None, "not json", "[]"):
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator','claude','ok',?,?,1.5,?)", (now - 600, now - 300, note))
+    assert coord_reasons()[1]
+
+
 def test_one_listener_per_chat(env):
     """The newest listener wins, and a listener whose starter is gone exits by itself. The replaced
     one says so and exits LISTEN_REPLACED; any other SIGTERM still ends a listener as before."""
