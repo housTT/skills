@@ -58542,6 +58542,30 @@ def test_ttr_records_one_incident_per_machine_from_conditions_outages_and_heal_c
     assert ttr.observe(p, t0 + 800 + ml.CONDITION_GONE_S) == ([], ["box-a"])
 
 
+def test_ttr_ignores_a_frozen_heal_report_while_the_project_is_paused(env):
+    from ttp import heal
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    p = make(env, "alpha")
+    mm.add("box-b")
+    t0 = 1_800_000_000.0
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0, "last_check": t0,
+                                               "machine_reported": ["box-b", "down"]})
+    assert ttr.observe(p, t0 + 60) == (["box-b"], [])
+    # Paused: heal checks stop, so the report freezes. Within its period plus the margin it still counts.
+    p.db.set_kv("paused", True)
+    assert ttr.observe(p, t0 + 600 + ttr.HEAL_STALE_MARGIN_S - 1) == ([], [])
+    # Past that the frozen report is ignored, so the pause does not stretch the incident.
+    late = t0 + 600 + ttr.HEAL_STALE_MARGIN_S + 1
+    assert ttr.observe(p, late) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE alias='box-b'")["ended"] == late
+    # Not paused: the same stale report counts again (the check runs and keeps it current).
+    p.db.set_kv("paused", False)
+    assert ttr.observe(p, late + 60) == (["box-b"], [])
+
+
 def test_ttr_keeps_an_open_incident_across_a_daemon_restart_and_never_duplicates_it(env):
     import sqlite3
     from ttp import machine_ledger as ml

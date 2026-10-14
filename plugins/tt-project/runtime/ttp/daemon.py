@@ -1102,7 +1102,8 @@ class Daemon:
 
     def record_ttr(self) -> None:
         """Machine incidents for time to recover (ttr.observe), model-free, every ttr.OBSERVE_S. It runs
-        while the project is paused too, so a recovery then is recorded when it happens."""
+        while the project is paused too, but heal checks do not: a heal report gone stale then is ignored
+        (ttr.down_now), so a pause does not stretch a heal-sourced incident."""
         now = time.time()
         if now - getattr(self, "_ttr_at", 0.0) < ttr.OBSERVE_S:
             return

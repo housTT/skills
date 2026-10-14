@@ -19,7 +19,10 @@ Records live in this project's database (ttr_incidents): rows are only added, an
 written once. A unique index allows one open incident per machine and every step is one transaction,
 so a daemon restart or host reboot mid-incident neither loses nor duplicates one: the next tick finds
 the open row and keeps it, or ends it once the machine is healthy. While the daemon is stopped nothing
-is observed: a recovery in that time is recorded at its first tick after.
+is observed: a recovery in that time is recorded at its first tick after. While the project is paused
+heal checks do not run, so their reports freeze: a heal report whose last check is older than the
+check's period plus HEAL_STALE_MARGIN_S is ignored then, and an incident only it kept open ends there;
+co-tenant conditions and known outages still count.
 
 `ttp ttr [<project>] [<alias>] [--days N] [--json]` reports per machine the incidents in the window
 (those still open, or that ended within it), the median, p90 and max TTR of the ended ones, the open
@@ -38,6 +41,7 @@ OBSERVE_S = 60          # how often the daemon records
 DAYS = 30               # `ttp ttr` window by default
 REVIEW_DAYS = 7         # the daily review's window
 CAUSE_CHARS = 200
+HEAL_STALE_MARGIN_S = 300   # while paused, a heal report older than its check's period plus this is ignored
 KINDS = ("down", "held", "outage")
 
 
@@ -59,10 +63,15 @@ def down_now(p, now: float, aliases: set[str] | None = None) -> dict[str, dict]:
     from . import heal, machine_ledger
     aliases = watched(p) if aliases is None else aliases
     seen: dict[str, list[dict]] = {}
+    paused = bool(p.db.kv("paused", False))
     for row, _ in heal.checks(p.db):
-        rep = heal.state(p.db, row["name"]).get("machine_reported")
+        st = heal.state(p.db, row["name"])
+        rep = st.get("machine_reported")
+        # Heal checks do not run while the project is paused: a report no newer than the check's
+        # period plus a margin is frozen, not evidence the machine is still down.
+        if paused and now - float(st.get("last_check") or 0) > float(row["every_s"] or 0) + HEAL_STALE_MARGIN_S:
+            continue
         if isinstance(rep, list) and len(rep) == 2 and rep[0] in aliases:
-            st = heal.state(p.db, row["name"])
             seen.setdefault(rep[0], []).append({"since": float(st.get("since") or st.get("unknown_since") or now),
                                                 "kind": rep[1], "cause": f"heal check {row['name']}"})
     for c in machine_ledger.conditions().values():
