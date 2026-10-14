@@ -53178,6 +53178,40 @@ def test_a_retry_when_255_whose_host_answers_wakes_its_task_as_a_broken_probe(en
         "probe broken: exit 255 though ssh reaches box-a: its remote command failed"
 
 
+def test_unreachable_hosts_in_separate_probes_cost_the_tick_one_ssh_timeout_not_one_each(env, monkeypatch):
+    """Four probes, each naming its own unreachable host, finish in one tick: their hosts are asked
+    all at once (each check waits for the others, as one ConnectTimeout would), once a minute, and
+    every task still waits on the outage."""
+    import threading
+    p = make(env)
+    from ttp import daemon as dmod, netwait
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _ssh_255(p)
+    together, asked = threading.Barrier(4, timeout=5), []
+
+    def answers(host, env=None):
+        asked.append(host)
+        together.wait()   # breaks (5 s) unless all four are asked at once
+        return False
+    monkeypatch.setattr(netwait, "answers", answers)
+    d = dmod.Daemon(p.base)
+    tids = [_due_waiting_task(p, f"ssh -o BatchMode=yes box-{c} test -e /tmp/marker") for c in "abcd"]
+    for tid in tids:
+        p.db.update_task(tid, not_before=time.time() + 3600)
+    d.probe_waiting()
+    for tid in tids:
+        d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert sorted(asked) == ["box-a", "box-b", "box-c", "box-d"] and not together.broken
+    assert {d._probe_rc[t][0] for t in tids} == {netwait.UNREACHABLE_RC}, "each still waits on the outage"
+    d.probe_waiting()
+    for tid in tids:
+        if tid in d._probes:
+            d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert len(asked) == 4, "a host is asked at most once a minute"
+
+
 def test_ssh_pipe_bypasses_controlmaster_so_host_key_is_checked(monkeypatch):
     # A reused ControlMaster socket skips the host key check, so the strict call must not use one.
     from ttp import upstream

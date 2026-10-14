@@ -5499,6 +5499,7 @@ class Daemon:
         self._poll_on_pass(now)
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
+        done = []
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
             if rc is None and now - started < PROBE_TIMEOUT_S:
@@ -5508,6 +5509,11 @@ class Daemon:
                 _kill_group(proc)
             if id(proc) not in outs:
                 outs[id(proc)] = self._probe_text(proc)
+            done.append((tid, proc, probe, rc))
+        # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
+        self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
+                           for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
+        for tid, proc, probe, rc in done:
             task = db.task(tid)
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
@@ -5593,10 +5599,15 @@ class Daemon:
 
     def _host_answers(self, host: str, now: float) -> bool:
         """ssh reaches `host`, asked at most once a minute for all the probes that name it."""
-        got = self._host_up.get(host)
-        if got is None or now - got[1] >= 60:
-            got = self._host_up[host] = (netwait.answers(host, self._probe_env()), now)
-        return got[0]
+        self._check_hosts([host], now)
+        return self._host_up[host][0]
+
+    def _check_hosts(self, hosts: list[str], now: float) -> None:
+        """Asks ssh about each host not asked in the last minute, all in one parallel pass."""
+        stale = [h for h in dict.fromkeys(hosts) if now - self._host_up.get(h, (False, -1e18))[1] >= 60]
+        if stale:
+            env = self._probe_env()
+            self._host_up.update((h, (ok, now)) for h, ok in netwait.reach(stale, env).items())
 
     def _drop_stale_probe(self, tid: int, probe: str) -> None:
         """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget

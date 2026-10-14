@@ -33,6 +33,8 @@ A probe's 255 counts as unreachable only when it is ssh's own: every host the pr
 with `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> true` (confirm). A probe that names no host, or
 whose host answers, failed its own remote command (e.g. lost quotes and `|| exit 255`): the daemon
 treats it as a broken probe against its task, never as an outage.
+The daemon checks the hosts of every probe that exited 255 in one tick together (reach), so an
+outage holds its tick for one ConnectTimeout, not one per probe; each host is asked once a minute.
 """
 from __future__ import annotations
 
@@ -56,6 +58,7 @@ _OUT_HOST = re.compile(r"(?:connect to host|resolve hostname|[Cc]onnection to|co
                        r"([A-Za-z0-9_.\-]+)")
 _SSH_ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")   # ssh options that take a value
 _SUBST = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\$\(|`)+")   # `x=$(`, `$(` or a backtick before ssh
+REACH_THREADS = 32             # hosts checked at once in one reach() pass
 CONFIRM_TIMEOUT_S = 10         # ConnectTimeout of the check that a probe's host really is unreachable
 
 
@@ -116,6 +119,15 @@ def answers(alias: str, env: dict | None = None) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode != UNREACHABLE_RC
+
+
+def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
+    """answers() for each alias, all at once: in an outage the pass waits out one timeout, not one each."""
+    names = list(dict.fromkeys(aliases))
+    if not names:
+        return {}
+    with ThreadPoolExecutor(min(len(names), REACH_THREADS)) as ex:
+        return dict(zip(names, ex.map(lambda h: answers(h, env), names)))
 
 
 def confirm(probe: str, output: str = "", answered=None) -> str:
