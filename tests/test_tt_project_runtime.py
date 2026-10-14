@@ -18299,6 +18299,27 @@ def test_a_lock_wait_that_gives_up_on_its_first_poll_still_shows_as_progress(env
     assert "waiting for board" in (run_dir / "progress.md").read_text(), "a wait looked like a stall"
 
 
+def test_a_lock_wait_that_gives_up_on_its_first_pass_is_still_noted(env, tmp_path):
+    # A slow host can pass the run's cap before the first poll ends: the give-up still leaves its note.
+    p = make(env)
+    run_dir = tmp_path / "wrun"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 0.002}))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
+    try:
+        _wait_for_file(held, holder)
+        r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"], capture_output=True,
+                           text=True, env={**run_env, "TTP_RUN_DIR": str(run_dir)}, timeout=60)
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert r.returncode == 75, (r.returncode, r.stderr)
+    assert "waiting for board" in (run_dir / "progress.md").read_text(), "a give-up left no note"
+
+
 def _wait_for_file(path, proc, timeout=60):
     deadline = time.time() + timeout
     while not path.exists():
