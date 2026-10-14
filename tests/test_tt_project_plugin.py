@@ -1430,7 +1430,8 @@ def test_setup_box_slurm_check_takes_only_an_idle_unreserved_node(tmp_path):
     assert run("check", "<box-alias>", "node07", "--allow", "n1,n2").stdout.startswith("refused: node07 is not in the allowed")
     assert "demo_nodes" in run("check", "<box-alias>", "demo1").stdout
     assert "excluded_nodes" in run("check", "<box-alias>", "bad1").stdout
-    for state in ("ALLOCATED", "MIXED", "IDLE+DRAIN", "DOWN+NOT_RESPONDING", "IDLE+RESERVED", "IDLE+MAINT"):
+    for state in ("ALLOCATED", "MIXED", "IDLE+DRAIN", "DOWN+NOT_RESPONDING", "IDLE+RESERVED", "IDLE+MAINT",
+                  "IDLE*", "IDLE~", "IDLE$", "IDLE@", "IDLE#", "IDLE%", "IDLE!", "IDLE^", "IDLE-"):
         (fake / "node.txt").write_text(f"NodeName=node07 State={state} LastBusyTime=2000-01-01T00:00:00\n")
         r = run("check", "<box-alias>", "node07")
         assert r.returncode == 1 and f"state is {state}" in r.stdout, (state, r.stdout)
@@ -1468,6 +1469,10 @@ def test_setup_box_slurm_submit_refuses_unsafe_jobs_and_prints_note_and_probe(tm
     assert "not a Slurm time limit" in run(*base, "--time", "UNLIMITED", "--command", "true").stdout
     for cmd in ("salloc -N1", "sbatch --no-shell x; make"):
         assert "salloc and --no-shell are not allowed" in run(*base, "--time", "30", "--command", cmd).stdout
+    r = run(*base, "--time", "30", "--command", "echo 'unbalanced")
+    assert r.returncode == 1 and "cannot be parsed" in r.stdout and "Traceback" not in r.stderr
+    assert "not under workdir_root" in run(*base[:-4], "--checkout", f"{tmp_path}/work/../x", "--purpose", "p",
+                                           "--time", "30", "--command", "true").stdout
     assert "not under workdir_root" in run(*base[:-4], "--checkout", "/tmp/x", "--purpose", "p",
                                            "--time", "30", "--command", "true").stdout
     assert "partition 'nope'" in run(*[("nope" if a == "p4" else a) for a in base], "--time", "30", "--command", "true").stdout
@@ -1507,6 +1512,16 @@ def test_setup_box_slurm_status_and_verify_clean(tmp_path):
     assert "no longer in squeue" in r.stdout and "rc missing" in r.stdout and "all passed" in r.stdout
     (rundir / "job.rc").write_text("0\n")
     assert "rc 0" in run("status", "<box-alias>", "4242", "--name", "t1").stdout
+    (rundir / "job.rc").unlink()
+    squeue = tmp_path / "bin" / "squeue"
+    squeue.write_text('#!/bin/bash\necho "squeue: error: Unable to contact slurm controller" >&2; exit 1\n')
+    r = run("status", "<box-alias>", "4242", "--name", "t1")  # unknown, not ended: no resubmit cue
+    assert r.returncode == 2 and "squeue failed" in r.stdout, r.stdout
+    assert "ended" not in r.stdout and "rc missing" not in r.stdout
+    squeue.write_text('#!/bin/bash\necho "slurm_load_jobs error: Invalid job id specified" >&2; exit 1\n')
+    r = run("status", "<box-alias>", "4242", "--name", "t1")
+    assert r.returncode == 0 and "no longer in squeue" in r.stdout and "rc missing" in r.stdout
+    squeue.write_text('#!/bin/bash\ncat "$FAKE/squeue.txt"\n')
     r = run("verify-clean", "<box-alias>", "node07")
     assert r.returncode == 0 and "clean: no job" in r.stdout and "cannot check processes" in r.stdout
     (fake / "squeue.txt").write_text("4242 RUNNING\n")

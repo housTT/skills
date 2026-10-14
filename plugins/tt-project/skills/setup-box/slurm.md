@@ -31,7 +31,8 @@ Other people share the cluster's nodes. Hold a node only while work runs on it.
 | Your jobs | `squeue -u "$USER"` |
 
 - Take a node only when its state is plain `IDLE`. `MIXED`, `ALLOCATED`, `COMPLETING`, `PLANNED`
-  or any `+DRAIN`, `+RESERVED`, `+MAINT` or `+NOT_RESPONDING` flag means it is not free.
+  or any `+DRAIN`, `+RESERVED`, `+MAINT` or `+NOT_RESPONDING` flag means it is not free, and so
+  does a suffix such as `IDLE*` (not responding), `IDLE~` (powered down) or `IDLE$` (maintenance).
 - A node listed in any reservation is not free, even when it shows `IDLE`.
 - A default time limit may be short (often an hour); always pass `--time`.
 - With `PreemptMode=CANCEL` a higher-priority job may end yours; resubmit it.
@@ -63,7 +64,7 @@ login node (`slurm.login`) over ssh.
 |---|---|
 | `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (minutes since the node was last busy) when given |
 | `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line |
-| `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc` and the last 20 lines of `job.log` |
+| `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc` and the last 20 lines of `job.log`; exit 2 when `squeue` fails (state unknown: never treat that as ended) |
 | `verify-clean <box> <node> [--ssh]` | exit 0 when no job of yours is on the node; with `--ssh`, also lists your processes there |
 
 `submit` refuses a missing or unlimited `--time`, `salloc` and `--no-shell`, a checkout or run dir
@@ -82,9 +83,10 @@ After submitting:
    the hand-off.
 2. Hand off `waiting` with the printed `retry_when`: it exits 0 once `squeue` no longer lists the
    job, 1 while it does or `squeue` fails, 255 while ssh fails.
-3. On waking, `box.py slurm status <box> <job> --name NAME`. `rc missing` means the job was killed
-   before its trap ran (time limit, preemption, node failure): quote the log tail and resubmit or
-   report it.
+3. On waking, `box.py slurm status <box> <job> --name NAME`. A time limit or preemption sends TERM,
+   which the trap records as `rc 143`. `rc missing` means a SIGKILL before the trap ran, a node
+   failure, or a job that never started: quote the log tail and resubmit or report it. Exit 2
+   means `squeue` failed and the job may still run: retry later, never resubmit on it.
 4. `box.py slurm verify-clean <box> <node>`, and record the end time with `ttp note`.
 
 ## Status after a job ends

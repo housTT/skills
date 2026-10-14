@@ -83,8 +83,8 @@ def check_node(e: dict, login: str, node: str, *, allow: Optional[List[str]] = N
         raise Refused(f"scontrol show node {node} failed: {(r.stderr or r.stdout).strip()[-300:]}")
     now, line = lines[0], lines[1]
     state = field(line, "State") or "?"
-    flags = state.rstrip("*~#!%$@^-").split("+")
-    if flags != ["IDLE"]:
+    # Exactly IDLE: a suffix (IDLE*, IDLE~, IDLE$, ...) or +flag marks a node not to take.
+    if state != "IDLE":
         raise Refused(f"{node} state is {state}, not plain IDLE")
     r = _login(login, "scontrol -o show reservation")
     if r.returncode != 0 and "No reservations" not in r.stdout + r.stderr:
@@ -158,7 +158,7 @@ wait $!
 
 def _under(path: str, root: str) -> bool:
     root = root.rstrip("/")
-    return path == root or path.startswith(root + "/")
+    return ".." not in path.split("/") and (path == root or path.startswith(root + "/"))
 
 
 def cmd_check(args) -> int:
@@ -180,7 +180,11 @@ def cmd_submit(args) -> int:
             raise Refused("--time is required: the expected run time plus a small margin")
         if not TIME_RE.match(args.time):
             raise Refused(f"--time {args.time!r} is not a Slurm time limit (e.g. 90, 1:30:00, 1-0)")
-        if any(f in shlex.split(command, comments=True) for f in FORBIDDEN):
+        try:
+            words = shlex.split(command, comments=True)
+        except ValueError as err:
+            raise Refused(f"--command cannot be parsed ({err})") from None
+        if any(f in words for f in FORBIDDEN):
             raise Refused("salloc and --no-shell are not allowed: submit one self-ending batch job")
         _name("job name", args.name)
         e, login = _box(args)
@@ -224,10 +228,16 @@ def cmd_status(args) -> int:
     try:
         _name("job id", args.job)
         e, login = _box(args)
-        r = _login(login, f"squeue -h -j {args.job} -o '%i|%T|%N|%M|%l|%R' 2>/dev/null; true")
+        r = _login(login, f"squeue -h -j {args.job} -o '%i|%T|%N|%M|%l|%R'")
     except (Refused, box.SiteError) as err:
         print(f"error: {err}")
         return 1
+    # A failed squeue (controller down, timeout 124) says nothing about the job: never report it
+    # ended, or the caller may resubmit a job that still runs. Only "Invalid job id" means gone.
+    if r.returncode != 0 and "invalid job id" not in (r.stderr + r.stdout).lower():
+        print(f"error: squeue failed (exit {r.returncode}), job state unknown: "
+              f"{(r.stderr or r.stdout).strip()[-300:]}")
+        return 2
     row = next((ln for ln in r.stdout.splitlines() if ln.split("|")[0] == args.job), None)
     if row:
         _, st, node, used, limit, reason = (row.split("|") + [""] * 6)[:6]
@@ -239,8 +249,8 @@ def cmd_status(args) -> int:
         r = _login(login, f"cat {_rpath(rundir)}/job.rc 2>/dev/null || echo missing; "
                           f"echo ---; tail -n 20 {_rpath(rundir)}/job.log 2>/dev/null")
         rc, _, tail = r.stdout.partition("---\n")
-        print(f"rc {rc.strip()} (missing: killed before its trap ran, e.g. time limit, preemption "
-              f"or node failure)" if rc.strip() == "missing" else f"rc {rc.strip()}")
+        print(f"rc {rc.strip()} (missing: SIGKILL before its trap ran, node failure, or the job "
+              f"never started)" if rc.strip() == "missing" else f"rc {rc.strip()}")
         print(tail.rstrip())
     return 0
 
