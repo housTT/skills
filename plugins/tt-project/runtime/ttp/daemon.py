@@ -540,6 +540,7 @@ class Daemon:
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
+        self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
@@ -5489,7 +5490,7 @@ class Daemon:
         `retry_after_s` timer runs out while the probe still says "not yet", the task sleeps another
         `retry_after_s` instead of spending a worker run to find that out. "Not yet" is any exit in
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
-        lives on). A broken probe
+        lives on; only when the host named really does not answer, _own_255). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
         fix the probe. Past `waiting.max_hold_s` after the hand-off a "not yet" keeps it asleep too (a
         model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
@@ -5516,6 +5517,8 @@ class Daemon:
                 # Its device runner is down: the daemon brings it back, and the task sleeps on.
                 self._restart_runner(runner, tid, now)
                 rc = 1
+            if rc == netwait.UNREACHABLE_RC:
+                rc = self._own_255(tid, probe, outs[id(proc)], now)
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
@@ -5552,7 +5555,7 @@ class Daemon:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
         probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
         yet, and so do 75 (EX_TEMPFAIL, e.g. a busy `ttp lock`) and 255 (ssh could not reach the
-        host: a reboot or a network blip). A broken
+        host: a reboot or a network blip; a 255 whose host answers is broken, _own_255). A broken
         probe (another exit, a timeout, a probe that cannot start) is raised to the
         coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
         met after `coordinator.defer_max_days`."""
@@ -5578,6 +5581,22 @@ class Daemon:
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+
+    def _own_255(self, tid: int, probe: str, out: str, now: float) -> int | str:
+        """A probe's 255 means "host unreachable" only when it is ssh's own: each host it names is
+        checked (netwait.confirm). One that names none, or whose host answers, failed its own remote
+        command: why it is broken, which takes the broken-probe path, never the network outage."""
+        why = netwait.confirm(probe, out, lambda h: self._host_answers(h, now))
+        if why:
+            log(self.p, f"task {tid} probe is broken, not waiting on an unreachable host: {why}")
+        return why or netwait.UNREACHABLE_RC
+
+    def _host_answers(self, host: str, now: float) -> bool:
+        """ssh reaches `host`, asked at most once a minute for all the probes that name it."""
+        got = self._host_up.get(host)
+        if got is None or now - got[1] >= 60:
+            got = self._host_up[host] = (netwait.answers(host, self._probe_env()), now)
+        return got[0]
 
     def _drop_stale_probe(self, tid: int, probe: str) -> None:
         """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget
@@ -5612,8 +5631,8 @@ class Daemon:
         elif rc != 0:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
-                                 f"its start_when probe is broken ({why}; only 0 = start and 1, 75 or 255 = not "
-                                 f"yet are valid): {d.get('when', '')[:300]}")
+                                 f"its start_when probe is broken ({why}; only 0 = start, 1 or 75 = not yet and "
+                                 f"ssh's own 255 = host unreachable are valid): {d.get('when', '')[:300]}")
 
     def _start_resource_stale(self, task: dict, d: dict, now: float) -> None:
         """A start_when that has said not yet for waiting.start_resource_stale_s while the task names a

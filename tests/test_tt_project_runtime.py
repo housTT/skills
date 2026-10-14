@@ -26930,6 +26930,21 @@ def _ready(p, tid):
     return tid in [t["id"] for t in p.db.ready_tasks()]
 
 
+def _ssh_255(p, up=False):
+    """A stand-in `ssh` first on the probes' PATH (the harness bin): a host that does not answer
+    (exit 255, ssh's own error), or with `up` one that answers: `true` passes, any other remote
+    command fails (exit 1). No real host is contacted. Returns a probe that reaches box-a over it."""
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    act = ('[ "$*" = true ] && exit 0; exit 1' if up
+           else 'echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255')
+    (b / "ssh").write_text("#!/bin/sh\n"
+                           "while [ $# -gt 0 ]; do case $1 in -o) shift 2;; -*) shift;; *) break;; esac; done\n"
+                           f"host=$1; shift\n{act}\n")
+    (b / "ssh").chmod(0o755)
+    return "ssh -o BatchMode=yes box-a test -e /tmp/marker"
+
+
 def test_a_due_waiting_task_sleeps_on_while_its_probe_says_not_yet(env):
     p = make(env)
     from ttp import daemon as dmod
@@ -27752,7 +27767,7 @@ def test_an_unreachable_host_probe_keeps_the_task_asleep_past_the_hold_cap(env):
     p = make(env)
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
-    tid = _due_waiting_task(p, "exit 255")
+    tid = _due_waiting_task(p, _ssh_255(p))
     _settle_probe(d, tid)
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()          # due with a fresh 255: extended like "not yet", no worker run
@@ -27798,11 +27813,12 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
 
 
-@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "exit 255"])
+@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "unreachable"])
 def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_coordinator_once(env, probe):
     """A model run cannot make a "not yet" probe pass: past max_hold_s the task sleeps on and the
     coordinator gets one wait_stale event per wait, not one per check."""
     p = make(env)
+    probe = _ssh_255(p) if probe == "unreachable" else probe
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
@@ -34711,7 +34727,7 @@ def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
-    coord.apply(p, [{"type": "task_add", "title": "remote", "spec": "s", "start_when": "exit 255"}])
+    coord.apply(p, [{"type": "task_add", "title": "remote", "spec": "s", "start_when": _ssh_255(p)}])
     tid = _added(p, "remote")
     d = dmod.Daemon(p.base)
     for _ in range(2):
@@ -52928,6 +52944,14 @@ def test_network_outage_names_the_hosts_from_ssh_errors_or_the_probe(env):
         == ["gw.example"], "no alias in the probe: ssh's own error"
     assert netwait.hosts("test -e /tmp/x") == []
     assert "The hosts this project's work needs cannot be reached" in netwait.text("UTC", 0.0, 1, [])
+    # ssh inside a command substitution, as a probe captures the remote answer, and ending one.
+    assert netwait.hosts("m=$(ssh -o BatchMode=yes h1 stat x) || exit 255") == ["h1"]
+    assert netwait.hosts("m=`ssh -o BatchMode=yes h1 stat x` || exit 255") == ["h1"]
+    assert netwait.hosts('[ "$(ssh box-a)" ] || exit 255') == ["box-a"]
+    assert netwait.confirm("test -e /x || exit 255", "", lambda h: False) == \
+        "exit 255 from a probe that names no ssh host"
+    assert netwait.confirm("ssh h1 true", "", lambda h: False) == "", "every host it names is unreachable"
+    assert "ssh reaches h1" in netwait.confirm("ssh h1 true", "", lambda h: h == "h1")
 
 
 def test_network_outage_classes_loopback_proxyjump_and_proxycommand_routes_as_tunnels(monkeypatch):
@@ -53050,6 +53074,7 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     from ttp.db import deferral
     p = make(env)
     _no_events(p)
+    _ssh_255(p)   # the check that the named host is out of reach gets ssh's own 255 too
     stub = p.root / "reach.sh"
     stub.write_text("echo 'ssh: connect to host gw.example port 22: Connection timed out' >&2; exit 255\n")
     probe = f"sh {stub}"
@@ -53096,6 +53121,61 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     assert len(cycle(at)) == 1, "clearing posts no new alert"
     assert not alerts.needs_you(p.db, at) and not p.db.kv("network_outage"), "the outage ended after the debounce"
     assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved' AND ref='network:unreachable'")) == 1
+
+
+@pytest.mark.parametrize("up", [True, False])
+def test_a_probe_255_is_a_network_outage_only_when_its_host_does_not_answer(env, monkeypatch, up):
+    """A start_when that exits 255 through its own `|| exit 255` after its remote command failed, while
+    the host answers ssh, is a broken probe against its task, never a network outage. With the host
+    really out of reach (ssh stubbed to 255) the outage is alerted, naming the alias."""
+    from ttp import alerts, netwait
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    p = make(env)
+    _no_events(p)
+    _ssh_255(p, up=up)
+    monkeypatch.setattr(netwait, "_ssh_config", lambda alias: {})
+    probe = "m=$(ssh -o BatchMode=yes box-a stat /x) || exit 255"
+    d = dmod.Daemon(p.base)
+    assert coord.apply(p, [{"type": "task_add", "title": "device job", "spec": "s", "start_when": probe}]) == []
+    tid = _added(p, "device job")
+    clock = {"now": time.time()}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    at = start = clock["now"]
+    while at < start + 1200:
+        clock["now"] = at
+        d.probe_waiting()
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(timeout=30)
+        d.probe_waiting()
+        d._net_checked = 0.0
+        d.check_unreachable()
+        alerts.sweep(p.db, at)
+        at += dmod.PROBE_EVERY_S + 20
+    sent = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='network:unreachable'")
+    broken = _events(p, tid, "deferral_probe_broken")
+    if up:
+        assert sent == [] and not p.db.kv("network_outage"), "the host answers: no network outage"
+        assert len(broken) == 1 and f"#{tid}" in broken[0]["text"] and "ssh reaches box-a" in broken[0]["text"], broken
+        assert "task %d probe is broken" % tid in (p.logs / "daemon.log").read_text()
+    else:
+        assert len(sent) == 1 and "box-a" in sent[0]["text"], sent
+        assert p.db.kv("network_outage")["hosts"] and not broken
+    assert p.db.task(tid)["status"] == "queued"
+
+
+def test_a_retry_when_255_whose_host_answers_wakes_its_task_as_a_broken_probe(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "`ssh box-a stat /x` || exit 255")
+    _ssh_255(p, up=True)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert _ready(p, tid)
+    assert json.loads(p.db.task(tid)["result"])["woke"] == \
+        "probe broken: exit 255 though ssh reaches box-a: its remote command failed"
 
 
 def test_ssh_pipe_bypasses_controlmaster_so_host_key_is_checked(monkeypatch):
