@@ -86,7 +86,7 @@ def health_end(p: Project, resource: str) -> dict | None:
 
 
 def describe(v: dict, where=None) -> str:
-    """'ends 2026-10-06 05:00 PDT, or when `probe` passes; waits on project x's report' (or '')."""
+    """'ends 2026-10-06 05:00 UTC, or when `probe` passes; waits on project x's report' (or '')."""
     end = v.get("end_when")
     when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
             if isinstance(end, dict) else f"when `{end}` passes")

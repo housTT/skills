@@ -139,7 +139,7 @@ def short(ts: float, where, now: float | None = None) -> str:
 
 
 def clock(env: dict | None = None, now: float | None = None) -> str:
-    """'23:32:05 PDT': now in the home zone of the project in `env` or this process's environment
+    """'23:32:05 UTC': now in the home zone of the project in `env` or this process's environment
     (TTP_PROJECT), for lines people read live (a run's notes); UTC without one."""
     where = None
     try:

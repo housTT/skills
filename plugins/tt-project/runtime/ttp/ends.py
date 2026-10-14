@@ -69,7 +69,7 @@ def stamp(ts: float) -> str:
 
 
 def shown(ts: float, where=None) -> str:
-    """'2026-10-12 05:11 PDT': `ts` in the home zone of `where` (a Project, its settings or a zone
+    """'2026-10-12 05:11 UTC': `ts` in the home zone of `where` (a Project, its settings or a zone
     name), else timefmt.ambient()."""
     return timefmt.long(ts, where if where is not None else timefmt.ambient())
 
@@ -129,7 +129,7 @@ def from_action(a: dict, now: float | None = None) -> dict:
 
 
 def describe(end: dict, where=None) -> str:
-    """'ends 2026-10-06 05:00 PDT, or when <until>' for prompts and alerts, in the home zone of `where`
+    """'ends 2026-10-06 05:00 UTC, or when <until>' for prompts and alerts, in the home zone of `where`
     (a Project, its settings or a zone name); without one the stored UTC stamp."""
     when = (timefmt.long(end["expires"], where) if where is not None else stamp(end["expires"])) \
         if end.get("expires") else ""
