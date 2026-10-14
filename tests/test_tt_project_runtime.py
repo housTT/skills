@@ -20356,8 +20356,10 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     # A wait with no end of its own (--timeout 0, or one left in the background) must not lift the
     # wall clock: for providers that report cost only at the end it is the only spend bound.
     lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board --timeout 0 -- true"
+    # The limit scales with host load: `ttp lock` must start its wait before the limit ends.
+    limit = max(1, int(_load_scaled(1) + 0.999))
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 1,
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": limit,
         "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
     try:
         _wait_for_file(held, holder)
@@ -20368,14 +20370,17 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
         release.touch()
         holder.wait(timeout=30)
     info = json.loads((run_dir / "exit.json").read_text())
-    assert info["stopped"] == "timeout" and info["ended"] - info["started"] < 6, info
+    elapsed = info["ended"] - info["started"]
+    assert info["stopped"] == "timeout" and elapsed < 2 * limit + _load_scaled(4), info
     assert "handed-off" not in (run_dir / "output.jsonl").read_text()
+    from ttp import locks
     from ttp.daemon import _cut_off_cost
-    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": 1}))
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": limit}))
     (run_dir / "output.jsonl").write_text("{}\n")   # it did something; a silent run costs nothing
-    # Booked on the time beyond the one limit's worth of waiting, never below it.
-    assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 1, 0) / 1, 1),
-                                                         abs=0.01)
+    # Booked on the time beyond at most one limit's worth of waiting, never below it.
+    waited = locks.waited(run_dir, info["ended"])
+    assert _cut_off_cost(run_dir, info) == pytest.approx(
+        6.0 * min(max(elapsed - min(waited, limit), 0) / limit, 1), abs=0.01)
 
 
 # guarded push -------------------------------------------------------------------------------------
