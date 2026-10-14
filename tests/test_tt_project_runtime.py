@@ -11527,6 +11527,162 @@ def test_harness_commits_wait_until_the_run_end_is_saved(env, tmp_path, monkeypa
                          text=True).stdout
     assert "memory (fact)" in log and "charter (policies)" in log
 
+
+def _harness_task(p, title="tune prompts"):
+    return p.db.x("INSERT INTO tasks(created,title,spec,kind,status) VALUES(?,?,?,?,?)",
+                  (time.time(), title, "s", "harness", "running"))
+
+
+def _harness_run(p, tid, status="running"):
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), status))
+
+
+def _hgit(cwd, *args):
+    r = subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def _commit_in(cwd, rel, text, msg="edit"):
+    f = pathlib.Path(cwd) / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text)
+    _hgit(cwd, "add", rel)
+    _hgit(cwd, "commit", "-q", "-m", msg)
+
+
+def _task_ids(p):
+    return [r["id"] for r in p.db.q("SELECT id FROM tasks ORDER BY id")]
+
+
+def test_a_lone_harness_task_works_in_the_harness_and_a_concurrent_one_gets_its_own_worktree(env):
+    p = make(env)
+    from ttp import harnesstree
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    assert harnesstree.workdir(p, a) == p.harness
+    assert d._workdir_for({"id": a, "kind": "harness"}) == (str(p.harness), None)
+    _harness_run(p, a)   # a works in the checkout: b gets a worktree of its own
+    own = harnesstree.workdir(p, b)
+    assert own == p.state / "harness-worktrees" / f"t{b}" and own.is_dir()
+    assert _hgit(own, "rev-parse", "--abbrev-ref", "HEAD").strip() == f"ttp/harness-t{b}"
+    assert harnesstree.workdir(p, b) == own   # kept on later runs
+    _harness_run(p, b)
+    # a's run does not count itself, and b works in its own worktree: the checkout is not busy for a
+    assert not harnesstree.checkout_busy(p, a)
+    assert harnesstree.workdir(p, a) == p.harness
+
+
+def test_a_harness_worktree_lands_its_commits_and_is_removed(env):
+    p = make(env)
+    from ttp import harnesstree
+    from ttp import service
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    _harness_run(p, b)
+    assert harnesstree.sweep(p, {a, b}) == {}   # still running: left alone
+    assert own.exists()
+    assert harnesstree.sweep(p, {a}) == {b: "merged"}
+    assert (p.harness / "prompts" / "extra.md").read_text() == "more\n"
+    assert not own.exists() and not (p.state / "harness-worktrees").exists()
+    assert not _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip()
+    assert not (p.state / service.RESTART_REQUEST).exists()   # no runtime/ change
+
+
+def test_a_harness_worktree_that_changed_runtime_asks_the_daemon_to_restart(env):
+    p = make(env)
+    from ttp import harnesstree
+    from ttp import service
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in(own, "runtime/ttp/extra_note.txt", "x\n", "b: runtime")
+    assert harnesstree.land(p, b) == "merged"
+    req = json.loads((p.state / service.RESTART_REQUEST).read_text())
+    assert f"#{b}" in req["why"] and "runtime/" in req["why"]
+
+
+def test_a_dirty_harness_worktree_lands_its_commits_and_is_kept(env):
+    p = make(env)
+    from ttp import harnesstree
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    (own / "prompts" / "wip.md").write_text("half done\n")
+    assert harnesstree.land(p, b) == "kept"
+    assert (p.harness / "prompts" / "extra.md").exists()
+    assert (own / "prompts" / "wip.md").exists() and own.is_dir()
+    assert harnesstree.workdir(p, b) == own   # the next run picks it up
+    assert harnesstree.land(p, b) == "kept"   # nothing new to merge; still dirty
+
+
+def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
+    p = make(env)
+    from ttp import harnesstree
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in(own, "prompts/clash.md", "from b\n", "b")
+    _commit_in(p.harness, "prompts/clash.md", "from a\n", "a")
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    for _ in range(3):   # the daemon retries each tick; the coordinator hears once
+        assert harnesstree.sweep(p, set()) == {b: "conflict"}
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert not _hgit(p.harness, "status", "--porcelain").strip()   # merge aborted
+    assert (p.harness / "prompts" / "clash.md").read_text() == "from a\n"
+    assert own.is_dir()
+    ev = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and ev[0]["task"] == b
+    assert f"ttp/harness-t{b}" in ev[0]["text"] and "keeping both sides' intents" in ev[0]["text"]
+    _commit_in(own, "prompts/clash.md", "from b, again\n", "b2")   # a new head is reported again
+    assert harnesstree.land(p, b) == "conflict"
+    assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 2
+
+
+def test_the_daemon_tick_lands_harness_worktrees_of_ended_runs_only(env):
+    p = make(env)
+    from ttp import harnesstree
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    _harness_task(p, "c")
+    a, b, c = _task_ids(p)[-3:]
+    _harness_run(p, a)
+    own_b, own_c = harnesstree.workdir(p, b), harnesstree.workdir(p, c)
+    _commit_in(own_b, "prompts/b.md", "b\n", "b")
+    _commit_in(own_c, "prompts/c.md", "c\n", "c")
+    _harness_run(p, c)   # c still runs; b's run ended
+    _harness_run(p, b, status="done")
+    d.land_harness_worktrees()
+    assert (p.harness / "prompts" / "b.md").exists() and not own_b.exists()
+    assert own_c.is_dir() and not (p.harness / "prompts" / "c.md").exists()
+
+
+def test_the_harness_prompt_explains_worktrees_and_staging_by_name():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-harness.md").read_text(encoding="utf-8").split())
+    for phrase in ("yours gets a git worktree of the harness of its own", "the daemon merges your commits",
+                   "do not `ttp restart` from a worktree", "stage only the files you changed, by name",
+                   "never `git add -A`, `git add .` or `git commit -a`"):
+        assert phrase in text, phrase
+
+
 def test_only_exclusive_resources_serialize_whole_tasks(env):
     p = make(env)
     from ttp.daemon import Daemon
