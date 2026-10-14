@@ -2352,6 +2352,7 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     if rc_file.exists():
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
+        print(f"ttp checks: full output ('$ cmd' lines, test results) in {run_dir / 'checks.log'}")
     elif not info:
         print(f"ttp checks: no detached checks recorded in {run_dir}")
         return 0

@@ -36984,7 +36984,9 @@ def test_detached_ttp_checks_finish_record_the_pass_and_a_rerun_stops_the_earlie
         assert (run / "checks.rc").read_text().strip() == "0"
         assert json.loads((run / "checks.json").read_text())["passed"] is True
         assert _ttp("checks", "--result", str(run)) == 0
-        assert "finished with exit code 0" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "finished with exit code 0" in out
+        assert f"full output ('$ cmd' lines, test results) in {run / 'checks.log'}" in out
     finally:
         try:
             os.killpg(first, signal.SIGKILL)
