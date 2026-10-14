@@ -27,7 +27,11 @@ _PLAIN = re.compile(r"[A-Za-z0-9_./${}~-]+")
 def _remote_root(root: str) -> str:
     """`root` as a remote shell word: ~ and $VARS expand, anything else is quoted."""
     if root.startswith("~"):
-        root = "$HOME" + root[1:]
+        rest = root[1:]
+        if _PLAIN.fullmatch(rest or "x"):
+            root = "$HOME" + rest
+        else:
+            return '"$HOME"' + shlex.quote(rest)
     return f'"{root}"' if _PLAIN.fullmatch(root) else shlex.quote(root)
 
 
@@ -132,6 +136,8 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
     lock = ("unknown" if p is None else "free" if p.returncode == 0
             else "busy or paused" if p.returncode == 75 else f"error (exit {p.returncode})")
     facts["lock"] = lock
+    if lock == "unknown" or lock.startswith("error"):
+        problems.append("lock: could not probe")
     lines.append(f"lock {resource}: {lock}" + (": wait for it, never override it" if lock == "busy or paused" else ""))
 
     rc = 255 if not ssh_ok else 1 if problems else 75 if lock == "busy or paused" else 0

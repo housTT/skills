@@ -1189,6 +1189,7 @@ def test_setup_box_bare_check_ready_box(tmp_path):
     (dict(svc="inactive"), (), 1, "do not start a second broker"),
     (dict(broker=False, svc="inactive"), (), 0, "broker: none"),
     (dict(lock_rc=75), (), 75, "busy or paused: wait for it, never override it"),
+    (dict(lock_rc=2), (), 1, "lock: could not probe"),
     (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: failed (exit 255) connection refused"),
     (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
     (dict(machines={}), (), 0, "not in `ttp machines list`"),
@@ -1197,6 +1198,21 @@ def test_setup_box_bare_check_problems(tmp_path, kw, args, rc, expect):
     env, _ = _bare_env(tmp_path, **kw)
     r = _bare_check(tmp_path, env, *args)
     assert r.returncode == rc and expect in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_bare_check_missing_probe_is_a_problem(tmp_path):
+    env, _ = _bare_env(tmp_path)
+    (tmp_path / "bin" / "ttp").unlink()
+    r = _bare_check(tmp_path, env)
+    assert r.returncode == 1 and "lock: could not probe" in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_bare_remote_root_with_odd_characters_keeps_home():
+    sys.path.insert(0, str(BOX_PY.parent))
+    import box_bare
+    assert box_bare._remote_root("~/<workdir>/a b") == "\"$HOME\"'/<workdir>/a b'"
+    assert box_bare._remote_root("~/<workdir>") == '"$HOME/<workdir>"'
+    assert box_bare._remote_root("~") == '"$HOME"'
 
 
 def test_setup_box_bare_check_custom_lock_and_wrong_route(tmp_path):
