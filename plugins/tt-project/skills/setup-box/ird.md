@@ -19,12 +19,13 @@ IRD may be deprecated: prefer Slurm where your site has it (`slurm.md`).
 "<box-alias>": {
   "route": "ird",
   "workdir_root": "/<workdir>",
-  "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>"], "user": "<your-ird-user>"}
+  "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>"], "user": "<your-ird-user>", "arch": "<arch>"}
 }
 ```
 
 `ird.mgmt` is the management host's ssh alias, `ird.pools` the pools you may reserve from (first
 is the default). `ird.user` is optional: without it `box.py` asks the management host (`id -un`).
+`ird.arch` is optional: the arch `ird_e2e.sh` reserves when no `--arch` is given.
 `excluded_nodes` and `demo_nodes` are never offered or reserved. See `site.md`.
 
 ## Reserve only for the run
@@ -104,6 +105,35 @@ reset, verify). When it says a host reboot is needed:
 
 If the machine does not come back, or the device still fails after the reboot, release and
 reserve another machine.
+
+## End-to-end test (run by the user where IRD is reachable)
+
+`scripts/ird_e2e.sh` runs the whole route once and prints a report. Agents cannot run it when the
+management host is reachable only from the user's laptop: the user runs it there (macOS or Linux).
+
+1. Install: needs `bash`, `python3` and `ssh` (on macOS, `xcode-select --install` gives
+   `python3`). Get the plugin's files: install the tt-project plugin, or clone the
+   tenstorrent/skills repository; the script is `<plugin-root>/skills/setup-box/scripts/ird_e2e.sh`.
+2. Fill in the site file `~/.tt-project/boxes.json` (`site.md`) with one `ird` box as above:
+   `ird.mgmt`, `ird.pools`, `ird.arch` and `workdir_root` (a writable path on the reserved
+   machine). Flags override them: `--box <box-alias> --mgmt <ird-mgmt-alias> --pool <pool>
+   --arch <arch> --workdir /<workdir>`. There are no built-in defaults for these.
+3. Put `Include ~/.tt-project/ird/ssh-hosts` at the top of `~/.ssh/config`, and check that
+   `ssh <ird-mgmt-alias> true` works without a password prompt.
+4. Run `bash <plugin-root>/skills/setup-box/scripts/ird_e2e.sh --dry-run` first: it only lists
+   machines and prints the rest. Then run it without `--dry-run`. Optional: `--timeout hh:mm:ss`
+   (default 00:30:00), `--extend-min N` (default 15), `--repo <git-url>` (a small public repo).
+5. The first ssh to the machine may ask you to check its host key (`ssh-workflow.md`).
+6. Paste back the block from `--- ird-e2e report (paste this back) ---` to `--- end ---` (also
+   saved to the `report.txt` path it prints) into your project's chat, not a public place: it
+   names machines and pools.
+
+The steps: list and pick a free, non-draining machine; reserve it (every flag before the arch,
+`--wait 120`); check the managed ssh block and ssh in through `ProxyJump`; clone the repo into a
+per-run worktree under `workdir_root`, add a file, build it, run `tt-smi -s`; extend once with
+`change-timeout` and check the new expiry; release and check the id is gone from `ird list`.
+On any failure or Ctrl-C a trap releases the reservation this run made, and only that one.
+Exit 0 pass, 1 a step failed, 2 bad usage, 130 interrupted.
 
 ## Exit codes
 

@@ -1911,3 +1911,136 @@ def test_setup_box_ird_says_so_when_ird_is_unreachable(fake_ird, tmp_path):
     rc, out = fake_ird.run("list", "<ird-box>", FAKE_SSH_PORT=str(closed))
     assert rc == 255 and "no route to its ssh port" in out, out
     assert fake_ird.ird_log() == []
+
+
+# --- setup-box IRD end-to-end kit: ird_e2e.sh against the same fake ird, ssh into a local shell ---
+
+IRD_E2E = BOX_PY.parent / "ird_e2e.sh"
+
+E2E_SSH = r"""#!/bin/sh
+case "$1" in -V) echo "OpenSSH_fake"; exit 0;; esac
+if [ "$1" = "-G" ]; then case "$2" in m-*)
+  echo "$*" >> "$FAKE_DIR/ssh.log"; printf 'hostname %s\nproxyjump <ird-mgmt-alias>\n' "$2"; exit 0;; esac; fi
+exec "$FAKE_DIR/bin/ssh" "$@"
+"""
+
+E2E_CC = r"""#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out=$2; shift; done
+printf '#!/bin/sh\necho ird-e2e build ok\n' > "$out"; chmod +x "$out"
+"""
+
+E2E_SMI = r"""#!/bin/sh
+[ -n "$FAKE_SMI_HANG" ] && { touch "$FAKE_SMI_HANG"; sleep 30; }
+[ -n "$FAKE_SMI_FAIL" ] && { echo "no devices"; exit 1; }
+echo '{"device_info": [{"board_info": {"board_type": "n300 L"}}, {"board_info": {"board_type": "n300 R"}}]}'
+"""
+
+
+def _e2e(fake_ird, tmp_path, include=True):
+    import subprocess
+    shims = tmp_path / "e2e-bin"
+    shims.mkdir()
+    for name, body in (("ssh", E2E_SSH), ("cc", E2E_CC), ("tt-smi", E2E_SMI)):
+        (shims / name).write_text(body)
+        (shims / name).chmod(0o755)
+    repo = tmp_path / "public-repo"
+    repo.mkdir()
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                                    env={**fake_ird.env, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    git("init", "-q")
+    (repo / "README").write_text("hello\n")
+    git("add", "README")
+    git("commit", "-q", "-m", "init")
+    if include:
+        (fake_ird.home / ".ssh").mkdir()
+        (fake_ird.home / ".ssh" / "config").write_text(f"Include {fake_ird.ird_dir}/ssh-hosts\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {**fake_ird.env, "PATH": f"{shims}:{fake_ird.env['PATH']}", "TMPDIR": str(tmp_path)}
+    argv = ["bash", str(IRD_E2E), "--site", str(fake_ird.site), "--arch", "<arch>",
+            "--workdir", str(work), "--repo", f"file://{repo}"]
+    return argv, env, work
+
+
+def test_setup_box_ird_e2e_dry_run_lists_and_only_prints_the_rest(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path, include=False)
+    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "step 1 list: PASS 2 free, picked m-idle" in out, out
+    assert ("step 2 reserve: DRY box.py ird reserve <ird-box> --arch <arch> --timeout 00:30:00 "
+            "--pool <pool> --machine m-idle --wait 120") in out, out
+    assert "lacks 'Include" in out and "result: PASS (dry-run: steps 2-6 not run)" in out, out
+    assert "--- ird-e2e report (paste this back) ---" in out and "reservation: none" in out, out
+    assert all(l.startswith("list-machines") for l in fake_ird.ird_log()), fake_ird.ird_log()
+    # Values the run cannot guess are refused before any ird call; no real names as defaults.
+    r = subprocess.run([a for a in argv if a != "<arch>" and a != "--arch"] + ["--dry-run"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 1 and "missing --arch" in r.stdout + r.stderr, r.stdout + r.stderr
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)  # live, no Include
+    assert r.returncode == 1 and "lacks 'Include" in r.stdout, r.stdout
+    assert all(l.startswith("list-machines") for l in fake_ird.ird_log()), fake_ird.ird_log()
+
+
+def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird, tmp_path):
+    import subprocess
+    argv, env, work = _e2e(fake_ird, tmp_path)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    for line in ("step 2 reserve: PASS id 100 on m-idle", "step 3 ssh: PASS via ProxyJump",
+                 "edited 1 file(s);ird-e2e build ok; tt-smi -s ok, boards: 1x n300 L,1x n300 R",
+                 "step 5 extend: PASS +15 min", "step 6 release: PASS 100 gone from ird list",
+                 "reservation: 100  released: yes", "result: PASS"):
+        assert line in out, (line, out)
+    log = fake_ird.ird_log()
+    assert "reserve --cluster <pool> --timeout 00:30:00 --machine m-idle --no-shell <arch>" in log, log
+    assert [l for l in log if l.startswith("change-timeout")] == ["change-timeout 100 15"], log
+    assert fake_ird.load()["reservations"] == []
+    assert "tt-project ird 100" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
+    assert list((work / "ird-e2e").iterdir()) == []  # the per-run tree is removed
+
+
+@pytest.mark.parametrize("how", ["fail", "ctrl-c"])
+def test_setup_box_ird_e2e_trap_releases_only_its_own_reservation(fake_ird, tmp_path, how):
+    import signal
+    import subprocess
+    import time
+    fake_ird.add("99")  # the user's own reservation made by hand: never touched
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    marker = tmp_path / "smi-started"
+    env.update({"FAKE_SMI_FAIL": "1"} if how == "fail" else {"FAKE_SMI_HANG": str(marker)})
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+                         start_new_session=True)
+    if how == "ctrl-c":
+        deadline = time.time() + 60
+        while not marker.exists() and time.time() < deadline and p.poll() is None:
+            time.sleep(0.1)
+        assert marker.exists()
+        os.killpg(p.pid, signal.SIGINT)
+    out = p.communicate(timeout=120)[0]
+    assert p.returncode == (1 if how == "fail" else 130), out
+    assert "releasing reservation 100 (made by this run)" in out and "released: yes (by the trap)" in out, out
+    assert ("result: FAIL at 4 work: tt-smi -s (rc 1)" if how == "fail" else "result: interrupted at 4 work") in out, out
+    assert [r["id"] for r in fake_ird.load()["reservations"]] == ["99"]
+    assert [l for l in fake_ird.ird_log() if l.startswith("release")] == ["release 100"]
+
+
+def test_setup_box_ird_e2e_ships_executable_and_documented():
+    assert os.access(IRD_E2E, os.X_OK)
+    text = (SKILLS / "setup-box" / "ird.md").read_text(encoding="utf-8")
+    for part in ("ird_e2e.sh", "--dry-run", "ird.arch", "paste this back"):
+        assert part in text, part
+
+
+def test_setup_box_ird_e2e_is_shellcheck_clean():
+    import shutil
+    import subprocess
+    assert subprocess.run(["bash", "-n", str(IRD_E2E)]).returncode == 0
+    sc = shutil.which("shellcheck")
+    if not sc:
+        pytest.skip("shellcheck not installed")
+    r = subprocess.run([sc, str(IRD_E2E)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
