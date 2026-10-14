@@ -698,6 +698,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   its working copy: a change to a covered input and its refreshed digest land in one commit, with no
   second commit to move the pin, and the change's own review covers the definition. A covered input
   whose digest was not refreshed still fails, and the error prints its digest at HEAD.
+  A harness definition may bind a path to `"committed"` instead of a digest, for an input that changes
+  often and is checked by its own commands (a watcher's or schedule's JSON): whatever HEAD commits there
+  is covered, under a pinned or an at-HEAD definition, with no digest to refresh and no pin to move.
+  The file must still exist at HEAD as a regular file and match its working copy. Candidate
+  definitions keep exact digests.
 
   A separate `--purpose candidate` definition keeps exact publication identities:
   `{"purpose":"candidate","candidates":{"<full-candidate-commit-id>":{"paths":{...},"commands":[...]}}}`.

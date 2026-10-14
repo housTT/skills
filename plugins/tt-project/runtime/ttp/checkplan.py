@@ -16,6 +16,7 @@ from . import push
 GIT_ERROR, IDENTITY_ERROR, INPUT_ERROR = 20, 65, 66
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+COMMITTED = "committed"
 
 
 class PlanError(Exception):
@@ -85,24 +86,30 @@ def _blob(repo: Path, commit: str, path: str) -> bytes:
     return _read_git(repo, "cat-file", "blob", oid)
 
 
-def _scope(scope) -> dict:
+def _scope(scope, committed: bool = False) -> dict:
+    """`committed` (harness coverage only): a path may bind to COMMITTED instead of a digest, so
+    whatever HEAD commits there is covered (a watcher's or schedule's JSON that changes often)."""
     if not isinstance(scope, dict) or set(scope) != {"paths", "commands"}:
         raise PlanError(INPUT_ERROR, "coverage needs exactly paths and commands")
     paths, commands = scope["paths"], scope["commands"]
     if not isinstance(paths, dict) or not paths or any(
-            not _path(p) or not isinstance(h, str) or not _DIGEST.fullmatch(h) for p, h in paths.items()):
-        raise PlanError(INPUT_ERROR, "paths must bind exact repository files to SHA-256 digests")
+            not _path(p) or not isinstance(h, str)
+            or not (_DIGEST.fullmatch(h) or (committed and h == COMMITTED)) for p, h in paths.items()):
+        raise PlanError(INPUT_ERROR, "paths must bind exact repository files to SHA-256 digests"
+                        + (f' (or "{COMMITTED}")' if committed else ""))
     if not isinstance(commands, list) or not commands or any(
             not isinstance(c, str) or not c.strip() or push.check_problem(c) for c in commands):
         raise PlanError(INPUT_ERROR, "commands must be a nonempty list of check commands")
     return scope
 
 
-def _verify(repo: Path, head: str, scope: dict) -> None:
+def _verify(repo: Path, head: str, scope: dict, definition_path: str = "") -> None:
     for path, expected in scope["paths"].items():
         blob = _blob(repo, head, path)
-        if (digest := hashlib.sha256(blob).hexdigest()) != expected:
-            raise PlanError(IDENTITY_ERROR, f"uncovered committed input: {path} (sha256 at HEAD: {digest})")
+        if expected != COMMITTED and (digest := hashlib.sha256(blob).hexdigest()) != expected:
+            hint = (f'; refresh its digest in {definition_path}, or bind it to "{COMMITTED}" there when any '
+                    "committed content is covered" if definition_path else "")
+            raise PlanError(IDENTITY_ERROR, f"uncovered committed input: {path} (sha256 at HEAD: {digest}){hint}")
         file = repo / path
         try:
             if not file.resolve().is_relative_to(repo.resolve()) or file.is_symlink():
@@ -171,8 +178,8 @@ def run(repo: Path, definition_commit: str | None, definition_path: str, purpose
         else:
             if set(plan) != {"purpose", "coverage"}:
                 raise PlanError(INPUT_ERROR, "harness definition needs coverage")
-            scope = _scope(plan["coverage"])
-        _verify(repo, head, scope)
+            scope = _scope(plan["coverage"], committed=True)
+        _verify(repo, head, scope, definition_path if purpose == "harness" else "")
         print(f"check-plan: {purpose} on {head}; definition {definition_commit}:{definition_path}"
               + (" (at HEAD)" if at_head else ""), flush=True)
         for command in scope["commands"]:

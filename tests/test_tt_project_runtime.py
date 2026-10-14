@@ -240,6 +240,55 @@ def test_check_plan_at_head_takes_a_covered_change_and_its_digests_in_one_commit
                   "--definition-path", "plan.json", "--purpose", "harness"])
     assert e.value.code == 2
 
+
+def test_check_plan_covers_a_committed_watcher_input_in_one_step(tmp_path, capsys):
+    """A watcher's JSON (box-watch.json) committed with the definition that binds it to "committed"
+    passes at once, and a later change to it passes under the same pinned definition commit."""
+    import hashlib
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    (repo / "box-watch.json").write_text('{"boxes": []}\n')
+    plan["coverage"]["paths"]["box-watch.json"] = "committed"
+    plan["coverage"]["commands"].append("python3 -m json.tool box-watch.json")
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", "-A")
+    git("commit", "-qm", "watcher input and its definition, one commit")
+    pinned = git("rev-parse", "HEAD")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 0
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    # The watcher input changes again: no digest to refresh and no pin to move.
+    (repo / "box-watch.json").write_text('{"boxes": ["a"]}\n')
+    git("commit", "-qam", "watcher input only")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 0
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    # Still bound: the committed file must parse, match the working copy and exist.
+    (repo / "box-watch.json").write_text("{\n")
+    git("commit", "-qam", "broken watcher input")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") != 0
+    git("revert", "--no-edit", "HEAD")
+    (repo / "box-watch.json").write_text('{"boxes": ["b"]}\n')
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 65   # uncommitted edit
+    git("checkout", "-q", "box-watch.json")
+    git("rm", "-q", "box-watch.json")
+    git("commit", "-qm", "watcher input removed")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 66
+    git("revert", "--no-edit", "HEAD")
+    # A digest-bound input still fails when stale, and the error says how to cover it.
+    (repo / "selector.py").write_text("# selector v2\n")
+    git("commit", "-qam", "selector change")
+    capsys.readouterr()
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 65
+    err = capsys.readouterr().err
+    assert "uncovered committed input: selector.py" in err and 'plan.json, or bind it to "committed"' in err
+    assert hashlib.sha256(b"# selector v2\n").hexdigest() in err
+    # Candidate identities keep exact digests: "committed" is not a candidate binding.
+    (tmp_path / "c").mkdir()
+    crepo, cgit, cplan, _, cand = _check_plan_repo(tmp_path / "c", "candidate")
+    cplan["candidates"][cand]["paths"]["selector.py"] = "committed"
+    (crepo / "plan.json").write_text(json.dumps(cplan))
+    cgit("commit", "-qam", "candidate bound to committed")
+    assert checkplan.run(crepo, cgit("rev-parse", "HEAD"), "plan.json", "candidate") == 66
+
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 # `ttp setup` syncs every filesystem on the host (os.sync); on a busy machine that waits tens of seconds
