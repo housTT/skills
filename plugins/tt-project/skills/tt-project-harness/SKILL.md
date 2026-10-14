@@ -123,7 +123,8 @@ do not run while the project is paused. A task that must reboot the host its har
    (`ttp detach --remote`), where this host's reboot cannot end it. A job started with
    `ttp detach --resumable` (only one that is safe to rerun from the start) is started again by
    the daemon after the reboot while its task still waits on it, with no model run, up to
-   `budget.max_job_relaunches` times (default 3).
+   `budget.max_job_relaunches` times (default 3). Abrupt reboots it relaunches through count toward
+   `budget.max_reboot_losses`, so a job that takes the host down still gets its task blocked.
 2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no

@@ -5581,13 +5581,16 @@ class Daemon:
             if not since or since >= self.boot_at:
                 continue
             asleep, relaunched = self._relaunch_checks(t, prev)
-            if asleep or self._relaunch_jobs(t, prev):
+            cut = False
+            if not asleep:
+                asleep, cut = self._relaunch_jobs(t, prev)
+            if asleep:
                 continue   # asleep on its retry_when: the same checks or resumable jobs run again
             self._probe_rc.pop(t["id"], None)
-            counts = bool(relaunched) or self._job_cut_by_reboot(t["id"])
+            counts = bool(relaunched) or cut or self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
-            # Reboots its relaunched checks went through count too: a loop stays within the cap.
-            n = self._reboot_losses(t["id"]) + wakes + relaunched
+            # Reboots its relaunched checks or jobs went through count too: a loop stays within the cap.
+            n = self._reboot_losses(t["id"]) + wakes + relaunched + self._job_relaunch_boots(t["id"])
             if counts and n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 # Its detached job may be what takes the host down: stop waking it.
                 prev.pop("reboot_wakes", None)
@@ -5667,19 +5670,23 @@ class Daemon:
         log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
         return True, 0
 
-    def _relaunch_jobs(self, t: dict, prev: dict) -> bool:
+    def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
         """A task waiting on local detached jobs (retry_when `ttp detach --check <rc...>`) that all
         opted in with `--resumable`: start each the reboot cut short (no .rc) again, model-free, note
-        it on the task and keep the task asleep on its retry_when. True when it stays asleep (relaunched
-        now, or already on this boot: a daemon restart). False wakes it as before: a job it waits on
-        that did not opt in, one found lost on an earlier boot, one that cannot start, or one past
-        budget.max_job_relaunches relaunches (noted on the task, so its run reads why)."""
+        it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
+        stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
+        before: a job it waits on that did not opt in, one found lost on an earlier boot, one that
+        cannot start, one past budget.max_job_relaunches relaunches, or a relaunch that would reach
+        budget.max_reboot_losses (noted on the task, so its run reads why). cut when an abrupt,
+        unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
+        Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
         rcs = _waited_jobs(str(prev.get("retry_when") or ""))
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
         if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
-            return False   # not only its own runs' jobs: not ours to start
-        todo, again, cap = [], False, int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
+            return False, False   # not only its own runs' jobs: not ours to start
+        todo, again, cut = [], False, False
+        cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
         for rc in rcs:
             m = detach.read_resume(rc)
             if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
@@ -5689,32 +5696,57 @@ class Daemon:
                 continue
             lost = detach.lost(rc)
             if m is None or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
-                return False
+                return False, cut
+            loss = self._abrupt_cut(m.get("boot"))
+            cut = cut or loss
             n = int(m.get("relaunches") or 0)
             if n >= cap:
                 why = (f"the reboot cut short detached job {rc.stem} again; it was relaunched {n} times "
                        f"already (cap {cap}), so the task wakes instead")
                 _task_note(rc.parent, why)
                 log(self.p, f"task {tid}: {why}")
-                return False
-            todo.append((rc, n))
+                return False, cut
+            todo.append((rc, n, loss))
         if not todo:
-            return again   # all ended before the reboot: woken as before
+            return again, False   # all ended before the reboot: woken as before
+        limit = int(self.cfg["budget"].get("max_reboot_losses", 3))
+        if cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
+            # This reboot would reach the cap: wake it, and the wake path blocks it as a reboot loop.
+            why = (f"the reboot cut short detached job {todo[0][0].stem}; not relaunched: with {k} earlier "
+                   f"reboot losses this one reaches budget.max_reboot_losses ({limit})")
+            _task_note(todo[0][0].parent, why)
+            log(self.p, f"task {tid}: {why}")
+            return False, True
         nice = nice_level(self.cfg.get("runner"))[0]
-        for rc, n in todo:
+        for rc, n, loss in todo:
             if why := detach.relaunch(rc, self.boot, nice):
                 _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
                 log(self.p, f"task {tid}: detached job {rc.stem} not relaunched: {why}")
-                return False
+                return False, cut
             text = (f"the host reboot cut short detached job {rc.stem}; relaunched it "
                     f"({n + 1} of {cap}), no model run")
             _task_note(rc.parent, text)
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                         "VALUES(?,?,?,?,?,?,?,?)",
-                        (time.time(), "daemon", "job_relaunched", f"job_relaunched:{tid}:{self.boot}:{rc}", "low",
+                        (time.time(), "daemon", "job_relaunched",
+                         f"job_relaunched:{tid}:{self.boot}:{'loss' if loss else 'free'}:{rc}", "low",
                          f"#{tid} {t['title']}: {text}", "handled", tid))
             log(self.p, f"task {tid}: {text} ({rc})")
-        return True
+        return True, cut
+
+    def _abrupt_cut(self, boot: str | None) -> bool:
+        """Whether boot `boot` ended in an abrupt reboot no planned host cycle explains: one a job
+        it cut short may have caused (as _job_cut_by_reboot judges)."""
+        return self._shutdown(boot) != "orderly" and not (boot and self._planned_cycle(boot))
+
+    def _job_relaunch_boots(self, tid: int) -> int:
+        """Boots on which resumable jobs of task tid were relaunched after an abrupt, unplanned reboot,
+        since it was last blocked: each is a reboot loss the relaunch kept from waking the task."""
+        db = self.p.db
+        since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
+        rows = db.q("SELECT fingerprint FROM events WHERE kind='job_relaunched' AND task=? AND ts>? AND fingerprint "
+                    "LIKE ?", (tid, since or 0, f"job_relaunched:{tid}:%:loss:%"))
+        return len({r["fingerprint"].split(":")[2] for r in rows})
 
     def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
         """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,

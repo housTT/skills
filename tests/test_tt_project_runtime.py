@@ -26916,10 +26916,14 @@ def _job_relaunches(p, tid):
     return p.db.q("SELECT * FROM events WHERE kind='job_relaunched' AND task=?", (tid,))
 
 
-def _boot_daemon(p, boot="a-later-boot"):
+def _boot_daemon(p, boot="a-later-boot", max_losses=None, orderly_after=None):
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     d.boot, d.boot_at = boot, time.time() - 300
+    if max_losses is not None:
+        d.cfg["budget"]["max_reboot_losses"] = max_losses
+    if orderly_after:
+        p.db.set_kv("boot_prev", {"boot": boot, "prev_boot": orderly_after, "shutdown": "orderly"})
     d.wake_after_reboot()
     return d
 
@@ -26979,16 +26983,57 @@ def test_a_resumable_job_past_its_relaunch_cap_wakes_the_task_with_a_note(env, t
     p = make(env)
     tid = p.db.add_task("crashy", "s", kind="work", tier="light", origin="user")
     rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
-    for i in range(3):
-        _boot_daemon(p, f"boot-{i}")
+    for i in range(3):   # max_reboot_losses above the job cap: the job cap is what stops it here
+        _boot_daemon(p, f"boot-{i}", max_losses=10)
         assert not _woken(p, tid), i
         assert _wait_for_path(rc)
         _resumable_job_cut_by_reboot(p, tmp_path, tid)
     assert json.loads(detach.resume_file(rc).read_text())["relaunches"] == 3
-    _boot_daemon(p, "boot-3")
+    _boot_daemon(p, "boot-3", max_losses=10)
     assert _woken(p, tid), "a job that keeps dying with the host was relaunched forever"
     assert len(_job_relaunches(p, tid)) == 3 and len(counter.read_text().split()) == 4
     assert "relaunched 3 times already (cap 3), so the task wakes instead" in (rc.parent / "progress.md").read_text()
+
+
+def test_resumable_job_relaunches_count_toward_max_reboot_losses(env, tmp_path, monkeypatch):
+    """Abrupt reboots answered by a relaunch are reboot losses: the task is blocked as a reboot loop
+    once they reach max_reboot_losses, as it would be without --resumable. A new job name per run
+    starts no fresh count; orderly reboots and planned host cycles are not counted."""
+    from ttp import coordinator as coord, daemon as dm
+    p = make(env)
+    tid = p.db.add_task("crashy", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    _boot_daemon(p, "boot-0")
+    assert not _woken(p, tid) and _wait_for_path(rc)
+    # The next run's job has another name: the count carries over.
+    rc2, _ = _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job2")
+    _boot_daemon(p, "boot-1")
+    assert not _woken(p, tid) and _wait_for_path(rc2)
+    _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job2")
+    _boot_daemon(p, "boot-2")
+    t = p.db.task(tid)
+    assert t["status"] == "blocked", "a reboot loop through relaunches was not counted"
+    assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+    assert len(_job_relaunches(p, tid)) == 2
+    assert "reaches budget.max_reboot_losses (3)" in (rc2.parent / "progress.md").read_text()
+    # A requeue starts the count over.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    assert dm.Daemon(p.base)._job_relaunch_boots(tid) == 0
+    # Orderly reboots and planned host cycles relaunch without counting.
+    calm = p.db.add_task("calm", "s", kind="work", tier="light", origin="user")
+    rc3, _ = _resumable_job_cut_by_reboot(p, tmp_path, calm, name="calm")
+    for i in range(3):
+        with monkeypatch.context() as m:
+            if i == 1:
+                m.setattr(dm.Daemon, "_planned_cycle", lambda self, boot: {"path": "x", "reason": "planned"})
+            _boot_daemon(p, f"calm-{i}", orderly_after=None if i == 1 else "an-earlier-boot")
+        assert not _woken(p, calm) and _wait_for_path(rc3), i
+        _resumable_job_cut_by_reboot(p, tmp_path, calm, name="calm")
+    assert p.db.task(calm)["status"] == "queued" and len(_job_relaunches(p, calm)) == 3
+    assert dm.Daemon(p.base)._job_relaunch_boots(calm) == 0
+    _boot_daemon(p, "calm-3", orderly_after="an-earlier-boot")
+    assert _woken(p, calm), "the job cap still wakes it"
+    assert p.db.task(calm)["status"] == "queued"
 
 
 def test_detach_resumable_is_refused_for_a_remote_job(env):
