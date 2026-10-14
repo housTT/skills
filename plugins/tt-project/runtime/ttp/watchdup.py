@@ -27,7 +27,7 @@ import re
 import time
 
 from .db import DB
-from .screen import normalize
+from . import screen   # a module, not its names: screen imports this module too
 
 WINDOW_S = 86400.0
 DEFAULT = 3
@@ -53,10 +53,10 @@ def threshold(cfg: dict) -> int:
 
 def key_kind(key: str | None, subject: str = "") -> str:
     """The condition class of a watcher key (see the module doc); NO_KEY for none."""
-    k = normalize(key or "")
+    k = screen.normalize(key or "")
     if not k:
         return NO_KEY
-    subj = normalize(subject or "")   # an issue's subject is stored normalized; the key must match it
+    subj = screen.normalize(subject or "")   # an issue's subject is stored normalized; the key must match it
     if subj and k.startswith(subj) and len(k) > len(subj) and (_SEP.match(k, len(subj)) or k[len(subj)] == " "):
         k = k[len(subj) + 1:].strip() or k
     parts = [x.strip() for x in _SEP.split(k)]
