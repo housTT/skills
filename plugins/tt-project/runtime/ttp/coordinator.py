@@ -281,10 +281,14 @@ MUTE_CHARS = 200
 # Every coordinator turn is a fresh session whose digest the provider writes to its cache whole.
 # Every turn, at any effort, sees these background sections as one line while they are as the
 # previous turn saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused
-# resources and memory changes are always shown whole; so is the machine ledger on a turn whose
-# events concern a machine.
+# resources and memory changes are always shown whole; so is the machine ledger on a turn with a
+# machine_* event.
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger", "tried")
+# Sections that change only when memory, the charter or the release does: they end the cached
+# context block (with_cached) instead of the digest, which a timestamp leads and so misses the cache
+# whole every turn. Their order is fixed, so the block is byte-identical while they are unchanged.
+CACHED_SECTIONS = ("prompt_delta", "memory_added", "memory_recent")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
@@ -323,8 +327,9 @@ _RETIRE_RE = re.compile(r"\bstale restriction|\bretir(e|es|ing)\b|\bno longer ap
 # The coordinator's system prompt (restrictions, role, charter, STANDING and standing memory) is a
 # snapshot, re-rendered only when the provider's cache is cold anyway, when it is older than
 # coordinator.prompt_max_age_s, or at once for a restrictions change or a charter edit on the user's
-# word. Every other change waits in the digest as a delta (prompt_delta_lines), so deploys, memory
-# and charter edits between refreshes leave the cached prefix byte-identical.
+# word. Every other change waits as a delta (prompt_delta_lines) at the end of the context block
+# (CACHED_SECTIONS), so deploys, memory and charter edits between refreshes leave the prefix before
+# it byte-identical.
 PROMPT_SNAPSHOT_KEY = "prompt_snapshot"   # kv: the rendered prompt and what it was rendered from
 MEMORY_SNAPSHOT_KEY = PROMPT_SNAPSHOT_KEY
 PROMPT_REFRESH_KEY = "prompt_refresh"     # kv: a charter edit on the user's word: the next turn re-renders
@@ -421,7 +426,7 @@ def memory_view(p: Project, now: float | None = None) -> dict:
 
 def recent_memory_lines(p: Project) -> list[str]:
     """The newest decisions and facts the coordinator's memory budget leaves room for after the
-    standing entries, shown live in the digest so a new one never changes the cached prompt."""
+    standing entries, shown live after the snapshot (CACHED_SECTIONS) so a new one never changes it."""
     rest = [e["line"] for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0] if not _standing_entry(e)]
     return [RECENT_MEMORY_HEADER] + rest if rest else []
 
@@ -545,18 +550,30 @@ def held_at_reboots(boots: list[dict], where=None) -> str:
     return "; ".join(f"{at} {item}" if n == 1 else f"{n}x, latest {at} {item}" for n, at, item in groups.values())
 
 
-def events_name_machine(db, event_ids: list[int], aliases: list[str]) -> bool:
-    """Whether any of the events is about a machine: a machine_* event, or one naming one of `aliases`."""
+def machine_events(db, event_ids: list[int]) -> bool:
+    """Whether any of the events is a machine event (machine_condition, machine_change_overdue, ...).
+    An event that only names a machine does not count: on a fleet nearly every event names one, and
+    an outage or a recovery reaches the ledger itself, whose changed hash shows it whole anyway."""
     if not event_ids:
         return False
-    rows = db.q(f"SELECT kind, text FROM events WHERE id IN ({','.join('?' * len(event_ids))})", list(event_ids))
-    named = re.compile("|".join(rf"(?<![\w.-]){re.escape(a)}(?![\w-])" for a in aliases)) if aliases else None
-    return any(str(r["kind"]).startswith("machine") or (named and named.search(str(r["text"] or "")))
-               for r in rows)
+    return bool(db.one(f"SELECT 1 FROM events WHERE id IN ({','.join('?' * len(event_ids))}) "
+                       "AND kind LIKE 'machine%' LIMIT 1", list(event_ids)))
 
 
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
     return "\n".join(text for _, text in digest_parts(p, gates, event_ids, msg_ids, seen)[0])
+
+
+def split_cached(parts: list[tuple[str, str]]) -> tuple[str, list[tuple[str, str]]]:
+    """(the CACHED_SECTIONS' text in their fixed order, the rest of the digest's parts)."""
+    got = dict(k_t for k_t in parts if k_t[0] in CACHED_SECTIONS)
+    return "\n".join(got[k] for k in CACHED_SECTIONS if k in got), [kt for kt in parts if kt[0] not in CACHED_SECTIONS]
+
+
+def with_cached(context: str, cached: str) -> str:
+    """The stable context block with the slow sections at its end, after the snapshot, so a change
+    in them misses the cache only from there (or only this block, where it has a breakpoint)."""
+    return f"{context}\n{cached}\n" if cached else context
 
 
 def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
@@ -660,7 +677,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         kept = [ln for ln in lines if not ln.startswith("No recovery owner")]   # named once: not a change
         section("machine_ledger", ["## Shared machines in your Resources: open changes (`ttp machines change`), "
                                    "conditions, owners"] + [f"- {ln}" for ln in lines], "\n".join(kept),
-                None if events_name_machine(db, event_ids, machine_ledger.resource_machines(p)) else
+                None if machine_events(db, event_ids) else
                 f"## Shared machines in your Resources: {len(kept)} open (as last turn)")
     section("prompt_delta", prompt_delta_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))

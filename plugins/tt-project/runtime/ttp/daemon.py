@@ -4021,6 +4021,7 @@ class Daemon:
             # Every turn, at any effort, sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               db.kv(coord.DIGEST_SEEN_KEY) or {})
+            cached, parts = coord.split_cached(parts)   # slow sections: in the cached context block
             prompt = "\n".join(text for _, text in parts)
             # `escalate` is offered only where the daemon would take it: a routine turn that a raise
             # would change, not a rerun, over a batch not escalated before (Daemon._escalate_refusal).
@@ -4031,6 +4032,7 @@ class Daemon:
                        "\n\nThis turn's effort: routine. If this batch is harder than routine bookkeeping, "
                        "return only an `escalate` action: it reruns once at high effort." if offer else "")
             head, context = coord.prompt_parts(self.p)
+            context = coord.with_cached(context, cached)
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
                            cache_ttl=str(c.get("cache_ttl", cachettl.AUTO) or ""),
@@ -4040,7 +4042,7 @@ class Daemon:
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
                                  **({"wake_due": due} if due else {}),
                                  **({"escalated": True} if esc else {}), **checked,
-                                 "digest": coord.digest_size(parts), **({"gate": seen_now} if seen_now else {})},
+                                 "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {})},
                            unblock=unblock)
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.

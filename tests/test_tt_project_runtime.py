@@ -5990,7 +5990,7 @@ def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(e
     assert k["unblock"] and "## Recurring\n" in prompt, "a raised turn must see a changed section whole"
 
 
-def test_an_unchanged_machine_ledger_is_one_line_on_a_raised_turn_unless_an_event_names_a_machine(env, monkeypatch):
+def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_ledger_change(env, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon
     from ttp import coordinator as coord
@@ -6022,12 +6022,63 @@ def test_an_unchanged_machine_ledger_is_one_line_on_a_raised_turn_unless_an_even
     assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
     assert "zzzz" not in prompt and k["note"]["digest"]["sections"]["machine_ledger"] < 200
     prompt, k = turn("task_failed", "the run on box-c lost its device")
-    assert k["unblock"] and "disabled auto power cycle" in prompt, "an event names a machine: show the ledger"
+    assert k["unblock"] and "disabled auto power cycle" not in prompt, "an event only naming a machine expanded it"
+    assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
     prompt, _ = turn("machine_condition", "a condition opened")
     assert "disabled auto power cycle" in prompt, "a machine event shows the ledger"
     ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
     prompt, _ = turn("task_failed")
     assert "a second change" in prompt, "a changed ledger is shown whole"
+    prompt, _ = turn("observation", "box-c is slow")
+    assert "a second change" not in prompt and "2 open (as last turn)" in prompt
+
+
+def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    p.add_memory("Picked the cheaper runner.", kind="decision")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def turn(text):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", "task_failed", "normal", text, "queued"))
+        clock[0] += 600
+        d.maybe_coordinate()
+        p.db.x("UPDATE events SET status='handled'")
+        return calls[-1]
+
+    first, k1 = turn("one")
+    second, k2 = turn("two")
+    assert k1["context"] == k2["context"], "the cached block changed with nothing slow changing"
+    assert k1["system"] == k2["system"]
+    ctx = k1["context"]
+    assert ctx.index("# MEMORY\n") < ctx.index(coord.RECENT_MEMORY_HEADER), "slow sections end the block"
+    assert "Picked the cheaper runner." in ctx.split(coord.RECENT_MEMORY_HEADER, 1)[1]
+    for prompt in (first, second):
+        assert coord.RECENT_MEMORY_HEADER not in prompt and "Picked the cheaper runner." not in prompt
+    assert "one" in first and "two" in second   # the per-turn digest still differs
+    assert k2["note"]["digest"]["cached_chars"] > 0 and "memory_recent" not in k2["note"]["digest"]["sections"]
+    p.add_memory("The build takes 40 minutes.", kind="fact")
+    _, k3 = turn("three")
+    assert k3["context"] != k2["context"] and "The build takes 40 minutes." in k3["context"]
+    assert k3["context"].startswith(k2["context"].split(coord.RECENT_MEMORY_HEADER, 1)[0]), \
+        "a slow change moved the snapshot part of the block"
+
+
+def test_split_cached_keeps_a_fixed_order_and_the_rest_of_the_digest():
+    from ttp import coordinator as coord
+    parts = [("budget", "B"), ("memory_recent", "R"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A")]
+    cached, rest = coord.split_cached(parts)
+    assert cached == "P\nA\nR" and rest == [("budget", "B"), ("tasks", "T")]
+    assert coord.split_cached([("tasks", "T")]) == ("", [("tasks", "T")])
+    assert coord.with_cached("CTX\n", "") == "CTX\n" and coord.with_cached("CTX\n", "R") == "CTX\n\nR\n"
 
 
 def test_the_host_line_counts_a_lock_held_at_several_reboots_once_with_the_latest(env):
