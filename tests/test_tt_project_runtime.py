@@ -63106,3 +63106,21 @@ def test_venv_rebuild_cmd_single_clause_bounds_and_scoped_tables(tmp_path):
         assert want in cmd, want
     for bad in ("torch", "setuptools", "bad<1", "requests"):
         assert bad not in cmd, bad
+
+
+def test_venv_rebuild_cmd_hash_in_string_and_include_group(tmp_path):
+    from ttp import push
+    (tmp_path / "pyproject.toml").write_text(
+        '[project] # main\nname = "x"\ndependencies = ["mcp<2"]\n'
+        '[dependency-groups] # groups\n'
+        'test = ["pytest>=8,<9"]\n'
+        'dev = ["pkg @ git+https://host/r.git#subdirectory=py", "pytest>=8,<9", "ruff"]\n'
+        'both = [{include-group = "test"}, "ruff"]\n')
+    cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
+    for want in ("'pytest>=8,<9'", " ruff", "mcp<2"):
+        assert want in cmd, want
+    assert " , " not in cmd and not cmd.rstrip().endswith(",")
+    (tmp_path / "pyproject.toml").write_text(
+        '[dependency-groups]\ndev = [{include-group = "test"}, "ruff"]\n')
+    cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
+    assert " ruff" in cmd and " test" not in cmd

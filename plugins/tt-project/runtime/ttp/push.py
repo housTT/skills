@@ -363,12 +363,15 @@ def venv_rebuild_cmd(venv: Path) -> str:
         arr = r"\[(?:\s*(?:\"[^\"]*\"|'[^']*'|#[^\n]*|,|\{[^}]*\}))*\s*\]"
 
         def table(name):
-            m = re.search(rf"^\[{re.escape(name)}\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+            m = re.search(rf"^\[{re.escape(name)}\][ \t]*(?:#[^\n]*)?$(.*?)(?=^\[|\Z)", text, re.M | re.S)
             return m.group(1) if m else ""
 
         def entries(body, key):
             m = re.search(rf"^\s*[\"']?{re.escape(key)}[\"']?\s*=\s*({arr})", body, re.M)
-            return [a or b for a, b in re.findall(r"\"([^\"]*)\"|'([^']*)'", re.sub(r"#[^\n]*", "", m.group(1)))] if m else []
+            if not m:
+                return []   # one tokenizer: strings first, then comments and inline tables (include-group), which are skipped
+            toks = re.findall(r"\"([^\"]*)\"|'([^']*)'|(#[^\n]*|\{[^}]*\})", m.group(1))
+            return [a or b for a, b, skip in toks if not skip]
 
         def bounded(r):
             return "@" not in r and ";" not in r and re.match(r"[A-Za-z0-9_.-]+(\[[^\]]*\])?\s*[<>=!~]", r) \
