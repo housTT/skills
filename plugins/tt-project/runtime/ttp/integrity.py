@@ -59,6 +59,17 @@ def _cut_short(data: bytes, head: bytes | None) -> bool:
     return bool(head) and len(data) < len(head) and head.startswith(data) and not data.endswith(b"\n")
 
 
+def looks_cut(p: Project, rel: str, data: bytes) -> bool:
+    """Whether harness file `rel` (CHARTER*, MEMORY.md or under memory/) holding `data` shows the
+    marks check_harness repairs, so a sweep never commits a cut write over the good copy."""
+    text = _text(data)
+    if text is None:
+        return True
+    if rel.startswith("memory/"):
+        return not text.endswith("\n") or (text.startswith("---") and not _entry_ok(text))
+    return _cut_short(data, _head(p, rel))
+
+
 def _read(path: Path) -> bytes:
     try:
         return path.read_bytes()

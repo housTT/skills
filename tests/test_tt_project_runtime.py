@@ -8505,6 +8505,36 @@ def test_harness_commit_timeout_is_configurable_and_logged(env, monkeypatch):
     assert "memory" not in _harness_dirty(p).lower()
 
 
+def test_harness_sweep_never_commits_a_cut_write_over_the_good_copy(env):
+    """A power cut leaves damaged charter and memory files uncommitted; the sweep that heals failed
+    commits must leave them for the boot integrity check to put back from the last commit."""
+    p = make(env)
+    from ttp import integrity, runner
+    from ttp.daemon import Daemon, KV_INTEGRITY
+    a = p.add_memory("A good entry the cut damages.", kind="fact")
+    good, charter = a.read_bytes(), p.charter_path.read_bytes()
+    a.write_bytes(good[:len(good) // 2].rstrip(b"\n") + b"\0" * 16)   # cut short, NUL-padded
+    p.charter_path.write_bytes(charter[:len(charter) - 7].rstrip(b"\n"))
+    old = time.time() - 3600
+    for f in (a, p.charter_path):
+        os.utime(f, (old, old))
+    p.add_memory("A later fact whose commit sweeps.")
+    Daemon(p.base).heal_harness_git()
+    dirty = _harness_dirty(p)
+    assert a.name in dirty and "CHARTER.md" in dirty, dirty
+    assert "look like a cut write" in _daemon_log_text(p)
+    res = integrity.check_harness(p)
+    assert a.read_bytes() == good and p.charter_path.read_bytes() == charter, res
+    assert not res["bad"] and len(res["restored"]) == 2, res
+    # A good leftover waits for this boot's integrity check, once a daemon has run one before.
+    b = p.add_memory("Left by a failed commit.", kind="fact")
+    subprocess.run(["git", "-C", str(p.harness), "reset", "-q", "--soft", "HEAD~1"], check=True)
+    p.db.set_kv(KV_INTEGRITY, {"boot": "an-earlier-boot", "at": old})
+    assert p.sweep_harness(min_age_s=0) is False and b.name in _harness_dirty(p)
+    p.db.set_kv(KV_INTEGRITY, {"boot": runner.boot_id(), "at": time.time()})
+    assert p.sweep_harness(min_age_s=0) is True and b.name not in _harness_dirty(p)
+
+
 def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

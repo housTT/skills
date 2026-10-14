@@ -885,8 +885,19 @@ class Project:
     def sweep_harness(self, min_age_s: float = 60) -> bool:
         """Commit the charter and memory files (CHARTER*, MEMORY.md, memory/) a failed commit left
         uncommitted, so it heals itself. A file changed in the last `min_age_s` is left to the commit
-        its writer is about to make. True when it committed something."""
+        its writer is about to make. A file showing the marks of a cut write is never committed (see
+        integrity.looks_cut), and nothing is swept on a boot whose integrity check has not run yet:
+        after a power cut the uncommitted files are what that check puts back from the last commit.
+        True when it committed something."""
+        from . import integrity
+        from .runner import same_boot
         if not (self.harness / ".git").exists():
+            return False
+        try:   # kv "integrity" is Daemon.check_integrity's record; none yet: no daemon has run it
+            boot = (self.db.kv("integrity") or {}).get("boot") if (self.state / "project.db").exists() else None
+        except Exception:
+            boot = None
+        if boot and not same_boot(boot):
             return False
         try:
             out = subprocess.run(["git", "-C", str(self.harness), "status", "--porcelain=v1", "-z", "--no-renames",
@@ -899,18 +910,24 @@ class Project:
             self._git_log(f"sweep: status failed with exit {out.returncode}: {out.stderr.strip()[:300]}")
             return False
         now = time.time()
-        rel, gone = [], []
+        rel, gone, cut = [], [], []
         for entry in filter(None, out.stdout.split("\0")):
             path = entry[3:]
             f = self.harness / path
             try:
                 if now - f.stat().st_mtime < min_age_s:
                     continue
+                if integrity.looks_cut(self, path, f.read_bytes()):
+                    cut.append(path)
+                    continue
                 rel.append(path)
             except FileNotFoundError:
                 gone.append(path)
             except OSError:
                 continue
+        if cut:
+            self._git_log(f"sweep: left {len(cut)} file(s) that look like a cut write for the integrity check: "
+                          + ", ".join(cut)[:300])
         if not (rel or gone):
             return False
         self._git_log(f"sweep: committing {len(rel) + len(gone)} file(s) a failed commit left: "
