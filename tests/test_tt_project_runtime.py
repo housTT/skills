@@ -23877,6 +23877,7 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     assert push.resolve(p, repo) == ("origin", "proj", False)
     monkeypatch.delenv(push.LAND_ENV)
     assert _ttp("push", "--land", "--own") != 0
+    _record_checks_pass(p, own_only, repo)   # a code task lands only tested work (untested_landing)
     # A spec with a landing step lands as before; a `no_push:` line or a negated step never counts.
     for spec, lands in (("Then land it with `ttp push`.", True), ("Land it on the push branch.", True),
                         ("Run `ttp push`.\nno_push: experiment only", False), ("Do not run `ttp push`.", False)):
@@ -23906,6 +23907,78 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{review}-review")
     monkeypatch.setenv("TTP_TASK", str(review))
     assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv("TTP_TASK")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+
+
+def _record_checks_pass(p, tid, repo, head=None, passed=True):
+    """A `ttp checks` record in a run of task `tid` on `head` (default HEAD) of worktree `repo`."""
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+                 (tid, "worker", "fake", time.time(), "running"))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "checks.json").write_text(json.dumps({
+        "head": head or _git_out(repo, "rev-parse", "HEAD"), "worktree": str(repo), "passed": passed,
+        "commands": ["true"], "skipped": [], "ts": time.time()}))
+    return run_dir
+
+
+def test_a_code_workers_plain_push_lands_only_tested_work_unless_land_overrides_it(env, monkeypatch, capsys, tmp_path):
+    # Replays the upstream note: a code task's worker ran plain `ttp push --detach` and it rebased the
+    # task branch onto the push branch and pushed untested work there. A code task whose spec says to
+    # land now needs `ttp checks` passed on HEAD; `--land` overrides it, explicitly and logged.
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("fix", kind="code", spec="Fix it, then land it with `ttp push`.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    for args in (["push"], ["push", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "`ttp checks` has not passed on this commit" in err and "ttp push --own --detach" in err \
+            and "ttp push --land --detach" in err, err
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # A failed record, a pass on another commit or a dirty tree is not tested work.
+    _record_checks_pass(p, tid, repo, passed=False)
+    with pytest.raises(ValueError, match="has not passed"):
+        push.resolve(p, repo)
+    _record_checks_pass(p, tid, repo, head=_git_out(repo, "rev-parse", "HEAD~1"))
+    with pytest.raises(ValueError, match="has not passed"):
+        push.resolve(p, repo)
+    _record_checks_pass(p, tid, repo)
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    (repo / "mine.txt").write_text("changed\n")
+    with pytest.raises(ValueError, match="has not passed"):
+        push.resolve(p, repo)
+    _git_out(repo, "checkout", "-q", "--", "mine.txt")
+    # A new commit after the pass needs its own.
+    _commit(repo, "more.txt", "more\n")
+    with pytest.raises(ValueError, match="has not passed"):
+        push.resolve(p, repo)
+    # --land is the explicit override: it lands untested, and says so on stderr and in the run's notes.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv(push.LAND_ENV, "1")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    assert "--land: task #%d lands its own branch" % tid in capsys.readouterr().err
+    assert "explicit override of the landing guard" in (run_dir / "progress.md").read_text()
+    monkeypatch.delenv(push.LAND_ENV)
+    # With own pushes off the refusal does not offer --own.
+    p.set_config("delivery.own_push", "off")
+    with pytest.raises(ValueError) as e:
+        push.resolve(p, repo)
+    assert "--own" not in str(e.value) and "ttp checks" in str(e.value)
+    p.set_config("delivery.own_push", "on")
+    # Unchanged: a review and other task kinds land untested as before (the push runs the checks
+    # itself), and the push queue (no task in its environment) is not gated.
+    for kind in ("review", "work"):
+        other_tid = p.db.add_task(kind, "Land it with `ttp push`.", kind=kind)
+        _git_out(repo, "checkout", "-q", "-B", f"ttp/t{other_tid}-x")
+        monkeypatch.setenv("TTP_TASK", str(other_tid))
+        assert push.resolve(p, repo) == ("origin", "proj", False), kind
     monkeypatch.delenv("TTP_TASK")
     assert push.resolve(p, repo) == ("origin", "proj", False)
 
@@ -42708,6 +42781,7 @@ def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_pu
     same, sbranch = task(["pr_branch:proj"])
     _git_out(repo, "checkout", "-q", "-B", sbranch)
     monkeypatch.setenv("TTP_TASK", str(same))
+    _record_checks_pass(p, same, repo)   # a code task lands only tested work
     assert push.resolve(p, repo) == ("origin", "proj", False)
     monkeypatch.delenv("TTP_TASK")
     assert push.resolve(p, repo) == ("origin", "proj", False)

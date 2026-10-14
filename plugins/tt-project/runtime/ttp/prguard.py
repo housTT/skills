@@ -611,11 +611,17 @@ def _task_pass(head: str, cwd: str | None) -> dict | None:
     task, base = os.environ.get("TTP_TASK", ""), os.environ.get("TTP_PROJECT")
     if not (task.isdigit() and base and head):
         return None
+    from .project import Project
+    return task_pass(Project(base), task, head, cwd)
+
+
+def task_pass(p, task: str, head: str, cwd: str | None) -> dict | None:
+    """_task_pass for project `p` and task `task`, in any run of it (also the current one)."""
+    if not (str(task).isdigit() and head):
+        return None
     top = _git_out(cwd, "rev-parse", "--show-toplevel")
     if not top or _git_out(cwd, "status", "--porcelain", "--untracked-files=no"):
         return None
-    from .project import Project
-    p = Project(base)
     if not (p.state / "project.db").is_file():
         return None
     try:

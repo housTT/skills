@@ -87,6 +87,18 @@ def frontmatter(path: pathlib.Path) -> dict:
     return yaml.safe_load(text[3:text.find("\n---", 3)]) or {}
 
 
+def test_worker_prompt_publishes_task_branches_with_push_own():
+    """worker.md names `ttp push --own` for a task branch and keeps plain `ttp push` for delivery;
+    kind-code.md says a landing needs `ttp checks` passed on HEAD unless `--land` overrides it."""
+    prompts = PLUGIN / "template" / "prompts"
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    assert "publish your task branch with `ttp push --own --detach`" in worker
+    assert "plain `ttp push` is delivery onto the push branch, reserved for reviews, the push queue" in worker
+    code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
+    assert "It also refuses until `ttp checks` passed on your committed HEAD; `--land` overrides that too and is logged" in code
+    assert "To publish your task branch instead, use `ttp push --own`" in code
+
+
 def test_manifests_agree():
     data = [json.loads(p.read_text()) for p in MANIFESTS]
     assert {d["name"] for d in data} == {"tt-project"}

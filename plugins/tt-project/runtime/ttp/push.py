@@ -1710,12 +1710,42 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                 return remote, branch, True
         raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
-    if m and task and m.group(1) == task and not os.environ.get(LAND_ENV) and not _told_to_land(p, task, d):
-        raise ValueError(f"task #{task}'s spec does not ask it to land on {remote}/{push_to}, and a plain "
-                         f"`ttp push` from its own branch {branch} would. Publish {branch} under its own name "
-                         f"with `ttp push --own --detach`; only if the spec does ask to land on the push "
-                         f"branch, say so with `ttp push --land --detach`")
+    if m and task and m.group(1) == task:
+        if os.environ.get(LAND_ENV):
+            say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
+                   f"(explicit override of the landing guard)")
+            print(say, file=sys.stderr)
+            run_note(say)
+        elif not _told_to_land(p, task, d):
+            raise ValueError(f"task #{task}'s spec does not ask it to land on {remote}/{push_to}, and a plain "
+                             f"`ttp push` from its own branch {branch} would. Publish {branch} under its own name "
+                             f"with `ttp push --own --detach`; only if the spec does ask to land on the push "
+                             f"branch, say so with `ttp push --land --detach`")
+        elif why := untested_landing(p, repo, task, d):
+            raise ValueError(why)
     return remote, push_to, False
+
+
+def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
+    """Why a code task's worker must not land its own branch on the push branch yet, or "": plain
+    `ttp push` is delivery, so from a code task's run it needs `ttp checks` passed on exactly HEAD
+    in this worktree (this run's or an earlier run's of the task, prguard.task_pass). A review, the
+    push queue (no task) and other kinds are not gated here; `--land` (LAND_ENV) overrides it."""
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return ""
+    if not t or t.get("kind") != "code":
+        return ""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    if prguard.task_pass(p, task, head, str(repo)):
+        return ""
+    own = (f" To publish the branch under its own name instead, run `ttp push --own --detach`."
+           if own_push({"delivery": d}) != "off" else "")
+    return (f"task #{task} is a code task and `ttp checks` has not passed on this commit ({head[:10]}) in "
+            f"this worktree with no uncommitted changes: plain `ttp push` delivers to the push branch, so "
+            f"it lands only tested work. Run `ttp checks` (committed), then rerun.{own} An explicit "
+            f"`ttp push --land --detach` overrides this and is logged")
 
 
 def _told_to_land(p: Project, task: str, d: dict) -> bool:
