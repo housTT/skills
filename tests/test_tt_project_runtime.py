@@ -49137,6 +49137,62 @@ def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_c
     stretch(now + 401 * 60, 3)
 
 
+def test_heal_check_marks_a_known_owned_state_with_one_output_line():
+    from ttp import heal
+    assert heal.known_run(75, "probing\nttp-heal: known trays: power work on the box\n") == \
+        ("trays", "power work on the box")
+    assert heal.known_run(1, "  ttp-heal: known the user: resource paused (bench)  ") == \
+        ("the user", "resource paused (bench)")
+    assert heal.known_run(255, "ttp-heal: known trays: x") is None, "only on exit 75 or 1"
+    assert heal.known_run(0, "ttp-heal: known trays: x") is None
+    assert heal.known_run(75, "ttp-heal: known trays:") is None, "it needs a reason"
+    assert heal.known_run(75, "ttp-heal: known : why") is None, "and an owner"
+    assert heal.known_run(75, "it says ttp-heal: known trays: x inline") is None, "only a line of its own counts"
+
+
+def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_line_is_unknown_again(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=3600, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    owned = dict(spec, check="echo 'ttp-heal: known trays: power work on the box'; exit 75")
+    for t in (0, 61 * 60, 300 * 60):
+        assert heal.run(d, "svc", owned, now + t) == ("ok (known, trays: power work on the box)", None)
+    assert heal.describe({"name": "svc"}, spec, p.db, now + 300 * 60).startswith(
+        "svc: known (trays: power work on the box);")
+    assert heal.summary(p.db, now + 300 * 60)["unknown"] == 1
+    # Exit 1 with the line: past its grace, still no fix and no task.
+    bad = dict(spec, check="echo 'ttp-heal: known the user: resource paused'; exit 1")
+    assert heal.run(d, "svc", bad, now + 310 * 60)[0] == "ok (known, the user: resource paused)"
+    assert heal.run(d, "svc", bad, now + 320 * 60)[0] == "ok (known, the user: resource paused)"
+    assert _heal_told(p) == ([], []) and not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    # A run without the line starts the ordinary unknown stretch; a known run in it ends that stretch.
+    dark = dict(spec, check="exit 75")
+    t0 = now + 400 * 60
+    assert heal.run(d, "svc", dark, t0) == ("ok (unknown, rc 75)", None)
+    assert "known_run" not in heal.state(p.db, "svc")
+    assert heal.run(d, "svc", owned, t0 + 50 * 60)[0].startswith("ok (known")
+    assert heal.run(d, "svc", dark, t0 + 61 * 60) == ("ok (unknown, rc 75)", None)
+    assert _heal_told(p) == ([], [])
+    status = heal.run(d, "svc", dark, t0 + 122 * 60)[0]
+    assert status == "ok (unknown, rc 75; coordinator told)", status
+    assert [e["fingerprint"] for e in _heal_told(p)[1]] == [f"heal:svc:unknown:{t0 + 61 * 60:.0f}"]
+
+
+def test_heal_outage_check_known_owned_runs_never_escalate_as_an_outage(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    spec, now = _heal_spec(p), time.time()
+    owned = dict(spec, check="echo 'ttp-heal: known recovery: handed to the recovery owner'; exit 75")
+    for t in (0, 30 * 60, 120 * 60):
+        assert heal.run(d, "svc", owned, now + t)[0] == "ok (known, recovery: handed to the recovery owner)"
+    assert _heal_told(p) == ([], []) and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    # Without the line the outage window counts from the first unknown run.
+    dark = dict(spec, check="exit 75")
+    assert heal.run(d, "svc", dark, now + 130 * 60) == ("ok (unknown, rc 75)", now + 130 * 60 + 600)
+    assert "could not tell for 10 min" in heal.run(d, "svc", dark, now + 140 * 60)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
 def test_heal_unknown_cap_is_validated_and_zero_turns_it_off(env):
     from ttp import heal
     with pytest.raises(ValueError, match="unknown_cap_s"):

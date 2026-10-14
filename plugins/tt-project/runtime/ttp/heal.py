@@ -85,6 +85,13 @@ on a check without `outage`: its own grace, its fix, `known_fault` keeps it quie
 task, no outage wording, and nothing reported to the machine ledger (an earlier down report clears).
 A check that never prints the line keeps the behaviour above.
 
+Known, owned states: a check that exits 75 or 1 and prints a line `ttp-heal: known <owner>: <why>` (KNOWN_RE)
+says it knows what is going on and who owns it (a pause it reads, a machine outage, a fault handed to a
+recovery owner). That run is not unknown and not unhealthy: no unknown_cap_s message, no outage window, no
+fix, no task; it ends the current unknown stretch, and the status reads "known (<owner>: <why>)". Each run
+says so for itself: the next run without the line starts or keeps the ordinary unknown stretch, or is
+handled as healthy or unhealthy as above.
+
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
 kills the check's or fix's whole process group, and the daemon tells its watchdog it still moves
 between the check and the fix; after a fix the schedule's own command waits for the recheck, so one
@@ -144,6 +151,7 @@ LOCK_WAIT_S = 30                # how long a fix waits for its resource lock bef
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
 FINDING = "ttp-heal: not-outage"   # a check output line: unhealthy, but the box is up (module doc)
+KNOWN_RE = re.compile(r"ttp-heal: known ([^:\s][^:]*?): *(\S.*)")   # a check output line: a known, owned state
 # An unknown check result that is only its route failing (module doc): ssh's own exit code, or its words.
 ROUTE_RC = 255
 ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out|no route to host|"
@@ -457,6 +465,17 @@ def finding(rc: int, out: str) -> bool:
     return rc != 0 and any(line.strip() == FINDING for line in (out or "").splitlines())
 
 
+def known_run(rc: int, out: str) -> tuple[str, str] | None:
+    """(owner, why) of a run that exits 75 or 1 with a KNOWN_RE line of its own (module doc), else None."""
+    if rc not in (1, 75):
+        return None
+    for line in (out or "").splitlines():
+        m = KNOWN_RE.fullmatch(line.strip())
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+    return None
+
+
 def route_failed(rc: int, out: str) -> bool:
     """An unknown check result that only says its route (ssh, a tunnel) failed: ROUTE_RC, or ROUTE_RE in its output."""
     return rc not in (0, 1) and (rc == ROUTE_RC or ROUTE_RE.search(out or "") is not None)
@@ -673,6 +692,14 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st["known_outage"] = known[0]
     elif st.pop("known_outage", None):   # the known outage ended: a check still failing gets its grace,
         _fresh(st, "unknown_since", "route_only")   # an unknown one a new stretch
+    owned = known_run(rc, out)
+    if owned:   # a known, owned state: ends the unknown stretch; no cap message, fix or task
+        for key in ("unknown_since", "route_only", "unknown_told"):
+            st.pop(key, None)
+        st["known_run"] = f"{owned[0]}: {owned[1]}"[:300]
+        _save(db, name, st)
+        return f"ok (known, {st['known_run'][:150]})", None
+    st.pop("known_run", None)
     if finding(rc, out):   # the box is up: a plain unhealthy result of a check without `outage`
         rc, spec, st["finding"] = 1, {**spec, "outage": False}, True
     else:
@@ -1106,7 +1133,7 @@ def summary(db: DB, now: float | None = None) -> dict:
         s = state(db, r["name"])
         if s.get("status") == "unhealthy" and s.get("escalated"):   # an unreachable box escalated too
             n_bad += 1
-        elif "unknown_since" in s:   # the latest reading tells nothing either way
+        elif "unknown_since" in s or "known_run" in s:   # the latest reading tells nothing either way
             n_unknown += 1
         elif s.get("status") == "unhealthy":
             n_bad += 1
@@ -1142,7 +1169,9 @@ def describe(r: dict, spec: dict, db: DB, now: float | None = None) -> str:
     s = state(db, r["name"])
     what = spec.get("check") or f"preset {spec.get('preset')}"
     status = s.get("status") or "not checked yet"
-    if "unknown_since" in s:
+    if "known_run" in s:
+        status = f"known ({s['known_run']})"
+    elif "unknown_since" in s:
         status = f"unknown (exit {s.get('last_rc')})"
     elif status == "unhealthy" and s.get("since"):
         status += f" for {(now - float(s['since'])) / 60:.0f} min"
