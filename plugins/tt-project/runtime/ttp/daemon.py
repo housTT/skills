@@ -169,6 +169,7 @@ REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "sub
 PR_FIX_ROUNDS = 2
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
+JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
 ON_PASS_TIMEOUT_S, ON_PASS_DIR, ON_PASS_LOG = 600, "on_pass", "on_pass.log"   # a hand-off's on_pass_cmd
 ON_PASS_NOTES_EVERY_S, ON_PASS_NOTES_DAYS = 600, 14   # sweep for notes an unsettled on_pass_cmd queued
@@ -557,7 +558,7 @@ class Daemon:
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
-        self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str]] = {}
+        self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str, str, str]] = {}
         self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
@@ -5372,6 +5373,8 @@ class Daemon:
                 fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
                 if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
                     why = got[0] if isinstance(got[0], str) else f"exit {got[0]}"
+                    if detach.failed_check(probe, got[0]):
+                        why += ": a detached job it waits on failed or left no exit code"
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                                 "VALUES(?,?,?,?,?,?,?,?)",
                                 (now, "daemon", "hold_probe_broken", fp, "normal",
@@ -5524,10 +5527,10 @@ class Daemon:
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
-            if rc == 0:
+            if rc == 0 or detach.failed_check(probe, rc):
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
-                    self._probe_passed(task, now)
+                    (self._probe_passed if rc == 0 else self._job_failed)(task, now)
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
@@ -5545,9 +5548,9 @@ class Daemon:
                 continue
             self._start_probe(t["id"], probe, now)
             got = self._probe_rc.get(t["id"])
-            if t["id"] not in self._probes and got and got[0] == 0 and got[2] == probe \
-                    and (t["not_before"] or 0) > now:
-                self._probe_passed(db.task(t["id"]) or t, now)   # a shared verdict
+            if t["id"] not in self._probes and got and got[2] == probe and (t["not_before"] or 0) > now \
+                    and (got[0] == 0 or detach.failed_check(probe, got[0])):   # a shared verdict
+                (self._probe_passed if got[0] == 0 else self._job_failed)(db.task(t["id"]) or t, now)
         self.probe_deferred(now)
 
     def probe_deferred(self, now: float) -> None:
@@ -5632,6 +5635,10 @@ class Daemon:
             self._start_rc[task["id"]] = (rc, now, d.get("when") or "")
         if rc in NOT_YET_RCS:
             self._start_resource_stale(task, d, now)
+        elif detach.failed_check(d.get("when") or "", rc):
+            self._deferral_event(task, d.get("since") or task["created"], "deferral_job_failed",
+                                 f"a detached job its start_when waits on failed or left no exit code (exit {rc} of "
+                                 f"`ttp detach --check`, not a broken probe): {d.get('when', '')[:300]}")
         elif rc != 0:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
@@ -6048,7 +6055,8 @@ class Daemon:
         has ended). Checked when the wait starts, on each verdict and at wait_stale. The task keeps
         its timer and its probe; the coordinator decides. A probe that exits 0 passed: its task wakes."""
         prev = load_result(task["result"])
-        if rc == 0 or prev.get("status") != "waiting" or prev.get("retry_when") != probe:
+        if rc == 0 or detach.failed_check(probe, rc) or prev.get("status") != "waiting" \
+                or prev.get("retry_when") != probe:
             return
         tid, db = task["id"], self.p.db
         since = prev.get("waiting_since")
@@ -6157,6 +6165,8 @@ class Daemon:
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
         if fresh and rc == 0:
             self._probe_passed(task, now)
+        elif fresh and detach.failed_check(str(prev.get("retry_when") or ""), rc):
+            self._job_failed(task, now)
         elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
         elif fresh:
@@ -6335,12 +6345,31 @@ class Daemon:
                 why += f"; its on_pass_cmd was not run: {started}"
         self._wake_waiting(task, why, now)
 
-    def _start_on_pass(self, task: dict, now: float) -> bool | str | None:
+    def _job_failed(self, task: dict, now: float) -> None:
+        """A waiting task's `ttp detach --check` found its jobs ended, but one failed or left no exit
+        code (detach.FAILED_RC): never a passed probe. The hand-off's on_pass_cmd, when it names one,
+        decides model-free (_start_on_pass); else, or when it cannot run, the task wakes at once at
+        its own tier with the check's output (each job's `job finished rc=N`)."""
+        out = (self._probe_out.get(task["id"]) or ("",))[0].strip()[-1500:] or "(no output)"
+        why = f"{JOB_FAILED}:\n{out}"
+        try:
+            started = self._start_on_pass(task, now, said=JOB_FAILED)
+        except Exception as e:   # a wake is always safe
+            started = f"it could not start: {type(e).__name__}: {e}"
+        if started is True:
+            return
+        if started:
+            why += f"\nits on_pass_cmd was not run: {started}"
+        tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
+        self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True})
+
+    def _start_on_pass(self, task: dict, now: float, said: str = "probe passed") -> bool | str | None:
         """A passed probe of a hand-off naming an `on_pass_cmd`: run that command model-free from the
         project root with the owner's HOME (command_env), only once the run that named it has ended,
         in the background, and keep the task asleep while it runs (_poll_on_pass settles it). True when
         it runs (or already ran from an earlier pass of the same probe, or waits for its run to end),
-        None when the hand-off names none, else why it was not run."""
+        None when the hand-off names none, else why it was not run. `said` is what the probe found
+        (JOB_FAILED for a detached job that failed): the log and the wake say it."""
         tid = task["id"]
         if tid in self._on_pass:
             return True
@@ -6380,12 +6409,12 @@ class Daemon:
                                     stderr=subprocess.STDOUT, start_new_session=True,
                                     env=env)
         where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
-        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where)
+        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
-                              blocked_reason=f"its probe passed; running its on_pass_cmd model-free "
+                              blocked_reason=f"its {said}; running its on_pass_cmd model-free "
                                              f"(up to {timeout / 60:g} min)")
-        log(self.p, f"task {tid} retry_when probe passed; running its on_pass_cmd model-free (pid {proc.pid})")
+        log(self.p, f"task {tid} retry_when {said}; running its on_pass_cmd model-free (pid {proc.pid})")
         return True
 
     def _poll_on_pass(self, now: float) -> None:
@@ -6395,7 +6424,7 @@ class Daemon:
         the task at once at its own tier; anything else wakes it as any passed probe does. Either way
         the wake carries the command's exit and the end of its output."""
         db = self.p.db
-        for tid, (proc, started, timeout, out, run_id, cmd, where) in list(self._on_pass.items()):
+        for tid, (proc, started, timeout, out, run_id, cmd, where, said) in list(self._on_pass.items()):
             rc = proc.poll()
             if rc is None and now - started < timeout:
                 continue
@@ -6444,9 +6473,10 @@ class Daemon:
                         f"(ran with {where}); the end of its output:\n{tail}")
             # A command that failed or overran is a real failure a light wake could only pass on:
             # wake at the task's own tier, as failed checks do.
-            failed = rc is None or rc != 0
+            # So is a detached job that failed.
+            failed = rc is None or rc != 0 or said == JOB_FAILED
             tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
-            self._wake_waiting(task, f"probe passed; its on_pass_cmd did not record done "
+            self._wake_waiting(task, f"{said}; its on_pass_cmd did not record done "
                                      f"({why or 'its run is gone'}; ran with {where}); "
                                      f"the end of its output:\n{tail}", now,
                                extra={"wake_tier": tier, "escalated_wake": True} if failed else None)

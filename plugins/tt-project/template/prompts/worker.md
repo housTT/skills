@@ -183,8 +183,9 @@ never write to a run folder named in earlier context):
   For a job on another machine (a device job goes through a device runner instead, when your task
   header lists them), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
   (also a chain that only drives it over ssh), set `"survives_reboot": true` and use the `retry_when` it
-  prints, `ttp detach --check --host <alias> <dir>/<name>`: 0 once the job wrote its exit code or is
-  gone, 1 while it runs, 255 while ssh fails. Prefer it to a bare `ssh <host> test -e <marker>`. Copy a
+  prints, `ttp detach --check --host <alias> <dir>/<name>`: 0 once the job wrote exit code 0, 4 once it
+  failed or is gone (your `on_pass_cmd` then decides, else you wake with its exit code), 1 while it
+  runs, 255 while ssh fails. Prefer it to a bare `ssh <host> test -e <marker>`. Copy a
   script to a host under a temporary name and `mv` it into place (overwriting a running script corrupts
   it). Stop a driver by its process group (`kill -- -<pgid>`).
 <!-- /ttp:if remote -->

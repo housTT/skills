@@ -344,7 +344,8 @@ def job_ended(rc: Path) -> bool:
 
 
 def job_probe(rcs: list, ttp: str = "ttp") -> str:
-    """A `retry_when` that exits 0 once every one of these detached jobs ended, 1 before."""
+    """A `retry_when` that exits 0 once every one of these detached jobs ended with exit 0, 4 once all
+    ended but one failed or is gone (detach.FAILED_RC), 1 before."""
     return f"{ttp} detach --check " + " ".join(shlex.quote(str(r)) for r in rcs)
 
 

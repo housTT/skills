@@ -2702,8 +2702,9 @@ def cmd_detach(a) -> None:
 
     Output goes to $TTP_RUN_DIR/<name>.log and the exit code to $TTP_RUN_DIR/<name>.rc once it
     ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
-    once the job wrote its .rc, or once its process is gone without one (a kill, a reboot: it says
-    why, see detach.state), else 1. From a command a sandbox would end with everything it started,
+    once the job wrote exit code 0, 4 (detach.FAILED_RC) once it wrote another one or its process is
+    gone without one (a kill, a reboot: it says why, see detach.state), else 1. On 4 the daemon runs
+    the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
@@ -2725,17 +2726,19 @@ def cmd_detach(a) -> None:
         _detach_remote(a, _own_ttp())
         return
     if a.check is not None:
-        ended = True
+        ended, failed = True, False
         for rc in map(Path, a.check):
             st, why = detach.state(rc)
             if st == "ended":
-                print(f"{rc.stem}: ended, exit {why}")
+                failed = failed or why != "0"
+                print(f"{rc.stem}: job finished rc={why}")
             elif st == "lost":
+                failed = True
                 print(f"{rc.stem}: gone without an exit code ({why}); see {rc.with_suffix('.log')}")
             else:
                 ended = False
                 print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}")
-        sys.exit(0 if ended else 1)
+        sys.exit(1 if not ended else detach.FAILED_RC if failed else 0)
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -2850,8 +2853,9 @@ def _detach_remote(a, ttp: str) -> None:
     """`ttp detach --remote <ssh alias> [--dir <remote dir>] <name> -- <command...>`: start the driver
     on that host with setsid nohup, so it outlives this run, ssh and a reboot of this host. <name>.log,
     .rc, .pid, .boot and .start go to the remote folder (default ~/.ttp-detach/<run>); the retry_when
-    it prints, `ttp detach --check --host <alias> <dir>/<name>`, exits 0 once the .rc exists or the
-    driver is gone (pid dead, or the host restarted), 1 while it runs and 255 when ssh fails."""
+    it prints, `ttp detach --check --host <alias> <dir>/<name>`, exits 0 once the .rc holds 0, 4 once it
+    holds another exit code or the driver is gone (pid dead, or the host restarted), 1 while it runs
+    and 255 when ssh fails."""
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -2876,9 +2880,11 @@ def _detach_remote(a, ttp: str) -> None:
 
 
 def _detach_check_remote(host: str, prefixes: list) -> int:
-    """`ttp detach --check --host <alias> <dir>/<name>...`: 0 once every job ended or is gone, 1 while
+    """`ttp detach --check --host <alias> <dir>/<name>...`: 0 once every job ended with exit 0, 4
+    (detach.FAILED_RC) once every one ended or is gone but one failed or left no exit code, 1 while
     any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read."""
-    ended = True
+    from .detach import FAILED_RC
+    ended, failed = True, False
     for pre in prefixes:
         name = Path(pre[:-3] if pre.endswith(".rc") else pre).name
         r = _ssh_sh(host, _REMOTE_CHECK, [pre])
@@ -2890,16 +2896,20 @@ def _detach_check_remote(host: str, prefixes: list) -> int:
             print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
             return 2
         if out[0] == "rc":
-            print(f"{name}: ended, exit {out[1].strip() if len(out) > 1 and out[1].strip() else '?'}")
+            code = out[1].strip() if len(out) > 1 and out[1].strip() else "?"
+            failed = failed or code != "0"
+            print(f"{name}: job finished rc={code}")
         elif out[0] == "running":
             ended = False
             print(f"{name}: running on {host}")
         elif out[0] == "none":
+            failed = True
             print(f"{name}: gone without an exit code: no driver was recorded at {pre} on {host}")
         else:
+            failed = True
             why = "the host restarted" if out[0] == "boot" else "killed, or the host restarted"
             print(f"{name}: gone without an exit code ({why}); see {pre}.log on {host}")
-    return 0 if ended else 1
+    return 1 if not ended else FAILED_RC if failed else 0
 
 
 def cmd_devq(a) -> None:
@@ -5315,7 +5325,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="*", metavar="RC",
-                   help="exit 0 once every job of these .rc paths ended or is gone, else 1 (for retry_when)")
+                   help="exit 0 once every job of these .rc paths ended with exit 0, 4 once all ended or are "
+                   "gone but one failed or left no exit code, else 1 (for retry_when)")
     s.add_argument("--remote", metavar="HOST",
                    help="start the job on this ssh host with setsid nohup; it survives this run and a reboot here")
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")

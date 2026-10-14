@@ -27896,6 +27896,105 @@ def test_a_failed_on_pass_cmd_wakes_the_task_at_its_own_tier(env, monkeypatch, t
     assert res["wake_tier"] == wake and res["escalated_wake"] is True, res
 
 
+def _ended_jobs(tmp_path, **codes):
+    """Detached jobs that ended with these exit codes (name=code), and the `ttp detach --check` on them."""
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(exist_ok=True)
+    for name, code in codes.items():
+        (jobs / f"{name}.rc").write_text(f"{code}\n")
+    return "ttp detach --check " + " ".join(str(jobs / f"{n}.rc") for n in codes)
+
+
+def test_detach_check_tells_a_job_that_finished_ok_from_one_that_failed_or_still_runs(env, tmp_path):
+    """0 only once every job wrote exit 0; 4 (detach.FAILED_RC) once all ended but one failed; 1 while
+    any runs, whatever the others ended with. Each ended job says `job finished rc=N`."""
+    from ttp import detach
+    p = _device_project(env, device=False)
+    ok = _ttp_run(p, *_ended_jobs(tmp_path, a=0, b=0).split()[1:])
+    assert ok.returncode == 0 and "a: job finished rc=0" in ok.stdout and "b: job finished rc=0" in ok.stdout
+    bad = _ttp_run(p, *_ended_jobs(tmp_path, a=0, c=3).split()[1:])
+    assert bad.returncode == detach.FAILED_RC == 4 and "c: job finished rc=3" in bad.stdout, bad.stdout
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    started = run_dir / "started"
+    r = _ttp_run(p, "detach", "long", "--", "sh", "-c", f"touch {started}; sleep 60",
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0 and _wait_for_path(started), r.stderr
+    try:
+        mixed = _ttp_run(p, *_ended_jobs(tmp_path, c=3).split()[1:], str(run_dir / "long.rc"))
+        assert mixed.returncode == 1 and "long: running" in mixed.stdout, mixed.stdout
+    finally:
+        os.killpg(json.loads((run_dir / "detached.json").read_text())[0]["pid"], signal.SIGKILL)
+    assert detach.failed_check("ttp detach --check /r/a.rc", 4) and not detach.failed_check("exit 4", 4)
+    assert not detach.failed_check("ttp detach --check /r/a.rc", 3)
+
+
+def test_a_failed_detached_job_wakes_its_task_at_once_with_its_rc_never_as_a_passed_probe(env, monkeypatch, tmp_path):
+    """The reported failure: `ttp detach --check` exited 0 for a job that failed, so the wait read as
+    passed and the log said 'probe passed'. Now the task wakes at once, at its own tier, with each
+    job's `job finished rc=N`."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    probe = _ended_jobs(tmp_path, build=0, bench=3)
+    tid = _due_waiting_task(p, probe)
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], task["blocked_reason"])
+    assert res["woke"].startswith("detached job failed") and "bench: job finished rc=3" in res["woke"], res["woke"]
+    assert res["escalated_wake"] is True and res["wake_tier"] == task["tier"], res
+    log = (p.logs / "daemon.log").read_text()
+    assert f"task {tid} retry_when detached job failed" in log and "job finished rc=3" in log
+    assert f"task {tid} retry_when probe passed" not in log and "probe broken" not in log
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='probe_never_passes'", (tid,))
+
+
+def test_a_failed_detached_job_lets_the_on_pass_cmd_decide_model_free(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    probe = _ended_jobs(tmp_path, bench=2)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, """printf '{"status":"done","summary":"rc 2 is expected"}'""" + _TO_RESULT,
+                               probe=probe)
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done" and json.loads(task["result"])["run_status"] == "model-free", task["status"]
+    log = (p.logs / "daemon.log").read_text()
+    assert f"task {tid} retry_when detached job failed; running its on_pass_cmd model-free" in log
+    assert "probe passed" not in log
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+    # One that does not record done (even with exit 0) wakes the task at its own tier.
+    tid2, _ = _on_pass_cmd_task(p, tmp_path, "echo checked", probe=probe)
+    _settle_on_pass(d, tid2)
+    res = json.loads(p.db.task(tid2)["result"])
+    assert _ready(p, tid2) and res["woke"].startswith("detached job failed; its on_pass_cmd did not record done")
+    assert res["escalated_wake"] is True and res["wake_tier"] == "standard", res
+
+
+def test_a_start_when_on_a_failed_detached_job_raises_job_failed_not_broken(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    coord.apply(p, [{"type": "task_add", "title": "after the job", "spec": "s",
+                     "start_when": _ended_jobs(tmp_path, bench=3)}])
+    tid = _added(p, "after the job")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        d.probe_waiting()
+        if tid in d._probes:
+            d._probes[tid][0].wait(30)
+            d.probe_waiting()
+    ev = _events(p, tid, "deferral_job_failed")
+    assert len(ev) == 1 and "failed or left no exit code" in ev[0]["text"], ev
+    assert not _events(p, tid, "deferral_probe_broken") and not _ready(p, tid)
+    assert coord.EFFORT_EVENT_TRIGGERS["deferral_job_failed"] == "stuck"
+
+
 _OWNER_HOME_CHECK = ("python3 -c \"import os, pwd, sys; "
                      "sys.exit(os.path.expanduser('~') != pwd.getpwuid(os.getuid()).pw_dir)\" && "
                      """printf '{"status":"done","summary":"home checked"}'""" + _TO_RESULT)
@@ -45776,7 +45875,7 @@ def test_detach_writes_rc_log_and_a_durable_registry(env):
     assert jobs[0]["name"] == "job1" and jobs[0]["rc"] == str(rc.resolve())
     assert "detach --check" in r.stdout
     check = _ttp_run(p, "detach", "--check", str(rc))
-    assert check.returncode == 0 and "exit 3" in check.stdout
+    assert check.returncode == 4 and "job1: job finished rc=3" in check.stdout, "a failed job is no pass"
     again = _ttp_run(p, "detach", "job1", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
     assert again.returncode != 0, "a name is used once per run"
 
@@ -45831,7 +45930,7 @@ def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could
     assert own.is_dir() and stray.is_dir(), "a running job's dir, and what is not a job's, stay"
     pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
     os.killpg(pid, signal.SIGKILL)
-    assert _check_until_ended(p, run_dir / "long.rc").returncode == 0
+    assert _check_until_ended(p, run_dir / "long.rc").returncode == 4
     detach.tend(p)
     assert not own.exists() and not tmp.exists() and stray.is_dir()
 
@@ -45870,16 +45969,16 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
     os.killpg(pid, signal.SIGKILL)
     deadline = time.time() + 20
-    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
+    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode == 1:
         time.sleep(0.1)
     check = _ttp_run(p, "detach", "--check", str(rc))
-    assert check.returncode == 0 and "gone without an exit code" in check.stdout
+    assert check.returncode == 4 and "gone without an exit code" in check.stdout
     assert not rc.exists()
 
 
 def _check_until_ended(p, rc, timeout=None):
     deadline = time.time() + (timeout or _load_scaled(60))
-    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
+    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode == 1:
         time.sleep(0.1)
     return _ttp_run(p, "detach", "--check", str(rc))
 
@@ -45908,7 +46007,7 @@ def test_detach_from_a_sandboxed_command_is_queued_and_the_daemon_starts_it(env,
     detach.tend(p)
     assert not list((p.state / detach.QUEUE).glob("*.json")) and not detach.queued(rc).exists()
     check = _check_until_ended(p, rc)
-    assert check.returncode == 0 and "exit 3" in check.stdout, check
+    assert check.returncode == 4 and "rc=3" in check.stdout, check
     assert (run_dir / "job1.log").read_text().strip() == "hi there"
 
 
@@ -45937,7 +46036,7 @@ def test_detach_inside_a_pid_namespace_that_ends_with_the_command_still_runs_the
     assert _ttp_run(p, "detach", "--check", str(run_dir / "job.rc")).returncode == 1
     detach.tend(p)
     check = _check_until_ended(p, run_dir / "job.rc")
-    assert check.returncode == 0 and "exit 5" in check.stdout, check
+    assert check.returncode == 4 and "rc=5" in check.stdout, check
     assert (run_dir / "job.log").read_text().strip() == "done"
 
 
@@ -45968,7 +46067,7 @@ def test_a_detached_job_gone_without_an_exit_code_says_why(env, monkeypatch):
     q.write_text(json.dumps(m))
     detach.tend(p)
     check = _ttp_run(p, "detach", "--check", str(run_dir / "late.rc"))
-    assert check.returncode == 0 and "did not start it" in check.stdout, check
+    assert check.returncode == 4 and "did not start it" in check.stdout, check
     assert not (run_dir / "late.log").exists() and not q.exists()
 
 
@@ -46028,7 +46127,7 @@ def test_detach_remote_runs_the_driver_over_ssh_and_its_check_reports_running_th
     go.touch()
     assert _wait_for_path(remote / "drv.rc")
     check = _ttp_run(p, *probe[1:], env=e)
-    assert check.returncode == 0 and "ended, exit 3" in check.stdout, check.stdout
+    assert check.returncode == 4 and "drv: job finished rc=3" in check.stdout, check.stdout
     assert (remote / "drv.log").read_text().strip() == "hi"
     assert set((tmp_path / "ssh.log").read_text().split()) == {"box-a"}
     again = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--", "true", env=e)
@@ -46056,21 +46155,21 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
         assert boot.strip(), "the boot is recorded (boot_id, or kern.boottime without /proc)"
         (rdir / "long.boot").write_text("another-boot\n")
         gone = _ttp_run(p, *probe[1:], env=e)
-        assert gone.returncode == 0 and "gone without an exit code" in gone.stdout, gone.stdout
+        assert gone.returncode == 4 and "gone without an exit code" in gone.stdout, gone.stdout
         (rdir / "long.boot").write_text(boot)
         assert _ttp_run(p, *probe[1:], env=e).returncode == 1
     finally:
         _kill_driver(pid)
     # Killed: no .rc is ever written, and the check still ends the wait with 'gone', not a missing marker.
     deadline = time.time() + 20
-    while time.time() < deadline and _ttp_run(p, *probe[1:], env=e).returncode != 0:
+    while time.time() < deadline and _ttp_run(p, *probe[1:], env=e).returncode == 1:
         time.sleep(0.1)
     gone = _ttp_run(p, *probe[1:], env=e)
-    assert gone.returncode == 0 and "gone without an exit code (killed, or the host restarted)" in gone.stdout
+    assert gone.returncode == 4 and "gone without an exit code (killed, or the host restarted)" in gone.stdout
     assert not (rdir / "long.rc").exists()
     # A pid now taken by another process (its start differs) is gone too.
     (rdir / "long.pid").write_text(f"{os.getpid()}\n")
-    assert _ttp_run(p, *probe[1:], env=e).returncode == 0
+    assert _ttp_run(p, *probe[1:], env=e).returncode == 4
     # Several jobs on one host: still waiting while any one runs; a path with .rc reads the same.
     r2 = _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "two", "--", "sleep", "60", env=e)
     pid2 = int((rdir / "two.pid").read_text())
@@ -46433,9 +46532,9 @@ def test_a_dead_detached_job_wakes_its_waiting_task(env):
     assert run() == 1, "the job still runs: the task stays asleep"
     os.killpg(jobs[0]["pid"], signal.SIGKILL)
     deadline = time.time() + 20
-    while time.time() < deadline and run() != 0:
+    while time.time() < deadline and run() == 1:
         time.sleep(0.1)
-    assert run() == 0, "gone without an .rc: the probe ends the wait instead of sleeping to max_hold_s"
+    assert run() == 4, "gone without an .rc: the probe ends the wait as a failed job, not sleeping to max_hold_s"
 
 
 def test_probe_env_finds_ttp(env):

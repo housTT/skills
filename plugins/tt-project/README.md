@@ -497,8 +497,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   (0 free, 75 busy or paused) without a model. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
-  without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote its
-  exit code or its process is gone. `ttp detach` records what the job asks for (`--cores`, `--devices`,
+  without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote exit
+  code 0, 4 once all ended but one wrote another exit code or is gone without one (it prints `job
+  finished rc=N` per job), and 1 while any runs. On 4 the daemon never treats the wait as passed: the
+  hand-off's `on_pass_cmd` decides model-free, else the task wakes at once at its own tier with that
+  output; a `start_when` on it raises `deferral_job_failed` instead of starting. `ttp detach` records what the job asks for (`--cores`, `--devices`,
   `--mem-gb`, else `-j N`-style flags in its command); the daemon samples the CPU time of the job's own
   process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
@@ -506,8 +509,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   app show requested vs used per job ("unmeasured" where it cannot sample). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
-  0 once the .rc exists or the driver is gone (pid dead, or that host's boot id changed), 1 while it
-  runs and 255 while ssh fails. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
+  0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that
+  host's boot id changed), 1 while it runs and 255 while ssh fails. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
   and 255 while not; `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`
   ({resource: host}, else `device.runners.<name>.host`) each time it runs, so a waiting probe follows
   a resource moved to another box (an unknown resource exits 2). Config `device.runners.<name>` (opt-in) sets up one serial

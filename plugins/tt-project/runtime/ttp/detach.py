@@ -53,6 +53,15 @@ QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job 
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
 RELAUNCH_CAP = 3         # default relaunches of a resumable job after reboots (budget.max_job_relaunches)
+FAILED_RC = 4            # `ttp detach --check`: every job ended, but one with an exit code other than 0 or none
+CHECK_RE = re.compile(r"\bdetach\s+--check\b")
+
+
+def failed_check(probe: str, rc) -> bool:
+    """Whether a probe's exit says the detached jobs it checks ended and one failed (FAILED_RC), not
+    that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
+    with the job's exit code, never as a passed probe."""
+    return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
