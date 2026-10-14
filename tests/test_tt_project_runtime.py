@@ -13293,6 +13293,45 @@ def test_version_shows_the_source_commit(env, capsys):
     assert out.startswith(f"ttp {__version__} (") and out.endswith(")") and len(out) > len(f"ttp {__version__} ()")
 
 
+def test_setup_installs_the_skills_and_ttp_skill_finds_them_from_any_project(env, tmp_path):
+    """A worker in another project (any agent, no plugin cache) reads this release's skills."""
+    from ttp import __version__
+    r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin")],
+                       capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
+    assert r.returncode == 0, r.stderr
+    skill = env["home"] / "lib" / __version__ / "skills" / "tt-project-harness" / "SKILL.md"
+    assert skill.read_text() == (TTP.parents[1] / "skills" / "tt-project-harness" / "SKILL.md").read_text()
+    installed = env["home"] / "lib" / "current" / "bin" / "ttp"
+    r = subprocess.run([sys.executable, str(installed), "skill", "tt-project-harness"],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and pathlib.Path(r.stdout.strip()).resolve() == skill.resolve(), r.stderr
+    p = make(env)      # a project's harness copy has no skills of its own: the installed ones are found
+    r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "skill", "tt-project-harness"],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and pathlib.Path(r.stdout.strip()).resolve() == skill.resolve(), r.stderr
+    r = subprocess.run([sys.executable, str(installed), "skill"], capture_output=True, text=True, timeout=300)
+    assert {ln.split("\t")[0] for ln in r.stdout.splitlines()} >= {"tt-project", "tt-project-harness", "setup-box"}
+    r = subprocess.run([sys.executable, str(installed), "skill", "no-such"], capture_output=True, text=True, timeout=300)
+    assert r.returncode == 1 and "tt-project-harness" in r.stderr
+
+
+def test_ttp_skill_without_an_install_says_how_to_get_one(env, monkeypatch, capsys):
+    from ttp import cli
+    monkeypatch.setattr(cli, "PLUGIN_ROOT", env["home"] / "nowhere")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["skill", "tt-project-harness"])
+    assert e.value.code == 1 and "ttp setup" in capsys.readouterr().err
+
+
+def test_harness_skill_documents_until_reboot_pauses_and_fsync():
+    text = (TTP.parents[1] / "skills" / "tt-project-harness" / "SKILL.md").read_text()
+    assert "--until-reboot" in text and "fsync" in text
+
+
+def test_worker_prompt_names_ttp_skill():
+    assert "`ttp skill <name>`" in (TTP.parents[1] / "template" / "prompts" / "worker.md").read_text()
+
+
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],

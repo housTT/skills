@@ -651,8 +651,9 @@ def ship_runtime(host: str) -> str:
     stage = f".tt-project/lib/{__version__}"
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"rm -rf ~/{stage} && mkdir -p ~/{stage}"])
     mac = ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
+    parts = [d for d in ("runtime", "template", "bin", "skills") if (PLUGIN_ROOT / d).exists()]
     tar = subprocess.Popen(["tar", *mac, "--exclude", "__pycache__", "-C", str(PLUGIN_ROOT), "-czf", "-",
-                            "runtime", "template", "bin"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            *parts], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                            env={**os.environ, "COPYFILE_DISABLE": "1"})
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"tar -C ~/{stage} -xzf -"], stdin=tar.stdout)
     tar.wait()
@@ -2486,6 +2487,31 @@ def cmd_clip(a) -> None:
     sys.exit(rc)
 
 
+def skill_dirs() -> list[Path]:
+    """Where this release's skills are: the plugin's own, else the copy `ttp setup` installed with this
+    version, else the current install (a project's harness copy has none of its own)."""
+    from .project import HOME_DIR
+    return [PLUGIN_ROOT / "skills", HOME_DIR / "lib" / __version__ / "skills", HOME_DIR / "lib" / "current" / "skills"]
+
+
+def cmd_skill(a) -> None:
+    """Print the path of an installed tt-project skill's SKILL.md (no name: list them), so a worker in
+    any project, on any agent, can read the skill without finding the plugin cache."""
+    for d in skill_dirs():
+        names = sorted(f.parent.name for f in d.glob("*/SKILL.md")) if d.is_dir() else []
+        if not names:
+            continue
+        if not a.name:
+            for n in names:
+                print(f"{n}\t{d / n / 'SKILL.md'}")
+            return
+        if a.name in names:
+            print(d / a.name / "SKILL.md")
+            return
+        die(f"no skill {a.name!r} in {d}; there are: {', '.join(names)}", 1)
+    die("no installed tt-project skills found; run `<plugin-root>/bin/ttp setup`", 1)
+
+
 def cmd_killscan(a) -> None:
     """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
@@ -4055,7 +4081,7 @@ def cmd_setup(a) -> None:
     commit = source_commit()
     before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
     if RUNTIME.resolve() != (lib / "runtime").resolve():
-        for part in ("runtime", "template", "bin"):
+        for part in ("runtime", "template", "bin", "skills"):    # skills: readable by workers of any project
             src = PLUGIN_ROOT / part
             if src.exists():
                 _copy_tree(src, lib / part)
@@ -5355,6 +5381,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_clip)
+
+    s = sub.add_parser("skill", help="print the path of an installed tt-project skill's SKILL.md (no name: list them)")
+    s.add_argument("name", nargs="?", help="e.g. tt-project-harness")
+    s.set_defaults(fn=cmd_skill)
 
     s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill, killall, pgrep/pidof, ps | grep into kill) "
                                         "in scripts before running them; --shim writes stand-ins that only log")
