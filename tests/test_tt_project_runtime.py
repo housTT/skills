@@ -24152,15 +24152,15 @@ def test_push_checks_see_the_push_mode_and_the_tip_they_push_onto(env, monkeypat
     _commit(other, "theirs.txt", "theirs\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     tip = _git_out(origin, "rev-parse", "proj")
-    _commit(repo, "mine.txt", "mine\n")
+    _commit(repo, "mine.dat", "mine\n")
     assert _ttp_push() == 0 and seen() == f"target {tip}"
     # --own: a branch the remote does not have yet has no tip; once published, its tip there.
     _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
     monkeypatch.setenv("TTP_TASK", "30")
-    _commit(repo, "own.txt", "1\n")
+    _commit(repo, "own.dat", "1\n")
     assert _ttp("push", "--own") == 0 and seen() == "own none"
     first = _git_out(repo, "rev-parse", "HEAD")
-    _commit(repo, "own.txt", "2\n")
+    _commit(repo, "own.dat", "2\n")
     assert _ttp("push", "--own") == 0 and seen() == f"own {first}"
     # ttp checks pushes nothing: no tip.
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
@@ -36309,7 +36309,7 @@ def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
     monkeypatch.setenv("TTP_TASK", "60")
     _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
-    _commit(repo, "mine.txt", "mine\n")
+    _commit(repo, "mine.dat", "mine\n")
     head = _git_out(repo, "rev-parse", "HEAD")
     # All skipped, nothing recorded: refused, and the message says how to fix it.
     capsys.readouterr()
@@ -36325,7 +36325,7 @@ def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project
     assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
     assert log.read_text().split() == [head, head], "the recorded check must also run on the pushed commit"
     # A record of another head does not count.
-    _commit(repo, "more.txt", "more\n")
+    _commit(repo, "more.dat", "more\n")
     capsys.readouterr()
     assert _ttp("push", "--own") == 4 and "ttp checks -- <cmd>" in capsys.readouterr().err
     assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
@@ -57061,8 +57061,8 @@ def test_checks_record_missing_target_and_probe_config_change(env, tmp_path, mon
     p.set_config("delivery.push_branch", "work")
     base = _git_out(p.root, "rev-parse", "HEAD").strip()
     _git_out(p.root, "update-ref", "refs/remotes/origin/work", base)
-    (p.root / "docs").mkdir(exist_ok=True)
-    _commit_files(p.root, {"docs/new.md": "docs\n"}, "docs")
+    (p.root / "src").mkdir(exist_ok=True)
+    _commit_files(p.root, {"src/new.dat": "docs\n"}, "docs")
     run = tmp_path / "missing-run"
     run.mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
