@@ -34287,6 +34287,8 @@ DURABLE_EXEMPT = {
     ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",
     ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
     ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
+    ("project.py", '"daemon.log", "a") as f'): "a log line",
+    ("project.py", "os.replace(f, dest / rel)"): "moves a stale git lock file aside, a rename within one directory tree; a lost move only leaves the lock to the next try",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 

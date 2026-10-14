@@ -783,9 +783,11 @@ class Project:
         self.db.after_commit(lambda: self._git_commit(rel, message, gone))
 
     def _harness_git_cfg(self, key: str) -> float:
+        # Read project.json directly: read_config would keep this process's last good copy, which a
+        # later set_config on a missing project.json would write back.
         try:
-            v = float((self.read_config()[0].get("harness_git") or {}).get(key) or 0)
-        except (TypeError, ValueError, AttributeError):
+            v = float((json.loads(self.config_path.read_text()).get("harness_git") or {}).get(key) or 0)
+        except (OSError, TypeError, ValueError, AttributeError):
             v = 0
         return v if v > 0 else DEFAULT_CONFIG["harness_git"][key]
 
