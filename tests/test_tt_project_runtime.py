@@ -170,8 +170,9 @@ TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "
 # `ttp setup` syncs every filesystem on the host (os.sync); on a busy machine that waits tens of seconds
 # for other processes' writes. The env fixture skips it in-process; subprocess runs of setup skip it the
 # same way through this launcher. The sync itself is tested in-process.
-TTP_NO_SYNC = [sys.executable, "-c", "import os, runpy, sys; os.sync = lambda: None; del sys.argv[0]; "
-               "runpy.run_path(sys.argv[0], run_name='__main__')", str(TTP)]
+NO_SYNC = [sys.executable, "-c", "import os, runpy, sys; os.sync = lambda: None; del sys.argv[0]; "
+           "runpy.run_path(sys.argv[0], run_name='__main__')"]   # + the launcher to run
+TTP_NO_SYNC = [*NO_SYNC, str(TTP)]
 # Tests without the env fixture import ttp too; each must also pass when run alone.
 sys.path.insert(0, str(RUNTIME))
 
@@ -11682,7 +11683,7 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
     ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
 
     def setup():
-        r = subprocess.run([sys.executable, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
+        r = subprocess.run([*NO_SYNC, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
                            capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
         return r.stdout, (env["home"] / "lib" / __version__ / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
