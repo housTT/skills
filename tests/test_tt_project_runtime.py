@@ -6323,7 +6323,7 @@ def test_charter_update_merges_into_the_one_existing_section(env):
     assert heads == ["## Brief (verbatim from the user)", "## Goals and success criteria",
                      "## Restrictions (binding on every task)", "## Policies", "## Resources", "## Notes"], heads
     policies = charter.split("## Policies\n", 1)[1].split("\n## ", 1)[0]
-    assert policies.rstrip().endswith("never hold a node idle or touch another user's allocation.\n\nPush daily."
+    assert policies.rstrip().endswith("schedules such work into the next window.\n\nPush daily."
                                       "\n\nReview first."), policies
     restrictions = charter.split("## Restrictions (binding on every task)\n", 1)[1].split("\n## ", 1)[0]
     assert restrictions.strip() == "Never merge.", "the template placeholder stayed next to a real restriction"

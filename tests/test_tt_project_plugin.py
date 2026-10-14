@@ -363,10 +363,11 @@ def test_no_wording_asks_the_user_to_do_what_tt_project_can_do():
             assert not m, f"{rel}: {m.group(0)!r} makes the user do or approve what tt-project can do: {item[:120]}"
 
 
-def test_local_web_forwards_open_without_asking_and_exposing_tunnels_ask():
+def test_local_web_forwards_ask_once_and_exposing_tunnels_ask():
     remote = " ".join((SKILLS / "tt-project" / "remote.md").read_text(encoding="utf-8").split())
     assert "ALWAYS ask the user before opening any tunnel" not in remote
-    assert "open it without asking and keep it up" in remote
+    assert "the user's first one is asked once, per user" in remote and "`ttp consent tunnel yes|no`" in remote
+    assert "After a yes, open it and keep it up without asking" in remote and "After a no, never re-ask" in remote
     assert "`ttp web <name> --tunnel --keep`" in remote and "`com.tt-project.tunnel.<name>`" in remote
     assert re.search(r"Ask the user before any tunnel that exposes their machine to others: a reverse forward", remote)
     rows = {row.split("|")[1].strip(): row.split("|")[3].strip()
