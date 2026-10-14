@@ -214,6 +214,8 @@ never write to a run folder named in earlier context):
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.
+- To read another task's record (spec, hand-off, review findings), run `ttp task <project> show <id>`; never
+  open project.db.
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
   `retry_when` `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or
   `ttp upstream --fp "<title>" "<spec>"`); once it passes, check the fix and close the note with

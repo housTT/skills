@@ -62749,3 +62749,23 @@ def test_ttp_checks_pass_stdout_names_checks_log(env, tmp_path, monkeypatch, cap
     out = capsys.readouterr().out
     assert "(recorded)" in out and f"(full output: {run / 'checks.log'})" in out
     assert "$ test -f a.txt" in (run / "checks.log").read_text()
+
+
+def test_task_show_prints_spec_handoff_and_findings(env, capsys):
+    from ttp import cli
+    p = make(env)
+    done = p.db.add_task("Do thing", "the spec text", kind="code")
+    p.db.update_task(done, status="done", result=json.dumps(
+        {"status": "done", "summary": "did it", "followups": [{"title": "next"}], "notes": "a note"}))
+    rev = p.db.add_task("Review thing", "check it", kind="review")
+    p.db.update_task(rev, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "bad", "findings": [{"fact": "missing test"}]}))
+    cli.main(["task", p.name, "show", str(done)])
+    out = capsys.readouterr().out
+    assert "Do thing" in out and "the spec text" in out and "did it" in out and "next" in out and "a note" in out
+    cli.main(["task", p.name, "show", str(rev)])
+    out = capsys.readouterr().out
+    assert "missing test" in out and "changes_needed" in out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", p.name, "show", "99999"])
+    assert e.value.code != 0 and "no task #99999" in capsys.readouterr().err

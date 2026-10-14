@@ -3097,6 +3097,13 @@ def cmd_task(a) -> None:
     elif a.action == "list":
         for t in p.db.q("SELECT id,status,kind,result,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
             print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{t['title']}")
+    elif a.action == "show":
+        if not a.title.strip().isdigit():
+            die(f"show needs a task id, not {a.title!r}")
+        t = p.db.task(int(a.title))
+        if not t:
+            die(f"no task #{int(a.title)} in {p.name}", 1)
+        print(show_task(t))
     elif a.action == "cancel":
         from .runner import stop_runs
         tid = int(a.title)
@@ -3126,6 +3133,20 @@ def cmd_task(a) -> None:
             print(record_superseded(p, int(a.title), a.probe.strip()))
         except ValueError as e:
             die(str(e))
+
+
+def show_task(t: dict) -> str:
+    """`ttp task show`: a task's title, kind, status, spec and stored hand-off (summary, follow-ups, notes,
+    review findings). Read-only."""
+    from .db import load_result
+    r = load_result(t["result"])
+    out = [f"#{t['id']} {t['title']}", f"kind: {t['kind']}   status: {task_outcome(t)}   tier: {t['tier']}",
+           "", "spec:", t["spec"] or "(none)"]
+    for key in ("summary", "question", "followups", "notes", "findings"):
+        v = r.get(key)
+        if v:
+            out += ["", f"{key}:", v if isinstance(v, str) else json.dumps(v, indent=2)]
+    return "\n".join(out)
 
 
 def add_task(p, a) -> tuple[int, str]:
@@ -5368,8 +5389,8 @@ def main(argv: list[str] | None = None) -> None:
                                        "by hand (requeue: a blocked or stopped task runs again), re-point a not-yet-started task's probe, "
                                        "or record a done task's work as re-landed under another commit")
     s.add_argument("name")
-    s.add_argument("action", choices=["add", "list", "cancel", "requeue", "set-when", "superseded"])
-    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/requeue/set-when/superseded: the task id")
+    s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded"])
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--spec")
