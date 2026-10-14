@@ -62312,3 +62312,16 @@ def test_push_result_line_matches_the_documented_format_and_pushed_flag_exit_cod
     marker.write_text(json.dumps({"status": "failed", "exit": 4, "log": "/nonexistent"}))
     assert push.result(marker, pushed_only=True) == push.NOT_PUSHED
     assert push.result(marker) == 0
+
+
+def test_watcher_distinct_episodes_of_one_key_count_as_churn(env, monkeypatch):
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    for n in range(1, 5):
+        run("eps", {"text": "box-a: job failed", "severity": "high", "key": "job", "episode": f"e{n}"})
+    assert watchdup.counts(p.db, "watcher:eps", time.time()) == [("box-a", 4)]
+    assert "watcher:eps opened 4 issues on subject 'box-a'" in log()
+    # Each superseded issue and its successor count once; the supersede itself adds no reopen.
+    assert [r["cleared_why"] for r in p.db.q("SELECT cleared_why FROM issues ORDER BY id")][:3] == \
+        ["superseded by a new episode"] * 3
