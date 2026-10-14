@@ -1729,6 +1729,14 @@ def test_setup_box_slurm_status_and_verify_clean(tmp_path):
     (fake / "squeue.txt").write_text("4242 RUNNING\n")
     r = run("verify-clean", "<box-alias>", "node07")
     assert r.returncode == 1 and "not clean" in r.stdout
+    (fake / "squeue.txt").write_text("")
+    ssh = tmp_path / "bin" / "ssh"
+    ssh.write_text('#!/bin/bash\nwhile [ "${1#-}" != "$1" ]; do shift 2; done\n'
+                   '[ "$1" = node07 ] && { echo "Host key verification failed." >&2; exit 255; }\n'
+                   'shift; exec bash -c "$*"\n')
+    r = run("verify-clean", "<box-alias>", "node07", "--ssh")
+    assert r.returncode == 1 and "cannot check processes on node07: Host key verification failed" in r.stdout, r.stdout
+    assert "Traceback" not in r.stderr and "ssh <box-alias> failed" not in r.stdout
 
 
 def test_setup_box_slurm_submit_and_status_measure_unknown_chips(tmp_path):

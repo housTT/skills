@@ -425,7 +425,17 @@ def cmd_verify_clean(args) -> int:
         print(f"cannot check processes on {args.node}: ssh to a compute node is allowed only during "
               f"your own allocation (pass --ssh where it is always allowed)")
         return 0
-    r = _login(login, f"ssh -o BatchMode=yes -o ConnectTimeout=15 {args.node} 'ps -u \"$USER\" -o pid=,comm='")
+    # the inner ssh's 255 is the node's failure, not the login's: mark it and exit 3
+    try:
+        r = _login(login, f"ssh -o BatchMode=yes -o ConnectTimeout=15 {args.node} 'ps -u \"$USER\" -o pid=,comm='; "
+                          f"rc=$?; if [ $rc = 255 ]; then echo ttp-node-ssh-failed >&2; exit 3; fi; exit $rc")
+    except box.SiteError as err:
+        print(f"error: {err}")
+        return 2
+    if r.returncode == 3 and "ttp-node-ssh-failed" in r.stderr:
+        reason = r.stderr.replace("ttp-node-ssh-failed", "").strip()[-300:] or "ssh failed (exit 255)"
+        print(f"cannot check processes on {args.node}: {reason}")
+        return 1
     if r.returncode != 0:
         print(f"cannot check processes on {args.node}: ssh failed (exit {r.returncode})")
         return 0
