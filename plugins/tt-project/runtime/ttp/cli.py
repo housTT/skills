@@ -2772,12 +2772,15 @@ def cmd_devq(a) -> None:
     """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
 
     `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] [--input <path>]...
-    [--cold-start <s>] [--wedge-pattern <regex>]... [--no-wedge-check] [--no-lint] -- <command>` lints the
+    [--cold-start <s>] [--artifact <path>] [--wedge-pattern <regex>]... [--no-wedge-check] [--no-lint] -- <command>`
+    lints the
     command first (devq.lint: bash -n, the scripts it calls exist on the host, a task id not this task's;
     --no-lint skips it; --wedge-pattern replaces the runner's wedge_patterns for this job and
     --no-wedge-check turns them off), then
     queues one job on the runner's host (whose job guard, devq.guard, may refuse it; it checks the --input
-    paths are readable there and warns on a --cold-start longer than the job's limit) and starts the runner if it is down (with runner.device_timeout_max_s
+    paths are readable there and warns on a --cold-start longer than the job's limit; it stamps the job with the
+    workdir's commit, dirty flag and the built --artifact, else the runner's build_artifact: devq.build_stamp)
+    and starts the runner if it is down (with runner.device_timeout_max_s
     set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
     `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, 1 while it runs and
     3 while it waits with no runner alive (the daemon then runs `ttp devq start <runner>` itself, model-free,
@@ -2805,11 +2808,12 @@ def cmd_devq(a) -> None:
     rest = list(a.rest or [])
     if a.op == "submit":
         usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
-                 "[--input <path>]... [--cold-start <s>] [--wedge-pattern <regex>]... [--no-wedge-check] "
+                 "[--input <path>]... [--cold-start <s>] [--artifact <path>] [--wedge-pattern <regex>]... "
+                 "[--no-wedge-check] "
                  "[--no-lint] -- <command...>")
         opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
         sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
-        for flag in ("--id", "--config", "--workdir"):
+        for flag in ("--id", "--config", "--workdir", "--artifact"):
             sp.add_argument(flag, default="")
         sp.add_argument("--timeout", type=int, default=0)
         sp.add_argument("--input", action="append", default=[])
@@ -2835,6 +2839,8 @@ def cmd_devq(a) -> None:
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
                 "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout,
                 "inputs": o.input, "cold_start_s": o.cold_start}
+        if o.artifact:
+            spec["artifact"] = o.artifact
         if o.wedge_pattern and o.no_wedge_check:
             die("devq submit: --wedge-pattern and --no-wedge-check exclude each other")
         if o.wedge_pattern or o.no_wedge_check:

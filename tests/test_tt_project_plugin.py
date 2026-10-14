@@ -1109,8 +1109,13 @@ def test_setup_box_links_tt_buddy_instead_of_copying():
     for ref in ("recipes/developer-setup.md", "recipes/workspace.md", "recipes/tt-metal/build.md",
                 "recipes/tt-metal/env.md", "recipes/tt-metal/test.md", "tt-buddy:run", "skills/run/mcp.md"):
         assert ref in agents, ref
-    for page in ("ird", "slurm", "exabox", "bare-metal", "migrate-off-sync"):
+    for page in ("ird", "slurm", "exabox", "bare-metal", "migrate-off-sync", "device-runs"):
         assert (SKILLS / "setup-box" / f"{page}.md").is_file(), page
+    runs = (SKILLS / "setup-box" / "device-runs.md").read_text(encoding="utf-8")
+    for ref in ("recipes/tt-metal/build.md", "tt-buddy:run", "skills/run/mcp.md", "ttp devq submit",
+                "--artifact", "build_changed", "diff_sha256"):
+        assert ref in runs, ref
+    assert "`device-runs.md`" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_setup_box_states_company_etiquette_without_personal_policy():

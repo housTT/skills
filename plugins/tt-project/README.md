@@ -528,6 +528,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   writes the marker with status `wedged`, the pattern and the line, so the task can recover the device
   instead of waiting out the time limit. A job's `--wedge-pattern <regex>` (repeatable) replaces the
   list for that job and `--no-wedge-check` turns it off.
+  Every job carries a build stamp, taken on the runner's host from the job's `--workdir`: the repo
+  (origin without credentials), branch, commit, a dirty flag with a hash of the uncommitted changes,
+  and the built artifact (`--artifact`, else the runner's `build_artifact`) with its size, time and
+  sha256. Submit prints it and warns on a dirty tree or on changed C/C++ sources newer than the
+  artifact; the job record and the done marker keep it under `build`, the runner stamps again at
+  start and records any difference under `build_changed`, and the probe prints it.
   Before it queues a job, `ttp devq submit` lints its command so a job that would fail at once never
   takes a slot: it refuses a command `bash -n` rejects and a script the command calls that is missing
   on the runner's host or not valid shell there (checked over ssh in batch mode, read-only; an

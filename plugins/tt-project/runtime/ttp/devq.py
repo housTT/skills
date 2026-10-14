@@ -9,6 +9,8 @@ takes the jobs one at a time in arrival order, each only after the health gate p
 done marker per job. A job a device drop or a host reboot killed is run again; once one config dropped
 max_drops times in a row its jobs are skipped and marked so, until `ttp devq clear`. A job whose output
 matches one of its wedge_patterns (a device hang signature) is stopped at once and marked wedged.
+Every job carries a build stamp (build_stamp: the workdir's repo, branch, commit, dirty flag and the
+built artifact's size, time and hash), taken at submit and again at start, in its spec and done marker.
 
 This file is also the runner itself: `ttp devq` copies it to the host's state folder and runs it there
 with that host's python3, so it uses the standard library only and runs on Linux and macOS alike.
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -75,6 +78,9 @@ RUNNER_DEFAULTS = {
     "netfs_policy": "warn",    # "warn" or "refuse" for such a path
     "disk_max_pct": 0,         # refuse a submit, and hold the queue, while a disk is fuller than this (0 = off)
     "disk_paths": [],          # the disks disk_max_pct watches ([] = / and the runner's state folder)
+    # The built binary or library jobs load (relative to a job's workdir, or absolute; "" = none): its size,
+    # time and hash go in each job's build stamp. A job's own artifact (`--artifact`) wins.
+    "build_artifact": "",
 }
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
@@ -725,6 +731,109 @@ def guard(d: Path, cfg: dict, spec: dict) -> tuple:
     return errors, warnings
 
 
+_SOURCES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".S")
+HASH_MAX_BYTES = 1 << 30   # an artifact larger than this is stamped by size and time only
+
+
+def _git(wd: str, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", wd, *args], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.decode(errors="replace") if r.returncode == 0 else None
+
+
+def _changed(wd: str, porcelain: str) -> list:
+    """Paths `git status --porcelain -z` names, relative to the checkout's top (a rename's old name skipped)."""
+    out, parts = [], porcelain.split("\0")
+    i = 0
+    while i < len(parts):
+        e = parts[i]
+        i += 1
+        if len(e) > 3:
+            out.append(e[3:])
+            if e[0] in "RC":
+                i += 1
+    return out
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_stamp(workdir: str, artifact: str = "") -> dict:
+    """What a job runs: the workdir's git repo (origin without credentials, else its top folder), branch,
+    commit, whether the tree is dirty and a hash of its uncommitted changes, and the built artifact's size,
+    time and sha256 (its build id). `stale` lists changed C/C++ sources newer than the artifact: the job
+    would run an old build. Read-only; a workdir outside git gets repo, commit and dirty None."""
+    wd = os.path.expanduser(workdir or "~")
+    stamp = {"workdir": wd, "repo": None, "branch": None, "commit": None, "dirty": None, "diff_sha256": None,
+             "artifact": None, "stale": [], "stamped_utc": _utc()}
+    top = (_git(wd, "rev-parse", "--show-toplevel") or "").strip()
+    if top:
+        url = (_git(wd, "config", "--get", "remote.origin.url") or "").strip()
+        status = _git(wd, "status", "--porcelain", "-z", "--untracked-files=all")
+        diff = _git(wd, "diff", "HEAD", "--binary")
+        stamp.update(repo=re.sub(r"^([a-z+]+://)[^/@]*@", r"\1", url) or top,
+                     branch=(_git(wd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None,
+                     commit=(_git(wd, "rev-parse", "HEAD") or "").strip() or None,
+                     dirty=None if status is None else bool(status.strip("\0")))
+        if stamp["dirty"]:
+            stamp["diff_sha256"] = hashlib.sha256(((diff or "") + "\0" + status).encode()).hexdigest()
+    if artifact:
+        a = Path(wd, os.path.expanduser(artifact))
+        try:
+            st = a.stat()
+        except OSError:
+            stamp["artifact"] = {"path": str(a), "missing": True}
+            return stamp
+        stamp["artifact"] = {"path": str(a), "size": st.st_size, "mtime": st.st_mtime, "mtime_utc": _utc(st.st_mtime),
+                             "sha256": _sha256(a) if a.is_file() and st.st_size <= HASH_MAX_BYTES else None}
+        if stamp["dirty"]:
+            for rel in _changed(wd, status or ""):
+                f = Path(top, rel)
+                with contextlib.suppress(OSError):
+                    if f.suffix in _SOURCES and f.stat().st_mtime > st.st_mtime:
+                        stamp["stale"].append(rel)
+    return stamp
+
+
+def stamp_line(stamp) -> str:
+    """One line for a person: `<commit12>[+dirty] on <branch> artifact <sha12> built <utc>`."""
+    if not isinstance(stamp, dict):
+        return "no build stamp"
+    words = [f"{(stamp.get('commit') or 'no-git')[:12]}{'+dirty' if stamp.get('dirty') else ''}"]
+    if stamp.get("branch"):
+        words.append(f"on {stamp['branch']}")
+    a = stamp.get("artifact") or {}
+    if a.get("missing"):
+        words.append(f"artifact {a['path']} missing")
+    elif a:
+        words.append(f"artifact {(a.get('sha256') or 'unhashed')[:12]} built {a.get('mtime_utc')}")
+    if stamp.get("stale"):
+        words.append(f"STALE: {len(stamp['stale'])} changed source(s) newer than the artifact")
+    return " ".join(words)
+
+
+_STAMP_KEYS = ("commit", "dirty", "diff_sha256")
+
+
+def stamp_changes(before, after) -> dict:
+    """What differs between the stamp at submit and at start (commit, uncommitted changes, artifact)."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {}
+    out = {k: [before.get(k), after.get(k)] for k in _STAMP_KEYS if before.get(k) != after.get(k)}
+    a, b = before.get("artifact") or {}, after.get("artifact") or {}
+    for k in ("sha256", "size", "mtime", "missing"):
+        if a.get(k) != b.get(k):
+            out[f"artifact.{k}"] = [a.get(k), b.get(k)]
+    return out
+
+
 def _now() -> float:
     return time.time()
 
@@ -860,6 +969,9 @@ def probe(d: Path, job: str) -> int:
     if at == "done":
         m = _load(d / "done" / f"{job}.json")
         print(f"{job}: {m.get('status', '?')} rc={m.get('rc')} log={m.get('log', '')}"
+              + (f" build={stamp_line(m['build'])}" if m.get("build") else "")
+              + (" (the build changed between submit and start: " + ", ".join(m["build_changed"]) + ")"
+                 if m.get("build_changed") else "")
               + (f" ({m.get('reason', '')}; recover the device before running it again)"
                  if m.get("status") == "wedged" else ""))
         return 0
@@ -914,6 +1026,20 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if where_is(d, job) != "unknown":
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
         return 2
+    if not isinstance(spec.get("artifact", ""), str):
+        print("devq submit: artifact must be a path", file=sys.stderr)
+        return 2
+    spec["build"] = build_stamp(wd, spec.get("artifact") or settings(cfg)["build_artifact"])
+    print(f"build: {stamp_line(spec['build'])}")
+    if spec["build"]["dirty"]:
+        print("devq submit: warning: the workdir has uncommitted changes; the result is tied to its diff hash "
+              "only (commit first to make it reproducible)", file=sys.stderr)
+    if spec["build"]["stale"]:
+        print("devq submit: warning: changed sources are newer than the built artifact (rebuild before "
+              "queueing?): " + ", ".join(spec["build"]["stale"][:5]), file=sys.stderr)
+    if (spec["build"]["artifact"] or {}).get("missing"):
+        print(f"devq submit: warning: build artifact {spec['build']['artifact']['path']} does not exist",
+              file=sys.stderr)
     spec["submitted"] = _now()
     # The settings go down before the job: an idle runner may dequeue it at once and must see them
     # (it rereads them for each job it takes, see loop).
@@ -1126,7 +1252,11 @@ class Runner:
         marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
                   "task": spec.get("task", ""), "config": spec.get("config", job),
                   "attempts": st.get("attempts", 0), "drops": st.get("drops", []),
-                  "started": st.get("started"), "finished": _now(), "finished_utc": _utc(), **extra}
+                  "started": st.get("started"), "finished": _now(), "finished_utc": _utc(),
+                  "build": spec.get("build"), **extra}
+        changed = stamp_changes(spec.get("build"), st.get("build_at_start"))
+        if changed:
+            marker["build_changed"] = changed
         _write(self.d / "done" / f"{job}.json.t", json.dumps(marker, indent=1))
         (self.d / "running" / f"{job}.json").replace(self.d / "done" / f"{job}.spec.json")
         for leftover in [self.d / "running" / f"{job}.state.json", *(self.d / "running").glob(f"{job}.*.rc"),
@@ -1270,6 +1400,9 @@ class Runner:
                 if why:
                     self.finish(job, st, "skipped", None, why)
                     return
+                if "build" in spec:   # the build as the job starts: the tree may have moved since submit
+                    st["build_at_start"] = build_stamp(spec.get("workdir") or "",
+                                                       spec.get("artifact") or self.cfg["build_artifact"])
                 try:
                     self.launch(job, spec, st)
                 except OSError as e:

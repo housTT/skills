@@ -53,6 +53,8 @@ and build/run recipes on the box).
   sources). The repository is the only channel.
 - Long work runs detached on the box with a log and an rc file (`ssh-workflow.md`); the task hands
   off `waiting` with a `retry_when` that reads the rc file.
+- Device jobs go through the box's queue or broker and carry a build stamp (commit, dirty flag,
+  built artifact): `device-runs.md`.
 
 ## Storage
 
@@ -70,5 +72,5 @@ A box task's result.json says:
 | host | the `ttp machines` alias (never a raw hostname) |
 | path | the checkout or worktree path on the box |
 | commit | the commit it built or ran, and whether it was pushed (branch) or only reported (diff) |
-| jobs | job or reservation ids it started, with start and end |
+| jobs | job or reservation ids it started, with start and end, and each device job's build stamp |
 | still running | what is still running or held on the box, or "nothing" after checking |

@@ -45827,6 +45827,63 @@ def test_devq_runs_jobs_in_order_once_the_health_gate_passes_and_writes_done_mar
     assert not list((d / "running").iterdir()), "nothing left behind once every job finished"
 
 
+def test_devq_stamps_each_job_with_its_build_and_flags_a_dirty_tree_and_a_stale_artifact(devq_dir, tmp_path):
+    import hashlib
+    d, repo, gate = devq_dir, tmp_path / "repo", tmp_path / "gate"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                               *args], check=True, capture_output=True, text=True).stdout.strip()
+    git("init", "-q", "-b", "feat")
+    git("remote", "add", "origin", "https://user:secret@example.com/org/repo.git")
+    (repo / "a.cpp").write_text("int a;\n")
+    git("add", "a.cpp")
+    git("commit", "-q", "-m", "one")
+    lib = repo / "build" / "lib.so"
+    lib.parent.mkdir()
+    lib.write_bytes(b"built")
+    os.utime(repo / "a.cpp", (time.time() - 100, time.time() - 100))
+    (repo / ".gitignore").write_text("build/\n")
+    git("add", ".gitignore")
+    git("commit", "-q", "-m", "ignore")
+    head = git("rev-parse", "HEAD")
+    cfg = {"build_artifact": "build/lib.so", "health": f"test -e {gate}"}
+    gate.touch()
+    r = _devq_submit(d, cfg, "clean", "true", workdir=str(repo))
+    m = _devq_marker(d, "clean")
+    b = m["build"]
+    assert (b["repo"], b["branch"], b["commit"], b["dirty"], b["diff_sha256"]) == (
+        "https://example.com/org/repo.git", "feat", head, False, None), b
+    assert b["artifact"]["sha256"] == hashlib.sha256(b"built").hexdigest() and b["artifact"]["size"] == 5
+    assert b["stale"] == [] and "build_changed" not in m and "warning" not in r.stderr
+    assert f"build: {head[:12]} on feat artifact {b['artifact']['sha256'][:12]}" in r.stdout
+    assert f"build={head[:12]} on feat" in _devq("probe", d, "clean").stdout
+    assert json.loads((d / "done" / "clean.spec.json").read_text())["build"] == b, "the job record has it too"
+
+    (repo / "a.cpp").write_text("int a = 1;\n")      # an edit newer than the build: dirty and stale
+    gate.unlink()
+    r = _devq_submit(d, cfg, "dirty", "true", workdir=str(repo))
+    assert "uncommitted changes" in r.stderr and "newer than the built artifact" in r.stderr and "a.cpp" in r.stderr
+    assert "+dirty" in r.stdout and "STALE" in r.stdout
+    git("commit", "-q", "-am", "two")                  # the tree moves while the job waits for the device
+    gate.touch()
+    m = _devq_marker(d, "dirty")
+    b = m["build"]
+    assert b["commit"] == head and b["dirty"] is True and len(b["diff_sha256"]) == 64 and b["stale"] == ["a.cpp"]
+    assert m["build_changed"]["commit"] == [head, git("rev-parse", "HEAD")] and "dirty" in m["build_changed"]
+    assert "the build changed between submit and start" in _devq("probe", d, "dirty").stdout
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = _devq_submit(d, cfg, "nogit", "true", workdir=str(plain), artifact=str(tmp_path / "nope.so"))
+    b = _devq_marker(d, "nogit")["build"]
+    assert (b["repo"], b["commit"], b["dirty"]) == (None, None, None) and b["artifact"]["missing"] is True
+    assert "does not exist" in r.stderr
+    bad = _devq("submit", d, json.dumps(DEVQ_FAST), json.dumps({"id": "bad", "cmd": "true", "artifact": 3}))
+    assert bad.returncode == 2 and "artifact must be a path" in bad.stderr
+
+
 def test_devq_requeues_a_dropped_job_and_skips_a_config_after_max_drops(devq_dir, tmp_path):
     d, count = devq_dir, tmp_path / "count"
     cfg = {"drop_check": 'grep -q DEVICE-LOST "$TTP_DEVQ_LOG" && echo "lost chips in $TTP_DEVQ_JOB"'}
