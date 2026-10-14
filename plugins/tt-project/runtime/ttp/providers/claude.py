@@ -396,6 +396,13 @@ class Claude(Provider):
         bill = acct.get("billingType") or data.get("billingType") or ""
         return " | ".join(x for x in (who, org if org and who not in org else "", bill) if x)
 
+    def account_kind(self) -> str:
+        try:
+            data = json.loads(Path(os.path.expanduser("~/.claude.json")).read_text())
+        except (OSError, ValueError):
+            return ""
+        return str((data.get("oauthAccount") or {}).get("billingType") or data.get("billingType") or "")
+
 
 def claude_config_dir() -> Path:
     """Where Claude Code keeps credentials and session transcripts."""

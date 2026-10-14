@@ -7,7 +7,8 @@ runs on (ssh alias; "" = this machine), its state folder there, a health gate an
 queue jobs with `ttp devq submit`, then hand off `waiting` on `ttp devq probe <name> <id>`; the runner
 takes the jobs one at a time in arrival order, each only after the health gate passes, and writes a
 done marker per job. A job a device drop or a host reboot killed is run again; once one config dropped
-max_drops times in a row its jobs are skipped and marked so, until `ttp devq clear`.
+max_drops times in a row its jobs are skipped and marked so, until `ttp devq clear`. A job whose output
+matches one of its wedge_patterns (a device hang signature) is stopped at once and marked wedged.
 
 This file is also the runner itself: `ttp devq` copies it to the host's state folder and runs it there
 with that host's python3, so it uses the standard library only and runs on Linux and macOS alike.
@@ -29,6 +30,18 @@ import sys
 import time
 from pathlib import Path
 
+# Fatal hang signatures tt-metal and tt-umd print once a device is wedged and will not recover without a
+# reset: tt-metal's dispatch timeouts ("TIMEOUT: device timeout ..., potential hang detected[, the device
+# is unrecoverable]"), tt-umd's all-ones PCIe read ("Read 0xffffffff over PCIe ...: the board should be
+# reset.") and its ARC message queue timeout. A job whose output matches one is stopped early instead of
+# holding the device until its time limit.
+WEDGE_PATTERNS = [
+    r"potential hang detected",
+    r"the device is unrecoverable",
+    r"the board should be reset",
+    r"Timeout waiting for ARC msg request queue",
+]
+
 RUNNER_DEFAULTS = {
     "host": "",                # ssh alias of the device host; "" = this machine
     "dir": "",                 # state folder on that host; "" = ~/.tt-project/devq/<name>
@@ -46,6 +59,10 @@ RUNNER_DEFAULTS = {
     "reservation_cap_s": 0,
     "idle_exit_s": 1800,       # the runner exits after this long with nothing queued; submit restarts it
     "poll_s": 10,              # between checks on a running job
+    # Regexes on a running job's output that mean the device is wedged: on the first match the job is
+    # stopped (TERM, then KILL after a short grace) and marked "wedged" with the pattern and the line, so
+    # the caller can recover the device. A job's own wedge_patterns replace these ([] = no check).
+    "wedge_patterns": WEDGE_PATTERNS,
     # A regex matching the command line of the project's old per-task drivers ("" = none). While one
     # of the user's processes matches, the runner does not start and starts no job, and the probe keeps
     # a task with a pending job asleep: both checking "no other job of ours" at once could pass.
@@ -62,7 +79,7 @@ _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "ref
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
-STATUSES = ("done", "failed", "skipped")
+STATUSES = ("done", "failed", "skipped", "wedged")
 
 
 def config_problems(name: str, cfg) -> list:
@@ -82,6 +99,8 @@ def config_problems(name: str, cfg) -> list:
             out.append(f"{where}.{k}: {v!r} is not a string")
         elif k in _CHOICES and v not in _CHOICES[k]:
             out.append(f"{where}.{k}: {v!r} is not one of {', '.join(repr(c) for c in _CHOICES[k])}")
+        elif k == "wedge_patterns":
+            out += [f"{where}.{k}: {x}" for x in pattern_problems(v)]
         elif isinstance(RUNNER_DEFAULTS[k], list):
             ok = isinstance(v, list) and all(isinstance(x, str) and x.startswith(("/", "~")) for x in v)
             if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
@@ -99,6 +118,47 @@ def config_problems(name: str, cfg) -> list:
     if isinstance(cfg.get("host"), str) and cfg["host"].startswith("-"):
         out.append(f"{where}.host: must not start with '-'")
     return out
+
+
+def pattern_problems(patterns) -> list:
+    """Why `patterns` is not a list of regexes, one line each ([] when it is)."""
+    if not isinstance(patterns, list) or not all(isinstance(x, str) and x for x in patterns):
+        return [f"{patterns!r} is not a list of non-empty regexes"]
+    out = []
+    for x in patterns:
+        try:
+            re.compile(x)
+        except re.error as e:
+            out.append(f"{x!r} is not a regex ({e})")
+    return out
+
+
+def wedge_patterns(spec: dict, cfg: dict) -> list:
+    """The job's wedge patterns: its own list when it has one, else the runner's."""
+    own = spec.get("wedge_patterns")
+    return own if isinstance(own, list) else cfg["wedge_patterns"]
+
+
+def scan_wedge(path: Path, offset: int, patterns: list) -> tuple:
+    """(offset, (pattern, line) or None): the first line of `path` from `offset` on that matches one of
+    `patterns`, and how far the scan got. A line not yet ended is left for the next call, unless it is
+    longer than one read."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(1 << 22)
+    except OSError:
+        return offset, None
+    end = chunk.rfind(b"\n") + 1
+    if not end and len(chunk) < 1 << 22:
+        return offset, None
+    chunk = chunk[:end] if end else chunk
+    for raw in chunk.splitlines():
+        line = raw.decode("utf-8", "replace")
+        for pat in patterns:
+            if pat.search(line):
+                return offset + len(chunk), (pat.pattern, line.strip()[:300])
+    return offset + len(chunk), None
 
 
 def settings(cfg: dict | None) -> dict:
@@ -789,7 +849,9 @@ def probe(d: Path, job: str) -> int:
     at = where_is(d, job)
     if at == "done":
         m = _load(d / "done" / f"{job}.json")
-        print(f"{job}: {m.get('status', '?')} rc={m.get('rc')} log={m.get('log', '')}")
+        print(f"{job}: {m.get('status', '?')} rc={m.get('rc')} log={m.get('log', '')}"
+              + (f" ({m.get('reason', '')}; recover the device before running it again)"
+                 if m.get("status") == "wedged" else ""))
         return 0
     if at == "unknown":
         print(f"{job}: unknown to the runner in {d}")
@@ -819,6 +881,11 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if not isinstance(spec.get("cmd"), str) or not spec["cmd"].strip():
         print("devq submit: cmd missing", file=sys.stderr)
         return 2
+    if spec.get("wedge_patterns") is not None:
+        bad = pattern_problems(spec["wedge_patterns"])
+        if bad:
+            print("devq submit: wedge_patterns: " + "; ".join(bad), file=sys.stderr)
+            return 2
     wd = spec.get("workdir") or ""
     if wd and not Path(wd).is_dir():
         print(f"devq submit: workdir {wd} does not exist on this host", file=sys.stderr)
@@ -1040,16 +1107,16 @@ class Runner:
             self.set_state(f"{job}: waiting: an old per-task driver still runs ({legacy[0]})")
             time.sleep(self.cfg["health_poll_s"])
 
-    def finish(self, job: str, st: dict, status: str, rc, reason: str) -> None:
+    def finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
         with self.steady():
-            self._finish(job, st, status, rc, reason)
+            self._finish(job, st, status, rc, reason, **extra)
 
-    def _finish(self, job: str, st: dict, status: str, rc, reason: str) -> None:
+    def _finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
         spec = _load(self.d / "running" / f"{job}.json")
         marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
                   "task": spec.get("task", ""), "config": spec.get("config", job),
                   "attempts": st.get("attempts", 0), "drops": st.get("drops", []),
-                  "started": st.get("started"), "finished": _now(), "finished_utc": _utc()}
+                  "started": st.get("started"), "finished": _now(), "finished_utc": _utc(), **extra}
         _write(self.d / "done" / f"{job}.json.t", json.dumps(marker, indent=1))
         (self.d / "running" / f"{job}.json").replace(self.d / "done" / f"{job}.spec.json")
         for leftover in [self.d / "running" / f"{job}.state.json", *(self.d / "running").glob(f"{job}.*.rc"),
@@ -1108,12 +1175,19 @@ class Runner:
         return job_limit(spec, self.cfg)
 
     def wait(self, job: str, spec: dict, st: dict) -> tuple:
-        """(rc, how) of the current attempt: how is "" (it ended), "timeout" or "interrupted" (it is
-        gone without an exit code: killed, or the host restarted)."""
+        """(rc, how) of the current attempt: how is "" (it ended), "timeout", "wedged" (its output matched
+        a wedge pattern, recorded in cur["wedge"]; it was stopped) or "interrupted" (it is gone without an
+        exit code: killed, or the host restarted)."""
         cur = st["cur"]
         rcf, lockf = Path(cur["rc"]), Path(cur["lock"])
         limit = self.limit(spec)
         child = self._child
+        patterns, seen = [], 0
+        for x in wedge_patterns(spec, self.cfg) or []:
+            try:
+                patterns.append(re.compile(x))
+            except (re.error, TypeError) as e:
+                self.log(f"{job}: wedge pattern {x!r} ignored: {e}")
         while True:
             if child is not None:
                 child.poll()      # reap it, so its lock is released once it ends
@@ -1126,6 +1200,16 @@ class Runner:
                 if rcf.exists():
                     continue
                 return None, "interrupted"
+            if patterns:
+                seen, hit = scan_wedge(Path(cur["log"]), seen, patterns)
+                if hit:
+                    pid = cur.get("pid") or _lock_pid(lockf)
+                    if pid:
+                        _kill_group(pid)
+                    if child is not None:
+                        child.poll()
+                    cur["wedge"] = {"pattern": hit[0], "line": hit[1]}
+                    return None, "wedged"
             if limit and _now() - cur["started"] >= limit:
                 pid = cur.get("pid") or _lock_pid(lockf)
                 if pid:
@@ -1200,6 +1284,14 @@ class Runner:
                     self.save(job, st)
                 need = 2
                 continue
+            if how == "wedged":
+                w = st["cur"]["wedge"]
+                _append(self.d / "drops.log", f"utc={_utc()} job={job} task={spec.get('task', '')} "
+                        f"config={spec['config']} attempt={st['cur']['n']} kind=wedged "
+                        f"pattern=\"{w['pattern']}\" evidence=\"{w['line'][:300]}\"\n")
+                self.finish(job, st, "wedged", None, f"wedged: output matched {w['pattern']!r}: {w['line'][:200]}",
+                            wedge=w)
+                return
             _rm(self.d / "configs" / spec["config"])
             if how == "timeout":
                 self.finish(job, st, "failed", rc, f"timed out after {self.limit(spec):.0f} s")

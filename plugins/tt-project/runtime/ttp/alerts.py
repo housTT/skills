@@ -124,6 +124,16 @@ def breaker(db: DB, provider: str) -> dict | None:
     return rec if rec.get("open") else None
 
 
+def switch_text(switched: dict) -> str:
+    """A login's change of account in words: its kinds only, never an email address."""
+    old, new = switched.get("from") or "", switched.get("to") or ""
+    if old and new and old != new:
+        return f"{old} before, {new} now"
+    if new:
+        return f"{new}, as before" if old == new else f"{new} now"
+    return "account kind unknown"
+
+
 def login_proven(db: DB, provider: str, since: float) -> bool:
     """Whether a run on `provider` started at or after `since` got past the login: it succeeded, or
     it is still running and spends or streams tokens (Daemon.meter_running). Age alone is no proof:
@@ -363,6 +373,8 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 # A status line clears as quietly as it was raised.
                 sev = CLEARED_SEVERITY.get(kind) or ("normal" if _urgent(ep["severity"]) else "low")
                 text = "Cleared: " + CLEARED_TEXT[kind].format(arg=arg)
+                if kind == "auth" and (sw := (db.kv(BREAKER + arg) or {}).get("switched")):
+                    text += f" It is on another account than before the logout ({switch_text(sw)})."
             if kind in ("heal", "heal-hold") and why != "condition cleared":
                 text, sev = f"Cleared: {ep['key']} user alert: {why}.", "low"
             closed.append(_close(db, ep, now, why, text, sev))

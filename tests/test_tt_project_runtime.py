@@ -14261,6 +14261,35 @@ def test_a_restart_that_times_out_is_escalated_and_reported(env, monkeypatch, st
         assert found == "restart failed" and msg["severity"] == "high" and "could not restart" in msg["text"]
 
 
+def test_a_hung_systemd_daemon_is_killed_before_its_restart_so_the_restart_is_plain(env, monkeypatch):
+    """The unit's SIGTERM only asks the daemon to stop after its tick, which a hung one never ends: a
+    restart with it still alive waits out systemd's stop timeout, past RESTART_TIMEOUT_S."""
+    from ttp import service, watchdog
+    p, proc = _stuck_daemon(env, monkeypatch, age=watchdog.HANG_S + 100)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    calls = []
+
+    def systemctl(*args, timeout):   # systemd: stopping a live hung main pid outlasts the timeout
+        calls.append(args[0])
+        if args[0] in ("restart", "stop") and proc.poll() is None:
+            raise subprocess.TimeoutExpired(["systemctl"], timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(watchdog, "_systemctl", systemctl)
+    now = time.time()
+    try:
+        assert watchdog.check(p, now=now) == "stale"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S, dump_wait_s=0) == "restarted"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert calls == ["restart"]
+    unit = f"{service.unit_name(p)}.service"
+    assert p.db.kv("daemon_hang")["how"] == f"killed hung pid {proc.pid}, systemctl --user restart {unit}"
+    msg = p.db.one("SELECT severity, text FROM messages WHERE ref='daemon-hang'")
+    assert msg["severity"] == "normal" and "escalated" not in msg["text"]
+
+
 def test_a_daemon_that_hangs_again_soon_backs_off_and_escalates_once(env, monkeypatch):
     from ttp import watchdog
     p, proc = _stuck_daemon(env, monkeypatch, age=0)
@@ -18545,6 +18574,79 @@ def test_the_login_check_backs_off_and_closes_the_breaker_and_its_alert(env, mon
     assert p.db.one("SELECT cleared FROM alerts WHERE key='auth:fake'")["cleared"], "the alert outlived the breaker"
     assert attention(p.db, time.time()) == []
     assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0, "the login was checked with a model run"
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_login_back_on_another_account_holds_one_check_then_starts_and_says_so(env, monkeypatch, switch):
+    """A login that comes back as another account than before the logout may be a user mid-switch:
+    nothing starts until one more check; still another account then, work starts, the chat hears
+    the change (account kind only) and an event records it. The same account starts at once."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import ACCOUNT_SWITCH_EVENT, AUTH_CHECK_S, Daemon
+    from ttp.providers import get_provider
+    cls = type(get_provider("fake"))
+    who = {"account": "one@example.com | plan_a", "kind": "plan_a"}
+    monkeypatch.setattr(cls, "account", lambda self: who["account"])
+    monkeypatch.setattr(cls, "account_kind", lambda self: who["kind"])
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status) VALUES('worker','fake',?,?,?,'ok')",
+           (who["account"], time.time() - 60, time.time() - 50))
+    d = Daemon(p.base)
+    d.open_breaker("fake", "401")
+    d.alert("auth:fake", "fake is logged out", "high")
+    if switch:
+        who.update(account="two@example.com | plan_b", kind="plan_b")
+    login.write_text("")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    events = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (ACCOUNT_SWITCH_EVENT,))
+    cleared = lambda: p.db.q("SELECT text FROM messages WHERE text LIKE 'Cleared: fake is logged in again%'")
+    if not switch:
+        assert alerts.breaker(p.db, "fake") is None, "the same account waited"
+        assert not events() and len(cleared()) == 1 and "another account" not in cleared()[0]["text"]
+        return
+    b = alerts.breaker(p.db, "fake")
+    assert b and b["account_hold"] and d._logged_out("fake"), "another account started at once"
+    assert round(b["next_check"] - time.time()) == AUTH_CHECK_S[0] and not events() and not cleared()
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake"), "the hold ended before its check was due"
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None and not d._logged_out("fake")
+    ev = events()
+    assert len(ev) == 1 and ev[0]["status"] == "handled" and "plan_a before, plan_b now" in ev[0]["text"]
+    text = cleared()[0]["text"]
+    assert len(cleared()) == 1 and "another account than before the logout (plan_a before, plan_b now)" in text
+    assert "@" not in text + ev[0]["text"] + ev[0]["data"], "an email address was shown or kept"
+
+
+def test_a_login_back_on_the_old_account_after_its_hold_starts_without_a_note(env, monkeypatch):
+    """A user who switches back within the hold's check gets the plain 'logged in again'."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import ACCOUNT_SWITCH_EVENT, Daemon
+    from ttp.providers import get_provider
+    cls = type(get_provider("fake"))
+    who = {"account": "a | plan_a"}
+    monkeypatch.setattr(cls, "account", lambda self: who["account"])
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d = Daemon(p.base)
+    from ttp import budget as bud
+    bud.note_account(p.db, "fake", who["account"])
+    d.open_breaker("fake", "401")
+    who["account"] = "b | plan_b"
+    login.write_text("")
+    for _ in range(2):
+        p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+        d.check_logins()
+        if alerts.breaker(p.db, "fake"):
+            who["account"] = "a | plan_a"   # switched back during the hold
+    assert alerts.breaker(p.db, "fake") is None
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (ACCOUNT_SWITCH_EVENT,))
+    assert not (p.db.kv("auth_breaker:fake") or {}).get("switched")
 
 
 def test_a_refusal_right_after_a_passed_login_check_falls_back_to_one_probe_run(env, monkeypatch):
@@ -25598,6 +25700,89 @@ def test_an_on_pass_cmd_can_send_notes_with_only_note_context(env, monkeypatch, 
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+def test_an_on_pass_cmd_records_obligation_progress_and_receipts_with_note_context(env, monkeypatch, tmp_path):
+    """`ttp obligation progress|receipt` in an on_pass_cmd go to the waiting run's file, filed for its task
+    when it settles, however old that run; user-only obligation actions stay refused."""
+    from ttp import daemon as dmod, obligations as ob
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    cmd = ("set -e; ttp obligation progress \"$OID\" 'job checked'; "
+           "ttp obligation receipt \"$OID\" 'docs/report.md'; "
+           "if ttp obligation add 'should refuse'; then exit 10; fi; "
+           "printf '{\"status\":\"done\",\"summary\":\"delivered\"}' > \"$TTP_RESULT\"")
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd)
+    p.db.x("UPDATE runs SET started=?, ended=? WHERE task=?",
+           (time.time() - 30 * 86400, time.time() - 30 * 86400 + 60, tid))
+    oid = ob.add(p, "the urgent report", [tid])
+    monkeypatch.setenv("OID", oid)
+    _settle_on_pass(d, tid)
+    output = (run_dir / "on_pass" / "on_pass.log").read_text()
+    assert p.db.task(tid)["status"] == "done", (p.db.task(tid)["result"], output)
+    assert "not inside a run" in output and f"recorded for task #{tid}" in output
+    o = ob.get(p.db, oid)
+    assert o["receipt"] and o["receipt"]["evidence"] == "docs/report.md", o
+    assert [e["text"] for e in o["owners"][str(tid)]["evidence"]][:1] == ["job checked"]
+
+
+def _ack_wait(cli, *args):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["ack-wait", *args])
+    return e.value.code
+
+
+def test_ack_wait_probe_passes_only_on_the_named_projects_reply_naming_the_hash(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+    from ttp.project import register
+    p = make(env)
+    for name in ("second", "third"):
+        (env["tmp"] / name).mkdir()
+        register(name, {"host": "testhost", "dir": str(env["tmp"] / name)})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please confirm the new probe works"
+    assert upstream.send(p.name, 4, "second", request) == "sent"
+    fp, sha = upstream.note_id("second", request), upstream.receipt(request).split()[-1]
+    probe = ["probe", "--from", "second", "--hash", fp]
+    assert _ack_wait(cli, *probe) == 1, "the request itself is no reply"
+    upstream.send("third", 1, p.name, f"re {fp}: not ours")
+    upstream.send("second", 1, "third", f"re {fp}: to another project")
+    upstream.send("second", 1, p.name, "an unrelated note")
+    assert _ack_wait(cli, *probe) == 1
+    upstream.send("second", 9, p.name, f"Re {fp.upper()} and {sha}: works here")
+    assert _ack_wait(cli, *probe) == 0 and _ack_wait(cli, "probe", "--from", "second", "--hash", sha) == 0
+    assert _ack_wait(cli, "probe", "--from", "nowhere", "--hash", fp) == 2, "an unknown project never replies"
+    assert _ack_wait(cli, "probe", "--from", p.name, "--hash", fp) == 2
+    assert _ack_wait(cli, "probe", "--from", "second", "--hash", "xyz") == 2
+    assert _ack_wait(cli, "probe", "--from", "second", "--hash", "abc1234") == 2, "too short to name one note"
+    assert _ack_wait(cli, "settle", "--from", "second", "--hash", fp) == 2, "settle writes $TTP_RESULT only"
+    assert "not set" in capsys.readouterr().err
+
+
+def test_ack_wait_ends_a_waiting_task_model_free_once_the_reply_arrives(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "second").mkdir()
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    fp = upstream.note_id("second", "please confirm")
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, f"ttp ack-wait settle --from second --hash {fp}",
+                                     probe=f"ttp ack-wait probe --from second --hash {fp}")
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "queued" and not _ready(p, tid) and tid not in d._on_pass
+    upstream.send("second", 2, p.name, f"confirmed {fp}: the probe passes here")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["blocked_reason"], res, (run_dir / "on_pass" / "on_pass.log").read_text())
+    assert res["run_status"] == "model-free" and "another project's data" in res["summary"]
+    assert "the probe passes here" in res["summary"] and res["metrics"]["reply_note"]
+    assert f"second replied to {fp}" in (run_dir / "progress.md").read_text()
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
 def test_on_pass_note_context_preserves_deferred_delivery(env, monkeypatch, capsys):
     from ttp import cli, upstream
     from ttp.project import register
@@ -25965,6 +26150,71 @@ def test_an_on_pass_cmd_still_runs_model_free_after_a_resource_move_rewrites_its
         assert task["status"] == "done" and flag.exists(), (task["status"], task["blocked_reason"], res)
         assert res["summary"] == "verified" and res["run_status"] == "model-free"
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+@pytest.mark.parametrize("change", ["probe", "cmd", "both", "unrelated"])
+def test_an_on_pass_cmd_runs_model_free_after_set_when_rewrites_the_hand_off(env, monkeypatch, tmp_path, capsys,
+                                                                            change):
+    """`ttp task set-when` re-points the probe and/or sets the on_pass_cmd of a waiting task; the run's
+    result.json keeps what it wrote, and the daemon still takes it as the hand-off the task waits on."""
+    p = make(env)
+    from ttp import cli, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    cmd = f"touch {flag}; printf '{{\"status\":\"done\",\"summary\":\"verified\"}}' > \"$TTP_RESULT\""
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd, probe="exit 1" if change != "cmd" else "true")
+    if change in ("cmd", "both", "unrelated"):   # the run named no on_pass_cmd
+        hand = json.loads((run_dir / "result.json").read_text())
+        hand.pop("on_pass_cmd")
+        (run_dir / "result.json").write_text(json.dumps(hand))
+        res = json.loads(p.db.task(tid)["result"])
+        res.pop("on_pass_cmd")
+        p.db.update_task(tid, result=json.dumps(res))
+    args = {"probe": ["true"], "cmd": ["--on-pass-cmd", cmd]}.get(change, ["true", "--on-pass-cmd", cmd])
+    cli.main(["task", "demo", "set-when", str(tid), *args])
+    out = capsys.readouterr().out
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == "true" and res["on_pass_cmd"] == cmd, res
+    assert ("retry_when set: true" in out) == (change != "cmd") and ("on_pass_cmd set" in out) == (change != "probe")
+    if change == "unrelated":   # a result.json naming some other probe is still not the hand-off the task waits on
+        hand = json.loads((run_dir / "result.json").read_text())
+        (run_dir / "result.json").write_text(json.dumps({**hand, "retry_when": "test -e /tmp/other"}))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    if change == "unrelated":
+        assert _ready(p, tid) and not flag.exists()
+        assert "its on_pass_cmd was not run: the task's last run's result.json is not the hand-off" in res["woke"]
+    else:
+        assert task["status"] == "done" and flag.exists(), (task["status"], task["blocked_reason"], res)
+        assert res["summary"] == "verified" and res["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_set_when_keeps_the_runs_own_probe_across_rewrites_and_clears_an_on_pass_cmd(env, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = _due_waiting_task(p, "exit 1", on_pass_cmd="true")
+    cli.main(["task", "demo", "set-when", str(tid), "exit 2"])
+    cli.main(["task", "demo", "set-when", str(tid), "exit 3", "--on-pass-cmd", ""])
+    assert "on_pass_cmd cleared" in capsys.readouterr().out
+    res = json.loads(p.db.task(tid)["result"])
+    assert (res["retry_when"], res["retry_when_orig"], res["on_pass_cmd_orig"]) == ("exit 3", "exit 1", "true")
+    assert "on_pass_cmd" not in res
+
+
+def test_set_when_on_pass_cmd_needs_a_waiting_task(env, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), "--on-pass-cmd", "true"])
+    assert "only a waiting task has an on_pass_cmd" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "requeue", str(tid), "--on-pass-cmd", "true"])
+    assert "--on-pass-cmd goes with set-when" in capsys.readouterr().err
+    assert p.db.task(tid)["result"] is None
 
 
 def test_passed_checks_still_record_on_pass_after_a_resource_move_rewrites_the_probe(env, monkeypatch, tmp_path):
@@ -33123,6 +33373,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
+    ("daemon.py", 'open(stacks, "a")'): "a log (thread stacks of an overrunning tick)",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("daemon.py", '"daemon.start"'): "names a process, which a reboot ends",
     ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
@@ -44052,6 +44303,70 @@ def test_devq_health_gate_refusal_skips_the_job_after_health_wait(devq_dir, tmp_
     assert m["attempts"] == 0 and not (tmp_path / "ran").exists()
 
 
+def _gone(pid, timeout=10):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_devq_stops_a_job_whose_output_matches_a_wedge_pattern_and_frees_the_device(devq_dir, tmp_path):
+    d, pidf = devq_dir, tmp_path / "pid"
+    t0 = time.time()
+    _devq_submit(d, {}, "hang-1", f"echo $$ > {pidf}; echo warming up; "
+                 "echo 'TIMEOUT: device timeout, potential hang detected, the device is unrecoverable'; sleep 120",
+                 timeout_s=300)
+    _devq_submit(d, {}, "next-1", "echo fine")
+    m = _devq_marker(d, "hang-1")
+    assert m["status"] == "wedged" and m["rc"] is None, m
+    assert m["wedge"]["pattern"] == "potential hang detected" and "the device is unrecoverable" in m["wedge"]["line"]
+    assert "wedged: output matched" in m["reason"]
+    assert time.time() - t0 < 60, "stopped early, not at its 300 s limit"
+    assert _gone(int(pidf.read_text())), "the wedged job's process group was stopped"
+    assert _devq_marker(d, "next-1")["status"] == "done", "the device went to the next job"
+    assert not list((d / "running").iterdir()), "no job lock left behind"
+    assert "kind=wedged" in (d / "drops.log").read_text()
+    probe = _devq("probe", d, "hang-1")
+    assert probe.returncode == 0 and "wedged" in probe.stdout and "recover the device" in probe.stdout
+
+
+def test_devq_wedge_patterns_spare_a_clean_job_and_a_job_overrides_them(devq_dir, tmp_path):
+    d = devq_dir
+    _devq_submit(d, {}, "clean-1", "echo step 1; sleep 0.3; echo step 2 ok")
+    _devq_submit(d, {}, "off-1", "echo 'potential hang detected'; sleep 0.3; echo done anyway", wedge_patterns=[])
+    _devq_submit(d, {}, "own-1", "echo 'MYHANG at 3'; sleep 120", wedge_patterns=["MY[H]ANG"], timeout_s=300)
+    clean, off, own = (_devq_marker(d, j) for j in ("clean-1", "off-1", "own-1"))
+    assert (clean["status"], clean["rc"]) == ("done", 0) and "wedge" not in clean
+    assert pathlib.Path(clean["log"]).read_text().split("\n")[1] == "step 2 ok"
+    assert (off["status"], off["rc"]) == ("done", 0), "[] turns the check off for that job"
+    assert own["status"] == "wedged" and own["wedge"] == {"pattern": "MY[H]ANG", "line": "MYHANG at 3"}
+    assert not list((d / "running").iterdir()), "no job lock left behind"
+    bad = _devq("submit", d, json.dumps(DEVQ_FAST), json.dumps({"id": "bad-1", "cmd": "true", "wedge_patterns": ["("]}))
+    assert bad.returncode == 2 and "not a regex" in bad.stderr
+
+
+def test_devq_wedge_patterns_default_config_check_and_partial_lines(tmp_path):
+    from ttp import devq
+    assert devq.settings({})["wedge_patterns"] == devq.WEDGE_PATTERNS and devq.WEDGE_PATTERNS
+    assert devq.config_problems("r", {"wedge_patterns": []}) == []
+    assert any("not a regex" in x for x in devq.config_problems("r", {"wedge_patterns": ["a(", "ok"]}))
+    assert devq.config_problems("r", {"wedge_patterns": "x"})
+    log, pats = tmp_path / "log", [re.compile(x) for x in devq.WEDGE_PATTERNS]
+    log.write_bytes(b"ok\nRead 0xffffffff over PCIe ID 0: the board sh")
+    at, hit = devq.scan_wedge(log, 0, pats)
+    assert (at, hit) == (3, None), "a line not yet ended waits for its end"
+    with open(log, "ab") as f:
+        f.write(b"ould be reset.\nmore\n")
+    at, hit = devq.scan_wedge(log, at, pats)
+    assert hit == ("the board should be reset", "Read 0xffffffff over PCIe ID 0: the board should be reset.")
+    assert devq.wedge_patterns({"wedge_patterns": ["x"]}, devq.settings({})) == ["x"]
+    assert devq.wedge_patterns({}, devq.settings({"wedge_patterns": []})) == []
+
+
 def test_devq_probe_exit_codes(devq_dir):
     import fcntl
     d = devq_dir
@@ -47443,6 +47758,76 @@ def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
     box = dict(spec, outage=True)
     assert heal.run(d, "svc", box, now)[0] == "unhealthy (known fault: kept quiet)"
     assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
+
+
+def test_heal_known_fault_object_is_validated_and_strings_still_load(env):
+    from datetime import datetime, timezone
+    from ttp import heal
+    from ttp import schedule as sched
+    iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    assert heal.validate({"check": "true", "known_fault": "vendor bug"})["known_fault"] == "vendor bug"
+    ok = [{"name": "svc", "kind": "command", "every": "5m",
+           "payload": {"heal": {"check": "true", "known_fault": "vendor bug"}}}]
+    assert sched.parse_file(json.dumps(ok))
+    kf = {"why": "vendor bug", "match": "err [0-9]+", "until": iso(time.time() + 6 * 86400)}
+    assert heal.validate({"check": "true", "known_fault": kf})["known_fault"] == kf
+    assert heal.validate({"check": "true", "known_fault": {"why": "vendor bug"}})
+    for bad, msg in [({"why": "x", "owner": "y"}, "unknown key"), ({"match": "x"}, "needs `why`"),
+                     ({"why": " "}, "needs `why`"), ({"why": "x", "match": "("}, "not a valid regex"),
+                     ({"why": "x", "match": 3}, "is text"), ({"why": "x", "until": "soon"}, "ISO time"),
+                     ({"why": "x", "until": iso(time.time() + 8 * 86400)}, "at most 7 d"), (["x"], "text or an object")]:
+        with pytest.raises(ValueError, match=msg):
+            heal.validate({"check": "true", "known_fault": bad})
+
+
+@pytest.mark.parametrize("fix", [True, False])
+def test_heal_known_fault_match_keeps_only_matching_failures_quiet(env, fix):
+    from ttp import heal
+    p, d, up = _heal_setup(env, known_fault={"why": "vendor bug", "match": "err [0-9]+: vendor"},
+                          **({} if fix else {"fix": None}))
+    spec, now = dict(_heal_spec(p), check=f"test -e {up} || {{ echo 'err 42: vendor fault'; exit 1; }}"), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    other = dict(spec, known_fault={"why": "vendor bug", "match": "power lost"})
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    out = heal.run(d, "svc", other, now)[0]
+    if fix:
+        assert out == "unhealthy (fixed; rechecking)" and up.exists()
+    else:
+        assert "self-fix task" in out and len(p.db.q("SELECT id FROM tasks WHERE origin='daemon'")) == 1
+
+
+@pytest.mark.parametrize("form", ["string", "until"])
+def test_heal_known_fault_ends_escalates_and_asks_renewal_once(env, form):
+    from datetime import datetime, timezone
+    from ttp import heal
+    now = time.time()
+    end = now + 3600 if form == "until" else now + heal.KNOWN_FAULT_S
+    kf = ("vendor bug" if form == "string"
+          else {"why": "vendor bug", "until": datetime.fromtimestamp(end, timezone.utc).isoformat()})
+    p, d, up = _heal_setup(env, fix=None, known_fault=kf)
+    spec = _heal_spec(p)
+    renewals = lambda: p.db.q("SELECT * FROM messages WHERE direction='out' AND text LIKE '%known_fault (vendor bug) ended%'")
+    observed = lambda: p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'heal:svc:known_fault:%'")
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.state(p.db, "svc")["known_since"] == now
+    # A healthy spell keeps its end: a flapping fault never renews itself.
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 60)[0] == "ok (healthy)"
+    up.unlink()
+    assert heal.run(d, "svc", spec, end - 60)[0] == "unhealthy (known fault: kept quiet)"
+    assert not renewals() and heal.holds(p.db, "svc", end - 60) is False
+    out = heal.run(d, "svc", spec, end + 1)[0]
+    assert "self-fix task" in out, out
+    assert len(renewals()) == 1 and renewals()[0]["severity"] == "low"
+    assert len(observed()) == 1 and observed()[0]["severity"] == "low"
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    assert heal.run(d, "svc", spec, end + 120)[0] == f"unhealthy (self-fix task #{tid} failed; alerted)"
+    assert len(renewals()) == 1 and len(observed()) == 1
+    # Renewing (a changed entry) keeps it quiet again.
+    renewed = dict(spec, known_fault={"why": "vendor bug, renewed"})
+    assert heal.run(d, "svc", renewed, end + 180)[0] == "unhealthy (known fault: kept quiet)"
 
 
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
@@ -52971,6 +53356,7 @@ def test_heal_field_types_are_what_validate_takes():
         for k, t in [*heal.COMMON_FIELDS.items(), *fields.items()]:
             assert seen.setdefault(k, t) == t, k
         typed = {**heal.COMMON_FIELDS, **fields}
+        typed = {k: t.get('anyOf', [t])[0] for k, t in typed.items()}   # known_fault: text, or an object
         block = {k: fixed.get(k, [sample[t['items']['type']]] if t['type'] == 'array' else sample[t['type']])
                  for k, t in typed.items() if k != 'preset'}
         out = heal.validate({**block, **({'preset': preset} if preset else {})})
@@ -57123,3 +57509,236 @@ def test_start_after_accepts_a_space_and_the_home_zone_abbreviation(env):
         coordinator.parse_start_after("2026-10-13 16:00 EDT", now=now, tz=tz)
     with pytest.raises(ValueError, match=r"2026-10-13T16:00-07:00"):
         coordinator.parse_start_after("2026-10-13 16:00 PST", now=now, tz=tz)
+
+
+def test_archiving_a_named_directory_of_many_files_takes_linear_time(tmp_path, monkeypatch):
+    # A hand-off that named a directory of ~300k files kept a daemon's first tick busy for hours:
+    # store() and _split() looked each file up in lists of all of them. 200k names stay well under a
+    # few seconds with set lookups; the list scans took minutes.
+    from ttp import archive
+    n = 200_000
+    named = [f"tmp/out/{i:06d}.txt" for i in range(n)]
+    others = [f"build/{i:06d}.o" for i in range(n // 2)] + named[: n // 2]
+    monkeypatch.setattr(archive, "files_of", lambda root, rels: named if rels == ["tmp/out"] else others)
+    monkeypatch.setattr(archive, "sha256", lambda f, progress=None: "0" * 64)
+    t0 = time.monotonic()
+    with monkeypatch.context() as m:
+        m.setattr(pathlib.Path, "lstat", lambda self: types.SimpleNamespace(st_size=1))
+        named_files, keep, dropped, sizes = archive._split(tmp_path, ["tmp/out"], ["build"], cap_mb=0.05)
+    assert len(named_files) == n and len(keep) == n + 50_000 and len(dropped) == n // 2 - 50_000
+    new = archive._entries(tmp_path, keep + dropped, sizes, set(named_files), set(dropped), set(), "files.tar.gz")
+    assert time.monotonic() - t0 < 20
+    assert sum(e["named"] for e in new) == n and sum(e["stored"] == "dropped" for e in new) == len(dropped)
+    assert all(e["archive"] == "files.tar.gz" for e in new if e["stored"] == "tar")
+
+
+def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
+
+    def step_that_blocks():   # a step stuck in a call with no timeout, still telling the watchdogs it moves
+        for _ in range(20):
+            time.sleep(0.05)
+            d._progress()
+    d.lift_boot_pause = step_that_blocks
+    d._watch_ticks(every_s=0.05)
+    try:
+        d.tick()
+        d._tick_ended()
+    finally:
+        d.stopping = True
+    daemon_log = (p.logs / "daemon.log").read_text()
+    assert "tick overrun: running 0 min, in step step_that_blocks" in daemon_log
+    stacks = (p.logs / dm.TICK_STACKS).read_text()
+    assert "in step step_that_blocks" in stacks and "step_that_blocks" in stacks.split("in step", 1)[1].split("\n", 1)[1]
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+    assert told and "in step step_that_blocks" in told["text"] and dm.TICK_STACKS in told["text"]
+    # Once per tick: a later look at the same tick and a quick next tick add nothing.
+    assert d.check_overrun(time.monotonic() + 3600) is None
+    d._tick_began = d._moved = time.monotonic()
+    assert d.check_overrun() is None
+    d._tick_ended()
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")) == 1
+
+
+def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watchdogs_restart(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    # The stall dump (plus one watch interval) comes before the watchdogs restart a daemon whose last
+    # seen progress (throttled to PROGRESS_EVERY_S) is WATCHDOG_S old; the long-tick dump does not.
+    assert dm.TICK_STALL_S + 30 < dm.WATCHDOG_S - dm.PROGRESS_EVERY_S < dm.TICK_OVERRUN_S
+    monkeypatch.setattr(dm, "TICK_STALL_S", 0.3)
+    seen = {}
+
+    def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
+        time.sleep(1.0)
+        stacks = p.logs / dm.TICK_STACKS
+        seen["stacks"] = stacks.read_text() if stacks.exists() else ""
+    d.lift_boot_pause = step_stuck_silently
+    d._watch_ticks(every_s=0.05)
+    try:
+        d.tick()
+        d._tick_ended()
+    finally:
+        d.stopping = True
+    assert "no progress for 0 min" in seen["stacks"] and "in step step_stuck_silently" in seen["stacks"]
+    assert "step_stuck_silently" in seen["stacks"].split("in step", 1)[1].split("\n", 1)[1]
+    assert seen["stacks"].count("--- ") == 1   # once per stall, not once per watch interval
+    assert "tick stalled: " in (p.logs / "daemon.log").read_text()
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+    assert told and "without progress" in told["text"] and "step_stuck_silently" in told["text"]
+
+
+def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    real = time.time
+    d.tick()   # a real tick: it started on the monotonic clock
+    d._tick_began = d._moved = time.monotonic()
+    monkeypatch.setattr(dm.time, "time", lambda: real() + 3 * 3600)   # the wall clock jumps; monotonic did not
+    assert d.check_overrun() is None
+    d._tick_ended()
+    assert not (p.logs / dm.TICK_STACKS).exists()
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+
+
+def _verified_checks_repo(env, tmp_path, monkeypatch):
+    """A worktree whose project checks are one unscoped check and one scoped to src/**, each counting
+    its runs, with a push target at the first commit so the scope compares with it."""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    whole, scoped = tmp_path / "whole", tmp_path / "scoped"
+    p.set_config("delivery.push_checks", [f"sh -c 'echo x >> {whole}'",
+                                          {"run": f"sh -c 'echo x >> {scoped}'", "if_changed": "src/**"}])
+    p.set_config("delivery.push_branch", "origin/proj")
+    subprocess.run([*git, "remote", "add", "origin", str(tmp_path / "none.git")], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/proj", "HEAD"], check=True)
+    ran = lambda f: len(f.read_text().splitlines()) if f.exists() else 0
+    return p, repo, run, git, lambda: (ran(whole), ran(scoped))
+
+
+def _commit_in(git, repo, name, text):
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    subprocess.run([*git, "add", name], check=True)
+    subprocess.run([*git, "commit", "-qm", name], check=True)
+    return subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+
+def test_a_continuation_checks_only_the_commits_after_its_inherited_marker(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, push, verified
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    first = p.db.add_task("first hop", kind="code")
+    nxt = p.db.add_task("next hop", kind="code", labels=[f"continues:{first}"])
+    monkeypatch.setenv("TTP_TASK", str(first))
+    marked = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    cli.main(["checks"])
+    assert counts() == (1, 1)
+    assert verified.own(p.db, first, "checks")["sha"] == marked
+    # The next hop inherits the marker: its commit touches nothing under src/**, so the scoped check is
+    # verified through the marker; the unscoped one covers the whole tree and runs again.
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    monkeypatch.setenv("TTP_RUN_ID", "42")
+    head = _commit_in(git, repo, "notes.txt", "notes\n")
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 1), out
+    assert f"verified through {marked[:12]} (#{first}'s checks)" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["verified_through"] == marked and len(rec["verified"]) == 1
+    # Its own marker carries the verified check on, so the hop after it can skip it too.
+    assert len(verified.own(p.db, nxt, "checks")["commands"]) == 2
+    # The push gate never reads the marker: the scoped check still applies to the pushed head.
+    todo, _ = push.applicable(repo, head, push.check_list(p.config()["delivery"]["push_checks"]),
+                              lambda m: None, "origin/proj")
+    assert len(todo) == 2
+    # A rerun on the same head by the same task (e.g. the daemon's pre-started checks) reuses what is
+    # known: the scoped check through its own marker at HEAD, the unscoped one through its recorded pass.
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 1), out
+    assert "(recorded)" in out
+    # --fresh runs every check again.
+    cli.main(["checks", "--fresh"])
+    assert counts() == (3, 2)
+    # The first hop's own rerun on its head still hits its recorded pass of every check.
+    monkeypatch.setenv("TTP_TASK", str(first))
+    subprocess.run([*git, "checkout", "-q", marked], check=True)
+    cli.main(["checks"])
+    assert counts() == (3, 2)
+    subprocess.run([*git, "checkout", "-q", "-"], check=True)
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    # A commit after the marker under src/** runs the scoped check again.
+    _commit_in(git, repo, "src/b.py", "b = 1\n")
+    cli.main(["checks"])
+    assert counts() == (4, 3)
+
+
+def test_a_rewritten_history_falls_back_to_full_verification(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, prompts, verified
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    first = p.db.add_task("first hop", kind="code")
+    nxt = p.db.add_task("next hop", kind="code", labels=[f"continues:{first}"])
+    monkeypatch.setenv("TTP_TASK", str(first))
+    marked = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    cli.main(["checks"])
+    assert counts() == (1, 1)
+    line = prompts.verified_line(p, p.db.task(nxt), str(repo))
+    assert f"verified through {marked[:12]}" in line and f"git log {marked[:12]}..HEAD" in line
+    # The marker's commit is rewritten away (an amend of its message only, as a rebase would): not an
+    # ancestor any more, though nothing under src/** changed, so only the fallback reruns the scoped check.
+    subprocess.run([*git, "commit", "-q", "--amend", "-m", "src/a.py, reworded"], check=True)
+    _commit_in(git, repo, "notes.txt", "notes\n")
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 2), "a marker that is no longer an ancestor still skipped a check"
+    assert "no longer an ancestor" in out and "full verification" in out
+    assert "verified" not in json.loads((run / "checks.json").read_text())
+    line = prompts.verified_line(p, p.db.task(nxt), str(repo))
+    assert "no longer an ancestor" in line and "Verify the whole change" in line
+    # A task that continues nothing gets no marker line.
+    assert prompts.verified_line(p, p.db.task(first), str(repo)) == ""
+    assert verified.scope(p.db, p.db.task(first), repo, marked) is None
+
+
+def test_a_passing_review_marks_the_reviewed_head_for_the_tasks_that_continue_it(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, verified
+    from ttp.daemon import Daemon
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "root", repo)
+    d = Daemon(p.base)
+    d.p = p
+    code = p.db.add_task("first hop", kind="code")
+    review = p.db.add_task(f"Review #{code}: first hop", kind="review", depends_on=[code],
+                           labels=[f"auto_review:{code}"])
+    reviewed = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    extra = {}
+    d._mark_verified(p.db.task(review), {"entries": [{"branch": "b", "head": reviewed}]}, extra)
+    assert extra["verified_through"] == reviewed
+    assert verified.own(p.db, code, "review") == {**verified.own(p.db, code, "review"), "sha": reviewed,
+                                                   "review": review, "kind": "review"}
+    # A fix that continues the review inherits the reviewed head: its review covers only what came after.
+    fix = p.db.add_task("fix", kind="code", labels=[f"continues:{review}"])
+    head = _commit_in(git, repo, "src/b.py", "b = 1\n")
+    line = d._verified_review_line(p.db.task(fix), head)
+    assert f"verified through {reviewed[:12]} (#{code}'s review)" in line
+    assert f"git log {reviewed[:12]}..{head[:12]}" in line and "push checks still run in full" in line
+    # Rewritten: the review covers the whole change.
+    subprocess.run([*git, "reset", "-q", "--hard", "HEAD~2"], check=True)
+    head = _commit_in(git, repo, "src/c.py", "c = 1\n")
+    assert "review the whole change" in d._verified_review_line(p.db.task(fix), head)
+    # A code task with no lineage has no marker line; the hand-off line shows the marker.
+    assert d._verified_review_line(p.db.task(code), head) == ""
+    p.db.update_task(review, status="done", result=json.dumps({"summary": "passed", **extra}))
+    assert f"verified through {reviewed[:12]}" in coord.digest(p, {}, [], []).split("## Recently finished")[1]

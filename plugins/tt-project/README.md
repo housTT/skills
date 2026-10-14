@@ -466,14 +466,21 @@ prolonged whole-box outage.
   runner stopped with TERM ends its health or drop check with it (jobs keep running and the next
   runner adopts them). A task queues each device job with
   `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] -- <command>` and waits on
-  `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed
-  or skipped, with exit code and log), 1 while it waits and 3 while it waits with no runner alive:
+  `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed,
+  skipped or wedged, with exit code and log), 1 while it waits and 3 while it waits with no runner alive:
   the project's daemon then runs `ttp devq start <runner>` itself, without a model, at most every
   10 min and `device.runner_restarts_per_day` (default 6) times a day per runner, and queues one
   harness task to fix the runner after two failed restarts in a row or the day's cap. The runner is
   started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
   after a drop or a host reboot, and skips a config that dropped `max_drops` times in a row until
   `ttp devq clear <runner> <config>`; drops go to its `drops.log`. `ttp devq status` shows the queue.
+  While a job runs, the runner reads its output for `wedge_patterns` (regexes; the default list holds
+  the fatal hang signatures tt-metal and tt-umd print, such as "potential hang detected", "the device
+  is unrecoverable", "the board should be reset" and "Timeout waiting for ARC msg request queue"). On
+  the first match it stops the job (TERM, then KILL after 5 s), frees the device for the next job and
+  writes the marker with status `wedged`, the pattern and the line, so the task can recover the device
+  instead of waiting out the time limit. A job's `--wedge-pattern <regex>` (repeatable) replaces the
+  list for that job and `--no-wedge-check` turns it off.
   Before it queues a job, `ttp devq submit` lints its command so a job that would fail at once never
   takes a slot: it refuses a command `bash -n` rejects and a script the command calls that is missing
   on the runner's host or not valid shell there (checked over ssh in batch mode, read-only; an

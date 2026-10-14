@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, watchdup, worktree
+from . import anchors, budgetkind, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, relay, responsibilities, reviewcap, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -716,7 +716,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for k, t in enumerate(finished):
         summary = ("see new events" if f"task:{t['id']}" in in_events
                    else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS) if k < FINISHED_DETAIL else "")
-        lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}" + (f" — {summary}" if summary else ""))
+        lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}"
+                     + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else ""))
     section("finished", lines)
     said = " ".join(str(e["text"] or "") for e in events)
     if msg_ids:

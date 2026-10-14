@@ -367,6 +367,11 @@ class Provider:
         """Who pays: an email/org/plan label. Never a secret."""
         return ""
 
+    def account_kind(self) -> str:
+        """The kind of account it is logged in as (plan, billing or login mode), safe to show:
+        never an email address or a name. Empty when unknown."""
+        return ""
+
     def meter(self) -> list:
         """Plan-window utilization for the whole account, when the provider exposes it. A meter that
         also reads credits and free window resets leaves them in `last_credits` (credits.parse)."""

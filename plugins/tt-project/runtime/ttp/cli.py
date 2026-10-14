@@ -1662,8 +1662,22 @@ def cmd_checks(a) -> None:
             failed = HARNESS_SKIPPED
             out.write(f"{failed}\n")
             passed, todo = False, []
+        # A continuation's if_changed checks that passed at its lineage's marker, with nothing under their
+        # scope changed since, are verified through it (verified.py); `ttp push` never reads the marker.
+        # A recorded pass of every check on this tree comes first: the marker only covers what it lacks.
         hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
-        if not todo and passed and push.outside_scope(cmds, skipped):
+        mark, verified_cmds = _verified_scope(p, Path(top), head, todo, lambda m: (print(f"ttp checks: {m}"),
+                                                                                    out.write(f"{m}\n")),
+                                              a.fresh) \
+            if passed and todo and purpose == "candidate" and not hit else (None, [])
+        todo = [c for c in todo if c not in verified_cmds]
+        if verified_cmds and todo and not a.fresh:
+            hit = _recorded_pass(p, tree, todo, purpose)
+        if not todo and passed and verified_cmds:
+            said = f"every applicable check was {mark['line']}"
+            out.write(f"{said}\n")
+            print(f"ttp checks: {said}")
+        elif not todo and passed and push.outside_scope(cmds, skipped):
             out.write(f"{push.OUT_OF_SCOPE}\n")
             print(f"ttp checks: {push.OUT_OF_SCOPE}")
         elif not todo and passed:
@@ -1725,6 +1739,8 @@ def cmd_checks(a) -> None:
             "purpose": purpose, **({"env_problem": env_problem} if env_problem else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                     **({"verified": verified_cmds, "verified_through": mark["sha"]}
+                                                        if verified_cmds else {}),
                                                      "purpose": purpose, **({"not_run": not_run} if not_run else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
@@ -1742,10 +1758,13 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    if purpose == "candidate":
+        _mark_verified(p, head, tree, list(todo) + list(verified_cmds))
     if hit:
         print(said)
         return
-    _record_pass(p, tree, todo, purpose)
+    if todo:
+        _record_pass(p, tree, todo, purpose)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
@@ -1754,6 +1773,59 @@ def cmd_checks(a) -> None:
 
 
 HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
+
+
+def _run_task(p: Project | None) -> dict | None:
+    task = os.environ.get("TTP_TASK") or ""
+    try:
+        return p.db.task(int(task)) if p and task.isdigit() else None
+    except Exception:
+        return None
+
+
+def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
+                    fresh: bool = False) -> tuple[dict | None, list]:
+    """(the run's task's inherited checks marker, the if_changed checks in `todo` it verifies): each passed
+    at the marker, and the commits after it change nothing under its scope. A marker at `head` itself (a
+    rerun on the same head) verifies the scoped checks it recorded, unless `fresh`. A marker that is no
+    longer an ancestor of `head` (rewritten history) verifies none: every check runs, and that is said.
+    Checks without an if_changed scope always run, as they cover the whole tree."""
+    from . import push, verified
+    t = _run_task(p)
+    try:
+        m = verified.scope(p.db, t, top, head, "checks", include_self=True) if t else None
+    except Exception:
+        return None, []
+    if not m or (m["sha"] == head and fresh):
+        return m, []
+    if not m["ok"]:
+        say(m["line"])
+        return m, []
+    files = [] if m["sha"] == head else verified.changed_since(top, m["sha"], head)
+    if files is None:
+        say(f"cannot tell what changed since {m['sha'][:12]}: full verification")
+        return m, []
+    passed = {str(c) for c in m.get("commands") or []}
+    mine = [c for c in todo if getattr(c, "if_changed", ()) and str(c) in passed
+            and not any(push.matches(files, g) for g in c.if_changed)]
+    for c in mine:
+        say(f"Verified: {c} ({m['line']}: nothing under {', '.join(c.if_changed)} changed since)")
+    if not mine:
+        say(f"{m['line']}: every check runs, as each covers what changed since")
+    return m, mine
+
+
+def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
+    """Record this run's task as verified through `head` (verified.py); a failure never fails the checks."""
+    from . import verified
+    t = _run_task(p)
+    if not t:
+        return
+    try:
+        verified.record(p.db, t["id"], "checks", head, tree=tree, commands=[str(c) for c in cmds],
+                        run=os.environ.get("TTP_RUN_ID") or "?")
+    except Exception as e:
+        print(f"ttp checks: could not record the verified-through marker: {e}", file=sys.stderr)
 
 
 def _harness_purpose(a) -> dict:
@@ -2336,6 +2408,44 @@ def cmd_landed(a) -> None:
     sys.exit(landed.run(p, a))
 
 
+def cmd_ack_wait(a) -> None:
+    """`ttp ack-wait probe|settle --from <project> --hash <h>`: wait model-free for another project's
+    reply to a note (ackwait.py). probe: 0 once the reply is in this machine's inbox, 1 while not, 2
+    when it cannot tell. settle (an on_pass_cmd): write the hand-off quoting the reply to $TTP_RESULT."""
+    from . import ackwait
+    p = here()
+    if not p:
+        print("ttp ack-wait: no project here (run it in a project or with TTP_PROJECT set)")
+        sys.exit(ackwait.CANNOT)
+    if a.frm == p.name or not (local_project(a.frm) or remote_entry(a.frm)):
+        print(f"ttp ack-wait: {a.frm!r} is not another project of this user's; `ttp list` shows them")
+        sys.exit(ackwait.CANNOT)
+    try:
+        n = ackwait.find(p.name, a.frm, a.hash)
+    except ValueError as e:
+        print(f"ttp ack-wait: {e}")
+        sys.exit(ackwait.CANNOT)
+    except OSError as e:
+        print(f"ttp ack-wait: cannot read the inbox: {e}")
+        sys.exit(ackwait.CANNOT)
+    if not n:
+        print(f"no reply from {a.frm} naming {a.hash.strip().lower()} yet")
+        sys.exit(ackwait.WAITING)
+    if a.action == "probe":
+        print(f"{a.frm} replied: note {n['fp']}")
+        sys.exit(ackwait.FOUND)
+    out = os.environ.get("TTP_RESULT")
+    if not out:
+        die("ttp ack-wait settle is an on_pass_cmd: it writes the hand-off to $TTP_RESULT, which is not set",
+            ackwait.CANNOT)
+    write_json(Path(out), ackwait.handoff(n, a.frm, a.hash.strip().lower(), a.status))
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
+    if run_dir:
+        durable_append(Path(run_dir) / "progress.md",
+                       f"{time.strftime('%H:%M:%S')} {a.frm} replied to {a.hash.strip().lower()}: note {n['fp']}\n")
+    print(f"{a.frm} replied (note {n['fp']}); hand-off {a.status} written to {out}")
+
+
 def cmd_detach(a) -> None:
     """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
 
@@ -2538,8 +2648,10 @@ def cmd_devq(a) -> None:
     """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
 
     `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] [--input <path>]...
-    [--cold-start <s>] [--no-lint] -- <command>` lints the command first (devq.lint: bash -n, the scripts it
-    calls exist on the host, a task id not this task's; --no-lint skips it), then
+    [--cold-start <s>] [--wedge-pattern <regex>]... [--no-wedge-check] [--no-lint] -- <command>` lints the
+    command first (devq.lint: bash -n, the scripts it calls exist on the host, a task id not this task's;
+    --no-lint skips it; --wedge-pattern replaces the runner's wedge_patterns for this job and
+    --no-wedge-check turns them off), then
     queues one job on the runner's host (whose job guard, devq.guard, may refuse it; it checks the --input
     paths are readable there and warns on a --cold-start longer than the job's limit) and starts the runner if it is down (with runner.device_timeout_max_s
     set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
@@ -2569,7 +2681,8 @@ def cmd_devq(a) -> None:
     rest = list(a.rest or [])
     if a.op == "submit":
         usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
-                 "[--input <path>]... [--cold-start <s>] [--no-lint] -- <command...>")
+                 "[--input <path>]... [--cold-start <s>] [--wedge-pattern <regex>]... [--no-wedge-check] "
+                 "[--no-lint] -- <command...>")
         opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
         sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
         for flag in ("--id", "--config", "--workdir"):
@@ -2578,6 +2691,8 @@ def cmd_devq(a) -> None:
         sp.add_argument("--input", action="append", default=[])
         sp.add_argument("--cold-start", type=int, default=0)
         sp.add_argument("--no-lint", action="store_true")
+        sp.add_argument("--wedge-pattern", action="append", default=[])
+        sp.add_argument("--no-wedge-check", action="store_true")
         try:
             o, extra = sp.parse_known_args(opts)
         except SystemExit:
@@ -2596,6 +2711,13 @@ def cmd_devq(a) -> None:
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
                 "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout,
                 "inputs": o.input, "cold_start_s": o.cold_start}
+        if o.wedge_pattern and o.no_wedge_check:
+            die("devq submit: --wedge-pattern and --no-wedge-check exclude each other")
+        if o.wedge_pattern or o.no_wedge_check:
+            spec["wedge_patterns"] = o.wedge_pattern
+            bad = devq.pattern_problems(o.wedge_pattern)
+            if bad:
+                die("devq submit: --wedge-pattern: " + "; ".join(bad))
         if not o.no_lint:
             errors, warnings = devq.lint(spec["cmd"], rc, o.id, o.workdir, spec["task"])
             for w in warnings:
@@ -2700,6 +2822,8 @@ def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
     if a.action != "add" and (a.start_when, a.start_after, a.why) != (None, None, None):
         die("--start-when, --start-after and --why go with add; for a queued task use set-when")
+    if a.action != "set-when" and a.on_pass_cmd is not None:
+        die("--on-pass-cmd goes with set-when")
     if a.action == "add":
         try:
             tid, note = add_task(p, a)
@@ -2727,7 +2851,7 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit():
             die(f"set-when needs a task id, not {a.title!r}")
         try:
-            print(set_when(p.db, int(a.title), a.probe, p))
+            print(set_when(p.db, int(a.title), a.probe, p, on_pass_cmd=a.on_pass_cmd))
         except ValueError as e:
             die(str(e))
     elif a.action == "superseded":
@@ -2757,14 +2881,17 @@ def add_task(p, a) -> tuple[int, str]:
         + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
 
-def set_when(db, tid: int, probe: str | None, p=None) -> str:
+def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
     `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update
-    (the push branch's log check needs `p`)."""
+    (the push branch's log check needs `p`). `on_pass_cmd` sets (\"\" clears) a waiting task's
+    model-free completion command; `probe` None then keeps its retry_when. The first rewrite keeps
+    what the run's result.json says as retry_when_orig / on_pass_cmd_orig, so the daemon still
+    takes that result.json as the hand-off the task waits on (daemon._same_probe)."""
     from .coordinator import _start_args, check_probe, check_task_refs, defer_labels, marker_only_probe, start_why
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
-    if probe is None:
-        raise ValueError("set-when needs the probe command (\"\" clears it)")
+    if probe is None and on_pass_cmd is None:
+        raise ValueError("set-when needs the probe command (\"\" clears it) or --on-pass-cmd")
     with db.tx():   # BEGIN IMMEDIATE: the daemon cannot start the task between the check and the write
         task = db.task(tid)
         if not task:
@@ -2774,15 +2901,30 @@ def set_when(db, tid: int, probe: str | None, p=None) -> str:
                              f"its probe changed; add a new one instead")
         prev = load_result(task["result"])
         if prev.get("status") == "waiting" and not deferral(task).get("when"):
-            check_probe(probe, "retry_when")
-            check_task_refs(db, probe, "retry_when")
-            if probe.strip():
-                prev["retry_when"] = probe.strip()
-            else:
-                prev.pop("retry_when", None)
+            said = []
+            if probe is not None:
+                check_probe(probe, "retry_when")
+                check_task_refs(db, probe, "retry_when")
+            if on_pass_cmd is not None:
+                check_probe(on_pass_cmd, "on_pass_cmd")
+            for key, value in (("retry_when", probe), ("on_pass_cmd", on_pass_cmd)):
+                if value is None:
+                    continue
+                prev.setdefault(f"{key}_orig", prev.get(key))
+                if value.strip():
+                    prev[key] = value.strip()
+                else:
+                    prev.pop(key, None)
             db.update_task(tid, result=dump_result(prev))
-            return f"task #{tid} retry_when " + (f"set: {probe.strip()}" if probe.strip()
-                                                 else "cleared; it wakes at its retry timer")
+            if probe is not None:
+                said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
+                                             else "cleared; it wakes at its retry timer"))
+            if on_pass_cmd is not None:
+                said.append("on_pass_cmd " + (f"set: {on_pass_cmd.strip()}" if on_pass_cmd.strip()
+                                              else "cleared; a passed probe wakes it"))
+            return f"task #{tid} " + "; ".join(said)
+        if on_pass_cmd is not None:
+            raise ValueError(f"task #{tid} is not waiting on a hand-off: only a waiting task has an on_pass_cmd")
         cur = deferral(task)
         after, when = _start_args({"start_when": probe}, cur, p)
         db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]"))
@@ -2990,11 +3132,12 @@ def cmd_heal(a) -> None:
 
 def cmd_obligation(a) -> None:
     """`ttp obligation add|attach|progress|receipt|drop|list`: urgent deliverables owed to the user (obligations.py).
-    Inside a run, progress and receipts go to the run's file and the daemon files them for its task."""
+    Inside a run, progress and receipts go to the run's file and the daemon files them for its task; so
+    do a task's on_pass_cmd's (note-only context: the waiting run's directory)."""
     from . import obligations as ob
     if a.milestone and a.action != "receipt":
         die("--milestone is for a checked milestone receipt")
-    run_dir = os.environ.get("TTP_RUN_DIR")
+    run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
     if run_dir and a.action in ("progress", "receipt"):
         task = os.environ.get("TTP_TASK") or ""
         if not task.isdigit():
@@ -4648,6 +4791,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--onto", help="the branch to look on (default: delivery.push_branch)")
     s.set_defaults(fn=cmd_landed)
 
+    s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
+                                        "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "
+                                        "(an on_pass_cmd: writes the hand-off quoting the reply to $TTP_RESULT)")
+    s.add_argument("action", choices=["probe", "settle"])
+    s.add_argument("--from", dest="frm", required=True, metavar="PROJECT", help="the project that replies")
+    s.add_argument("--hash", required=True, help="the note's id or sha256 prefix, as `ttp note --to` printed it; "
+                                                 "the reply names it")
+    s.add_argument("--status", choices=["done", "needs_review"], default="done", help="settle: the hand-off's status")
+    s.set_defaults(fn=cmd_ack_wait)
+
     s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="*", metavar="RC",
                    help="exit 0 once every job of these .rc paths ended or is gone, else 1 (for retry_when)")
@@ -4731,6 +4884,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
     s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
     s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")
+    s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
+                   "retry_when passes (\"\" clears it); without a probe its retry_when stays")
     s.set_defaults(fn=cmd_task)
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "

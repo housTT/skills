@@ -79,6 +79,7 @@ from . import timefmt
 from . import turngate
 from . import unblock
 from . import upstream
+from . import verified
 from . import waitheal
 from . import watchdup
 from . import screen as scr
@@ -103,6 +104,14 @@ LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
+# A tick still running this long gets every thread's stack written to TICK_STACKS (faulthandler) and,
+# once it ends, an alert: a slow step that keeps telling the watchdogs it moves is never restarted.
+TICK_OVERRUN_S = 900
+# A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
+# (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
+TICK_STALL_S = HEARTBEAT_STALE_S
+TICK_STACKS = "tick-stacks.log"   # under logs/; also written on SIGUSR2, where ptrace is not allowed
+TICK_STACKS_MAX = 2_000_000   # bytes before the file is rotated to <name>.1
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 STACKS_FILE = "daemon-stacks.log"   # SIGUSR1 appends every thread's stack here (register_stack_dump)
 STACKS_MAX_BYTES = 1 << 20          # a longer one is started afresh when the daemon starts
@@ -473,6 +482,10 @@ class Daemon:
         self.identity = identity.capture(boot=self.boot, started=self._started)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
+        self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
+        self._moved = 0.0        # when the running tick last made progress, monotonic
+        self._step_name = ""     # the tick step running now
+        self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
@@ -567,10 +580,12 @@ class Daemon:
         self.sync_schedules(start=True)
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
+        self._watch_ticks()
         self.check_integrity(start=True)
         while not self.stopping:
             try:
                 self.tick()
+                self._tick_ended()
                 self._beat()
                 try:
                     service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
@@ -756,11 +771,81 @@ class Daemon:
             except (OSError, subprocess.SubprocessError):
                 pass
 
+    def _stacks_file(self):
+        """logs/TICK_STACKS opened for appending, rotated once past TICK_STACKS_MAX."""
+        stacks = self.p.logs / TICK_STACKS
+        stacks.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if stacks.stat().st_size > TICK_STACKS_MAX:
+                stacks.replace(stacks.with_name(stacks.name + ".1"))
+        except OSError:
+            pass
+        return open(stacks, "a")
+
+    def _watch_ticks(self, every_s: float = 30) -> None:
+        """A thread that dumps every thread's stack when a tick overruns (check_overrun), and SIGUSR2
+        for a dump on demand: a py-spy or gdb attach needs ptrace, which hardened hosts refuse."""
+        try:
+            self._sig_stacks = self._stacks_file()   # kept open: faulthandler writes to its fd
+            faulthandler.register(signal.SIGUSR2, file=self._sig_stacks, all_threads=True)
+        except (OSError, RuntimeError, ValueError, AttributeError):
+            pass   # no SIGUSR2 (Windows) or no logs/: the overrun dump still works
+
+        def watch() -> None:
+            while not self.stopping:
+                time.sleep(every_s)
+                try:
+                    self.check_overrun()
+                except Exception:   # never in the way of the tick
+                    log(self.p, "tick watch error: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        threading.Thread(target=watch, daemon=True, name="tick-watch").start()
+
+    def check_overrun(self, now: float | None = None) -> dict | None:
+        """Once per tick that has run TICK_OVERRUN_S, and once per stall of TICK_STALL_S without progress
+        (before the watchdogs restart it): log it with the step it is in, and append every thread's
+        stack to logs/TICK_STACKS. Monotonic time, which stands still while the host sleeps, so a
+        sleep is no overrun. Runs on the watch thread (files only, never the database)."""
+        now = time.monotonic() if now is None else now
+        began, moved, o = self._tick_began, self._moved, self._overrun or {}
+        if not began:
+            return None
+        same = o.get("began") == began
+        stalled = now - moved >= TICK_STALL_S and not (same and o.get("moved") == moved)
+        if not stalled and (same or now - began < TICK_OVERRUN_S):
+            return None
+        path, step, mins = self.p.logs / TICK_STACKS, self._step_name, int((now - began) // 60)
+        what = (f"tick stalled: no progress for {int((now - moved) // 60)} min, running {mins} min" if stalled
+                else f"tick overrun: running {mins} min")
+        with self._stacks_file() as fh:
+            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {what}, in step {step or '(before the steps)'}\n")
+            fh.flush()
+            faulthandler.dump_traceback(file=fh, all_threads=True)
+        self._overrun = {"began": began, "moved": moved, "step": step, "stacks": str(path),
+                         "stalled": stalled or bool(same and o.get("stalled"))}
+        log(self.p, f"{what}, in step {step or '(none yet)'}; "
+                    f"every thread's stack is in {path}")
+        return self._overrun
+
+    def _tick_ended(self) -> None:
+        """After a tick: alert once when it overran (check_overrun), naming the step and its stacks."""
+        began, self._tick_began = self._tick_began, 0.0
+        o = self._overrun
+        if not o or o.get("began") != began or o.get("alerted"):
+            return
+        o["alerted"] = True
+        mins = int((time.monotonic() - began) // 60)
+        log(self.p, f"tick overrun over: the tick took {mins} min")
+        stall = f" ({TICK_STALL_S // 60} min or more without progress)" if o.get("stalled") else ""
+        self.alert("tick-overrun", f"A daemon tick took {mins} min{stall}, in step {o['step'] or '(none)'}: no worker "
+                                   f"started and no message was handled meanwhile. Every thread's stack while it "
+                                   f"ran is in {o['stacks']}.", severity="normal")
+
     def _progress(self) -> None:
         """A tick step finished: tell systemd's WatchdogSec and `ttp.watchdog` the daemon still moves,
         so a long tick (a first tick that fetches and adds many worktrees, several slow watchers) is
         not taken for a stuck one. Before this daemon's first completed tick the heartbeat is left
         alone (`ttp restart` reads it as that tick); the start marker carries the progress instead."""
+        self._moved = time.monotonic()   # for check_overrun's stall dump
         now = time.time()
         if now - self._progressed < PROGRESS_EVERY_S:
             return
@@ -775,6 +860,8 @@ class Daemon:
             pass
 
     def tick(self) -> None:
+        self._tick_began = self._moved = time.monotonic()
+        self._step_name = ""
         self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
@@ -786,6 +873,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity,
                      self.sync_schedules, self.lint_charter, self.tend_holds):
+            self._step_name = step.__name__
             step()
             self._progress()
         self._idle.update(self.cfg, self._has_work)
@@ -810,6 +898,7 @@ class Daemon:
             if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
+            self._step_name = step.__name__
             step()
             self._progress()
 
@@ -2674,6 +2763,8 @@ class Daemon:
                 approval, new = check, "pushing"
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
+        if new in ("done", "pushing"):
+            self._mark_verified(task, approval, extra)
         if ended:
             extra["run_status"] = ended
         if wakes and new != "blocked":
@@ -2958,27 +3049,60 @@ class Daemon:
             stamp = get_provider(prov).credentials_stamp()
         except Exception:
             stamp = ""
+        # The account it ran as before the logout, as runs record it (opaque), and its kind: a login
+        # that comes back on another account is held for one more check, then named (check_logins).
+        acct = budgetkind.account_hash(bud.current_accounts(db).get(prov) or "")
         # Its CLI said logged in, yet a run was refused again before any got through: that check
         # proves nothing for this logout, or every close would release the queue to fail once more.
         distrust = prev.get("closed_why") == LOGIN_CHECK_PASSED and \
             not alerts.login_proven(db, prov, float(prev.get("closed") or 0))
         db.set_kv(alerts.BREAKER + prov, {"open": True, "opened": now, "checks": 0, "creds": stamp,
+                                          **({"account": acct, "account_kind": self._account(prov)[1]} if acct else {}),
                                           "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200],
                                           **({"distrust": True} if distrust else {})})
         log(self.p, f"{prov}: logged out; no runs start on it until a login check passes")
 
-    def _close_breaker(self, prov: str, rec: dict, why: str) -> None:
+    def _account(self, prov: str) -> tuple[str, str]:
+        """The account `prov` is logged in as now: its opaque id (budgetkind.account_hash of the label
+        runs record) and its kind (never an email address)."""
+        try:
+            agent = get_provider(prov)
+            return budgetkind.account_hash(agent.account() or ""), agent.account_kind() or ""
+        except Exception:
+            return "", ""
+
+    def _account_switched(self, prov: str, rec: dict) -> dict | None:
+        """{"from", "to"} kinds when `prov` is logged in again as another account than before the
+        logout; None when it is the same one, or either is unknown."""
+        now_acct, kind = self._account(prov)
+        if not rec.get("account") or not now_acct or now_acct == rec["account"]:
+            return None
+        return {"from": rec.get("account_kind") or "", "to": kind}
+
+    def _close_breaker(self, prov: str, rec: dict, why: str, switched: dict | None = None) -> None:
         now = time.time()
-        self.p.db.set_kv(alerts.BREAKER + prov, {"open": False, "opened": rec.get("opened"), "closed": now,
-                                                 "checks": rec.get("checks", 0), "closed_why": why})
-        self.p.db.set_kv(f"auth_probe:{prov}", 0)
-        log(self.p, f"{prov}: {why}; runs start on it again")
+        with self.p.db.tx():
+            self.p.db.set_kv(alerts.BREAKER + prov, {"open": False, "opened": rec.get("opened"), "closed": now,
+                                                     "checks": rec.get("checks", 0), "closed_why": why,
+                                                     **({"switched": switched} if switched else {})})
+            self.p.db.set_kv(f"auth_probe:{prov}", 0)
+            if switched:
+                # Recorded only: the budget fingerprint (budgetkind) re-plans for the new account.
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                            (now, "daemon", ACCOUNT_SWITCH_EVENT, "low",
+                             f"{prov} is logged in again as another account than before the logout "
+                             f"({alerts.switch_text(switched)}).", "handled",
+                             json.dumps({"provider": prov, **switched})))
+        log(self.p, f"{prov}: {why}; runs start on it again"
+                    + (f" (another account: {alerts.switch_text(switched)})" if switched else ""))
 
     def check_logins(self) -> None:
         """Close each open auth breaker once its provider is logged in again: its CLI says so (a
         model-free status check on the AUTH_CHECK_S backoff, at once when its credential files
         change), or a run started since it opened got past the login. A CLI without a status check
-        says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe)."""
+        says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe). A login back as
+        another account than before the logout waits one more check; still another then, it closes
+        and says so (_close_breaker)."""
         db, now = self.p.db, time.time()
         # A logged-out alert from before the breaker existed (an upgrade) opens it.
         for ep in db.q("SELECT key, MIN(raised) raised FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL "
@@ -2993,7 +3117,7 @@ class Daemon:
             if not rec:
                 continue
             if alerts.login_proven(db, prov, float(rec.get("opened") or 0)):
-                self._close_breaker(prov, rec, "a run on it got past the login")
+                self._close_breaker(prov, rec, "a run on it got past the login", self._account_switched(prov, rec))
                 continue
             try:
                 agent = get_provider(prov)
@@ -3001,7 +3125,8 @@ class Daemon:
             except Exception:
                 agent, stamp = None, ""
             changed = bool(stamp) and stamp != rec.get("creds")
-            if now < float(rec.get("next_check") or 0) and not changed:
+            # Held for another account (below): the next check waits its step, so a switch can finish.
+            if now < float(rec.get("next_check") or 0) and (not changed or rec.get("account_hold")):
                 continue
             try:
                 ok = agent.login_check() if agent and not rec.get("distrust") else None
@@ -3009,7 +3134,15 @@ class Daemon:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None
             if ok or (ok is None and changed):
-                self._close_breaker(prov, rec, LOGIN_CHECK_PASSED if ok else "its credentials changed")
+                switched = self._account_switched(prov, rec)
+                if switched and not rec.get("account_hold"):
+                    # Logged in again as another account than before the logout: the user may be
+                    # mid-switch. Nothing starts until one more check; still another account then, it starts.
+                    db.set_kv(alerts.BREAKER + prov, {**rec, "account_hold": now, "last_check": now, "creds": stamp,
+                                                      "next_check": now + AUTH_CHECK_S[0]})
+                    log(self.p, f"{prov}: logged in again as another account; one more login check before runs start")
+                    continue
+                self._close_breaker(prov, rec, LOGIN_CHECK_PASSED if ok else "its credentials changed", switched)
                 continue
             n = int(rec.get("checks") or 0) + 1
             db.set_kv(alerts.BREAKER + prov, {**rec, "checks": n, "last_check": now, "creds": stamp, "probe": ok is None,
@@ -5888,7 +6021,7 @@ class Daemon:
         r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND dir IS NOT NULL "
                           "ORDER BY id DESC LIMIT 1", (tid,))
         full = _read_result(Path(r["dir"]) / RESULT_FILE) if r and r["dir"] else None
-        if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
+        if not full or full.get("status") != "waiting" or not _same_probe(full, prev, "on_pass_cmd") \
                 or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
         if r["status"] == "running":
@@ -5941,6 +6074,11 @@ class Daemon:
             if r and r["dir"]:
                 # Its notes were acknowledged when sent: they go out whatever it ends with.
                 self._file_queued_notes(run_id, tid, Path(r["dir"]))
+                try:   # and its obligation records, while its task is still queued (file_runs reads those)
+                    for line in obligations.file_runs(self.p, now):
+                        log(self.p, f"obligation record refused: {line}")
+                except Exception:
+                    log(self.p, "obligations: filing an on_pass_cmd's records failed\n" + traceback.format_exc())
             task = db.task(tid)
             prev = load_result(task["result"]) if task else {}
             if not task or task["status"] != "queued" or prev.get("status") != "waiting" \
@@ -6339,6 +6477,8 @@ class Daemon:
         if prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
+        if line := self._verified_review_line(task, full):
+            lines.append(line)
         lines.append(REVIEW_CHECK_LINE)
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
                      "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
@@ -6430,6 +6570,39 @@ class Daemon:
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
+
+    def _verified_review_line(self, task: dict, full: str) -> str:
+        """The review spec's line on the review marker the code task inherits (verified.py): review only
+        what came after it while it is an ancestor of the head, else the whole change. "" without one."""
+        try:
+            m = verified.scope(self.p.db, task, self.p.root, full, "review")
+        except Exception as e:
+            log(self.p, f"task {task['id']}: inherited marker not read: {e}")
+            return ""
+        if not m:
+            return ""
+        if not m["ok"]:
+            return f"Inherited marker: {m['line']}: review the whole change, inherited commits included."
+        return (f"Inherited marker: {m['line']}. Review only the commits after it (`git log {m['sha'][:12]}.."
+                f"{full[:12]}`); do not review or re-test the inherited commits again. The push checks still run "
+                f"in full on the commit that is pushed.")
+
+    def _mark_verified(self, task: dict, approval: dict | None, extra: dict) -> None:
+        """A passing review records the head it accepted as the reviewed code tasks' `review` marker
+        (verified.py); a finished task's hand-off shows the marker it reached. Never fails the hand-off."""
+        try:
+            if task["kind"] == "review":
+                heads = [e["head"] for e in (approval or {}).get("entries") or [] if e.get("head")]
+                head = heads[0] if heads else worktree.reviewed_head(self.p, task)
+                if not head:
+                    return
+                for t in push._reviewed(self.p, str(task["id"])):
+                    verified.record(self.p.db, t["id"], "review", head, review=task["id"])
+                extra["verified_through"] = head
+            elif m := verified.own(self.p.db, task["id"], "checks"):
+                extra["verified_through"] = m["sha"]
+        except Exception as e:
+            log(self.p, f"task {task['id']}: verified-through marker not recorded: {e}")
 
     def _precheck_line(self, task: dict, head: str, checks: Path) -> str:
         """The review spec's line on the checks _precheck started on the code task's head."""
@@ -7157,6 +7330,7 @@ PAUSED_NOTE = "waits for a paused resource:"
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
+ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:
@@ -7622,11 +7796,12 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     return [x[:300] for x in lines if x.strip()][-n:]
 
 
-def _same_probe(full: dict, prev: dict) -> bool:
-    """Whether a run's result.json `full` wrote the retry_when the task waits on (`prev`): the same one,
-    or the one a resource move rewrote (task_update keeps it as retry_when_orig)."""
-    probe = full.get("retry_when")
-    return probe == prev.get("retry_when") or probe is not None and probe == prev.get("retry_when_orig")
+def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:
+    """Whether a run's result.json `full` wrote the retry_when (or `key`) the task waits on (`prev`): the
+    same one, or the one a resource move or `ttp task set-when` rewrote (kept as `<key>_orig`, None when
+    the run wrote none)."""
+    probe = full.get(key)
+    return probe == prev.get(key) or f"{key}_orig" in prev and probe == prev[f"{key}_orig"]
 
 
 def _wait_key(result: dict) -> str:

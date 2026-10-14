@@ -304,7 +304,8 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
     patches = [e for e in old.get("patches") or [] if isinstance(e, dict)]
     named_files, keep, dropped, sizes = _split(root, named, others, cap_mb)
     big = [f for f in keep if sizes[f] > TAR_MAX_MB * 1e6 and not (root / f).is_symlink()]
-    small = [f for f in keep if f not in big]
+    big_set = set(big)
+    small = [f for f in keep if f not in big_set]
     why = room(dest, need_bytes(root, dest, small, big, sizes, patch), reserve_bytes)
     if why:
         raise NoRoom(why)
@@ -317,15 +318,7 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
         n = 0
         while (dest / (patch_name := "tracked.patch" if not n else f"tracked.{n}.patch")).exists():
             n += 1
-    new = []
-    for f in keep + dropped:
-        full = root / f
-        progress()
-        digest = "" if full.is_symlink() else sha256(full, progress)
-        new.append({"path": f, "size": sizes[f], "sha256": digest, "named": f in named_files,
-                    "stored": "dropped" if f in dropped else "file" if f in big else "tar",
-                    **({"archive": tar_name} if f in small else {}),
-                    **({"blob": blob(digest)} if f in big else {}), "at": time.time()})
+    new = _entries(root, keep + dropped, sizes, set(named_files), set(dropped), big_set, tar_name, progress)
     new_patches = [{"file": patch_name, "size": len(patch), "sha256": hashlib.sha256(patch).hexdigest(),
                     "paths": list(tracked), "at": time.time()}] if patch else []
     info = {"task": task["id"], "status": task.get("status") or "", "branch": task.get("branch") or "",
@@ -419,10 +412,27 @@ def store(p: Project, task: dict, root: Path, named: list[str], others: list[str
             **({"patch": str(dest / patch_name)} if patch else {})}
 
 
+def _entries(root: Path, files: list[str], sizes: dict, named: set, dropped: set, big: set, tar_name: str,
+             progress=lambda: None) -> list[dict]:
+    """A manifest entry per file, hashed. Membership is looked up in sets: a hand-off may name a
+    directory of hundreds of thousands of files, and a list scan per file made that hours of CPU."""
+    new = []
+    for f in files:
+        full = root / f
+        progress()
+        digest = "" if full.is_symlink() else sha256(full, progress)
+        stored = "dropped" if f in dropped else "file" if f in big else "tar"
+        new.append({"path": f, "size": sizes[f], "sha256": digest, "named": f in named, "stored": stored,
+                    **({"archive": tar_name} if stored == "tar" else {}),
+                    **({"blob": blob(digest)} if stored == "file" else {}), "at": time.time()})
+    return new
+
+
 def _split(root: Path, named: list[str], others: list[str], cap_mb: float):
     """(the named files, the files to archive, the files to drop, size of each); see store."""
     named_files = files_of(root, named)
-    other_files = [f for f in files_of(root, others) if f not in named_files]
+    seen = set(named_files)
+    other_files = [f for f in files_of(root, others) if f not in seen]
     sizes = {f: (root / f).lstat().st_size for f in named_files + other_files}
     keep, left, dropped = list(named_files), cap_mb * 1e6, []
     for f in sorted(other_files, key=lambda f: (sizes[f], f)):

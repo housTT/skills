@@ -267,6 +267,9 @@ class Codex(Provider):
         mode = auth.get("auth_mode") or ("api_key" if auth.get("OPENAI_API_KEY") else "chatgpt")
         return f"codex ({mode})"
 
+    def account_kind(self) -> str:
+        return self.account()
+
     def meter(self) -> list:
         """Plan windows via the app-server protocol; spends no model tokens."""
         exe = self.binary()
