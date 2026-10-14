@@ -44861,6 +44861,9 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "outside_user: not a regex" in " ".join(devq.config_problems("r", {"outside_user": "("}))
     assert devq.settings({"legacy_driver": "x"})["outside_user"] == "x", "the old key name is still read"
     assert devq.settings({"legacy_driver": "x", "outside_user": "y"})["outside_user"] == "y"
+    assert devq.config_problems("r", {"legacy_driver": "x"}) == [], "the old key name is no unknown key"
+    assert not [x for x in config_problems({"device": {"runners": {"r": {"legacy_driver": "x"}}}}) if "legacy_driver" in x]
+    assert devq.config_problems("r", {"legacy_driver": 3}) == ["device.runners.r.legacy_driver: 3 is not a string"]
     tid = p.db.add_task("run it", "s", kind="work", tier="light", origin="user")
     assert "device runners: dev (on this machine)" in worker_task(p, p.db.task(tid), str(p.root), None)
     p.set_config("device", {"runners": {}})

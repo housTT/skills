@@ -83,6 +83,9 @@ NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped", "wedged")
 
 
+_ALIASES = {"legacy_driver": "outside_user"}   # old key name -> the key it still sets (see settings)
+
+
 def config_problems(name: str, cfg) -> list:
     """One line per problem in config device.runners.<name>."""
     where = f"device.runners.{name}"
@@ -90,19 +93,20 @@ def config_problems(name: str, cfg) -> list:
         return [f"{where}: a runner name is letters, digits, . _ -"]
     if not isinstance(cfg, dict):
         return [f"{where}: not a table of settings"]
-    out = [f"{where}.{k}: unknown key" for k in cfg if k not in RUNNER_DEFAULTS]
+    out = [f"{where}.{k}: unknown key" for k in cfg if _ALIASES.get(k, k) not in RUNNER_DEFAULTS]
     for k, v in cfg.items():
-        if k not in RUNNER_DEFAULTS:
+        if _ALIASES.get(k, k) not in RUNNER_DEFAULTS:
             continue
-        if isinstance(RUNNER_DEFAULTS[k], int) and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+        default = RUNNER_DEFAULTS[_ALIASES.get(k, k)]
+        if isinstance(default, int) and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
             out.append(f"{where}.{k}: {v!r} is not a number >= 0")
-        elif isinstance(RUNNER_DEFAULTS[k], str) and not isinstance(v, str):
+        elif isinstance(default, str) and not isinstance(v, str):
             out.append(f"{where}.{k}: {v!r} is not a string")
         elif k in _CHOICES and v not in _CHOICES[k]:
             out.append(f"{where}.{k}: {v!r} is not one of {', '.join(repr(c) for c in _CHOICES[k])}")
         elif k == "wedge_patterns":
             out += [f"{where}.{k}: {x}" for x in pattern_problems(v)]
-        elif isinstance(RUNNER_DEFAULTS[k], list):
+        elif isinstance(default, list):
             ok = isinstance(v, list) and all(isinstance(x, str) and x.startswith(("/", "~")) for x in v)
             if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
                 out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
@@ -165,8 +169,9 @@ def scan_wedge(path: Path, offset: int, patterns: list) -> tuple:
 
 def settings(cfg: dict | None) -> dict:
     cfg = cfg or {}
-    if "legacy_driver" in cfg and "outside_user" not in cfg:   # the key's old name
-        cfg = {**cfg, "outside_user": cfg["legacy_driver"]}
+    for old, new in _ALIASES.items():
+        if old in cfg and new not in cfg:
+            cfg = {**cfg, new: cfg[old]}
     return {**RUNNER_DEFAULTS, **{k: v for k, v in cfg.items() if k in RUNNER_DEFAULTS}}
 
 
