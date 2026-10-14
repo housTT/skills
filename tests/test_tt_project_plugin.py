@@ -1201,3 +1201,113 @@ def test_setup_box_bare_metal_page_covers_the_route():
                  "git submodule update --init --recursive", "ccache", "not portable",
                  "box.py bare check <box-alias>"):
         assert part in page, part
+
+
+def _migrate_home(tmp_path, present):
+    """A fake HOME (plus PATH stubs for mutagen and crontab), with every sync leftover or none."""
+    home, stubs, repo = tmp_path / "home", tmp_path / "stubs", tmp_path / "proj"
+    for d in (home / ".ssh", stubs, repo, home / ".claude" / "skills"):
+        d.mkdir(parents=True)
+    (home / ".ssh" / "config").write_text("Host <box-alias>\n    User <user>\n")
+    mutagen = "echo 'unable to connect to daemon' >&2; exit 1"
+    crontab = "echo 'no crontab for user' >&2; exit 1"
+    if present:
+        ttw = home / "tt-workflows"
+        for d in ("skills/tt-old", "hooks", "scripts"):
+            (ttw / d).mkdir(parents=True)
+        (ttw / "scripts" / "devrun.sh").write_text("#!/bin/sh\n")
+        (ttw / "hooks" / "guard.py").write_text("")
+        units = home / ".config" / "systemd" / "user"
+        units.mkdir(parents=True)
+        (units / "devsync.service").write_text("[Service]\n")
+        (home / "Library" / "LaunchAgents").mkdir(parents=True)
+        (home / "Library" / "LaunchAgents" / "org.example.devsync.plist").write_text("")
+        with (home / ".ssh" / "config").open("a") as f:
+            f.write("\n# devsync-managed ssh-hosts\nInclude ~/.devsync/ssh-hosts\n")
+        for skills in (".claude/skills", ".agents/skills", ".cursor/skills"):
+            (home / skills).mkdir(parents=True, exist_ok=True)
+            (home / skills / "tt-old").symlink_to(ttw / "skills" / "tt-old")
+        (home / ".claude" / "skills" / "tt-gone").symlink_to(ttw / "skills" / "tt-gone")
+        (home / ".claude" / "skills" / "tt-mine").symlink_to(tmp_path)
+        hook = f"python3 {ttw}/hooks/guard.py"
+        (home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": hook}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/true"}]}]}}))
+        (home / ".codex").mkdir()
+        (home / ".codex" / "hooks.json").write_text(json.dumps(
+            {"hooks": {"PreToolUse": [{"hooks": [{"command": f"{ttw}/hooks/missing.sh"}]}]}}))
+        (home / ".cursor" / "hooks.json").write_text(json.dumps(
+            {"version": 1, "hooks": {"beforeShellExecution": [{"command": hook}]}}))
+        mutagen = ("printf 'Name: proj-sync\\nIdentifier: sync_abc\\nAlpha:\\n\\tURL: /src\\n'; "
+                   '[ "$MUTAGEN_DISABLE_AUTOSTART" = 1 ] || echo autostarted')
+        crontab = (f"echo '*/5 * * * * {ttw}/scripts/cron_lap.sh --dir x'; "
+                   f"echo '# 0 * * * * {ttw}/scripts/old.sh'; echo '0 1 * * * /usr/bin/true'")
+        (repo / "ttw.toml").write_text('[host]\ndevice_host = "<box-alias>"\nremote_root = "/<workdir>"\n')
+        (repo / "run.sh").write_text("#!/bin/sh\n~/tt-workflows/scripts/devrun.sh make\n")
+        (repo / "run.log").write_text("devrun.sh quoted in a log\n")
+    for name, body in (("mutagen", mutagen), ("crontab", crontab)):
+        (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+        (stubs / name).chmod(0o755)
+    return home, stubs, repo
+
+
+def _migrate_run(home, stubs, repo, *extra):
+    import subprocess
+    env = dict(os.environ, HOME=str(home), PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    return subprocess.run([sys.executable, str(BOX_PY), "migrate", "check", "--home", str(home),
+                           "--repo", str(repo), *extra], capture_output=True, text=True, timeout=60, env=env)
+
+
+def _tree(root):
+    return sorted((str(p), p.is_symlink() or p.stat().st_mtime_ns) for p in root.rglob("*"))
+
+
+def test_setup_box_migrate_check_reports_every_leftover_and_changes_nothing(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=True)
+    before = _tree(tmp_path)
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = r.stdout
+    assert "found devsync-unit: " in out and "devsync.service" in out and "org.example.devsync.plist" in out
+    assert "found ssh-include: " in out and "Include ~/.devsync/ssh-hosts" in out
+    assert "found mutagen: sync session proj-sync (sync_abc)" in out and "autostarted" not in out
+    for skills in (".claude/skills", ".agents/skills", ".cursor/skills"):
+        assert f"found skill-link: {home / skills / 'tt-old'} -> " in out, skills
+    assert "inactive skill-link: " in out and "tt-gone" in out and "(dangling)" in out
+    assert "tt-mine" not in out
+    assert "found hook: " + str(home / ".claude/settings.json") + " PreToolUse: python3 " in out
+    assert "/usr/bin/true" not in out
+    assert str(home / ".codex/hooks.json") + " PreToolUse: " in out and "script missing" in out
+    assert str(home / ".cursor/hooks.json") + " beforeShellExecution: " in out
+    assert "found cron: crontab line 1:" in out and "inactive cron: crontab line 2:" in out
+    assert "crontab line 3" not in out
+    assert 'device_host = "<box-alias>"' in out and 'remote_root = "/<workdir>"' in out
+    assert f"found devrun-caller: {repo / 'run.sh'}" in out and "run.log" not in out
+    assert "report only: nothing was changed" in out
+    assert _tree(tmp_path) == before
+    data = json.loads(_migrate_run(home, stubs, repo, "--json").stdout)
+    kinds = {f["kind"] for f in data["found"] if f["active"]}
+    assert kinds == {"devsync-unit", "ssh-include", "mutagen", "skill-link", "hook", "cron",
+                     "ttw-toml", "devrun-caller"}
+
+
+def test_setup_box_migrate_check_is_clear_when_nothing_is_left(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for kind in ("devsync-unit", "ssh-include", "mutagen", "skill-link", "hook", "cron", "ttw-toml",
+                 "devrun-caller"):
+        assert f"clear {kind}\n" in r.stdout, kind
+    assert "found" not in r.stdout and "0 active leftover(s)" in r.stdout
+
+
+def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
+    text = (SKILLS / "setup-box" / "migrate-off-sync.md").read_text(encoding="utf-8")
+    steps = ["devsync is-finished", "mutagen sync terminate", "git worktree", "tt-buddy:run",
+             "managed\n     include", "after its replacement is in place", "skill symlinks",
+             "Archive tt-workflows"]
+    pos = [text.find(s) for s in steps]
+    assert -1 not in pos and pos == sorted(pos), dict(zip(steps, pos))
+    assert "box.py migrate check" in text and "ttp note --to <project>" in text
+    assert "Never edit another project's harness" in text
+    assert "nothing to turn on" in text and "released\n   right after" in text
