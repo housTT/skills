@@ -85,13 +85,27 @@ const heldAs = (t) => t.status !== "queued" ? "" : (t.blocked_reason || "").star
   : (t.blocked_reason || "").startsWith("held: network,") ? "held: network" : "";
 const held = (t) => !!heldAs(t);
 
+// A chain's metric across its runs (continues, fixes, re-reviews): run, time, value and delta.
+const num = (v) => Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : String(+v.toPrecision(4));
+function trendHtml(series) {
+  return (series || []).map((s) => {
+    const vals = s.points.map((x) => x.value), lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    const xy = vals.map((v, i) => `${(i * 100 / (vals.length - 1)).toFixed(1)},${(hi === lo ? 10 : 18 - (v - lo) * 16 / (hi - lo)).toFixed(1)}`).join(" ");
+    const unit = s.unit ? " " + esc(s.unit) : "";
+    const rows = s.points.slice().reverse().map((x) => `<tr><td>${x.run ? "run " + x.run : "—"}</td><td>#${x.task}</td><td>${esc(x.at)}</td><td>${num(x.value)}${unit}</td>` +
+      `<td>${x.delta == null ? "" : (x.delta > 0 ? "+" : "") + num(x.delta)}</td></tr>`).join("");
+    return `<div class="trend"><b>${esc(s.name)}</b> <svg class="spark" viewBox="0 0 100 20" preserveAspectRatio="none"><polyline points="${xy}"/></svg>` +
+      `<table class="trend-t"><tr><th>run</th><th>task</th><th>time</th><th>value</th><th>delta</th></tr>${rows}</table></div>`;
+  }).join("");
+}
+
 function taskRow(t) {
   const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
     ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age)})</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}
-    ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
+    ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}${trendHtml(t.trend)}
     ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
     ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}

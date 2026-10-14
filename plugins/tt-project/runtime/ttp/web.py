@@ -19,7 +19,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, heal, identity, obligations, projpause, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
-from . import timefmt, upstream
+from . import timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -573,6 +573,10 @@ def state_payload(p: Project, db: DB) -> dict:
                  retry={**{k: result[k] for k in WAIT_KEYS if k in result}, "next_try": t["not_before"]}
                  if t["status"] == "queued" and result.get("status") == "waiting" else None)
         del t["labels"]
+    trends = trend.for_tasks(db, [t["id"] for t in tasks], tz, now)   # each chain's metrics across its runs
+    for t in tasks:
+        if t["id"] in trends:
+            t["trend"] = trends[t["id"]]
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
     health_now = health(p, db, now=now)

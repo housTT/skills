@@ -423,6 +423,9 @@ prolonged whole-box outage.
   key when the outage is `waiting.tunnel_outage_page_after_s` (3600; 0 pages at once) old.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
+- A task's row in the web app shows its chain's metric trend (the task, what continues it, its fixes
+  and re-reviews): each numeric hand-off `metrics` value (`12.5` or `"12.5 ms"`) seen in at least two
+  runs, with a sparkline and run, time in the project's home zone, value and delta per run.
 - The web app's header and `ttp status` show the budget in one line, for example
   `5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%`.
   The windows and averages are the account's (an average is the mean of each completed window's

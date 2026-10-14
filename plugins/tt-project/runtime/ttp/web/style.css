@@ -65,3 +65,6 @@ form#say { display: flex; gap: 8px; margin-top: 8px; } form#say input { flex: 1;
 .board .item:first-of-type { border-top: 0; }
 .board .col.you { border-left: 4px solid var(--red); } .board .col.review { border-left: 4px solid var(--yellow); }
 .board .col.work { border-left: 4px solid var(--accent); } .board .col.stuck { border-left: 4px solid var(--orange); }
+.trend { margin: 6px 0; font-size: 13px; }
+.trend .spark { width: 120px; height: 20px; vertical-align: middle; } .trend .spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.trend-t { border-collapse: collapse; font-variant-numeric: tabular-nums; } .trend-t th, .trend-t td { padding: 1px 8px 1px 0; text-align: left; color: var(--muted); } .trend-t td:nth-child(4) { color: inherit; }

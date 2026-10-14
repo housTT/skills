@@ -60331,3 +60331,64 @@ def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, m
     assert [o["ok"] for o in both] == [True, False] and gc.exit_code(both) == 1
     [none] = gc.service_up()
     assert none["error"] is True and gc.exit_code([none]) == 75
+
+
+def test_web_task_rows_show_their_chains_metric_trend(env, tmp_path):
+    """A task chain (continues, fixes, re-reviews) shows its hand-offs' numeric metrics across runs:
+    run, home-zone time, value and delta. A chain without a repeated metric gets no trend."""
+    p = make(env)
+    from ttp import trend
+    from ttp.db import dump_result
+    from ttp.web import state_payload
+    trend._cache.clear()
+    now = time.time()
+
+    def run(task, n, metrics, ended):
+        d = tmp_path / f"run{task}-{n}"
+        d.mkdir()
+        (d / "result.json").write_text(json.dumps({"status": "done", "summary": "s", "metrics": metrics}))
+        return p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,'worker','claude',?,?,'done',?)",
+                      (task, ended - 60, ended, str(d)))
+    first = p.db.add_task("speed up decode", "s", kind="code", origin="user")
+    then = p.db.add_task("speed up decode, part 2", "s", kind="code", origin="user", labels=[f"continues:{first}"])
+    r1 = run(first, 1, {"tok_s": "10.5 tok/s", "verdict": "pass"}, now - 7200)
+    r2 = run(first, 2, {"tok_s": "12 tok/s", "tests": True}, now - 3600)
+    r3 = run(then, 1, {"tok_s": 11.0}, now - 600)
+    p.db.update_task(then, result=dump_result({"status": "done", "summary": "s", "metrics": {"tok_s": 11.0}}))
+    side = p.db.add_task("follow-up of the plan", "s", kind="code", origin="user", parent=first)   # parent: not a chain
+    run(side, 1, {"tok_s": 99}, now - 300)
+    run(side, 2, {"note": "n/a"}, now - 200)
+    alone = p.db.add_task("plain change", "s", kind="code", origin="user")
+    run(alone, 1, {"tests": 40}, now - 100)
+    tasks = {t["id"]: t for t in json.loads(json.dumps(state_payload(p, p.db), default=str))["tasks"]}
+    got = tasks[then]["trend"]
+    assert tasks[first]["trend"] == got and [s["name"] for s in got] == ["tok_s"], got
+    pts = got[0]["points"]
+    assert [x["run"] for x in pts] == [r1, r2, r3] and [x["value"] for x in pts] == [10.5, 12.0, 11.0], pts
+    assert [x["delta"] for x in pts] == [None, 1.5, -1.0] and got[0]["unit"] == "tok/s", pts
+    from ttp import timefmt
+    assert all(x["at"].endswith(" " + timefmt.abbrev(timefmt.zone(p), now)) for x in pts), pts
+    assert "trend" not in tasks[side] and "trend" not in tasks[alone]
+    assert trend.numeric("45/45") is None and trend.numeric(True) is None and trend.numeric("3.5%") == (3.5, "%")
+
+
+def test_web_app_renders_a_trend_only_when_the_chain_has_one():
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "${trendHtml(t.trend)}" in js[js.index("function taskRow"):]
+    fn = js[js.index("const num ="):js.index("function taskRow")]
+    series = [{"name": "tok_s", "unit": "tok/s", "points": [
+        {"run": 7, "task": 3, "at": "2026-10-13 09:30 PDT", "value": 10.5, "delta": None},
+        {"run": 9, "task": 4, "at": "2026-10-13 10:30 PDT", "value": 12, "delta": 1.5}]}]
+    script = ("const esc = (s) => String(s).replace(/</g, '&lt;');\n" + fn +
+              f"\nconsole.log(JSON.stringify([trendHtml({json.dumps(series)}), trendHtml(undefined), trendHtml(null)]));")
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    html, none, null = json.loads(r.stdout)
+    assert none == "" and null == ""
+    assert "<polyline" in html and "tok_s" in html and "run 9" in html and "10:30 PDT" in html
+    assert "12 tok/s" in html and "+1.5" in html and html.index("run 9") < html.index("run 7"), html
