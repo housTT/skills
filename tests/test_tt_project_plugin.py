@@ -1733,6 +1733,11 @@ if cmd == "list-machines":
     for m in st["machines"]:  # FAKE_IRD_PREFIX: a site prefix that `ird list` does not print
         print(os.environ.get("FAKE_IRD_PREFIX", "") + " ".join(m))
 elif cmd == "list":
+    fails = os.path.join(d, "list-fails")  # FAKE_IRD_LIST_FAIL=n: ssh drops for n lists after a reserve
+    n = int(open(fails).read()) if os.path.exists(fails) else 0
+    if n > 0:
+        open(fails, "w").write(str(n - 1))
+        print("ssh: connect to host <ird-mgmt>: Connection timed out", file=sys.stderr); sys.exit(255)
     print("2026-10-14 08:00:00 INFO connected")
     for r in st["reservations"]:
         print(f"{r['id']} {r['user']} pool part {r['machine']} a b c d e {r['port']}")
@@ -1745,7 +1750,7 @@ elif cmd == "reserve":
             flags[rest[i][2:]] = rest[i + 1]; i += 2
     if len(rest) - i != 1 or os.environ.get("FAKE_IRD_NOOP"):
         print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
-        sys.exit(0)
+        sys.exit(int(os.environ.get("FAKE_IRD_RC", "0")))
     rid = str(st["next_id"]); st["next_id"] += 1
     machine = flags.get("machine", "")[len(os.environ.get("FAKE_IRD_PREFIX", "")):] or \
         next(m[0] for m in st["machines"] if m[4] == "idle")
@@ -1764,6 +1769,8 @@ elif cmd == "reserve":
         print("rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL",
               file=sys.stderr)
     print(f"{9000 + int(rid)} on {machine}: Reservation complete", file=sys.stderr)
+    if os.environ.get("FAKE_IRD_LIST_FAIL"):
+        open(os.path.join(d, "list-fails"), "w").write(os.environ["FAKE_IRD_LIST_FAIL"])
     if os.environ.get("FAKE_IRD_HANG"):  # landed, then hangs until a timeout or a signal
         import time; json.dump(st, open(path, "w")); open(os.environ["FAKE_IRD_HANG"], "w").close()
         time.sleep(60)
@@ -1844,7 +1851,7 @@ def fake_ird(tmp_path):
     import socket
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
-    srv.listen(8)
+    srv.listen(128)  # every probe connects and is never accepted
     yield FakeIrd(tmp_path, srv.getsockname()[1])
     srv.close()
 
@@ -1972,6 +1979,35 @@ def test_setup_box_ird_reserve_takes_the_machine_ird_reserved(fake_ird):
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
                            "--machine", "site1-m-idle", FAKE_IRD_PREFIX="site1-")
     assert rc == 0 and "reserved 101 machine=m-idle" in out and "asked for" not in out, out
+
+
+def test_setup_box_ird_reserve_claims_what_landed_when_ssh_drops_mid_reserve(fake_ird):
+    # rc 255 (ssh dropped) after the reservation landed: the ird list diff still claims it.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-idle", FAKE_IRD_RC="255")
+    assert rc == 0, out
+    assert "warning: ird reserve exited 255, but reservation 100 is in ird list: claimed it" in out, out
+    assert "reserved 100 machine=m-idle" in out, out
+    assert _claims(fake_ird) == ["<ird-box>.100.json"]
+    # ... and when the next `ird list` fails too, one retry finds and claims it.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-mixed", FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="1")
+    assert rc == 0 and "warning: checking ird list failed" in out and "reserved 101 machine=m-mixed" in out, out
+    assert _claims(fake_ird) == ["<ird-box>.100.json", "<ird-box>.101.json"]
+    # A successful reserve whose first list fails is retried the same way.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-idle", FAKE_IRD_LIST_FAIL="1")
+    assert rc == 0 and "reserved 102 machine=m-idle" in out, out
+    # The list stays down: say a reservation may have landed and where to look; touch nothing.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-idle", FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="9")
+    assert rc == 255 and "A reservation may have landed: check `box.py ird status <ird-box>`" in out, out
+    assert len(_claims(fake_ird)) == 3 and not [l for l in fake_ird.ird_log() if l.startswith("release")]
+    # ssh dropped before anything landed: no claim, and the message says it may still land.
+    (fake_ird.dir / "list-fails").unlink()
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           FAKE_IRD_NOOP="1", FAKE_IRD_RC="255")
+    assert rc == 255 and "may still land" in out, out
 
 
 def test_setup_box_ird_same_machine_ignores_site_prefix_and_domain():
@@ -2259,6 +2295,35 @@ def test_setup_box_ird_e2e_claims_the_real_machine_despite_rc_1_and_noise(fake_i
                  "reservation: 100 on m-mixed  released: yes", "result: PASS"):
         assert line in out, (line, out)
     assert fake_ird.load()["reservations"] == []
+
+
+def test_setup_box_ird_e2e_ssh_drop_mid_reserve_still_claims_and_releases(fake_ird, tmp_path):
+    import subprocess
+    fake_ird.add("99")
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env.update(FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="1")
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    for line in ("  warning: ird reserve exited 255", "step 2 reserve: PASS id 100 on m-idle,",
+                 "reservation: 100 on m-idle  released: yes", "result: PASS"):
+        assert line in out, (line, out)
+    assert [r["id"] for r in fake_ird.load()["reservations"]] == ["99"]
+
+
+def test_setup_box_ird_e2e_notes_a_different_machine_only_when_it_differs(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env["FAKE_IRD_PREFIX"] = "site1-"  # list-machines names carry a site prefix, ird list's do not
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0 and "picked site1-m-idle" in out, out
+    assert "step 2 reserve: PASS id 100 on m-idle," in out and "asked for" not in out, out
+    env["FAKE_IRD_LAND"] = "m-mixed"
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "PASS id 101 on m-mixed (asked for site1-m-idle; using the machine ird reserved)" in out, out
 
 
 def test_setup_box_ird_e2e_trap_releases_what_an_interrupted_reserve_left(fake_ird, tmp_path):

@@ -50,7 +50,9 @@ $S ird release <box-alias> <id>         # right after the run
   non-zero after the reservation completed, or be cut off. `box.py` snapshots your reservations
   first, diffs a fresh `ird list` after the reserve and claims the one new reservation (claim
   written before anything is reported). A non-zero exit with a new reservation is a success with a
-  warning; no new reservation is a failure. If several new reservations of yours could be this
+  warning; no new reservation is a failure. That includes ssh dropping mid-reserve (exit 255):
+  `box.py` retries `ird list` a few times, and if it stays unreachable it says a reservation may
+  have landed and to check `status`. If several new reservations of yours could be this
   one (another task reserved at once), it narrows by `--ssh-port` and the machine `ird` says it
   reserved; if still several, it claims and releases none and says so: check `status`, retry with
   `--machine`, and release by hand what is yours and unused.

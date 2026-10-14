@@ -31,6 +31,7 @@ BAD_STATES = ("drain", "down", "fail", "maint", "reboot", "unknown")
 FREE_STATES = ("free", "idle", "mixed")
 DEFAULT_TTL_S = 3600
 DEFAULT_WAIT_S = 270  # under the ~5 min a worker may block one tool call
+LIST_RETRY_S = (2, 5)  # waits before re-reading `ird list` after it failed mid-reserve
 BEGIN = "# >>> tt-project ird {id}"
 END = "# <<< tt-project ird {id}"
 
@@ -402,10 +403,18 @@ def _reserve(ctx: Ctx, args, m, pool: str) -> int:
         argv += ["--ssh-port", str(args.ssh_port)]
     argv += ["--no-shell", args.arch]  # every flag before the arch positional
     try:
-        r = ctx.call(*argv, timeout=args.wait)
+        try:
+            r = ctx.call(*argv, timeout=args.wait)
+        except IrdError as e:  # ssh dropped (255): the reservation may have landed all the same
+            r = subprocess.CompletedProcess(argv, e.code, "", str(e))
         text = r.stdout + "\n" + r.stderr
         landed = [x.group(1) for x in COMPLETE_RE.finditer(text)]
-        rid, row, others = _pick_new(ctx, args, before, landed[-1] if landed else "")
+        try:
+            rid, row, others = _pick_new_retrying(ctx, args, before, landed[-1] if landed else "")
+        except IrdError as e:
+            raise IrdError(f"ird reserve exited {r.returncode} and checking ird list failed: {e}. A "
+                           f"reservation may have landed: check `box.py ird status {ctx.alias}` and "
+                           f"release what you do not use", UNREACHABLE) from None
         if rid and r.returncode != 124:
             expires = _claim(ctx, args, rid, row, pool, m)
     except (KeyboardInterrupt, Interrupted) as e:
@@ -422,6 +431,10 @@ def _reserve(ctx: Ctx, args, m, pool: str) -> int:
     if not rid:
         if others:
             raise IrdError(_ambiguous(ctx, others))
+        if r.returncode == UNREACHABLE:
+            raise IrdError(f"{r.stderr.strip()[-300:]}; no new reservation in ird list yet, but it may "
+                           f"still land: check `box.py ird status {ctx.alias}` and release what you do "
+                           f"not use", UNREACHABLE)
         rest = "\n".join(l for l in text.splitlines() if l.strip() and not NOISE_RE.match(l.strip()))
         raise IrdError(f"ird reserve made no reservation (rc {r.returncode}): {rest.strip()[-400:]}")
     for w in warnings:
@@ -453,6 +466,17 @@ def _pick_new(ctx: Ctx, args, before: set, landed: str) -> Tuple[str, Optional[d
         rid, row = next(iter(new.items()))
         return rid, row, {}
     return "", None, new
+
+
+def _pick_new_retrying(ctx: Ctx, args, before: set, landed: str):
+    """_pick_new, retried a few times when `ird list` fails (ssh may be down for a moment)."""
+    for delay in LIST_RETRY_S:
+        try:
+            return _pick_new(ctx, args, before, landed)
+        except IrdError as e:
+            print(f"warning: checking ird list failed ({e}); retrying in {delay:g}s")
+            time.sleep(delay)
+    return _pick_new(ctx, args, before, landed)
 
 
 def _unclaimed_or_ours(ctx: Ctx, rid: str) -> bool:

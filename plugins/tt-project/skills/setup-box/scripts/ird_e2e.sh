@@ -228,8 +228,8 @@ EXPIRES=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* expires=\([^ ]*\).*/\1/p
 MACHINE=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* machine=\([^ ]*\).*/\1/p')
 RES_LINE="$RID on $MACHINE"
 ROW1=$(row_of "$RID")
-LANDED=""
-[ "$MACHINE" = "$PICKED" ] || LANDED=" (asked for $PICKED; using the machine ird reserved)"
+LANDED=""  # box.py compares the names ignoring a site prefix or domain, and warns when they differ
+printf '%s\n' "$OUT" | grep -q '^warning: asked for ' && LANDED=" (asked for $PICKED; using the machine ird reserved)"
 note "step 2 reserve: PASS id $RID on $MACHINE$LANDED, expires $EXPIRES ($(( $(date +%s) - T0 ))s)"
 note "  ird list row: ${ROW1:-<none>}"
 
