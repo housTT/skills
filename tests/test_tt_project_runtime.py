@@ -12470,7 +12470,7 @@ def _stale_runtime(tmp_path, preload=False):
 def test_setup_installs_its_own_runtime_not_the_one_on_pythonpath(env, tmp_path):
     from ttp import __version__
     r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin")],
-                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=max(180, _load_scaled(60)))
+                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
     assert r.returncode == 0, r.stderr
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
     assert f'__version__ = "{__version__}"' in (env["home"] / "lib" / "current" / "runtime" / "ttp" /
@@ -12487,7 +12487,7 @@ def test_a_launcher_refuses_a_foreign_runtime(env, tmp_path, case):
         shutil.copy(TTP, launcher)
     r = subprocess.run([sys.executable, str(launcher), "setup", "--bin-dir", str(tmp_path / "bin")],
                        env=_stale_runtime(tmp_path, preload=case == "stale ttp already imported"),
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, timeout=300)
     assert r.returncode != 0 and "stale runtime ran" not in r.stdout
     assert ("no runtime at" if launcher != TTP else "loaded ttp 0.0.1") in r.stderr
     assert not (env["home"] / "lib").exists()
@@ -12503,7 +12503,7 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
 
     def setup():
         r = subprocess.run([*NO_SYNC, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                           capture_output=True, text=True, timeout=max(180, _load_scaled(60)))
+                           capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
         assert r.returncode == 0, r.stderr
         return r.stdout, (env["home"] / "lib" / __version__ / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
 
@@ -12547,9 +12547,9 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
     f = claude / "skills" / "tt-project" / "SKILL.md"
 
     def setup(*extra):
-        # 240 s at least: one setup copies the plugin and took 28 s alone at host load 120.
+        # 300 s at least: one setup copies the plugin and took 28 s alone at host load 120.
         r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                           capture_output=True, text=True, timeout=max(240, _load_scaled(60)))
+                           capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
         assert r.returncode == 0, r.stderr
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
@@ -12584,7 +12584,7 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
 
     def setup(*extra):
         return subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                              capture_output=True, text=True, timeout=max(180, _load_scaled(60)))
+                              capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
     r = setup()
     assert r.returncode != 0 and f"ttp {_newer(__version__)} is installed" in r.stderr and "--force" in r.stderr
     assert (env["home"] / "lib" / "current").resolve() == newer.resolve() and not (tmp_path / "bin").exists()
@@ -12712,7 +12712,7 @@ def test_version_shows_the_source_commit(env, capsys):
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                       capture_output=True, text=True, timeout=max(180, _load_scaled(60)))
+                       capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
     assert r.returncode != 0 and "harness copy" in r.stderr
     assert str(env["home"] / "lib" / "current" / "bin" / "ttp") in r.stderr   # names the ttp it would run
     assert not (env["home"] / "lib" / "current").exists()
