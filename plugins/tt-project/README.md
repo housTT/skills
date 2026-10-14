@@ -18,8 +18,7 @@ name, which is also where it can use local hardware.
 codex plugin add tt-project@tenstorrent-skills     # Codex
 ```
 
-Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`, or start the CLI with
-`agent --plugin-dir <this folder>`.
+Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`.
 
 Until tt-project is on `main`, install it as described in [Dogfood install](#dogfood-install).
 
