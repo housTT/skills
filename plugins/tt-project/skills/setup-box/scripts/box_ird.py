@@ -616,7 +616,7 @@ def cmd_extend(ctx: Ctx, args) -> int:
                        f"left to read the new expiry from: {' '.join(after['fields'])}")
     grew = max(pairs, key=lambda p: p[1] - p[0])
     _, now_left = grew if grew[1] - grew[0] >= 60 else min(pairs, key=lambda p: abs(p[0] - left_s))
-    new = now + dt.timedelta(seconds=now_left)
+    new = (now + dt.timedelta(seconds=now_left)).replace(second=0, microsecond=0)  # minutes, as old
     c.update(task=ctx.task or c.get("task", ""), heartbeat=time.time(), expires=new.isoformat(timespec="minutes"))
     write_claim(ctx.alias, args.id, c)
     gained = (new - old).total_seconds() / 60

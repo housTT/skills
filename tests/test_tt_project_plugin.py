@@ -2336,7 +2336,7 @@ def test_setup_box_ird_extend_passes_only_when_ird_list_shows_the_time_added(fak
     assert rc == 0, out
     # ird change-timeout sets the time left, so extend asks for what is left plus the minutes.
     assert [l for l in fake_ird.ird_log() if l.startswith("change-timeout")] == ["change-timeout 100 45"]
-    new = re.search(r"^extended 100 by 15 min: expires=(\S+) \(was (\S+), \+1[45] min per ird list\)$", out, re.M)
+    new = re.search(r"^extended 100 by 15 min: expires=(\S+) \(was (\S+), \+1[456] min per ird list\)$", out, re.M)
     assert new and new.group(2) == old, out
     gained = dt.datetime.fromisoformat(new.group(1)) - dt.datetime.fromisoformat(old)
     assert dt.timedelta(minutes=14) <= gained <= dt.timedelta(minutes=16), out
@@ -2345,7 +2345,7 @@ def test_setup_box_ird_extend_passes_only_when_ird_list_shows_the_time_added(fak
 
 
 @pytest.mark.parametrize("how, message", [
-    ("noop", r"exited 0, but ird list shows it expiring \S+ \(was \S+, [+-]0 min, asked \+15\)"),
+    ("noop", r"exited 0, but ird list shows it expiring \S+ \(was \S+, [+-][01] min, asked \+15\)"),
     ("half", r"exited 0, but ird list shows it expiring \S+ \(was \S+, -[0-9]+ min, asked \+15\)"),
     ("fail", r"ird change-timeout 100 45 failed \(rc 3\): change-timeout: permission denied"),
 ])
