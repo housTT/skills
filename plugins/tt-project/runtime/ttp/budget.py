@@ -14,7 +14,8 @@ Two regimes, chosen per provider from what the provider reports:
   windows, with the user's defaults when the charter sets none; and a global daily cap on what the
   whole account spends today across every project tt-project can see (globalcap.py).
 A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
-norm) overrides both. On plan windows its dollars are virtual, so it counts coordinator turns there.
+norm) overrides both. On plan windows its dollars are virtual, so it counts wasted runs and
+coordinator turns there.
 """
 from __future__ import annotations
 
@@ -205,8 +206,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     # On a plan below its line the dollars are virtual: the windows and their line already bound the
-    # spend, so the coordinator signal counts self-started turns and turns re-woken on the same
-    # evidence instead, and the total signal is off. Billed by use or on paid credits past the line,
+    # spend, so the waste signal counts wasted runs, the coordinator signal counts self-started turns
+    # and turns re-woken on the same evidence instead, and the total signal is off. Billed by use or on paid credits past the line,
     # dollars.
     virtual = g.regime == "windows" and "paid_credits" not in g.numbers
     g.numbers["billing"] = "plan" if virtual else "usage"
@@ -234,7 +235,15 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
                       "waste_1h": round(waste, 2), "waste_limit": round(waste_cap, 2),
                       "coordinator_1h": round(thrash, 2), "coordinator_user_1h": round(asked, 2)})
-    if waste > waste_cap:
+    if virtual:
+        # On a plan a costly failed run is no loop by itself: count the wasted runs instead.
+        lost = sum(1 for r in runs_h if wasted(r))
+        lost_cap = int(b.get("hourly_waste_runs", 4)) * workers
+        g.numbers.update({"waste_runs_1h": lost, "waste_runs_limit": lost_cap})
+        if lost > lost_cap:
+            _raise(g, "red", f"runaway guard: {lost} failed or stalled runs in the last hour "
+                             f"(limit {lost_cap}); resumes automatically as the hour rolls over")
+    elif waste > waste_cap:
         _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
     selfs = [r for r in coord_h if not user_turn(r)]

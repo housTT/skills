@@ -4628,7 +4628,8 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
     p = make(env)
     from ttp import budget as bud
     now = time.time()
-    wins = [bud.Window("claude", "seven_day", 40)]
+    p.set_config("budget.global_daily_usd", 0)
+    wins = []   # billed by use: the waste signal counts dollars (on a plan it counts runs, test below)
     for i, cost in enumerate((4.3, 4.3, 1.5, 0.5, 0.9)):   # a busy first hour of real work
         p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd) VALUES('worker','claude','ok',?,?,?)",
                (now - 3000, now - 60 * i, cost))
@@ -4744,6 +4745,33 @@ def test_plan_billed_work_with_high_virtual_dollars_is_not_held(env):
     g = bud.evaluate(p.db, p.config(), "claude", wins, now)
     assert g.regime == "windows" and g.numbers["billing"] == "plan" and g.level == "green", g.reasons
     assert not any("cap" in r or "runaway" in r for r in g.reasons), g.reasons
+
+
+def test_runaway_guard_on_a_plan_counts_wasted_runs_not_virtual_dollars(env):
+    """On a plan with headroom a few costly failed runs are not a loop; more failed runs than the
+    per-worker cap are. Billed by use, the dollar limit still holds."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    wins = [bud.Window("claude", "five_hour", 7.0, now + 3600), bud.Window("claude", "seven_day", 30.0, now + 86400)]
+
+    def fail(i):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
+               "VALUES(1,'worker','claude','failed',?,?,12)", (now - 3000 + i * 300, now - 2900 + i * 300))
+        p.db.spend("claude", 12.0, "task:1")
+
+    for i in range(2):                                    # $24 lost, far over the $8 dollar limit
+        fail(i)
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.numbers["billing"] == "plan" and g.numbers["waste_runs_1h"] == 2, g.numbers
+    assert g.level != "red" and not any("runaway" in r for r in g.reasons), g.reasons
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)  # billed by use: dollars
+    assert any("$24.00 spent on failed or stalled runs" in r for r in g.reasons), g.reasons
+    for i in range(2, 5):                                 # five failed runs of one task: over 4 per worker
+        fail(i)
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.level == "red" and any("5 failed or stalled runs in the last hour (limit 4)" in r
+                                    for r in g.reasons), g.reasons
 
 
 def test_runaway_guard_on_a_plan_trips_on_repeated_turns_not_virtual_dollars(env):
@@ -36356,7 +36384,7 @@ def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):
 def test_every_key_the_code_reads_is_known(env):
     from ttp.coordinator import USER_SETTABLE
     from ttp.project import unknown_key_hint
-    extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_coordinator_usd",
+    extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_waste_runs", "budget.hourly_coordinator_usd",
              "budget.max_pace_hold_s", "jev.via", "jev.url", "jev.model"]
     for key in [*USER_SETTABLE, *extra]:
         assert unknown_key_hint(key) is None, key
