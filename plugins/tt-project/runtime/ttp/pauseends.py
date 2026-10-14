@@ -85,12 +85,12 @@ def health_end(p: Project, resource: str) -> dict | None:
     return None
 
 
-def describe(v: dict) -> str:
-    """'ends 2026-10-06T12:00Z, or when `probe` passes; waits on project x's report' (or '')."""
+def describe(v: dict, where=None) -> str:
+    """'ends 2026-10-06 05:00 PDT, or when `probe` passes; waits on project x's report' (or '')."""
     end = v.get("end_when")
     when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
             if isinstance(end, dict) else f"when `{end}` passes")
-    parts = ([ends.stamp(float(v["until"]))] if v.get("until") else []) + ([when] if end else [])
+    parts = ([ends.shown(float(v["until"]), where)] if v.get("until") else []) + ([when] if end else [])
     out = "ends " + ", or ".join(parts) if parts else ""
     if v.get("end_default"):
         out += " (a default: it was set without an end)"
@@ -196,7 +196,7 @@ def migrate(p: Project, now: float) -> list[str]:
                 done.append(name)
     if done:
         db.post("out", f"Resource pause{'s' if len(done) > 1 else ''} {', '.join(sorted(done))} had no end; "
-                       f"each now ends {ends.stamp(until)} by default. When that passes the coordinator lifts "
+                       f"each now ends {ends.shown(until, p)} by default. When that passes the coordinator lifts "
                        f"or extends it; a pause the user set stays until the user lifts it.",
                 chat=None, kind="info", severity="low")
     return sorted(done)
@@ -230,7 +230,7 @@ class PauseEnds:
                 probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
             why = ""
             if v.get("until") and float(v["until"]) <= now:
-                why = f"its end time {ends.stamp(float(v['until']))} passed"
+                why = f"its end time {ends.shown(float(v['until']), self.p)} passed"
             elif probe and rc[1] == probe and rc[0] == 0:
                 why = f"its end_when probe `{probe}` passed"
             elif probe and rc[1] == probe and rc[0] is not None and rc[0] not in ends.NOT_YET_RCS:

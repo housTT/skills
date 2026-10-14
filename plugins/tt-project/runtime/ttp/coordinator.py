@@ -663,7 +663,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else "")
-                         + (f" ({pauseends.describe(v)})" if pauseends.describe(v) else "")
+                         + (f" ({pauseends.describe(v, p)})" if pauseends.describe(v) else "")
                          + (" (its end passed; the user's pause: only they lift it, no ask)" if v.get("by") == "user"
                             and v.get("until") and float(v["until"]) <= now else ""))
     section("paused", lines)
@@ -2599,7 +2599,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     why = f" ({entry['reason']})" if paused and entry["reason"] else ""
     _tell_runs(db, name, paused, why, key)
     scope = " for every project that shares it" if is_shared else ""
-    till = f"; {pauseends.describe(entry)}" if paused and pauseends.describe(entry) else ""
+    till = f"; {pauseends.describe(entry, p)}" if paused and pauseends.describe(entry) else ""
     return (f"{name} paused{why}{scope}: tasks using it wait, and `ttp lock {name}` refuses it{till}" if paused
             else f"{name} resumed{scope}" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
 

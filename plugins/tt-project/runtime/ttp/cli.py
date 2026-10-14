@@ -3375,7 +3375,7 @@ def _machine_change(a) -> None:
         if not got:
             print("no open machine changes")
         for c in got:
-            print(ml.change_line(c) + (f" (closed {ml.ends.stamp(c['closed'])}: {c.get('closed_why')})"
+            print(ml.change_line(c) + (f" (closed {ml.ends.shown(c['closed'])}: {c.get('closed_why')})"
                                        if c.get("closed") else ""))
         return
     p = here()

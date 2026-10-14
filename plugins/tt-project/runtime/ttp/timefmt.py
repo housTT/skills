@@ -152,6 +152,21 @@ def clock(env: dict | None = None, now: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if now is None else now, _tz(where)).strftime("%H:%M:%S %Z")
 
 
+def ambient() -> str:
+    """The zone for a time shown without a project in hand: the home zone of the project in
+    TTP_PROJECT, else the account's budget.timezone, else this machine's."""
+    try:
+        base = os.environ.get("TTP_PROJECT")
+        if base:
+            from .project import Project
+            tz = valid(Project(base).raw_config().get(KEY))
+            if tz:
+                return tz
+        return fallback()[0]
+    except Exception:
+        return "UTC"
+
+
 def abbrev(where, ts: float | None = None) -> str:
     """The zone's abbreviation at `ts` (now by default): 'UTC', or the zone's own ('<zone>')."""
     return datetime.fromtimestamp(ts if ts is not None else time.time(), _tz(where)).strftime("%Z")

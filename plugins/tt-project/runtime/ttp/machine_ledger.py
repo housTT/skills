@@ -161,7 +161,7 @@ def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | Non
     """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes)."""
     now = time.time() if now is None else now
     when = ends.parse_expires(at, now, what="--power-cycle-at")
-    what = f"power-cycle intent, at {ends.stamp(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
+    what = f"power-cycle intent, at {ends.shown(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
     return add_change(alias, what, "none: a planned power cycle; the entry closes itself after it", by,
                       expires=when + POWER_CYCLE_AFTER_S, task=task, now=now, expects=["down"],
                       extra={"kind": POWER_CYCLE, "at": when})
@@ -246,7 +246,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         return c
 
 
-def overdue(c: dict, now: float | None = None) -> str:
+def overdue(c: dict, now: float | None = None, where=None) -> str:
     """Why entry `c` is overdue ("" when it is not)."""
     now = time.time() if now is None else now
     if c.get("closed") or c.get("kind") == POWER_CYCLE:   # a power cycle has nothing to undo: it closes itself
@@ -254,7 +254,7 @@ def overdue(c: dict, now: float | None = None) -> str:
     if c.get("probe_passed"):
         return "its until-probe passed"
     if float(c.get("expires") or 0) <= now:
-        return f"expired {ends.stamp(float(c['expires']))}"
+        return f"expired {ends.shown(float(c['expires']), where)}"
     return ""
 
 
@@ -272,10 +272,10 @@ def expects_now(c: dict, now: float | None = None) -> list[str]:
     return [str(x) for x in c.get("expects") or []]
 
 
-def change_line(c: dict, now: float | None = None) -> str:
-    late = overdue(c, now)
-    end = f"until-probe `{c['probe']}`, at the latest {ends.stamp(c['expires'])}" if c.get("probe") \
-        else f"ends {ends.stamp(c['expires'])}"
+def change_line(c: dict, now: float | None = None, where=None) -> str:
+    late = overdue(c, now, where)
+    end = f"until-probe `{c['probe']}`, at the latest {ends.shown(c['expires'], where)}" if c.get("probe") \
+        else f"ends {ends.shown(c['expires'], where)}"
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     return (f"#{c['id']} {c['alias']}: {c['what']} (by {by}; undo: `{c['undo']}`; {end})"
@@ -365,9 +365,9 @@ def outages(now: float | None = None, doc: dict | None = None) -> dict[str, dict
     return {a: o for a, o in got.items() if isinstance(o, dict) and float(o.get("until") or 0) > now}
 
 
-def outage_line(alias: str, o: dict) -> str:
+def outage_line(alias: str, o: dict, where=None) -> str:
     owner = f"; owner: {o['owner']}" if o.get("owner") else ""
-    return f"{alias}: known outage until {ends.stamp(o['until'])} (by {o.get('by') or '?'}{owner}): {o['why']}"
+    return f"{alias}: known outage until {ends.shown(o['until'], where)} (by {o.get('by') or '?'}{owner}): {o['why']}"
 
 
 def on_machine(alias: str) -> Callable[[str], bool]:
@@ -426,7 +426,7 @@ def quiet_reason(c: dict, now: float, doc: dict | None = None) -> tuple[str, boo
     alias, cond = c["alias"], c["condition"]
     o = outages(now, doc).get(alias)
     if o:
-        return (f"known outage until {ends.stamp(o['until'])}"
+        return (f"known outage until {ends.shown(o['until'])}"
                 + (f", owned by {o['owner']}" if o.get("owner") else "") + f": {o['why']}"), True
     for ch in changes({alias}):
         if cond in expects_now(ch, now):
@@ -578,7 +578,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     page["pending"] = {
                         "target": who, "kind": "machine_condition_held", "key": f"machine:{key}",
                         "alias": c["alias"], "stage": int(page.get("stage") or 0), "id": nid, "severity": "low",
-                        "text": f"Machine {c['alias']} reported {c['condition']} since {ends.stamp(c['first'])} by "
+                        "text": f"Machine {c['alias']} reported {c['condition']} since {ends.shown(c['first'])} by "
                                 f"{', '.join(c['seen_by'])}, but your own heal check {', '.join(checks)} sees it "
                                 f"healthy: {why}. No recovery page "
                                 f"was sent; nothing to do unless you see otherwise."}
@@ -609,7 +609,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     if page["stage"] else ""
                 # No running count in the text: a resend after a crash is the same note.
                 _pending(page, target, "machine_condition", f"machine:{key}", c["alias"], float(c["first"]),
-                         f"Machine {c['alias']} {c['condition']} since {ends.stamp(c['first'])}, seen by "
+                         f"Machine {c['alias']} {c['condition']} since {ends.shown(c['first'])}, seen by "
                          f"{', '.join(c['seen_by'])}: {c.get('text') or 'no detail'}. "
                          f"Recovery page {page['stage'] + 1}{skipped}: "
                          f"check and recover it; record any live change with `ttp machines change add`.")
@@ -756,17 +756,17 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     if not mine:
         return []
     known = machines.load()
-    lines = [change_line(c, now) for c in changes(set(mine))]
+    lines = [change_line(c, now, p) for c in changes(set(mine))]
     for c in conditions().values():
         if c.get("alias") in mine:
             owner = (known.get(c["alias"]) or {}).get("recovery_owner")
             held = (c.get("page") or {}).get("held")
             hush = (c.get("page") or {}).get("quiet")
-            lines.append(f"{c['alias']} {c['condition']} since {ends.stamp(c['first'])} (seen by "
+            lines.append(f"{c['alias']} {c['condition']} since {ends.shown(c['first'], p)} (seen by "
                          f"{', '.join(c.get('seen_by', []))}; recovery owner: {owner or 'none set'}"
                          + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "")
                          + (f"; not escalated: {hush}" if hush else "") + ")")
-    lines += [outage_line(a, o) for a, o in sorted(outages(now).items()) if a in mine]
+    lines += [outage_line(a, o, p) for a, o in sorted(outages(now).items()) if a in mine]
     named = list(p.db.kv(GAP_KV) or [])
     gaps = [a for a in mine if not (known.get(a) or {}).get("recovery_owner") and a not in named]
     if gaps:
@@ -785,7 +785,7 @@ def review_lines(p, now: float | None = None) -> list[str]:
     mine = set(resource_machines(p)) | {a for a, m in known.items()
                                         if p.name in (m.get("recovery_owner"), m.get("recovery_fallback"))}
     got = _read(ROUTES, {"conditions": {}}).get("quiet") or {}
-    return [f"{a} {q.get('condition')} since {ends.stamp(float(q.get('first') or 0))} (seen by "
-            f"{', '.join(q.get('seen_by') or []) or '?'}), last {ends.stamp(float(q['at']))}: not paged: {q.get('why')}"
+    return [f"{a} {q.get('condition')} since {ends.shown(float(q.get('first') or 0), p)} (seen by "
+            f"{', '.join(q.get('seen_by') or []) or '?'}), last {ends.shown(float(q['at']), p)}: not paged: {q.get('why')}"
             for a, q in sorted(got.items()) if a in mine and isinstance(q, dict)
             and now - float(q.get("at") or 0) < REVIEW_S]

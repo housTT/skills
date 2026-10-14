@@ -64,7 +64,14 @@ def check_sh(probe: str, what: str) -> None:
 
 
 def stamp(ts: float) -> str:
+    """The stored form (charter lines, front matter); `shown` is the one people read."""
     return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(ts))
+
+
+def shown(ts: float, where=None) -> str:
+    """'2026-10-12 05:11 PDT': `ts` in the home zone of `where` (a Project, its settings or a zone
+    name), else timefmt.ambient()."""
+    return timefmt.long(ts, where if where is not None else timefmt.ambient())
 
 
 def parse_time(raw: str) -> float | None:
@@ -260,7 +267,7 @@ class Ends:
             rc = verdicts.get(key, (None, "", ""))
             why = ""
             if end.get("expires") and end["expires"] <= now:
-                why = f"expired {stamp(end['expires'])}"
+                why = f"expired {shown(end['expires'], self.p)}"
             elif end.get("probe") and rc[1] == end["probe"] and rc[0] == 0:
                 why = "its until_probe passed"
             if why:

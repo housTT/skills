@@ -50892,6 +50892,30 @@ def test_run_notes_memory_ends_sweep_spend_and_deploy_times_use_the_home_zone_on
     assert out.getvalue().rstrip().endswith("since 2026-07-01 05:00 PDT"), out.getvalue()
 
 
+def test_machine_ledger_and_pause_end_times_show_the_home_zone_on_a_utc_box(env, utc_box, monkeypatch):
+    """Machine conditions ('since ...'), change and outage ends, and resource pause ends are in the
+    home zone with its abbreviation: the project's when one is in hand, else the one in TTP_PROJECT."""
+    from datetime import datetime, timezone as dt_timezone
+    from ttp import ends, pauseends
+    from ttp import machine_ledger as ml
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    summer = datetime(2026, 7, 1, 12, 0, tzinfo=dt_timezone.utc).timestamp()
+    assert ends.shown(summer, p) == "2026-07-01 05:00 PDT"
+    change = {"id": 1, "alias": "box", "what": "a drop-in", "undo": "rm it", "by": "t", "expires": summer}
+    assert ml.change_line(change, summer + 60, p).endswith("ends 2026-07-01 05:00 PDT) OVERDUE: expired "
+                                                          "2026-07-01 05:00 PDT")
+    line = ml.outage_line("box", {"until": summer, "why": "maintenance"}, p)
+    assert "until 2026-07-01 05:00 PDT" in line and "Z" not in line.split("(")[0], line
+    assert pauseends.describe({"until": summer}, p) == "ends 2026-07-01 05:00 PDT"
+    # No project in hand (a CLI line, the machine view): the project in the environment.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert ends.shown(summer) == "2026-07-01 05:00 PDT"
+    assert pauseends.describe({"until": summer}) == "ends 2026-07-01 05:00 PDT"
+    src = (RUNTIME / "ttp" / "machine_ledger.py").read_text() + (RUNTIME / "ttp" / "pauseends.py").read_text()
+    assert "ends.stamp(" not in src, "user-facing ledger and pause times go through ends.shown"
+
+
 def test_mute_heal_and_lock_holder_times_show_the_home_zone_on_a_utc_box(env, utc_box):
     """Mute lines and their end summary, a heal check's self-fix task and lock holders (local and
     shared) are in the project's home zone with its abbreviation, never the box's UTC."""
