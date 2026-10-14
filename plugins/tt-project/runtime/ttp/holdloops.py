@@ -26,7 +26,7 @@ are resolved.
 from __future__ import annotations
 
 from . import anchors
-from .db import DB, _first_dead, deferral, dependency_ids
+from .db import DB, _first_dead, deferral, dependency_ids, load_result
 
 LOOPS_KEY = "hold_loops"        # kv {key: {"since", "raised", "task", "text", "kind"}}
 TIME_KEY = "hold_time_only"     # kv {task id: {"since", "ends": [...], "flag": ts, "why"}}
@@ -107,18 +107,23 @@ def _time_end(t: dict, now: float) -> float | None:
                 return None
         return None
     if t["status"] == "queued":
+        # only a start_after deferral: not_before alone is also the daemon's own retry backoff
+        # (busy resource, failed start, a waiting task's probe), which it moves on every try
         d = deferral(t)
-        if not d.get("when") and float(t["not_before"] or 0) > now:
-            return float(t["not_before"])
+        if not d.get("when") and float(d.get("after") or 0) > now:
+            return float(d["after"])
     return None
 
 
 def _real_end(t: dict, states: dict) -> bool:
     """The task waits on something other than a time: an ask, resource or probe anchor, a
-    start_when probe, or a dependency not done (an open one produces its evidence; a blocked or dead
-    one is its own condition)."""
+    start_when probe, a waiting hand-off's retry_when or on_pass_cmd probe, or a dependency not done
+    (an open one produces its evidence; a blocked or dead one is its own condition)."""
     got = anchors.anchor(t) if t["status"] == "blocked" else None
     if got and got[0] in REAL_ENDS or deferral(t).get("when"):
+        return True
+    r = load_result(t["result"])
+    if r.get("status") == "waiting" and (r.get("retry_when") or r.get("on_pass_cmd")):
         return True
     return any(states.get(d) != "done" for d in dependency_ids(t))
 

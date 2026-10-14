@@ -8890,6 +8890,32 @@ def _loop_events(p, kind):
     return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (kind,))
 
 
+def test_daemon_retry_backoffs_and_waiting_probes_are_no_time_only_hold_but_a_re_armed_start_after_is(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    d = Daemon(p.base)
+    now = time.time()
+    # A waiting hand-off whose probe says "not yet" each tick: the daemon moves not_before forward.
+    waits = {}
+    for key in ("retry_when", "on_pass_cmd"):
+        waits[key] = p.db.add_task(f"waits on its job ({key})", "s", kind="code", origin="user")
+        p.db.update_task(waits[key], status="queued", result=dump_result(
+            {"status": "waiting", "summary": "job running", key: "test -e /nonexistent", "waiting_for": "job"}))
+    # A plain queued task the daemon retries after a busy resource or a failed start.
+    busy = p.db.add_task("plain queued", "s", origin="user")
+    # A start_after deferral the coordinator re-arms: a real time-only hold.
+    later = p.db.add_task("check it tomorrow", "s", origin="user")
+    for i in range(3):
+        for t in (*waits.values(), busy):
+            p.db.update_task(t, not_before=now + i * 600 + 900)
+        p.db.update_task(later, not_before=now + i * 600 + 3600,
+                         labels=[f"start_after:{now + i * 600 + 3600:.0f}", f"deferred_since:{now:.0f}"])
+        d._raise_hold_loops(now + i * 120)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [later] and "re-armed" in evs[0]["text"], evs
+
+
 def test_a_time_only_hold_with_no_producer_is_raised_once_and_re_arming_does_not_hide_it(env):
     p = make(env)
     from ttp import anchors, holdloops, sweep
