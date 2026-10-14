@@ -11,11 +11,11 @@ below WATCHDOG_S, well above any single tick step; a long tick's steps refresh t
 
 A hung daemon is then, with no model: sent SIGUSR1, which makes it write every thread's stack
 (faulthandler, registered at daemon start) to state/daemon-stacks.log; the new part of that file is
-saved as an incident file under state/incidents/. It is restarted through its service (`systemctl
---user restart` with a timeout; past it, stop, kill the pid and start; launchd and cron: the pid is
-ended and the service starts a new one), and one alert per incident under the key `daemon-hang`
-names the project, the dump and whether the restart worked. It clears itself once a daemon completes
-a tick again. Each restart within `watchdog.window_s` doubles the threshold for the next one (up to
+saved as an incident file under state/incidents/. It is restarted through its service (systemd: the
+hung pid is killed, then `systemctl --user restart` with a timeout; past it, stop, kill and start;
+launchd and cron: the pid is ended and the service starts a new one), and one alert per incident
+under the key `daemon-hang` names the project, the dump and whether the restart worked. It clears
+itself once a daemon completes a tick again. Each restart within `watchdog.window_s` doubles the threshold for the next one (up to
 16 times), and the `watchdog.restarts`-th restart in that window escalates once with a high alert.
 """
 from __future__ import annotations
@@ -202,9 +202,13 @@ def _restart(p: Project, pid: int, grace_s: float) -> tuple[bool, str]:
     svc = service.installed(p)
     if svc and svc["kind"] == "systemd":
         unit = service._unit(p).name
+        # Its SIGTERM handler only asks it to stop after the tick, which a hung daemon never ends, so a
+        # restart would wait out the unit's stop timeout (90 s, past RESTART_TIMEOUT_S). The stacks
+        # are saved: kill the hung pid first, then the restart only starts a new daemon.
+        killed = _end(pid, 0)
         did = _ctl("restart", unit, timeout=RESTART_TIMEOUT_S)
         if did == "ok" and not _alive(pid):
-            return True, f"systemctl --user restart {unit}"
+            return True, (f"killed hung pid {pid}, " if killed else "") + f"systemctl --user restart {unit}"
         # Escalate: stop the unit, kill the pid if the stop did not end it, start it again.
         why = f"systemctl --user restart {unit} {did}" if did != "ok" else f"pid {pid} survived the restart"
         stop = _ctl("stop", unit, timeout=STOP_TIMEOUT_S)

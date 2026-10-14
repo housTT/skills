@@ -14190,6 +14190,35 @@ def test_a_restart_that_times_out_is_escalated_and_reported(env, monkeypatch, st
         assert found == "restart failed" and msg["severity"] == "high" and "could not restart" in msg["text"]
 
 
+def test_a_hung_systemd_daemon_is_killed_before_its_restart_so_the_restart_is_plain(env, monkeypatch):
+    """The unit's SIGTERM only asks the daemon to stop after its tick, which a hung one never ends: a
+    restart with it still alive waits out systemd's stop timeout, past RESTART_TIMEOUT_S."""
+    from ttp import service, watchdog
+    p, proc = _stuck_daemon(env, monkeypatch, age=watchdog.HANG_S + 100)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    calls = []
+
+    def systemctl(*args, timeout):   # systemd: stopping a live hung main pid outlasts the timeout
+        calls.append(args[0])
+        if args[0] in ("restart", "stop") and proc.poll() is None:
+            raise subprocess.TimeoutExpired(["systemctl"], timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(watchdog, "_systemctl", systemctl)
+    now = time.time()
+    try:
+        assert watchdog.check(p, now=now) == "stale"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S, dump_wait_s=0) == "restarted"
+    finally:
+        proc.kill()
+        proc.wait()
+    assert calls == ["restart"]
+    unit = f"{service.unit_name(p)}.service"
+    assert p.db.kv("daemon_hang")["how"] == f"killed hung pid {proc.pid}, systemctl --user restart {unit}"
+    msg = p.db.one("SELECT severity, text FROM messages WHERE ref='daemon-hang'")
+    assert msg["severity"] == "normal" and "escalated" not in msg["text"]
+
+
 def test_a_daemon_that_hangs_again_soon_backs_off_and_escalates_once(env, monkeypatch):
     from ttp import watchdog
     p, proc = _stuck_daemon(env, monkeypatch, age=0)
