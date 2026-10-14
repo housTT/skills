@@ -57057,8 +57057,53 @@ def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
     assert told and "in step step_that_blocks" in told["text"] and dm.TICK_STACKS in told["text"]
     # Once per tick: a later look at the same tick and a quick next tick add nothing.
-    assert d.check_overrun(time.time() + 3600) is None
-    d._tick_began = time.time()
+    assert d.check_overrun(time.monotonic() + 3600) is None
+    d._tick_began = d._moved = time.monotonic()
     assert d.check_overrun() is None
     d._tick_ended()
     assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")) == 1
+
+
+def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watchdogs_restart(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    # The stall dump (plus one watch interval) comes before the watchdogs restart a daemon whose last
+    # seen progress (throttled to PROGRESS_EVERY_S) is WATCHDOG_S old; the long-tick dump does not.
+    assert dm.TICK_STALL_S + 30 < dm.WATCHDOG_S - dm.PROGRESS_EVERY_S < dm.TICK_OVERRUN_S
+    monkeypatch.setattr(dm, "TICK_STALL_S", 0.3)
+    seen = {}
+
+    def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
+        time.sleep(1.0)
+        stacks = p.logs / dm.TICK_STACKS
+        seen["stacks"] = stacks.read_text() if stacks.exists() else ""
+    d.lift_boot_pause = step_stuck_silently
+    d._watch_ticks(every_s=0.05)
+    try:
+        d.tick()
+        d._tick_ended()
+    finally:
+        d.stopping = True
+    assert "no progress for 0 min" in seen["stacks"] and "in step step_stuck_silently" in seen["stacks"]
+    assert "step_stuck_silently" in seen["stacks"].split("in step", 1)[1].split("\n", 1)[1]
+    assert seen["stacks"].count("--- ") == 1   # once per stall, not once per watch interval
+    assert "tick stalled: " in (p.logs / "daemon.log").read_text()
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
+    assert told and "without progress" in told["text"] and "step_stuck_silently" in told["text"]
+
+
+def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
+    import ttp.daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    real = time.time
+    d.tick()   # a real tick: it started on the monotonic clock
+    d._tick_began = d._moved = time.monotonic()
+    monkeypatch.setattr(dm.time, "time", lambda: real() + 3 * 3600)   # the wall clock jumps; monotonic did not
+    assert d.check_overrun() is None
+    d._tick_ended()
+    assert not (p.logs / dm.TICK_STACKS).exists()
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")

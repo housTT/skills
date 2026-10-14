@@ -106,6 +106,9 @@ PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still 
 # A tick still running this long gets every thread's stack written to TICK_STACKS (faulthandler) and,
 # once it ends, an alert: a slow step that keeps telling the watchdogs it moves is never restarted.
 TICK_OVERRUN_S = 900
+# A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
+# (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
+TICK_STALL_S = HEARTBEAT_STALE_S
 TICK_STACKS = "tick-stacks.log"   # under logs/; also written on SIGUSR2, where ptrace is not allowed
 TICK_STACKS_MAX = 2_000_000   # bytes before the file is rotated to <name>.1
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
@@ -478,9 +481,10 @@ class Daemon:
         self.identity = identity.capture(boot=self.boot, started=self._started)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
-        self._tick_began = 0.0   # when the running tick started (0: between ticks)
+        self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
+        self._moved = 0.0        # when the running tick last made progress, monotonic
         self._step_name = ""     # the tick step running now
-        self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S
+        self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
@@ -796,20 +800,28 @@ class Daemon:
         threading.Thread(target=watch, daemon=True, name="tick-watch").start()
 
     def check_overrun(self, now: float | None = None) -> dict | None:
-        """Once per tick that has run TICK_OVERRUN_S: log it with the step it is in, and append every
-        thread's stack to logs/TICK_STACKS. Runs on the watch thread (files only, never the database)."""
-        now = time.time() if now is None else now
-        began = self._tick_began
-        if not began or now - began < TICK_OVERRUN_S or (self._overrun or {}).get("began") == began:
+        """Once per tick that has run TICK_OVERRUN_S, and once per stall of TICK_STALL_S without progress
+        (before the watchdogs restart it): log it with the step it is in, and append every thread's
+        stack to logs/TICK_STACKS. Monotonic time, which stands still while the host sleeps, so a
+        sleep is no overrun. Runs on the watch thread (files only, never the database)."""
+        now = time.monotonic() if now is None else now
+        began, moved, o = self._tick_began, self._moved, self._overrun or {}
+        if not began:
             return None
-        path = self.p.logs / TICK_STACKS
+        same = o.get("began") == began
+        stalled = now - moved >= TICK_STALL_S and not (same and o.get("moved") == moved)
+        if not stalled and (same or now - began < TICK_OVERRUN_S):
+            return None
+        path, step, mins = self.p.logs / TICK_STACKS, self._step_name, int((now - began) // 60)
+        what = (f"tick stalled: no progress for {int((now - moved) // 60)} min, running {mins} min" if stalled
+                else f"tick overrun: running {mins} min")
         with self._stacks_file() as fh:
-            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} tick running {int((now - began) // 60)} min, "
-                     f"in step {self._step_name or '(before the steps)'}\n")
+            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {what}, in step {step or '(before the steps)'}\n")
             fh.flush()
             faulthandler.dump_traceback(file=fh, all_threads=True)
-        self._overrun = {"began": began, "step": self._step_name, "stacks": str(path)}
-        log(self.p, f"tick overrun: running {int((now - began) // 60)} min, in step {self._step_name or '(none yet)'}; "
+        self._overrun = {"began": began, "moved": moved, "step": step, "stacks": str(path),
+                         "stalled": stalled or bool(same and o.get("stalled"))}
+        log(self.p, f"{what}, in step {step or '(none yet)'}; "
                     f"every thread's stack is in {path}")
         return self._overrun
 
@@ -820,9 +832,10 @@ class Daemon:
         if not o or o.get("began") != began or o.get("alerted"):
             return
         o["alerted"] = True
-        mins = int((time.time() - began) // 60)
+        mins = int((time.monotonic() - began) // 60)
         log(self.p, f"tick overrun over: the tick took {mins} min")
-        self.alert("tick-overrun", f"A daemon tick took {mins} min, in step {o['step'] or '(none)'}: no worker "
+        stall = f" ({TICK_STALL_S // 60} min or more without progress)" if o.get("stalled") else ""
+        self.alert("tick-overrun", f"A daemon tick took {mins} min{stall}, in step {o['step'] or '(none)'}: no worker "
                                    f"started and no message was handled meanwhile. Every thread's stack while it "
                                    f"ran is in {o['stacks']}.", severity="normal")
 
@@ -831,6 +844,7 @@ class Daemon:
         so a long tick (a first tick that fetches and adds many worktrees, several slow watchers) is
         not taken for a stuck one. Before this daemon's first completed tick the heartbeat is left
         alone (`ttp restart` reads it as that tick); the start marker carries the progress instead."""
+        self._moved = time.monotonic()   # for check_overrun's stall dump
         now = time.time()
         if now - self._progressed < PROGRESS_EVERY_S:
             return
@@ -845,7 +859,8 @@ class Daemon:
             pass
 
     def tick(self) -> None:
-        self._tick_began, self._step_name = time.time(), ""
+        self._tick_began = self._moved = time.monotonic()
+        self._step_name = ""
         self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
