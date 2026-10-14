@@ -493,6 +493,23 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
 
 
+@pytest.fixture
+def host_tz(monkeypatch):
+    """Sets this machine's zone (TZ + time.tzset) for one test, so a test can prove the runtime reads
+    the project's home zone, never the host's. Restores the zone afterwards."""
+    old = os.environ.get("TZ")
+
+    def setz(name):
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+    yield setz
+    if old is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
+
+
 def make(env, name="demo"):
     from ttp.cli import bootstrap
     from ttp.project import register
@@ -11082,15 +11099,19 @@ def _reviews(p):
 
 
 @pytest.mark.parametrize("clock_at", ["00:10", "04:01", "12:00", "23:50"])
-def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_debounce(env, monkeypatch, clock_at):
-    # The wall clock is pinned to a time of day: the review's regular slot (04:30) may fall inside the debounce.
+def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_debounce(env, monkeypatch, host_tz,
+                                                                                       clock_at):
+    # The wall clock is pinned to a time of day in the schedule's zone (never the host's, set apart here):
+    # the review's regular slot (04:30) may fall inside the debounce.
     from datetime import datetime
+    from ttp import schedule as sched, timefmt
+    host_tz("Pacific/Auckland")
+    p = make(env)
+    zone = sched.zone_of(p.db.one("SELECT * FROM schedules WHERE name='daily-review'"), timefmt.home(p))
     real = time.time
     hh, mm = (int(x) for x in clock_at.split(":"))
-    offset = [datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp() - real()]
+    offset = [datetime.now(timefmt.tzinfo(zone)).replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp() - real()]
     monkeypatch.setattr(time, "time", lambda: real() + offset[0])
-    p = make(env)
-    from ttp import schedule as sched
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     d.gates = {}
@@ -11107,7 +11128,7 @@ def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_de
     assert s["last_status"].startswith("skipped: last run done 1.0 h ago on unchanged evidence"), s["last_status"]
     # The skip counts as the period's run: the next trigger is the regular slot, not a quick retry.
     assert _reviews(p) == [first] and s["last_run"] > time.time() - 60
-    assert s["next_run"] == sched.next_run(s["every_s"], s["at"], s["last_run"]) > time.time()
+    assert s["next_run"] == sched.next_run(s["every_s"], s["at"], s["last_run"], zone) > time.time()
     assert s["next_run"] > s["last_run"]
     if s["next_run"] < time.time() + 3600:
         # That slot falls inside the debounce: it wakes, skips again, and moves on a full period.
@@ -17690,7 +17711,7 @@ def test_the_task_cap_names_its_next_slot_and_wakes_then(env, monkeypatch):
     from ttp import coordinator as coord, timefmt
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_new_tasks_per_day", 2)
-    timefmt.set_home(p, "America/Los_Angeles")
+    assert timefmt.set_home(p, "America/Los_Angeles")
     now = time.time()
     old = [p.db.add_task(f"earlier {i}", "s", origin="coordinator") for i in range(2)]
     for tid, ago in zip(old, (3600, 1800)):
@@ -28009,17 +28030,20 @@ def test_a_light_review_stays_light_after_a_reboot_loss(env, tmp_path):
     assert d._size_review(p.db.task(rev))[0]["tier"] == "light", "a reboot loss lifted the review's tier"
 
 
-def test_the_resume_after_a_reboot_says_so_with_the_last_notes(env, tmp_path):
+def test_the_resume_after_a_reboot_says_so_with_the_last_notes(env, tmp_path, host_tz):
+    host_tz("Pacific/Auckland")              # the boot time reads in the home zone, never the host's
     p = make(env)
+    from ttp import timefmt
     from ttp.daemon import Daemon
     from ttp.prompts import worker_task
+    assert timefmt.set_home(p, "America/Los_Angeles")
     d = Daemon(p.base)
     d.boot_at = time.time() - 300
     tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
     notes = [f"step {i}" for i in range(7)]
     _lost_to_reboot(p, d, tmp_path, tid, notes=notes)
     text = worker_task(p, p.db.task(tid), str(p.root), None)
-    assert "The host rebooted (booted " + time.strftime("%Y-%m-%d %H:%M", time.localtime(d.boot_at)) in text, text
+    assert "The host rebooted (booted " + timefmt.long(d.boot_at, "America/Los_Angeles") + ")" in text, text
     assert "Detached jobs, /tmp files and device state" in text and "`git status`" in text
     assert all(f"step {i}" in text for i in range(2, 7)) and "step 1" not in text, text
 
@@ -33781,17 +33805,20 @@ def _tasks_up_to(p, n):
         p.db.add_task("earlier", "s", kind="work", tier="light", origin="user")
 
 
-def test_task_add_start_after_keeps_the_task_queued_until_then(env):
+def test_task_add_start_after_keeps_the_task_queued_until_then(env, host_tz):
+    host_tz("Pacific/Auckland")              # a dated start_after reads in the home zone, never the host's
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, timefmt
     from datetime import datetime
-    later = datetime.fromtimestamp(time.time() + 2 * 86400).strftime("%Y-%m-%dT%H:%M")
+    assert timefmt.set_home(p, "America/Los_Angeles")
+    home = timefmt.zone(p)
+    later = datetime.fromtimestamp(time.time() + 2 * 86400, home).strftime("%Y-%m-%dT%H:%M")
     assert coord.apply(p, [{"type": "task_add", "title": "in three days", "spec": "s", "start_after": "3d"},
                            {"type": "task_add", "title": "on a date", "spec": "s", "start_after": later},
                            {"type": "task_add", "title": "now", "spec": "s", "start_after": "now"}]) == []
     three, dated, now_ = _added(p, "in three days"), _added(p, "on a date"), _added(p, "now")
     assert abs(p.db.task(three)["not_before"] - (time.time() + 3 * 86400)) < 60
-    assert abs(p.db.task(dated)["not_before"] - datetime.fromisoformat(later).timestamp()) < 1
+    assert abs(p.db.task(dated)["not_before"] - datetime.fromisoformat(later).replace(tzinfo=home).timestamp()) < 1
     assert any(lb.startswith("start_after:") for lb in _labels(p, three))
     ready = [t["id"] for t in p.db.ready_tasks()]
     assert three not in ready and dated not in ready and now_ in ready
@@ -51793,7 +51820,7 @@ def _net_setup(env, monkeypatch, n=2, probe=NET_PROBE, out=NET_OUT, ssh_config=N
     monkeypatch.setattr(netwait, "_ssh_config", lambda alias: dict((ssh_config or {}).get(alias) or {}))
     p = make(env)
     _no_events(p)
-    timefmt.set_home(p, "America/Los_Angeles")
+    assert timefmt.set_home(p, "America/Los_Angeles")
     d = Daemon(p.base)
     for i in range(n):
         assert coord.apply(p, [{"type": "task_add", "title": f"device job {i}", "spec": "s",
