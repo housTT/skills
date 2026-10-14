@@ -313,9 +313,13 @@ def file_runs(p, now: float | None = None) -> list[str]:
     seen = dict(_load(db)["runs"])
     out: list[str] = []
     # A queued task's runs too: its on_pass_cmd writes to the run it waits on, however old.
-    runs = db.q("SELECT id, task, dir, started FROM runs WHERE dir IS NOT NULL AND task IS NOT NULL "
+    cutoff = now - RUN_FILES_DAYS * 86400
+    runs = db.q("SELECT id, task, dir, started, status FROM runs WHERE dir IS NOT NULL AND task IS NOT NULL "
                 "AND (status='running' OR started>=? OR task IN (SELECT id FROM tasks WHERE status='queued'))",
-                (now - RUN_FILES_DAYS * 86400,))
+                (cutoff,))
+    # Before offsets were kept (below), an old run's offset was dropped once it left the window; such a
+    # run back in the set (its task re-queued) has its records from inside the window filed already.
+    legacy = not _load(db).get("runs_kept")
     for r in runs:
         f = Path(r["dir"]) / RUN_FILE
         try:
@@ -324,18 +328,28 @@ def file_runs(p, now: float | None = None) -> list[str]:
         except OSError:
             continue
         done = int(seen.get(str(r["id"]), 0))
+        old = legacy and str(r["id"]) not in seen and r["status"] != "running" and float(r["started"] or 0) < cutoff
         for line in lines[done:]:
             try:
                 rec = json.loads(line)
+                if old and float(rec.get("ts") or 0) < float(r["started"] or 0) + RUN_FILES_DAYS * 86400:
+                    continue
                 record(p, str(rec["id"]), str(rec["kind"]), str(rec.get("evidence") or ""), int(r["task"]),
                        now=min(float(rec.get("ts") or now), now), milestone=rec.get("milestone"))
             except (ValueError, KeyError, TypeError) as e:
                 out.append(f"run {r['id']}: {str(e)[:200]}")
         seen[str(r["id"])] = len(lines)
+    # An offset is kept while it counts lines and the run is not gone: a run leaves the set when it ages
+    # out and comes back when its task is re-queued, and must not be read again from line 0.
     keep = {str(r["id"]) for r in runs}
+    filed = [k for k, v in seen.items() if k not in keep and int(v)]
+    if filed:
+        keep |= {str(r["id"]) for r in db.q(f"SELECT id FROM runs WHERE id IN ({','.join('?' * len(filed))})",
+                                            tuple(int(k) for k in filed))}
     with db.tx():
         st = _load(db)
         st["runs"] = {k: v for k, v in seen.items() if k in keep}
+        st["runs_kept"] = True
         db.set_kv(KV, st)
     return out
 

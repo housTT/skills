@@ -51353,6 +51353,50 @@ def test_obligation_run_record_written_in_two_parts_is_not_lost(env, monkeypatch
     assert len(ob.get(p.db, oid)["owners"][str(tid)]["evidence"]) == 1, "and is filed once"
 
 
+def test_obligation_run_records_are_not_filed_twice_when_an_aged_out_run_comes_back(env, monkeypatch):
+    """A run past RUN_FILES_DAYS leaves the filing set and comes back when its task is re-queued (its
+    on_pass_cmd may still write to it): its records are not read again from line 0."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    run_dir = p.runs / "r-aged"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    rid = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+    (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 600, "id": oid, "kind": "progress",
+                                                   "evidence": "commit abc"}) + "\n")
+    check(now + 700)
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (int(rid),))
+    p.db.update_task(tid, status="done")
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    check(later)
+    assert ob._load(p.db)["runs"].get(rid) == 1, "an aged-out run keeps its offset"
+    p.db.update_task(tid, status="queued")
+    check(later + 60)
+    evidence = lambda: [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]]
+    assert evidence() == ["commit abc"], "the re-queued task's old run is not filed twice"
+    (run_dir / ob.RUN_FILE).open("a").write(json.dumps({"ts": later + 90, "id": oid, "kind": "receipt",
+                                                        "evidence": "docs/report.md"}) + "\n")
+    assert ob.file_runs(p, later + 120) == []
+    assert ob.get(p.db, oid)["receipt"]["evidence"] == "docs/report.md", "a new record in it is filed"
+    assert ob.file_runs(p, later + 180) == [] and evidence() == ["commit abc"]
+    assert ob._load(p.db)["runs"].get(rid) == 2
+
+    # State written before offsets were kept: the aged-out run's offset is already gone.
+    oid2 = ob.add(p, "the second report", [tid], now=later + 200)
+    st = ob._load(p.db)
+    st["runs"].pop(rid)
+    st.pop("runs_kept")
+    p.db.set_kv(ob.KV, st)
+    (run_dir / ob.RUN_FILE).open("a").write(json.dumps({"ts": later + 240, "id": oid2, "kind": "progress",
+                                                        "evidence": "commit def"}) + "\n")
+    assert ob.file_runs(p, later + 300) == [], "no spurious refusal of the already-filed receipt"
+    assert evidence() == ["commit abc"]
+    assert [e["text"] for e in ob.get(p.db, oid2)["owners"][str(tid)]["evidence"]] == ["commit def"]
+    assert ob._load(p.db)["runs"].get(rid) == 3 and ob._load(p.db)["runs_kept"]
+
+
 def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(env, monkeypatch):
     from ttp import cli
     from ttp import coordinator as coord
