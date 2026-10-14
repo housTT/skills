@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, timefmt, worktree
+from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, settinghold, timefmt, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
@@ -1652,14 +1652,18 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
 
 def _told_to_land(p: Project, task: str, d: dict) -> bool:
     """Whether task `task` may land its own branch on the push branch with a plain `ttp push`: its
-    spec or title has a landing step (settinghold.lands; a `no_push:` line never does), or it is a
-    review. A task the project has no row of is not gated (nothing to read)."""
-    from . import settinghold
+    spec or title has a landing step (settinghold.lands; a `no_push:` line never does), its pr_branch
+    label names the push branch, or it is a review. Not gated: a task the project has no row of
+    (nothing to read), or own pushes off (delivery.own_push: the push branch is the only one)."""
+    if own_push({"delivery": d}) == "off":
+        return True
     try:
         t = p.db.task(int(task))
     except (ValueError, TypeError):
         return True
     if not t or t.get("kind") == "review":
+        return True
+    if pr_branch_of(p, t) and not labelled_elsewhere(p, t, d):
         return True
     return settinghold.lands(t, str(d.get("push_branch") or ""))
 

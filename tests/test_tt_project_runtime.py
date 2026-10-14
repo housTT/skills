@@ -23468,6 +23468,20 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
         except ValueError as e:
             got = str(e)
         assert (got == ("origin", "proj", False)) is lands, (spec, got)
+    # A pr_branch label naming the push branch is an explicit target; with own pushes off the push
+    # branch is the only one. Both land without a landing step in the spec.
+    p.db.conn.execute("UPDATE tasks SET spec=? WHERE id=?", ("Fix it.", own_only))
+    p.db.conn.commit()
+    with pytest.raises(ValueError, match="does not ask it to land"):
+        push.resolve(p, repo)
+    p.db.conn.execute("UPDATE tasks SET labels=? WHERE id=?", ('["pr_branch:proj"]', own_only))
+    p.db.conn.commit()
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    p.db.conn.execute("UPDATE tasks SET labels=? WHERE id=?", ("[]", own_only))
+    p.db.conn.commit()
+    p.set_config("delivery.own_push", "off")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    p.set_config("delivery.own_push", "on")
     # A review lands from its own branch as before; outside a run nothing is gated.
     review = p.db.add_task("review", kind="review")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{review}-review")
@@ -41741,8 +41755,10 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
         assert not push.is_notes_branch(p, own)
         if labels:
             assert push.own_target(p, repo) == ("origin", "feature/x")
-        else:
+        else:   # its spec has no landing step: `--land` says it may land
+            monkeypatch.setenv(push.LAND_ENV, "1")
             assert push.resolve(p, repo) == ("origin", "proj", False)
+            monkeypatch.delenv(push.LAND_ENV)
     # A branch recorded on the task row is its own code branch too; the slug then no longer is.
     p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/t{tid}-fix-notes", tid))
     assert not push.is_notes_branch(p, f"ttp/t{tid}-fix-notes")
