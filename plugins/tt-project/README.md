@@ -21,6 +21,8 @@ codex plugin add tt-project@tenstorrent-skills     # Codex
 Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`, or start the CLI with
 `agent --plugin-dir <this folder>`.
 
+Until tt-project is on `main`, install it as described in [Dogfood install](#dogfood-install).
+
 The first use installs a `ttp` command for your user (`ttp setup`). Python 3.9+ and `git` are the
 only requirements; the runtime uses the standard library.
 
@@ -38,6 +40,87 @@ skill is `/tt-project:tt-project`. `ttp setup` adds a small personal skill,
 lists as `/tt-project` and that loads the plugin's skill. Only you can run it, so Claude still sees one
 tt-project skill, not two. Every `ttp setup` refreshes it. If you already have your own skill named
 `tt-project`, setup leaves it as it is. `ttp setup --no-shortcut` removes the shortcut.
+
+## Dogfood install
+
+tt-project is not on `main` yet, so adding the marketplace from `main` does not find it. Install
+the dogfood cut instead: the tag `smartonTT/tt-project-dogfood-1` of `tenstorrent/skills`. To
+follow the latest work, use the branch `smartonTT/tt-project` wherever the commands below say
+`smartonTT/tt-project-dogfood-1`. You need Python 3.9+, `git` with `user.name` and `user.email`
+set, and a logged-in agent CLI to run the project's workers.
+
+Claude Code (a branch or tag goes after `#`):
+
+```bash
+claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#smartonTT/tt-project-dogfood-1'
+claude plugin install tt-project@tenstorrent-skills
+claude plugin details tt-project    # Skills (2): tt-project, tt-project-harness
+"$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
+```
+
+Codex (`--ref` takes a branch or tag):
+
+```bash
+codex plugin marketplace add tenstorrent/skills --ref smartonTT/tt-project-dogfood-1
+codex plugin add tt-project@tenstorrent-skills
+"$(ls -d "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
+```
+
+Cursor installs plugins from a team marketplace or a local folder, and neither takes a git ref, so
+check out the tag with `git` and copy the plugin into Cursor's local plugin folder. These steps
+follow Cursor's plugin documentation and have not been tested end to end yet:
+
+```bash
+git clone --depth 1 --branch smartonTT/tt-project-dogfood-1 https://github.com/tenstorrent/skills.git tt-skills-dogfood
+mkdir -p ~/.cursor/plugins/local
+cp -R tt-skills-dogfood/plugins/tt-project ~/.cursor/plugins/local/tt-project
+~/.cursor/plugins/local/tt-project/bin/ttp setup
+```
+
+Then restart Cursor (or run **Developer: Reload Window**).
+
+`ttp setup` installs `ttp` in `~/.local/bin` (add that folder to `PATH` if it is not there yet)
+and adds the plain `/tt-project` command for Claude Code. The skill also runs it on first use.
+
+First project: in a chat, say "start a tt-project called `demo` in this repository: <brief>", or
+from a shell inside a git repository:
+
+```bash
+ttp new demo --describe "Keep the README accurate."
+```
+
+It ends with a checked link, `web app: http://127.0.0.1:<port>/#token=<token>`. Open it in a
+browser; `ttp web demo` prints it again. `--provider claude|codex|cursor` picks the agent CLI that
+runs the workers (default: the chat's own CLI; Claude Code from a plain shell). The coordinator starts on the brief right away.
+
+Update: remove the marketplace, then repeat the install commands above with the new tag or branch,
+`ttp setup` included. Running projects take in the new release within an hour and keep their work.
+
+```bash
+claude plugin marketplace remove tenstorrent-skills    # also uninstalls its plugins
+codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
+```
+
+When you follow the branch, Claude Code can also update in place (then run `ttp setup` as above):
+
+```bash
+claude plugin marketplace update tenstorrent-skills && claude plugin update tt-project@tenstorrent-skills
+```
+
+Uninstall: stop every project (`ttp list` names them), then remove the shortcut, the plugin and
+the per-user files (project registry, saved keys and the installed `ttp`):
+
+```bash
+ttp stop <name> --kill          # each project: ends its daemon and workers, removes its service
+ttp setup --no-shortcut
+claude plugin marketplace remove tenstorrent-skills
+codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
+rm -rf ~/.cursor/plugins/local/tt-project
+rm -rf ~/.tt-project ~/.local/bin/ttp
+```
+
+Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
+history. If you ran `ttp notifier install`, also remove its `tt-project-notifier` user service.
 
 ## Using it
 

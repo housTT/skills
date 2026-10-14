@@ -119,6 +119,27 @@ def test_claude_code_shortcut_is_plain_tt_project_and_loads_the_plugin_skill():
     assert "`/tt-project`" in readme and "`/tt-project:tt-project-harness`" in readme
 
 
+def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
+    """Teammates install from the dogfood tag, not `main` (which has no tt-project): Claude Code
+    takes the ref after `#`, Codex after `--ref`, Cursor through a git checkout; the marketplace
+    and plugin names must be the ones both catalogues register."""
+    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert "\n## Dogfood install\n" in readme
+    section = readme.split("\n## Dogfood install\n", 1)[1].split("\n## ", 1)[0]
+    repo = PLUGIN.parents[1]
+    names = {json.loads((repo / f).read_text())["name"] for f in
+             (".claude-plugin/marketplace.json", ".agents/plugins/marketplace.json")}
+    assert len(names) == 1
+    market, plugin, tag = names.pop(), json.loads(MANIFESTS[0].read_text())["name"], "smartonTT/tt-project-dogfood-1"
+    assert f"claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#{tag}'" in section
+    assert f"codex plugin marketplace add tenstorrent/skills --ref {tag}" in section
+    assert f"git clone --depth 1 --branch {tag} " in section
+    for cmd in (f"claude plugin install {plugin}@{market}", f"codex plugin add {plugin}@{market}",
+                f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
+                "bin/ttp\" setup", "ttp new ", "ttp stop <name> --kill"):
+        assert cmd in section, cmd
+
+
 def test_runtime_is_standard_library_only_and_python39_compatible():
     stdlib = set(sys.stdlib_module_names)
     for py in RUNTIME.rglob("*.py"):
