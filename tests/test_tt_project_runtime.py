@@ -9123,6 +9123,24 @@ def test_daemon_retry_backoffs_and_waiting_probes_are_no_time_only_hold_but_a_re
     assert [e["task"] for e in evs] == [later] and "re-armed" in evs[0]["text"], evs
 
 
+def test_a_blocked_until_hold_after_a_waiting_hand_off_is_a_time_only_hold(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    d = Daemon(p.base)
+    now = time.time()
+    # The daemon runs a waiting hand-off's probe only while the task is queued: once blocked on a
+    # time, that probe is no producer.
+    t = p.db.add_task("waited, then held", "s", kind="code", origin="user")
+    p.db.update_task(t, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"], result=dump_result(
+        {"status": "waiting", "summary": "job running", "retry_when": "test -e /nonexistent", "waiting_for": "job"}))
+    d._raise_hold_loops(now)
+    p.db.update_task(t, labels=[f"waits:until:{now + 7200:.0f}"])
+    d._raise_hold_loops(now + 60)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [t] and "re-armed" in evs[0]["text"], evs
+
+
 def test_a_time_only_hold_with_no_producer_is_raised_once_and_re_arming_does_not_hide_it(env):
     p = make(env)
     from ttp import anchors, holdloops, sweep

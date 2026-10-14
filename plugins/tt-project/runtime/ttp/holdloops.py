@@ -117,13 +117,13 @@ def _time_end(t: dict, now: float) -> float | None:
 
 def _real_end(t: dict, states: dict) -> bool:
     """The task waits on something other than a time: an ask, resource or probe anchor, a
-    start_when probe, a waiting hand-off's retry_when or on_pass_cmd probe, or a dependency not done
-    (an open one produces its evidence; a blocked or dead one is its own condition)."""
+    start_when probe, a queued waiting hand-off's retry_when or on_pass_cmd probe (the daemon runs
+    no other), or a dependency not done (an open one produces its evidence; a blocked or dead one is its own condition)."""
     got = anchors.anchor(t) if t["status"] == "blocked" else None
     if got and got[0] in REAL_ENDS or deferral(t).get("when"):
         return True
     r = load_result(t["result"])
-    if r.get("status") == "waiting" and (r.get("retry_when") or r.get("on_pass_cmd")):
+    if t["status"] == "queued" and r.get("status") == "waiting" and (r.get("retry_when") or r.get("on_pass_cmd")):
         return True
     return any(states.get(d) != "done" for d in dependency_ids(t))
 
