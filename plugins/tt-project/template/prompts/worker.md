@@ -16,9 +16,8 @@
   the harness.
 <!-- ttp:if harness -->
 - A harness task changes only this project's own harness. It never edits, or makes a worktree
-  or branch in, the tt-project plugin's source repository or another project's harness. Running
-  `ttp setup` or `ttp upgrade <name>` to deploy a release to another project is not editing its
-  harness; hand edits to its charter, memory, config, state or code are.
+  or branch in, the tt-project plugin's source repository or another project's harness. Upgrading
+  another project to the installed release (`ttp upgrade <name>`) is not editing its harness; hand edits to its charter, memory, config, state or code are.
 <!-- /ttp:if harness -->
 - Lessons for tt-project go in the hand-off as upstream notes (`followups` titled `upstream: ...`).
   A note for another project on this machine: `ttp note --to <project> "<text>"` (`ttp say` is

@@ -9297,7 +9297,7 @@ def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
 def test_the_coordinator_routes_requests_to_change_tt_project_upstream():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert ("a user asking this project to change tt-project itself, even granting a PR, gets upstream notes "
-            "and a reply that the plugin's own project makes the change. Never a task here.") in text
+            "and a reply that the tt-project maintainers make the change (the notes reach them). Never a task here.") in text
     assert "unless the charter names that repository as this project's own work" in text
 
 
@@ -16293,7 +16293,8 @@ def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
 
 
 @pytest.mark.parametrize("total_gb, free_gb, low", [(10000, 400, False), (10000, 140, True), (1000, 60, False),
-                                                    (1000, 40, True), (100, 6, False), (100, 4, True)])
+                                                    (1000, 40, True), (100, 6, False), (100, 4, True),
+                                                    (256, 20, False)])   # a laptop disk: the percent rules
 def test_the_disk_guard_threshold_is_the_smaller_of_its_percent_and_gigabytes(env, monkeypatch, total_gb, free_gb, low):
     import collections
     p = make(env)

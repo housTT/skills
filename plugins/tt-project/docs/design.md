@@ -261,6 +261,25 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   own cursor; new notes become `upstream_note` events for its coordinator. Coordinators pass the
   notes on to the user only while no project reads the inbox.
 
+## Maintainer notes
+
+These are for people changing tt-project itself, not for running a project.
+
+- Testing a branch before release: run `plugins/tt-project/bin/ttp setup` from a checkout at that
+  branch's tip. The installed `ttp setup` reinstalls its own version and warns about it.
+- Coordinator cache tuning (see providers.md). An earlier seven-day comparison found a token-hit
+  increase from about 57% to 68.5%, but cost per turn rose from $0.073–0.083 to $0.127 as prompts
+  grew and effort changed. Its "cold" threshold was below 30%, distinct from the existing status
+  miss threshold of 50%. A better hit rate alone therefore does not demonstrate savings. Evaluate
+  this change using three days before and three days after deployment, selecting turns with a 5–60
+  minute gap since the previous coordinator turn ended. The status API's
+  `coordinator_cache["3d"].gap_5_60m` reports token hit and cost per turn for that cohort, with raw
+  counters and known/missing counts. Compare the same provider, model and effort, report prompt
+  sizes and sample counts, and retain the change only if both token hit and cost per turn improve.
+  If the sample or telemetry is insufficient, report unknown and extend observation; do not infer a
+  miss or savings. Revert the tuning if the comparison shows no improvement while retaining the
+  telemetry needed to diagnose it.
+
 ## Prior art
 
 The design borrows from agent project managers that already exist:
