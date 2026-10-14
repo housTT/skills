@@ -416,6 +416,31 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_shipped_prompts_and_templates_hold_no_one_users_cluster_policy():
+    # One user's rules (a node list, an idle threshold, a machine list) belong in their own charter;
+    # the shipped prompts, templates and skills state only company-wide scheduler etiquette.
+    personal = re.compile(r"(?i)exact nodes|idle (at least|as long)|LastBusyTime|default 2 ?h|nodes? the user "
+                          r"(listed|allows)|existing machine list|demo nodes?|any idle node")
+    files = [f for d in ("template", "skills") for f in sorted((PLUGIN / d).rglob("*")) if f.is_file()]
+    hits = [f"{f.relative_to(PLUGIN)}:{n}: {line.strip()}" for f in files if f.suffix in (".md", ".json", ".txt")
+            for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1) if personal.search(line)]
+    assert not hits, "\n".join(hits)
+
+    def flat(*parts):
+        return " ".join((PLUGIN / pathlib.Path(*parts)).read_text(encoding="utf-8").split())
+    worker = flat("template", "prompts", "worker.md")
+    for part in ("Get nodes only through the cluster's scheduler.",
+                 "Where the charter names nodes, partitions or limits, stay within them",
+                 "never widen your own scope", "allocated, drained, reserved for others or down",
+                 "Release the allocation as soon as the work ends."):
+        assert part in worker, part
+    coord = flat("template", "prompts", "coordinator.md")
+    assert "within any nodes, partitions or limits the charter names" in coord
+    assert "never widen a task's scope yourself" in coord
+    assert "within any nodes, partitions or limits under Resources" in flat("template", "CHARTER.md")
+    assert "add none of your own" in flat("skills", "tt-project", "create.md")
+
+
 def test_prompts_and_charter_template_say_self_heal_then_report():
     def flat(*parts):
         return " ".join((PLUGIN / "template" / pathlib.Path(*parts)).read_text(encoding="utf-8").split())

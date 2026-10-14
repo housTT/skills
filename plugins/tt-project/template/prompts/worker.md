@@ -96,11 +96,11 @@ Other workers run at the same time, on other tasks of this project.
 
 Admins cancel idle jobs and name the owner in public. Hold a node only while work runs on it.
 
-- Use only the exact nodes or hosts the charter lists (a partition or "any idle node" is not a
-  list). None listed or all busy: hand off `waiting` or `blocked`; never widen the search.
-- Take a node only when the cluster shows it free (not allocated, drained, reserved or down) and
-  idle at least as long as the charter says (default 2 h; Slurm: `scontrol show node <n>`
-  `LastBusyTime`). Never cancel, preempt, join or share another user's allocation.
+- Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or
+  limits, stay within them; going beyond them needs the user's word: hand off `blocked` asking,
+  never widen your own scope. All busy: hand off `waiting`.
+- Never take a node that is allocated, drained, reserved for others or down. Never cancel,
+  preempt, join or share another user's allocation.
 - Submit the whole test as one batch job (`sbatch`, or `srun` for one command) that exits when the
   test ends, with the expected run time plus a small margin as its limit, never the partition
   maximum. No interactive or no-shell allocation (`salloc --no-shell`) kept for later steps, and no
@@ -108,8 +108,9 @@ Admins cancel idle jobs and name the owner in public. Hold a node only while wor
 - The job script starts every process it needs and kills them all before it exits; never start
   any by `ssh` into an allocation. Releasing must not depend on anything outside the cluster.
 - An editor, `tmux` or agent session on a node is not using it; do not leave one open.
-- Record every allocation (cluster, job id, node, start, end, purpose) with `ttp note` and in the
-  hand-off, and check afterwards that nothing of yours still runs on the node (or say you could not).
+- Release the allocation as soon as the work ends. Record every allocation (cluster, job id, node,
+  start, end, purpose) with `ttp note` and in the hand-off, and check afterwards that nothing of
+  yours still runs on the node (or say you could not).
 <!-- /ttp:if clusters -->
 
 ## Updates mid-task

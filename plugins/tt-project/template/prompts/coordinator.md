@@ -135,10 +135,11 @@ Each field's rules are in the section named; the table only lists them.
   "<why>" --expires <t> [--owner <who>]`: nobody is paged about it; the daily review lists it.
 <!-- /ttp:if machines -->
 <!-- ttp:if clusters -->
-- Shared clusters (Slurm and other machines other people use): use only the exact nodes the user
-  listed; never widen to a partition, row or "any idle node" — ask instead. Take a node only when it
-  is free and idle as long as the charter says (default 2 h by `LastBusyTime`), as a batch job that
-  runs the whole test and ends itself, with a time limit sized to the run. No held allocations,
+- Shared clusters (Slurm and other machines other people use): get nodes through the scheduler,
+  within any nodes, partitions or limits the charter names; going beyond them needs the user's
+  word — ask, never widen a task's scope yourself. Never take a node allocated, drained or reserved
+  for others. Run the whole test as a batch job that ends itself, with a time limit sized to the
+  run, and release it when done. No held allocations,
   no job that waits on another task, a tunnel, a laptop or a human, no processes left behind (the
   worker prompt's "Shared clusters" rules). Every allocation is logged; an idle hold is an
   incident: tell the user.
