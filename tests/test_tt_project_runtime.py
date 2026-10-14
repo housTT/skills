@@ -48767,6 +48767,140 @@ def test_heal_known_fault_ends_escalates_and_asks_renewal_once(env, form):
     assert heal.run(d, "svc", renewed, end + 180)[0] == "unhealthy (known fault: kept quiet)"
 
 
+@pytest.mark.parametrize("via", ["machine", "resource", "outage_unknown"])
+def test_heal_known_machine_outage_keeps_the_check_quiet_then_grace_after_it(env, via):
+    """Replay: a check on a box with a known `ttp machines outage` opened a self-fix task; once the outage
+    ended a check still failing went straight to escalation with no grace."""
+    from ttp import heal, timefmt
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    block = {"machine": "box-a"} if via == "machine" else {"resource": "box-a-device"}
+    if via == "outage_unknown":
+        block = {"resource": "box-a-device", "outage": True, "check": "exit 75"}
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, **block)
+    spec, now = _heal_spec(p), time.time()
+    tid = _heal_to_self_fix_failed(p, d, up, dict(spec, check=f"test -e {up}", grace_s=0), now)   # an earlier episode
+    rec = ml.set_outage("box-a", "hardware repair", "user", "2h", now=now)
+    until = timefmt.long(rec["until"], p)
+    if via == "outage_unknown":   # unknown within its window, then quiet past it instead of escalating
+        assert heal.run(d, "svc", spec, now + 30)[0] == "ok (unknown, rc 75)"
+    for dt in (660, 3600, 7000):
+        assert heal.run(d, "svc", spec, now + dt)[0] == f"unhealthy (known outage until {until})"
+    st = heal.state(p.db, "svc")
+    assert st["known_outage"] == "box-a" and not {"task", "escalated", "alerted", "observed"} & set(st)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'") and not up.exists()
+    assert p.db.task(tid)["status"] == "failed"
+    # The outage ends and the box still fails: a fresh episode with its grace, not an escalation.
+    ml.clear_outage("box-a")
+    t1 = now + 7300
+    first = heal.run(d, "svc", spec, t1)[0]
+    if via == "outage_unknown":
+        assert first == "ok (unknown, rc 75)"
+    else:
+        assert first == "unhealthy (0 s, grace 600 s)"
+    assert "self-fix task" in heal.run(d, "svc", spec, t1 + 600)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_unknown_check_under_a_known_machine_outage_tells_no_one(env, escalate):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, machine="box-a", unknown_cap_s=600, escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 255")
+    ml.set_outage("box-a", "hardware repair", "user", "4h", now=now)
+    for t in (0, 11 * 60, 3600, 3 * 3600):
+        assert heal.run(d, "svc", dark, now + t) == ("ok (unknown, rc 255)", None)
+    assert _heal_told(p) == ([], []) and "unknown_told" not in heal.state(p.db, "svc")
+    # The outage over, the same stretch says so once past its cap again.
+    ml.clear_outage("box-a")
+    assert heal.run(d, "svc", dark, now + 4 * 3600 + 60) == ("ok (unknown, rc 255)", None)
+    assert "told" in heal.run(d, "svc", dark, now + 4 * 3600 + 60 + 601)[0]
+    assert sum(map(len, _heal_told(p))) == 1
+
+
+@pytest.mark.parametrize("block", [{"machine": "box-b"}, {"resource": "box-ab-device"}, {"resource": "box-a2"}])
+def test_heal_outage_on_another_machine_does_not_quiet_the_check(env, block):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, escalate="coordinator", **block)
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "4h", now=now)
+    assert heal.known_outage(spec, now) is None
+    heal.run(d, "svc", dict(spec, check="exit 255"), now)
+    assert "coordinator told" in heal.run(d, "svc", dict(spec, check="exit 255"), now + 601)[0]
+    assert "it has no fix" in heal.run(d, "svc", spec, now + 700)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+
+
+def test_heal_back_from_a_long_unknown_stretch_starts_a_fresh_episode(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    tid = _heal_to_self_fix_failed(p, d, up, dict(spec, grace_s=0), now)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 10)[0]
+    # A short unknown blip keeps the episode.
+    heal.run(d, "svc", dark, now + 20)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 30)[0]
+    # A long one (past grace and FRESH_UNKNOWN_S) with the task closed: grace again, then a new task.
+    heal.run(d, "svc", dark, now + 40)
+    t1 = now + 40 + heal.FRESH_UNKNOWN_S + 1
+    assert heal.run(d, "svc", spec, t1)[0] == "unhealthy (0 s, grace 600 s)"
+    st = heal.state(p.db, "svc")
+    assert st["since"] == t1 and not {"task", "escalated", "observed"} & set(st)
+    assert "it has no fix" in heal.run(d, "svc", spec, t1 + 600)[0]
+    assert heal.state(p.db, "svc")["task"] != tid
+    # An open task survives a long unknown stretch: the episode goes on.
+    heal.run(d, "svc", dark, t1 + 700)
+    assert "open" in heal.run(d, "svc", spec, t1 + 700 + 10 * heal.FRESH_UNKNOWN_S)[0]
+
+
+def test_heal_fresh_episode_after_a_long_unknown_stretch_keeps_the_fix_cap(env, tmp_path):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=f"echo fixed >> {tmp_path}/fixes", grace_s=0, max_fixes=1, window_h=2,
+                           escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fixed; rechecking)"
+    assert "the fix ran but" in heal.run(d, "svc", spec, now + 10)[0]
+    p.db.update_task(heal.state(p.db, "svc")["task"], status="failed")
+    heal.run(d, "svc", dict(spec, check="exit 75"), now + 20)
+    assert "used up its cap (1)" in heal.run(d, "svc", spec, now + 20 + heal.FRESH_UNKNOWN_S + 1)[0]
+    assert (tmp_path / "fixes").read_text().count("fixed") == 1
+
+
+def test_heal_reboots_keep_the_fix_cap_and_an_open_self_fix_task(env, tmp_path):
+    """Known gap (module doc): a reboot starts no fresh episode, so a crash-looping box gets no fix per boot."""
+    from ttp import heal
+    boot = tmp_path / "boot"
+    boot.write_text("aaaaaaaa-1111")
+    p, d, up = _heal_setup(env, grace_s=300, max_fixes=1, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    spec = dict(spec, check=f'echo "boot_id: $(cat {boot})"; test -e {up}', fix=f"echo fixed >> {tmp_path}/fixes")
+    assert "grace" in heal.run(d, "svc", spec, now)[0]
+    assert heal.run(d, "svc", spec, now + 300)[0] == "unhealthy (fixed; rechecking)"
+    assert "the fix ran but" in heal.run(d, "svc", spec, now + 310)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    for i, t in enumerate((400, 900, 1500)):
+        boot.write_text(f"bbbbbbbb-{i}")   # the host rebooted and still fails
+        assert heal.run(d, "svc", spec, now + t)[0] == f"unhealthy (self-fix task #{tid} open)"
+    p.db.update_task(tid, status="failed")
+    for i, t in enumerate((2000, 2600, 3500)):
+        boot.write_text(f"cccccccc-{i}")
+        assert "coordinator told" in heal.run(d, "svc", spec, now + t)[0]
+    assert (tmp_path / "fixes").read_text().count("fixed") == 1
+    assert len(heal.state(p.db, "svc")["fixes"]) == 1
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
 @pytest.mark.parametrize("task_status", ["running", "done", "failed", "blocked", "gone", "escalated-only"])
 def test_heal_known_fault_added_after_self_fix_stays_quiet(env, escalate, task_status):

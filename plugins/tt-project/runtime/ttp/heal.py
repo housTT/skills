@@ -67,6 +67,18 @@ Everything else keeps the route rule above. Known limits: with no peer answering
 down (our own route looks the same); a route failure with another exit code, ping unable to tell, or a network
 that drops ping stays a route problem. Set them only for a box that answers ping when it is up.
 
+Known machine outages: while the check's machine (machine_of) or its `resource` has a known outage in the
+machine ledger (`ttp machines outage`, until its end), an unhealthy result is kept quiet like a known
+fault (no fix, no task, no alert), an outage check's unknown stretch never escalates, and a long unknown
+stretch says nothing (no unknown_cap_s message); the status reads "known outage until <time>". Once the
+outage ends, a check still failing starts a fresh episode.
+
+Fresh episodes: an unhealthy result after an unknown stretch (ending in 75 or 255, not a broken check)
+longer than its grace (at least FRESH_UNKNOWN_S) whose self-fix task is no longer open starts a new
+episode, grace included. It keeps the fix history, so `max_fixes` per `window_h` still holds, and an
+open self-fix task keeps the episode going. Known gap: a host reboot does not start a fresh episode;
+the fix cap and any open self-fix task carry across reboots.
+
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
 the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
 on a check without `outage`: its own grace, its fix, `known_fault` keeps it quiet, the ordinary self-fix
@@ -140,6 +152,7 @@ ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out
                       r"ssh: connect to host|connection closed by .* port", re.I)
 HOST_RE = re.compile(r"[A-Za-z0-9_.:%\[\]][A-Za-z0-9_.:%\[\]-]*")   # one host name or address, never an option
 PING_S = 3                      # how long box_silent waits for each ping reply
+FRESH_UNKNOWN_S = 900          # an unknown stretch shorter than this never starts a fresh episode (module doc)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
 OPEN = ("queued", "running", "waiting", "needs_review")
@@ -561,6 +574,38 @@ def machine_of(spec: dict, known: dict | None = None) -> str | None:
                  if res == a or res.startswith((a + "-", a + ":"))), None)
 
 
+def known_outage(spec: dict, now: float) -> tuple[str, dict] | None:
+    """(alias, record) of a known machine-ledger outage on the check's machine or `resource`, else None."""
+    alias, res = machine_of(spec), str(spec.get("resource") or "")
+    try:
+        from . import machine_ledger
+        outs = machine_ledger.outages(now)
+    except Exception:   # the ledger is shared and best effort
+        return None
+    return next(((a, o) for a, o in sorted(outs.items(), key=lambda x: len(x[0]), reverse=True)
+                 if a == alias or res == a or res.startswith((a + "-", a + ":"))), None)
+
+
+def _fresh(st: dict, *also: str) -> None:
+    """Start a new unhealthy episode: grace again, no task, nothing escalated (module doc). Keeps `fixes`."""
+    for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", *also):
+        st.pop(key, None)
+
+
+def _quiet_outage(host: Any, name: str, st: dict, known: tuple[str, dict], now: float) -> tuple[str, float | None]:
+    """Unhealthy under a known machine-ledger outage: like a known fault, no fix, no task, no alert."""
+    from . import alerts
+    db = host.p.db
+    alias, rec = known
+    until = timefmt.long(float(rec["until"]), host.p)
+    alerts.close_key(db, STATE_KEY + name, f"known outage of {alias} until {until}: {rec.get('why') or ''}", now)
+    for key in ("task", "escalated", "alerted", "observed", "phase"):
+        st.pop(key, None)
+    st["known_outage"] = alias
+    _save(db, name, st)
+    return f"unhealthy (known outage until {until})", None
+
+
 def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
     """Tell the machine ledger what the check sees of its machine (module doc): down or held, or cleared."""
     alias = machine_of(spec)
@@ -621,7 +666,13 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     ping = getattr(host, "_progress", None)
     if callable(ping):
         ping()
+    was_rc = st.get("last_rc")
     st.update(last_check=now, last_rc=rc, last_out=out[-1000:])
+    known = known_outage(spec, now)
+    if known:
+        st["known_outage"] = known[0]
+    elif st.pop("known_outage", None):   # the known outage ended: a check still failing gets its grace,
+        _fresh(st, "unknown_since", "route_only")   # an unknown one a new stretch
     if finding(rc, out):   # the box is up: a plain unhealthy result of a check without `outage`
         rc, spec, st["finding"] = 1, {**spec, "outage": False}, True
     else:
@@ -664,6 +715,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             if dark >= window:
                 st["status"] = "unhealthy"
                 st.setdefault("since", st["unknown_since"])
+                if known:
+                    return _quiet_outage(host, name, st, known, now)
                 if paused:
                     return _paused_outage(host, name, st, paused, now)
                 if st.get("task") or st.get("escalated"):
@@ -678,18 +731,25 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             again = float(st["unknown_since"]) + window
         told = ""
         cap = float(spec.get("unknown_cap_s", DEFAULTS["unknown_cap_s"]) or 0)
-        if not spec.get("outage") and cap and not st.get("unknown_told") and now - float(st["unknown_since"]) >= cap:
+        if not spec.get("outage") and not known and cap and not st.get("unknown_told") and now - float(st["unknown_since"]) >= cap:
             st["unknown_told"] = now   # once per stretch: the next healthy or unhealthy result ends it
             told = "; " + _tell_unknown(host, name, spec, st, rc, out, now)
         _save(db, name, st)
         if rc in UNKNOWN_RCS:
             return f"ok (unknown, rc {rc}{told})", again
         return f"error: heal check exited {rc}{told}: {out[-150:]}", again
+    dark = now - float(st.get("unknown_since") or now)
     for key in ("unknown_since", "route_only", "unknown_told"):
         st.pop(key, None)
+    if dark > max(_grace(spec), FRESH_UNKNOWN_S) and was_rc in UNKNOWN_RCS:   # not a broken check
+        t = db.task(int(st["task"])) if st.get("task") else None
+        if t is None or t["status"] not in OPEN:
+            _fresh(st)   # back from a long unknown stretch with no open task: a new episode, same fix cap
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
     down = now - float(since)
+    if known:
+        return _quiet_outage(host, name, st, known, now)
     kf = known_fault(spec)
     if kf and _confirmed(spec, st, now) and _known_covers(kf, st):
         key = _known_key(kf)
@@ -715,7 +775,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if pending:
         st["phase"] = None
         return _escalate(host, name, spec, st, now, f"the fix ran but the check still fails {down / 60:.0f} min on")
-    grace = min(spec["grace_s"], OUTAGE_S) if spec.get("outage") else spec["grace_s"]   # a whole box waits no longer
+    grace = _grace(spec)
     if down < grace:
         _save(db, name, st)
         return f"unhealthy ({down:.0f} s, grace {grace:.0f} s)", float(since) + grace
@@ -762,6 +822,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     st["phase"] = "settling"
     _save(db, name, st)
     return "unhealthy (fixed; rechecking)", now + spec["settle_s"]
+
+
+def _grace(spec: dict) -> float:
+    return min(spec["grace_s"], OUTAGE_S) if spec.get("outage") else spec["grace_s"]   # a whole box waits no longer
 
 
 def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) -> tuple[str, float | None]:
