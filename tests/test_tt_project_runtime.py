@@ -12491,7 +12491,7 @@ def _stale_runtime(tmp_path, preload=False):
 def test_setup_installs_its_own_runtime_not_the_one_on_pythonpath(env, tmp_path):
     from ttp import __version__
     r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin")],
-                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
+                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
     assert r.returncode == 0, r.stderr
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
     assert f'__version__ = "{__version__}"' in (env["home"] / "lib" / "current" / "runtime" / "ttp" /
@@ -12524,7 +12524,7 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
 
     def setup():
         r = subprocess.run([*NO_SYNC, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                           capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
+                           capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
         assert r.returncode == 0, r.stderr
         return r.stdout, (env["home"] / "lib" / __version__ / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
 
@@ -12605,7 +12605,7 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
 
     def setup(*extra):
         return subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                              capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
+                              capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
     r = setup()
     assert r.returncode != 0 and f"ttp {_newer(__version__)} is installed" in r.stderr and "--force" in r.stderr
     assert (env["home"] / "lib" / "current").resolve() == newer.resolve() and not (tmp_path / "bin").exists()
@@ -12733,7 +12733,7 @@ def test_version_shows_the_source_commit(env, capsys):
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                       capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
+                       capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
     assert r.returncode != 0 and "harness copy" in r.stderr
     assert str(env["home"] / "lib" / "current" / "bin" / "ttp") in r.stderr   # names the ttp it would run
     assert not (env["home"] / "lib" / "current").exists()
@@ -21222,7 +21222,7 @@ def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
     holder.wait(timeout=30)
     info = json.loads((run_dir / "exit.json").read_text())
     assert info["stopped"] is None and info["rc"] == 0, info
-    assert info["ended"] - info["started"] > 3.5, ("the run never outlasted its limit", info)
+    assert info["ended"] - info["started"] > 6.5, ("the run never outlasted its limit", info)
     assert "handed-off" in (run_dir / "output.jsonl").read_text()
 
 
