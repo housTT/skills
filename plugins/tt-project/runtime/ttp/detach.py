@@ -201,24 +201,37 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
     if lock is None:
         return "it is still running", 0
     try:
-        n = int(m.get("relaunches") or 0) + 1
+        # Counted on this boot already, by a daemon that died before starting it: counted once.
+        again = m.get("boot") == boot and bool(m.get("relaunches"))
+        n = int(m.get("relaunches") or 0) + (0 if again else 1)
         log = Path(m.get("log") or rc.with_suffix(".log"))
         if log.exists():
             log.replace(log.with_name(f"{log.name}.{n}"))
         lost(rc).unlink(missing_ok=True)
         started(rc).unlink(missing_ok=True)
         # Counted before it starts: a crash here never relaunches it past the cap.
-        write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
-                                     "relaunched": time.time()}, mode=0o600)
+        if not again:
+            write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
+                                         "relaunched": time.time()}, mode=0o600)
         pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
                     machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
+        # Before the lock goes: a daemon that dies after this still finds the job to stop
+        # (running_pid; the wrapper's <name>.started covers the instant before).
+        _restamp(rc, pid, boot)
     except (OSError, ValueError, TypeError) as e:
         return f"it could not start: {e}", 0
     finally:
         lock.close()
     renice(pid, nice)
-    _restamp(rc, pid, boot)
     return "", pid
+
+
+def relaunch_started(rc: Path) -> bool:
+    """Whether the job `relaunch` counted on this boot started (it clears <name>.started and <name>.rc
+    is absent before it starts): it runs, or its wrapper ran. False after a crash between counting
+    it and starting it."""
+    rc = Path(rc)
+    return rc.exists() or started(rc).exists() or not locks.any_free([locks.job_lock(rc)])
 
 
 def stop(rc: Path, pid: int, why: str) -> None:
@@ -232,13 +245,21 @@ def stop(rc: Path, pid: int, why: str) -> None:
 
 
 def running_pid(rc: Path, this_boot) -> int:
-    """The pid of a job relaunched on this boot (its registry entry names a boot `this_boot` accepts)
-    that still runs (holds its lock), else 0: the one `stop` may end."""
-    j = _entry(Path(rc))
-    pid = j.get("pid")
-    if not (isinstance(pid, int) and pid > 1 and this_boot(j.get("boot"))):
+    """The pid of a job relaunched on this boot (its registry entry names a boot `this_boot` accepts,
+    else its resume record does and <name>.started names it) that still runs (holds its lock), else 0:
+    the one `stop` may end."""
+    rc = Path(rc)
+    if locks.any_free([locks.job_lock(rc)]):
         return 0
-    return 0 if locks.any_free([locks.job_lock(Path(rc))]) else pid
+    j = _entry(rc)
+    pid = j.get("pid") if this_boot(j.get("boot")) else None
+    if not (isinstance(pid, int) and pid > 1) and this_boot((read_resume(rc) or {}).get("boot")):
+        # A daemon that died between starting it and restamping the registry: the wrapper's own pid.
+        try:
+            pid = int(started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pid = None
+    return pid if isinstance(pid, int) and pid > 1 else 0
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:

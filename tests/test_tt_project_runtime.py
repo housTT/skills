@@ -29933,6 +29933,56 @@ def test_a_daemon_restart_after_the_relaunches_records_the_boot_once(env, tmp_pa
     assert _job_stopped(rc1)
 
 
+def test_a_daemon_death_between_start_and_registry_still_stops_the_job(env, tmp_path, monkeypatch):
+    """The daemon died right after starting job a, before its registry entry named the new pid and
+    boot; on restart b cannot start. a is found by the pid its wrapper wrote and stopped."""
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("pair", "s", kind="work", tier="light", origin="user")
+    rc1, rc2, counter = _two_resumable_jobs(p, tmp_path, tid, b_cwd=str(tmp_path / "gone"))
+    with monkeypatch.context() as mp:
+        mp.setattr(detach, "_restamp", lambda *a: None)   # the crash: the registry is never restamped
+        why, pid = detach.relaunch(rc1, "a-later-boot")
+    assert not why and pid and _wait_for_path(detach.started(rc1))
+    assert json.loads((rc1.parent / "detached.json").read_text())[0]["boot"] == "an-earlier-boot"
+    assert detach.running_pid(rc1, lambda b: b == "a-later-boot") == pid
+    _boot_daemon(p)
+    assert _woken(p, tid), "a job that could not start did not wake the task"
+    assert _job_stopped(rc1), "the job relaunched before the registry named it was left running"
+    assert not _job_relaunches(p, tid)
+
+
+def test_a_daemon_death_between_counting_and_starting_a_job_starts_it_once(env, tmp_path, monkeypatch):
+    """The daemon died after counting the relaunch in the resume record, before starting the job. The
+    restart starts it, counted once, and writes job_relaunched only once it runs."""
+    from ttp import detach
+
+    class Crash(BaseException):
+        pass
+
+    def die(*a, **k):
+        raise Crash
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    with monkeypatch.context() as mp:
+        mp.setattr(detach, "start", die)
+        with pytest.raises(Crash):
+            detach.relaunch(rc, "a-later-boot")
+    m = json.loads(detach.resume_file(rc).read_text())
+    assert m["relaunches"] == 1 and m["boot"] == "a-later-boot" and not detach.relaunch_started(rc)
+    d = _boot_daemon(p)
+    assert not _woken(p, tid) and p.db.task(tid)["not_before"]
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0", "the counted job was never started"
+    assert counter.read_text().split() == ["run", "run"]
+    assert json.loads(detach.resume_file(rc).read_text())["relaunches"] == 1, "counted twice"
+    assert len(_job_relaunches(p, tid)) == 1 and d._job_relaunch_boots(tid) == 1
+    assert (rc.parent / "progress.md").read_text().count("relaunched it (1 of 3)") == 1
+    # A further restart on the same boot starts nothing more.
+    _boot_daemon(p)
+    assert counter.read_text().split() == ["run", "run"] and len(_job_relaunches(p, tid)) == 1
+
+
 def test_a_resumable_job_queued_before_a_reboot_is_relaunched_not_lost(env, tmp_path):
     """A --resumable job queued for the daemon but not started before a reboot longer than the queue
     timeout: wake_after_reboot relaunches it, and its stale queue entry is settled without .lost."""

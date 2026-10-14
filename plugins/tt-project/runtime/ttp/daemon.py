@@ -5962,7 +5962,8 @@ class Daemon:
         cannot start (the ones started before it are stopped again: all or none), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
         budget.max_reboot_losses (noted on the task, so its run reads why). A job relaunched on this
         boot before a daemon restart counts as started: stopped when the task wakes, and its
-        job_relaunched event written if the restart came first. cut when an abrupt,
+        job_relaunched event written if the restart came first; one the restart cut off between
+        counting and starting it is started now. cut when an abrupt,
         unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
@@ -5986,7 +5987,9 @@ class Daemon:
                 # counted as started below, judged by the boot that cut it short.
                 loss = self._abrupt_cut(m.get("cut_boot"))
                 cut = cut or loss
-                done.append((rc, int(m["relaunches"]) - 1, loss))
+                # One counted but never started (the restart came between the two) starts now,
+                # counted once (relaunch keeps the count), its job_relaunched written once it runs.
+                (done if detach.relaunch_started(rc) else todo).append((rc, int(m["relaunches"]) - 1, loss))
                 continue
             if rc.exists():
                 continue
