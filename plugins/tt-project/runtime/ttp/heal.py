@@ -52,6 +52,16 @@ was refused or timed out, or the host or network unreachable: ROUTE_RE), the box
 escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
+Untenanted holds: a check that prints a line `ttp-heal: untenanted-hold` (UNTENANTED; the broker preset
+prints it while `hold_field` is set and its optional `holder_field` is empty) says a device is held with
+no tenant, so queued work cannot use it. Seen on every run (any exit code, 75 included) for the project's
+`heal.untenanted_hold_s` (UNTENANTED_HOLD_S), it pages once per stretch, whatever else keeps the check
+quiet: a known machine outage, a check standing down with 75, a known fault or an observation mute. The
+page is a keyed high alert `heal-hold:<name>` to the user, or with `escalate` "coordinator" one high
+observation; a run that answers (0 or 1) without the line ends the stretch and clears the alert. Only a
+pause of the check's `resource` that the user set, or whose reason names the check, keeps it quiet. An
+outage keeps silencing everything else the check reports.
+
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
 the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
 on a check without `outage`: its own grace, its fix, `known_fault` keeps it quiet, the ordinary self-fix
@@ -116,6 +126,9 @@ LOCK_WAIT_S = 30                # how long a fix waits for its resource lock bef
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
 FINDING = "ttp-heal: not-outage"   # a check output line: unhealthy, but the box is up (module doc)
+UNTENANTED = "ttp-heal: untenanted-hold"   # a check output line: a device held with no tenant (module doc)
+UNTENANTED_HOLD_S = 14400       # heal.untenanted_hold_s default: an untenanted hold pages after this long
+HOLD_KEY = "heal-hold:"         # alert key of an untenanted hold's page
 # An unknown check result that is only its route failing (module doc): ssh's own exit code, or its words.
 ROUTE_RC = 255
 ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out|no route to host|"
@@ -134,7 +147,7 @@ COMMON_FIELDS: dict[str, dict] = {
 PRESET_FIELDS: dict[str, dict[str, dict]] = {
     "systemd": {"unit": _TEXT, "user": _FLAG, "host": _TEXT},
     "http": {"url": _TEXT, "expect": {"type": "array", "items": {"type": "integer"}}},
-    "broker": {"status_command": _TEXT, "hold_field": _TEXT, "auto_fields": {"type": "array", "items": _TEXT},
+    "broker": {"status_command": _TEXT, "hold_field": _TEXT, "holder_field": _TEXT, "auto_fields": {"type": "array", "items": _TEXT},
                "expected_count": _COUNT, "max_recent_failures": _COUNT},
 }
 _COMMON = set(COMMON_FIELDS)
@@ -307,6 +320,8 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
     state["held"] = bool(_field(data, spec.get("hold_field") or BROKER_HOLD))
     if state["held"]:
         problems.append(f"{spec.get('hold_field') or BROKER_HOLD} is set")
+        if spec.get("holder_field") and not _field(data, spec["holder_field"]):
+            problems.append(f"{spec['holder_field']} is empty\n{UNTENANTED}")
     missing = []
     for f in spec.get("auto_fields") or BROKER_AUTO:
         v = _field(data, f)
@@ -345,6 +360,11 @@ def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[i
 def finding(rc: int, out: str) -> bool:
     """A check result that is a non-outage finding: non-zero, with a FINDING line in its output."""
     return rc != 0 and any(line.strip() == FINDING for line in (out or "").splitlines())
+
+
+def untenanted(out: str) -> bool:
+    """A check result that reports a device held with no tenant: an UNTENANTED line in its output."""
+    return any(line.strip() == UNTENANTED for line in (out or "").splitlines())
 
 
 def route_failed(rc: int, out: str) -> bool:
@@ -506,6 +526,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if callable(ping):
         ping()
     st.update(last_check=now, last_rc=rc, last_out=out[-1000:])
+    _untenanted_hold(host, name, spec, st, rc, out, now)
     if finding(rc, out):   # the box is up: a plain unhealthy result of a check without `outage`
         rc, spec, st["finding"] = 1, {**spec, "outage": False}, True
     else:
@@ -519,7 +540,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st.pop("pause_asked", None)
     if rc == 0:
         was = st.get("status")
-        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported")
+        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported",
+                                  "hold_since", "hold_paged")
                if k in st}
         _save(db, name, {**nxt, "status": "healthy"})
         t = db.task(int(st["task"])) if st.get("task") else None
@@ -752,6 +774,60 @@ def _tell_paused(host: Any, name: str, spec: dict, st: dict, res: str, now: floa
              text + " Lift the pause once its reason is over, or repair the check another way within the charter.",
              now)
     return "coordinator told"
+
+
+def _untenanted_s(host: Any) -> float:
+    v = ((getattr(host, "cfg", None) or {}).get("heal") or {}).get("untenanted_hold_s")
+    try:
+        return max(0.0, float(v)) if v is not None and not isinstance(v, bool) else UNTENANTED_HOLD_S
+    except (TypeError, ValueError):
+        return UNTENANTED_HOLD_S
+
+
+def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: str, now: float) -> None:
+    """Track a device held with no tenant (module doc) and page once it outlasts heal.untenanted_hold_s,
+    whatever outage, fault or mute keeps the rest of the check quiet. Changes `st`; its caller saves it."""
+    db = host.p.db
+    if not untenanted(out):
+        if rc in (0, 1) and st.pop("hold_since", None) is not None and st.pop("hold_paged", None):
+            from . import alerts
+            alerts.close_key(db, HOLD_KEY + name, "the hold has a tenant again or ended", now)
+        return
+    since = float(st.setdefault("hold_since", now))
+    ceiling = _untenanted_s(host)
+    if st.get("hold_paged") or now - since < ceiling:
+        return
+    res = str(spec.get("resource") or "")
+    try:
+        pause = (db.paused_resources() or {}).get(res) if res else None
+    except Exception:
+        pause = None
+    if pause and _pause_names(pause, name):
+        return   # the user paused it, or the pause names this check: the hold is known
+    what = machine_of(spec) or res or "its device"
+    try:
+        from . import machine_ledger
+        known = machine_ledger.outages(now).get(machine_of(spec) or "")
+    except Exception:   # the ledger is shared and best effort
+        known = None
+    text = (f"Device held with no tenant: heal check {name} reports {what} held with no holder for "
+            f"{(now - since) / 3600:.1f} h (ceiling {ceiling / 3600:g} h), so queued work cannot use it. "
+            + (f"The known outage of {what} ({known.get('why') or 'no reason given'}) does not cover an "
+               f"untenanted hold. " if known else "")
+            + f"Find who holds it and release it, or record why it must stay. Last check (exit {rc}): {out[-300:]}")
+    st["hold_paged"] = now
+    if escalate_to(host, spec) == "coordinator":
+        fp = f"{HOLD_KEY}{name}:{since:.0f}"
+        if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "high", text, "queued"))
+        return
+    host.alert(HOLD_KEY + name, text, "high")
+
+
+def hold_paged(db: DB, name: str) -> bool:
+    """The untenanted-hold page of check `name` is still live (alerts: `heal-hold:<name>`)."""
+    return bool(state(db, name).get("hold_paged"))
 
 
 def _paused_resource(db: Any, spec: dict) -> str:

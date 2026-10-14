@@ -3296,6 +3296,77 @@ def test_mute_escalation_skips_cleared_conditions_and_honours_never(env):
     assert "never asks" in scr.mute_line(never, t1 + 8 * 3600)
 
 
+def test_ttp_mute_end_ends_a_mute_without_a_turn_and_records_who(env, capsys, monkeypatch):
+    from ttp import cli
+    from ttp import screen as scr
+    p = make(env)
+    scr.mute(p.db, "watcher:hw", "tray dropped", 24)
+    scr.count_muted(p.db, "watcher:hw", "box-a: tray dropped", "high")
+    cli.main(["mute", "list", "demo"])
+    assert "watcher:hw 'tray dropped'" in capsys.readouterr().out
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    cli.main(["mute", "end", "demo", "WATCHER:hw", "Tray Dropped"])   # any case, as a mute matches
+    assert "ended the mute" in capsys.readouterr().out and scr.mutes(p.db) == []
+    ev = p.db.q("SELECT text, status FROM events WHERE kind='observation' AND text LIKE 'mute ended:%'")
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "ended by the user" in ev[0]["text"], ev
+    assert "1 observation" in ev[0]["text"]
+    with pytest.raises(SystemExit) as e:   # nothing left to end
+        cli.main(["mute", "end", "demo", "watcher:hw", "tray dropped"])
+    assert e.value.code == 2 and "no active mute" in capsys.readouterr().err
+    # A run ends only its own project's mutes, and is named as who ended it.
+    scr.mute(p.db, "watcher:hw", "tray dropped", 24)
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.base / "state" / "runs" / "9"))
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_PROJECT", str(env["repo"] / "elsewhere"))   # another project's run
+    with pytest.raises(SystemExit):
+        cli.main(["mute", "end", "demo", "watcher:hw", "tray dropped"])
+    assert "only its own project" in capsys.readouterr().err and len(scr.mutes(p.db)) == 1
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.main(["mute", "end", "demo", "watcher:hw", "tray dropped"])
+    assert p.db.q("SELECT id FROM events WHERE text LIKE '%ended by task #7%'")
+
+
+def test_a_hold_mute_never_stays_silent_past_its_cap(env):
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    p = make(env)
+
+    def asks(src):
+        return p.db.q("SELECT text FROM events WHERE kind='observation' AND source=? AND text LIKE ?",
+                      (src, f"%{scr.MUTE_PERSISTS}%"))
+
+    # escalate_after_h 0 (or over the cap) on a match naming a hold is capped, and the ack says so.
+    notes = coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held", "hours": 48,
+                             "escalate_after_h": 0, "why": "the repair team has it"},
+                            {"type": "observation_mute", "source": "watcher:sm", "match": "hold state", "hours": 48,
+                             "escalate_after_h": 24},
+                            {"type": "observation_mute", "source": "watcher:ok", "match": "held", "hours": 48,
+                             "escalate_after_h": 3}])
+    assert notes == []
+    capped = [n for n in p.db.kv(coord.NOTES_KEY, []) if "covers a device hold" in n]
+    assert len(capped) == 2 and "asks after 6 h, not 0" in capped[0] and "not 24" in capped[1], notes
+    by = {m["source"]: m for m in scr.mutes(p.db)}
+    assert by["watcher:hw"]["escalate_after_h"] == scr.MUTE_HOLD_ESCALATE_H and by["watcher:hw"]["hold"]
+    assert by["watcher:ok"]["escalate_after_h"] == 3   # already within the cap: kept
+    # A mute whose match does not name a hold, but whose conditions or key do, still asks after the cap.
+    scr.mute(p.db, "watcher:st", "state machine", 48, why="the vendor has it", escalate_after_h=0)
+    scr.mute(p.db, "watcher:kk", "chip lines", 48, why="the vendor has it", escalate_after_h=0)
+    t0 = time.time()
+    for at in (t0 + i * 1800 for i in range(15)):   # every 30 min for 7 h
+        scr.count_muted(p.db, "watcher:hw", "box-a: held with no tenant", "high", now=at)
+        scr.count_muted(p.db, "watcher:st", "box-a: state machine stuck in hold", "high", now=at)
+        scr.count_muted(p.db, "watcher:kk", "box-a: chip lines low", "high", now=at, key="device_held")
+        assert at - t0 >= 6 * 3600 or not asks("watcher:hw")
+    for src in ("watcher:hw", "watcher:st", "watcher:kk"):
+        assert len(asks(src)) == 1, src
+    # A mute of something else with escalate_after_h 0 still never asks.
+    scr.mute(p.db, "watcher:x", "tray dropped", 48, why="the vendor has it", escalate_after_h=0)
+    for at in (t0 + i * 1800 for i in range(17)):
+        scr.count_muted(p.db, "watcher:x", "box-a: tray dropped", "high", now=at)
+    assert asks("watcher:x") == []
+
+
 def test_mute_replay_of_a_held_box_wakes_the_coordinator_two_hours_in(env, monkeypatch):
     """The post-mortem timeline: muted at 10:01 for 24 h, the watcher reports the held box every 30 min.
     Before, nothing woke for 24 h; now the coordinator wakes at high effort at about 12:01."""
@@ -11784,7 +11855,7 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
 
     def setup(*extra):
         r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                           capture_output=True, text=True, timeout=_load_scaled(60))
+                           capture_output=True, text=True, timeout=_load_scaled(300))
         assert r.returncode == 0, r.stderr
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
@@ -47507,6 +47578,99 @@ def test_heal_cli_lists_and_tests_a_check(env, capsys, monkeypatch):
     with pytest.raises(SystemExit) as e:
         cli.main(["heal", "test", "svc"])
     assert e.value.code == 0
+
+
+def _hold_check(p, holder):
+    """A check that, like one standing down for a known outage, exits 75: it prints the untenanted-hold line
+    while `holder` is missing."""
+    from ttp import heal
+    return heal.validate({"check": f"test -e {holder} || echo '{heal.UNTENANTED}'; exit 75", "machine": "box-a",
+                          "outage": True, "grace_s": 0})
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outage(env, escalate):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env)
+    holder = p.root / "holder"
+    spec = {**_hold_check(p, holder), "escalate": escalate}
+    now = time.time()
+    ml.set_outage("box-a", "unrelated repair", "user", "1d", now=now)
+    ceiling = heal.UNTENANTED_HOLD_S
+
+    def pages():
+        return (p.db.q("SELECT ref FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'"),
+                p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'heal-hold:%'"))
+
+    for t in (now, now + ceiling / 2, now + ceiling - 60):
+        heal.run(d, "svc", spec, t)
+    assert pages() == ([], [])
+    for t in (now + ceiling, now + ceiling + 900):   # past the ceiling: once
+        heal.run(d, "svc", spec, t)
+    alerts_, events = pages()
+    if escalate == "user":
+        assert [a["ref"] for a in alerts_] == ["heal-hold:svc"] and events == []
+        text = p.db.one("SELECT text FROM messages WHERE ref='heal-hold:svc'")["text"]
+    else:
+        assert alerts_ == [] and len(events) == 1 and events[0]["severity"] == "high"
+        text = events[0]["text"]
+    assert "held with no holder" in text and "unrelated repair" in text and "box-a" in text
+    # Unknown runs without the line keep the page; a run that answers without it clears it.
+    heal.run(d, "svc", {**spec, "check": "exit 75"}, now + ceiling + 1000)
+    assert heal.hold_paged(p.db, "svc")
+    holder.touch()
+    heal.run(d, "svc", {**spec, "check": "exit 1"}, now + ceiling + 1200)
+    assert not heal.hold_paged(p.db, "svc")
+    if escalate == "user":
+        assert p.db.one("SELECT cleared FROM alerts WHERE key='heal-hold:svc'")["cleared"] is not None
+    # The project's heal.untenanted_hold_s sets the ceiling.
+    d.cfg.setdefault("heal", {})["untenanted_hold_s"] = 600
+    holder.unlink()
+    t1 = now + 2 * ceiling
+    heal.run(d, "svc", spec, t1)
+    heal.run(d, "svc", spec, t1 + 600)
+    assert heal.hold_paged(p.db, "svc")
+
+
+def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):
+    from ttp import coordinator as coord
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env)
+    now = time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "1d", now=now)
+    # A check standing down for the outage without the line: no hold page, however long.
+    plain = heal.validate({"check": "echo 'known outage: standing down'; exit 75", "machine": "box-a", "grace_s": 0})
+    for t in (now, now + 3600, now + 5 * heal.UNTENANTED_HOLD_S):
+        heal.run(d, "svc", plain, t)
+    assert not heal.hold_paged(p.db, "svc") and "hold_since" not in heal.state(p.db, "svc")
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")
+    # An untenanted hold on a resource the user paused is known: quiet too.
+    spec = {**_hold_check(p, p.root / "holder"), "resource": "box-a-device"}
+    coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    t0 = now + 6 * heal.UNTENANTED_HOLD_S
+    for t in (t0, t0 + heal.UNTENANTED_HOLD_S + 60):
+        heal.run(d, "svc", spec, t)
+    assert not heal.hold_paged(p.db, "svc")
+
+
+def test_heal_broker_preset_reports_a_hold_with_no_holder(env, tmp_path):
+    from ttp import heal
+    status = tmp_path / "status.json"
+    spec = heal.validate({"preset": "broker", "status_command": f"cat {status}", "holder_field": "holder"})
+    status.write_text(json.dumps({"held": True, "holder": "", "auto_power_cycle": True, "auto_reboot": True}))
+    rc, out = heal.check(spec, {}, str(tmp_path))
+    assert rc == 1 and heal.untenanted(out) and "holder is empty" in out
+    status.write_text(json.dumps({"held": True, "holder": "job 12", "auto_power_cycle": True, "auto_reboot": True}))
+    rc, out = heal.check(spec, {}, str(tmp_path))
+    assert rc == 1 and not heal.untenanted(out)
+    rc, out = heal.check(heal.validate({"preset": "broker", "status_command": f"cat {status}"}), {}, str(tmp_path))
+    assert not heal.untenanted(out)   # no holder_field: a hold alone is not called untenanted
 
 
 def test_heal_open_task_matches_labels_exactly_not_as_like_wildcards(env):

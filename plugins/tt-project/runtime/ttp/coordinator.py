@@ -1786,9 +1786,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
                                by=by, key=key, end=pauseends.from_action(a, p=p, by=owner) if a["paused"] else None)
             elif t == "observation_mute":
-                scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
-                         a.get("why") or a.get("reason") or a.get("text") or "",
-                         escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"))
+                m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
+                             a.get("why") or a.get("reason") or a.get("text") or "",
+                             escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"))
+                if scr.hold_cap_note(m, a.get("escalate_after_h")):
+                    notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)))
             elif t in ("noop", "escalate", None):
