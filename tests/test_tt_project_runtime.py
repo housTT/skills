@@ -6806,7 +6806,9 @@ def test_a_user_turn_duty_that_shares_words_with_bans_goes_in_with_its_source(en
     hist = (p.harness / coord.CHARTER_HISTORY).read_text()
     assert f"### Added to Policies (" in hist and f", user message #{said}, turn 2.0)\n{_SELF_HEALING}" in hist, hist
     note = " ".join(db.kv(coord.NOTES_KEY) or [])
-    assert "went in on the user's word" in note and "Never use a paused device." in note, note
+    assert "went in on the user's word" in note and "Never push to main." in note, note
+    # Only the items about the same action or object: a generic verb ("use") shares neither.
+    assert "Never use a paused device." not in note and "Never disturb" not in note, note
     # A retried turn adds it once.
     assert coord.apply(p, [add], turn=2, user_turn=True, messages=[said]) == []
     assert p.charter_path.read_text().count("Self-healing (prime directive)") == 1
@@ -7177,10 +7179,13 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
                            turn=turn, user_turn=True)
     for k, (ban, text) in enumerate((
             ("Never let workers push to main.", "Workers may push to the work branch."),
-            ("Never let workers delete files on the shared box.", "Workers may write logs to their run folder."))):
+            ("Never let workers delete files on the shared box.", "Workers may delete logs in their run folder."))):
         assert lint(ban, text) == [], text
         # The guard (one resend) flags the same action on another target; the lint does not.
         assert "`both_hold`: true" in guard(ban, text, 10 + k)[0], text
+    # A write is a broad family: deleting on one target and writing to another share no action.
+    ban, text = "Never let workers delete files on the shared box.", "Workers may write logs to their run folder."
+    assert lint(ban, text) == [] and guard(ban, text, 14) == [], text
     # A generic verb ("touch") names no action: without a shared object nothing is flagged.
     ban, text = "Never let workers touch the shared folder.", "Workers may push to their own branch."
     assert lint(ban, text) == [] and guard(ban, text, 15) == [], text
@@ -7318,11 +7323,11 @@ def test_guard_replays_the_exception_refusals_and_still_refuses_a_real_contradic
                                turn=30 + 2 * k + user_turn, user_turn=user_turn) == [], (section, user_turn)
             assert text in p.charter_path.read_text() and quote not in p.charter_path.read_text()
     # True contradictions are still refused, naming only the items about the same action or object
-    # (an edit is a write, as a push is: the branch named like the folder shares both).
+    # (pushing to main is about the force-push ban too: both push to a branch; an edit is a write).
     generic = ("Keep content generic", "Never modify another")
     for k, (section, text, want, unrelated) in enumerate((
             ("Policies", "Workers may push to main once CI passes.", "Never push to main.",
-             generic + ("Never disturb", "Never force-push", "Project-b's", "The shared")),
+             generic + ("Never disturb", "Project-b's", "The shared")),
             ("Resources", "Workers may write to the shared reports folder.", "The shared reports folder is read-only.",
              generic + ("Never disturb", "Never force-push", "Project-b's", "Push only")),
             ("Resources", "Project-b's acme-proj folder may be edited by workers.",

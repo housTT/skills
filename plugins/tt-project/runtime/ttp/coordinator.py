@@ -2985,6 +2985,11 @@ _CONDITION_RE = re.compile(r"\b(?:once|if|when|whenever|after|before|until|unles
                            r"as long as)\b[^,;:]*", re.I)
 
 
+# A participle after a possessive or determiner describes its noun ("the other project's running
+# jobs"); it is not what the rule does.
+_ATTRIBUTE_RE = re.compile(r"(?:'s|\b(?:the|its|their|our|your|any|all|other|those|these))\s+$")
+
+
 def _target(sentence: str, conditions: bool = True) -> tuple[set[str], set[str]]:
     """A rule's (action families, object words), from every word in it: a pull request is opened.
     Without `conditions`, words of a condition clause name no object (its actions still count)."""
@@ -2994,8 +2999,10 @@ def _target(sentence: str, conditions: bool = True) -> tuple[set[str], set[str]]
     what = low if conditions else _CONDITION_RE.sub(
         lambda m: m[0] if any(_ACTIONS.get(_stem(w)) or _ACTIONS.get(w)
                               for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", m[0])) else " ", low)
-    for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", low):
-        if fam := _ACTIONS.get(_stem(w)) or _ACTIONS.get(w):
+    for m in re.finditer(r"[a-z][a-z0-9-]*[a-z0-9]", low):
+        w = m[0]
+        if (fam := _ACTIONS.get(_stem(w)) or _ACTIONS.get(w)) and not (
+                w.endswith("ing") and _ATTRIBUTE_RE.search(low, 0, m.start())):
             acts |= fam
     for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", what):
         s = _stem(w)
@@ -3016,9 +3023,10 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     alone. Words of a condition clause name no object ("once CI passes" says when, not what to).
     For the guard: they share an object word (_on_object) and name no two different actions
     (one names none, or _same_action), or they name the same specific action (a generic verb such as
-    "use" names none) and one names no object. "Skill names must start with tt-" shares "tt-" words
-    with "Never force-push to the tt-project branch", but starting is not pushing; "Never push to
-    main" and "Pushing to the release branch is fine" push to different objects. For the lint
+    "use" names none), or two writes ("edit", "commit": a broad family) when one names no object.
+    "Skill names must start with tt-" shares "tt-" words with "Never force-push to the tt-project
+    branch", but starting is not pushing; "Never push to main" and "Pushing to the release branch is
+    fine" both push to a branch. For the lint
     (`strict`, a pair stays in the digest until settled by key): they name the same action
     (_same_action), and they share an object word the same way, or one names no object (a rule on
     the action alone, "Pushing is fine once CI passes", covers every object)."""
@@ -3027,9 +3035,9 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     on_object = _on_object(ao, bo)
     if strict:
         return _same_action(aa, ba) and (not ao or not bo or on_object)
-    named = aa & ba - {_ANY} or "write" in aa and ba & _WRITES or "write" in ba and aa & _WRITES
+    wider = "write" in aa and ba & _WRITES or "write" in ba and aa & _WRITES
     return (on_object and (not aa or not ba or _same_action(aa, ba))
-            or bool(named) and not (ao and bo))
+            or bool(aa & ba - {_ANY, "write"}) or bool(wider) and not (ao and bo))
 
 
 def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
@@ -3771,7 +3779,7 @@ CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_ov
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (7, "a6e70075e1a5240912b22ed3c48040983c598a30f465f9ab3866cc12af559423")
+CHARTER_GUARD_PIN = (7, "920d3a931fc6156f18d22159e5fd0916f79b91bf065a8556a7a726f6bd34810a")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
