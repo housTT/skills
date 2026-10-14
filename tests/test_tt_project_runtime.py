@@ -44388,6 +44388,10 @@ def _devq_marker(d, job, timeout=None):
 
 
 def _devq_runner_pids(d):
+    # The runner writes runner.pid (which `start` waits for) just before it logs its start line.
+    log, deadline = d / "runner.log", time.time() + _load_scaled(20)
+    while time.time() < deadline and "runner started" not in (log.read_text() if log.exists() else ""):
+        time.sleep(0.05)
     return [line for line in (d / "runner.log").read_text().splitlines() if "runner started" in line]
 
 
