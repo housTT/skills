@@ -59,6 +59,8 @@ ssh <box-alias> 'mkdir -p <workdir>/runs/<task> && cd <workdir>/runs/<task> &&
 - One clone per repository under `<workdir_root>/<repo>`; one `git worktree` per task:
   `<workdir_root>/<repo>-wt/t<task-id>` on branch `ttp/t<task-id>-<slug>`.
 - Fetch before branching: `git -C <workdir_root>/<repo> fetch origin`.
+  In a shared clone, `git fetch` moves its `origin/*` refs (the clone then shows "behind N"), but
+  never moves its checkout.
 - Commit and push from the worktree, or report `git -C <path> rev-parse HEAD` and a diff.
 - Clean up when the task ends: `git -C <workdir_root>/<repo> worktree remove <path>` once
   everything is pushed or reported, then `git worktree prune`. Keep build trees others reuse.

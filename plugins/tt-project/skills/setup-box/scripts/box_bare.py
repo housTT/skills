@@ -42,7 +42,9 @@ def probe_script(root: str, service: str = BROKER_SERVICE) -> str:
         'while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; '
         'echo "df_path=$d"; '
         'echo "df_kb=$(df -Pk "$d" 2>/dev/null | awk \'NR==2{print $4}\')"; '
-        f"if command -v {BROKER_CMD} >/dev/null 2>&1; then echo broker_cmd=yes; else echo broker_cmd=no; fi; "
+        f"if command -v {BROKER_CMD} >/dev/null 2>&1; then echo broker_cmd=yes; "
+        f"echo \"queue=$({BROKER_CMD} status 0 2>&1 | head -n 6 | tr '\\n' ' ' | cut -c1-300)\"; "
+        "else echo broker_cmd=no; fi; "
         f"echo \"broker_svc=$(systemctl is-active {shlex.quote(service)} 2>/dev/null)\""
     )
 
@@ -122,6 +124,11 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
             lines.append(f"disk: {free_gb:.0f} GB free in {kv.get('df_path')} (guard {min_free_gb:g} GB)")
         has_cmd, svc = kv.get("broker_cmd") == "yes", kv.get("broker_svc", "").strip() or "unknown"
         facts.update(broker_cmd=has_cmd, broker_service=svc)
+        queue = " ".join(kv.get("queue", "").split())
+        if queue:
+            facts["broker_queue"] = queue
+            if "serving" in facts.get("tags", []):
+                lines.append(f"broker queue (read-only, `{BROKER_CMD} status 0`): {queue}")
         if has_cmd and svc == "active":
             lines.append(f"broker: {BROKER_CMD} present, {service} active: run device work through it")
         elif has_cmd or svc == "active":

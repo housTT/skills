@@ -32,6 +32,8 @@ broker where it has one.
 - The guard is the machine's own threshold (`ttp machines add <box-alias> --min-free-gb <N>`),
   else the harness default; `box.py bare check --min-free-gb <N>` overrides it for one check
   (0 = off).
+- Work that builds nothing (for example a small-repo worktree) may pass a lower `--min-free-gb`
+  to its check; a build keeps the guard.
 - Below the guard, do not build there: free your own old worktrees and build trees, or pick
   another box. Never delete another user's or task's files to make room.
 
@@ -47,6 +49,11 @@ broker where it has one.
 
 - Where the box runs the tt-device-mcp broker, every device run goes through it. Use the
   `tt-buddy:run` skill and its `skills/run/mcp.md`; do not reconstruct their rules here.
+- A broker job needs a Python env even for a non-tt-metal workspace: with no env file `run-bg`
+  refuses ("Python env not found at <workspace>/tt-metal/python_env"). Set one up as in
+  `tt-buddy:run`'s `skills/run/mcp.md` § Env file (TT_METAL_HOME, PYTHONPATH, PYTHON_ENV_DIR).
+- `run-bg` prints `Job <id> queued (position: N)`; `tt-device-mcp wait <id>` blocks until the
+  job ends.
 - Never start a second broker (no `tt-device-mcp daemon start` beside a running service), and
   never stop, restart or reconfigure the box's broker. A broker that is installed but not active
   is reported, not worked around.

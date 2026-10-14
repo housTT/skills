@@ -1128,7 +1128,7 @@ def test_setup_box_states_company_etiquette_without_personal_policy():
         assert banned not in pages, banned
 
 
-def _bare_env(tmp_path, *, ssh_down=False, broker=True, svc="active", free_kb=500 * 1024 ** 2,
+def _bare_env(tmp_path, *, queue="", ssh_down=False, broker=True, svc="active", free_kb=500 * 1024 ** 2,
               machines=None, lock_rc=0):
     """PATH shims: ssh runs the remote command in a local shell over fake df/systemctl/broker; ttp
     answers `machines list --json` and `lock --probe`. Every ssh and ttp call is logged."""
@@ -1148,7 +1148,7 @@ def _bare_env(tmp_path, *, ssh_down=False, broker=True, svc="active", free_kb=50
     shim("systemctl", f'[ "$2" = tt-device-broker ] && echo {svc} || echo inactive\n'
                       f'[ "{svc}" = active ]\n')
     if broker:
-        shim("tt-device-mcp", "exit 0\n")
+        shim("tt-device-mcp", f'[ "$1 $2" = "status 0" ] && echo {shlex.quote(queue)}\nexit 0\n')
     shim("ttp", f'echo "ttp $*" >> {log}\n'
                 f'[ "$1" = machines ] && {{ echo {shlex.quote(json.dumps(machines or {}))}; exit 0; }}\n'
                 f'exit {lock_rc}\n')
@@ -1213,6 +1213,16 @@ def test_setup_box_bare_remote_root_with_odd_characters_keeps_home():
     assert box_bare._remote_root("~/<workdir>/a b") == "\"$HOME\"'/<workdir>/a b'"
     assert box_bare._remote_root("~/work") == '"$HOME/work"'
     assert box_bare._remote_root("~") == '"$HOME"'
+
+
+def test_setup_box_bare_check_shows_broker_queue_for_serving_box(tmp_path):
+    q = "running 1 queued 2 owners alice bob"
+    env, _ = _bare_env(tmp_path, queue=q, machines={"<box-alias>": {"tags": ["serving"]}})
+    r = _bare_check(tmp_path, env)
+    assert f"broker queue (read-only, `tt-device-mcp status 0`): {q}" in r.stdout, r.stdout
+    assert json.loads(_bare_check(tmp_path, env, "--json").stdout)["broker_queue"] == q
+    env2, _ = _bare_env(tmp_path / "b", queue=q) if (tmp_path / "b").mkdir() is None else None
+    assert "broker queue" not in _bare_check(tmp_path / "b", env2).stdout
 
 
 def test_setup_box_bare_check_custom_lock_and_wrong_route(tmp_path):
