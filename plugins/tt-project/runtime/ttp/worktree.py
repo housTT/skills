@@ -239,7 +239,8 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
       worktree-leftovers/<t<id>-date>/ (modified tracked files with a patch, uncommitted.patch), and
       the worktree is removed, so ensure makes it again on `branch`; returns None. The branch stays.
       Ignored build and tool caches (disk.cache_dirs, as clear_caches matches them) do not move: they
-      are regenerable and go with the worktree. prune_leftovers deletes old leftovers folders.
+      are regenerable and go with the worktree, except hand-off artifacts in them (handoff_artifacts),
+      which move. prune_leftovers deletes old leftovers folders.
     Anything else (commits of another task, submodules set up in it, `branch` checked out in another
     worktree) raises WorkspaceStuck, touching nothing. Each recovery is a `worktree_recovered` event."""
     t = git_timeout(p)
@@ -271,8 +272,13 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
     others = ["ls-files", "--others", "--exclude-standard", "--directory"]
     ignored = _names(path, *others, "--ignored", timeout=t)
     caches = _caches(set(ignored), (p.config().get("disk") or {}).get("cache_dirs"))
+    # As clear_caches' keep: a cache inside a hand-off artifact moves with it, and an artifact
+    # inside a cache moves by itself.
+    arts = handoff_artifacts(p, task["id"], path, ignored=set(ignored))
+    caches = {c for c in caches if not any(c.startswith(a + "/") for a in arts)}
+    held = [a for a in arts if any(a == c or a.startswith(c + "/") for c in caches)]
     loose: list[str] = []
-    for e in sorted(dict.fromkeys(_names(path, *others, timeout=t) + changed
+    for e in sorted(dict.fromkeys(_names(path, *others, timeout=t) + changed + held
                                   + [i for i in ignored if i not in caches])):
         # An entry inside a directory that moves already goes with it.
         if not any(e.startswith(d + "/") for d in loose) and not ((path / e).is_symlink() and e in links):

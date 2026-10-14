@@ -20342,6 +20342,30 @@ def test_old_worktree_leftovers_folders_are_pruned_after_the_configured_days(env
     assert d.prune_leftovers() == [], "ran again within the hour"
 
 
+def test_a_worktree_on_another_branch_moves_hand_off_artifacts_inside_ignored_caches(env):
+    # Caches go with the old worktree, but a hand-off artifact inside one is output, not cache.
+    p = make(env)
+    from ttp import worktree
+    task, path, own = _moved_branch(p, worktree)
+    exclude = p.root / _git_out(p.root, "rev-parse", "--git-common-dir") / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(exclude.read_text() + "\nbuild/\n.cache/\n" if exclude.exists() else "build/\n.cache/\n")
+    (path / "build").mkdir()
+    (path / "build" / "report.html").write_text("<html>")
+    (path / "build" / "lib.so").write_bytes(b"\0" * 4096)
+    (path / ".cache").mkdir()
+    (path / ".cache" / "blob").write_text("cached")
+    _handoff(p, task["id"], [str(path / "build" / "report.html")])
+    worktree.ensure(p, task)
+    data = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
+                               (task["id"], worktree.RECOVERED_EVENT))["data"])
+    from pathlib import Path
+    dest = Path(data["leftovers"])
+    assert (dest / "build" / "report.html").read_text() == "<html>", "a hand-off artifact in a cache was lost"
+    assert not (dest / "build" / "lib.so").exists() and not (dest / ".cache").exists()
+    assert data["bytes"] == len("<html>") and "build/report.html" in data["moved"]
+
+
 def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env):
     p = make(env)
     from ttp import worktree
@@ -20363,6 +20387,7 @@ def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env
     assert t["status"] == "blocked" and "cannot recover by itself" in t["blocked_reason"], t["blocked_reason"]
     d.retry_workspaces()
     assert p.db.task(task["id"])["status"] == "blocked", "a workspace that cannot recover was retried"
+
 
 def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):
     p = make(env)

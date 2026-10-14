@@ -171,7 +171,8 @@
   task's is recovered: a branch with commits of this task (or the task it continues) is adopted; one
   with no commits of its own has its untracked, ignored and modified files (and `uncommitted.patch`)
   moved to `state/worktree-leftovers/t<id>-<date>/` and is made again on the task's branch. Ignored
-  build and tool caches (`disk.cache_dirs`) are not moved: they go with the old worktree. Leftovers
+  build and tool caches (`disk.cache_dirs`) are not moved: they go with the old worktree, except
+  hand-off artifacts inside them, which move. Leftovers
   folders are deleted after `disk.worktree_leftovers_keep_days` (30; 0 keeps them). Any other case
   (another task's commits, submodules, the branch checked out elsewhere) blocks at once. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
   after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
