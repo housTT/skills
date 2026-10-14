@@ -7270,13 +7270,14 @@ class Daemon:
         full...; worktree.ensure already recovered what an earlier attempt left behind). It goes back
         to the queue after a backoff (`worktree.retry_backoff_s`, doubling) up to
         `worktree.create_retries` times without a model run; only a failure that outlasts them is
-        blocked as `workspace:`, for the coordinator."""
+        blocked as `workspace:`, for the coordinator. One that retrying cannot fix (`final`, e.g.
+        worktree.WorkspaceStuck) is blocked at once."""
         db = self.p.db
         w = self.cfg.get("worktree") or {}
         limit = int(w.get("create_retries", 3) or 0)
         with db.tx():
             tries = db.kv(WORKSPACE_TRIES_KEY, {}) or {}
-            n = int(tries.get(str(task["id"]), 0)) + 1
+            n = limit + 1 if getattr(e, "final", False) else int(tries.get(str(task["id"]), 0)) + 1
             tries[str(task["id"])] = n
             db.set_kv(WORKSPACE_TRIES_KEY, tries)
             if n <= limit:
@@ -7284,8 +7285,9 @@ class Daemon:
                 db.update_task(task["id"], status="queued", not_before=time.time() + delay,
                                blocked_reason=f"{WORKSPACE_RETRY_NOTE} ({n}/{limit}): {e}"[:400])
             else:
-                db.update_task(task["id"], status="blocked",
-                               blocked_reason=f"workspace: {e} (after {n} tries)"[:400])
+                db.update_task(task["id"], status="blocked", blocked_reason=(
+                    f"workspace: {e} (not retried: it cannot recover by itself)" if getattr(e, "final", False)
+                    else f"workspace: {e} (after {n} tries)")[:400])
         log(self.p, f"task {task['id']} workspace failed ({n}/{limit + 1}): {e}")
 
     def retry_workspaces(self) -> None:

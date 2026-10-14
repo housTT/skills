@@ -20165,16 +20165,18 @@ def test_a_workspace_locked_initializing_with_an_index_and_edits_is_kept_and_reu
         "the kept worktree stayed locked"
 
 
-def test_a_workspace_on_another_branch_is_left_alone(env):
+def test_a_workspace_on_another_branch_without_commits_keeps_its_files_and_is_made_again(env):
     p = make(env)
     from ttp import worktree
     task = p.db.task(p.db.add_task("moved", "s", kind="code", tier="light", origin="user"))
     path, branch = worktree.ensure(p, task)
     _git_out(path, "checkout", "-q", "-b", "elsewhere")
     (path / "work.txt").write_text("mine")
-    with pytest.raises(RuntimeError, match="elsewhere"):
-        worktree.ensure(p, task)
-    assert (path / "work.txt").read_text() == "mine"
+    assert worktree.ensure(p, task) == (path, branch)
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch and not (path / "work.txt").exists()
+    moved = list((p.state / worktree.LEFTOVERS_DIR).glob(f"t{task['id']}-*/work.txt"))
+    assert [f.read_text() for f in moved] == ["mine"], "the worktree's file was not kept"
+    assert _git_out(p.root, "rev-parse", "--verify", "elsewhere"), "the other branch was deleted"
 
 
 def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(env, monkeypatch):
@@ -20198,7 +20200,8 @@ def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(e
     _git_out(repo, "worktree", "remove", "--force", str(path))
     assert worktree.ensure(p, other_task) == (opath, obranch)
     _git_out(opath, "checkout", "-q", "-b", "elsewhere")
-    with pytest.raises(RuntimeError, match="elsewhere"):
+    _git_out(opath, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "theirs")
+    with pytest.raises(worktree.WorkspaceStuck, match="elsewhere"):
         worktree.ensure(p, other_task)
 
 
@@ -20246,6 +20249,90 @@ def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run
     d.retry_workspaces()
     assert d._workspace_tries(tid) == 0, "a cancelled task's workspace tries were kept"
 
+
+def _moved_branch(p, worktree):
+    """A task continuing another whose worktree was made on its own branch, after which its recorded
+    branch changed to the continued task's (the reported case). Returns (task, path, own branch)."""
+    old = p.db.add_task("first try", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, branch=f"ttp/t{old}-first-try", status="failed")
+    _git_out(p.root, "branch", f"ttp/t{old}-first-try", worktree.resolve_base(p))
+    tid = p.db.add_task("second try", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    path, own = worktree.ensure(p, dict(p.db.task(tid), branch=None))
+    assert own == f"ttp/t{tid}-second-try"
+    p.db.update_task(tid, branch=f"ttp/t{old}-first-try")
+    return p.db.task(tid), path, own
+
+
+def _commit_in(path, name, text="x"):
+    (path / name).write_text(text)
+    _git_out(path, "add", name)
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
+    return _git_out(path, "rev-parse", "HEAD")
+
+
+def test_a_worktree_on_another_branch_with_the_tasks_own_commits_is_adopted(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.prompts import worker_task
+    task, path, own = _moved_branch(p, worktree)
+    head = _commit_in(path, "work.txt")
+    (path / "notes.txt").write_text("loose")
+    assert worktree.ensure(p, task) == (path, own), "the worktree's branch with this task's commits was not adopted"
+    assert _git_out(path, "rev-parse", "HEAD") == head and (path / "notes.txt").read_text() == "loose"
+    ev = p.db.one("SELECT * FROM events WHERE task=? AND kind=?", (task["id"], worktree.RECOVERED_EVENT))
+    assert ev and json.loads(ev["data"])["adopted"] == own and ev["status"] == "handled"
+    assert "now works on it" in worker_task(p, task, str(path), own)
+
+
+def test_a_worktree_on_another_branch_with_only_loose_output_moves_it_and_is_made_again(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.prompts import worker_task
+    task, path, own = _moved_branch(p, worktree)
+    (path / "out").mkdir()
+    (path / "out" / "frame.png").write_text("png")
+    (path / "shot.png").write_text("png2")
+    tracked = _git_out(path, "ls-files").splitlines()[0]
+    (path / tracked).write_text("edited")
+    path2, branch = worktree.ensure(p, task)
+    assert (path2, branch) == (path, task["branch"])
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == task["branch"]
+    assert _git_out(path, "status", "--porcelain") == "", "the remade worktree is not clean"
+    assert _git_out(p.root, "rev-parse", "--verify", own), "the worktree's old branch was deleted"
+    dest = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
+                               (task["id"], worktree.RECOVERED_EVENT))["data"])["leftovers"]
+    from pathlib import Path
+    dest = Path(dest)
+    assert dest.parent == p.state / worktree.LEFTOVERS_DIR and dest.name.startswith(f"t{task['id']}-")
+    assert (dest / "out" / "frame.png").read_text() == "png" and (dest / "shot.png").read_text() == "png2"
+    assert (dest / tracked).read_text() == "edited" and "edited" in (dest / "uncommitted.patch").read_text()
+    assert str(dest) in worker_task(p, task, str(path), branch), "the start note does not name the leftovers"
+    # Once a run started, the note is not repeated.
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (task["id"], "worker", time.time() + 1, "done"))
+    assert str(dest) not in worker_task(p, task, str(path), branch)
+
+
+def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    p.set_config("worktree.create_retries", 3)
+    task, path, own = _moved_branch(p, worktree)
+    _git_out(path, "switch", "-qc", "ttp/t9999-unrelated")
+    head = _commit_in(path, "theirs.txt")
+    (path / "out.log").write_text("log")
+    with pytest.raises(worktree.WorkspaceStuck, match="not this task's"):
+        worktree.ensure(p, task)
+    assert _git_out(path, "rev-parse", "HEAD") == head and (path / "out.log").exists(), "the worktree was touched"
+    d = Daemon(p.base)
+    try:
+        worktree.ensure(p, task)
+    except worktree.WorkspaceStuck as e:
+        d._workspace_failed(p.db.task(task["id"]), e)
+    t = p.db.task(task["id"])
+    assert t["status"] == "blocked" and "cannot recover by itself" in t["blocked_reason"], t["blocked_reason"]
+    d.retry_workspaces()
+    assert p.db.task(task["id"])["status"] == "blocked", "a workspace that cannot recover was retried"
 
 def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):
     p = make(env)

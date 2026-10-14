@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from .db import continues_id
@@ -192,6 +193,104 @@ def _reusable(p: Project, path: Path, branch: str) -> tuple[bool, dict | None]:
     return False, rec
 
 
+class WorkspaceStuck(RuntimeError):
+    """A workspace ensure cannot make by itself: retrying will not help, so the daemon blocks the task
+    at once instead of retrying it."""
+    final = True
+
+
+RECOVERED_EVENT = "worktree_recovered"   # the task's event when ensure fixed a worktree on another branch
+
+
+def _owns(p: Project, task: dict, name: str) -> bool:
+    """Whether branch `name` is this task's work: its own (ttp/t<id>-...), or the branch of the task
+    it continues (that task's own or the one recorded on its row)."""
+    old_id = continues_id(task)
+    if any(name.startswith(f"ttp/t{i}-") for i in (task["id"], old_id) if i):
+        return True
+    old = p.db.task(old_id) if old_id else None
+    return bool(old and old["branch"] == name)
+
+
+def _resolved(p: Project, *refs: str) -> list[str]:
+    return [r for r in refs if r and _has(p, r)]
+
+
+def _untracked(path: Path, *extra: str) -> list[str]:
+    out = _git(path, "ls-files", "--others", "--exclude-standard", "--directory", "-z", *extra)
+    return [e.rstrip("/") for e in out.split("\0") if e.strip("/")]
+
+
+def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -> str | None:
+    """The task's worktree at `path` is on branch `there`, not on `branch` (the task's branch changed
+    after its worktree was made). Recovered without a model, never losing work:
+    - `there` has commits that neither the base nor `branch` has, and it is this task's own branch or
+      the one of the task it continues (_owns): it is adopted as it is; returns `there`.
+    - it has none: its untracked, ignored and modified files move to the project's
+      worktree-leftovers/<t<id>-date>/ (modified tracked files with a patch, uncommitted.patch), and
+      the worktree is removed, so ensure makes it again on `branch`; returns None. The branch stays.
+    Anything else (commits of another task, submodules set up in it, `branch` checked out in another
+    worktree) raises WorkspaceStuck, touching nothing. Each recovery is a `worktree_recovered` event."""
+    t = git_timeout(p)
+    try:
+        base = resolve_base(p)
+    except RuntimeError:
+        base = ""
+    ahead = int(_git(p.root, "rev-list", "--count", there, "--not",
+                     *_resolved(p, base, branch, f"origin/{branch}"), timeout=t) or 0)
+    if ahead:
+        if not _owns(p, task, there):
+            raise WorkspaceStuck(f"worktree {path} left as it is: it is on branch {there}, not {branch}, and "
+                                 f"{there} has {ahead} commit(s) of its own that are not this task's")
+        _recovered(p, task, f"worktree {path} was on branch {there}, not {branch}; {there} has {ahead} commit(s) "
+                   f"of this task's own, so the task now works on it", adopted=there, was=branch)
+        return there
+    why = inspect(path)["why"] or ""
+    if why.startswith("has submodules"):
+        raise WorkspaceStuck(f"worktree {path} left as it is: it is on branch {there}, not {branch}, and {why}")
+    held = next((r["path"] for r in _records(p).values()
+                 if r["branch"] == branch and Path(r["path"]).resolve() != path.resolve()), None)
+    if held:
+        raise WorkspaceStuck(f"worktree {path} left as it is: it is on branch {there}, not {branch}, and {branch} "
+                             f"is checked out in {held}")
+    dest = p.state / LEFTOVERS_DIR / f"t{task['id']}-{time.strftime('%Y%m%d-%H%M%S')}"
+    links = set((p.config().get("worktree") or {}).get("link_paths", LINK_PATHS) or [])
+    patch = _git(path, "diff", "HEAD", "--binary", timeout=t)
+    changed = [e for e in _git(path, "diff", "HEAD", "--name-only", "-z", timeout=t).split("\0")
+               if e and (path / e).exists()]
+    loose: list[str] = []
+    for e in sorted(dict.fromkeys(_untracked(path) + _untracked(path, "--ignored") + changed)):
+        # An entry inside a directory that moves already goes with it.
+        if not any(e.startswith(d + "/") for d in loose) and not ((path / e).is_symlink() and e in links):
+            loose.append(e)
+    if patch:
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "uncommitted.patch").write_text(patch + "\n")
+    moved = move_leftovers(path, loose, dest)
+    _git(p.root, "worktree", "remove", "--force", "--force", str(path), timeout=t)
+    _git(p.root, "worktree", "prune", check=False, timeout=t)
+    kept = f"; its {moved} uncommitted file(s){' and patch' if patch else ''} moved to {dest}" \
+        if moved or patch else "; it held no uncommitted files"
+    _recovered(p, task, f"worktree {path} was on branch {there} with no commits of its own, not on {branch}: "
+               f"made again on {branch}{kept}", leftovers=str(dest) if moved or patch else None,
+               moved=loose[:50], was=there)
+    return None
+
+
+def _recovered(p: Project, task: dict, text: str, **data) -> None:
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (time.time(), "daemon", RECOVERED_EVENT, "low", text[:500], json.dumps(data), "handled", task["id"]))
+
+
+def recovery_note(p: Project, task: dict) -> str:
+    """What ensure did to the task's worktree since its last run started (worktree_recovered events),
+    for the worker's start note; "" when nothing."""
+    last = p.db.one("SELECT MAX(started) s FROM runs WHERE task=?", (task["id"],))
+    rows = p.db.q("SELECT text FROM events WHERE task=? AND kind=? AND ts>? ORDER BY id",
+                  (task["id"], RECOVERED_EVENT, float((last["s"] if last else 0) or 0)))
+    return "".join(f"Workspace recovered: {r['text']}.\n" for r in rows)
+
+
 def ensure(p: Project, task: dict) -> tuple[Path, str]:
     """Create (or reuse) the task's worktree. A retried task continues on its own branch. A task
     carrying a branch (`pr_branch:<branch>`) works on that branch when it may (on_carried), else on
@@ -201,7 +300,7 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     `worktree.create_attempts` (default 2) attempts, each with a longer timeout. A check that fails
     raises and leaves the worktree as it is: an error never counts as half-made. A branch is never
     deleted: one with commits beyond where it would start is checked out as it is; one without is
-    reset to that start."""
+    reset to that start. A worktree on another branch than the task's is recovered (_other_branch)."""
     carried = on_carried(p, task) if not task.get("branch") else ""
     own = f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
@@ -210,6 +309,12 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
         # branch and failed before the branch was stored: it stays there.
         carried = ""
     branch = task.get("branch") or carried or own
+    rec = _registered(p, path) if path.is_dir() else None
+    if rec and rec["branch"] and rec["branch"] != branch and not rec["prunable"] \
+            and not (rec["locked"] or "").startswith("initializing"):
+        # The task's branch changed after its worktree was made: adopt the worktree's branch, or move
+        # its loose files out and make it again (_other_branch).
+        branch = _other_branch(p, task, path, rec["branch"], branch) or branch
     attempts = max(1, int((p.config().get("worktree") or {}).get("create_attempts") or 2))
     for n in range(attempts):
         whole, rec = _reusable(p, path, branch)

@@ -16,7 +16,7 @@ from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
                       push_queue_on)
-from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
+from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
 
 def _read(p: Project, name: str, on: set[str] | None = None) -> str:
@@ -535,6 +535,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                         "If you hand off `waiting` again, give one.\n")
     # A review with a push step run while a setting hold stands: review only, then blocked.
     history += settinghold.prompt_line(p.db, cfg, task, p.root)
+    if branch:
+        history += recovery_note(p, task)
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:
