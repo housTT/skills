@@ -1037,6 +1037,13 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def sync_all() -> None:
+    """Flush every filesystem (setup and upgrades write whole trees). Tests skip it: on a busy host
+    one flush can take minutes, and test folders need no power-loss durability."""
+    if hasattr(os, "sync") and not os.environ.get("TTP_TEST_NO_SYNC"):
+        os.sync()
+
+
 def durable_write(path: Path, text: str | bytes, mode: int | None = None) -> None:
     """Replace `path` with `text` so a power cut leaves the old content or the new, never an empty
     or half-written file: a temporary file in the same directory is written and synced, renamed over

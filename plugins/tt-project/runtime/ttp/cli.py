@@ -34,7 +34,7 @@ from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
-                      NOTE_RUN_ENV, in_run)
+                      NOTE_RUN_ENV, in_run, sync_all)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -3631,8 +3631,7 @@ def cmd_setup(a) -> None:
         for f in (lib / "bin").iterdir():
             f.chmod(0o755)
     (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
-    if hasattr(os, "sync"):    # a reboot now must not leave empty files that upgrades take in as upstream
-        os.sync()
+    sync_all()    # a reboot now must not leave empty files that upgrades take in as upstream
     # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
         durable_write(forced_mark(), __version__ + "\n")
@@ -3876,8 +3875,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             die(f"could not apply the checked upgrade to {h}: {(r.stdout + r.stderr)[-500:]}"
                 + (f"; files a running harness task changed were left for it to commit ({', '.join(left[:5])}): "
                    f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
-    if hasattr(os, "sync"):
-        os.sync()       # a reboot right after must not leave the files git just wrote empty
+    sync_all()       # a reboot right after must not leave the files git just wrote empty
     if parked:      # merged without its worker: the paused project's finish task has nothing left to do
         release.fence(p, parked["task"], f"{new_v} ({new_c})")
         print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
@@ -4063,8 +4061,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
                        env={**os.environ, release.GUARD_ENV: "1"})
     if r.returncode != 0:
         die(f"--apply: could not fast-forward main to {commit}: {(r.stderr or r.stdout).strip()[-400:]}", 1)
-    if hasattr(os, "sync"):
-        os.sync()
+    sync_all()
     release.clear_stuck(p)
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service

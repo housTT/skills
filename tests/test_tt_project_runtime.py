@@ -342,6 +342,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
+    monkeypatch.setenv("TTP_TEST_NO_SYNC", "1")   # setup and upgrades skip the host-wide flush (minutes on a busy host)
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
@@ -11780,6 +11781,17 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
     assert version() == f"ttp {__version__} ({second})"
 
 
+def test_sync_all_flushes_the_disks_unless_a_test_skips_it(env, monkeypatch):
+    from ttp import project
+    calls = []
+    monkeypatch.setattr(os, "sync", lambda: calls.append(1))
+    project.sync_all()
+    assert calls == []
+    monkeypatch.delenv("TTP_TEST_NO_SYNC")
+    project.sync_all()
+    assert calls == [1]
+
+
 def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_path):
     claude = env["tmp"] / "claude"
     f = claude / "skills" / "tt-project" / "SKILL.md"
@@ -11864,6 +11876,7 @@ def test_setup_syncs_the_copied_lib_to_disk_before_switching_lib_current(env, tm
     (lib / "current").rename(lib / "old")
     (lib / "current").symlink_to(lib / "old")
     seen = []
+    monkeypatch.delenv("TTP_TEST_NO_SYNC")   # this test checks the flush itself
     monkeypatch.setattr(cli.os, "sync", lambda: seen.append((lib / "current").resolve()), raising=False)
     with contextlib.redirect_stdout(io.StringIO()):
         cli.main(["setup", "--bin-dir", str(tmp_path / "bin"), "--force"])
@@ -12193,6 +12206,7 @@ def test_upgrade_restores_runtime_files_a_crash_left_empty(env, monkeypatch, com
     from ttp import cli, service
     monkeypatch.setattr(service, "restart", lambda p: "restarted")
     synced = []
+    monkeypatch.delenv("TTP_TEST_NO_SYNC")   # this test checks the flush itself
     monkeypatch.setattr(os, "sync", lambda: synced.append(1))
     h = p.harness
     _install_template(env)
