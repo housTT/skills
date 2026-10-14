@@ -49,6 +49,7 @@ RUN_FILE = "obligations.jsonl"
 CLOCK_S = 2 * 3600
 CHECK_EVERY_S = 300
 RUN_FILES_DAYS = 7            # run records are looked for in runs started this recently (or still running)
+RUN_IDS_PER_QUERY = 500       # kept run offsets checked per query (SQLite caps the variables in one)
 CLOSED = ("done", "failed", "cancelled")
 TEXT_MAX = 500
 EVIDENCE_MAX = 300
@@ -340,12 +341,21 @@ def file_runs(p, now: float | None = None) -> list[str]:
                 out.append(f"run {r['id']}: {str(e)[:200]}")
         seen[str(r["id"])] = len(lines)
     # An offset is kept while it counts lines and the run is not gone: a run leaves the set when it ages
-    # out and comes back when its task is re-queued, and must not be read again from line 0.
+    # out and comes back when its task is re-queued, and must not be read again from line 0. It is
+    # dropped once its task is closed and every obligation that task owns has its receipt or was dropped:
+    # read again, its records change nothing (record() returns early for those).
     keep = {str(r["id"]) for r in runs}
-    filed = [k for k, v in seen.items() if k not in keep and int(v)]
+    filed = [int(k) for k, v in seen.items() if k not in keep and int(v)]
     if filed:
-        keep |= {str(r["id"]) for r in db.q(f"SELECT id FROM runs WHERE id IN ({','.join('?' * len(filed))})",
-                                            tuple(int(k) for k in filed))}
+        st = _load(db)
+        open_owners = {t for o in st["items"].values() if not (o["receipt"] or o.get("dropped"))
+                       for t in o["owners"]}
+        for i in range(0, len(filed), RUN_IDS_PER_QUERY):   # one SQL variable each: stay under SQLite's cap
+            part = filed[i:i + RUN_IDS_PER_QUERY]
+            keep |= {str(r["id"]) for r in db.q(
+                f"SELECT r.id, r.task, t.status FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                f"WHERE r.id IN ({','.join('?' * len(part))})", tuple(part))
+                if r["status"] not in CLOSED or str(r["task"]) in open_owners}
     with db.tx():
         st = _load(db)
         st["runs"] = {k: v for k, v in seen.items() if k in keep}

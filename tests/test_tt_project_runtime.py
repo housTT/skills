@@ -53337,6 +53337,81 @@ def test_obligation_run_records_are_not_filed_twice_when_an_aged_out_run_comes_b
     assert ob._load(p.db)["runs"].get(rid) == 3 and ob._load(p.db)["runs_kept"]
 
 
+
+def test_obligation_legacy_offset_of_an_aged_out_run_is_not_filed_twice(env, monkeypatch):
+    """State from before offsets were kept: an aged-out run's offset is gone. When its task is re-queued,
+    only the records written after it left the window are filed; its open obligation gets no replay."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    run_dir = p.runs / "r-legacy"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    rid = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+    (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 600, "id": oid, "kind": "progress",
+                                                   "evidence": "commit old"}) + "\n")
+    check(now + 700)
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (int(rid),))
+    p.db.update_task(tid, status="done")
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    st = ob._load(p.db)
+    st["runs"].pop(rid)
+    st.pop("runs_kept")
+    p.db.set_kv(ob.KV, st)
+    p.db.update_task(tid, status="queued")
+    (run_dir / ob.RUN_FILE).open("a").write(json.dumps({"ts": later + 30, "id": oid, "kind": "progress",
+                                                        "evidence": "commit new"}) + "\n")
+    assert ob.file_runs(p, later + 60) == []
+    assert [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]] == ["commit old", "commit new"]
+    assert ob._load(p.db)["runs"].get(rid) == 2 and ob._load(p.db)["runs_kept"]
+
+
+def test_obligation_kept_run_offsets_are_bounded(env, monkeypatch):
+    """Kept offsets are checked in chunks (one SQL variable each) and dropped once the run's task is
+    closed and all its obligations are received or dropped; such a run read again changes nothing."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    tid2 = p.db.add_task("build another", "make it", kind="work", tier="light", origin="coordinator")
+    tid3 = p.db.add_task("build a third", "make it", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    oid2 = ob.add(p, "the second report", [tid2], now=now)
+    oid3 = ob.add(p, "the third report", [tid3], now=now)
+    rids = {}
+    for t, o, name in ((tid, oid, "a"), (tid2, oid2, "b"), (tid3, oid3, "c")):
+        run_dir = p.runs / f"r-{name}"
+        run_dir.mkdir(parents=True)
+        p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+               (t, "worker", now, "done", str(run_dir)))
+        rids[t] = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+        (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 600, "id": o, "kind": "receipt",
+                                                       "evidence": f"docs/{name}.md"}) + "\n")
+    ob.drop(p, oid3, "no longer wanted", now=now + 60)
+    ob.file_runs(p, now + 700)
+    p.db.update_task(tid, status="done")
+    p.db.update_task(tid2, status="blocked")
+    p.db.update_task(tid3, status="cancelled")
+    # Many offsets of runs that are gone: more than SQLite allows variables in one statement.
+    q = p.db.q
+
+    def capped(sql, args=()):
+        if len(args) > ob.RUN_IDS_PER_QUERY:
+            raise sqlite3.OperationalError("too many SQL variables")
+        return q(sql, args)
+    monkeypatch.setattr(p.db, "q", capped)
+    st = ob._load(p.db)
+    st["runs"].update({str(10 ** 6 + i): 1 for i in range(5 * ob.RUN_IDS_PER_QUERY)})
+    p.db.set_kv(ob.KV, st)
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    assert ob.file_runs(p, later) == []
+    assert ob._load(p.db)["runs"] == {rids[tid2]: 1}, "only the run whose task may still act keeps its offset"
+    # The pruned run comes back with its task re-queued: its records are no-ops on a received obligation.
+    p.db.update_task(tid, status="queued")
+    assert ob.file_runs(p, later + 60) == []
+    assert ob.get(p.db, oid)["receipt"]["evidence"] == "docs/a.md"
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"] == []
+
+
 def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(env, monkeypatch):
     from ttp import cli
     from ttp import coordinator as coord
