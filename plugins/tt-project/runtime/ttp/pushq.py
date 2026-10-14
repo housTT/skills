@@ -277,6 +277,23 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     return out
 
 
+def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[int, list[str]]:
+    """What check_approval would refuse in a head the daemon is about to queue a review of: {task id:
+    ["<short sha> <subject>", ...]} of the commits `head` carries from other tasks whose latest review
+    failed (see _inherited), judged as the auto review of code task `task` will be. {} when the queue
+    is off, the target was never fetched, or git fails or hangs: the approval still checks it."""
+    tgt = target(p) if enabled(p, cfg) else None
+    tip = _tracking_tip(p, *tgt) if tgt else ""
+    if not tip or not task.get("branch"):
+        return {}
+    review = {"id": -1, "parent": None, "title": "", "spec": "", "depends_on": json.dumps([task["id"]]),
+              "labels": json.dumps([f"auto_review:{task['id']}"])}
+    try:
+        return _inherited(p, review, [{"branch": task["branch"], "head": head}], tip, time.time()).get(head, {})
+    except (subprocess.SubprocessError, OSError):
+        return {}
+
+
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
     """Validate a review's `push` list with fast local git: {"ignored": why} in a project that does
     not push or, while the queue is off, for anything but a list of approvals; {"invalid": why} (also

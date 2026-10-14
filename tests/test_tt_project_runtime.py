@@ -39080,6 +39080,28 @@ def test_a_review_approving_a_head_with_rejected_commits_runs_again_and_is_told_
     assert not s.p.db.q("SELECT id FROM push_queue WHERE task=?", (crev,))
 
 
+def test_a_daemon_queued_review_names_the_rejected_commits_its_head_carries(env, monkeypatch):
+    from ttp import pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, _ = _pq_stacked(s, "stacked", on=xbranch)
+    d = Daemon(s.p.base)
+    rid, added = d._auto_review(s.p.db.task(c), "made the change")
+    spec = s.p.db.task(rid)["spec"]
+    assert added and f"carries unreviewed commits from tasks whose latest review failed (#{x}: " in spec, spec
+    assert "edit rejected.txt" in spec and '"inherited": [%d]' % x in spec
+    # What the spec names is what the queue would refuse the review's approval for, and accept once listed.
+    entry = {"branch": cbranch, "head": chead}
+    assert f"from #{x}," in pushq.check_approval(s.p, s.p.db.task(rid), [entry]).get("invalid", "")
+    assert pushq.check_approval(s.p, s.p.db.task(rid), [{**entry, "inherited": [x]}]).get("entries")
+    # A head with no rejected commits under it: no such line.
+    f, _, _, _ = _pq_stacked(s, "fresh")
+    rid, added = d._auto_review(s.p.db.task(f), "made the change")
+    assert added and "unreviewed commits" not in s.p.db.task(rid)["spec"]
+
+
 def _pq_add_reviewed_tasks(db, start, stop):
     """Code tasks start..stop-1 on branches of their own, each with a finished review naming its branch
     in the spec (passed and failed in turn)."""

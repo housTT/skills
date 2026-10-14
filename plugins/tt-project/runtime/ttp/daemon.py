@@ -136,6 +136,21 @@ AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
 # follow it. A re-review reads the first review's `ttp push --own` step only there, as this sentence.
 REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
                      "that its tests fail without it.")
+INHERITED_COMMITS_MAX = 10   # commits per task an auto review's spec lists, as the queue's refusal does
+
+
+def inherited_line(carried: dict[int, list[str]]) -> str:
+    """The review spec's line on the commits its head carries from tasks whose latest review failed
+    (pushq.carried), with kind-review.md's choice, so the approval is not refused for them later."""
+    parts = []
+    for tid, commits in sorted(carried.items()):
+        more = f" (+{len(commits) - INHERITED_COMMITS_MAX} more)" if len(commits) > INHERITED_COMMITS_MAX else ""
+        parts.append(f"#{tid}: {'; '.join(commits[:INHERITED_COMMITS_MAX])}{more}")
+    return (f"Its head carries unreviewed commits from tasks whose latest review failed ({' | '.join(parts)}). "
+            f"Approve a head without them, or judge them in this review and, only if they are sound, add "
+            f"\"inherited\": {sorted(carried)} to its push entry.")
+
+
 OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delivers onto its own branch) "
                       r".*`ttp push --own --detach`")
 # What a failed review's hand-off says failed (review_failure; kind-review.md): only a check or gate
@@ -6552,6 +6567,9 @@ class Daemon:
         elif pushes:
             lines.append((f"{ignored} " if ignored else "") + f"If it passes, push it with `ttp push` from the "
                          f"change's worktree (it publishes to {d['push_branch']}).")
+            # Named now, so a review that passes need not be woken again by the queue's refusal.
+            if carried := pushq.carried(self.p, task, full, cfg):
+                lines.append(inherited_line(carried))
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
         checks = self._precheck(task, full) if pushes else None
