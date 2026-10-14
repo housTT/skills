@@ -26780,7 +26780,7 @@ def _due_waiting_task(p, probe, since_ago=600.0, **extra):
 def _settle_probe(d, tid):
     d.probe_waiting()
     if tid in d._probes:
-        d._probes[tid][0].wait(10)
+        d._probes[tid][0].wait(_load_scaled(60))
         d.probe_waiting()
 
 
@@ -45153,8 +45153,8 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     assert not rc.exists()
 
 
-def _check_until_ended(p, rc, timeout=20):
-    deadline = time.time() + timeout
+def _check_until_ended(p, rc, timeout=None):
+    deadline = time.time() + (timeout or _load_scaled(60))
     while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
         time.sleep(0.1)
     return _ttp_run(p, "detach", "--check", str(rc))
@@ -46287,6 +46287,8 @@ def test_devq_start_is_idempotent_one_runner_holds_the_lock(devq_dir):
     assert first.returncode == 0 and "runner started" in first.stdout, first.stderr
     second = _devq("start", d, json.dumps(DEVQ_FAST))
     assert second.returncode == 0 and "already running" in second.stdout
+    # The runner holds its lock before it writes runner.pid and logs its start: wait for the line.
+    assert _wait_for(lambda: _devq_runner_pids(d), _load_scaled(30)), "the runner never logged its start"
     pid = int((d / "runner.pid").read_text())
     assert len(_devq_runner_pids(d)) == 1
     # A runner started by hand while one is up exits at once without touching anything.
