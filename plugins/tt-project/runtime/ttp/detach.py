@@ -38,6 +38,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -62,6 +63,23 @@ def failed_check(probe: str, rc) -> bool:
     that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
     with the job's exit code, never as a passed probe."""
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def failed_why(probe: str, rc, cwd=None) -> str:
+    """How a failed check reads: "job rc=N" (the first failed job's exit code, read from the rc files the
+    probe's `detach --check` names, relative to `cwd`), else "probe exit 4": 4 is the probe's, not the job's."""
+    try:
+        words = shlex.split(probe or "")
+        for i, w in enumerate(words):
+            if w == "--check":
+                for a in words[i + 1:]:
+                    if a.startswith("-") or a in ("&&", "||", ";", "|"):
+                        break
+                    st, why = state(Path(cwd or ".") / a)
+                    if st == "ended" and why != "0":
+                        return f"job rc={why}"
+                break
+    except (OSError, ValueError):
+        pass
+    return f"probe exit {rc}"
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")

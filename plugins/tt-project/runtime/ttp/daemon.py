@@ -5381,7 +5381,7 @@ class Daemon:
             if detach.failed_check(probe, got[0]):   # the jobs it waits on ended: over, and the why says one failed
                 self._probe_rc.pop(tid, None)
                 return (f"the detached job its when probe waits on ended but failed or left no exit code "
-                        f"(exit {got[0]}): {probe[:300]}")
+                        f"({detach.failed_why(probe, got[0], self.p.root)}): {probe[:300]}")
             if got[0] not in NOT_YET_RCS:
                 fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
                 if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):

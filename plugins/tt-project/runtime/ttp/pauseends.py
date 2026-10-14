@@ -235,7 +235,7 @@ class PauseEnds:
                 why = f"its end_when probe `{probe}` passed"
             elif probe and rc[1] == probe and detach.failed_check(probe, rc[0]):
                 why = (f"the detached job its end_when probe `{probe}` waits on ended but failed or left no "
-                       f"exit code (exit {rc[0]})")
+                       f"exit code ({detach.failed_why(probe, rc[0], self.p.root)})")
             elif probe and rc[1] == probe and rc[0] is not None and rc[0] not in ends.NOT_YET_RCS:
                 why = (f"its end_when probe `{probe}` is broken "
                        f"({rc[0] if isinstance(rc[0], str) else f'exit {rc[0]}'}): it would never end"
@@ -426,7 +426,7 @@ class MuteEnds:
             if ran == probe and (rc == 0 or detach.failed_check(probe, rc)):
                 why = (f"its end_when probe `{probe}` passed" if rc == 0 else
                        f"the detached job its end_when probe `{probe}` waits on ended but failed or left no "
-                       f"exit code (exit {rc})")
+                       f"exit code ({detach.failed_why(probe, rc, self.p.root)})")
                 if scr.end_mute(self.p.db, m["source"], m["match"], probe, why, now, where=self.p):
                     done.append(f"{m['source']} {m['match']!r}")
                 continue

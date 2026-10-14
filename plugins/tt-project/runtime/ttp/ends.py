@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import timefmt
+from . import detach, timefmt
 from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
@@ -272,7 +272,7 @@ class Ends:
             elif end.get("probe") and rc[1] == end["probe"] and rc[0] == 0:
                 why = "its until_probe passed"
             elif end.get("probe") and rc[1] == end["probe"] and failed_check(end["probe"], rc[0]):
-                why = f"the detached job its until_probe waits on ended but failed or left no exit code (exit {rc[0]})"
+                why = f"the detached job its until_probe waits on ended but failed or left no exit code ({detach.failed_why(end['probe'], rc[0], self.p.root)})"
             if why:
                 try:
                     retire(self.p, item, why, now)

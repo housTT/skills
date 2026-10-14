@@ -63242,3 +63242,11 @@ def test_scratch_git_dirs_do_not_see_a_repo_enclosing_the_tmp_base(devq_dir, tmp
     """Regression: with the tmp base inside a git checkout, a scratch dir is still not in a repo."""
     out = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     assert out.returncode != 0 or Path(out.stdout.strip()) == tmp_path
+
+
+def test_failed_why_names_the_jobs_rc_not_the_probes(tmp_path):
+    """A failed check reads 'job rc=N' (the job's exit code), never the probe's own exit 4."""
+    (tmp_path / "j.rc").write_text("7\n")
+    assert detach.failed_why("ttp detach --check j.rc", 4, tmp_path) == "job rc=7"
+    assert detach.failed_why("ttp detach --check missing.rc", 4, tmp_path) == "probe exit 4"
+    assert detach.failed_why("exit 4", 4, tmp_path) == "probe exit 4"

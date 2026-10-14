@@ -255,7 +255,7 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
     if c.get("closed") or c.get("kind") == POWER_CYCLE:   # a power cycle has nothing to undo: it closes itself
         return ""
     if c.get("probe_job_failed"):
-        return f"the detached job its until-probe waits on ended but failed (exit {c['probe_job_failed']})"
+        return f"the detached job its until-probe waits on ended but failed ({c['probe_job_failed'] if isinstance(c['probe_job_failed'], str) else 'probe exit ' + str(c['probe_job_failed'])})"
     if c.get("probe_passed"):
         return "its until-probe passed"
     if float(c.get("expires") or 0) <= now:
@@ -735,7 +735,7 @@ class Probes:
                     if (c.get("id"), c.get("probe")) in ids and not c.get("closed"):   # not a probe an edit replaced
                         c["probe_passed"] = now
                         if ids[(c["id"], c["probe"])]:
-                            c["probe_job_failed"] = ids[(c["id"], c["probe"])]
+                            c["probe_job_failed"] = detach.failed_why(c["probe"], ids[(c["id"], c["probe"])], self.p.root)
                 _write(LEDGER, doc)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
