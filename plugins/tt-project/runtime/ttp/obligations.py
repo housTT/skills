@@ -272,6 +272,8 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         own = o["owners"].get(str(task)) if task is not None else None
         if task is not None and own is None:
             raise ValueError(f"task #{task} is not a required owner of {oid}")
+        if own is not None and now < float(own["since"]):
+            return f"{oid}: record from before #{task} owned it ignored"
         if milestone is not None:
             if kind != "receipt":
                 raise ValueError("a milestone requires a receipt, not general progress")

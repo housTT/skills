@@ -54660,6 +54660,38 @@ def test_obligation_run_records_are_not_filed_twice_when_an_aged_out_run_comes_b
     assert ob._load(p.db)["runs"].get(rid) == 3 and ob._load(p.db)["runs_kept"]
 
 
+def test_obligation_pruned_run_read_again_files_nothing_from_before_ownership(env, monkeypatch):
+    """A closed task's run offset is pruned; the task is later attached to a still-open obligation and
+    the run is read from line 0: records older than its ownership are not filed, nor logged again."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    oid2 = ob.add(p, "another report", [], now=now)
+    run_dir = p.runs / "r-pruned"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    rid = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+    (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 60, "id": oid2, "kind": "progress",
+                                                   "evidence": "commit old"}) + "\n")
+    assert len(ob.file_runs(p, now + 100)) == 1, "refused: the task does not own it"
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (int(rid),))
+    p.db.update_task(tid, status="done")
+    st = ob._load(p.db)
+    for o in st["items"].values():
+        o["owners"].pop(str(tid), None)
+    p.db.set_kv(ob.KV, st)
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    assert ob.file_runs(p, later) == []
+    assert rid not in ob._load(p.db)["runs"], "offset pruned"
+    p.db.update_task(tid, status="queued")
+    st = ob._load(p.db)
+    st["items"][oid2]["owners"][str(tid)] = {"since": later + 10, "progress": None, "evidence": []}
+    p.db.set_kv(ob.KV, st)
+    assert ob.file_runs(p, later + 20) == [], "the old refusal is not logged again"
+    assert ob.get(p.db, oid2)["owners"][str(tid)]["evidence"] == []
+
+
 
 def test_obligation_legacy_offset_of_an_aged_out_run_is_not_filed_twice(env, monkeypatch):
     """State from before offsets were kept: an aged-out run's offset is gone. When its task is re-queued,
