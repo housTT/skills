@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Continue chains: caps per lineage, and the next hop the daemon queues itself.
 
-A lineage here is a chain of tasks linked back by `continues:<id>` labels and by `continue:`
-follow-ups (a task titled `continue: ...` whose parent is the task it continues). Its first task is
+A lineage here is a chain of tasks linked back by `continues:<id>` and `follows:<id>` labels (the
+latter on a task_add that `continues` a done task, whatever its title) and by `continue:` follow-ups (a task titled `continue: ...` whose parent is the task it continues). Its first task is
 the root; each later one is a hop. Per lineage the runtime counts hops, the spend of all its tasks,
 and stalls: the hops, counted back from the newest, that failed or made no progress.
 
@@ -23,8 +23,10 @@ evidence), sent in a high-effort turn; that override is recorded as an OVERRIDE_
 
 Model-free hop (`chains.auto`, on by default): a done task whose only proposal is one `continue:`
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
-with `continues` set (an AUTO_EVENT). The notice, and a local_only notice for that task's branch,
-go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
+with `continues` set (an AUTO_EVENT). The next hop starts from the base, not that task's branch, so a
+code task whose branch has changes gets its review queued first; without one the coordinator
+decides. The notice, and a local_only notice for a branch its review still carries, go to the next
+digest (NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
 AUTO_EVENT = "continue_auto"
 TRIGGER = "continue chain over its cap"
+FOLLOWS = "follows:"   # label of a task_add that `continues` a done task: a lineage link that takes nothing over
 NOTICES_KEY = "chain_notices"   # kv: [{ts, text}]: hops the daemon queued, shown once in the next digest
 MAX_CHAIN = 200
 MAX_NOTICES = 30
@@ -59,9 +62,21 @@ def caps(cfg: dict) -> dict:
     return out
 
 
+def follows_id(task: dict) -> int | None:
+    """The done task a follow-up was added to continue (its FOLLOWS label), whatever its title."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except ValueError:
+        return None
+    for lb in labels if isinstance(labels, list) else []:
+        if isinstance(lb, str) and lb.startswith(FOLLOWS) and lb[len(FOLLOWS):].isdigit():
+            return int(lb[len(FOLLOWS):])
+    return None
+
+
 def prev_of(task: dict) -> int | None:
-    """The task `task` continues: its `continues:` label, or the parent of a `continue:` follow-up."""
-    if (c := continues_id(task)) is not None:
+    """The task `task` continues: its `continues:` or FOLLOWS label, or the parent of a `continue:` follow-up."""
+    if (c := continues_id(task)) is not None or (c := follows_id(task)) is not None:
         return c
     if task.get("parent") and CONT_TITLE.match(task.get("title") or ""):
         return int(task["parent"])
@@ -189,19 +204,26 @@ def check_add(p, cfg: dict, prev: int, reason, high_effort: bool) -> str:
     raise ValueError(f"task_add continues #{prev} refused: {why}; {hint}")
 
 
-def auto_hop(p, cfg: dict, task: dict, fup: dict) -> tuple[int, str] | None:
-    """Queue `fup`, the only (`continue:`) follow-up of done `task`, when its lineage is under every
-    cap and `task` made progress: (new task id, why it progressed), else None."""
+def hop_ready(p, cfg: dict, task: dict, fup: dict) -> str:
+    """Why `fup`, the only (`continue:`) follow-up of done `task`, may be queued by the daemon (`task`
+    made progress and its lineage is under every cap), '' when it may not."""
+    if not caps(cfg)["auto"] or not CONT_TITLE.match(str(fup.get("title") or "")):
+        return ""
+    ch = chain(p.db, task["id"])
+    if not ch or refusal(p, cfg, ch):
+        return ""
+    return progress(p, ch, len(ch) - 1)
+
+
+def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
+    """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
+    progressed), else None."""
     from . import coordinator as coord
     db = p.db
-    if not caps(cfg)["auto"] or not CONT_TITLE.match(str(fup.get("title") or "")):
-        return None
-    ch = chain(db, task["id"])
-    if not ch or refusal(p, cfg, ch):
-        return None
-    why = progress(p, ch, len(ch) - 1)
+    why = hop_ready(p, cfg, task, fup) if why is None else why
     if not why:
         return None
+    ch = chain(db, task["id"])
     title = str(fup["title"]).strip()[:200]
     action = {"type": "task_add", "title": title, "spec": str(fup.get("spec") or ""), "kind": task["kind"],
               "tier": task["tier"], "priority": task["priority"], "budget_usd": task["budget_usd"],

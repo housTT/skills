@@ -1309,6 +1309,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
+                elif followup and followup["kind"] != "review":   # a hop of its lineage, whatever its title (chaincap)
+                    labels.append(f"{chaincap.FOLLOWS}{followup['id']}")
                 # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
                 # it says it carries none (`pr_branch: ""`), names only the push branch to land on, or
                 # that branch was never published (`ttp push --own` cannot create it) and it does not

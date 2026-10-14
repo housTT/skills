@@ -2942,7 +2942,12 @@ class Daemon:
         # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
         # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
         plain = not fups and not notes and sev == "normal"
-        review = self._auto_review(dict(task, **upd), summary, add=plain) \
+        # A done hop whose only proposal is the next `continue:` hop, with progress and under the
+        # chain caps, gets it from the daemon (chaincap). That hop starts from the base, not this
+        # branch, so a code hop's own commits get their review now, as a plain hand-off's do.
+        ready = self._continue_ready(dict(task, **upd), fups) \
+            if new == "done" and not approval and not notes and sev == "normal" else ""
+        review = self._auto_review(dict(task, **upd), summary, add=plain or bool(ready)) \
             if new == "done" and task["kind"] == "code" else None
         if review:
             known = None if review[1] else db.task(review[0])
@@ -2975,10 +2980,10 @@ class Daemon:
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
-        # A done hop whose only proposal is the next `continue:` hop, with progress and under the
-        # chain caps: the daemon queues it, and the next digest says so (chaincap).
-        hop = self._auto_continue(dict(task, **upd), fups) \
-            if new == "done" and not approval and not notes and sev == "normal" and not review and not fix else None
+        # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
+        # no review stays with the coordinator, or its commits would never be reviewed or delivered.
+        hop = self._auto_continue(dict(task, **upd), fups, ready) \
+            if ready and not fix and (review or task["kind"] != "code" or not self._has_changes(task)) else None
         if hop:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})."
@@ -4824,9 +4829,10 @@ class Daemon:
                 live[key] = {"branch": b, "head": head, "ahead": ahead, "since": (told.get(key) or {}).get("since", now)}
                 if key not in told:
                     log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
-                    # A hop whose continuation the daemon queued: the next hop carries on from it, so
-                    # the notice goes to the next digest without a turn of its own (chaincap).
-                    folded = chaincap.auto_continued(db, t["id"])
+                    # A hop whose continuation the daemon queued, with a review still carrying its
+                    # branch: the notice goes to the next digest without a turn of its own (chaincap).
+                    # The next hop starts from the base, so without that review it stays queued.
+                    folded = _carrying_review(db, t["id"]) if chaincap.auto_continued(db, t["id"]) else None
                     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                          (now, f"task:{t['id']}", "local_only", "normal",
                           f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
@@ -4838,7 +4844,7 @@ class Daemon:
                     if folded:
                         chaincap.add_notice(db, f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} "
                                                 f"commit{'' if ahead == 1 else 's'} ahead of every remote; its "
-                                                f"continuation carries on from it.")
+                                                f"review #{folded} carries it.")
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
 
@@ -7031,17 +7037,34 @@ class Daemon:
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 
-    def _auto_continue(self, task: dict, fups: list[dict]) -> tuple[int, str] | None:
-        """chaincap.auto_hop for a done task whose only proposal is one `continue:` follow-up; None
+    def _continue_ready(self, task: dict, fups: list[dict]) -> str:
+        """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
         otherwise or when it cannot be read (the coordinator decides then)."""
         if len(fups) != 1 or upstream.is_note(fups[0]) or fups[0].get("start_after") or fups[0].get("start_when") \
                 or not chaincap.CONT_TITLE.match(str(fups[0]["title"])):
-            return None
+            return ""
         try:
-            return chaincap.auto_hop(self.p, self.cfg, task, fups[0])
+            return chaincap.hop_ready(self.p, self.cfg, task, fups[0])
+        except Exception:
+            log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return ""
+
+    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
+        """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
+        try:
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return None
+
+    def _has_changes(self, task: dict) -> bool:
+        """Whether a task's branch changes anything against the base; True when that cannot be read."""
+        if not task.get("branch"):
+            return False
+        try:
+            return bool(worktree.diff_lines(self.p, [task["branch"]]))
+        except Exception:
+            return True
 
     def _review_area(self, review: dict) -> dict | None:
         """reviewcap.area for a review failing now; None when it cannot be read (a fix still follows)."""
@@ -7697,6 +7720,15 @@ LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
+
+
+def _carrying_review(db, task_id: int) -> int | None:
+    """A review of the task that has not failed or been cancelled: it reviews, and pushes, its branch."""
+    for r in db.q("SELECT id, depends_on FROM tasks WHERE kind='review' AND status NOT IN ('failed','cancelled') "
+                  "ORDER BY id DESC"):
+        if task_id in dependency_ids(r):
+            return r["id"]
+    return None
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:

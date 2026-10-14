@@ -42153,7 +42153,9 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     from ttp import coordinator as coord
     root, _, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
     (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
-    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and not reviews
+    # The next hop starts from the base, not this branch: this hop's commits get their review first.
+    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and len(reviews) == 1
+    assert reviews[0]["status"] == "queued" and f"Review #{reviews[0]['id']} queued by the daemon" in done["text"]
     assert done["status"] == "handled" and f"Continue hop #{hop1['id']} queued by the daemon (1 new commit)" in done["text"]
     assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "a hop with progress woke the coordinator"
     assert [t["id"] for t in chaincap.chain(p.db, hop1["id"])] == [root, hop1["id"]]
@@ -42161,15 +42163,23 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     _hop(env, p, hop1["id"], {"b.py": 5}, _cont("feature, part 2"))
     (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop1["id"],))
     assert not p.db.q("SELECT id FROM events WHERE status='queued'")
+    assert p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
     digest = coord.digest(p, {}, [], [])
     assert "continue hop queued by the daemon" in digest and f"Continue hop #{hop2['id']}" in digest
-    # A local-only notice for a hop the daemon continued is folded into the digest too.
+    # A local-only notice for a hop the daemon continued, while its review carries the branch, is
+    # folded into the digest too; without that review it goes to the coordinator.
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     t1 = p.db.task(hop1["id"])
+    (r1,) = p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
     d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
     lo = p.db.one("SELECT * FROM events WHERE kind='local_only'")
-    assert lo["status"] == "handled" and any("exists only on this machine" in n for n in chaincap.notices(p.db))
+    assert lo["status"] == "handled" and any(f"its review #{r1['id']} carries it" in n for n in chaincap.notices(p.db))
+    p.db.update_task(r1["id"], status="cancelled")
+    p.db.set_kv("local_only", None)
+    p.db.x("DELETE FROM events WHERE kind='local_only'")
+    d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
+    assert p.db.one("SELECT status FROM events WHERE kind='local_only'")["status"] == "queued"
     chaincap.clear_notices(p.db, time.time())
     assert chaincap.notices(p.db) == []
     # A hop with no new commit and no new evidence goes to the coordinator.
@@ -42187,6 +42197,12 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == ""
     line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
     assert f"#{root} feature: 2 hops to #{hop2['id']}" in line and "2 auto" in line
+    # A code hop with changes whose review cannot be queued goes to the coordinator: the next hop
+    # would start without its commits and nothing would review or deliver them.
+    p.set_config("review.auto", False)
+    other, _, done, reviews = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
+    assert not reviews and not p.db.q("SELECT id FROM tasks WHERE parent=?", (other,))
+    assert done["status"] == "queued" and "Continue hop" not in done["text"]
 
 
 def _chain(p, n, status="done"):
@@ -42203,6 +42219,7 @@ def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_wha
     p = make(env)
     from ttp import audit, chaincap
     from ttp import coordinator as coord
+    from ttp.db import continues_id
     p.set_config("chains.max_hops", 2)
     root, _, tip = _chain(p, 2)
     act = {"type": "task_add", "title": "continue: parser, next", "spec": "carry on", "kind": "code", "continues": tip}
@@ -42234,6 +42251,19 @@ def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_wha
     ids = _chain(p, 2, status="failed")
     assert "2 failed or no-progress hops" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-1]))
     assert chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-2])) == ""
+    # A hop added with `continues` on a done task stays in its lineage whatever its title.
+    p.set_config("chains.max_hops", 2)
+    root, tip = _chain(p, 1)
+    assert coord.apply(p, [{"type": "task_add", "title": "parser part three", "spec": "s", "kind": "code",
+                            "continues": tip}]) == []
+    (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
+    assert chaincap.FOLLOWS + str(tip) in json.loads(new["labels"]) and continues_id(new) is None
+    assert [t["id"] for t in chaincap.chain(p.db, new["id"])] == [root, tip, new["id"]]
+    assert "chains.max_hops is 2" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, new["id"]))
+    p.db.update_task(new["id"], status="done")
+    problems = coord.apply(p, [{"type": "task_add", "title": "parser, the rest", "spec": "s", "kind": "code",
+                                "continues": new["id"]}])
+    assert any("refused" in x and "chains.max_hops is 2" in x for x in problems), problems
 
 
 def test_a_continue_hop_in_an_area_under_review_area_cap_is_refused(env):
