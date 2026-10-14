@@ -2993,11 +2993,17 @@ class Daemon:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
         # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
         # no review stays with the coordinator, or its commits would never be reviewed or delivered.
-        hop = self._auto_continue(dict(task, **upd), fups, ready) \
-            if ready and not fix and (review or task["kind"] != "code" or not self._has_changes(task)) else None
+        # With a review, the next hop starts once they landed: from the tip before that, it would lack
+        # them. Commits already on the push branch (another commit carries them) need no wait.
+        changes = bool(ready) and not fix and task["kind"] == "code" and self._has_changes(task)
+        landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
+        wait = changes and not landed_now
+        hop = self._auto_continue(dict(task, **upd), fups, ready, wait) \
+            if ready and not fix and (review or not wait) else None
         if hop:
             folded.add(id(fups[0]))
-            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})."
+            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
+                f"; it starts once #{task['id']}'s commits land on the push branch." if wait else ".")
         routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -7105,10 +7111,11 @@ class Daemon:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
 
-    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
+    def _auto_continue(self, task: dict, fups: list[dict], why: str,
+                       wait_landed: bool = False) -> tuple[int, str] | None:
         """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
         try:
-            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why, wait_landed)
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return None

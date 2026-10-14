@@ -42853,6 +42853,56 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     assert done["status"] == "queued" and "Continue hop" not in done["text"]
 
 
+def _land_on_proj(repo, other, branch):
+    """Another clone lands `branch`'s commits on origin/proj as rebased copies (new shas, after a commit
+    of its own), as the push queue does."""
+    _commit(other, f"theirs-{branch.replace('/', '-')}.txt", "theirs\n")
+    _git_out(other, "fetch", "-q", str(repo), branch)
+    _git_out(other, "cherry-pick", "HEAD..FETCH_HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+
+
+def test_a_daemon_queued_code_hop_starts_only_once_its_predecessors_reviewed_commits_landed(env, monkeypatch):
+    """The next hop starts from the push branch's tip: while the previous hop's review is still queued
+    it would lack that hop's commits, redo them or conflict with them at push time."""
+    from ttp import daemon as dmod
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    assert len(reviews) == 1 and reviews[0]["status"] == "queued"
+    assert hop["status"] == "queued" and f"start_when:landed:#{root}" in _labels(p, hop["id"])
+    assert f"it starts once #{root}'s commits land on the push branch" in done["text"] and done["status"] == "handled"
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, hop["id"])
+    _settle_deferred(d, hop["id"])
+    assert not _ready(p, hop["id"]), "the hop started while its predecessor's review was still queued"
+    assert not _events(p, hop["id"], "deferral_probe_broken")
+    _land_on_proj(repo, other, branch)
+    _settle_deferred(d, hop["id"], until=lambda: _ready(p, hop["id"]))
+    assert _ready(p, hop["id"]), "the hop stayed deferred after its predecessor's commits landed"
+
+
+def test_a_daemon_queued_code_hop_whose_predecessor_already_landed_starts_at_once(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    branches = {}
+
+    def land(tid, head):
+        branches[tid] = p.db.task(tid)["branch"]
+        _land_on_proj(repo, other, branches[tid])
+
+    root, _, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"), before=land)
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    assert not reviews and p.db.one("SELECT 1 FROM task_superseded WHERE task=?", (root,))
+    assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"])) and _ready(p, hop["id"])
+    assert f"Continue hop #{hop['id']} queued by the daemon (1 new commit)." in done["text"]
+    # A code hop that committed nothing has nothing to land: its next hop starts at once too.
+    _hop(env, p, hop["id"], {}, dict(_cont("feature, part 2"), metrics={"passed": 3}))
+    (nxt,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop["id"],))
+    assert not any(x.startswith("start_when:") for x in _labels(p, nxt["id"])) and _ready(p, nxt["id"])
+
+
 def _chain(p, n, status="done"):
     """A root code task and `n` `continue:` hops after it, all `status`: their ids."""
     ids = [p.db.add_task("parser", "s", kind="code", origin="coordinator")]
