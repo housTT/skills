@@ -40,6 +40,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -186,19 +187,19 @@ def read_resume(rc: Path) -> dict | None:
     return m if ok else None
 
 
-def relaunch(rc: Path, boot: str, nice: int = 0) -> str:
+def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
     """Start a resumable job a reboot cut short again, with the command, cwd and environment it was
     started with (secrets from the caller's own environment). Its old log is kept as <name>.log.<n>.
-    Returns "" once started, else why not."""
+    Returns ("", pid) once started, else (why not, 0)."""
     rc = Path(rc)
     m = read_resume(rc)
     if m is None:
-        return "it has no resume record"
+        return "it has no resume record", 0
     if rc.exists():
-        return "it already ended"
+        return "it already ended", 0
     lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(map(str, m["command"])))
     if lock is None:
-        return "it is still running"
+        return "it is still running", 0
     try:
         n = int(m.get("relaunches") or 0) + 1
         log = Path(m.get("log") or rc.with_suffix(".log"))
@@ -211,12 +212,22 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> str:
         pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
                     machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
     except (OSError, ValueError, TypeError) as e:
-        return f"it could not start: {e}"
+        return f"it could not start: {e}", 0
     finally:
         lock.close()
     renice(pid, nice)
     _restamp(rc, pid, boot)
-    return ""
+    return "", pid
+
+
+def stop(rc: Path, pid: int, why: str) -> None:
+    """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
+    own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass   # already gone
+    _mark_lost(Path(rc), why)
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:

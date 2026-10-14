@@ -29300,6 +29300,40 @@ def test_resumable_job_relaunches_count_toward_max_reboot_losses(env, tmp_path, 
     assert p.db.task(calm)["status"] == "queued"
 
 
+def test_a_partial_relaunch_stops_the_jobs_it_started_and_counts_the_boot_once(env, tmp_path):
+    """Two resumable jobs; the second cannot start. The task wakes with no job left running, and the
+    boot counts once (as the wake), never also as a relaunch boot."""
+    from ttp import detach, locks
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("pair", "s", kind="work", tier="light", origin="user")
+    rc1, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid, name="a")
+    m = json.loads(detach.resume_file(rc1).read_text())
+    detach.resume_file(rc1).write_text(json.dumps({**m, "command": ["sh", "-c", f"echo run >>{counter}; sleep 60"]}))
+    rc2, _ = _resumable_job_cut_by_reboot(p, tmp_path, tid, name="b")
+    m = json.loads(detach.resume_file(rc2).read_text())
+    detach.resume_file(rc2).write_text(json.dumps({**m, "cwd": str(tmp_path / "gone")}))
+    t = p.db.task(tid)
+    p.db.update_task(tid, result=json.dumps({**json.loads(t["result"]),
+                                             "retry_when": f"ttp detach --check {rc1} {rc2}"}))
+    d = _boot_daemon(p)
+    assert _woken(p, tid), "a job that could not start did not wake the task"
+    assert not _job_relaunches(p, tid), "a boot that woke the task was also counted as a relaunch boot"
+    assert d._job_relaunch_boots(tid) == 0 and json.loads(p.db.task(tid)["result"]).get("reboot_wakes") == 1
+    deadline = time.time() + _load_scaled(10)
+    while not locks.any_free([locks.job_lock(rc1)]) and time.time() < deadline:
+        time.sleep(0.05)
+    assert locks.any_free([locks.job_lock(rc1)]), "the first job was left running"
+    assert not rc1.exists() and detach.state(rc1)[0] == "lost"
+    assert "could not start" in detach.state(rc1)[1]
+    notes = (rc1.parent / "progress.md").read_text()
+    assert "detached job b; not relaunched: it could not start" in notes and "stopped the jobs relaunched before it (a)" in notes
+    assert "relaunched it" not in notes
+    # A daemon restart on the same boot leaves the woken task alone.
+    _boot_daemon(p)
+    assert not _job_relaunches(p, tid) and json.loads(p.db.task(tid)["result"]).get("reboot_wakes") == 1
+
+
 def test_detach_resumable_is_refused_for_a_remote_job(env):
     p = make(env)
     r = _ttp_run(p, "detach", "--resumable", "--remote", "box", "job", "--", "true")

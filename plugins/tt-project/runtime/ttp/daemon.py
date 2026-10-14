@@ -5918,7 +5918,7 @@ class Daemon:
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
         before: a job it waits on that did not opt in, one found lost on an earlier boot, one that
-        cannot start, one past budget.max_job_relaunches relaunches, or a relaunch that would reach
+        cannot start (the ones started before it are stopped again: all or none), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
         budget.max_reboot_losses (noted on the task, so its run reads why). cut when an abrupt,
         unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
@@ -5959,12 +5959,24 @@ class Daemon:
             _task_note(todo[0][0].parent, why)
             log(self.p, f"task {tid}: {why}")
             return False, True
+        # All or none: a job that cannot start wakes the task, so the ones started before it are
+        # stopped again (no job of a woken task runs on), and the relaunches are recorded only once all
+        # started (a boot that wakes the task is not also counted as a relaunch boot).
         nice = nice_level(self.cfg.get("runner"))[0]
+        started = []
         for rc, n, loss in todo:
-            if why := detach.relaunch(rc, self.boot, nice):
-                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+            why, pid = detach.relaunch(rc, self.boot, nice)
+            if why:
+                for r, k in started:
+                    detach.stop(r, k, f"stopped right after its relaunch: detached job {rc.stem}, which the "
+                                      f"task also waits on, could not start ({why}), so the task wakes instead")
+                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}"
+                           + (f"; stopped the jobs relaunched before it ({', '.join(r.stem for r, _ in started)})"
+                              if started else ""))
                 log(self.p, f"task {tid}: detached job {rc.stem} not relaunched: {why}")
                 return False, cut
+            started.append((rc, pid))
+        for rc, n, loss in todo:
             text = (f"the host reboot cut short detached job {rc.stem}; relaunched it "
                     f"({n + 1} of {cap}), no model run")
             _task_note(rc.parent, text)
