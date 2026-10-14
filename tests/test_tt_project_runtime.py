@@ -58046,3 +58046,169 @@ def test_failover_review_lines_say_when_a_logout_ended(env):
     got = failover.review_lines(p.db, now, where="America/Los_Angeles")[0]
     assert "no known end" not in got and "(ended " in got and "lasted 2.5 h)" in got, got
     assert got.endswith(f"#{tid} is now done") and (" PDT, " in got or " PST, " in got), got
+
+
+# ssh-preflight @<resource> and stale harness git locks ----------------------------------------------
+def _fake_ssh(tmp_path, up: set[str]) -> dict:
+    """A stand-in ssh on PATH: logs its target, exits 0 for hosts in `up`, 255 for others."""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "ssh.log"
+    ups = " ".join(sorted(up))
+    (bindir / "ssh").write_text(
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; *) break;; esac; done\n"
+        f"echo \"$1\" >> {shlex.quote(str(log))}\n"
+        f"for h in {ups}; do [ \"$h\" = \"$1\" ] && exit 0; done\n"
+        "echo \"ssh: connect to host $1 port 22: No route to host\" >&2\nexit 255\n")
+    (bindir / "ssh").chmod(0o755)
+    return {"PATH": f"{bindir}:{os.environ['PATH']}", "_log": log}
+
+
+def test_hostmap_resolves_a_resource_from_config_and_leaves_a_plain_host_alone():
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import hostmap
+    cfg = {"device": {"locks": ["dev-a", "dev-b"], "hosts": {"dev-a": "boxA", "build": " boxB "},
+                      "runners": {"dev-a": {"host": "boxR"}, "r2": {"host": "boxC"}, "local": {}}}}
+    assert hostmap.resolve(cfg, "boxZ") == "boxZ", "a plain host is probed as it is"
+    assert hostmap.resolve(cfg, "@dev-a") == "boxA", "device.hosts wins over a runner of the same name"
+    assert hostmap.resolve(cfg, "@dev-b") == "boxA", "a device lock name finds the name it shares the lock with"
+    assert hostmap.resolve(cfg, "@build") == "boxB"
+    assert hostmap.resolve(cfg, "@r2") == "boxC", "a runner's host counts"
+    with pytest.raises(KeyError) as e:
+        hostmap.resolve(cfg, "@nope")
+    assert "'nope'" in e.value.args[0] and "@build" in e.value.args[0] and "@local" not in e.value.args[0]
+    with pytest.raises(KeyError):
+        hostmap.resolve({}, "@dev-a")
+    assert hostmap.problems({"device": {"hosts": ["boxA"]}}) == ["device.hosts: not a table of resource names to hosts"]
+    assert hostmap.problems({"device": {"hosts": {"a": "", "b": 3, "c": "-oProxy", "d": "@e", "ok": "boxA"}}}) == [
+        "device.hosts.a: '' is not a host name", "device.hosts.b: 3 is not a host name",
+        "device.hosts.c: '-oProxy' is not a host name", "device.hosts.d: '@e' is not a host name"]
+    from ttp.project import config_problems
+    assert "device.hosts: not a table of resource names to hosts" in config_problems({"device": {"hosts": "x"}})
+
+
+def test_ssh_preflight_follows_a_resource_to_its_current_host(env, tmp_path):
+    p = make(env)
+    fake = _fake_ssh(tmp_path, {"boxA", "boxB"})
+    run = lambda *a: _ttp_run(p, "ssh-preflight", *a, env={"PATH": fake["PATH"]})
+    r = run("boxA")
+    assert r.returncode == 0 and "boxA reachable" in r.stdout, r.stderr
+    r = run("boxQ")
+    assert r.returncode == 255 and "No route to host" in r.stderr
+    # Unknown resource: exit 2 (the probe is broken, so the task wakes), naming what the map has.
+    r = run("@dev")
+    assert r.returncode == 2 and "no host for resource 'dev'" in r.stderr and "known: none" in r.stderr
+    p.set_config("device", {"hosts": {"dev": "boxQ"}})
+    r = run("@dev")
+    assert r.returncode == 255 and "boxQ (@dev) not reachable" in r.stderr
+    # The resource moved: the same probe now reaches the new box.
+    p.set_config("device.hosts.dev", "boxB")
+    r = run("@dev")
+    assert r.returncode == 0 and "boxB (@dev) reachable" in r.stdout, r.stderr
+    assert fake["_log"].read_text().split() == ["boxA", "boxQ", "boxQ", "boxB"]
+    # Found from the working directory too, as retry_when probes run in the project root.
+    e = {k: v for k, v in os.environ.items() if k not in ("TTP_PROJECT", "TTP_RUN_DIR")}
+    r = subprocess.run([sys.executable, str(TTP), "ssh-preflight", "@dev"], cwd=str(p.root),
+                       env={**e, "PATH": fake["PATH"]}, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+
+def test_worker_prompt_says_to_probe_a_mapped_resource_by_name(env):
+    p = make(env)
+    from ttp.prompts import worker_features
+    task = {"id": 1, "kind": "code", "title": "t", "spec": "s"}
+    assert "hostmap" not in worker_features(p, task)
+    p.set_config("device", {"hosts": {"dev": "boxA"}})
+    assert "hostmap" in worker_features(p, task)
+    src = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    from ttp.prompts import feature_blocks, _hostmap_line
+    assert "ttp ssh-preflight @<resource>" in feature_blocks(src, {"hostmap", "wait"})
+    assert "ttp ssh-preflight" not in feature_blocks(src, {"wait"})
+    assert _hostmap_line(p.config()).startswith("resource hosts (probe with `ttp ssh-preflight @<resource>`")
+    assert "@dev (on boxA)" in _hostmap_line(p.config()) and _hostmap_line({}) == ""
+
+
+def _harness_lock(repo: pathlib.Path, rel: str, age_s: float) -> pathlib.Path:
+    path = repo / ".git" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    t = time.time() - age_s
+    os.utime(path, (t, t))
+    return path
+
+
+def test_stale_git_locks_are_cleared_but_live_or_young_ones_kept(tmp_path):
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import gitlocks
+    repo = tmp_path / "harness"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    old = _harness_lock(repo, "index.lock", 3600)
+    ref = _harness_lock(repo, "refs/heads/main.lock", 3600)
+    young = _harness_lock(repo, "HEAD.lock", 30)
+    obj = _harness_lock(repo, "objects/pack/x.lock", 3600)
+    # A git process running in the repository may hold them: nothing is removed.
+    me = os.getpid()
+    other = subprocess.Popen(["sleep", "30"], cwd=str(repo))
+    try:
+        procs = [(other.pid, "git commit -q")]
+        removed, held = gitlocks.clear(repo, 600, procs=procs)
+        assert removed == [] and held == [other.pid] and old.exists() and ref.exists()
+        # A git process naming the repository holds it too, wherever it runs.
+        assert gitlocks.clear(repo, 600, procs=[(me, f"git -C {repo.resolve()} add x")])[1] == [me]
+    finally:
+        other.kill()
+        other.wait()
+    assert gitlocks.clear(repo, 0, procs=[]) == ([], []), "0 turns it off"
+    # A git process that ended, a git process elsewhere, or another program does not.
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    removed, held = gitlocks.clear(repo, 600, procs=[(me, "python3 x"), (gone.pid, "git status"),
+                                                     (me, f"git log {tmp_path / 'other'}")])
+    assert held == [] and sorted(removed) == sorted([old, ref])
+    assert young.exists(), "a lock younger than the threshold is kept"
+    assert obj.exists(), "object store locks are left alone"
+    assert not old.exists() and not ref.exists()
+
+
+def test_a_git_lock_a_process_has_open_is_never_stale(tmp_path):
+    if not pathlib.Path("/proc/self/fd").is_dir():
+        pytest.skip("open files are read from /proc")
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import gitlocks
+    repo = tmp_path / "harness"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    lock = _harness_lock(repo, "index.lock", 3600)
+    holder = subprocess.Popen([sys.executable, "-c", "import sys,time; f=open(sys.argv[1]); time.sleep(30)",
+                               str(lock)])
+    try:
+        deadline = time.time() + 10
+        while str(lock) not in gitlocks._open_fds(holder.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        removed, held = gitlocks.clear(repo, 600, procs=[(holder.pid, "python3 holder")])
+        assert removed == [] and held == [holder.pid] and lock.exists()
+    finally:
+        holder.kill()
+        holder.wait()
+    assert gitlocks.clear(repo, 600, procs=[])[0] == [lock]
+
+
+def test_daemon_clears_a_stale_harness_git_lock_and_logs_it(env):
+    p = make(env)
+    from ttp import gitlocks
+    from ttp.daemon import Daemon
+    assert gitlocks.git_dir(p.harness) is not None
+    lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    assert gitlocks.settings(d.cfg) == 600
+    d.clear_git_locks()
+    assert not lock.exists()
+    assert "harness git locks: removed stale" in (p.logs / "daemon.log").read_text()
+    ev = p.db.one("SELECT severity,text FROM events WHERE kind='git_lock_cleared'")
+    assert ev["severity"] == "low" and "index.lock" in ev["text"]
+    # Off when the threshold is 0.
+    lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
+    p.set_config("watchdog.stale_git_lock_s", 0)
+    d.cfg, d._git_locks_at = p.config(), 0.0
+    d.clear_git_locks()
+    assert lock.exists()

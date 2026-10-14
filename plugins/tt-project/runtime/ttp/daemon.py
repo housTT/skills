@@ -45,6 +45,7 @@ from . import coordlimits
 from . import detach
 from . import effort
 from . import failover
+from . import gitlocks
 from . import grants
 from . import ends
 from . import heal
@@ -886,7 +887,7 @@ class Daemon:
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
-                     self.check_integrity,
+                     self.check_integrity, self.clear_git_locks,
                      self.sync_schedules, self.lint_charter, self.tend_holds):
             self._step_name = step.__name__
             step()
@@ -4494,6 +4495,29 @@ class Daemon:
         text = integrity.problem_text(res)
         if text:
             self.alert("integrity", text, severity="high", every_s=86400)
+
+    def clear_git_locks(self, every_s: float = 300) -> None:
+        """Remove `.git/*.lock` files a killed git command left in the harness repository, once no
+        process holds them and they are older than watchdog.stale_git_lock_s (see ttp.gitlocks):
+        such a lock blocks every harness commit until removed. Each removal is logged."""
+        now = time.time()
+        if now - getattr(self, "_git_locks_at", 0.0) < every_s:
+            return
+        self._git_locks_at = now
+        try:
+            removed, held = gitlocks.clear(self.p.harness, gitlocks.settings(self.cfg))
+        except Exception:
+            log(self.p, "harness git locks: check failed\n" + traceback.format_exc())
+            return
+        if held and held != getattr(self, "_git_locks_held", None):
+            log(self.p, f"harness git locks: old lock files kept, still held by pid(s) {', '.join(map(str, held))}")
+        self._git_locks_held = held
+        if removed:
+            names = ", ".join(str(x) for x in removed)
+            log(self.p, f"harness git locks: removed stale {names}")
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (now, "daemon", "git_lock_cleared", "low",
+                         f"Removed stale git lock file(s) no process held: {names}"[:500], "handled"))
 
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and

@@ -2238,6 +2238,33 @@ def cmd_killscan(a) -> None:
     sys.exit(1 if hits else 0)
 
 
+def cmd_ssh_preflight(a) -> None:
+    """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when). `@<resource>`
+    finds the host in the project's config `device.hosts` (or `device.runners`) each time it runs,
+    so a probe follows its resource to another box; an unknown resource exits 2."""
+    from . import hostmap
+    target = a.target
+    if target.startswith("@"):
+        base = os.environ.get("TTP_PROJECT") or \
+            next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
+        if not base:
+            die("ttp ssh-preflight @<resource> only works in a tt-project (or with TTP_PROJECT set)")
+        try:
+            host = hostmap.resolve(Project(base).config(), target)
+        except KeyError as e:
+            die(f"ssh-preflight: {e.args[0]}", hostmap.UNKNOWN_RC)
+    else:
+        host = target
+    rc, out = hostmap.preflight(host, a.timeout)
+    shown = f"{host} ({target})" if host != target else host
+    if rc == 0:
+        print(f"ssh-preflight: {shown} reachable")
+    else:
+        print(f"ssh-preflight: {shown} not reachable (ssh exit {rc})" + (f": {out}" if out else ""),
+              file=sys.stderr)
+    sys.exit(rc)
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -4821,6 +4848,12 @@ def main(argv: list[str] | None = None) -> None:
                         "inside a run: at most half its stall limit")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_lock)
+
+    s = sub.add_parser("ssh-preflight", help="exit 0 once a host answers over ssh, 255 while not (for "
+                                             "retry_when); @<resource> takes the host from config device.hosts")
+    s.add_argument("target", help="an ssh host, or @<resource> (config device.hosts or device.runners)")
+    s.add_argument("--timeout", type=float, default=30.0, help="give up on ssh after this many seconds")
+    s.set_defaults(fn=cmd_ssh_preflight)
 
     s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "
                                       "rebased (same patch-id or author/date/subject), 1 while not yet, 2 if it "

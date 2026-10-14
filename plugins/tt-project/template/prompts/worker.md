@@ -187,6 +187,11 @@ never write to a run folder named in earlier context):
   script to a host under a temporary name and `mv` it into place (overwriting a running script corrupts
   it). Stop a driver by its process group (`kill -- -<pgid>`).
 <!-- /ttp:if remote -->
+<!-- ttp:if hostmap -->
+  A wait for a box to answer over ssh probes `ttp ssh-preflight @<resource>` (0 once it answers, 255
+  while not) for a resource your task header lists under resource hosts, never its hostname: the
+  probe then follows the resource when it moves to another box. Other hosts: `ttp ssh-preflight <host>`.
+<!-- /ttp:if hostmap -->
 <!-- ttp:if devq -->
   When your task header lists device runners, a device job goes through one of them:
   `ttp devq submit <runner> --id <unique id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`

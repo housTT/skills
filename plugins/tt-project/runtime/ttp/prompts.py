@@ -289,6 +289,15 @@ def _runner_line(cfg: dict) -> str:
             "driver of your own\n") + out
 
 
+def _hostmap_line(cfg: dict) -> str:
+    from .hostmap import table
+    tab = table(cfg)
+    if not tab:
+        return ""
+    return ("resource hosts (probe with `ttp ssh-preflight @<resource>`, never the host): "
+            + ", ".join(f"@{n} (on {h})" for n, h in sorted(tab.items())) + "\n")
+
+
 # A charter item's own tag says who it is for; untagged, an item is for workers when it speaks of
 # their work and names no coordinator duty.
 _AUDIENCE_TAG = re.compile(r"\[(workers?|coordinator)\]", re.I)
@@ -433,6 +442,9 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     if re.search(r"\b(slurm|cluster)", resources, re.I) or any(
             {"slurm", "cluster"} & set(t) for t in tags.values()):
         on.add("clusters")
+    from .hostmap import table
+    if table(cfg):
+        on.add("hostmap")
     return on | unsure
 
 
@@ -565,6 +577,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         "dir named in earlier context\n"
         + _resource_line(task)
         + _runner_line(cfg)
+        + _hostmap_line(cfg)
         + f"project root: {p.root}\n"
         + _zone_line(p)
         + venv_line

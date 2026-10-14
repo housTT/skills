@@ -116,7 +116,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # running its own detached driver. Empty: none, and workers keep the detached-driver path.
     # nodes: globs of the device files a job opens to use the device (Linux), so a detached job of a
     # task holding the device that opens none of them counts as leaving it unused (jobuse.py).
-    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": []},
+    # hosts: {resource: ssh host} for `ttp ssh-preflight @<resource>` (hostmap.py), so a probe
+    # follows a resource that moves to another box; runners' hosts count too.
+    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
+               "hosts": {}},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
@@ -259,7 +262,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
     # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
     # and the `restarts`-th in that window sends one high alert.
-    "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600},
+    # stale_git_lock_s: a .git/*.lock in the harness repository this old that no process holds is
+    # removed (a killed git command left it; it blocks every harness commit; gitlocks.py; 0: off).
+    "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600, "stale_git_lock_s": 600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
     # A conflicting merge queues one harness task a day at most (at once when the last one landed its
@@ -538,6 +543,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     out += bump_problems(delivery.get("version_bump"))
     from .devq import config_problems as runner_problems
+    from .hostmap import problems as host_problems
+    out += host_problems(raw)
     runners = (raw.get("device") or {}).get("runners")
     if runners is not None and not isinstance(runners, dict):
         out.append("device.runners: not a table of runners by name")
