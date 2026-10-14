@@ -18412,7 +18412,7 @@ def test_a_lock_wait_that_gives_up_on_its_first_poll_still_shows_as_progress(env
     finally:
         release.touch()
         holder.wait(timeout=30)
-    assert r.returncode == 75, (r.returncode, r.stderr)
+    assert r.returncode == 75 and "stayed busy" in r.stderr, (r.returncode, r.stderr)
     assert "waiting for board" in (run_dir / "progress.md").read_text(), "a wait looked like a stall"
 
 
