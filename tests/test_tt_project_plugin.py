@@ -1111,3 +1111,93 @@ def test_setup_box_states_company_etiquette_without_personal_policy():
     for banned in ("idle at least", "nodes the user listed", "nodes you listed", "machine list",
                    "reservation cap", "reservation-cap"):
         assert banned not in pages, banned
+
+
+def _bare_env(tmp_path, *, ssh_down=False, broker=True, svc="active", free_kb=500 * 1024 ** 2,
+              machines=None, lock_rc=0):
+    """PATH shims: ssh runs the remote command in a local shell over fake df/systemctl/broker; ttp
+    answers `machines list --json` and `lock --probe`. Every ssh and ttp call is logged."""
+    import shlex
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    log = tmp_path / "calls.log"
+
+    def shim(name, body):
+        p = bin_ / name
+        p.write_text("#!/bin/bash\n" + body, encoding="utf-8")
+        p.chmod(0o755)
+    shim("ssh", f'echo "ssh $*" >> {log}\n' + ("echo 'connection refused' >&2; exit 255\n" if ssh_down
+                                              else 'exec bash -c "${@: -1}"\n'))
+    shim("df", f'echo "Filesystem 1024-blocks Used Available Capacity Mounted"\n'
+               f'echo "/dev/x 999999999 1 {free_kb} 1% /"\n')
+    shim("systemctl", f'[ "$2" = tt-device-broker ] && echo {svc} || echo inactive\n'
+                      f'[ "{svc}" = active ]\n')
+    if broker:
+        shim("tt-device-mcp", "exit 0\n")
+    shim("ttp", f'echo "ttp $*" >> {log}\n'
+                f'[ "$1" = machines ] && {{ echo {shlex.quote(json.dumps(machines or {}))}; exit 0; }}\n'
+                f'exit {lock_rc}\n')
+    env = {k: v for k, v in os.environ.items() if k != "TTP_BOXES_FILE"}
+    env["PATH"] = f"{bin_}:/usr/bin:/bin"
+    return env, log
+
+
+def _bare_check(tmp_path, env, *args, site=None):
+    import subprocess
+    path = tmp_path / "boxes.json"
+    path.write_text(json.dumps(site or {"version": 1, "boxes": {"<box-alias>": {
+        "route": "bare", "workdir_root": "~/<workdir>"}}}), encoding="utf-8")
+    return subprocess.run([sys.executable, str(BOX_PY), "--site", str(path), "bare", "check", "<box-alias>", *args],
+                          capture_output=True, text=True, timeout=60, env=env)
+
+
+def test_setup_box_bare_check_ready_box(tmp_path):
+    env, log = _bare_env(tmp_path, machines={"<box-alias>": {"tags": ["device"], "min_free_gb": 100}})
+    r = _bare_check(tmp_path, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "ssh: ok" in out and "500 GB free" in out and "guard 100 GB" in out
+    assert "tt-device-mcp present, tt-device-broker active" in out
+    assert "lock <box-alias>-device: free" in out and out.rstrip().endswith("verdict: ready")
+    calls = log.read_text()
+    # One non-interactive ssh call; the device lock is only probed, never taken.
+    assert calls.count("ssh ") == 1 and "BatchMode=yes" in calls
+    assert "ttp lock --probe <box-alias>-device" in calls
+    facts = json.loads(_bare_check(tmp_path, env, "--json").stdout)
+    assert facts["rc"] == 0 and facts["broker_service"] == "active" and facts["tags"] == ["device"]
+
+
+@pytest.mark.parametrize("kw, args, rc, expect", [
+    (dict(free_kb=10 * 1024 ** 2), (), 1, "below the guard of 150 GB"),
+    (dict(free_kb=10 * 1024 ** 2), ("--min-free-gb", "0"), 0, "verdict: ready"),
+    (dict(machines={"<box-alias>": {"tags": [], "min_free_gb": 5}}, free_kb=10 * 1024 ** 2), (), 0, "guard 5 GB"),
+    (dict(svc="inactive"), (), 1, "do not start a second broker"),
+    (dict(broker=False, svc="inactive"), (), 0, "broker: none"),
+    (dict(lock_rc=75), (), 75, "busy or paused: wait for it, never override it"),
+    (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: failed (exit 255) connection refused"),
+    (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
+    (dict(machines={}), (), 0, "not in `ttp machines list`"),
+])
+def test_setup_box_bare_check_problems(tmp_path, kw, args, rc, expect):
+    env, _ = _bare_env(tmp_path, **kw)
+    r = _bare_check(tmp_path, env, *args)
+    assert r.returncode == rc and expect in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_bare_check_custom_lock_and_wrong_route(tmp_path):
+    env, log = _bare_env(tmp_path)
+    site = {"version": 1, "boxes": {"<box-alias>": {"route": "slurm", "workdir_root": "/<workdir>",
+                                                     "slurm": {"login": "<l>", "partitions": []}}}}
+    r = _bare_check(tmp_path, env, "--resource", "<res>", site=site)
+    assert "route is 'slurm', not bare" in r.stdout and "lock <res>: free" in r.stdout
+    assert "ttp lock --probe <res>" in log.read_text()
+
+
+def test_setup_box_bare_metal_page_covers_the_route():
+    page = (SKILLS / "setup-box" / "bare-metal.md").read_text(encoding="utf-8")
+    for part in ("ttp machines list", "ttp lock --probe <box-alias>-device", "--until", "serving",
+                 "unstable", "tt-buddy:run", "skills/run/mcp.md", "Never start a second broker",
+                 "TT_VISIBLE_DEVICES", "--min-free-gb", "recipes/developer-setup.md",
+                 "git submodule update --init --recursive", "ccache", "not portable",
+                 "box.py bare check <box-alias>"):
+        assert part in page, part
