@@ -9,7 +9,9 @@ Otherwise it gets a git worktree of the harness repo of its own (state/harness-w
 branch ttp/harness-t<id>), and keeps it on later runs while it exists.
 
 When its run ends the daemon lands it (land): the branch's commits are merged into the harness
-checkout, and the worktree and branch are removed once nothing is left in them. A merge that
+checkout. The worktree and branch stay while the task is open (a waiting task's detached job may run
+in it, and its next run works there again); they are removed once the task ended (or is gone from the
+database), nothing uncommitted is left in them and no detached job or `ttp push` of it runs (held). A merge that
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
 pass (the daemon retries each tick, sweep), and reported to the coordinator once per branch head
 (a refusal only while no harness run works in the checkout). A merge that changed runtime/ asks
@@ -79,12 +81,35 @@ def workdir(p: Project, tid: int) -> Path:
     return own
 
 
+def held(p: Project, tid: int) -> str | None:
+    """Why harness task `tid`'s worktree must stay, or None: the task is still open, or a detached
+    job, detached checks or a detached `ttp push` of it still runs (in it, for all we know)."""
+    from .db import TERMINAL_TASK_STATES
+    task = p.db.task(int(tid))
+    if task and task["status"] not in TERMINAL_TASK_STATES:
+        return f"task #{tid} ({task['status']}) is still open"
+    from .push import running
+    own = path(p, tid).resolve()
+    if any(Path(m.get("repo") or "/").resolve() == own for m in running(p)):
+        return "a detached `ttp push` runs in it"
+    from . import hold
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    for r in p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (int(tid),)):
+        d = Path(r["dir"])
+        if hold.live(hold.run_jobs(d)):
+            return "a detached job of it still runs"
+        info = _read_checks_pid(d)
+        if info and not (d / CHECKS_RC).exists() and _checks_alive(info):
+            return "its detached checks still run"
+    return None
+
+
 def land(p: Project, tid: int) -> str:
     """Merge harness task `tid`'s worktree branch into the harness checkout (call it when no run of
-    the task is live); remove the worktree and branch once nothing is left in them. Returns what
-    happened: '' (no worktree), 'merged', 'kept' (uncommitted changes stay in the worktree for the
-    task's next run; its commits landed), 'busy' (git refused, e.g. over the checkout's own changes)
-    or 'conflict'."""
+    the task is live); remove the worktree and branch once nothing is left in them and nothing holds
+    them (held). Returns what happened: '' (no worktree), 'merged' (and removed), 'kept' (its commits
+    landed; the worktree stays, for the open task or its live jobs, or with uncommitted changes for
+    the task's next run), 'busy' (git refused, e.g. over the checkout's own changes) or 'conflict'."""
     own = path(p, tid)
     if not own.exists():
         return ""
@@ -113,7 +138,7 @@ def land(p: Project, tid: int) -> str:
                           json.dumps({"at": time.time(), "pid": os.getpid(),
                                       "why": f"harness task #{tid}'s merged commits changed runtime/"}))
         outcome = "merged"
-    if dirty(own):
+    if dirty(own) or held(p, tid):
         return "kept"
     r = _git(p.harness, "worktree", "remove", str(own), timeout=120)
     if r.returncode != 0 and own.exists():
@@ -141,7 +166,8 @@ def _report_conflict(p: Project, tid: int, why: str) -> None:
 
 def sweep(p: Project, running: set[int]) -> dict[int, str]:
     """Land every harness worktree whose task has no live run (`running`: task ids with one); a
-    worktree whose task is gone from the database is landed too. Returns task id -> outcome."""
+    worktree whose task is gone from the database is landed too. Each is removed only once its task
+    ended and nothing holds it (land). Returns task id -> outcome."""
     root = p.state / DIR
     if not root.is_dir():
         return {}

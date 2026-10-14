@@ -11591,6 +11591,7 @@ def test_a_harness_worktree_lands_its_commits_and_is_removed(env):
     _harness_run(p, b)
     assert harnesstree.sweep(p, {a, b}) == {}   # still running: left alone
     assert own.exists()
+    p.db.update_task(b, status="done")
     assert harnesstree.sweep(p, {a}) == {b: "merged"}
     assert (p.harness / "prompts" / "extra.md").read_text() == "more\n"
     assert not own.exists() and not (p.state / "harness-worktrees").exists()
@@ -11608,6 +11609,7 @@ def test_a_harness_worktree_that_changed_runtime_asks_the_daemon_to_restart(env)
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
     _commit_in(own, "runtime/ttp/extra_note.txt", "x\n", "b: runtime")
+    p.db.update_task(b, status="done")
     assert harnesstree.land(p, b) == "merged"
     req = json.loads((p.state / service.RESTART_REQUEST).read_text())
     assert f"#{b}" in req["why"] and "runtime/" in req["why"]
@@ -11628,6 +11630,56 @@ def test_a_dirty_harness_worktree_lands_its_commits_and_is_kept(env):
     assert (own / "prompts" / "wip.md").exists() and own.is_dir()
     assert harnesstree.workdir(p, b) == own   # the next run picks it up
     assert harnesstree.land(p, b) == "kept"   # nothing new to merge; still dirty
+
+
+def test_an_open_harness_task_keeps_its_worktree_after_its_commits_land(env):
+    p = make(env)
+    from ttp import harnesstree
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    _harness_run(p, b, status="done")
+    p.db.update_task(b, status="waiting")   # e.g. on its own detached checks, run in the worktree
+    assert harnesstree.held(p, b) == f"task #{b} (waiting) is still open"
+    assert harnesstree.sweep(p, {a}) == {b: "kept"}
+    assert (p.harness / "prompts" / "extra.md").read_text() == "more\n"   # its commits landed
+    assert own.is_dir() and _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip()
+    assert harnesstree.workdir(p, b) == own   # its next run works there again
+    _commit_in(own, "prompts/more.md", "again\n", "b: more")
+    assert harnesstree.sweep(p, {a}) == {b: "kept"}
+    assert (p.harness / "prompts" / "more.md").exists()
+    p.db.update_task(b, status="done")
+    assert harnesstree.sweep(p, {a}) == {b: "merged"}
+    assert not own.exists() and not _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip()
+
+
+def test_a_harness_worktree_stays_while_a_detached_job_of_its_ended_task_runs(env):
+    p = make(env)
+    from ttp import harnesstree, locks
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    rd = p.state / "runs" / "9001"
+    rd.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (b, "worker", "fake", time.time(), "done", str(rd)))
+    rc = rd / "checks-job.rc"
+    (rd / "detached.json").write_text(json.dumps([{"name": "checks-job", "rc": str(rc)}]))
+    p.db.update_task(b, status="done")
+    lock = locks.try_take([locks.job_lock(rc)], "detached job checks-job", "pytest")
+    try:
+        assert harnesstree.held(p, b) == "a detached job of it still runs"
+        assert harnesstree.sweep(p, {a}) == {b: "kept"} and own.is_dir()
+    finally:
+        lock.close()
+    rc.write_text("0\n")
+    assert harnesstree.held(p, b) is None
+    assert harnesstree.sweep(p, {a}) == {b: "merged"} and not own.exists()
 
 
 def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
@@ -11670,6 +11722,7 @@ def test_the_daemon_tick_lands_harness_worktrees_of_ended_runs_only(env):
     _commit_in(own_c, "prompts/c.md", "c\n", "c")
     _harness_run(p, c)   # c still runs; b's run ended
     _harness_run(p, b, status="done")
+    p.db.update_task(b, status="done")
     d.land_harness_worktrees()
     assert (p.harness / "prompts" / "b.md").exists() and not own_b.exists()
     assert own_c.is_dir() and not (p.harness / "prompts" / "c.md").exists()
