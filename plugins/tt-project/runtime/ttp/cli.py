@@ -119,7 +119,9 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     A dropped connection (see _dropped) means the path was lost (this machine's network, or the
     host restarting), not that the project stopped, so wait (5 s, doubling to 2 min) and reconnect.
     A reconnect within LISTEN_GRACE_S says nothing; a longer outage is explained once, from the
-    side ssh's error points to (sshfail.kind). The listener left on the far side
+    side ssh's error points to (sshfail.kind). An outage that began with the host dropping a working
+    connection keeps that wording while it reboots (its retries time out); only this machine losing
+    its own path (sshfail.offline) switches to the network advice. The listener left on the far side
     exits on its own once its session is gone, and the new one replaces it if it has not yet.
     Each (re)connect first sends what is queued here. A message is printed once per listener:
     one shown before a drop is not shown again after the reconnect, and with --once, a batch that
@@ -129,12 +131,13 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     A listener replaced by a newer one for the same chat ends with LISTEN_REPLACED and is not
     retried: reconnecting would displace the newer one in turn, and the two would take turns.
     """
+    from . import sshfail
     once = "--once" in argv
     limit = _listen_timeout(argv)
     deadline = time.time() + limit if limit > 0 else None
     shown: set[int] = set()
     delay, told, held, tries = 5.0, False, False, 0
-    down_since, connected = None, False
+    down_since, connected, drop = None, False, None
     while True:
         start = time.time()
         failed = flush_outbox(name, entry, quiet=held) if name else None
@@ -155,7 +158,10 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
         now = time.time()
         if now - start >= LISTEN_CONNECTED_S or (rc != 255 and rc >= 128):
             connected, down_since, told, delay = True, None, False, 5.0   # it was up: a new outage starts now
-        down_since = now if down_since is None else down_since
+        if down_since is None:   # the error that started this outage, if a working session dropped
+            down_since, drop = now, ((err, rc) if connected else None)
+        if drop and sshfail.kind(drop[0], True) == "host" and not sshfail.offline(err):
+            err, rc = drop      # a host rebooting times out while down: still its side, not this network
         if deadline and now + delay >= deadline:
             if not told:
                 _unreachable(entry, err, rc, connected)

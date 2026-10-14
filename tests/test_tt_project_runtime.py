@@ -10201,6 +10201,43 @@ def test_a_host_that_restarts_under_a_listener_is_named_as_restarting_once_past_
     assert "back on that network" not in err and "10.1.2.3" not in err, err
 
 
+def test_a_rebooting_host_keeps_its_restart_wording_while_its_retries_time_out(env, monkeypatch, capsys):
+    """Review #2150: a host that is down while it reboots makes retries time out; the outage still
+    started with the host dropping a working connection, so it is not this machine's network."""
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    timeout = "ssh: connect to host 10.1.2.3 port 22: Connection timed out\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone)] + [(20, 255, timeout)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: box dropped the connection (probably restarting") == 1, err
+    assert "back on that network" not in err and "10.1.2.3" not in err, err
+
+
+@pytest.mark.parametrize("later", [
+    "ssh: connect to host 10.1.2.3 port 22: Network is unreachable\n",
+    "ssh: Could not resolve hostname box: Temporary failure in name resolution\n"])
+def test_a_drop_followed_by_this_machine_going_offline_gets_the_network_advice(env, monkeypatch, capsys, later):
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone)] + [(20, 255, later)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("once this machine is back on that network.") == 1, err
+    assert "restarting" not in err and "10.1.2.3" not in err, err
+
+
+def test_a_listener_that_never_connected_and_times_out_gets_the_network_advice(env, monkeypatch, capsys):
+    from ttp import cli
+    timeout = "ssh: connect to host 10.1.2.3 port 22: Connection timed out\n"
+    _listener_on_a_clock(cli, monkeypatch, [(20, 255, timeout)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: cannot reach box right now (ssh: connect to host box port 22: Connection timed out)") == 1, err
+    assert "once this machine is back on that network." in err, err
+    assert "restarting" not in err and "10.1.2.3" not in err, err
+
+
 def test_a_listener_reconnecting_within_the_grace_prints_nothing(env, monkeypatch, capsys):
     from ttp import cli
     gone = "Connection to 10.1.2.3 closed by remote host.\n"

@@ -17,7 +17,9 @@ another machine explain an ssh failure (exit 255) through `kind` and `scrub`:
 
 `host`: the host answered and dropped or turned the connection away, so it is restarting or its ssh
 server is down; this machine's network is fine. `network`: this machine has no path to it (or, on the
-first try, nothing says otherwise). An address ssh puts in its own text is replaced by the ssh alias
+first try, nothing says otherwise). A listener whose outage began with the host dropping a working
+connection keeps the `host` wording through later timeouts (a host down while it reboots times out);
+only `offline` (no name lookup, network unreachable) switches it to `network`. An address ssh puts in its own text is replaced by the ssh alias
 the user configured: user-facing text never names an IP.
 """
 from __future__ import annotations
@@ -30,6 +32,9 @@ _NETWORK = re.compile(r"could not resolve hostname|name or service not known|tem
 _HOST = re.compile(r"closed by remote host|connection closed by|connection reset|connection refused"
                    r"|kex_exchange_identification", re.I)
 _NO_ROUTE = re.compile(r"no route to host", re.I)
+# This machine lost its own path: no name lookup, no network. A timeout may just be the host down.
+_OFFLINE = re.compile(r"could not resolve hostname|name or service not known|temporary failure in name resolution"
+                      r"|nodename nor servname|no address associated|network is unreachable", re.I)
 
 _IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
 _V4 = re.compile(rf"(?<![\w.]){_IPV4}(?![\w.])")
@@ -52,6 +57,12 @@ def kind(stderr: str | None, connected: bool = False) -> str:
     if _NO_ROUTE.search(text):
         return "host" if connected else "network"
     return "other" if connected else "network"
+
+
+def offline(stderr: str | None) -> bool:
+    """ssh's error says this machine has no network or cannot look names up (unlike a timeout, which
+    a host that is down also gives)."""
+    return bool(_OFFLINE.search(stderr or ""))
 
 
 def no_ips(text: str, alias: str) -> str:
