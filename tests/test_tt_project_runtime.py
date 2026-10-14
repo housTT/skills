@@ -20263,7 +20263,7 @@ def _moved_branch(p, worktree):
     return p.db.task(tid), path, own
 
 
-def _commit_in(path, name, text="x"):
+def _commit_file_in(path, name, text="x"):
     (path / name).write_text(text)
     _git_out(path, "add", name)
     _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
@@ -20275,7 +20275,7 @@ def test_a_worktree_on_another_branch_with_the_tasks_own_commits_is_adopted(env)
     from ttp import worktree
     from ttp.prompts import worker_task
     task, path, own = _moved_branch(p, worktree)
-    head = _commit_in(path, "work.txt")
+    head = _commit_file_in(path, "work.txt")
     (path / "notes.txt").write_text("loose")
     assert worktree.ensure(p, task) == (path, own), "the worktree's branch with this task's commits was not adopted"
     assert _git_out(path, "rev-parse", "HEAD") == head and (path / "notes.txt").read_text() == "loose"
@@ -20373,7 +20373,7 @@ def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env
     p.set_config("worktree.create_retries", 3)
     task, path, own = _moved_branch(p, worktree)
     _git_out(path, "switch", "-qc", "ttp/t9999-unrelated")
-    head = _commit_in(path, "theirs.txt")
+    head = _commit_file_in(path, "theirs.txt")
     (path / "out.log").write_text("log")
     with pytest.raises(worktree.WorkspaceStuck, match="not this task's"):
         worktree.ensure(p, task)
