@@ -58307,6 +58307,25 @@ def test_a_continuation_checks_only_the_commits_after_its_inherited_marker(env, 
     assert counts() == (4, 3)
 
 
+def test_checks_fresh_ignores_an_inherited_marker_at_an_ancestor(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)
+    first = p.db.add_task("first hop", kind="code")
+    nxt = p.db.add_task("next hop", kind="code", labels=[f"continues:{first}"])
+    monkeypatch.setenv("TTP_TASK", str(first))
+    marked = _commit_in(git, repo, "src/a.py", "a = 1\n")
+    cli.main(["checks"])
+    assert counts() == (1, 1)
+    # The next hop's head is a descendant of the marker: --fresh still runs the scoped check again.
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    _commit_in(git, repo, "notes.txt", "notes\n")
+    capsys.readouterr()
+    cli.main(["checks", "--fresh"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 2), out
+    assert f"verified through {marked[:12]}" not in out
+
+
 def test_a_rewritten_history_falls_back_to_full_verification(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, prompts, verified
     p, repo, run, git, counts = _verified_checks_repo(env, tmp_path, monkeypatch)

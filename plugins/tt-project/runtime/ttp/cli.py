@@ -1809,7 +1809,8 @@ def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
                     fresh: bool = False) -> tuple[dict | None, list]:
     """(the run's task's inherited checks marker, the if_changed checks in `todo` it verifies): each passed
     at the marker, and the commits after it change nothing under its scope. A marker at `head` itself (a
-    rerun on the same head) verifies the scoped checks it recorded, unless `fresh`. A marker that is no
+    rerun on the same head) verifies the scoped checks it recorded. `fresh` ignores the marker, at
+    `head` or an ancestor: every check runs again. A marker that is no
     longer an ancestor of `head` (rewritten history) verifies none: every check runs, and that is said.
     Checks without an if_changed scope always run, as they cover the whole tree."""
     from . import push, verified
@@ -1818,7 +1819,7 @@ def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
         m = verified.scope(p.db, t, top, head, "checks", include_self=True) if t else None
     except Exception:
         return None, []
-    if not m or (m["sha"] == head and fresh):
+    if not m or fresh:
         return m, []
     if not m["ok"]:
         say(m["line"])
