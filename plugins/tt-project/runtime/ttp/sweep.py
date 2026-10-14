@@ -10,7 +10,10 @@ its reason and its last re-check. The coordinator records exactly one outcome pe
 `sweep` action (OUTCOMES). `still_blocked` needs a re-checkable condition (`until_probe`, or an
 `until` that is not only "keep it blocked") and a next check (`start_after`); `human_indispensable`
 needs a `why`. An item the next sweep finds without an outcome since the last one, or whose
-`still_blocked` had no re-checkable condition or passed its next check, is carried and flagged.
+`still_blocked` had no re-checkable condition or passed its next check, is carried and flagged. A
+valid `still_blocked` whose next check is still ahead, on an item that has not changed since (status,
+spec, reason) and is no loop, is carried forward as one collapsed CARRIED line that needs no action; a
+sweep due only to its interval is skipped while every item is carried.
 
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
@@ -269,11 +272,28 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     state = db.kv(STATE_KEY, {}) or {}
     since = now - float(state.get("last") or 0)
     if since >= every:
+        outs = db.kv(OUTCOMES_KEY, {}) or {}
+        prev = state.get("items") or {}
+        if not holdloops.flagged(db) and all(_carries(i, state, outs, now) and not loop(db, i, prev.get(i["key"]))
+                                             for i in live):
+            return None   # nothing a sweep would ask for: every item keeps a valid, not-yet-due outcome
         return f"every {every / 3600:g}h"
     if since < min(every, _cfg(cfg, "blocker_sweep_min_gap_h", MIN_GAP_H) * 3600):
         return None
     sigs = _signals(db, state, live, now)
     return "; ".join(sigs)[:300] if sigs else None
+
+
+def _snap(i: dict) -> dict:
+    """What a carried outcome must still match: the item's status, spec and reason."""
+    return {"status": i["status"], "spec_sha": i["spec_sha"], "reason": i["reason"]}
+
+
+def carried(o: dict | None, i: dict, now: float) -> bool:
+    """A still_blocked outcome that still holds for item `i`: re-checkable, its next check ahead, and
+    recorded against the item as it is now. Such an item needs no new outcome at this sweep."""
+    return bool(o and o.get("outcome") == "still_blocked" and recheckable(o) and o.get("next")
+                and float(o["next"]) > now and o.get("item") == _snap(i))
 
 
 def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
@@ -285,6 +305,8 @@ def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
     out = {}
     for i in live:
         o = outs.get(i["key"])
+        if carried(o, i, now):
+            continue
         if i["key"] in prev and (not o or float(o.get("ts") or 0) < last):
             out[i["key"]] = "no outcome at the last sweep"
         elif o and o.get("outcome") == "still_blocked":
@@ -323,17 +345,20 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     backlog = _cfg(cfg, "review_backlog_h", REVIEW_BACKLOG_H) * 3600
     reviews = {i["key"]: review_diagnosis(db, i["task"], now, hold_of) for i in live
                if i["kind"] == "review" and backlog > 0 and (i["age_s"] or 0) >= backlog}
+    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    carry = [i["key"] for i in live if i["key"] not in loops and i["key"] not in reviews
+             and carried(outs.get(i["key"]), i, now)]
     n = int(state.get("n") or 0) + 1
     with db.tx():
         db.set_kv(STATE_KEY, {"last": now, "n": n, "why": why, "flags": flagged, "loops": loops, "reviews": reviews,
-                              "paused": [i["resource"] for i in live if i["kind"] == "paused"],
-                              "seen": _seen(state, live),
-                              "items": {i["key"]: {"status": i["status"], "spec_sha": i["spec_sha"]} for i in live}})
+                              "carried": carry, "paused": [i["resource"] for i in live if i["kind"] == "paused"],
+                              "seen": _seen(state, live), "items": {i["key"]: _snap(i) for i in live}})
         db.x("DELETE FROM kv WHERE key=?", (SIGNAL_KEY,))
         eid = db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                    (now, "daemon", SWEEP_KIND, "normal",
-                    f"Blocker sweep {n} ({why}): {len(live)} stuck item(s), {len(flagged)} carried, "
-                    f"{len(loops)} loop(s). Record one `sweep` outcome for each.",
+                    f"Blocker sweep {n} ({why}): {len(live)} stuck item(s), {len(flagged)} flagged, "
+                    f"{len(loops)} loop(s), {len(carry)} carried forward. Record one `sweep` outcome for each "
+                    f"item not carried.",
                     json.dumps({"sweep": n, "items": [i["key"] for i in live], "snapshot": live}), "queued"))
     return eid
 
@@ -367,6 +392,10 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None) -> 
         if not next_at or next_at <= now:
             raise ValueError(f"{key} still_blocked needs `start_after`: when to check it next")
         o["next"] = next_at
+        # The item as this sweep showed it: the outcome carries forward only while it stays so.
+        snap = ((db.kv(STATE_KEY, {}) or {}).get("items") or {}).get(key)
+        if snap:
+            o["item"] = snap
     elif outcome == "human_indispensable":
         if not str(a.get("why") or "").strip():
             raise ValueError(f"{key} human_indispensable needs `why` only a person can do it")
@@ -390,16 +419,26 @@ def _last_check(o: dict | None, now: float) -> str:
     return s
 
 
-def _header(n: int) -> str:
-    return (f"## Blocker sweep (high effort): {n} item(s). Return exactly one `sweep` action per item, "
+def _header(n: int, carry: int = 0) -> str:
+    return (f"## Blocker sweep (high effort): {n} item(s)" + (f", {carry} CARRIED" if carry else "")
+            + ". Return exactly one `sweep` action per item not marked CARRIED, "
             "with `id` (task) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
-            "closed) | still_blocked (`until_probe` or `until`: the concrete condition; `start_after`: the next "
-            "check) | human_indispensable (`why`). Make the change itself with the usual actions in this turn. "
-            "A FLAG or LOOP needs a real decision, not another addendum.")
+            "closed) | still_blocked (both required: `until_probe` or `until`, the concrete condition, AND "
+            "`start_after`, the next check: a delay such as 90m, 6h or 3d, or an ISO time such as "
+            "2026-10-05T09:00 in the home zone) | human_indispensable (`why`). A CARRIED item keeps its last "
+            "still_blocked until its next check; act on it only with news. Make the change itself with the usual "
+            "actions in this turn. A FLAG or LOOP needs a real decision, not another addendum.")
+
+
+def _carries(i: dict, state: dict, outs: dict, now: float) -> bool:
+    return not any(i["key"] in (state.get(f) or {}) for f in ("flags", "loops", "reviews")) \
+        and carried(outs.get(i["key"]), i, now)
 
 
 def _line(i: dict, state: dict, outs: dict, now: float) -> str:
     who = f"#{i['task']} {_clip(i['title'], 70)}" if i["task"] else f"resource {i['resource']}"
+    if _carries(i, state, outs, now):
+        return f"- {who} | CARRIED (no action): {_last_check(outs.get(i['key']), now)}"
     line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {_clip(i['reason']) or 'no reason given'} | " \
            f"{_last_check(outs.get(i['key']), now)}"
     for field, label in (("flags", "FLAG"), ("loops", "LOOP"), ("reviews", "review")):
@@ -483,7 +522,8 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
     ordered = sorted(live.values(), key=lambda i: (i["key"] not in flagged and i["key"] not in loops,
                                                    -(i["age_s"] or 0)))
-    out = [_header(len(live)), *(_line(i, state, outs, now) for i in ordered)]
+    carry = sum(1 for i in ordered if _carries(i, state, outs, now))
+    out = [_header(len(live), carry), *(_line(i, state, outs, now) for i in ordered)]
     for prov, g in sorted((db.kv("gates", {}) or {}).items()):
         if isinstance(g, dict) and g.get("level") == "red":
             path = credits.unblock_path(db, cfg or {}, prov, now)

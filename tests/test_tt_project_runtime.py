@@ -58304,3 +58304,43 @@ def test_wait_stale_skips_a_bare_time_gate_until_its_epoch_passes(env):
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()
     assert p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))
+
+
+def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_the_item_changes(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    a, b = db.add_task("waits on a repair"), db.add_task("no outcome yet")
+    for t in (a, b):
+        db.update_task(t, status="blocked", blocked_reason="r")
+    sweep.start(db, cfg, "every 6h", now - 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": a, "outcome": "still_blocked", "until_probe": "test -e /x",
+                            "start_after": "2d"}]) == []
+    eid = sweep.start(db, cfg, "every 6h", now)
+    state = db.kv(sweep.STATE_KEY)
+    assert state["carried"] == [f"task:{a}"] and f"task:{a}" not in state["flags"]
+    assert "1 carried forward" in db.one("SELECT text FROM events WHERE id=?", (eid,))["text"]
+    assert "CARRIED (no action)" in coord.digest(p, {}, [eid], [])
+    text = "\n".join(sweep.digest_lines(db, [eid], now))
+    [line_a] = [ln for ln in text.splitlines() if ln.startswith(f"- #{a} ")]
+    assert "CARRIED (no action)" in line_a and "until test -e /x" in line_a and "FLAG" not in line_a
+    assert "CARRIED" not in next(ln for ln in text.splitlines() if ln.startswith(f"- #{b} "))
+    # The header names the start_after format and both required still_blocked fields.
+    assert "1 CARRIED" in text and "per item not marked CARRIED" in text
+    assert "both required" in text and "AND `start_after`" in text and "2026-10-05T09:00" in text
+    # The next sweep carries it again, without a flag for "no outcome at the last sweep".
+    db.x("UPDATE events SET status='handled'")
+    sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    assert db.kv(sweep.STATE_KEY)["carried"] == [f"task:{a}"]
+    assert f"task:{a}" not in db.kv(sweep.STATE_KEY)["flags"]
+    # An interval sweep where every item is carried is skipped.
+    db.update_task(b, status="done")
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.due(db, cfg, now + 14 * 3600) is None
+    # A changed item (new reason) needs a fresh outcome.
+    db.update_task(a, blocked_reason="a different reason")
+    assert sweep.due(db, cfg, now + 14 * 3600) == "every 6h"
+    sweep.start(db, cfg, "every 6h", now + 14 * 3600)
+    assert db.kv(sweep.STATE_KEY)["carried"] == []
+    assert db.kv(sweep.STATE_KEY)["flags"] == {f"task:{a}": "no outcome at the last sweep"}
