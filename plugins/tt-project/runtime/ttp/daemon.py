@@ -5919,7 +5919,9 @@ class Daemon:
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
         before: a job it waits on that did not opt in, one found lost on an earlier boot, one that
         cannot start (the ones started before it are stopped again: all or none), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
-        budget.max_reboot_losses (noted on the task, so its run reads why). cut when an abrupt,
+        budget.max_reboot_losses (noted on the task, so its run reads why). A job relaunched on this
+        boot before a daemon restart counts as started: stopped when the task wakes, and its
+        job_relaunched event written if the restart came first. cut when an abrupt,
         unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
@@ -5927,17 +5929,29 @@ class Daemon:
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
         if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
             return False, False   # not only its own runs' jobs: not ours to start
-        todo, again, cut = [], False, False
+        todo, done, cut = [], [], False
         cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
+
+        def running():   # jobs relaunched on this boot that still run: a woken task keeps none
+            return [(r, k) for r, k in ((r, detach.running_pid(r, self._this_boot)) for r, _, _ in done) if k]
+
+        def wake(why: str) -> None:
+            for r, k in running():
+                detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})")
         for rc in rcs:
             m = detach.read_resume(rc)
             if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
-                again = True   # relaunched on this boot already
+                # Relaunched on this boot already (a daemon restart, maybe partway through the jobs):
+                # counted as started below, judged by the boot that cut it short.
+                loss = self._abrupt_cut(m.get("cut_boot"))
+                cut = cut or loss
+                done.append((rc, int(m["relaunches"]) - 1, loss))
                 continue
             if rc.exists():
                 continue
             lost = detach.lost(rc)
             if m is None or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
+                wake(f"detached job {rc.stem} is not resumable or was lost before this boot")
                 return False, cut
             loss = self._abrupt_cut(m.get("boot"))
             cut = cut or loss
@@ -5947,23 +5961,26 @@ class Daemon:
                        f"already (cap {cap}), so the task wakes instead")
                 _task_note(rc.parent, why)
                 log(self.p, f"task {tid}: {why}")
+                wake(why)
                 return False, cut
             todo.append((rc, n, loss))
-        if not todo:
-            return again, False   # all ended before the reboot: woken as before
+        if not todo and not done:
+            return False, False   # all ended before the reboot: woken as before
         limit = int(self.cfg["budget"].get("max_reboot_losses", 3))
-        if cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
+        if todo and cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
             # This reboot would reach the cap: wake it, and the wake path blocks it as a reboot loop.
             why = (f"the reboot cut short detached job {todo[0][0].stem}; not relaunched: with {k} earlier "
                    f"reboot losses this one reaches budget.max_reboot_losses ({limit})")
             _task_note(todo[0][0].parent, why)
             log(self.p, f"task {tid}: {why}")
+            wake(why)
             return False, True
-        # All or none: a job that cannot start wakes the task, so the ones started before it are
-        # stopped again (no job of a woken task runs on), and the relaunches are recorded only once all
-        # started (a boot that wakes the task is not also counted as a relaunch boot).
+        # All or none: a job that cannot start wakes the task, so the ones started before it (also by
+        # this daemon's earlier life on this boot) are stopped again (no job of a woken task runs on), and
+        # the relaunches are recorded only once all started (a boot that wakes the task is not also
+        # counted as a relaunch boot).
         nice = nice_level(self.cfg.get("runner"))[0]
-        started = []
+        started = running()
         for rc, n, loss in todo:
             why, pid = detach.relaunch(rc, self.boot, nice)
             if why:
@@ -5976,14 +5993,16 @@ class Daemon:
                 log(self.p, f"task {tid}: detached job {rc.stem} not relaunched: {why}")
                 return False, cut
             started.append((rc, pid))
-        for rc, n, loss in todo:
+        for rc, n, loss in done + todo:
+            fp = f"job_relaunched:{tid}:{self.boot}:{'loss' if loss else 'free'}:{rc}"
+            if self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue   # recorded before a daemon restart
             text = (f"the host reboot cut short detached job {rc.stem}; relaunched it "
                     f"({n + 1} of {cap}), no model run")
             _task_note(rc.parent, text)
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                         "VALUES(?,?,?,?,?,?,?,?)",
-                        (time.time(), "daemon", "job_relaunched",
-                         f"job_relaunched:{tid}:{self.boot}:{'loss' if loss else 'free'}:{rc}", "low",
+                        (time.time(), "daemon", "job_relaunched", fp, "low",
                          f"#{tid} {t['title']}: {text}", "handled", tid))
             log(self.p, f"task {tid}: {text} ({rc})")
         return True, cut

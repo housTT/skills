@@ -201,9 +201,9 @@ never write to a run folder named in earlier context):
 <!-- /ttp:if devq -->
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours survives it.
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
-  the daemon restarts it, with no model run, up to 3 times. `wake_tier` defaults to light. After 3
-  wakes that hand back the same `waiting_for` and `retry_when` with no new commit, the task goes to
-  the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
+  the daemon restarts it, with no model run, up to `budget.max_job_relaunches` times (default 3).
+  `wake_tier` defaults to light. After 3 wakes that hand back the same `waiting_for` and
+  `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the

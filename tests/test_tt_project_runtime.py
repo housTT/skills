@@ -29334,6 +29334,113 @@ def test_a_partial_relaunch_stops_the_jobs_it_started_and_counts_the_boot_once(e
     assert not _job_relaunches(p, tid) and json.loads(p.db.task(tid)["result"]).get("reboot_wakes") == 1
 
 
+def _two_resumable_jobs(p, tmp_path, tid, b_cwd=None):
+    """Task tid waits on resumable jobs a (sleeps) and b, both cut short by a reboot."""
+    from ttp import detach
+    rc1, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid, name="a")
+    m = json.loads(detach.resume_file(rc1).read_text())
+    detach.resume_file(rc1).write_text(json.dumps({**m, "command": ["sh", "-c", f"echo run >>{counter}; sleep 60"]}))
+    rc2, _ = _resumable_job_cut_by_reboot(p, tmp_path, tid, name="b")
+    if b_cwd:
+        m = json.loads(detach.resume_file(rc2).read_text())
+        detach.resume_file(rc2).write_text(json.dumps({**m, "cwd": b_cwd}))
+    t = p.db.task(tid)
+    p.db.update_task(tid, result=json.dumps({**json.loads(t["result"]),
+                                             "retry_when": f"ttp detach --check {rc1} {rc2}"}))
+    return rc1, rc2, counter
+
+
+def _job_stopped(rc):
+    from ttp import detach, locks
+    deadline = time.time() + _load_scaled(10)
+    while not locks.any_free([locks.job_lock(rc)]) and time.time() < deadline:
+        time.sleep(0.05)
+    return locks.any_free([locks.job_lock(rc)]) and not rc.exists() and detach.state(rc)[0] == "lost"
+
+
+def test_a_daemon_restart_mid_relaunch_stops_the_jobs_its_earlier_life_relaunched(env, tmp_path):
+    """The daemon died after relaunching job a, before job b; on restart b cannot start. a, started by
+    the earlier life on this boot, is stopped too: the woken task has no job left running."""
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("pair", "s", kind="work", tier="light", origin="user")
+    rc1, rc2, counter = _two_resumable_jobs(p, tmp_path, tid, b_cwd=str(tmp_path / "gone"))
+    why, pid = detach.relaunch(rc1, "a-later-boot")   # the earlier daemon life, then it died
+    assert not why and pid
+    assert json.loads(detach.resume_file(rc1).read_text())["cut_boot"] == "an-earlier-boot"
+    d = _boot_daemon(p)
+    assert _woken(p, tid), "a job that could not start did not wake the task"
+    assert _job_stopped(rc1), "the job the earlier daemon life relaunched was left running"
+    assert "could not start" in detach.state(rc1)[1]
+    assert "stopped the jobs relaunched before it (a)" in (rc1.parent / "progress.md").read_text()
+    assert not _job_relaunches(p, tid) and d._job_relaunch_boots(tid) == 0
+    assert json.loads(p.db.task(tid)["result"]).get("reboot_wakes") == 1
+
+
+def test_a_daemon_restart_after_the_relaunches_records_the_boot_once(env, tmp_path):
+    """The daemon died after relaunching both jobs, before recording them: the restart starts
+    nothing more, keeps the task asleep and writes the missing job_relaunched events (once), so
+    the boot counts toward max_reboot_losses."""
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("pair", "s", kind="work", tier="light", origin="user")
+    rc1, rc2, counter = _two_resumable_jobs(p, tmp_path, tid)
+    for rc in (rc1, rc2):
+        assert detach.relaunch(rc, "a-later-boot")[0] == ""
+    for _ in range(2):
+        d = _boot_daemon(p)
+        assert not _woken(p, tid) and p.db.task(tid)["not_before"]
+        assert len(_job_relaunches(p, tid)) == 2 and d._job_relaunch_boots(tid) == 1
+    assert _wait_for_path(rc2)
+    assert len((tmp_path / f"runs-{tid}-b").read_text().split()) == 2, "a job was started again"
+    assert len(counter.read_text().split()) <= 2, "a job was started again"
+    notes = (rc1.parent / "progress.md").read_text()
+    assert notes.count("cut short detached job a; relaunched it (1 of 3)") == 1
+    # The same restart when the reboot that cut them short was orderly: recorded, not a loss.
+    calm = p.db.add_task("calm", "s", kind="work", tier="light", origin="user")
+    rc3, counter3 = _resumable_job_cut_by_reboot(p, tmp_path, calm, name="calm")
+    assert detach.relaunch(rc3, "calm-boot")[0] == ""
+    d = _boot_daemon(p, "calm-boot", orderly_after="an-earlier-boot")
+    assert not _woken(p, calm) and len(_job_relaunches(p, calm)) == 1 and d._job_relaunch_boots(calm) == 0
+    detach.stop(rc1, detach.running_pid(rc1, lambda b: b == "a-later-boot"), "test over")
+    assert _job_stopped(rc1)
+
+
+def test_a_resumable_job_queued_before_a_reboot_is_relaunched_not_lost(env, tmp_path):
+    """A --resumable job queued for the daemon but not started before a reboot longer than the queue
+    timeout: wake_after_reboot relaunches it, and its stale queue entry is settled without .lost."""
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("queued", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    m = json.loads(detach.resume_file(rc).read_text())
+    detach.resume_file(rc).write_text(json.dumps({**m, "command": ["sh", "-c", f"echo run >>{counter}; sleep 60"]}))
+    q = detach.enqueue(p.state, rc, rc.with_suffix(".log"), ["sh", "-c", f"echo queued >>{counter}"],
+                       str(tmp_path), {})
+    old = json.loads(q.read_text())
+    q.write_text(json.dumps({**old, "queued": time.time() - detach.QUEUED_S - 1200}))
+    _boot_daemon(p)
+    assert not _woken(p, tid)
+    detach.tend(p)
+    assert not q.exists() and not detach.queued(rc).exists(), "the stale queue entry stayed"
+    assert not detach.lost(rc).exists(), "a relaunched job was marked lost"
+    assert detach.state(rc) == ("running", "")
+    # An expired entry of a job that runs (its lock held), relaunched or not, is no lost job either.
+    q = detach.enqueue(p.state, rc, rc.with_suffix(".log"), ["true"], str(tmp_path), {})
+    q.write_text(json.dumps({**json.loads(q.read_text()), "queued": time.time() - detach.QUEUED_S - 60}))
+    detach.tend(p)
+    assert not q.exists() and not detach.lost(rc).exists() and detach.state(rc) == ("running", "")
+    d = _boot_daemon(p)
+    detach.stop(rc, detach.running_pid(rc, d._this_boot), "test over")
+    assert _job_stopped(rc)
+    # Without a relaunch or a running job, an expired entry is still recorded as lost.
+    other = p.runs / f"jobs-{tid}" / "other.rc"
+    q = detach.enqueue(p.state, other, other.with_suffix(".log"), ["true"], str(tmp_path), {})
+    q.write_text(json.dumps({**json.loads(q.read_text()), "queued": time.time() - detach.QUEUED_S - 60}))
+    detach.tend(p)
+    assert detach.lost(other).exists() and "did not start it within" in detach.lost(other).read_text()
+
+
 def test_detach_resumable_is_refused_for_a_remote_job(env):
     p = make(env)
     r = _ttp_run(p, "detach", "--resumable", "--remote", "box", "job", "--", "true")

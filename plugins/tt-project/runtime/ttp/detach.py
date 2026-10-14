@@ -208,7 +208,8 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
         lost(rc).unlink(missing_ok=True)
         started(rc).unlink(missing_ok=True)
         # Counted before it starts: a crash here never relaunches it past the cap.
-        write_json(resume_file(rc), {**m, "boot": boot, "relaunches": n, "relaunched": time.time()}, mode=0o600)
+        write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
+                                     "relaunched": time.time()}, mode=0o600)
         pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
                     machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
     except (OSError, ValueError, TypeError) as e:
@@ -228,6 +229,16 @@ def stop(rc: Path, pid: int, why: str) -> None:
     except OSError:
         pass   # already gone
     _mark_lost(Path(rc), why)
+
+
+def running_pid(rc: Path, this_boot) -> int:
+    """The pid of a job relaunched on this boot (its registry entry names a boot `this_boot` accepts)
+    that still runs (holds its lock), else 0: the one `stop` may end."""
+    j = _entry(Path(rc))
+    pid = j.get("pid")
+    if not (isinstance(pid, int) and pid > 1 and this_boot(j.get("boot"))):
+        return 0
+    return 0 if locks.any_free([locks.job_lock(Path(rc))]) else pid
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:
@@ -363,6 +374,9 @@ def tend(p: Project) -> None:
             if rid and _read_checks_pid(rc.parent).get("req") == rid:
                 _settle(q, rc, rid)
                 continue
+        elif _superseded(rc, m):
+            _settle(q, rc, rid)
+            continue
         if time.time() - float(m.get("queued") or 0) > QUEUED_S:
             why = (f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
                    f"(was the daemon down?)")
@@ -391,6 +405,15 @@ def tend(p: Project) -> None:
                 finally:
                     lock.close()
         _settle(q, rc, rid, why)
+
+
+def _superseded(rc: Path, m: dict) -> bool:
+    """Whether a queued job already runs, or the daemon relaunched it since it was queued (a
+    --resumable job queued before a reboot): its request is spent, never a lost job, however old."""
+    r = read_resume(rc)
+    if r is not None and float(r.get("relaunched") or 0) >= float(m.get("queued") or 0) > 0:
+        return True
+    return locks.job_lock(rc).exists() and not locks.any_free([locks.job_lock(rc)])
 
 
 def sweep(state: Path) -> None:
