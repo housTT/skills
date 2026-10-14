@@ -3310,6 +3310,16 @@ class Daemon:
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
+        # A login on another account than the plan readings: the dollar caps hold it meanwhile (the
+        # stricter side), and the user hears why once; the alert clears itself once they match.
+        for prov, g in gates.items():
+            if g.numbers.get("account_mismatch"):
+                self.alert(f"account-mismatch:{prov}",
+                           f"{prov} is logged in to another account than the one its plan readings come from, so "
+                           f"its spend counts toward the dollar caps (the stricter gate) until they match. Check "
+                           f"which account {prov} is logged in as: if it should be the plan account, log in to it "
+                           f"again; the next run then reports its plan windows and this clears by itself.",
+                           severity="normal")
 
     def _budget_changed(self, prov: str, g: bud.Gate, account: str) -> None:
         """A change of the provider's account or budget kind (budgetkind.py) releases the holds the old
@@ -7618,7 +7628,7 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith("auth:") or key == netwait.KEY:
+        if key.startswith(("auth:", "account-mismatch:")) or key == netwait.KEY:
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")

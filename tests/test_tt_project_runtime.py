@@ -4642,12 +4642,13 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
 
 
 def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
-    """The coordinator $/h guard sums only turns the daemon started on its own (events, schedules,
-    idle wakes, sweeps); a turn started for a user message or an ask answer is the user's own work."""
+    """The coordinator $/h guard (billed by use) sums only turns the daemon started on its own (events,
+    schedules, idle wakes, sweeps); a turn started for a user message or an ask answer is the user's own work."""
     p = make(env)
     from ttp import budget as bud
     now = time.time()
-    wins = [bud.Window("claude", "seven_day", 40)]
+    p.set_config("budget.global_daily_usd", 0)
+    wins = []   # no plan windows: billed by use, so the guard counts dollars
 
     def turn(cost, messages, ago, events=()):
         note = json.dumps({"messages": list(messages), "events": list(events),
@@ -4689,6 +4690,86 @@ def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
         p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
                "VALUES('coordinator','claude','ok',?,?,1.5,?)", (now - 600, now - 300, note))
     assert coord_reasons()[1]
+
+
+def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, monkeypatch):
+    """A login on another account than the plan readings: the dollar caps hold it (the stricter side),
+    one user-facing alert says so, and once a run of the logged-in account reports its windows, the
+    plan windows gate it again with no manual step and the alert clears itself."""
+    p = make(env)
+    from ttp import alerts, budget as bud
+    from ttp.daemon import Daemon
+    now = time.time()
+    _old_plan(p, now)
+    from ttp.providers.claude import Claude
+    monkeypatch.setattr(Claude, "account", lambda self: "acct-b | plan")
+    bud.note_account(p.db, "claude", "acct-b | plan")     # the login switched
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and g.numbers.get("account_mismatch") and any("check the login" in r for r in g.reasons)
+    p.set_config("core_provider", "claude")
+    d = Daemon(p.base)
+    d.update_gates()
+    d.update_gates()                                      # a repeat does not post again
+    sent = p.db.q("SELECT * FROM messages WHERE ref='account-mismatch:claude'")
+    assert len(sent) == 1 and sent[0]["severity"] == "normal", [dict(m) for m in sent]
+    assert alerts.holds(p.db, "account-mismatch:claude", now, now)
+    # the next run on the logged-in account reports its windows
+    _run(p, "acct-b | plan", now - 120, now - 30, 0.5)
+    _reading(p, time.time(), "acct-b | plan", "five_hour", 7.0, now + 3600)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db), time.time())
+    assert g.regime == "windows" and not g.numbers.get("account_mismatch"), g.reasons
+    d.update_gates()
+    assert not alerts.holds(p.db, "account-mismatch:claude", now, time.time())
+    alerts.sweep(p.db)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='account-mismatch:claude'")["cleared"]
+
+
+def test_plan_billed_work_with_high_virtual_dollars_is_not_held(env):
+    """On a plan with headroom, dollars are virtual: neither the dollar caps nor the runaway guard's
+    dollar signals hold its work."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.set_config("budget.daily_usd", 10)
+    p.set_config("budget.global_daily_usd", 10)
+    wins = [bud.Window("claude", "five_hour", 7.0, now + 3600), bud.Window("claude", "seven_day", 30.0, now + 86400)]
+    for i in range(30):                                   # $600 of plan spend in the hour, all productive
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd) VALUES('worker','claude','ok',?,?,20)",
+               (now - 3000, now - 60 - i))
+        p.db.spend("claude", 20.0, f"task:{i}")
+    for i in range(8):                                    # coordinator turns of $1 each, all different
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator','claude','ok',?,?,1.0,?)",
+               (now - 600 - i, now - 500 - i, json.dumps({"messages": [], "gate": {"bg": f"b{i}", "keys": []}})))
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.regime == "windows" and g.numbers["billing"] == "plan" and g.level == "green", g.reasons
+    assert not any("cap" in r or "runaway" in r for r in g.reasons), g.reasons
+
+
+def test_runaway_guard_on_a_plan_trips_on_repeated_turns_not_virtual_dollars(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    wins = [bud.Window("claude", "five_hour", 7.0, now + 3600)]
+
+    def turn(ago, bg, cost=0.1):
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator','claude','ok',?,?,?,?)",
+               (now - ago - 30, now - ago, cost, json.dumps({"messages": [], "gate": {"bg": bg, "keys": ["k"]}})))
+        p.db.spend("claude", cost, "coordinator")
+
+    for i in range(3):                                    # three turns on the same evidence: fine
+        turn(100 + i * 60, "same", cost=2.0)              # $6 > the $4 dollar limit, but virtual
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.numbers["coordinator_repeats_1h"] == 3 and g.level != "red", g.reasons
+    turn(50, "same")                                      # the fourth re-wake on the same evidence
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.level == "red" and any("same evidence" in r for r in g.reasons), g.reasons
+    p.db.x("DELETE FROM runs")
+    for i in range(41):                                   # many cheap self-started turns, all different
+        turn(30 + i * 60, f"bg{i}", cost=0.01)
+    g = bud.evaluate(p.db, p.config(), "claude", wins, now)
+    assert g.level == "red" and any("41 self-started coordinator turns" in r for r in g.reasons), g.reasons
 
 
 def test_one_listener_per_chat(env):

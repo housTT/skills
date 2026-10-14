@@ -13,7 +13,8 @@ Two regimes, chosen per provider from what the provider reports:
   last 24 h) and a rolling 7 d cap on what THIS project spends across all its providers not on plan
   windows, with the user's defaults when the charter sets none; and a global daily cap on what the
   whole account spends today across every project tt-project can see (globalcap.py).
-A runaway check (spend rate far above this project's own norm) overrides both.
+A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
+norm) overrides both. On plan windows its dollars are virtual, so it counts coordinator turns there.
 """
 from __future__ import annotations
 
@@ -168,8 +169,12 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     lapsed = moved | {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
     plan = [w for w in windows if w.provider == provider and provider not in lapsed]
     if provider in moved:
-        g.reasons.append(f"{provider} is on another account than its plan readings; its spend counts toward "
-                         f"the dollar caps")
+        # The login and the readings disagree: billed by use is the safe side until they match (the
+        # next run of a plan account brings its own readings), but the user hears of it (daemon:
+        # alert account-mismatch:<provider>) instead of the caps taking over silently.
+        g.numbers["account_mismatch"] = True
+        g.reasons.append(f"{provider} is logged in to another account than its plan readings; check the login. "
+                         f"Until they match, its spend counts toward the dollar caps")
     elif provider in lapsed:
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     reading = credits.latest(db, provider, now) if plan else None
@@ -199,6 +204,12 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     #   the total signal still bounds it;
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
+    # On a plan below its line the dollars are virtual: the windows and their line already bound the
+    # spend, so the coordinator signal counts self-started turns and turns re-woken on the same
+    # evidence instead, and the total signal is off. Billed by use or on paid credits past the line,
+    # dollars.
+    virtual = g.regime == "windows" and "paid_credits" not in g.numbers
+    g.numbers["billing"] = "plan" if virtual else "usage"
     hour_ago = now - HOUR
     last_h = spent_last_hour(db, provider, now)
     runs_h = db.q("SELECT role, status, cost_usd, note FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
@@ -226,10 +237,22 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     if waste > waste_cap:
         _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
-    if thrash > thrash_cap:
+    selfs = [r for r in coord_h if not user_turn(r)]
+    same = repeated_turns(selfs)
+    g.numbers.update({"coordinator_turns_1h": len(selfs), "coordinator_repeats_1h": same})
+    if virtual:
+        turn_cap = int(b.get("hourly_coordinator_turns", 40))
+        repeat_cap = int(b.get("hourly_coordinator_repeats", 4))
+        if len(selfs) > turn_cap:
+            _raise(g, "red", f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
+                             f"(limit {turn_cap}; turns for user messages not counted)")
+        if same >= repeat_cap:
+            _raise(g, "red", f"runaway guard: {same} self-started coordinator turns in the last hour met the "
+                             f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
+    elif thrash > thrash_cap:
         _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
                          f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
-    if last_h > ceiling:
+    if last_h > ceiling and not virtual:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
 
@@ -947,6 +970,18 @@ def user_turn(run: dict) -> bool:
     """A coordinator turn the daemon started for user messages (an ask's answer is one too): its
     note lists them. A missing or unreadable note counts as a self-started turn."""
     return bool(_note(run["note"]).get("messages"))
+
+
+def repeated_turns(runs: list) -> int:
+    """The most coordinator turns among `runs` that met the same evidence: the same background and
+    events (their note's `gate`, turngate.material). Turns without a recorded gate count as none."""
+    seen: dict[str, int] = {}
+    for r in runs:
+        gate = _note(r["note"]).get("gate")
+        if isinstance(gate, dict) and gate.get("bg"):
+            fp = json.dumps([gate.get("bg"), sorted(gate.get("keys") or [])])
+            seen[fp] = seen.get(fp, 0) + 1
+    return max(seen.values(), default=0)
 
 
 def _note(raw) -> dict:
