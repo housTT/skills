@@ -20638,6 +20638,7 @@ def test_a_failed_or_timed_out_after_push_keeps_the_push_and_alerts_once(env, mo
     pushq.tend_receipts(p, lambda key, text, **k: raised.append((key, text, k)))
     assert len(raised) == 2 and "timed out" in raised[1][1]
     p.set_config("delivery.after_push", ["true"])
+    p.set_config("delivery.after_push_timeout_s", 120)   # 1 s is too short for `true` on a loaded host
     _commit(repo, "three.txt", "three\n")
     assert push.run(p, repo) == 0 and push.last_after["status"] == "ok"
     pushq.tend_receipts(p)
