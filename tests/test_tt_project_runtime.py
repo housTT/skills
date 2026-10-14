@@ -27971,7 +27971,7 @@ def test_a_failed_detached_job_pages_a_machine_change_s_undo_at_once(env):
     assert probes._procs[c["id"]][0].wait(timeout=30) == 4
     probes.tick(now + 1)
     [got] = ml.changes()
-    assert got["probe_passed"] and got["probe_job_failed"] == 4, got
+    assert got["probe_passed"] and got["probe_job_failed"] == "job rc=3", got
     assert ml.overdue(got, now + 1).startswith("the detached job its until-probe waits on ended but failed")
 
 
@@ -27986,7 +27986,7 @@ def test_a_failed_detached_job_retires_a_charter_until_probe(env, tmp_path):
     assert e.tick(now) == []
     e._procs[next(iter(e._procs))][0].wait(30)
     retired = e.tick(now + 1)
-    assert len(retired) == 1 and "ended but failed or left no exit code (exit 4)" in retired[0], retired
+    assert len(retired) == 1 and "ended but failed or left no exit code (job rc=3)" in retired[0], retired
     assert "Leave the queue alone." not in p.charter_path.read_text()
     assert not p.db.kv(ends.BROKEN_KEY), "a failed job is not a broken probe"
 
@@ -28030,7 +28030,7 @@ def test_a_failed_detached_job_releases_a_when_hold_saying_it_failed(env, tmp_pa
     task = p.db.task(tid)
     assert task["status"] == "queued" and "waits:" not in task["labels"], task
     [why] = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released'")]
-    assert "ended but failed or left no exit code (exit 4)" in why, why
+    assert "ended but failed or left no exit code (job rc=3)" in why, why
     assert not p.db.q("SELECT id FROM events WHERE kind='hold_probe_broken'")
 
 def test_a_failed_detached_job_lets_the_on_pass_cmd_decide_model_free(env, monkeypatch, tmp_path):
@@ -63245,6 +63245,7 @@ def test_scratch_git_dirs_do_not_see_a_repo_enclosing_the_tmp_base(devq_dir, tmp
 
 
 def test_failed_why_names_the_jobs_rc_not_the_probes(tmp_path):
+    from ttp import detach
     """A failed check reads 'job rc=N' (the job's exit code), never the probe's own exit 4."""
     (tmp_path / "j.rc").write_text("7\n")
     assert detach.failed_why("ttp detach --check j.rc", 4, tmp_path) == "job rc=7"
