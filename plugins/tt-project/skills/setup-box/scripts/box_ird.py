@@ -13,6 +13,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import pathlib
 import re
@@ -32,6 +33,9 @@ FREE_STATES = ("free", "idle", "mixed")
 DEFAULT_TTL_S = 3600
 DEFAULT_WAIT_S = 270  # under the ~5 min a worker may block one tool call
 LIST_RETRY_S = (2, 5)  # waits before re-reading `ird list` after it failed mid-reserve
+# A duration field of an `ird list` row, as Slurm prints time used and time left: [d-][h:]m:ss.
+DURATION_RE = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d\d)$")
+SEPS = "-_.:/"
 BEGIN = "# >>> tt-project ird {id}"
 END = "# <<< tt-project ird {id}"
 
@@ -148,7 +152,7 @@ class Ctx:
             if len(f) < 5 or not f[0].isdigit():
                 continue  # header or log lines
             port = f[10] if len(f) > 10 and f[10].isdigit() else ""
-            rows.append({"id": f[0], "user": f[1], "machine": f[4], "port": port})
+            rows.append({"id": f[0], "user": f[1], "machine": f[4], "port": port, "fields": f})
         return rows
 
     def mine(self) -> Dict[str, dict]:
@@ -354,7 +358,50 @@ def same_machine(a: str, b: str) -> bool:
     if a == b or a.split(".")[0] == b.split(".")[0]:
         return True
     short, long_ = sorted((a, b), key=len)
-    return any(long_.endswith(sep + short) for sep in "-_.:/")
+    return any(long_.endswith(sep + short) for sep in SEPS)
+
+
+def ird_name(name: str, machines: List[str], listed: List[str]) -> Tuple[str, str]:
+    """(`name` as `ird list` prints it, '') or ('', why not). `ird reserve --machine` takes that
+    form and places the reservation anywhere when given a name it does not know, such as the
+    site-prefixed one `ird list-machines` may print. The prefix is learned from the machines both
+    lists name; when they name none in common, or disagree, the form cannot be told."""
+    listed_set = set(listed)
+    if name in listed_set:
+        return name, ""
+    prefixes = set()
+    for m in machines:
+        for l in listed_set:
+            if m == l:
+                prefixes.add("")
+            elif m.endswith(l) and m[:-len(l)][-1:] in SEPS:
+                prefixes.add(m[:-len(l)])
+    if not prefixes:
+        return "", f"cannot tell the `ird list` form of {name} (no machine in both ird lists)"
+    if len(prefixes) > 1:
+        return "", f"cannot tell the `ird list` form of {name} (prefixes {sorted(prefixes)} disagree)"
+    p = prefixes.pop()
+    return (name[len(p):] if p and name.startswith(p) else name), ""
+
+
+def durations(fields: List[str]) -> List[int]:
+    """Seconds of each duration field of an `ird list` row (time used, time left), in row order."""
+    out = []
+    for f in fields:
+        m = DURATION_RE.match(f)
+        if m:
+            d, h, mi, s = (int(x or 0) for x in m.groups())
+            out.append(((d * 24 + h) * 60 + mi) * 60 + s)
+    return out
+
+
+def parse_expiry(s) -> Optional[dt.datetime]:
+    """An ISO time with its zone (as reserve and extend print it), else None."""
+    try:
+        t = dt.datetime.fromisoformat(str(s))
+    except ValueError:
+        return None
+    return t if t.tzinfo else None
 
 
 class Interrupted(Exception):
@@ -383,22 +430,27 @@ def cmd_reserve(ctx: Ctx, args) -> int:
     if pool not in ctx.pools:
         raise IrdError(f"pool {pool!r} is not in ird.pools of the site file")
     if args.machine:
-        found = [x for x in ctx.machines() if same_machine(x["machine"], args.machine)]
+        machines = ctx.machines()
+        found = [x for x in machines if same_machine(x["machine"], args.machine)]
         if not found:
             raise IrdError(f"no machine {args.machine} in ird list-machines")
         if found[0]["why"] and not found[0]["why"].startswith("busy"):
             raise IrdError(f"refused: {args.machine}: {found[0]['why']}")
+        name, why = ird_name(args.machine, [x["machine"] for x in machines],
+                             [r["machine"] for r in ctx.reservations()])
+        if why:
+            print(f"warning: {why}; reserving without --machine")
     with reserve_lock(args.wait), interruptible():
-        return _reserve(ctx, args, m, pool)
+        return _reserve(ctx, args, m, pool, name if args.machine else "")
 
 
-def _reserve(ctx: Ctx, args, m, pool: str) -> int:
+def _reserve(ctx: Ctx, args, m, pool: str, name: str) -> int:
     # Never trust ird's exit code alone: it can fail after the reservation completed, or be cut
     # off by a timeout or a signal. The diff of `ird list` against this snapshot decides.
     before = set(ctx.mine())
     argv = ["reserve", "--cluster", pool, "--timeout", args.timeout]
-    if args.machine:
-        argv += ["--machine", args.machine]
+    if name:
+        argv += ["--machine", name]
     if args.ssh_port:
         argv += ["--ssh-port", str(args.ssh_port)]
     argv += ["--no-shell", args.arch]  # every flag before the arch positional
@@ -538,14 +590,44 @@ def _abort(ctx: Ctx, args, before: set, pool: str, m, why: str) -> str:
 
 
 def cmd_extend(ctx: Ctx, args) -> int:
-    _, c = _gate(ctx, args.id, args.ttl, "extend")
-    r = ctx.call("change-timeout", args.id, str(args.minutes))
+    row, c = _gate(ctx, args.id, args.ttl, "extend")
+    if args.minutes < 1:
+        raise IrdError("minutes must be at least 1")
+    old = parse_expiry(c.get("expires"))
+    if old is None:
+        raise IrdError(f"cannot parse the expiry {c.get('expires')!r} in the claim of {args.id}; not extending")
+    # `ird change-timeout <id> <m>` sets the time left to m minutes; it does not add m.
+    left_s = (old - dt.datetime.now().astimezone()).total_seconds()
+    left = max(0, math.ceil(left_s / 60))
+    target = left + args.minutes
+    r = ctx.call("change-timeout", args.id, str(target))
     if r.returncode:
-        raise IrdError(f"ird change-timeout failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
-    c.update(task=ctx.task or c.get("task", ""), heartbeat=time.time(),
-             expires=(dt.datetime.now().astimezone() + dt.timedelta(minutes=args.minutes)).isoformat(timespec="minutes"))
+        raise IrdError(f"ird change-timeout {args.id} {target} failed (rc {r.returncode}): "
+                       f"{(r.stderr or r.stdout).strip()[-300:]}")
+    after = {x["id"]: x for x in ctx.reservations()}.get(args.id)
+    now = dt.datetime.now().astimezone()
+    if after is None:
+        raise IrdError(f"reservation {args.id} is gone from ird list after ird change-timeout")
+    # The time-left field is the one that grew (time used grows only by the seconds in between);
+    # when none grew, the one nearest the time left the claim expected.
+    pairs = list(zip(durations(row["fields"]), durations(after["fields"])))
+    if not pairs:
+        raise IrdError(f"ird change-timeout {args.id} {target} exited 0, but the ird list row has no time "
+                       f"left to read the new expiry from: {' '.join(after['fields'])}")
+    grew = max(pairs, key=lambda p: p[1] - p[0])
+    _, now_left = grew if grew[1] - grew[0] >= 60 else min(pairs, key=lambda p: abs(p[0] - left_s))
+    new = (now + dt.timedelta(seconds=now_left)).replace(second=0, microsecond=0)  # minutes, as old
+    c.update(task=ctx.task or c.get("task", ""), heartbeat=time.time(), expires=new.isoformat(timespec="minutes"))
     write_claim(ctx.alias, args.id, c)
-    print(f"extended {args.id} by {args.minutes} min, expires~{c['expires']}")
+    gained = (new - old).total_seconds() / 60
+    if gained < args.minutes - 1:
+        raise IrdError(f"ird change-timeout {args.id} {target} exited 0, but ird list shows it expiring "
+                       f"{c['expires']} (was {old.isoformat(timespec='minutes')}, {gained:+.0f} min, asked "
+                       f"+{args.minutes}): row before: {' '.join(row['fields'])}; after: {' '.join(after['fields'])}")
+    if gained > args.minutes + 2:
+        print(f"warning: ird added {gained:.0f} min, more than the {args.minutes} asked; release early when done")
+    print(f"extended {args.id} by {args.minutes} min: expires={c['expires']} "
+          f"(was {old.isoformat(timespec='minutes')}, {gained:+.0f} min per ird list)")
     return 0
 
 

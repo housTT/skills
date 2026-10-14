@@ -18,9 +18,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, locks, push, timefmt, upstream
+from . import checkdirs, batch, coordinator as coord, locks, push, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
-                 review_subject, reviewed_ids)
+                 pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
 from .worktree import fix_branches, named_refs
@@ -55,6 +55,7 @@ INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell whi
 INHERIT_GIT_S = 30             # each git call of that check, bounded, as the tick waits for it
 RESOLVES_MAX = 20               # upstream note fingerprints one approval may resolve (a hand-off's `resolves`)
 _HEX40 = re.compile(r"[0-9a-f]{40}")
+REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon queued to rebase it (auto_rebase)
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 _recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
@@ -337,6 +338,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"invalid": 'list the approved commits as "push": [{"branch": ..., "head": <40-hex sha>}]'}
     rows = p.db.q("SELECT status, head, created FROM push_queue WHERE task=? ORDER BY id", (task["id"],))
     conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
+    if not rows and (h := rebase_head(task)):
+        conflicted = [h]   # a rebase review (auto_rebase) re-approves the head its predecessor could not land
     reviewed: list[str] | None = None
     built: list[tuple[str, str]] = []
     out, added, accepted = [], {}, {}
@@ -917,7 +920,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
                 f"{d.get('onto') or m.get('tip') or '?'} in {files}")
         if d.get("cmd"):
             tail = _tail_of({}, d, 5)
-            woke += f"; its checks failed after the batch merged changes of different lines: {d['cmd']}"
+            woke += f"; its checks failed after the batch merged both sides' changes: {d['cmd']}"
             if tail:
                 woke += f" ({tail[-300:]})"
         done = [x for x in current if x["status"] in ("pushed", "landed")]
@@ -926,10 +929,15 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
                                                      f"{_short(x['pushed_sha'])})" for x in done)
         if int(task["attempts"] or 0) >= int(task["max_attempts"] or 3):
             text = f"{woke}. It keeps conflicting after {task['attempts']} attempts"
-            db.update_task(tid, status="failed", blocked_reason=None,
-                           result=dump_result({**prev, "status": "failed", "summary": text[:1500]}))
-            _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=True)
-            _reply(db, task, "failed", text)
+            rebase = auto_rebase(p, task, r, target, woke)
+            if rebase:
+                text += f"; the daemon queued #{rebase} to rebase it once more and re-approve it"
+            db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
+                {**prev, "status": "failed", "summary": text[:1500], **({"auto_rebase": rebase} if rebase else {})}))
+            # With a rebase queued, nothing is the coordinator's to decide yet: its own failure is.
+            _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not rebase)
+            if not rebase:
+                _reply(db, task, "failed", text)
         else:
             _requeue(db, task, woke)
             _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it",
@@ -956,6 +964,70 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         _reply(db, task, "done", result["summary"])
         settle_reviewed(db, now, only=_covers(db, task, rows))
     # else: some of its rows are still approved or batched; it keeps waiting.
+
+
+def rebase_head(task: dict) -> str:
+    """The conflicting head a push-conflict rebase review (auto_rebase) rebases, from its
+    `push_rebase:<head>` label, or ""."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return ""
+    for lb in labels if isinstance(labels, list) else []:
+        if isinstance(lb, str) and lb.startswith(REBASE_LABEL) and _HEX40.fullmatch(lb[len(REBASE_LABEL):]):
+            return lb[len(REBASE_LABEL):]
+    return ""
+
+
+def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> int | None:
+    """When a review's approved head keeps conflicting after its attempts, one review task that
+    continues it to rebase that head onto the push branch's tip, resolve keeping both sides' intents
+    and approve the new head again: its id, inside _settle's transaction. None, so the review fails
+    to the coordinator as before, when the review is itself such a rebase or continues one, the head
+    already had one, a task already continues the review, or the rolling review-task cap
+    (coordinator.max_review_tasks_per_day) allows no new review now."""
+    db, head = p.db, str(row["head"] or "")
+    if not _HEX40.fullmatch(head):
+        return None
+    seen, t = set(), review
+    while t and t["id"] not in seen and len(seen) < 50:   # the review and the tasks it continues
+        seen.add(t["id"])
+        if f'"{REBASE_LABEL}' in (t.get("labels") or ""):
+            return None
+        c = continues_id(t)
+        t = db.task(c) if c is not None else None
+    if db.one("SELECT id FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
+              (f'%"{REBASE_LABEL}{head}"%', f'%"continues:{review["id"]}"%')):
+        return None
+    cfg = p.config()
+    if coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+        return None
+    try:
+        labels = json.loads(review.get("labels") or "[]")
+    except (ValueError, TypeError):
+        labels = []
+    keep = [lb for lb in labels if isinstance(lb, str) and lb.startswith("auto_review:")] \
+        if isinstance(labels, list) else []
+    branch = row["branch"] or ""
+    tier = "deep" if review["tier"] == "deep" else "standard"
+    spec = "\n".join([
+        f"Review #{review['id']} ({review['title'][:150]}) passed, but the push queue could not land its approved "
+        f"head after {review['attempts']} attempts: {woke}.",
+        f"Branch: {branch or '(none)'} at {head}. Push branch: {target}.",
+        "Woken because `push conflict`: fetch, rebase that head onto the push branch's current tip in the change's "
+        "worktree and resolve every conflict keeping both sides' intents (the one edit you may make).",
+        "Then run the project's push checks (delivery.push_checks) on the rebased head with `ttp checks` and fix "
+        "only what the resolution broke. Once they pass, commit and hand off `done` with "
+        f'"push": [{{"branch": "{branch}", "head": "<the rebased head>"}}] to approve it into the push queue again.',
+        "If the conflict needs a decision about either change's intent, hand off `failed` saying what it is.",
+        "Return the rebased head and the check results."])
+    rid = db.add_task(f"Rebase {branch or _short(head)} onto {target} after push conflicts (review #{review['id']})",
+                      spec, kind="review", tier=tier, priority=review["priority"], origin="daemon",
+                      reply_chat=review["reply_chat"],
+                      budget_usd=float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier, 8.0)),
+                      depends_on=[d for d in dependency_ids(review) if isinstance(d, int)],
+                      labels=[*keep, f"continues:{review['id']}", f"{REBASE_LABEL}{head}"], **pin_of(review))
+    return rid
 
 
 # reviewed code tasks ------------------------------------------------------------------------------

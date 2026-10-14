@@ -292,7 +292,11 @@ CACHED_SECTIONS = ("prompt_delta", "memory_added", "memory_recent")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
-                       budgetkind.KIND: 2000}
+                       "charter_retry": 8000, budgetkind.KIND: 2000}
+# A refusal that carries the user's approved charter text to resend exactly (_charter_approval) keeps
+# up to this much of it in the digest and the charter_retry event: a clipped copy gets reworded.
+RESEND_CHARS = 6000
+RESEND_MARK = "send that text exactly"
 HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
@@ -824,7 +828,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for x in rejected:
         tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
             else "your previous turn's action was rejected; fix or drop it"
-        lines.append(f"- [{tag}] {x[:500]}{told}")
+        lines.append(f"- [{tag}] {x[:RESEND_CHARS if RESEND_MARK in x else 500]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     if not msg_ids and not event_ids and not rejected:
@@ -3722,6 +3726,20 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
         db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
 
 
+def _approved_text_file(p: Project, rec: dict) -> str:
+    """The user's approved charter text of `rec`, written whole to state/charter-approved/<id>.txt
+    so a refusal clipped on its way to the coordinator still names where to copy it from exactly.
+    Returns that path relative to the project root, or "" if it could not be written."""
+    name = re.sub(r"[^0-9a-zA-Z_-]", "", str(rec.get("id") or "")) or str(rec.get("sha") or "")[:12]
+    path = p.state / "charter-approved" / f"{name}.txt"
+    try:
+        if not path.exists() or path.read_text() != rec["text"]:
+            durable_write(path, rec["text"])
+    except OSError:
+        return ""
+    return str(path.relative_to(p.root))
+
+
 def _charter_approval(p: Project, section: str, quote: str, replaces: str, text: str) -> tuple[dict | None, str]:
     """The recorded, unused, unexpired approval (see _record_charter_approval) this change matches
     exactly: same section, same `quote` or the same section `replaces` names (by any of the names
@@ -3754,8 +3772,10 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
             continue
         ids = ", #".join(map(str, rec["messages"]))
         if rec["sha"] != sha:
-            found = found or (f"The user's yes in message #{ids} was for other text: "
-                              f"{clip(_ws(rec['text']), 300)!r}; send that text exactly, or ask again for this one")
+            whole = _approved_text_file(p, rec)
+            found = found or (f"The user's yes in message #{ids} was for other text"
+                              + (f" (also whole in {whole})" if whole else "")
+                              + f": {rec['text']!r}; {RESEND_MARK}, or ask again for this one")
         elif rec.get("used"):
             found = found or f"The user's yes in message #{ids} was already used once"
         elif time.time() - rec["ts"] > days * 86400:
@@ -3806,12 +3826,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 7
+CHARTER_GUARD_VERSION = 8
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (7, "920d3a931fc6156f18d22159e5fd0916f79b91bf065a8556a7a726f6bd34810a")
+CHARTER_GUARD_PIN = (8, "946695133b41c0b6c9ece0eed310a01b809c244c3839da6cbe2ee5607c3a1fd8")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
@@ -3845,7 +3865,8 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None) -> str:
                 + (f", `quote` {clip(_ws(str(a['quote'])), 300)!r}" if a.get("quote") else "")
                 + (f", `replaces` {_ws(str(a['replaces']))!r}" if a.get("replaces") else "")
                 + (f", `text` {clip(_ws(str(a['text'])), 400)!r}" if a.get("text") else ""))
-        msg = (f"A charter_update was refused ({sent}): {clip(err, 1200)}. Apply the fix that error names "
+        msg = (f"A charter_update was refused ({sent}): "
+               f"{clip(err, RESEND_CHARS if RESEND_MARK in err else 1200)}. Apply the fix that error names "
                f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); if the user has since "
                "said otherwise, leave it.")
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",

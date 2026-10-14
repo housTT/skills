@@ -262,15 +262,36 @@ note "step 4 work: PASS $(printf '%s' "$WORK" | tr '\n' ';' | sed 's/;$//'); tt-
 
 # --- 5 extend once --------------------------------------------------------------------------------
 STEP="5 extend"; T0=$(date +%s)
-OUT=$(box ird extend "$BOX" "$RID" "$EXTEND_MIN") || fail "box.py ird extend: $(printf '%s' "$OUT" | tail -n 3)"
-NEW=$(printf '%s\n' "$OUT" | sed -n 's/.*expires~\([^ ]*\).*/\1/p')
+OUT=$(box ird extend "$BOX" "$RID" "$EXTEND_MIN" 2>&1); rc=$?
+[ $rc -eq 0 ] || fail "box.py ird extend (rc $rc): $(printf '%s' "$OUT" | tail -n 3)"
+NEW=$(printf '%s\n' "$OUT" | sed -n 's/^extended .* expires=\([^ ]*\).*/\1/p')
 [ -n "$NEW" ] || fail "box.py ird extend printed no expiry: $OUT"
+# Pass only if the expiry moved forward by the minutes asked (less one for rounding): compare the
+# absolute times, zone included, never whether the ird list row changed (time left always does).
+GAIN=$(python3 - "$EXPIRES" "$NEW" "$EXTEND_MIN" <<'PY'
+import datetime as dt, sys
+def t(s):
+    try:
+        v = dt.datetime.fromisoformat(s)
+    except ValueError:
+        v = None
+    if v is None or v.tzinfo is None:
+        print(f"cannot parse expiry {s!r} (want an ISO time with its zone)")
+        sys.exit(2)
+    return v
+old, new = t(sys.argv[1]), t(sys.argv[2])
+gain = (new - old).total_seconds() / 60
+print(f"{gain:+.0f}")
+sys.exit(0 if gain >= int(sys.argv[3]) - 1 else 1)
+PY
+); rc=$?
+[ $rc -ne 2 ] || fail "$GAIN: reserve said '$EXPIRES', extend said '$NEW'"
+[ $rc -eq 0 ] || fail "expiry $EXPIRES -> $NEW is $GAIN min, not +$EXTEND_MIN: box.py ird extend printed: $OUT"
 STATUS=$(box ird status "$BOX") || fail "box.py ird status: $STATUS"
 printf '%s\n' "$STATUS" | grep -q "^$RID .*expires=$NEW" || fail "status does not show $RID expiring $NEW: $STATUS"
 ROW2=$(row_of "$RID")
 [ -n "$ROW2" ] || fail "reservation $RID is gone from ird list after the extend"
-if [ "$ROW2" != "$ROW1" ]; then SEEN="ird list row changed"; else SEEN="ird list row unchanged"; fi
-note "step 5 extend: PASS +$EXTEND_MIN min, expires $EXPIRES -> $NEW; $SEEN ($(( $(date +%s) - T0 ))s)"
+note "step 5 extend: PASS +$EXTEND_MIN min, expires $EXPIRES -> $NEW ($GAIN min) ($(( $(date +%s) - T0 ))s)"
 note "  ird list row: $ROW2"
 
 # --- 6 release ------------------------------------------------------------------------------------

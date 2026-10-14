@@ -73,11 +73,12 @@ CLEARED_TEXT = {
     "network": "The hosts the queued work waits on answer again; it resumes by itself.",
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
+    "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
-USER_BLOCKERS = ("network", "paused")   # paused: a long project pause (projpause)
-CLEARED_SEVERITY = {"network": "low", "paused": "low"}
+USER_BLOCKERS = ("network", "paused", "coord-budget")   # paused: a long project pause (projpause)
+CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang")
 
@@ -221,6 +222,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "paused":   # the same project pause still lasts (projpause)
         from . import projpause
         return projpause.holds(db, arg)
+    if key == "coord-budget":   # an item it named is still parked over its per-turn budget (turnsize.py)
+        from . import turnsize
+        return turnsize.holds(db)
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":
@@ -246,7 +250,8 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused")
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
+                                         "coord-budget")
 
 
 def _since(ep: dict) -> float:

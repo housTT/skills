@@ -391,8 +391,8 @@ def stats(db, now: float | None = None) -> dict[str, dict]:
         bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs")
     # Reboots count only against machines on the list (a lock such as push:<branch> is not a
     # machine), and only when most of the host's reboots happened while it was held: a host that
-    # reboots on its own says nothing about what it held at the time.
-    boots = db.boots(since)
+    # reboots on its own says nothing about what it held at the time. A planned reboot counts against nothing.
+    boots = [b for b in db.boots(since) if not b.get("planned")]
     known = set(load())
     held: dict[str, int] = {}
     for b in boots:

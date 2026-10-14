@@ -60,6 +60,10 @@ $S ird release <box-alias> <id>         # right after the run
   reservation elsewhere. Then `reserve` warns `asked for <A>, ird reserved <B>` and everything
   after (claim, ssh block, the printed line) uses `<B>`. Names are compared ignoring case and a
   site prefix or domain suffix, since `ird list-machines` and `ird list` may print them differently.
+- `--machine` takes either form. `ird reserve --machine` needs the `ird list` form and places the
+  reservation anywhere when given another, so `reserve` maps the name, learning the prefix from
+  machines both lists name. When it cannot tell (nothing in `ird list`, or the lists disagree),
+  it warns and reserves without `--machine`.
 - `ird` may print stderr lines about the management host's environment (changing ownership of
   your home directory, skipping a CA bundle while rehashing certificates). They say nothing about
   the reservation: `reserve` shows them as `warning: ird: ...`.
@@ -70,8 +74,12 @@ $S ird release <box-alias> <id>         # right after the run
 - Set `--timeout` to the run's expected length plus a small margin.
 - It prints `reserved <id> machine=<m> port=<p> expires=<time>`. Put the id and expiry in the
   task's hand-off (`jobs` in SKILL.md), and release before the hand-off unless the run continues.
-- A run that turns out longer: `$S ird extend <box-alias> <id> <minutes>` (`ird change-timeout`),
-  on demand from that task only, never from a daemon, hook or timer.
+- A run that turns out longer: `$S ird extend <box-alias> <id> <minutes>`, on demand from that
+  task only, never from a daemon, hook or timer. `ird change-timeout` sets the time left rather
+  than adding to it, so `extend` asks for the time left plus `<minutes>`, then reads the time left
+  back from `ird list`. It prints `extended <id> by <minutes> min: expires=<time> (was <time>, ...)`
+  and exits 1 when the expiry did not move forward by the minutes asked, when `change-timeout`
+  fails (its exit code and output), or when an expiry cannot be read.
 
 ## ssh to the reservation
 
@@ -149,7 +157,8 @@ management host is reachable only from the user's laptop: the user runs it there
 The steps: list and pick a free, non-draining machine; reserve it (every flag before the arch,
 `--wait 120`); check the managed ssh block and ssh in through `ProxyJump`; clone the repo into a
 per-run worktree under `workdir_root`, add a file, build it, run `tt-smi -s`; extend once with
-`change-timeout` and check the new expiry; release and check the id is gone from `ird list`.
+`extend` and pass only if the expiry moved forward by the minutes asked (absolute times, zone
+included); release and check the id is gone from `ird list`.
 Before reserving it snapshots your reservations. On exit, any failure, Ctrl-C or SIGTERM a trap
 diffs them again and releases every new one this run claimed; a new one without this run's claim
 is left alone and named in the report. The report's `reservation:` line gives the real id and

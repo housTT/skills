@@ -74,6 +74,8 @@ def remote_hosts() -> list[str]:
 
 
 LISTEN_GAVE_UP = 75   # `ttp listen --timeout` on another machine: still unreachable when the timeout ran out
+LISTEN_GRACE_S = 60     # a listener reconnecting within this says nothing about the drop
+LISTEN_CONNECTED_S = 25  # an ssh session that lasted this long had connected (ConnectTimeout is 20 s)
 LISTEN_REPLACED = 3   # a newer listener for the same chat took over; this one stops and does not reconnect
 REPLACED_MARK = "ttp: replaced by a newer listener"   # its stderr line, read even when ssh reports a drop
 _MSG_LINE = re.compile(r"\[#(\d+) ")
@@ -114,8 +116,12 @@ def _with_timeout(argv: list[str], left: float) -> list[str]:
 def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int:
     """A remote listener outlives network drops: a laptop changes networks, sleeps and wakes.
 
-    A dropped connection (see _dropped) means this machine lost the path, not that the project
-    stopped, so wait (5 s, doubling to 2 min) and reconnect. The listener left on the far side
+    A dropped connection (see _dropped) means the path was lost (this machine's network, or the
+    host restarting), not that the project stopped, so wait (5 s, doubling to 2 min) and reconnect.
+    A reconnect within LISTEN_GRACE_S says nothing; a longer outage is explained once, from the
+    side ssh's error points to (sshfail.kind). An outage that began with the host dropping a working
+    connection keeps that wording while it reboots (its retries time out); only this machine losing
+    its own path (sshfail.offline) switches to the network advice. The listener left on the far side
     exits on its own once its session is gone, and the new one replaces it if it has not yet.
     Each (re)connect first sends what is queued here. A message is printed once per listener:
     one shown before a drop is not shown again after the reconnect, and with --once, a batch that
@@ -125,36 +131,46 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     A listener replaced by a newer one for the same chat ends with LISTEN_REPLACED and is not
     retried: reconnecting would displace the newer one in turn, and the two would take turns.
     """
+    from . import sshfail
     once = "--once" in argv
     limit = _listen_timeout(argv)
     deadline = time.time() + limit if limit > 0 else None
     shown: set[int] = set()
-    delay, told, held = 5.0, False, False
+    delay, told, held, tries = 5.0, False, False, 0
+    down_since, connected, drop = None, False, None
     while True:
+        start = time.time()
         failed = flush_outbox(name, entry, quiet=held) if name else None
         held = held or failed is not None
         if failed is not None and failed.returncode == 255:
-            if not told:
-                _unreachable(entry, failed.stderr)
-            rc = 255
+            rc, err = 255, failed.stderr
         else:
             left = deadline - time.time() if deadline else 0
-            rc = forward(entry, _with_timeout(argv, left) if deadline and told else argv, quiet=told, shown=shown)
-            if _dropped(rc) and rc != 255 and not told:     # forward() already explained a 255
-                _unreachable(entry, None, rc)
+            errs: list[str] = []
+            rc = forward(entry, _with_timeout(argv, left) if deadline and tries else argv, quiet=True, shown=shown,
+                         failure=errs)
+            err = errs[-1] if errs else None
+        tries += 1
         if not _dropped(rc):
             return rc
         if once and shown:
             return 0        # the batch got here before the drop; --ack picks up from it
-        if deadline and time.time() + delay >= deadline:
+        now = time.time()
+        if now - start >= LISTEN_CONNECTED_S or (rc != 255 and rc >= 128):
+            connected, down_since, told, delay = True, None, False, 5.0   # it was up: a new outage starts now
+        if down_since is None:   # the error that started this outage, if a working session dropped
+            down_since, drop = now, ((err, rc) if connected else None)
+        if drop and sshfail.kind(drop[0], True) == "host" and not sshfail.offline(err):
+            err, rc = drop      # a host rebooting times out while down: still its side, not this network
+        if deadline and now + delay >= deadline:
+            if not told:
+                _unreachable(entry, err, rc, connected)
             print(f"ttp: still cannot reach {entry.get('ssh') or entry['host']} and --timeout ran out; "
                   f"stopping (exit {LISTEN_GAVE_UP}). Nothing is lost: unacknowledged messages come "
                   f"back on the next listen", file=sys.stderr)
             return LISTEN_GAVE_UP
-        if not told:
-            until = " until --timeout runs out" if deadline else ""
-            print(f"ttp: will keep retrying{until} and deliver messages once the connection is back",
-                  file=sys.stderr)
+        if not told and now - down_since >= LISTEN_GRACE_S:   # a quick reconnect says nothing
+            _unreachable(entry, err, rc, connected, " until --timeout runs out" if deadline else "")
             told = True
         time.sleep(delay)
         delay = min(delay * 2, 120.0)
@@ -194,29 +210,49 @@ def _ssh_relay(entry: dict, argv: list[str], shown: set[int]) -> subprocess.Comp
         return subprocess.CompletedProcess(proc.args, rc, None, err.read())
 
 
-def _unreachable(entry: dict, stderr: str | None, rc: int = 255) -> None:
+def _unreachable(entry: dict, stderr: str | None, rc: int = 255, connected: bool = False,
+                 retrying: str | None = None) -> None:
+    """Say why ssh to the project's host failed, from the user's side (sshfail.kind), naming the ssh
+    alias and never an address. `retrying`: the listener keeps retrying (the text after "retrying")."""
+    from . import machines as mm, sshfail
     host = entry.get("ssh") or entry["host"]
-    why = ((stderr or "").strip().splitlines() or [f"ssh exit {rc}" if rc != 255 else "unknown ssh error"])[-1]
-    print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
-          f"try again once this machine is back on that network.", file=sys.stderr)
-    from . import machines as mm
+    why, kind = sshfail.why(stderr, host, rc), sshfail.kind(stderr, connected)
+    if kind == "host":
+        head = (f"{host} dropped the connection" if connected else f"{host} is not accepting connections")
+        line = f"ttp: {head} (probably restarting; {why})."
+        tail = (f" Retrying{retrying}; messages are delivered once it is back." if retrying is not None
+                else " Try again in a minute or two.")
+    elif kind == "network":
+        line = f"ttp: cannot reach {host} right now ({why}). The project keeps running there;"
+        tail = (f" retrying{retrying}; messages are delivered once this machine is back on that network."
+                if retrying is not None else " try again once this machine is back on that network.")
+    else:
+        line = f"ttp: cannot reach {host} right now ({why})."
+        tail = (f" Retrying{retrying}; messages are delivered once the connection is back." if retrying is not None
+                else " The project keeps running there.")
+    print(line + tail, file=sys.stderr)
     if hint := mm.auth_failed_hint(stderr):
         print(f"ttp: {hint}", file=sys.stderr)
 
 
-def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] | None = None) -> int:
+def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] | None = None,
+            failure: list[str] | None = None) -> int:
     """Run this same command on the project's machine, streaming its output. With `shown` (a
-    listener), message lines already printed are not printed again."""
+    listener), message lines already printed are not printed again. `failure` collects the stderr
+    of a dropped connection (_dropped) instead of printing it: that caller explains the drop itself."""
+    from . import sshfail
     r = _ssh(entry, argv) if shown is None else _ssh_relay(entry, argv, shown)
     if shown is not None and REPLACED_MARK in (r.stderr or ""):
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
         return LISTEN_REPLACED
-    if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
+    if failure is not None and _dropped(r.returncode):   # the caller explains the drop, if it lasts
+        failure.append(r.stderr or "")
+    elif r.returncode == 255:   # ssh itself failed: the project's state is kept there
         if not quiet:
             _unreachable(entry, r.stderr)
     elif r.stderr:
-        sys.stderr.write(r.stderr)
+        sys.stderr.write(sshfail.scrub(r.stderr, entry.get("ssh") or entry["host"]))
     return r.returncode
 
 
@@ -1196,6 +1232,9 @@ def cmd_web(a) -> None:
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, f"{remote_ttp} web {shlex.quote(a.name)}"],
                        capture_output=True, text=True)
+    if r.returncode == 255:
+        _unreachable(entry, r.stderr)
+        sys.exit(255)
     m = weblink.LINK.search(r.stdout)
     if not m:
         die(f"could not read the web address from {host}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -1485,6 +1524,30 @@ def _command_key(c) -> str:
     return c
 
 
+_PYTEST_PROG = re.compile(r"(?:\S*/)?(?:pytest|py\.test)")
+_PYTHON_PROG = re.compile(r"(?:\S*/)?python(?:3(?:\.\d+)?)?")
+
+
+def _same_run_key(c) -> str:
+    """_command_key, with a pytest run's program made one word: `pytest`, `py.test`,
+    `python3 -m pytest` and `<venv>/bin/python -m pytest` run the same tests, as every bare pytest
+    runs with the venv's python (push.venv_cmd). Only for telling an extra command already run."""
+    key = _command_key(c)
+    if not isinstance(c, str):
+        return key
+    try:
+        words = shlex.split(key)
+    except ValueError:
+        return key
+    if not words or not all(_PLAIN_WORD.fullmatch(w) for w in words):
+        return key   # shell syntax: compared as written
+    if _PYTEST_PROG.fullmatch(words[0]):
+        return shlex.join(["pytest", *words[1:]])
+    if len(words) > 2 and _PYTHON_PROG.fullmatch(words[0]) and words[1:3] == ["-m", "pytest"]:
+        return shlex.join(["pytest", *words[3:]])
+    return key
+
+
 def _commands_hash(cmds: list) -> str:
     import hashlib
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
@@ -1576,21 +1639,44 @@ def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
     command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
-    here, is dropped: it would run twice. One that only a scoped check matches stays, as that
-    check may be skipped on this head."""
+    here, is dropped: it would run twice (a pytest run in any spelling, _same_run_key). One that
+    only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
+    it once that check applies)."""
     if not extra:
         return [], []
     if len(extra) == 1 or all(any(ch.isspace() for ch in w) for w in extra):
         given = [w for w in extra if w.strip()]
     else:
         given = [shlex.join(extra)]
-    seen = {_command_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    seen = {_same_run_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
     mine, dropped = [], []
     for c in given:
-        key = _command_key(c)
+        key = _same_run_key(c)
         (dropped if key in seen else mine).append(c)
         seen.add(key)
     return mine, dropped
+
+
+def _ran_again(todo: list, own: list) -> tuple[list, list]:
+    """(the applicable checks to run, the extras dropped): an extra command that a scoped project
+    check applicable on this head (in `todo`) also runs is dropped, so it runs once."""
+    keys = {_same_run_key(c) for c in todo if any(c is o for o in own)}
+    keep, dropped = [], []
+    for c in todo:
+        (dropped if not any(c is o for o in own) and _same_run_key(c) in keys else keep).append(c)
+    return keep, dropped
+
+
+def _warn_broken_venvs(p: Project | None, top: str, say) -> None:
+    """Warn about each venv the checks may use whose python does not run, with the command that
+    makes it again (push.broken_venvs): its checks would otherwise fail at import, unexplained."""
+    from . import push, worktree
+    also = [p.root / n for n in worktree.VENV_NAMES] if p else []
+    if os.environ.get("VIRTUAL_ENV"):
+        also.append(Path(os.environ["VIRTUAL_ENV"]))
+    for venv, why in push.broken_venvs(top, also):
+        say(f"warning: the venv {venv} is broken ({why}), so checks run without its packages; "
+            f"make it again with: {push.venv_rebuild_cmd(venv)}")
 
 
 def cmd_checks(a) -> None:
@@ -1667,6 +1753,11 @@ def cmd_checks(a) -> None:
     if p:
         from . import worktree
         worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
+    # Every check, extras too, runs in the project's environment: its venv active (VIRTUAL_ENV, PATH)
+    # when this shell has none, as a run has (worktree.project_venv).
+    venv_vars = {}
+    if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
+        venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
     dirty, runtime_written = _checks_dirty(git)
     if dirty:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
@@ -1697,10 +1788,17 @@ def cmd_checks(a) -> None:
         for line in not_run:
             print(f"ttp checks: {line}")
             out.write(f"{line}\n")
+        _warn_broken_venvs(p, top, lambda m: (print(f"ttp checks: {m}"), out.write(f"{m}\n")))
         try:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base, candidate=purpose == "candidate")
+            todo, again = _ran_again(todo, own)
+            if again:
+                said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
+                        f"delivery.push_checks entry runs it on this head")
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
             selected = list(todo)
         except push.ScopeError as e:
             out.write(f"{e}\n")
@@ -1741,7 +1839,7 @@ def cmd_checks(a) -> None:
                     f"at {when} (recorded); --fresh runs them again")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
-        child_env = {"PWD": top, **(slot.env() if slot else {})}
+        child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         for c in [] if hit else todo:
             executed.append(c)
             out.write(f"$ {c}\n")
@@ -1749,9 +1847,9 @@ def cmd_checks(a) -> None:
             check_start = out.tell()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
-            proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=group, env={**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
-                                         **child_env},
+            env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
+            proc = subprocess.Popen(push.check_argv(c, top, env), cwd=top, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=group, env=env,
                                     pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             try:
                 rc = proc.wait()
@@ -3142,12 +3240,12 @@ def cmd_memory(a) -> None:
         sys.exit("give the memory's text, or --forget <entry>")
     if a.text:
         print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
-    for name in a.forget or []:
-        try:
-            print(f"retired to {p.forget_memory(name, why=a.why)}")
-        except ValueError as e:
-            sys.exit(str(e))
+    done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
+    for dst in done:
+        print(f"retired to {dst}")
     memory_budget_check(p)
+    if errors:
+        sys.exit("\n".join(errors))
 
 
 def cmd_schedules(a) -> None:
@@ -3481,7 +3579,7 @@ def cmd_pause(a) -> None:
     from . import projpause
     by = projpause.caller(p)
     try:
-        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or "")
+        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or ("host power cycle (until reboot)" if boot else ""))
     except ValueError as e:
         die(f"{e}: pass --reason")
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
@@ -3767,6 +3865,13 @@ def stale_install_warning(cwd: Path | None = None) -> str:
     return ""
 
 
+def new_project_defaults_lines() -> list[str]:
+    """The defaults a new project gets, with the account-level budget settings applied."""
+    from .project import DEFAULT_CONFIG
+    budget = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
+    return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -3815,7 +3920,7 @@ def cmd_setup(a) -> None:
         print(line)
     from .project import DEFAULT_CONFIG
     print("defaults for new projects:")
-    for ln in defaults_lines(DEFAULT_CONFIG["budget"], bool((load_secrets().get("jev") or {}).get("key"))):
+    for ln in new_project_defaults_lines():
         print("  " + ln)
 
 
@@ -4044,6 +4149,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
               f"(superseded); the daemon restarts and the project stays paused")
     release.clear_stuck(p)
+    keep_note = _keep_light_coordinator(p)
+    if keep_note:
+        print(keep_note)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     res = service.restart(p)
@@ -4059,6 +4167,31 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               f"restarted and running work was kept."
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="alert", severity="low")
+
+
+def _keep_light_coordinator(p: Project) -> str:
+    """Since coordinator.model_tier an unset coordinator.model follows the standard tier. A project that
+    overrides a provider's light-tier model to make its coordinator cheaper keeps that model: model_tier
+    is set to "" for it (once; an explicit model_tier is the project's own choice). Returns the note."""
+    try:
+        raw = p.raw_config()
+    except Exception:
+        return ""
+    coord = raw.get("coordinator")
+    if isinstance(coord, dict) and "model_tier" in coord:
+        return ""
+    provs = raw.get("providers")
+    if not isinstance(provs, dict) or not any(
+            isinstance(v, dict) and isinstance(((v.get("tiers") or {}).get("light") or {}), dict)
+            and ((v.get("tiers") or {}).get("light") or {}).get("model") for v in provs.values()):
+        return ""
+    try:
+        p.set_config("coordinator.model_tier", "")
+    except Exception:
+        return ""
+    return ("upgrade note: this project overrides the light-tier model, so coordinator.model_tier was set to "
+            "\"\" and its coordinator keeps the light-tier model; `ttp config %s coordinator.model_tier "
+            "standard` makes it follow the standard tier" % p.name)
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:
@@ -5223,8 +5356,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name")
     s.add_argument("text", nargs="?")
     s.add_argument("--kind", default="fact")
-    s.add_argument("--forget", action="append", metavar="ENTRY",
-                   help="retire an entry (its name in [brackets]) to memory/archive/; repeatable")
+    s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
+                   help="retire entries (names in [brackets]) to memory/archive/: several names after one "
+                        "--forget, or the flag repeated, make one harness commit; an unknown name is "
+                        "reported and the others are still retired")
     s.add_argument("--standing", action="store_true",
                    help="an instruction that applies every time its case comes up (kept as a preference); "
                         "one finished instance never retires it")

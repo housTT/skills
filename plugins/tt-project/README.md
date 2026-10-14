@@ -162,7 +162,10 @@ and preferences you add later become part of the project's charter and memory.
   working directory with a short prompt, instead of starting over.
   A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. A
   detached job cut by a planned host cycle (`ttp drain <name> --reboot "<why>"`, or another project's
-  `state/host-cycle/<id>/record.json` on the same host) does not count.
+  `state/host-cycle/<id>/record.json` on the same host, or a `ttp machines change add <this host>
+  --power-cycle-at <t>` intent) does not count. Such a reboot is reported once as planned, at low
+  severity, naming what planned it; only abrupt, unplanned reboots count toward the "host looks
+  unstable" warning.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file. A temporary entry carries its end (a time, a plain-language condition or a probe); the daemon retires it to the archive or `CHARTER.history.md` once that passes and says so.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
@@ -256,6 +259,11 @@ prolonged whole-box outage.
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
+- A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
+  halved down to single items; a single item runs once more alone at the ceiling
+  (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit
+  or the dollar caps). One that fails even then is parked and you get one alert naming every parked
+  item; it runs again once you raise the cap or the ceiling. The other items go on.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and no code file
   with a risky name (`review.risky_names`: state, database, schema, migration, push, budget, billing,
   spend, spend cap, release and upgrade files by default; `[]` turns it off), and is docs and tests
@@ -721,17 +729,21 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
 - A bare pytest in a check (`pytest`, `py.test`, `python3 -m pytest`, also after `env` or
   `timeout <n>`) runs as `<venv>/bin/python -m pytest` when the repository has a `.venv/` or
-  `venv/` with pytest in it (in the worktree, else in its main checkout). The main checkout's venv
+  `venv/` with pytest in it (in the worktree, else in its main checkout, else the active venv: a
+  run's is the project's, and `ttp checks` activates the project's venv when none is). The main checkout's venv
   is not used when it has the project installed editable from the main checkout: a worktree's tests
   would import that code and could pass falsely. The check then runs as written and its output says
   why. A check that fails at import because a package is not installed is reported by `ttp checks`
   and `ttp doctor` as an environment problem, not as the head's code (as an environment problem
-  also, when tests failed too): point the check at a venv.
+  also, when tests failed too): point the check at a venv. Before it runs checks, `ttp checks` warns
+  of a venv whose `bin/python -c pass` fails (a dangling `.venv` link, or a venv made on another OS)
+  and prints the command that makes it again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An
-  added check that `delivery.push_checks` already runs on every head is dropped, and said, so it
-  never runs twice.
+  added check that `delivery.push_checks` already runs on every head, or through a scoped entry
+  that applies on this head, is dropped, and said, so it never runs twice. Spellings of one pytest
+  run (`pytest`, `python3 -m pytest`, `<venv>/bin/python -m pytest`) count as the same command.
 - In Claude Code workers and reviewers, a Bash call that runs one of the configured pytest checks
   in full (every path it names, or a directory above them, and no `-k`, `-m`, `--lf` or node id
   it does not have) is refused with a pointer to `ttp checks`, which reuses a recorded pass.

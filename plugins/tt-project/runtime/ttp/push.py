@@ -257,11 +257,12 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
             and all(getattr(s, "scoped", False) for s in own))
 
 
-def check_argv(cmd: str, top: str | Path | None = None) -> list[str]:
+def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None) -> list[str]:
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
-    With `top` (the worktree it runs in), a bare pytest runs with the repository's venv (venv_cmd)."""
-    cmd = venv_cmd(cmd, top) if top else cmd
+    With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
+    `env` (the check's environment; default this process's) has active (venv_cmd)."""
+    cmd = venv_cmd(cmd, top, env) if top else cmd
     bash = shutil.which("bash")
     return [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
 
@@ -274,32 +275,94 @@ _PYTEST_RUN = re.compile(r"(^|&&|\|\||[;|(\n])(\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\
                          r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])")
 
 
-def venv_python(top: str | Path) -> Path | None:
+def venv_python(top: str | Path, env: dict | None = None) -> Path | None:
     """The python of the repository's venv (.venv/ or venv/, with pytest installed in it) in the
-    worktree `top`, else in its main checkout (a linked worktree has no copy of an ignored venv), or None."""
-    return _venv(top)[0]
+    worktree `top`, else in its main checkout (a linked worktree has no copy of an ignored venv), else
+    the venv `env` (default this process's environment) has active, or None."""
+    return _venv(top, env)[0]
 
 
-def _venv(top: str | Path) -> tuple[Path | None, str]:
-    """(venv_python, "") or, when the only venv is the main checkout's and it has a package installed
-    editable from outside the worktree `top`, (None, why): the worktree's tests would import the main
-    checkout's code and could pass whatever the worktree's code does."""
+def _checkouts(top: str | Path) -> list[Path]:
+    """The worktree `top`, then its main checkout when it is a linked worktree."""
     bases = [Path(top)]
     r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
                        capture_output=True, text=True)
     common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
     if common and common.name == ".git" and common.parent not in bases:
         bases.append(common.parent)
-    for base in bases:
-        for d in VENV_DIRS:
-            py, bin_ = base / d / "bin" / "python", base / d / "bin"
-            if os.access(py, os.X_OK) and (bin_ / "pytest").exists():
-                if base != bases[0] and (src := editable_outside(base / d, top, base)):
-                    return None, (f"the venv {base / d} has the project installed editable from {src}, outside "
-                                  f"this worktree, so its tests would import that code, not this worktree's; "
-                                  f"pytest runs as written (make a venv in this worktree to use one)")
-                return py, ""
+    return bases
+
+
+def _venv(top: str | Path, env: dict | None = None) -> tuple[Path | None, str]:
+    """(venv_python, "") or, when the only venv is the main checkout's (or the active one) and it has
+    a package installed editable from outside the worktree `top`, (None, why): the worktree's tests
+    would import the main checkout's code and could pass whatever the worktree's code does. The active
+    venv (VIRTUAL_ENV: a run's is the project's) comes last, so an extra `ttp checks -- pytest` runs in
+    the environment the project's checks run in, not with whatever pytest PATH finds first."""
+    bases = _checkouts(top)
+    active = (os.environ if env is None else env).get("VIRTUAL_ENV") or ""
+    cands = [(base, base / d) for base in bases for d in VENV_DIRS]
+    if active and Path(active).is_absolute():
+        cands.append((bases[-1], Path(active)))
+    for base, venv in cands:
+        py, bin_ = venv / "bin" / "python", venv / "bin"
+        if os.access(py, os.X_OK) and (bin_ / "pytest").exists():
+            if base != bases[0] and (src := editable_outside(venv, top, base)):
+                return None, (f"the venv {venv} has the project installed editable from {src}, outside "
+                              f"this worktree, so its tests would import that code, not this worktree's; "
+                              f"pytest runs as written (make a venv in this worktree to use one)")
+            return py, ""
     return None, ""
+
+
+def broken_venvs(top: str | Path, also: list[Path] = ()) -> list[tuple[Path, str]]:
+    """The venvs a check may use (.venv/ or venv/ in the worktree `top` or its main checkout, and
+    `also`: the project's and the active one) whose python does not run, each with why. A link that
+    dangles, or a venv made on another OS (its bin/python points at an interpreter missing here),
+    leaves the checks without its packages; venv_python then skips it, and they fail at import."""
+    seen, out = set(), []
+    for venv in [b / d for b in _checkouts(top) for d in VENV_DIRS] + [Path(v) for v in also]:
+        if not (venv.is_symlink() or (venv / "pyvenv.cfg").is_file()):
+            continue   # not there, or a directory that is no venv
+        real = Path(os.path.realpath(venv))
+        if real in seen:
+            continue
+        seen.add(real)
+        py = venv / "bin" / "python"
+        try:
+            r = subprocess.run([str(py), "-c", "pass"], capture_output=True, text=True, timeout=30)
+            why = "" if r.returncode == 0 else \
+                f"{py} -c pass exited {r.returncode}: {(r.stderr.strip().splitlines() or [''])[-1][:200]}"
+        except FileNotFoundError:
+            why = (f"{venv} links to {os.readlink(venv)}, which is missing" if venv.is_symlink() and not real.exists()
+                   else f"{py} is missing or points at an interpreter that is missing")
+        except (OSError, subprocess.SubprocessError) as e:
+            why = f"{py} -c pass failed: {e}"
+        if why:
+            out.append((venv, why))
+    return out
+
+
+def venv_rebuild_cmd(venv: Path) -> str:
+    """The command that makes the venv `venv` again where it points, with the packages of the
+    checkout it sits in (an editable install with its test or dev extras, else its requirements.txt,
+    else pytest alone)."""
+    real, src = Path(os.path.realpath(venv)), venv.parent
+    q = shlex.quote
+    if (src / "pyproject.toml").is_file() or (src / "setup.py").is_file():
+        try:   # the keys of its [project.optional-dependencies] table (no tomllib before Python 3.11)
+            text = (src / "pyproject.toml").read_text(errors="replace")
+        except OSError:
+            text = ""
+        table = re.search(r"^\[project\.optional-dependencies\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        opt = set(re.findall(r"^\s*\"?([A-Za-z0-9_.-]+)\"?\s*=", table.group(1), re.M)) if table else set()
+        extras = ",".join(e for e in ("test", "dev") if e in opt)
+        what = f"-e {q(str(src) + (f'[{extras}]' if extras else ''))}"
+    elif (src / "requirements.txt").is_file():
+        what = f"-r {q(str(src / 'requirements.txt'))}"
+    else:
+        what = "pytest"
+    return f"python3 -m venv --clear {q(str(real))} && {q(str(real / 'bin' / 'python'))} -m pip install {what}"
 
 
 def editable_outside(venv: Path, top: str | Path, main: Path) -> str:
@@ -340,7 +403,7 @@ def editable_outside(venv: Path, top: str | Path, main: Path) -> str:
     return ""
 
 
-def venv_cmd(cmd: str, top: str | Path) -> str:
+def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     """`cmd` with each bare pytest run (`pytest`, `py.test`, `python[3] -m pytest`) made
     `<venv>/bin/python -m pytest` when the repository has a venv (venv_python); else `cmd` as it is.
     A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies.
@@ -348,7 +411,7 @@ def venv_cmd(cmd: str, top: str | Path) -> str:
     command stays as written and first prints why to the checks output."""
     if not _PYTEST_RUN.search(cmd):
         return cmd
-    py, why = _venv(top)
+    py, why = _venv(top, env)
     if not py:
         return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{cmd}" if why else cmd
     return _PYTEST_RUN.sub(lambda m: f"{m.group(1)}{m.group(2)}{shlex.quote(str(py))} -m pytest", cmd)
@@ -2368,7 +2431,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             started = time.time()
             env = {**check_env("own", tip, check_run_dir), **slot.env()}
             for cmd in todo:
-                if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
+                if subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
                     say(f"check failed on {head[:10]}: {cmd}; not pushing")
                     return CHECKS_FAILED
         if todo and timed:
@@ -2557,7 +2620,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
             for cmd in todo:
-                if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
+                if subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
                     say(f"check failed on {head[:10]}: {cmd}; not pushing")
                     return CHECKS_FAILED
         if todo and timed:

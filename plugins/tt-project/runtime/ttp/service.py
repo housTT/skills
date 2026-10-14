@@ -334,6 +334,8 @@ def restart_service(p: Project) -> str:
     if unit.exists():
         try:
             r = _run("systemctl", "--user", "restart", unit.name)
+        except subprocess.TimeoutExpired as e:
+            return f"{TIMED_OUT}: systemctl --user restart did not return within {e.timeout:.0f}s"
         except (OSError, subprocess.SubprocessError) as e:
             return f"could not run systemctl --user restart: {e}"
         return "restarted" if r.returncode == 0 else _manager_said("systemctl --user restart", r)
@@ -380,6 +382,11 @@ class Restarted(str):
     """restart()'s report. `outcome`: running, busy (alive, still in its first tick), deferred (the
     restart has not happened yet; the old daemon runs on), rolled_back, or failed."""
     outcome = "running"
+
+
+# The service manager took the restart but did not report back in time (the old daemon was still ending
+# its tick step): the restart is pending, not failed. restart() waits its usual window for the new daemon.
+TIMED_OUT = "restart timed out"
 
 
 def _said(text: str, outcome: str) -> Restarted:
@@ -593,6 +600,18 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
         time.sleep(poll_s(1))
 
 
+def _off_files(p: Project) -> str | None:
+    """The version the daemon's heartbeat reports when it differs from the runtime on disk, else None
+    (None too when either is unknown: a daemon started after the restart runs the files on disk)."""
+    from .daemon import heartbeat
+    ran = ((heartbeat(p) or {}).get("receipt") or {}).get("version")
+    try:
+        m = re.search(r'__version__ = "([^"]+)"', (p.harness / "runtime" / "ttp" / "__init__.py").read_text())
+    except OSError:
+        m = None
+    return ran if ran and m and ran != m.group(1) else None
+
+
 def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None,
             requested: bool = False) -> Restarted:
     """Restart the daemon and confirm it ticks. If it is broken (never started, exited, or its first
@@ -601,12 +620,15 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     restart again and alert. A daemon that is alive but still in a slow first tick is left alone.
     When the service manager refuses while the old daemon still ticks, nothing restarted: no rollback.
     If it could not be reached from here (a sandbox), the running daemon is asked to restart itself
-    (unless this is that restart, `requested`). The result's `outcome` says how it went."""
+    (unless this is that restart, `requested`). A restart the service manager did not confirm in time
+    (TIMED_OUT) is pending: it counts once a new daemon runs the runtime on disk within the window.
+    The result's `outcome` says how it went."""
     from .daemon import start_marker
     restart_fn = restart_fn or restart_service
     t0 = time.time()
     msg = restart_fn(p)
-    if msg != "restarted" and old_daemon_beats(p, t0):
+    timed_out = msg.startswith(TIMED_OUT)
+    if msg != "restarted" and not timed_out and old_daemon_beats(p, t0):
         if unreachable(msg) and not requested:
             return request_restart(p, f"The service manager could not be reached from here ({msg})", wait_s)
         return _said(f"The daemon was not restarted: {msg}. The old daemon still runs the previous runtime; "
@@ -617,7 +639,12 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
                      f"was never started, so nothing shows it is at fault", "failed")
     state = wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time())
     if state == "running":
-        return _said(f"{msg}; the daemon is running", "running")
+        off = _off_files(p) if timed_out else None
+        if off:
+            return _said(f"{msg}; a new daemon came up but runs {off}, not the runtime on disk. "
+                         f"Check `ttp status {p.name}`", "failed")
+        return _said(f"{msg}; the daemon is running" + (" (the restart was pending: it came up on the new runtime "
+                                                        "within the re-check window)" if timed_out else ""), "running")
     if state == "busy":
         st = start_marker(p)
         if not (st and float(st.get("started") or 0) >= t0):

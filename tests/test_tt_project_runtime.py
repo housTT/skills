@@ -10082,10 +10082,11 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli
     results = iter([255, 255, 0])
     calls, naps = [], []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(quiet) or next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None:
+                        calls.append(quiet) or next(results))
     monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
-    assert calls == [False, True, True], "the unreachable message should print once, not on every retry"
+    assert calls == [True, True, True], "the listener explains a drop itself, once, not forward() per retry"
     assert naps == [5.0, 10.0]
 
 
@@ -10138,7 +10139,7 @@ def test_remote_listen_once_ack_reconnects_after_an_ssh_drop_and_acks_once(env, 
     assert cli.forward_listen(entry, argv, "demo") == 0
     out, err = capsys.readouterr()
     assert len(calls) == 2 and naps == [5.0], (calls, naps)
-    assert "Broken pipe" in err and err.count("will keep retrying until --timeout runs out") == 1, err
+    assert "Broken pipe" not in err and "etrying" not in err, "a reconnect within the grace says nothing: " + err
     assert out.count(f"[#{new} ") == 1 and "fresh reply" in out and "already shown" not in out, out
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == old, \
         "only --ack marks messages read; the reconnect neither lost nor acknowledged the new reply"
@@ -10167,7 +10168,7 @@ def test_streaming_remote_listener_reconnects_on_any_dropped_session_and_shows_e
     assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     out, err = capsys.readouterr()
     assert out == "[#7 coordinator] hi\nmore of 7\n[#8 demo (alert, high)] x\n", out
-    assert len(calls) == 2 and naps == [5.0] and err.count("will keep retrying and deliver") == 1, err
+    assert len(calls) == 2 and naps == [5.0] and err == "", err
 
 
 def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, monkeypatch, capsys):
@@ -10188,9 +10189,159 @@ def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, mo
     calls.clear()
     assert cli.forward_listen(entry, ["listen", "demo", "--chat", "c1", "--timeout=12"]) == 75
     err = capsys.readouterr().err
-    assert err.count("will keep retrying until --timeout runs out") == 1 and "(exit 75)" in err, err
+    assert err.count("cannot reach far right now (client_loop") == 1 and "(exit 75)" in err, err
     assert calls[0].endswith("--timeout=12") and calls[1].endswith("--timeout=7"), calls
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stderr,connected,kind", [
+    ("ssh: Could not resolve hostname box: Name or service not known", True, "network"),
+    ("ssh: Could not resolve hostname box: Temporary failure in name resolution", False, "network"),
+    ("ssh: connect to host box port 22: Connection timed out", True, "network"),
+    ("ssh: connect to host box port 22: Network is unreachable", True, "network"),
+    ("Connection to 10.1.2.3 closed by remote host.", True, "host"),
+    ("Connection to 10.1.2.3 closed by remote host.", False, "host"),
+    ("ssh: connect to host box port 22: Connection refused", True, "host"),
+    ("ssh: connect to host box port 22: Connection refused", False, "host"),
+    ("kex_exchange_identification: read: Connection reset by peer", True, "host"),
+    ("ssh: connect to host box port 22: No route to host", True, "host"),
+    ("ssh: connect to host box port 22: No route to host", False, "network"),
+    ("client_loop: send disconnect: Broken pipe", True, "other"),
+    ("client_loop: send disconnect: Broken pipe", False, "network"),
+    ("", False, "network"),
+])
+def test_ssh_failure_kind_says_which_side_dropped(stderr, connected, kind):
+    from ttp import sshfail
+    assert sshfail.kind(stderr, connected) == kind
+
+
+_ADDRS = ["10.1.2.3", "192.168.0.17", "2001:db8::5", "fe80::1%eth0", "::ffff:10.0.0.7",
+          "2001:0db8:0000:0000:0000:ff00:0042:8329", "::1"]
+
+
+@pytest.mark.parametrize("addr", _ADDRS)
+@pytest.mark.parametrize("tmpl", ["Connection to {a} closed by remote host.",
+                                  "ssh: connect to host {a} port 22: No route to host",
+                                  "ssh: connect to host {a} port 22: Connection timed out",
+                                  "Warning: Permanently added '{a}' (ED25519) to the list of known hosts.\nPermission denied (publickey)."])
+@pytest.mark.parametrize("connected", [False, True])
+def test_no_ip_address_reaches_the_user_only_the_ssh_alias(capsys, addr, tmpl, connected):
+    from ttp import cli, sshfail
+    err = tmpl.format(a=addr)
+    cli._unreachable({"host": "box-host", "ssh": "box"}, err, connected=connected)
+    cli._unreachable({"host": "box-host", "ssh": "box"}, err, connected=connected, retrying="")
+    said = capsys.readouterr().err
+    assert addr not in said and addr.split("%")[0] not in said and "box" in said, said
+    assert addr not in sshfail.scrub(err + "\n", "box")
+    # Only ssh's own lines are scrubbed, and a time is no address.
+    assert sshfail.scrub("ran at 14:23:05 on 10.0.0.1\n", "box") == "ran at 14:23:05 on 10.0.0.1\n"
+    assert sshfail.no_ips("at 14:23:05", "box") == "at 14:23:05"
+
+
+def _listener_on_a_clock(cli, monkeypatch, attempts):
+    """forward_listen against a fake forward(): each attempt is (seconds it lasts, rc, ssh stderr)."""
+    clock, calls = [1000.0], []
+    monkeypatch.setattr(cli.time, "time", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def fwd(entry, argv, quiet=False, shown=None, failure=None):
+        took, rc, err = attempts.pop(0)
+        calls.append(quiet)
+        clock[0] += took
+        if cli._dropped(rc) and failure is not None:
+            failure.append(err)
+        return rc
+    monkeypatch.setattr(cli, "forward", fwd)
+    return calls
+
+
+def test_a_host_that_restarts_under_a_listener_is_named_as_restarting_once_past_the_grace(env, monkeypatch, capsys):
+    """The reported case: the project's host rebooted, and the listener blamed this machine's network
+    and printed the host's address. Now it names the ssh alias, says the host dropped it, and says so once."""
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    refused = "ssh: connect to host 10.1.2.3 port 22: Connection refused\n"
+    no_route = "ssh: connect to host 10.1.2.3 port 22: No route to host\n"
+    calls = _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone), (0, 255, no_route), (0, 255, refused),
+                                                    (0, 255, refused), (0, 255, no_route), (0, 255, refused), (1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert len(calls) == 7 and set(calls) == {True}
+    assert err.count("ttp: box dropped the connection (probably restarting;") == 1, err
+    assert "Retrying; messages are delivered once it is back." in err, err
+    assert "back on that network" not in err and "10.1.2.3" not in err, err
+
+
+def test_a_rebooting_host_keeps_its_restart_wording_while_its_retries_time_out(env, monkeypatch, capsys):
+    """Review #2150: a host that is down while it reboots makes retries time out; the outage still
+    started with the host dropping a working connection, so it is not this machine's network."""
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    timeout = "ssh: connect to host 10.1.2.3 port 22: Connection timed out\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone)] + [(20, 255, timeout)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: box dropped the connection (probably restarting") == 1, err
+    assert "back on that network" not in err and "10.1.2.3" not in err, err
+
+
+@pytest.mark.parametrize("later", [
+    "ssh: connect to host 10.1.2.3 port 22: Network is unreachable\n",
+    "ssh: Could not resolve hostname box: Temporary failure in name resolution\n"])
+def test_a_drop_followed_by_this_machine_going_offline_gets_the_network_advice(env, monkeypatch, capsys, later):
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone)] + [(20, 255, later)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("once this machine is back on that network.") == 1, err
+    assert "restarting" not in err and "10.1.2.3" not in err, err
+
+
+def test_a_listener_that_never_connected_and_times_out_gets_the_network_advice(env, monkeypatch, capsys):
+    from ttp import cli
+    timeout = "ssh: connect to host 10.1.2.3 port 22: Connection timed out\n"
+    _listener_on_a_clock(cli, monkeypatch, [(20, 255, timeout)] * 6 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: cannot reach box right now (ssh: connect to host box port 22: Connection timed out)") == 1, err
+    assert "once this machine is back on that network." in err, err
+    assert "restarting" not in err and "10.1.2.3" not in err, err
+
+
+def test_a_listener_reconnecting_within_the_grace_prints_nothing(env, monkeypatch, capsys):
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    refused = "ssh: connect to host box port 22: Connection refused\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone), (0, 255, refused), (0, 255, refused), (1, 0, "")])
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_listener_whose_name_does_not_resolve_keeps_the_network_advice(env, monkeypatch, capsys):
+    from ttp import cli
+    dns = "ssh: Could not resolve hostname box: Temporary failure in name resolution\n"
+    _listener_on_a_clock(cli, monkeypatch, [(0, 255, dns)] * 5 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: cannot reach box right now (ssh: Could not resolve hostname box") == 1, err
+    assert "retrying; messages are delivered once this machine is back on that network." in err, err
+    assert "restarting" not in err
+
+
+@pytest.mark.parametrize("stderr,says,not_says", [
+    ("ssh: connect to host 10.1.2.3 port 22: Connection refused\n", "box is not accepting connections (probably restarting",
+     "back on that network"),
+    ("ssh: Could not resolve hostname box: Name or service not known\n", "try again once this machine is back on that network",
+     "restarting"),
+])
+def test_a_forwarded_command_explains_an_ssh_failure_from_the_right_side(env, monkeypatch, capsys, stderr, says, not_says):
+    """`ttp status`, `ttp say`, `ttp connect` and `ttp web` share forward()/_unreachable."""
+    from ttp import cli
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: subprocess.CompletedProcess([], 255, "", stderr))
+    assert cli.forward({"host": "box", "dir": "/x"}, ["status", "demo"]) == 255
+    err = capsys.readouterr().err
+    assert says in err and not_says not in err and "10.1.2.3" not in err, err
 
 
 _REPLACED = "ttp: replaced by a newer listener for chat c1 (pid 4242); this one stops without reconnecting (exit 3)\n"
@@ -10326,7 +10477,8 @@ def test_remote_listener_sends_the_outbox_on_every_reconnect(env, monkeypatch):
     flushes = iter([failed, None])
     calls = []
     monkeypatch.setattr(cli, "flush_outbox", lambda name, entry, quiet=False: calls.append(("flush", name)) or next(flushes))
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(("listen", quiet)) or 0)
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None:
+                        calls.append(("listen", quiet)) or 0)
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
     assert calls == [("flush", "demo"), ("flush", "demo"), ("listen", True)]
@@ -10361,7 +10513,7 @@ def test_a_stuck_queued_message_does_not_keep_the_listener_away(env, monkeypatch
     from ttp import cli, outbox
     _stuck_outbox(cli, outbox, monkeypatch, 127)
     results, naps = iter([255, 0]), []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None: next(results))
     def nap(s):
         naps.append(s)
         assert len(naps) < 3, "the listener backs off on the stuck message instead of connecting"
@@ -14829,6 +14981,70 @@ def test_an_unreachable_service_manager_with_no_live_daemon_is_not_taken_for_a_b
     assert res.outcome == "failed" and "Restart unavailable from here" in res and BUS_DOWN in res, res
     assert not (p.state / "restart.request").exists()
     _no_rollback(p, head)
+
+
+def _restart_times_out(env, monkeypatch, age=1.0):
+    """A systemd project whose `systemctl --user restart` times out (the old daemon still ends its step)."""
+    from ttp import service
+    p, head, calls = _sandboxed_systemd(env, monkeypatch, age=age)
+
+    def run(*a):
+        calls.append(a)
+        if a[:3] == ("systemctl", "--user", "restart"):
+            raise subprocess.TimeoutExpired(list(a), 60)
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    monkeypatch.setattr(service, "_run", run)
+    return p, head
+
+
+def _new_daemon_beat(p, version):
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 4343, "started": time.time(),
+                                                   "receipt": {"version": version}}))
+
+
+def test_a_timed_out_restart_whose_daemon_comes_up_on_the_new_runtime_in_the_window_succeeds(env, monkeypatch):
+    """A restart the service manager did not confirm in time is pending, not failed: the new daemon
+    reporting the runtime on disk within the re-check window is a success, exit 0 and no alert."""
+    import threading
+    from ttp import cli, service
+    p, head = _restart_times_out(env, monkeypatch)
+    disk = cli._runtime_version(p.harness / "runtime")
+    timer = threading.Timer(0.2, _new_daemon_beat, (p, disk))
+    timer.start()
+    res = service.restart(p, wait_s=2, tick_wait_s=2)
+    timer.join()
+    assert res.outcome == "running" and "timed out" in res and "re-check window" in res, res
+    assert not service.unreachable(res), "a timeout is not an unreachable service manager"
+    cli._exit_for_restart(res)                 # no SystemExit: `ttp upgrade` exits 0
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+    _no_rollback(p, head)
+
+
+def test_a_timed_out_restart_still_fails_when_no_daemon_runs_the_new_runtime_by_the_window_end(env, monkeypatch):
+    from ttp import cli, service
+    # Nothing comes up: the daemon is broken, so the runtime is rolled back, with a high alert and exit 1.
+    p, head = _restart_times_out(env, monkeypatch, age=3600)
+    (p.state / "daemon.pid").unlink()
+    t0 = time.time()
+    res = service.restart(p, wait_s=0.3, tick_wait_s=0.3)
+    assert time.time() - t0 < 5
+    assert res.outcome == "rolled_back" and "timed out" in res, res
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+    with pytest.raises(SystemExit) as e:
+        cli._exit_for_restart(res)
+    assert e.value.code == 1
+    # A daemon that comes up on another version than the runtime on disk is no success either.
+    import threading
+    p, head = _restart_times_out(env, monkeypatch)
+    timer = threading.Timer(0.1, _new_daemon_beat, (p, "0.0.1-old"))
+    timer.start()
+    res = service.restart(p, wait_s=2, tick_wait_s=2)
+    timer.join()
+    assert res.outcome == "failed" and "runs 0.0.1-old" in res, res
+    with pytest.raises(SystemExit) as e:
+        cli._exit_for_restart(res)
+    assert e.value.code == 1
 
 
 def test_a_refused_restart_keeps_the_managers_output_and_a_live_old_daemon(env, monkeypatch):
@@ -20810,6 +21026,42 @@ def test_memory_cli_retires_an_entry(env):
     assert (p.memory_dir / "archive" / stale.name).exists() and "Old news." not in p.memory_text()
 
 
+def test_memory_cli_retires_several_entries_with_one_commit(env):
+    p = make(env)
+    olds = [p.add_memory(f"Old news {i}.", kind="fact", title=f"Old news {i}") for i in range(3)]
+    keep = p.add_memory("Still true.", kind="fact")
+    git = ["git", "-C", str(p.harness)]
+    count = lambda: int(subprocess.run([*git, "rev-list", "--count", "HEAD"], capture_output=True,
+                                       text=True).stdout)
+    before = count()
+    from ttp import cli
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--forget", olds[0].stem, f"[{olds[1].stem}]", "--forget", olds[2].stem])
+    assert count() == before + 1, "several names make one harness commit"
+    assert out.getvalue().count("retired to") == 3
+    for f in olds:
+        assert (p.memory_dir / "archive" / f.name).exists() and not f.exists()
+        assert f"memory/{f.name}" not in p.memory_index.read_text()
+    assert keep.exists() and "Still true." in p.memory_text() and "Old news" not in p.memory_text()
+    assert subprocess.run([*git, "status", "--porcelain", "--", "memory", "MEMORY.md"], capture_output=True,
+                          text=True).stdout.strip() == "", "the moves and the index are all committed"
+
+
+def test_memory_cli_reports_an_unknown_name_and_still_retires_the_others(env):
+    p = make(env)
+    a, b = (p.add_memory(f"Stale {i}.", kind="fact", title=f"Stale {i}") for i in range(2))
+    from ttp import cli
+    with pytest.raises(SystemExit, match="no-such-entry"), contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", a.stem, "no-such-entry", b.stem])
+    assert not a.exists() and not b.exists() and "Stale" not in p.memory_text()
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "-1", "--format=%s"], capture_output=True,
+                         text=True).stdout
+    assert a.stem in log and b.stem in log
+    # Nothing retirable: no commit, the error still reported.
+    done, errors = p.forget_memories(["no-such-entry"])
+    assert done == [] and len(errors) == 1
+
+
 def test_a_standing_entry_is_refused_retirement_without_a_why(env):
     p = make(env)
     from ttp import cli, coordinator as coord
@@ -23940,6 +24192,33 @@ def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(e
     assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
 
 
+@pytest.mark.parametrize("passes", [True, False])
+def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(env, monkeypatch, passes):
+    """Two changes each append a new test function at the end of one test file: a conflict to git
+    that the batch settles without a model by keeping both. With checks that pass on the result both
+    land; when the checks fail only on the merged file, the second entry goes back as a conflict (for
+    a rebase), not check_failed, and the first lands alone."""
+    check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    _commit(other, "test_x.py", "def test_base():\n    assert True\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"test_x.py": "def test_base():\n    assert True\n\n\ndef test_one():\n    pass\n"}),
+             _entry(repo, "e2", {"test_x.py": "def test_base():\n    assert True\n\n\ndef test_two():\n    pass\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed", m
+    landed = _git_out(origin, "show", "proj:test_x.py")
+    if passes:
+        assert _statuses(m) == ["pushed", "pushed"]
+        assert m["results"][1]["detail"] == {"settled": ["test_x.py"], "settled_by": ["added"]}
+        assert "def test_one" in landed and "def test_two" in landed
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        d = m["results"][1]["detail"]
+        assert d["files"] == ["test_x.py"] and d["settled_by"] == ["added"] and d["cmd"] == check, d
+        assert "def test_one" in landed and "def test_two" not in landed
+        assert m["conflicts"]["sent_back"] == 1 and m["conflicts"]["auto_resolved"] == 0
+
+
 def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkeypatch):
     """An entry that conflicts with one that then fails its checks is requeued, and still counts as
     conflicted; a rebase that stops without a conflict is sent back but counts as none."""
@@ -25182,7 +25461,7 @@ def test_a_push_conflict_from_failed_checks_after_a_hunks_merge_names_the_check(
     _pq_batch(s)
     _pq_tend(s)
     woke = json.loads(s.p.db.task(s.review)["result"])["woke"]
-    assert "its checks failed after the batch merged changes of different lines: pytest -q" in woke, woke
+    assert "its checks failed after the batch merged both sides' changes: pytest -q" in woke, woke
     assert "assert 1 == 2" in woke
 
 
@@ -25206,6 +25485,64 @@ def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_lan
     assert t["status"] == "pushing"
     [q] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_queued"]
     assert "settle the conflict" in q["text"] and q["status"] == "handled"
+
+
+def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_reaches_the_coordinator(env, monkeypatch):
+    """A review whose approved head conflicts on its last attempt does not fail to the coordinator: the
+    daemon queues one review that continues it and rebases that head (labelled with it), and the
+    rebase may approve a commit it made. Tending again queues no second one. When the rebase's own
+    head keeps conflicting, it fails to the coordinator as before, with no third task."""
+    s = _pq(env, monkeypatch)
+    onto = "ef" * 20
+    s.p.db.update_task(s.review, max_attempts=1)
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["tests/test_a.py"], "onto": onto})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    _pq_tend(s)
+    rebases = s.p.db.q("SELECT * FROM tasks WHERE labels LIKE '%push_rebase:%'")
+    assert len(rebases) == 1, rebases
+    rb = rebases[0]
+    t = s.p.db.task(s.review)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["auto_rebase"] == rb["id"], res
+    assert "rebase" in rb["title"].lower() and rb["kind"] == "review" and rb["status"] == "queued"
+    assert json.loads(rb["labels"]) == [f"continues:{s.review}", f"push_rebase:{s.head}"]
+    assert json.loads(rb["depends_on"]) == [s.code] and s.branch in rb["spec"] and s.head in rb["spec"]
+    assert "push conflict" in rb["spec"] and "delivery.push_checks" in rb["spec"]
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
+    assert ev["status"] == "handled" and f"queued #{rb['id']}" in ev["text"], ev
+    # The rebase approves the head it made over the conflicting one.
+    fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "rebase onto the tip")
+    s.p.db.update_task(rb["id"], max_attempts=1)
+    assert _pq_hand_off(env, s, push=[{"branch": s.branch, "head": fix}], task=rb["id"])["status"] == "pushing"
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(rb["id"])
+    assert t["status"] == "failed" and "auto_rebase" not in json.loads(t["result"])
+    assert len(s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")) == 1
+    [ev] = [e for e in _pq_events(s.p, mark, task=rb["id"]) if e["kind"] == "task_failed"]
+    assert ev["status"] == "queued" and "keeps conflicting" in ev["text"], ev
+
+
+def test_a_conflicting_head_gets_no_rebase_review_past_the_review_cap_or_after_one_already_ran(env, monkeypatch):
+    """The rolling review-task cap holds the automatic rebase back: the review fails to the coordinator
+    as before. A head that already had a rebase review gets none again, whoever re-approves it."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    s.p.set_config("coordinator.max_review_tasks_per_day", 0)
+    s.p.db.update_task(s.review, max_attempts=1)
+    row = {"head": s.head, "branch": s.branch}
+    with s.p.db.tx():
+        assert pushq.auto_rebase(s.p, s.p.db.task(s.review), row, "origin/proj", "push conflict: x") is None
+    s.p.set_config("coordinator.max_review_tasks_per_day", 50)
+    other = s.p.db.add_task("Review again", "r", kind="review", origin="coordinator", depends_on=[s.code])
+    with s.p.db.tx():
+        first = pushq.auto_rebase(s.p, s.p.db.task(s.review), row, "origin/proj", "push conflict: x")
+        assert first and pushq.auto_rebase(s.p, s.p.db.task(other), row, "origin/proj", "push conflict: x") is None
+    assert pushq.rebase_head(s.p.db.task(first)) == s.head
 
 
 def test_a_code_task_in_review_is_closed_when_a_review_that_settled_its_push_conflict_pushes_it(env, monkeypatch):
@@ -26127,6 +26464,113 @@ def test_orderly_reboots_never_call_the_host_unstable(env, tmp_path, monkeypatch
     assert all("(orderly;" in n["text"] and "unstable" not in n["text"] for n in notes), notes
 
 
+def _reboot_series(p, tmp_path, monkeypatch, planned):
+    """Boots 1..len(planned) after boot-0, each cutting one run short; boot i was a planned host cycle
+    (a host-cycle record for boot i-1) when planned[i-1]."""
+    from ttp.daemon import Daemon
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    for i, plan in enumerate(planned, 1):
+        (tmp_path / f"b{i}").mkdir()
+        _lost_deep_runs(p, tmp_path / f"b{i}", f"boot-{i - 1}", costs=(1.0,))
+        booted = time.time() - (len(planned) + 1 - i) * 600
+        if plan:
+            _host_cycle_record(p.state, f"boot-{i - 1}", booted - 120, reason="firmware update", by="ttp drain")
+        _boot_as(monkeypatch, f"boot-{i}", booted)
+        d = Daemon(p.base)
+        d.tick()
+        d.tick()
+    return _reboot_notices(p)
+
+
+_UNSTABLE_WORDS = ("abrupt", "unstable", "power, cooling", "system logs")
+
+
+def test_planned_reboots_are_told_as_planned_at_low_severity_and_never_counted_as_unstable(env, tmp_path,
+                                                                                          monkeypatch):
+    """A reboot a host-cycle record planned gets a low-severity notice that says it was planned and
+    what planned it, with no abrupt/unstable wording or power and cooling advice, however many come."""
+    p = make(env)
+    from ttp import db as dbm
+    from ttp import machines as mm
+    notes = _reboot_series(p, tmp_path, monkeypatch, [True] * 4)
+    assert len(notes) == 4 and all(n["severity"] == "low" for n in notes), notes
+    for n in notes:
+        assert "(planned;" in n["text"] and "It was a planned host cycle (host-cycle record rec-" in n["text"], n
+        assert "firmware update" in n["text"] and not any(w in n["text"] for w in _UNSTABLE_WORDS), n
+    assert not p.db.kv("host_unstable_told")
+    boots = p.db.boots(0)
+    assert len(boots) == 4 and not any(dbm.unplanned_abrupt(b) for b in boots)
+    assert all(b["planned"]["by"].startswith("host-cycle record rec-") for b in boots), boots
+    assert dbm.host_line(boots).startswith("host: 4 reboots in 24 h (4 planned) (last "), dbm.host_line(boots)
+    texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE source='host' AND kind='boot'")]
+    assert texts and all(t.startswith("the host rebooted (planned);") for t in texts), texts
+    mm.add("box-a", tags="device")
+    for b in p.db.q("SELECT id, data FROM events WHERE source='host' AND kind='boot'"):
+        data = {**json.loads(b["data"]), "held": ["box-a-device: task #7 (run 3)"]}
+        p.db.x("UPDATE events SET data=? WHERE id=?", (json.dumps(data), b["id"]))
+    assert mm.stats(p.db).get("box-a", {}).get("reboots", 0) == 0, "a planned reboot counted against a machine"
+
+
+def test_only_unplanned_abrupt_reboots_count_toward_an_unstable_host(env, tmp_path, monkeypatch):
+    """Unplanned, planned, unplanned, unplanned: the planned 3rd is told as planned (low, no unstable
+    wording, though two abrupt ones came before it); the 4th is the 3rd unplanned one and raises
+    today's high 'looks unstable' warning, counting 3, not 4."""
+    p = make(env)
+    from ttp import db as dbm
+    notes = _reboot_series(p, tmp_path, monkeypatch, [False, False, True, False])
+    assert [n["severity"] for n in notes] == ["normal", "normal", "low", "high"], notes
+    assert all("(abrupt;" in notes[i]["text"] and "planned" not in notes[i]["text"] for i in (0, 1, 3)), notes
+    assert "(planned;" in notes[2]["text"] and not any(w in notes[2]["text"] for w in _UNSTABLE_WORDS), notes[2]
+    assert "The host looks unstable: 3 abrupt reboots cut runs short in 24 h; check its power, cooling and " \
+           "system logs." in notes[3]["text"], notes[3]
+    assert sum(1 for b in p.db.boots(0) if dbm.unplanned_abrupt(b)) == 3
+
+
+def test_a_power_cycle_intent_in_the_machine_ledger_makes_this_hosts_reboot_planned(env, tmp_path, monkeypatch):
+    """`ttp machines change add <this host> --power-cycle-at <t>` plans the reboot that comes around t:
+    the notice names the change; an intent for another machine, or far from the boot, plans nothing."""
+    p = make(env)
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    monkeypatch.setattr(mm, "here", lambda known=None: ("box-a", {}))
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    booted = time.time() - 600
+    ml.add_power_cycle("box-b", "1h", "other", "firmware", now=booted - 3600 - 60)   # another machine
+    ml.add_power_cycle("box-a", "1h", "other", "old", now=booted - 3 * 3600 - 3600)   # long before this boot
+    _lost_deep_runs(p, tmp_path, "boot-0", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-1", booted)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    (n,) = _reboot_notices(p)
+    assert "(abrupt;" in n["text"] and "planned" not in n["text"], n
+    pc = ml.add_power_cycle("box-a", "1h", "other", "new firmware", now=booted - 3600 - 60)
+    (tmp_path / "b2").mkdir()
+    _lost_deep_runs(p, tmp_path / "b2", "boot-1", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-2", time.time() - 60)
+    pc["at"] = time.time() - 120
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        for c in doc["changes"]:
+            if c["id"] == pc["id"]:
+                c["at"] = pc["at"]
+        ml._write(ml.LEDGER, doc)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    n = _reboot_notices(p)[-1]
+    assert n["severity"] == "low" and "(planned;" in n["text"], n
+    assert f"It was a planned host cycle (machine change #{pc['id']} by other): power-cycle intent" in n["text"], n
+    assert "new firmware" in n["text"] and not any(w in n["text"] for w in _UNSTABLE_WORDS), n
+
+
 def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -26407,7 +26851,7 @@ def _due_waiting_task(p, probe, since_ago=600.0, **extra):
 def _settle_probe(d, tid):
     d.probe_waiting()
     if tid in d._probes:
-        d._probes[tid][0].wait(10)
+        d._probes[tid][0].wait(_load_scaled(60))
         d.probe_waiting()
 
 
@@ -28059,7 +28503,9 @@ def test_the_boot_record_names_a_planned_host_cycle(env, tmp_path, monkeypatch):
     (row,) = p.db.q("SELECT data FROM events WHERE source='host' AND kind='boot'")
     assert json.loads(row["data"])["planned"]["reason"] == "chips off the bus; power cycled"
     note = _reboot_notices(p)
-    assert len(note) == 1 and "It was a planned host cycle: chips off the bus" in note[0]["text"], note
+    assert len(note) == 1 and note[0]["severity"] == "low", note
+    assert "It was a planned host cycle (host-cycle record rec-boot-a): chips off the bus" in note[0]["text"], note
+    assert "abrupt" not in note[0]["text"], note
 
 
 def test_a_coordinator_turn_lost_to_a_reboot_is_not_a_failed_turn(env, tmp_path):
@@ -42257,6 +42703,95 @@ def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, t
     assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
 
 
+def _recording_venv(path, ran):
+    """A venv stand-in whose python records how it was called, with a pytest on its PATH."""
+    venv = _fake_venv(path)
+    (venv / "bin" / "python").write_text(f'#!/bin/sh\necho "$@" >> {ran}\n')
+    (venv / "bin" / "pytest").write_text(f"#!/bin/sh\necho venv-pytest >> {ran}\n")
+    for name in ("python", "pytest"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv
+
+
+def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_path, monkeypatch, capsys):
+    """Replays `ttp checks -- 'pytest -q --no-device-tests'` beside a project check that already runs
+    it: it ran twice, the second time with the pytest on PATH, whose python lacked the project's
+    packages, so it failed at import after the first run passed."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    ran = tmp_path / "ran"
+    venv = _recording_venv(p.root / ".venv", ran)
+    stub = tmp_path / "stub"   # the pytest PATH finds outside the venv: no project packages
+    stub.mkdir()
+    (stub / "pytest").write_text(f"#!/bin/sh\necho path-pytest >> {ran}\nexit 1\n")
+    (stub / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+    cmd = "pytest -q --no-device-tests"
+    # A scoped project check that applies on this head runs it: the extra is dropped, not run again.
+    p.set_config("delivery.push_checks", [{"run": cmd, "if_exists": "a.txt"}])
+    cli.main(["checks", "--fresh", "--", cmd])
+    out = capsys.readouterr().out
+    runs = lambda: [ln for ln in ran.read_text().splitlines() if ln != "-c pass"]   # not the venv probe
+    assert runs() == ["-m pytest -q --no-device-tests"], "once, with the project venv's python"
+    assert "a scoped delivery.push_checks entry runs it on this head" in out
+    # Another spelling of the same pytest run is the same command.
+    ran.unlink()
+    p.set_config("delivery.push_checks", [f"{venv}/bin/python -m pytest -q --no-device-tests"])
+    cli.main(["checks", "--fresh", "--", cmd])
+    assert len(runs()) == 1
+    assert "delivery.push_checks already runs it" in capsys.readouterr().out
+    # An extra pytest no project check runs still uses the project's venv, not the pytest on PATH.
+    ran.unlink()
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--fresh", "--", "pytest -q tests/x.py"])
+    assert runs() == ["-m pytest -q tests/x.py"]
+    # The same with the venv already active (a run's environment): VIRTUAL_ENV picks it.
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    assert push.venv_cmd("pytest -q", repo) == f"{shlex.quote(str(venv / 'bin' / 'python'))} -m pytest -q"
+    assert push.venv_cmd("pytest -q", repo, {}) == "pytest -q"
+    # Spellings of one pytest run; shell syntax stays as written.
+    keys = {cli._same_run_key(c) for c in ("pytest -q", "py.test -q", "python3 -m pytest -q",
+                                            "/x/.venv/bin/python -m pytest -q", ".venv/bin/pytest -q")}
+    assert keys == {"pytest -q"}
+    assert cli._same_run_key("pytest -q; true") == "pytest -q; true"
+    assert cli._same_run_key("python3 tools/pytest.py") == "python3 tools/pytest.py"
+
+
+def test_ttp_checks_warns_of_a_broken_venv_with_the_command_that_makes_it_again(env, tmp_path, monkeypatch, capsys):
+    """A project-root .venv link to a venv made on another OS (its python points at an interpreter
+    missing here) leaves the checks without its packages: ttp checks says so and how to rebuild it."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    (repo / ".gitignore").write_text(".venv\nvenv/\n")
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\n[project.optional-dependencies]\ntest = ["pytest"]\n')
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    real = _fake_venv(repo / "venv", python=False)
+    (real / "bin" / "python").symlink_to(tmp_path / "elsewhere" / "python3")
+    (repo / ".venv").symlink_to("venv")
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--fresh"])
+    out = capsys.readouterr().out
+    assert out.count("warning: the venv") == 1, out   # .venv and venv are one venv
+    assert f"python3 -m venv --clear {real} && {real}/bin/python -m pip install -e '{repo}[test]'" in out
+    assert "warning: the venv" in (run / "checks.log").read_text()
+    assert push.venv_cmd("pytest -q", repo) == "pytest -q"   # never the broken venv's python
+    # A link that dangles, and a python that does not run; a working venv is not named.
+    (repo / ".venv").unlink()
+    (repo / ".venv").symlink_to(tmp_path / "gone")
+    (real / "bin" / "python").unlink()
+    (real / "bin" / "python").write_text("#!/bin/sh\necho bad interpreter >&2\nexit 1\n")
+    (real / "bin" / "python").chmod(0o755)
+    found = dict(push.broken_venvs(repo))
+    assert "which is missing" in found[repo / ".venv"] and "bad interpreter" in found[repo / "venv"]
+    (real / "bin" / "python").unlink()
+    (real / "bin" / "python").symlink_to(sys.executable)
+    assert list(push.broken_venvs(repo)) == [(repo / ".venv", found[repo / ".venv"])]
+    assert push.venv_rebuild_cmd(tmp_path / "plain" / ".venv").endswith("-m pip install pytest")
+
+
 def test_ttp_checks_still_reads_a_checks_record_from_before_extras_were_split(env, tmp_path, monkeypatch):
     from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -44689,8 +45224,8 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     assert not rc.exists()
 
 
-def _check_until_ended(p, rc, timeout=20):
-    deadline = time.time() + timeout
+def _check_until_ended(p, rc, timeout=None):
+    deadline = time.time() + (timeout or _load_scaled(60))
     while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
         time.sleep(0.1)
     return _ttp_run(p, "detach", "--check", str(rc))
@@ -45823,6 +46358,8 @@ def test_devq_start_is_idempotent_one_runner_holds_the_lock(devq_dir):
     assert first.returncode == 0 and "runner started" in first.stdout, first.stderr
     second = _devq("start", d, json.dumps(DEVQ_FAST))
     assert second.returncode == 0 and "already running" in second.stdout
+    # The runner holds its lock before it writes runner.pid and logs its start: wait for the line.
+    assert _wait_for(lambda: _devq_runner_pids(d), _load_scaled(30)), "the runner never logged its start"
     pid = int((d / "runner.pid").read_text())
     assert len(_devq_runner_pids(d)) == 1
     # A runner started by hand while one is up exits at once without touching anything.
@@ -49616,6 +50153,27 @@ def test_heal_known_machine_outage_keeps_the_check_quiet_then_grace_after_it(env
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
 
 
+def test_heal_known_outage_end_keeps_a_still_open_self_fix_task(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, grace_s=0, machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "2h", now=now)
+    heal.run(d, "svc", spec, now + 10)
+    tid = p.db.add_task("open self-fix", kind="code") if hasattr(p.db, "add_task") else None
+    assert tid
+    st = heal.state(p.db, "svc")
+    st["task"] = tid
+    heal._save(p.db, "svc", st)
+    ml.clear_outage("box-a")
+    heal.run(d, "svc", spec, now + 60)
+    heal.run(d, "svc", spec, now + 120)
+    assert heal.state(p.db, "svc")["task"] == tid
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] <= 1
+
+
 @pytest.mark.parametrize("escalate", ["user", "coordinator"])
 def test_heal_unknown_check_under_a_known_machine_outage_tells_no_one(env, escalate):
     from ttp import heal
@@ -53349,6 +53907,81 @@ def test_obligation_run_records_are_not_filed_twice_when_an_aged_out_run_comes_b
     assert evidence() == ["commit abc"]
     assert [e["text"] for e in ob.get(p.db, oid2)["owners"][str(tid)]["evidence"]] == ["commit def"]
     assert ob._load(p.db)["runs"].get(rid) == 3 and ob._load(p.db)["runs_kept"]
+
+
+
+def test_obligation_legacy_offset_of_an_aged_out_run_is_not_filed_twice(env, monkeypatch):
+    """State from before offsets were kept: an aged-out run's offset is gone. When its task is re-queued,
+    only the records written after it left the window are filed; its open obligation gets no replay."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    run_dir = p.runs / "r-legacy"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    rid = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+    (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 600, "id": oid, "kind": "progress",
+                                                   "evidence": "commit old"}) + "\n")
+    check(now + 700)
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (int(rid),))
+    p.db.update_task(tid, status="done")
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    st = ob._load(p.db)
+    st["runs"].pop(rid)
+    st.pop("runs_kept")
+    p.db.set_kv(ob.KV, st)
+    p.db.update_task(tid, status="queued")
+    (run_dir / ob.RUN_FILE).open("a").write(json.dumps({"ts": later + 30, "id": oid, "kind": "progress",
+                                                        "evidence": "commit new"}) + "\n")
+    assert ob.file_runs(p, later + 60) == []
+    assert [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]] == ["commit old", "commit new"]
+    assert ob._load(p.db)["runs"].get(rid) == 2 and ob._load(p.db)["runs_kept"]
+
+
+def test_obligation_kept_run_offsets_are_bounded(env, monkeypatch):
+    """Kept offsets are checked in chunks (one SQL variable each) and dropped once the run's task is
+    closed and all its obligations are received or dropped; such a run read again changes nothing."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    tid2 = p.db.add_task("build another", "make it", kind="work", tier="light", origin="coordinator")
+    tid3 = p.db.add_task("build a third", "make it", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    oid2 = ob.add(p, "the second report", [tid2], now=now)
+    oid3 = ob.add(p, "the third report", [tid3], now=now)
+    rids = {}
+    for t, o, name in ((tid, oid, "a"), (tid2, oid2, "b"), (tid3, oid3, "c")):
+        run_dir = p.runs / f"r-{name}"
+        run_dir.mkdir(parents=True)
+        p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+               (t, "worker", now, "done", str(run_dir)))
+        rids[t] = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+        (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 600, "id": o, "kind": "receipt",
+                                                       "evidence": f"docs/{name}.md"}) + "\n")
+    ob.drop(p, oid3, "no longer wanted", now=now + 60)
+    ob.file_runs(p, now + 700)
+    p.db.update_task(tid, status="done")
+    p.db.update_task(tid2, status="blocked")
+    p.db.update_task(tid3, status="cancelled")
+    # Many offsets of runs that are gone: more than SQLite allows variables in one statement.
+    q = p.db.q
+
+    def capped(sql, args=()):
+        if len(args) > ob.RUN_IDS_PER_QUERY:
+            raise sqlite3.OperationalError("too many SQL variables")
+        return q(sql, args)
+    monkeypatch.setattr(p.db, "q", capped)
+    st = ob._load(p.db)
+    st["runs"].update({str(10 ** 6 + i): 1 for i in range(5 * ob.RUN_IDS_PER_QUERY)})
+    p.db.set_kv(ob.KV, st)
+    later = now + (ob.RUN_FILES_DAYS + 1) * 86400
+    assert ob.file_runs(p, later) == []
+    assert ob._load(p.db)["runs"] == {rids[tid2]: 1}, "only the run whose task may still act keeps its offset"
+    # The pruned run comes back with its task re-queued: its records are no-ops on a received obligation.
+    p.db.update_task(tid, status="queued")
+    assert ob.file_runs(p, later + 60) == []
+    assert ob.get(p.db, oid)["receipt"]["evidence"] == "docs/a.md"
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"] == []
 
 
 def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(env, monkeypatch):
@@ -60933,3 +61566,391 @@ def test_a_review_only_verdict_does_not_stand_in_for_a_review_that_pushes(env, m
     remote, branch = pushq.target(s.p)
     _git_out(s.p.root, "update-ref", f"refs/remotes/{remote}/{branch}", head)
     assert reviewreuse.delivered(s.p, head)
+
+
+def test_pause_until_reboot_without_reason_records_a_default_but_a_plain_pause_needs_one(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, projpause, runner
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-a")
+    monkeypatch.setattr(projpause, "caller", lambda _p: "worker")
+    cli.main(["pause", "demo", "--until-reboot"])
+    assert projpause.current(p.db)["reason"] == "host power cycle (until reboot)"
+    cli.main(["resume", "demo"])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["pause", "demo"])
+    assert e.value.code == 2
+
+
+def test_host_cycle_docs_pass_a_reason_and_tell_helpers_to_fsync():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "skills"
+    for f in ("tt-project-harness/SKILL.md", "tt-project/SKILL.md", "tt-project/operate.md"):
+        for line in (root / f).read_text().splitlines():
+            if "--until-reboot" in line and "ttp pause" in line:
+                assert "--reason" in line, (f, line)
+    assert "fsync" in (root / "tt-project-harness/SKILL.md").read_text()
+
+
+def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_turn(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(RESTR_CHARTER)
+    said = db.post("in", "goals: as below", chat=None, channel="web", kind="user", provenance="web-session")
+    approved = " ".join(f"Keep docs page {i} generic, with no setup details." for i in range(45))
+    assert len(approved) > 2000
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": approved}
+    assert "matches 2" in coord.apply(p, [act], turn=1, user_turn=True, messages=[said])[0]
+    # A later turn rewords it: refused, with the approved text whole and the file that holds it.
+    err = coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)", "text": approved[:-1] + "!"}], turn=2)
+    assert len(err) == 1 and "was for other text" in err[0] and repr(approved) in err[0], err
+    [rec] = db.kv(coord.CHARTER_APPROVALS_KEY)
+    path = f"tt-project/state/charter-approved/{rec['id']}.txt"
+    assert path in err[0] and (p.root / path).read_text() == approved
+    # Both ways it reaches the next turn keep it whole: the rejected line and the immediate retry.
+    db.set_kv(coord.REJECTED_KEY, err)
+    ids = [r["id"] for r in db.q("SELECT id FROM events WHERE kind='charter_retry' AND status='queued'")]
+    assert len(ids) == 1
+    d = coord.digest(p, {}, ids, [])
+    assert d.count(repr(approved)) == 2 and "[cut]" not in d, d
+    # The same text resent: applied.
+    assert coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)"}], turn=13) == []
+    assert approved in p.charter_path.read_text()
+
+
+def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
+    """A daemon whose coordinator turns run in-process: `cost_of(msg_ids, ev_ids)` is what a turn over
+    that batch would cost; one over its cap ends as the agent CLI does, with error_max_budget_usd.
+    `flaky(note)` True fails a turn for another reason (not over budget)."""
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    p.set_config("coordinator.max_turns_per_hour", 100000)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_coord_check", lambda *a, **k: None)
+    turns = []
+
+    def start_run(role, prompt, provider, tier, cwd, **kw):
+        note = kw["note"]
+        rid = p.db.x("INSERT INTO runs(role,provider,started,status,note) VALUES('coordinator','fake',?,'running',?)",
+                     (time.time(), json.dumps(note)))
+        cost, cap = cost_of(note["messages"], note["events"]), kw["budget_usd"]
+        other = flaky(note)
+        ok = cost <= cap and not other
+        turns.append({"messages": list(note["messages"]), "events": list(note["events"]), "cap": cap, "ok": ok,
+                      **({"other": True} if other else {})})
+        p.db.x("UPDATE runs SET status=?, ended=?, cost_usd=? WHERE id=?",
+               ("ok" if ok else "failed", time.time(), min(cost, cap), rid))
+        err = "" if ok else "boom" if other else "error_max_budget_usd: Reached maximum budget"
+        usage = SimpleNamespace(structured={"actions": [], "summary": "ok"} if ok else None, final_text="", error=err,
+                                extra={"subtype": "success" if ok else "error" if other else "error_max_budget_usd"})
+        d._finish_coordinator({"id": rid, "dir": "", "provider": "fake"}, usage, "ok" if ok else "failed", note)
+        return rid
+    monkeypatch.setattr(d, "start_run", start_run)
+
+    def step():
+        p.db.x("DELETE FROM kv WHERE key='coordinator_backoff_until'")
+        p.db.set_kv("last_coordinator_turn", time.time())   # no idle wake: only the backlog starts turns
+        d.cfg = p.config()
+        d.maybe_coordinate()
+        d.sweep_alerts()
+    return d, turns, step
+
+
+def _backlog(p, msgs, events, age=3600):
+    old = time.time() - age
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # what the project started with
+    p.db.x("UPDATE events SET status='handled' WHERE status='queued'")
+    mids = [p.db.post("in", f"message {i}", chat="cli") for i in range(msgs)]
+    p.db.x("UPDATE messages SET ts=? WHERE direction='in'", (old,))
+    eids = [p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (old, "daemon", "task_done", "normal", f"#{i} done", "queued")) for i in range(events)]
+    return mids, eids
+
+
+def _turn_budget_invariant(p):
+    """Every pending item is eligible for a next batch (alone at its raise, or in a batch) or parked,
+    and every parked one is named in the open coord-budget alert."""
+    from ttp import turnsize
+    cfg = p.config()
+    recs = turnsize.records(p.db)
+    pending = [turnsize.item_key("m", r["id"]) for r in
+               p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0")] + \
+        [turnsize.item_key("e", r["id"]) for r in p.db.q("SELECT id FROM events WHERE status='queued'")]
+    ep = p.db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL", (turnsize.ALERT_KEY,))
+    parked = []
+    for k in pending:
+        st, _ = turnsize.status(cfg, recs.get(k))
+        assert st in ("batch", "solo", "parked"), (k, st)
+        if st == "parked":
+            parked.append(k)
+            assert ep and re.search(re.escape(turnsize.label(k)) + r"\b", ep["text"]), \
+                f"{k} is parked but not named in the alert: {ep and ep['text']}"
+    if not parked:
+        assert not ep, f"the alert is open with nothing parked: {ep['text']}"
+    return parked
+
+
+def test_an_over_budget_backlog_is_split_in_halves_never_retried_as_is_and_handled_once(env, monkeypatch):
+    """A daemon resumes on 22 user messages and 10 events; a turn over the whole batch costs more than
+    the $1.00 cap. Each failed batch is halved, every item is handled by exactly one turn at the
+    configured cap, and nothing is parked or alerted."""
+    p = make(env)
+    from ttp import turnsize
+    mids, eids = _backlog(p, 22, 10)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 0.1 + 0.07 * (len(m) + len(e)))
+    for _ in range(12):
+        step()
+        _turn_budget_invariant(p)
+    assert turns[0] == {"messages": mids, "events": eids, "cap": 1.0, "ok": False}, turns[0]
+    assert turns[1]["messages"] == mids[:16] and not turns[1]["events"] and not turns[1]["ok"]
+    assert turns[2] == {"messages": mids[:8], "events": [], "cap": 1.0, "ok": True}, turns[2]
+    failed = [(tuple(t["messages"]), tuple(t["events"]), t["cap"]) for t in turns if not t["ok"]]
+    assert len(failed) == len(set(failed)), f"a failed batch was retried at the same cap: {failed}"
+    assert all(t["cap"] == 1.0 for t in turns), "a split needs no raise"
+    done_m = [i for t in turns if t["ok"] for i in t["messages"]]
+    done_e = [i for t in turns if t["ok"] for i in t["events"]]
+    assert sorted(done_m) == mids and sorted(done_e) == eids, "an item was dropped or handled twice"
+    assert not turnsize.records(p.db), "a handled item kept its record"
+    assert not p.db.q("SELECT id FROM messages WHERE ref=?", (turnsize.ALERT_KEY,)), "a split is no alert"
+    assert not p.db.kv("coordinator_failures"), "a handled over-budget turn is no coordinator failure"
+    assert p.config()["coordinator"]["turn_budget_usd"] == 1.0
+
+
+def test_a_normal_backlog_runs_as_one_turn_at_the_configured_cap(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    mids, eids = _backlog(p, 3, 2)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 0.3)
+    step()
+    step()
+    assert turns == [{"messages": mids, "events": eids, "cap": 1.0, "ok": True}], turns
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE role='coordinator'")["note"])
+    assert note["budget_usd"] == 1.0 and "sizing" not in note
+    assert not p.db.q("SELECT id FROM events WHERE kind='turn_budget'") and not turnsize.records(p.db)
+
+
+def test_turn_cap_ceiling_is_clipped_by_the_hourly_coordinator_and_dollar_caps(env):
+    p = make(env)
+    from ttp import turnsize
+    cfg = p.config()
+    assert turnsize.ceiling(cfg) == 2.0 and cfg["coordinator"]["turn_budget_ceiling_usd"] == 0
+    cfg["coordinator"]["turn_budget_ceiling_usd"] = 50
+    cfg["budget"].update(hourly_coordinator_usd=3.0, daily_usd=2.5, global_daily_usd=0)
+    assert turnsize.ceiling(cfg) == 2.5
+    cfg["budget"]["global_daily_usd"] = 1.2
+    assert turnsize.ceiling(cfg) == 1.2
+    room = turnsize.headroom(cfg, {"coordinator_1h": 1.0, "coordinator_user_1h": 0.5, "daily_cap": 20,
+                                   "spent_today": 19.0, "global_cap": 100, "global_today": 10})
+    assert room == pytest.approx(1.0)
+
+
+def test_a_single_item_over_budget_runs_once_at_the_ceiling_when_there_is_room(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 1.5 if mid in m else 0.2)
+    step()
+    # The hourly coordinator limit leaves no room for the raise yet: it waits, other items go on.
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 0.5)
+    other = p.db.post("in", "other", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (other,))
+    step()
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [([mid], 1.0, False), ([other], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == []
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 10.0)
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"], turns[-1]["ok"]) == ([mid], 2.0, True), turns
+    assert "runs it alone once more at $2.00" in p.db.one("SELECT text FROM events WHERE kind='turn_budget'")["text"]
+    assert not turnsize.records(p.db)
+    later = p.db.post("in", "later", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (later,))
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"]) == ([later], 1.0), "the cap did not fall back"
+    assert p.config()["coordinator"]["turn_budget_usd"] == 1.0
+
+
+def test_a_single_item_over_the_ceiling_is_parked_with_one_normal_alert_until_the_cap_rises(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 5.0 if mid in m else 0.2)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(4):
+        step()
+    assert [(t["cap"], t["ok"]) for t in turns] == [(1.0, False), (2.0, False)], turns
+    assert _turn_budget_invariant(p) == [f"m:{mid}"]
+    sent = p.db.q("SELECT severity, text FROM messages WHERE kind='alert' AND ref=?", (turnsize.ALERT_KEY,))
+    assert [s["severity"] for s in sent] == ["normal"], sent
+    assert f"user message #{mid}" in sent[0]["text"] and "turn_budget_usd" in sent[0]["text"]
+    other = p.db.post("in", "next", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (other,))
+    step()
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[2:]] == [([other], 1.0, True)], turns
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 0, "the parked item was dropped"
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] is None, "the alert cleared with an item parked"
+    p.set_config("coordinator.turn_budget_usd", 6.0)
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"], turns[-1]["ok"]) == ([mid], 6.0, True), turns
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] and _turn_budget_invariant(p) == []
+    assert not turnsize.records(p.db) and not p.db.kv(turnsize.PARKED_KEY)
+
+
+def test_an_item_unparked_by_a_higher_ceiling_runs_at_it_even_after_another_item_succeeds(env, monkeypatch):
+    """#2064 probe 1: A parked at $2 and B at $4; the ceiling goes to $3 while the caps leave $2 of
+    room. C's turn succeeds meanwhile; A must then run at $3, never be dropped, and B stays parked."""
+    p = make(env)
+    from ttp import turnsize
+    (a, b, c), _ = _backlog(p, 3, 0)
+    rec = {"attempts": 2, "base": 1.0, "size": 1, "ts": time.time()}
+    p.db.set_kv(turnsize.STATE_KEY, {f"m:{a}": {**rec, "cap": 2.0, "ceiling": 2.0},
+                                     f"m:{b}": {**rec, "cap": 4.0, "ceiling": 4.0}})
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 2.5 if a in m else 5.0 if b in m else 0.2)
+    p.set_config("coordinator.turn_budget_ceiling_usd", 3.0)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 2.0)
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [([c], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == [f"m:{b}"]
+    assert turnsize.records(p.db)[f"m:{a}"]["cap"] == 2.0, "C's turn touched A's record"
+    assert turnsize.status(p.config(), turnsize.records(p.db)[f"m:{a}"]) == ("solo", 3.0)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(3):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[1:]] == [([a], 3.0, True)], turns
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (a,))["handled"] == 1
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (b,))["handled"] == 0
+    assert list(turnsize.records(p.db)) == [f"m:{b}"]
+
+
+def test_two_heavy_items_parked_run_at_a_raised_ceiling_with_no_wasted_base_turn(env, monkeypatch):
+    """#2064 probe 2: two items costing $3.00 each are parked at the default $2.00 ceiling, the rest and
+    new messages go on in one batch; the ceiling set to $6 (clipped to the $4 hourly coordinator limit)
+    runs each alone at $4, with no turn at the $1 base in between."""
+    p = make(env)
+    from ttp import turnsize
+    (a, b, c, dd), _ = _backlog(p, 4, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 3.0 * len({a, b} & set(m)) + 0.2)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(10):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [
+        ([a, b, c, dd], 1.0, False), ([a, b], 1.0, False), ([a], 1.0, False), ([a], 2.0, False),
+        ([b], 1.0, False), ([b], 2.0, False), ([c, dd], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == [f"m:{a}", f"m:{b}"]
+    sent = p.db.q("SELECT severity, text FROM messages WHERE kind='alert' AND ref=?", (turnsize.ALERT_KEY,))
+    assert [s["severity"] for s in sent] == ["normal", "normal"], sent
+    assert f"user message #{a}" in sent[1]["text"] and f"user message #{b}" in sent[1]["text"]
+    new = [p.db.post("in", f"later {i}", chat="cli") for i in range(3)]
+    p.db.x(f"UPDATE messages SET ts=ts-60 WHERE id IN ({','.join('?' * len(new))})", new)
+    n = len(turns)
+    for _ in range(3):
+        step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [(new, 1.0, True)], turns[n:]
+    p.set_config("coordinator.turn_budget_ceiling_usd", 6.0)
+    n = len(turns)
+    for _ in range(4):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [([a], 4.0, True), ([b], 4.0, True)], turns[n:]
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] and not turnsize.records(p.db)
+
+
+def test_an_item_parked_by_a_lowered_ceiling_is_named_in_the_alert(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 1.5)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 0.0)
+    step()
+    assert _turn_budget_invariant(p) == []   # due alone at $2.00 once there is room
+    p.set_config("coordinator.turn_budget_ceiling_usd", 1.0)
+    step()
+    assert _turn_budget_invariant(p) == [f"m:{mid}"] and len(turns) == 1
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_turn_budget_invariant_holds_over_random_failures_and_setting_changes(env, monkeypatch, seed):
+    """Random backlogs, item costs, other failures, headroom and setting changes: after every daemon
+    step every pending item is eligible or parked and named in the alert; no over-budget batch is
+    retried at the same cap; no item is handled by two turns; once the settings allow, all drain."""
+    import random
+    p = make(env)
+    from ttp import turnsize
+    rnd = random.Random(seed)
+    weight: dict = {}
+
+    def cost(m, e):
+        return 0.05 + sum(weight[("m", i)] for i in m) + sum(weight[("e", i)] for i in e)
+
+    room = {"v": 100.0}
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: room["v"])
+    d, turns, step = _turn_budget_rig(p, monkeypatch, cost, flaky=lambda note: rnd.random() < 0.1)
+    _backlog(p, 0, 0)
+    old = time.time() - 3600
+
+    def add():
+        for _ in range(rnd.randint(1, 6)):
+            w = rnd.choice([0.02, 0.05, 0.1, 0.3, 1.5, 2.5, 5.0])
+            if rnd.random() < 0.5:
+                i = p.db.post("in", "m", chat="cli")
+                p.db.x("UPDATE messages SET ts=? WHERE id=?", (old, i))
+                weight[("m", i)] = w
+            else:
+                i = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                           (old, "daemon", "task_done", "normal", f"e{rnd.random()}", "queued"))
+                weight[("e", i)] = w
+    for _ in range(80):
+        r = rnd.random()
+        if r < 0.25:
+            add()
+        elif r < 0.35:
+            p.set_config("coordinator.turn_budget_usd", rnd.choice([0.5, 1.0, 2.0]))
+        elif r < 0.45:
+            p.set_config("coordinator.turn_budget_ceiling_usd", rnd.choice([0, 1.0, 3.0, 6.0]))
+        elif r < 0.5:
+            room["v"] = rnd.choice([0.0, 1.0, 3.0, 100.0])
+        step()
+        _turn_budget_invariant(p)
+    p.set_config("coordinator.turn_budget_usd", 10.0)
+    p.set_config("coordinator.turn_budget_ceiling_usd", 0)
+    p.set_config("budget.hourly_coordinator_usd", 50.0)
+    room["v"] = 100.0
+    d2, turns2, step2 = _turn_budget_rig(p, monkeypatch, cost)
+    for _ in range(60):
+        step2()
+        _turn_budget_invariant(p)
+    over = [(frozenset(t["messages"]), frozenset(t["events"]), t["cap"]) for t in turns + turns2
+            if not t["ok"] and not t.get("other")]
+    assert len(over) == len(set(over)), "an over-budget batch was retried at the same cap"
+    done = [("m", i) for t in turns + turns2 if t["ok"] for i in t["messages"]] + \
+        [("e", i) for t in turns + turns2 if t["ok"] for i in t["events"]]
+    assert len(done) == len(set(done)), "an item was handled by two turns"
+    assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0"), "an item never ran"
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "an event never ran"
+    assert not turnsize.records(p.db) and not _turn_budget_invariant(p)
+
+
+def test_setup_defaults_show_the_account_level_global_cap(env, tmp_path, monkeypatch):
+    from ttp import cli, project
+    monkeypatch.setattr(project, "HOME_DIR", tmp_path / "home")
+    (tmp_path / "home").mkdir()
+    before = "\n".join(cli.new_project_defaults_lines())
+    assert "$777" not in before
+    (tmp_path / "home" / "settings.json").write_text('{"budget": {"global_daily_usd": 777}}')
+    assert "$777" in "\n".join(cli.new_project_defaults_lines())
+
+
+def test_upgrade_keeps_a_light_tier_model_coordinator(env):
+    from ttp import cli
+    p = make(env)
+    assert cli._keep_light_coordinator(p) == ""         # no override: follows the standard tier
+    p.set_config("providers.claude.tiers.light.model", "haiku")
+    note = cli._keep_light_coordinator(p)
+    assert "upgrade note" in note
+    assert p.config()["coordinator"]["model_tier"] == ""
+    p.set_config("coordinator.model_tier", "standard")   # the project's own choice stays
+    assert cli._keep_light_coordinator(p) == ""
+    assert p.config()["coordinator"]["model_tier"] == "standard"

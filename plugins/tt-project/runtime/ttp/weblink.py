@@ -111,7 +111,8 @@ def _ssh_ok(host: str) -> str:
                            capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return str(e)
-    return "" if r.returncode == 0 else ((r.stderr or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
+    from . import sshfail
+    return "" if r.returncode == 0 else sshfail.why(r.stderr, host, r.returncode)
 
 
 def remote(name: str, entry: dict, remote_port: int, tok: str) -> tuple[str, int]:
