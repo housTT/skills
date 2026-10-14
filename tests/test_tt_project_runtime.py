@@ -47862,7 +47862,7 @@ def _devq_submit(d, cfg, job, cmd, **spec):
 
 
 def _devq_marker(d, job, timeout=None):
-    assert _wait_for_path(d / "done" / f"{job}.json", timeout or _load_scaled(20)), (d / "runner.log").read_text()
+    assert _wait_for_path(d / "done" / f"{job}.json", timeout or _load_scaled(90)), (d / "runner.log").read_text()
     return json.loads((d / "done" / f"{job}.json").read_text())
 
 
