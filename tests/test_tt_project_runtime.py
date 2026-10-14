@@ -54304,6 +54304,7 @@ def test_every_failed_checks_run_leaves_a_receipt_that_opens_no_gap_unless_class
     receipt = failed_run()
     assert receipt["kind"] == "check_failed" and receipt["check"] == selector and receipt["rc"] == 1
     assert receipt["head"] == head and receipt["purpose"] == "candidate" and receipt["unrelated"] is False
+    assert receipt["not_executed"] == ["git diff --check"]
     assert f"Unreviewed delivery identity: {head}" in receipt["output"]
     assert json.loads((run / "checks.json").read_text())["commands"] == [selector, "git diff --check"]
     review = {"status": "failed", "review_failure": "check_only", "summary": "checks failed"}
@@ -54312,6 +54313,7 @@ def test_every_failed_checks_run_leaves_a_receipt_that_opens_no_gap_unless_class
     p.set_config("delivery.push_checks", [{"run": "true", "if_exists": "absent/**"}])
     receipt = failed_run()
     assert receipt["kind"] == "none_apply" and receipt["check"] is None and receipt["head"] == head
+    assert receipt["not_executed"] == [], "a check skipped as not applicable is not an unrun one"
     assert checkgaps.wait(p, {"id": 1}, review, run, p.config()) is None
     # A harness run's receipt says so, and a missing target in it still opens no gap.
     p.set_config("delivery.push_checks", [])
@@ -54326,6 +54328,46 @@ def test_every_failed_checks_run_leaves_a_receipt_that_opens_no_gap_unless_class
     p.set_config("delivery.push_checks", ["true"])
     cli.main(["checks"])
     assert not (run / "check_failure.json").exists(), "a pass erases the failed receipt"
+
+
+def test_a_refused_exact_head_lists_the_unrun_checks_as_not_executed(env, monkeypatch):
+    """A mandatory selector that refuses the exact head leaves the receipt next to checks.json and
+    checks.log, for the run's purpose, with every check it kept from running listed as not executed;
+    nothing after it runs, and a passing run keeps its old checks.json with no such list."""
+    from ttp import cli
+    p = make(env)
+    (p.root / "scripts").mkdir()
+    _commit_files(p.root, {"scripts/select.py": "import subprocess\n"
+        "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+        "print('Unreviewed delivery identity: ' + head)\nraise SystemExit(65)\n"}, "selector")
+    selector, suite, extra = "python3 scripts/select.py", "touch suite-ran", "touch extra-ran"
+    p.set_config("delivery.push_checks", [selector, suite])
+    head = _git_out(p.root, "rev-parse", "HEAD").strip()
+    run = env["tmp"] / "refused-run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks", "--", extra])
+    assert exc.value.code == 1
+    receipt = json.loads((run / "check_failure.json").read_text())
+    record = json.loads((run / "checks.json").read_text())
+    assert receipt["kind"] == "check_failed" and receipt["check"] == selector and receipt["rc"] == 65
+    assert receipt["head"] == head and receipt["purpose"] == "candidate"
+    assert receipt["not_executed"] == [suite, extra] == record["not_executed"]
+    assert record["passed"] is False and record["purpose"] == "candidate" and record["skipped"] == []
+    assert f"Unreviewed delivery identity: {head}" in (run / "checks.log").read_text()
+    assert not (p.root / "suite-ran").exists() and not (p.root / "extra-ran").exists()
+    # The refusal stands: --fresh or a rerun on the same head refuses again, never reuses a pass.
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh", "--", extra])
+    assert json.loads((run / "check_failure.json").read_text())["not_executed"] == [suite, extra]
+    p.set_config("delivery.push_checks", ["true", "git diff --check"])
+    cli.main(["checks"])
+    record = json.loads((run / "checks.json").read_text())
+    assert record["passed"] is True and record["commands"] == ["true", "git diff --check"]
+    assert "not_executed" not in record and not (run / "check_failure.json").exists()
 
 
 def test_applicability_retry_start_failure_remains_retryable(env, monkeypatch):

@@ -1660,6 +1660,7 @@ def cmd_checks(a) -> None:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
+    executed, selected = [], []
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     start = log.stat().st_size if log.exists() else 0
@@ -1673,9 +1674,11 @@ def cmd_checks(a) -> None:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base)
+            selected = list(todo)
         except push.ScopeError as e:
             out.write(f"{e}\n")
             todo, skipped, passed, failed, scope_error = [], [], False, str(e.check), e.check
+            selected = list(cmds)   # no check was even judged, so none of them ran
         # A harness run qualifies the head only through a harness check: one skipped by if_exists or
         # if_changed leaves the untagged checks and extras (or nothing) to pass, which is no qualification.
         unqualified = (purpose == "harness" and passed
@@ -1713,6 +1716,7 @@ def cmd_checks(a) -> None:
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
         child_env = {"PWD": top, **(slot.env() if slot else {})}
         for c in [] if hit else todo:
+            executed.append(c)
             out.write(f"$ {c}\n")
             out.flush()
             check_start = out.tell()
@@ -1733,8 +1737,11 @@ def cmd_checks(a) -> None:
                 break
         if slot:
             slot.close()
-    env_problem, also = None, False
+    env_problem, also, not_executed = None, False, []
     if not passed:
+        # The applicable checks a failure or refusal left unrun stay listed as such, never as passed;
+        # those verified through the lineage marker were checked, not left unrun.
+        not_executed = [c for c in selected if c not in executed and c not in verified_cmds]
         with open(log, "rb") as f:   # this call's part of the log
             f.seek(start)
             text = f.read().decode("utf-8", errors="replace")
@@ -1758,12 +1765,14 @@ def cmd_checks(a) -> None:
                            "check": check.config() if check else None, "targets": [], "head": head,
                            "base": base, "worktree": top, "rc": rc if ran else None,
                            "output": output[-8000:], "unrelated": False}),
-            "purpose": purpose, **({"env_problem": env_problem} if env_problem else {})})
+            "purpose": purpose, "not_executed": not_executed,
+            **({"env_problem": env_problem} if env_problem else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
                                                         if verified_cmds else {}),
                                                      "purpose": purpose, **({"not_run": not_run} if not_run else {}),
+                                                     **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
