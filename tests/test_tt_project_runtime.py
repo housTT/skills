@@ -44543,6 +44543,8 @@ def _devq_runner_pids(d):
     log, deadline = d / "runner.log", time.time() + _load_scaled(20)
     while time.time() < deadline and "runner started" not in (log.read_text() if log.exists() else ""):
         time.sleep(0.05)
+    # The runner writes runner.pid before its first log line, so `start` can return before runner.log exists.
+    _wait_for_path(d / "runner.log", 10)
     return [line for line in (d / "runner.log").read_text().splitlines() if "runner started" in line]
 
 
