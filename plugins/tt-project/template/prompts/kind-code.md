@@ -35,12 +35,10 @@
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch.
 - Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
   `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
-  words, add `--land`. It also refuses until `ttp checks` passed on your committed HEAD; `--land`
-  overrides that too and is logged. To publish your task branch instead, use `ttp push --own`.
+  words, add `--land`.
 - It refuses uncommitted changes, rebases onto the target branch, runs the project's checks on
   the final head, starts over if the branch moved, and pushes without force.
-- Its checks can outlast a tool call: run `ttp push --detach`. It pushes in its own process,
-  prints `marker:` and `retry_when:` lines, and returns at once. Hand off
+- Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the

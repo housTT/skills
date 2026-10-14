@@ -231,10 +231,9 @@ never write to a run folder named in earlier context):
   with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or `needs_review`.
 - Never block one tool call longer than about 5 minutes: submit long work detached and hand off
-  `waiting`. Push with `ttp push --detach`, which does that for you: publish your task branch with
-  `ttp push --own --detach`; plain `ttp push` is delivery onto the push branch, reserved for reviews,
-  the push queue and a code task whose spec says to land. Where your task's rules say to
-  run a command in the foreground, do so with your longest timeout.
+  `waiting`. Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
+  (your task branch). Where your task's rules say to run a command in the foreground, do so with
+  your longest timeout.
 - Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>`, which writes
   `<name>.log` and `<name>.rc` in your run folder and prints the `retry_when`), or it dies with you.
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
