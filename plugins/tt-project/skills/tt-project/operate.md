@@ -166,8 +166,14 @@
   (default 120 s), scaled by the host's load per CPU up to `worktree.git_timeout_max_s` (900 s). After
   a timeout or a failure left behind by one, a whole worktree is reused and a half-made one (still
   locked "initializing", with no index or HEAD) is removed and made again (`worktree.create_attempts`,
-  default 2). A check that fails, or a worktree on another branch, is left as it is and counts as a
-  failure: an error never deletes a worktree. A branch with its own commits is never reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
+  default 2). A check that fails is left as it is and counts as a failure: an error never deletes a
+  worktree. A branch with its own commits is never reset. A worktree on another branch than the
+  task's is recovered: a branch with commits of this task (or the task it continues) is adopted; one
+  with no commits of its own has its untracked, ignored and modified files (and `uncommitted.patch`)
+  moved to `state/worktree-leftovers/t<id>-<date>/` and is made again on the task's branch. Ignored
+  build and tool caches (`disk.cache_dirs`) are not moved: they go with the old worktree. Leftovers
+  folders are deleted after `disk.worktree_leftovers_keep_days` (30; 0 keeps them). Any other case
+  (another task's commits, submodules, the branch checked out elsewhere) blocks at once. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
   after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
   coordinator. Tasks an older daemon blocked this way are queued again on their own. Checkouts
   leave Git LFS files as pointers (`GIT_LFS_SKIP_SMUDGE=1`), so a large download never outlasts the

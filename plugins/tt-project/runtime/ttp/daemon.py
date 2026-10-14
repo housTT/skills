@@ -509,6 +509,7 @@ class Daemon:
         self._step_name = ""     # the tick step running now
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
+        self._last_leftovers = 0.0   # when prune_leftovers last ran
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
@@ -879,7 +880,7 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
-                     self.prune_worktrees, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
+                     self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.clear_git_locks, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
@@ -5059,6 +5060,19 @@ class Daemon:
         if not self._disk_low:
             return False
         return task["kind"] not in DISK_LIGHT_KINDS or (self._disk_free or 0) < DISK_FLOOR_GB * 1e9
+
+    def prune_leftovers(self, every_s: float = 3600) -> list[str]:
+        """Hourly: delete recovered worktrees' leftovers folders (state/worktree-leftovers/) older than
+        disk.worktree_leftovers_keep_days (worktree.prune_leftovers; 0 keeps them all)."""
+        now = time.time()
+        if now - self._last_leftovers < every_s:
+            return []
+        self._last_leftovers = now
+        gone = worktree.prune_leftovers(self.p, self.cfg.get("disk", {}).get("worktree_leftovers_keep_days"), now)
+        if gone:
+            log(self.p, f"deleted {len(gone)} worktree leftovers folder(s) past disk.worktree_leftovers_keep_days: "
+                        f"{', '.join(gone[:10])}")
+        return gone
 
     def prune_worktrees(self, every_s: float = 300, force: bool = False) -> list[dict]:
         """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and

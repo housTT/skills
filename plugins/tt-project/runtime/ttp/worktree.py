@@ -216,9 +216,18 @@ def _resolved(p: Project, *refs: str) -> list[str]:
     return [r for r in refs if r and _has(p, r)]
 
 
-def _untracked(path: Path, *extra: str) -> list[str]:
-    out = _git(path, "ls-files", "--others", "--exclude-standard", "--directory", "-z", *extra)
-    return [e.rstrip("/") for e in out.split("\0") if e.strip("/")]
+def _raw(path: Path, *args: str, timeout: float = 120) -> bytes:
+    """git's output as bytes: a diff or a file name need not be UTF-8."""
+    out = subprocess.run(["git", "-C", str(path), *args], capture_output=True, timeout=timeout)
+    if out.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {out.stderr.decode(errors='replace').strip()[:300]}")
+    return out.stdout
+
+
+def _names(path: Path, *args: str, timeout: float = 120) -> list[str]:
+    """The paths a `-z` git listing names, decoded as the file system does (any bytes survive)."""
+    return [e.rstrip("/") for e in (os.fsdecode(b) for b in _raw(path, *args, "-z", timeout=timeout).split(b"\0"))
+            if e.strip("/")]
 
 
 def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -> str | None:
@@ -229,6 +238,8 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
     - it has none: its untracked, ignored and modified files move to the project's
       worktree-leftovers/<t<id>-date>/ (modified tracked files with a patch, uncommitted.patch), and
       the worktree is removed, so ensure makes it again on `branch`; returns None. The branch stays.
+      Ignored build and tool caches (disk.cache_dirs, as clear_caches matches them) do not move: they
+      are regenerable and go with the worktree. prune_leftovers deletes old leftovers folders.
     Anything else (commits of another task, submodules set up in it, `branch` checked out in another
     worktree) raises WorkspaceStuck, touching nothing. Each recovery is a `worktree_recovered` event."""
     t = git_timeout(p)
@@ -255,16 +266,20 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
                              f"is checked out in {held}")
     dest = p.state / LEFTOVERS_DIR / f"t{task['id']}-{time.strftime('%Y%m%d-%H%M%S')}"
     links = set((p.config().get("worktree") or {}).get("link_paths", LINK_PATHS) or [])
-    patch = _git(path, "diff", "HEAD", "--binary", timeout=t)
-    changed = [e for e in _git(path, "diff", "HEAD", "--name-only", "-z", timeout=t).split("\0")
-               if e and (path / e).exists()]
+    patch = _raw(path, "diff", "HEAD", "--binary", timeout=t)
+    changed = [e for e in _names(path, "diff", "HEAD", "--name-only", timeout=t) if (path / e).exists()]
+    others = ["ls-files", "--others", "--exclude-standard", "--directory"]
+    ignored = _names(path, *others, "--ignored", timeout=t)
+    caches = _caches(set(ignored), (p.config().get("disk") or {}).get("cache_dirs"))
     loose: list[str] = []
-    for e in sorted(dict.fromkeys(_untracked(path) + _untracked(path, "--ignored") + changed)):
+    for e in sorted(dict.fromkeys(_names(path, *others, timeout=t) + changed
+                                  + [i for i in ignored if i not in caches])):
         # An entry inside a directory that moves already goes with it.
         if not any(e.startswith(d + "/") for d in loose) and not ((path / e).is_symlink() and e in links):
             loose.append(e)
+    size = _size(path, loose)
     if patch:
-        durable_write(dest / "uncommitted.patch", patch + "\n")
+        durable_write(dest / "uncommitted.patch", patch)
     moved = move_leftovers(path, loose, dest)
     _git(p.root, "worktree", "remove", "--force", "--force", str(path), timeout=t)
     _git(p.root, "worktree", "prune", check=False, timeout=t)
@@ -272,7 +287,7 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
         if moved or patch else "; it held no uncommitted files"
     _recovered(p, task, f"worktree {path} was on branch {there} with no commits of its own, not on {branch}: "
                f"made again on {branch}{kept}", leftovers=str(dest) if moved or patch else None,
-               moved=loose[:50], was=there)
+               moved=loose[:50], bytes=size, caches=sorted(caches)[:50], was=there)
     return None
 
 
@@ -820,6 +835,39 @@ def last_run_dir(p: Project, task_id: int) -> Path | None:
 LEFTOVERS_DIR = "worktree-leftovers"
 DIRTY_EVENT = "worktree_uncommitted"   # the coordinator's event for a finished worktree's tracked changes
 LEFTOVERS_MAX_MB = 50   # disk.worktree_leftovers_max_mb: untracked files up to this total move out (see sweep)
+LEFTOVERS_KEEP_DAYS = 30   # disk.worktree_leftovers_keep_days: recovered leftovers folders kept this long
+
+
+def prune_leftovers(p: Project, keep_days: float | None = None, now: float | None = None) -> list[str]:
+    """Delete the project's worktree-leftovers/ folders (written by _other_branch's recovery) older
+    than `keep_days` (null: LEFTOVERS_KEEP_DAYS; 0 or less: keep all). A folder's age counts from the
+    later of the time in its name (t<id>-YYYYmmdd-HHMMSS) and its own mtime, so none newer than that
+    goes. Returns the names deleted."""
+    days = LEFTOVERS_KEEP_DAYS if keep_days is None else float(keep_days)
+    root = p.state / LEFTOVERS_DIR
+    if days <= 0 or not root.is_dir():
+        return []
+    now = time.time() if now is None else now
+    gone = []
+    for d in sorted(root.iterdir()):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            made = d.stat().st_mtime
+        except OSError:
+            continue
+        m = re.search(r"-(\d{8}-\d{6})$", d.name)
+        if m:
+            try:
+                made = max(made, time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S")))
+            except ValueError:
+                pass
+        if now - made < days * 86400:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            gone.append(d.name)
+    return gone
 
 
 # Build output and tool caches: regenerated on demand, often gigabytes. Only ignored entries are
@@ -901,16 +949,12 @@ def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | 
     return found
 
 
-def clear_caches(path: Path, names: list[str] | None = None, keep: list[str] = ()) -> list[str]:
-    """Delete ignored build and cache directories in a worktree. A cache-named directory goes only
-    when git ignores it wholly; else just the ignored entries named like one inside it. Nothing that
-    is, holds or lies in a path of `keep` (hand-off artifacts) goes. Returns what went."""
+def _caches(listed: set[str], names: list[str] | None = None) -> set[str]:
+    """The cache entries among a worktree's ignored ones (`listed`, as _ignored gives them): an
+    ignored entry named like one of `names` (null: CACHE_DIRS), or the first such directory in an
+    ignored entry's path that git lists itself."""
     import fnmatch
-    import shutil
     pats = CACHE_DIRS if names is None else names
-    listed = _ignored(path)
-    if listed is None:
-        return []
     found: set[str] = set()
     for entry in listed:
         parts = entry.split("/")
@@ -919,6 +963,18 @@ def clear_caches(path: Path, names: list[str] | None = None, keep: list[str] = (
             if prefix in listed and any(fnmatch.fnmatchcase(part, pat) for pat in pats):
                 found.add(prefix)
                 break
+    return found
+
+
+def clear_caches(path: Path, names: list[str] | None = None, keep: list[str] = ()) -> list[str]:
+    """Delete ignored build and cache directories in a worktree. A cache-named directory goes only
+    when git ignores it wholly; else just the ignored entries named like one inside it. Nothing that
+    is, holds or lies in a path of `keep` (hand-off artifacts) goes. Returns what went."""
+    import shutil
+    listed = _ignored(path)
+    if listed is None:
+        return []
+    found = _caches(listed, names)
     gone = []
     for rel in sorted(found):
         if any(rel.startswith(g + "/") for g in gone) or any(

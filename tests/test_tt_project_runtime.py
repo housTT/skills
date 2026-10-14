@@ -20289,27 +20289,57 @@ def test_a_worktree_on_another_branch_with_only_loose_output_moves_it_and_is_mad
     from ttp import worktree
     from ttp.prompts import worker_task
     task, path, own = _moved_branch(p, worktree)
+    exclude = p.root / _git_out(p.root, "rev-parse", "--git-common-dir") / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(exclude.read_text() + "\nbuild/\nout/\n" if exclude.exists() else "build/\nout/\n")
     (path / "out").mkdir()
     (path / "out" / "frame.png").write_text("png")
+    (path / "build").mkdir()
+    (path / "build" / "lib.so").write_bytes(b"\0" * 4096)
     (path / "shot.png").write_text("png2")
     tracked = _git_out(path, "ls-files").splitlines()[0]
-    (path / tracked).write_text("edited")
+    (path / tracked).write_bytes(b"edited \xff\xfe not utf-8")
     path2, branch = worktree.ensure(p, task)
     assert (path2, branch) == (path, task["branch"])
     assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == task["branch"]
     assert _git_out(path, "status", "--porcelain") == "", "the remade worktree is not clean"
     assert _git_out(p.root, "rev-parse", "--verify", own), "the worktree's old branch was deleted"
-    dest = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
-                               (task["id"], worktree.RECOVERED_EVENT))["data"])["leftovers"]
+    data = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
+                               (task["id"], worktree.RECOVERED_EVENT))["data"])
     from pathlib import Path
-    dest = Path(dest)
+    dest = Path(data["leftovers"])
     assert dest.parent == p.state / worktree.LEFTOVERS_DIR and dest.name.startswith(f"t{task['id']}-")
     assert (dest / "out" / "frame.png").read_text() == "png" and (dest / "shot.png").read_text() == "png2"
-    assert (dest / tracked).read_text() == "edited" and "edited" in (dest / "uncommitted.patch").read_text()
+    assert (dest / tracked).read_bytes() == b"edited \xff\xfe not utf-8"
+    assert b"edited" in (dest / "uncommitted.patch").read_bytes()
+    # An ignored build cache is regenerable: it goes with the old worktree, not to the leftovers.
+    assert not (dest / "build").exists() and not (path / "build").exists() and data["caches"] == ["build"]
+    assert data["bytes"] == len("png") + len("png2") + len(b"edited \xff\xfe not utf-8")
     assert str(dest) in worker_task(p, task, str(path), branch), "the start note does not name the leftovers"
     # Once a run started, the note is not repeated.
     p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (task["id"], "worker", time.time() + 1, "done"))
     assert str(dest) not in worker_task(p, task, str(path), branch)
+
+
+def test_old_worktree_leftovers_folders_are_pruned_after_the_configured_days(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    root = p.state / worktree.LEFTOVERS_DIR
+    now = time.time()
+    old, recent, stamped = root / "t1-20200101-000000", root / "t2-20200101-000000", root / "t3-29990101-000000"
+    for d in (old, recent, stamped):
+        (d / "out").mkdir(parents=True)
+        (d / "out" / "f.txt").write_text("x")
+        os.utime(d, (now - 40 * 86400,) * 2)
+    os.utime(recent, (now - 86400,) * 2)   # its name is old, but the folder is recent: kept
+    assert worktree.prune_leftovers(p, 0, now) == [] and old.exists(), "0 keeps all"
+    assert worktree.prune_leftovers(p, None, now) == [old.name]
+    assert not old.exists() and recent.exists() and stamped.exists()
+    p.set_config("disk.worktree_leftovers_keep_days", 0.5)
+    d = Daemon(p.base)
+    assert d.prune_leftovers() == [recent.name] and stamped.exists()
+    assert d.prune_leftovers() == [], "ran again within the hour"
 
 
 def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env):
