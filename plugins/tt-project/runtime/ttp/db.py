@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
-  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL);
+  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL, watch_key TEXT);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -195,6 +195,7 @@ class DB:
         self._migrate_schedule_tz()
         self._migrate_task_pin()
         self._migrate_message_context()
+        self._migrate_issue_watch_key()
 
     def _migrate_message_context(self) -> None:
         # A relayer's context, kept apart from the user's verbatim words. Older messages have none.
@@ -280,6 +281,14 @@ class DB:
             if "opened" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
                 self.x("ALTER TABLE issues ADD COLUMN opened REAL")
                 self.x("UPDATE issues SET opened=first_seen")
+
+    def _migrate_issue_watch_key(self) -> None:
+        # The stable key a watcher JSON line gave its issue (screen.py); watchdup groups issues by its kind.
+        if "watch_key" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+            return
+        with self.tx():
+            if "watch_key" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+                self.x("ALTER TABLE issues ADD COLUMN watch_key TEXT")
 
     def _migrate_push_landed(self) -> None:
         # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older

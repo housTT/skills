@@ -2804,6 +2804,37 @@ def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_
     assert "Noisy command watchers" in prompt
 
 
+def test_watcher_same_subject_warning_counts_only_one_key_kind_and_lists_the_keys(env, monkeypatch):
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    # Four distinct stable keys on one subject are four conditions: no warning.
+    for key, text in [("outage-ended", "box-a: known outage ended"), ("drop-in", "box-a: drop-in present"),
+                      ("recovered", "box-a: recovered 3 times"), ("box-a:hold", "box-a: held this episode")]:
+        run("distinct", {"text": text, "severity": "high", "key": key})
+    assert len(issues("distinct")) == 4 and "noisy watcher:" not in log()
+    assert watchdup.counts(p.db, "watcher:distinct", time.time()) == [("box-a", 1)]
+    # Four keys of one kind (one key per episode) on one subject still warn, and the warning lists them.
+    for n in range(1, 5):
+        run("episodes", {"text": f"box-a: hold episode {n}", "severity": "high", "key": f"hold:{n}"})
+    assert len(issues("episodes")) == 4
+    assert ("watcher:episodes opened 4 issues on subject 'box-a' within 24 h under key kind 'hold' "
+            "(keys: hold:1, hold:2, hold:3, hold:4)") in log()
+    # Keyless lines whose text changes are one kind too: they warn and say they had no key.
+    for why in ["ssh refused", "timed out", "no route", "host key changed"]:
+        run("keyless", {"text": f"box-b: unreachable ({why})", "severity": "high", "whole": True})
+    assert "watcher:keyless opened 4 issues on subject 'box-b' within 24 h under no key (changing text)" in log()
+    # The kind rule: case, a leading subject and digit runs do not tell keys apart; ':', '/' and '#' end the kind.
+    assert watchdup.key_kind("Retry 1") == watchdup.key_kind("retry 22") == "retry <n>"
+    assert watchdup.key_kind("box-a:hold", "box-a") == watchdup.key_kind("hold#7", "box-a") == "hold"
+    assert watchdup.key_kind("drop-in/x") != watchdup.key_kind("outage-ended") and watchdup.key_kind("") == ""
+    # A warning recorded before keys were kept still reads as before; a long key list is cut.
+    old = {"source": "watcher:x", "subject": "s", "n": 4}
+    assert watchdup.describe(old) == f"watcher:x opened 4 issues on subject 's' within 24 h: {watchdup.FIX}"
+    many = watchdup.describe({**old, "n": 9, "kind": "k", "keys": [f"k:{i}" for i in range(9)]})
+    assert "k:5, +3 more)" in many and "k:6" not in many
+
+
 def test_command_watcher_info_lines_clear_items_and_are_recorded_quietly(env, monkeypatch):
     from ttp import screen as scr
     run, issues, p = _json_watcher(env, monkeypatch)

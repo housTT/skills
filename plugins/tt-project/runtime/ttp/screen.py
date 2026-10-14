@@ -111,7 +111,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
         if cleared:
             return _clear(db, key_fingerprint(source, key), now)
         v = _issue(db, key_fingerprint(source, key), source, title, title, hint, judge, floor, now,
-                   rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg))
+                   rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg), key.strip())
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
         return v
     conditions = watcher_conditions(source, text, whole)
@@ -139,7 +139,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 
 def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: str | None, judge, floor: int,
            now: float, rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None,
-           subject: str | None = None, reraise_s: float = 0) -> Verdict:
+           subject: str | None = None, reraise_s: float = 0, watch_key: str | None = None) -> Verdict:
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
         db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title), lifecycle=?, subject=? "
@@ -173,9 +173,9 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
 
     severity, verdict_src, reason, info = judge()
     issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen,"
-                    "lifecycle,subject,opened) VALUES(?,?,?,?,1,?,?,?,?,?,?,?)",
+                    "lifecycle,subject,opened,watch_key) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?)",
                     (fp, source, now, now, title, severity, "open" if severity != "info" else "ignored",
-                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject, now))
+                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject, now, watch_key))
     if info.get("jev_call"):
         jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)

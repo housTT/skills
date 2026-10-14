@@ -4,20 +4,33 @@
 
 A watcher whose lines carry changing text (a varying error reason, a duration such as 'for 0.7h', a
 long line that splits at '; ') opens a new issue for each variant or fragment. When one watcher source
-opens more than `screen.same_subject_warn` issues (default 3; 0 turns it off) with the same subject
-within 24 h, the daemon logs one line and records it for the coordinator's digest and the daily
+opens more than `screen.same_subject_warn` issues (default 3; 0 turns it off) of one kind on the same
+subject within 24 h, the daemon logs one line and records it for the coordinator's digest and the daily
 review. It never wakes anyone and changes no issue: the fix is in the watcher's output (a stable JSON
-`key`, or `"whole": true`)."""
+`key`, or `"whole": true`).
+
+Issues of one kind are duplicates; distinct stable keys are distinct conditions. All issues opened
+under no key on a subject are one kind (their text changed). A keyed issue's kind is its key's kind
+prefix: the key, lower-cased, without a leading '<subject>' and separator, up to its first ':', '/' or
+'#', with each run of digits counted as one number. So 'hold:3' and 'hold:4' (or 'retry 1' and
+'retry 2') are one kind, while 'outage ended', 'drop-in' and 'recovered' are three. The warning lists
+the keys it counted, so a reader can tell duplicates from distinct conditions."""
 from __future__ import annotations
 
+import re
 import time
 
 from .db import DB
 
 WINDOW_S = 86400.0
 DEFAULT = 3
-KEY = "watcher_same_subject"   # kv: "<source>\n<subject>" -> {source, subject, n, at}
+KEY = "watcher_same_subject"   # kv: "<source>\n<subject>" -> {source, subject, n, at, kind, keys}
 FIX = 'give its JSON lines a stable "key" (or "whole": true), see the tt-project-harness skill'
+KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see the tt-project-harness skill'
+NO_KEY = ""                    # the kind of every issue opened under no key
+SHOWN_KEYS = 6
+_SEP = re.compile(r"[:/#]")
+_DIGITS = re.compile(r"\d+")
 
 
 def threshold(cfg: dict) -> int:
@@ -27,16 +40,39 @@ def threshold(cfg: dict) -> int:
         return DEFAULT
 
 
+def key_kind(key: str | None, subject: str = "") -> str:
+    """The kind prefix of a watcher key (see the module doc); NO_KEY for none."""
+    k = (key or "").strip().lower()
+    if not k:
+        return NO_KEY
+    subj = (subject or "").strip().lower()
+    if subj and k.startswith(subj) and len(k) > len(subj) and (_SEP.match(k, len(subj)) or k[len(subj)] == " "):
+        k = k[len(subj) + 1:].strip() or k
+    head = _SEP.split(k, 1)[0].strip() or k
+    return _DIGITS.sub("<n>", head)
+
+
+def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[tuple[str, str, list[str]]]:
+    """(subject, kind, keys) for each kind of issue `source` opened over the last `window_s`; one key per
+    issue, '' for an issue under no key; no subject is ''."""
+    out: dict[tuple[str, str], list[str]] = {}
+    for r in db.q("SELECT COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k FROM issues "
+                  "WHERE source=? AND first_seen>? ORDER BY first_seen, id", (source, now - window_s)):
+        out.setdefault((r["subject"], key_kind(r["k"], r["subject"])), []).append(r["k"])
+    return [(subject, kind, keys) for (subject, kind), keys in out.items()]
+
+
 def counts(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[tuple[str, int]]:
-    """(subject, issues opened) for `source` over the last `window_s`; no subject is ''."""
-    return [(r["subject"], int(r["n"])) for r in db.q(
-        "SELECT COALESCE(subject,'') AS subject, COUNT(*) AS n FROM issues WHERE source=? AND first_seen>? "
-        "GROUP BY COALESCE(subject,'')", (source, now - window_s))]
+    """(subject, issues of its largest kind) for `source` over the last `window_s`; no subject is ''."""
+    best: dict[str, int] = {}
+    for subject, _kind, keys in groups(db, source, now, window_s):
+        best[subject] = max(best.get(subject, 0), len(keys))
+    return sorted(best.items())
 
 
 def check(db: DB, cfg: dict, sources: list[str], now: float | None = None) -> list[str]:
-    """Record each source and subject over the threshold; return a log line for each one not
-    warned about in the last 24 h. A known one only has its count updated."""
+    """Record each source and subject with more issues of one kind than the threshold; return a log
+    line for each one not warned about in the last 24 h. A known one only has its count updated."""
     limit = threshold(cfg)
     if limit <= 0:
         return []
@@ -44,15 +80,18 @@ def check(db: DB, cfg: dict, sources: list[str], now: float | None = None) -> li
     warned = {k: w for k, w in (db.kv(KEY, {}) or {}).items() if now - float(w.get("at") or 0) < WINDOW_S}
     new, changed = [], False
     for source in sources:
-        for subject, n in counts(db, source, now):
-            if n <= limit:
-                continue
+        noisy: dict[str, tuple[str, list[str]]] = {}
+        for subject, kind, keys in groups(db, source, now):
+            if len(keys) > limit and len(keys) > len(noisy.get(subject, ("", []))[1]):
+                noisy[subject] = (kind, keys)
+        for subject, (kind, keys) in noisy.items():
             k = f"{source}\n{subject}"
             if k in warned:
-                if warned[k]["n"] != n:
-                    warned[k]["n"], changed = n, True
+                if warned[k]["n"] != len(keys) or warned[k].get("keys") != keys:
+                    warned[k].update(n=len(keys), kind=kind, keys=keys)
+                    changed = True
                 continue
-            warned[k] = {"source": source, "subject": subject, "n": n, "at": now}
+            warned[k] = {"source": source, "subject": subject, "n": len(keys), "at": now, "kind": kind, "keys": keys}
             new.append(describe(warned[k]))
     if new or changed or len(warned) != len(db.kv(KEY, {}) or {}):
         db.set_kv(KEY, warned)
@@ -61,7 +100,16 @@ def check(db: DB, cfg: dict, sources: list[str], now: float | None = None) -> li
 
 def describe(w: dict) -> str:
     subject = f"subject '{w['subject']}'" if w["subject"] else "no subject"
-    return f"{w['source']} opened {w['n']} issues on {subject} within 24 h: {FIX}"
+    keys = [k for k in (w.get("keys") or []) if k]
+    if keys:
+        shown = ", ".join(keys[:SHOWN_KEYS]) + (f", +{len(keys) - SHOWN_KEYS} more" if len(keys) > SHOWN_KEYS else "")
+        return f"{w['source']} opened {w['n']} issues on {subject} within 24 h under key kind " \
+               f"'{w.get('kind') or ''}' (keys: {shown}): {KEYED_FIX}"
+    if "keys" in w:
+        how = " under no key (changing text)"
+    else:   # recorded before keys were
+        how = ""
+    return f"{w['source']} opened {w['n']} issues on {subject} within 24 h{how}: {FIX}"
 
 
 def recent(db: DB, since: float, now: float | None = None) -> list[dict]:
