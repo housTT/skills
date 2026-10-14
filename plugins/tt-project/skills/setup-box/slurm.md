@@ -25,7 +25,7 @@ Other people share the cluster's nodes. Hold a node only while work runs on it.
 | Need | Command (on the login node) |
 |---|---|
 | Partitions, their nodes and states | `sinfo -N -o '%N %P %T'` |
-| One node: state, last busy time, reason | `scontrol -o show node <node>` (`State=`, `LastBusyTime=`, `Reason=`) |
+| One node: state, last busy time, reason | `scontrol -o show node <node>` (`State=`, `Reason=`, last busy time) |
 | Reservations (maintenance, demos, other teams) | `scontrol -o show reservation` |
 | Limits: default and maximum time, preemption | `scontrol show partition <partition>` (`DefaultTime`, `MaxTime`, `PreemptMode`) |
 | Your jobs | `squeue -u "$USER"` |
@@ -61,7 +61,7 @@ login node (`slurm.login`) over ssh.
 
 | Command | What |
 |---|---|
-| `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (against `LastBusyTime`) when given |
+| `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (minutes since the node was last busy) when given |
 | `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line |
 | `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc` and the last 20 lines of `job.log` |
 | `verify-clean <box> <node> [--ssh]` | exit 0 when no job of yours is on the node; with `--ssh`, also lists your processes there |

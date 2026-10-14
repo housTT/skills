@@ -1564,4 +1564,4 @@ def test_setup_box_exabox_agrees_with_worker_shared_clusters():
         assert re.search(r"(Never|No interactive or no-shell allocation \() ?`salloc --no-shell`", flat)
         assert "allocated, drained, reserved" in flat and "ttp note" in flat
     for name, text in pages.items():
-        assert "LastBusyTime" in text, name  # what box.py slurm check reads
+        assert "--min-idle" in text, name  # a charter's narrowing, never a default

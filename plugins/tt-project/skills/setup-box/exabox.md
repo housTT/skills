@@ -27,7 +27,7 @@ every rule and command in `slurm.md` applies. This page adds what is particular 
 - Get nodes only through `sbatch` (or `srun` for one command), as one self-ending batch job.
   Never `salloc --no-shell` or any allocation held for later steps.
 - Never take a node that is allocated, drained, reserved (for maintenance, demos or others) or
-  down. `box.py slurm check` reads `State`, `LastBusyTime` and the reservations, and the site
+  down. `box.py slurm check` reads the node's state and the reservations, and the site
   file's `demo_nodes` and `excluded_nodes`.
 - The job script starts and kills every process itself; never start work by ssh into a node.
 - Release the node when the work ends, record the allocation (cluster, job id, node, start, end,
