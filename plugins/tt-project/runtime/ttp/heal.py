@@ -59,12 +59,13 @@ was refused or timed out, or the host or network unreachable: ROUTE_RE), the box
 escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
-Telling a box that is off from our own route: `ping_host` (a host name or address, pinged from the daemon's
-machine) and an optional `ping_peer` (another host on the same network). A run whose route failed then pings
-them: `ping_host` silent while `ping_peer` answers (or with no `ping_peer`, `ping_host` silent alone) means
-the box itself is off or rebooting: that run is an outage like any other unknown run, so the box is reported
-down past the window. Both silent, or `ping_host` answering, stays this project's route problem. Set them
-only for a box that answers ping when it is up.
+Telling a box that is off from our own route: `ping_host` (a host name or address) and `ping_peer` (another
+host on the same network), set together and pinged from the daemon's machine. A run that exits 255 (ROUTE_RC,
+ssh's own failure) then pings them: `ping_host` silent while `ping_peer` answers means the box itself is off or
+rebooting: that run is an outage like any other unknown run, so the box is reported down past the window.
+Everything else keeps the route rule above. Known limits: with no peer answering, a silent box is never called
+down (our own route looks the same); a route failure with another exit code, ping unable to tell, or a network
+that drops ping stays a route problem. Set them only for a box that answers ping when it is up.
 
 Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
 the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
@@ -197,8 +198,8 @@ def validate(block: Any, where: str = "heal") -> dict:
         v = out.get(k)
         if v is not None and not (isinstance(v, str) and HOST_RE.fullmatch(v)):
             raise ValueError(f"{where}: `{k}` is one host name or address")
-    if out.get("ping_peer") and not out.get("ping_host"):
-        raise ValueError(f"{where}: `ping_peer` needs `ping_host`")
+    if bool(out.get("ping_host")) != bool(out.get("ping_peer")):
+        raise ValueError(f"{where}: `ping_host` and `ping_peer` are set together")
     if out.get("escalate") is not None and out["escalate"] not in ESCALATE:
         raise ValueError(f"{where}: `escalate` is one of {', '.join(ESCALATE)}")
     if out.get("condition") is not None and out["condition"] not in LEDGER_CONDITIONS:
@@ -458,16 +459,13 @@ def _pings(host: str, cwd: str) -> bool | None:
 
 
 def box_silent(spec: dict, cwd: str) -> str:
-    """After a route failure: why the box itself looks off (`ping_host` silent while `ping_peer`, if set,
-    answers), or "" when it may still be our route (no `ping_host`, it answers, the peer is silent too, or
-    ping could not tell)."""
-    box = spec.get("ping_host")
-    if not box or _pings(box, cwd) is not False:
+    """After ssh exited 255: why the box itself looks off (`ping_host` silent while `ping_peer` answers), or ""
+    when it may still be our route (no ping options, the box answers, the peer is silent too, or ping could
+    not tell)."""
+    box, peer = spec.get("ping_host"), spec.get("ping_peer")
+    if not (box and peer) or _pings(box, cwd) is not False or _pings(peer, cwd) is not True:
         return ""
-    peer = spec.get("ping_peer")
-    if peer and _pings(peer, cwd) is not True:
-        return ""
-    return f"{box} does not answer ping" + (f" while {peer} does" if peer else "") + ": it is off or rebooting"
+    return f"{box} does not answer ping while {peer} does: it is off or rebooting"
 
 
 def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
@@ -652,7 +650,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if rc != 1:
         # route_only: every unknown run since unknown_since was only its route failing (and the box not silent).
         route = route_failed(rc, out)
-        silent = box_silent(spec, cwd) if route else ""
+        silent = box_silent(spec, cwd) if rc == ROUTE_RC else ""
         if silent:
             st["last_out"] = (out[-800:] + f"\nping: {silent}").strip()
         st["route_only"] = route and not silent and bool(st.get("route_only", "unknown_since" not in st))

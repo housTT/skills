@@ -49363,15 +49363,18 @@ def test_an_outage_check_with_ping_host_tells_a_box_that_is_off_from_its_own_rou
     st = heal.state(p.db, "off")
     assert not st["route_only"] and list(ml.conditions()) == ["box-a:down"]
     assert "box-a does not answer ping while box-b does" in st["why"] and "ping: box-a" in st["last_out"]
-    # Without a peer, the box silent alone is enough.
-    heal.run(d, "off", heal.validate({**block, "ping_peer": None}), t0 + 3800)
-    assert not heal.state(p.db, "off")["route_only"]
-    # No ping without a route failure, nor without ping_host.
+    # Only ssh's own exit 255 pings: a route failure with another exit code stays our route, as do runs
+    # without a route failure or without the ping options.
     pinged.clear()
+    heal.run(d, "other", heal.validate({**block, "check": block["check"].replace("255", "2")}), t0)
+    heal.run(d, "other", heal.validate({**block, "check": block["check"].replace("255", "2")}), t0 + 3700)
+    assert heal.state(p.db, "other")["route_only"] and list(ml.conditions()) == ["box-a:down"]
     heal.run(d, "plain", heal.validate({**block, "check": "echo 'status: no answer'; exit 75"}), t0)
     heal.run(d, "noping", heal.validate({**block, "ping_host": None, "ping_peer": None}), t0)
     assert pinged == []
-    for bad in ({"ping_host": "-f"}, {"ping_host": "a b"}, {"ping_host": 3}, {"ping_peer": "box-b"}):
+    # A silent box with no peer to compare is never called down: the two options are set together.
+    for bad in ({"ping_host": "-f", "ping_peer": "b"}, {"ping_host": "a b", "ping_peer": "b"},
+                {"ping_host": 3, "ping_peer": "b"}, {"ping_peer": "box-b"}, {"ping_host": "box-a"}):
         with pytest.raises(ValueError):
             heal.validate({"check": "true", **bad})
 
