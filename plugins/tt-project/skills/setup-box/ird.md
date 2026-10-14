@@ -45,7 +45,11 @@ $S ird release <box-alias> <id>         # right after the run
 - `reserve` runs `ird reserve --cluster <pool> --timeout <hh:mm:ss> [--machine <m>]
   [--ssh-port <p>] --no-shell <arch>`. Every flag goes before the arch: some `ird` builds reject a
   flag after it and silently never reserve. `box.py` then checks that a new reservation of yours
-  appears, and fails if none does.
+  appears, and fails if none does. Reserves sharing a state dir run one at a time. If several
+  new reservations of yours match the request (another task reserved at once), it claims none and
+  says so: check `status`, retry with `--machine`, and release what you do not use.
+- `--wait` (default 270 s) caps how long `ird reserve` may take. On a timeout the reservation may
+  still land: check `$S ird status <box-alias>` before reserving again.
 - Set `--timeout` to the run's expected length plus a small margin.
 - It prints `reserved <id> machine=<m> port=<p> expires=<time>`. Put the id and expiry in the
   task's hand-off (`jobs` in SKILL.md), and release before the hand-off unless the run continues.

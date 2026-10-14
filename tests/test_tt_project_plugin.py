@@ -1621,6 +1621,12 @@ elif cmd == "reserve":
     machine = flags.get("machine") or next(m[0] for m in st["machines"] if m[4] == "idle")
     st["reservations"].append({"id": rid, "user": os.environ["FAKE_IRD_USER"], "machine": machine,
                                "port": flags.get("ssh-port", str(40000 + int(rid)))})
+    if os.environ.get("FAKE_IRD_ALSO"):  # another task of the same user reserves at the same time
+        other = str(st["next_id"]); st["next_id"] += 1
+        st["reservations"].append({"id": other, "user": os.environ["FAKE_IRD_USER"],
+                                   "machine": os.environ["FAKE_IRD_ALSO"], "port": "4999"})
+    if os.environ.get("FAKE_IRD_SLEEP"):  # lands only after the caller gave up
+        import time; time.sleep(float(os.environ["FAKE_IRD_SLEEP"]))
 elif cmd in ("release", "change-timeout", "reboot"):
     r = [r for r in st["reservations"] if r["id"] == a[1]]
     if not r:
@@ -1751,6 +1757,48 @@ def test_setup_box_ird_reserve_fails_when_ird_silently_reserves_nothing(fake_ird
     assert not (fake_ird.ird_dir / "claims").exists()
 
 
+def test_setup_box_ird_reserve_never_claims_a_concurrent_tasks_reservation(fake_ird):
+    # Same machine and port: the concurrent row (101, higher id) must not be taken for ours (100).
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-idle", "--ssh-port", "4100", FAKE_IRD_ALSO="m-mixed")
+    assert rc == 0 and "reserved 100 machine=m-idle port=4100" in out, out
+    assert sorted(p.name for p in (fake_ird.ird_dir / "claims").glob("*.json")) == ["<ird-box>.100.json"]
+    # Nothing tells two unpinned rows apart: refuse to guess, write no claim and no ssh block.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           FAKE_IRD_ALSO="m-mixed")
+    assert rc == 1 and "several new reservations of yours (102, 103)" in out and "no claim written" in out, out
+    assert sorted(p.name for p in (fake_ird.ird_dir / "claims").glob("*.json")) == ["<ird-box>.100.json"]
+    assert (fake_ird.ird_dir / "ssh-hosts").read_text().count("Host ") == 1
+    assert (fake_ird.ird_dir / "reserve.lock").exists()
+
+
+def test_setup_box_ird_reserve_waits_for_a_held_reserve_lock(fake_ird):
+    import fcntl
+    lock = fake_ird.ird_dir / "reserve.lock"
+    lock.parent.mkdir(parents=True)
+    with open(lock, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", "--wait", "1")
+    assert rc == 1 and "another `box.py ird reserve` held" in out, out
+    assert not [l for l in fake_ird.ird_log() if l.startswith("reserve")]
+
+
+def test_setup_box_ird_reserve_timeout_says_it_may_still_land(fake_ird):
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", "--wait", "1",
+                           FAKE_IRD_SLEEP="3")
+    assert rc == 1 and "may still land" in out and "box.py ird status <ird-box>" in out, out
+    assert "made no reservation" not in out
+
+
+def test_setup_box_ird_reserve_default_wait_fits_one_tool_call():
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_ird
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    assert box_ird.DEFAULT_WAIT_S < 300
+
+
 def test_setup_box_ird_acts_only_on_the_callers_reservations(fake_ird):
     fake_ird.add("5", user="other", machine="m-alloc")
     fake_ird.claim("5")
@@ -1790,8 +1838,11 @@ def test_setup_box_ird_release_follows_claims(fake_ird):
     assert "Host" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
     fake_ird.claim("10", heartbeat=time.time())  # its reservation already ended
     fake_ird.claim("11", project="other-proj")
+    dotted = fake_ird.ird_dir / "claims" / "<ird-box>.b.12.json"  # a box aliased "<ird-box>.b"
+    dotted.write_text(json.dumps({"id": "12", "project": "proj", "task": "t0"}))
     rc, out = fake_ird.run("release", "<ird-box>", "--stale")
     assert (fake_ird.ird_dir / "claims" / "<ird-box>.11.json").exists()
+    assert dotted.exists()
     assert not (fake_ird.ird_dir / "claims" / "<ird-box>.10.json").exists()
 
 

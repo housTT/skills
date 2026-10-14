@@ -9,7 +9,9 @@ Exit codes: 0 ok, 1 refused or failed, 255 the management host is unreachable.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -27,6 +29,7 @@ UNREACHABLE = 255
 BAD_STATES = ("drain", "down", "fail", "maint", "reboot", "unknown")
 FREE_STATES = ("free", "idle", "mixed")
 DEFAULT_TTL_S = 3600
+DEFAULT_WAIT_S = 270  # under the ~5 min a worker may block one tool call
 BEGIN = "# >>> tt-project ird {id}"
 END = "# <<< tt-project ird {id}"
 
@@ -312,6 +315,27 @@ def cmd_status(ctx: Ctx, args) -> int:
 TIMEOUT_RE = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
 
 
+@contextlib.contextmanager
+def reserve_lock(wait: float):
+    """Serialize reserves sharing this state dir: from the before-snapshot to the written claim."""
+    p = state_dir() / "reserve.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as f:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise IrdError(f"another `box.py ird reserve` held {p} for {wait:g}s; try again later")
+                time.sleep(1)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def cmd_reserve(ctx: Ctx, args) -> int:
     m = TIMEOUT_RE.match(args.timeout)
     if not m:
@@ -325,6 +349,11 @@ def cmd_reserve(ctx: Ctx, args) -> int:
             raise IrdError(f"no machine {args.machine} in ird list-machines")
         if found[0]["why"] and not found[0]["why"].startswith("busy"):
             raise IrdError(f"refused: {args.machine}: {found[0]['why']}")
+    with reserve_lock(args.wait):
+        return _reserve(ctx, args, m, pool)
+
+
+def _reserve(ctx: Ctx, args, m, pool: str) -> int:
     before = set(ctx.mine())
     argv = ["reserve", "--cluster", pool, "--timeout", args.timeout]
     if args.machine:
@@ -333,11 +362,22 @@ def cmd_reserve(ctx: Ctx, args) -> int:
         argv += ["--ssh-port", str(args.ssh_port)]
     argv += ["--no-shell", args.arch]  # every flag before the arch positional
     r = ctx.call(*argv, timeout=args.wait)
-    new = {k: v for k, v in ctx.mine().items() if k not in before}
+    # Another reserve of the same user (another host, or by hand) may land meanwhile: keep only
+    # unclaimed new rows matching the request, and refuse to guess between several.
+    new = {k: v for k, v in ctx.mine().items() if k not in before and read_claim(ctx.alias, k) is None
+           and (not args.machine or v["machine"] == args.machine)
+           and (not args.ssh_port or v["port"] == str(args.ssh_port))}
     if not new:
+        if r.returncode == 124:
+            raise IrdError(f"ird reserve timed out after {args.wait:g}s; the reservation may still land: "
+                           f"check `box.py ird status {ctx.alias}` and release what you do not use")
         raise IrdError(f"ird reserve made no reservation (rc {r.returncode}): "
                        f"{(r.stdout + r.stderr).strip()[-400:]}")
-    rid, row = sorted(new.items(), key=lambda kv: int(kv[0]))[-1]
+    if len(new) > 1:
+        raise IrdError(f"refused: several new reservations of yours ({', '.join(sorted(new, key=int))}) "
+                       "appeared at once, so which one is this run's is unclear; no claim written. "
+                       f"Check `box.py ird status {ctx.alias}`, retry with --machine, and release what you do not use")
+    rid, row = next(iter(new.items()))
     h, mi, s = map(int, m.groups())
     now = dt.datetime.now().astimezone()
     expires = (now + dt.timedelta(hours=h, minutes=mi, seconds=s)).isoformat(timespec="minutes")
@@ -405,6 +445,8 @@ def cmd_release(ctx: Ctx, args) -> int:
         live_ids = set(ctx.mine())
         for p in (state_dir() / "claims").glob(f"{ctx.alias}.*.json"):
             rid = p.name[len(ctx.alias) + 1:-len(".json")]
+            if not rid.isdigit():
+                continue  # another box whose alias starts with "<alias>."
             c = read_claim(ctx.alias, rid) or {}
             if rid not in live_ids and c.get("project") == ctx.project:
                 p.unlink(missing_ok=True)
@@ -461,7 +503,7 @@ def register(sub) -> None:
     p.add_argument("--machine")
     p.add_argument("--ssh-port", type=int)
     p.add_argument("--pid", type=int, help="owner pid (default the run's runner.pid)")
-    p.add_argument("--wait", type=float, default=600, help="seconds to wait for ird reserve")
+    p.add_argument("--wait", type=float, default=DEFAULT_WAIT_S, help="seconds to wait for ird reserve")
     p = add("extend", cmd_extend, "extend your reservation (on demand, never automatically)")
     p.add_argument("id")
     p.add_argument("minutes", type=int)
