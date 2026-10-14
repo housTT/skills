@@ -358,10 +358,28 @@ def venv_rebuild_cmd(venv: Path) -> str:
         opt = set(re.findall(r"^\s*\"?([A-Za-z0-9_.-]+)\"?\s*=", table.group(1), re.M)) if table else set()
         extras = ",".join(e for e in ("test", "dev") if e in opt)
         what = f"-e {q(str(src) + (f'[{extras}]' if extras else ''))}"
-        # declared upper bounds (mcp<2) hold wherever the pyproject lists them, dependency groups included
-        bounds = sorted({m for m in re.findall(r"\"([A-Za-z0-9_.-]+(?:\[[^\]\"]*\])?\s*[<>=!~][^\"]*<[^\"]*)\"", text)
-                         if "@" not in m and ";" not in m})
-        what += "".join(f" {q(b)}" for b in bounds)
+        # declared requirements, read only from [project].dependencies, the chosen extras and the
+        # test/dev dependency groups: bounded ones keep their bounds, a group is installed whole
+        arr = r"\[(?:\s*(?:\"[^\"]*\"|'[^']*'|#[^\n]*|,|\{[^}]*\}))*\s*\]"
+
+        def table(name):
+            m = re.search(rf"^\[{re.escape(name)}\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+            return m.group(1) if m else ""
+
+        def entries(body, key):
+            m = re.search(rf"^\s*[\"']?{re.escape(key)}[\"']?\s*=\s*({arr})", body, re.M)
+            return [a or b for a, b in re.findall(r"\"([^\"]*)\"|'([^']*)'", re.sub(r"#[^\n]*", "", m.group(1)))] if m else []
+
+        def bounded(r):
+            return "@" not in r and ";" not in r and re.match(r"[A-Za-z0-9_.-]+(\[[^\]]*\])?\s*[<>=!~]", r) \
+                and re.search(r"<|~=", r)
+
+        reqs = {r.strip() for r in entries(table("project"), "dependencies") if bounded(r.strip())}
+        for e in extras.split(","):
+            reqs |= {r.strip() for r in entries(table("project.optional-dependencies"), e) if bounded(r.strip())}
+        for g in ("test", "dev"):
+            reqs |= {r.strip() for r in entries(table("dependency-groups"), g) if r.strip() and "@" not in r}
+        what += "".join(f" {q(b)}" for b in sorted(reqs))
         if (src / "requirements.txt").is_file():
             what += f" -r {q(str(src / 'requirements.txt'))}"
     elif (src / "requirements.txt").is_file():

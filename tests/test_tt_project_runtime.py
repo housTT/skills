@@ -63091,3 +63091,18 @@ def test_venv_rebuild_cmd_keeps_declared_upper_bounds(tmp_path):
         '[dependency-groups]\ndev = ["pytest>=8,<9"]\n')
     cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
     assert "'mcp>=1.2,<2'" in cmd and "'pytest>=8,<9'" in cmd and "requests" not in cmd
+
+
+def test_venv_rebuild_cmd_single_clause_bounds_and_scoped_tables(tmp_path):
+    from ttp import push
+    (tmp_path / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["setuptools<70"]\n'
+        "[project]\nname = \"x\"\ndependencies = [\"mcp<2\", \"mcp[cli]<=1.9\", 'anyio<5', \"yarl~=1.2\", \"requests\"]\n"
+        '[project.optional-dependencies]\ngpu = ["torch<3"]\ntest = ["pytest-x<4"]\n'
+        '[dependency-groups]\ndev = ["pytest>=8,<9", "ruff"]\n'
+        '[tool.foo]\ndeps = ["bad<1"]\n')
+    cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
+    for want in ("'mcp<2'", "'mcp[cli]<=1.9'", "anyio<5", "yarl~=1.2", "pytest-x<4", "'pytest>=8,<9'", " ruff"):
+        assert want in cmd, want
+    for bad in ("torch", "setuptools", "bad<1", "requests"):
+        assert bad not in cmd, bad
