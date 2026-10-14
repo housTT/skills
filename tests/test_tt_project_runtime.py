@@ -18976,27 +18976,6 @@ def test_a_lock_wait_that_gives_up_on_its_first_poll_still_shows_as_progress(env
     assert "waiting for board" in (run_dir / "progress.md").read_text(), "a wait looked like a stall"
 
 
-def test_a_lock_wait_that_gives_up_on_its_first_pass_is_still_noted(env, tmp_path):
-    # A slow host can pass the run's cap before the first poll ends: the give-up still leaves its note.
-    p = make(env)
-    run_dir = tmp_path / "wrun"
-    run_dir.mkdir()
-    (run_dir / "run.json").write_text(json.dumps({"stall_s": 0.002}))
-    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    held, release = tmp_path / "held", tmp_path / "release"
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
-                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
-    try:
-        _wait_for_file(held, holder)
-        r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"], capture_output=True,
-                           text=True, env={**run_env, "TTP_RUN_DIR": str(run_dir)}, timeout=60)
-    finally:
-        release.touch()
-        holder.wait(timeout=30)
-    assert r.returncode == 75, (r.returncode, r.stderr)
-    assert "waiting for board" in (run_dir / "progress.md").read_text(), "a give-up left no note"
-
-
 def _wait_for_file(path, proc, timeout=60):
     deadline = time.time() + timeout
     while not path.exists():
@@ -37071,13 +37050,6 @@ def test_detached_ttp_checks_keep_their_output_and_marker_out_of_the_worktree():
         assert "setsid nohup sh -c 'ttp checks" not in text and "<log>" not in text and "> <marker>" not in text, name
     worker = " ".join((prompts / "worker.md").read_text().split())
     assert "Never kill by name or pattern (`pkill -f`, `killall`)" in worker
-
-
-def _wait_for(cond, timeout=30):
-    deadline = time.time() + timeout
-    while not cond() and time.time() < deadline:
-        time.sleep(0.05)
-    return cond()
 
 
 def _detached_checks(run, capsys, *check):
