@@ -43584,9 +43584,17 @@ def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_
     assert push.venv_cmd("pytest -q", repo) == f"{shlex.quote(str(venv / 'bin' / 'python'))} -m pytest -q"
     assert push.venv_cmd("pytest -q", repo, {}) == "pytest -q"
     # Spellings of one pytest run; shell syntax stays as written.
-    keys = {cli._same_run_key(c) for c in ("pytest -q", "py.test -q", "python3 -m pytest -q",
-                                            "/x/.venv/bin/python -m pytest -q", ".venv/bin/pytest -q")}
+    keys = {cli._same_run_key(c, "/x/.venv/bin/python") for c in (
+        "pytest -q", "py.test -q", "python -m pytest -q", "python3 -m pytest -q", "/x/.venv/bin/python -m pytest -q")}
     assert keys == {"pytest -q"}
+    # Only those: another explicit interpreter runs as written, so it is not the same run.
+    for c in ("/usr/bin/python3 -m pytest -q", "python3.11 -m pytest -q", ".venv/bin/pytest -q",
+              "/x/.venv/bin/python -m pytest -q"):
+        assert cli._same_run_key(c) == c
+    assert cli._extra_checks(["/usr/bin/python3 -m pytest -q"], push.check_list(["pytest -q"])) == (
+        ["/usr/bin/python3 -m pytest -q"], [])
+    assert cli._extra_checks(["/x/.venv/bin/python -m pytest -q"], push.check_list(["pytest -q"]),
+                             "/x/.venv/bin/python") == ([], ["/x/.venv/bin/python -m pytest -q"])
     assert cli._same_run_key("pytest -q; true") == "pytest -q; true"
     assert cli._same_run_key("python3 tools/pytest.py") == "python3 tools/pytest.py"
 

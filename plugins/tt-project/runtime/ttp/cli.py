@@ -1529,14 +1529,11 @@ def _command_key(c) -> str:
     return c
 
 
-_PYTEST_PROG = re.compile(r"(?:\S*/)?(?:pytest|py\.test)")
-_PYTHON_PROG = re.compile(r"(?:\S*/)?python(?:3(?:\.\d+)?)?")
-
-
-def _same_run_key(c) -> str:
-    """_command_key, with a pytest run's program made one word: `pytest`, `py.test`,
-    `python3 -m pytest` and `<venv>/bin/python -m pytest` run the same tests, as every bare pytest
-    runs with the venv's python (push.venv_cmd). Only for telling an extra command already run."""
+def _same_run_key(c, py: str = "") -> str:
+    """_command_key, with a pytest run's program made one word where push.venv_cmd runs them alike:
+    bare `pytest`, `py.test` and `python[3] -m pytest`, and `<py> -m pytest` for `py` the venv python
+    venv_cmd puts in their place (venv_python). Any other interpreter (`/usr/bin/python3 -m pytest`,
+    `.venv/bin/pytest`) runs as written, so stays distinct. Only for telling an extra command already run."""
     key = _command_key(c)
     if not isinstance(c, str):
         return key
@@ -1546,9 +1543,10 @@ def _same_run_key(c) -> str:
         return key
     if not words or not all(_PLAIN_WORD.fullmatch(w) for w in words):
         return key   # shell syntax: compared as written
-    if _PYTEST_PROG.fullmatch(words[0]):
+    if words[0] in ("pytest", "py.test"):
         return shlex.join(["pytest", *words[1:]])
-    if len(words) > 2 and _PYTHON_PROG.fullmatch(words[0]) and words[1:3] == ["-m", "pytest"]:
+    if len(words) > 2 and (words[0] in ("python", "python3") or (py and words[0] == py)) \
+            and words[1:3] == ["-m", "pytest"]:
         return shlex.join(["pytest", *words[3:]])
     return key
 
@@ -1639,13 +1637,14 @@ def checks_env_line(p: Project) -> str | None:
             f"{e.get('run') or '?'} at {when} ({what}): {e['problem']}")
 
 
-def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
+def _extra_checks(extra: list[str], own: list, py: str = "") -> tuple[list[str], list[str]]:
     """(the commands given after `--`, the ones dropped). One word is a shell command line as
     written (`ttp checks -- 'FOO=1 pytest -q'`). Several words that each hold whitespace are one
     command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
-    here, is dropped: it would run twice (a pytest run in any spelling, _same_run_key). One that
+    here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike,
+    _same_run_key). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -1654,22 +1653,22 @@ def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
         given = [w for w in extra if w.strip()]
     else:
         given = [shlex.join(extra)]
-    seen = {_same_run_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    seen = {_same_run_key(c, py) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
     mine, dropped = [], []
     for c in given:
-        key = _same_run_key(c)
+        key = _same_run_key(c, py)
         (dropped if key in seen else mine).append(c)
         seen.add(key)
     return mine, dropped
 
 
-def _ran_again(todo: list, own: list) -> tuple[list, list]:
+def _ran_again(todo: list, own: list, py: str = "") -> tuple[list, list]:
     """(the applicable checks to run, the extras dropped): an extra command that a scoped project
     check applicable on this head (in `todo`) also runs is dropped, so it runs once."""
-    keys = {_same_run_key(c) for c in todo if any(c is o for o in own)}
+    keys = {_same_run_key(c, py) for c in todo if any(c is o for o in own)}
     keep, dropped = [], []
     for c in todo:
-        (dropped if not any(c is o for o in own) and _same_run_key(c) in keys else keep).append(c)
+        (dropped if not any(c is o for o in own) and _same_run_key(c, py) in keys else keep).append(c)
     return keep, dropped
 
 
@@ -1740,14 +1739,6 @@ def cmd_checks(a) -> None:
                 "<full commit ID> (or --definition-at-head) --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
         not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
         own = [c for c in own if c.purpose != "candidate"]
-    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own)
-    if dropped:
-        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
-              f"delivery.push_checks already runs it")
-    cmds = own + mine
-    if not cmds:
-        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
-            "`--`, e.g. ttp checks -- pytest -q")
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
@@ -1764,6 +1755,16 @@ def cmd_checks(a) -> None:
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
         venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
+    # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
+    vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
+    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
+    if dropped:
+        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
+              f"delivery.push_checks already runs it")
+    cmds = own + mine
+    if not cmds:
+        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
+            "`--`, e.g. ttp checks -- pytest -q")
     own_harness = bool(p) and Path(top).resolve() == p.harness.resolve()
     dirty, runtime_written, state = _checks_dirty(git, purpose == "harness", own_harness)
     if dirty:
@@ -1803,7 +1804,7 @@ def cmd_checks(a) -> None:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base, candidate=purpose == "candidate")
-            todo, again = _ran_again(todo, own)
+            todo, again = _ran_again(todo, own, vpy)
             if again:
                 said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
                         f"delivery.push_checks entry runs it on this head")
