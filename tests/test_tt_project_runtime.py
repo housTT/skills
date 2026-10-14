@@ -11545,7 +11545,7 @@ def _hgit(cwd, *args):
     return r.stdout
 
 
-def _commit_in(cwd, rel, text, msg="edit"):
+def _commit_in_harness_tree(cwd, rel, text, msg="edit"):
     f = pathlib.Path(cwd) / rel
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(text)
@@ -11587,7 +11587,7 @@ def test_a_harness_worktree_lands_its_commits_and_is_removed(env):
     a, b = _task_ids(p)[-2:]
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
-    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "b: prompt")
     _harness_run(p, b)
     assert harnesstree.sweep(p, {a, b}) == {}   # still running: left alone
     assert own.exists()
@@ -11608,7 +11608,7 @@ def test_a_harness_worktree_that_changed_runtime_asks_the_daemon_to_restart(env)
     a, b = _task_ids(p)[-2:]
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
-    _commit_in(own, "runtime/ttp/extra_note.txt", "x\n", "b: runtime")
+    _commit_in_harness_tree(own, "runtime/ttp/extra_note.txt", "x\n", "b: runtime")
     p.db.update_task(b, status="done")
     assert harnesstree.land(p, b) == "merged"
     req = json.loads((p.state / service.RESTART_REQUEST).read_text())
@@ -11623,7 +11623,7 @@ def test_a_dirty_harness_worktree_lands_its_commits_and_is_kept(env):
     a, b = _task_ids(p)[-2:]
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
-    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "b: prompt")
     (own / "prompts" / "wip.md").write_text("half done\n")
     assert harnesstree.land(p, b) == "kept"
     assert (p.harness / "prompts" / "extra.md").exists()
@@ -11640,7 +11640,7 @@ def test_an_open_harness_task_keeps_its_worktree_after_its_commits_land(env):
     a, b = _task_ids(p)[-2:]
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
-    _commit_in(own, "prompts/extra.md", "more\n", "b: prompt")
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "b: prompt")
     _harness_run(p, b, status="done")
     p.db.update_task(b, status="waiting")   # e.g. on its own detached checks, run in the worktree
     assert harnesstree.held(p, b) == f"task #{b} (waiting) is still open"
@@ -11648,7 +11648,7 @@ def test_an_open_harness_task_keeps_its_worktree_after_its_commits_land(env):
     assert (p.harness / "prompts" / "extra.md").read_text() == "more\n"   # its commits landed
     assert own.is_dir() and _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip()
     assert harnesstree.workdir(p, b) == own   # its next run works there again
-    _commit_in(own, "prompts/more.md", "again\n", "b: more")
+    _commit_in_harness_tree(own, "prompts/more.md", "again\n", "b: more")
     assert harnesstree.sweep(p, {a}) == {b: "kept"}
     assert (p.harness / "prompts" / "more.md").exists()
     p.db.update_task(b, status="done")
@@ -11690,8 +11690,8 @@ def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
     a, b = _task_ids(p)[-2:]
     _harness_run(p, a)
     own = harnesstree.workdir(p, b)
-    _commit_in(own, "prompts/clash.md", "from b\n", "b")
-    _commit_in(p.harness, "prompts/clash.md", "from a\n", "a")
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b\n", "b")
+    _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
     head = _hgit(p.harness, "rev-parse", "HEAD").strip()
     for _ in range(3):   # the daemon retries each tick; the coordinator hears once
         assert harnesstree.sweep(p, set()) == {b: "conflict"}
@@ -11702,7 +11702,7 @@ def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
     ev = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
     assert len(ev) == 1 and ev[0]["status"] == "queued" and ev[0]["task"] == b
     assert f"ttp/harness-t{b}" in ev[0]["text"] and "keeping both sides' intents" in ev[0]["text"]
-    _commit_in(own, "prompts/clash.md", "from b, again\n", "b2")   # a new head is reported again
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b, again\n", "b2")   # a new head is reported again
     assert harnesstree.land(p, b) == "conflict"
     assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 2
 
@@ -11718,8 +11718,8 @@ def test_the_daemon_tick_lands_harness_worktrees_of_ended_runs_only(env):
     a, b, c = _task_ids(p)[-3:]
     _harness_run(p, a)
     own_b, own_c = harnesstree.workdir(p, b), harnesstree.workdir(p, c)
-    _commit_in(own_b, "prompts/b.md", "b\n", "b")
-    _commit_in(own_c, "prompts/c.md", "c\n", "c")
+    _commit_in_harness_tree(own_b, "prompts/b.md", "b\n", "b")
+    _commit_in_harness_tree(own_c, "prompts/c.md", "c\n", "c")
     _harness_run(p, c)   # c still runs; b's run ended
     _harness_run(p, b, status="done")
     p.db.update_task(b, status="done")
