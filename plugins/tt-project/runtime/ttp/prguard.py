@@ -600,8 +600,9 @@ def _git_out(cwd: str | None, *args: str) -> str:
 
 def candidate_record(rec: object) -> bool:
     """A `ttp checks` record that can be candidate or publication evidence: one written for the
-    candidate purpose (or before purposes existed), never a `--purpose harness` qualification."""
-    return isinstance(rec, dict) and rec.get("purpose", "candidate") == "candidate"
+    candidate purpose (or before purposes existed), never a `--purpose harness` qualification nor a
+    fast-path run (docs/data-only diff: the project's checks did not run)."""
+    return isinstance(rec, dict) and rec.get("purpose", "candidate") == "candidate" and not rec.get("fast_path")
 
 
 def _task_pass(head: str, cwd: str | None) -> dict | None:
@@ -656,6 +657,10 @@ def _checks_problem(cwd: str | None = None) -> str | None:
         return None
     if not isinstance(rec, dict):
         return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
+    if rec.get("fast_path"):
+        return ("refused: the checks recorded for this run are a fast-path pass (docs/data-only diff; the "
+                "project's checks did not run), which never counts for a PR. Run `ttp checks --fresh` with "
+                "delivery.checks_fast_globs unset for this diff, or add a non-docs change. " + CHECKS_HOW)
     if not candidate_record(rec):
         return ("refused: the checks recorded for this run are a harness qualification (`ttp checks --purpose "
                 "harness`), which never counts for a PR. " + CHECKS_HOW)

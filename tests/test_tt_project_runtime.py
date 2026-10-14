@@ -62777,6 +62777,79 @@ def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
     assert push.fast_globs({"delivery": {"checks_fast_globs": ["*.rst"]}}) == ["*.rst"]
 
 
+@pytest.mark.parametrize("path", [
+    "CMakeLists.txt", "sub/CMakeLists.txt", "requirements.txt", "requirements-dev.txt", "constraints.txt",
+    "plugins/x/skills/y/SKILL.md", "skills/y/notes.md", "plugins/x/prompts/p.md", "AGENTS.md", "CLAUDE.md",
+    "docs/conf.py", "data/gen.py", "a.sh", "m.cmake", "Makefile", "c.cpp", "h.hpp", "x.js", "x.ts", "p.json",
+    "p.toml", "p.yaml", "p.yml", "p.cfg", "p.ini"])
+def test_checks_fast_path_never_takes_code_build_or_installed_content(tmp_path, path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {path: b"x\n"})
+    assert not push.fast_path(tmp_path, base, head, [*push.FAST_GLOBS, "*"])
+    assert push.fast_path(tmp_path, base, head, ["*"], exclude=[])
+
+
+def _fast_cli(env, tmp_path, monkeypatch, files, push_check, extras=()):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_branch", "work")
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/work", base], check=True)
+    mark = tmp_path / "mark"
+    p.set_config("delivery.push_checks", [f"echo project >> {mark}"] if push_check else [])
+    for name, body in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(body)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "change"], check=True)
+    return cli, p, run, mark
+
+
+def test_ttp_checks_fast_path_on_a_docs_only_commit(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and "FAST-PATH pass" in out and "recorded for the draft PR" not in out
+    assert not mark.exists(), "the project's check ran on the fast path"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["fast_path"] is True and rec["skipped_project_checks"]
+    assert len(rec["commands"]) == 2 and all("git diff" in c for c in rec["commands"])
+    from ttp import prguard
+    assert not prguard.candidate_record(rec)
+    assert "fast-path pass" in prguard._checks_problem(os.getcwd())
+
+
+def test_ttp_checks_fast_path_flags_whitespace(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "trail \n"}, True)
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    assert not mark.exists()
+
+
+def test_ttp_checks_runs_the_project_check_for_a_mixed_docs_and_code_commit(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n", "docs/conf.py": "x = 1\n"}, True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" not in out and mark.exists()
+    assert "fast_path" not in json.loads((run / "checks.json").read_text())
+
+
+def test_ttp_checks_fast_globs_empty_turns_the_fast_path_off(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.checks_fast_globs", [])
+    cli.main(["checks"])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists()
+
+
+def test_ttp_checks_fast_path_still_runs_commands_after_dashes(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    extra = tmp_path / "extra"
+    cli.main(["checks", "--", f"echo extra >> {extra}"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and extra.exists() and not mark.exists()
+    assert json.loads((run / "checks.json").read_text())["fast_path"] is True
+
+
 def test_checks_fast_path_falls_back_for_code_manifest_or_script(tmp_path):
     from ttp import push
     base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "tests/test_a.py": b"x\n"})

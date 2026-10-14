@@ -1788,6 +1788,7 @@ def cmd_checks(a) -> None:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
+    fast_skipped, fast_cmds = [], []
     executed, selected = [], []
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -1809,10 +1810,17 @@ def cmd_checks(a) -> None:
                         f"delivery.push_checks entry runs it on this head")
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
-            if todo and purpose == "candidate" and push.fast_path(Path(top), base, head, push.fast_globs(p.config() if p else None)):
-                todo = fast = push.fast_checks(base)
+            fcfg = p.config() if p else None
+            if todo and purpose == "candidate" and push.fast_path(Path(top), base, head, push.fast_globs(fcfg),
+                                                                 push.fast_exclude(fcfg)):
+                own_s = {str(c) for c in own}
+                fast_skipped = [str(c) for c in todo if str(c) in own_s]
+                fast_cmds = push.fast_checks(base)
+                todo = [c for c in todo if str(c) not in own_s] + fast_cmds
                 said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
-                        "only the whitespace and CRLF checks run (delivery.checks_fast_globs sets the paths)")
+                        "only the whitespace and CRLF checks run (delivery.checks_fast_globs sets the paths, "
+                        "delivery.checks_fast_exclude the paths that never take it)"
+                        + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             selected = list(todo)
@@ -1916,7 +1924,10 @@ def cmd_checks(a) -> None:
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
                                                         if verified_cmds else {}),
-                                                     "purpose": purpose, **({"not_run": not_run} if not_run else {}),
+                                                     "purpose": purpose,
+                                                     **({"fast_path": True, "skipped_project_checks": fast_skipped}
+                                                        if fast_cmds else {}),
+                                                     **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
@@ -1934,6 +1945,15 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
+        extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
+        if extras:
+            _record_pass(p, tree, extras, purpose, run_dir)
+        print(f"ttp checks: FAST-PATH pass on {head[:12]} (whitespace and CRLF checks"
+              + (f" and {len(extras)} command(s) after `--`" if extras else "")
+              + f"); the project's checks did NOT run, so this is not a full pass and does not count for a PR "
+              f"(full output: {log})")
+        return
     if purpose == "candidate":
         _mark_verified(p, head, tree, list(todo) + list(verified_cmds))
     if hit:
