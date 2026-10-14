@@ -63082,3 +63082,11 @@ def test_push_result_pushed_flag_on_batch_markers(tmp_path, capsys):
     assert push.result(done) == 0 and push.result(done, pushed_only=True) == push.NOT_PUSHED
     assert push.result(ok, pushed_only=True) == 0
     assert push.result(dead, pushed_only=True) == push.NOT_PUSHED
+
+
+def test_venv_rebuild_cmd_keeps_declared_upper_bounds(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["mcp>=1.2,<2", "requests"]\n'
+        '[dependency-groups]\ndev = ["pytest>=8,<9"]\n')
+    cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
+    assert "'mcp>=1.2,<2'" in cmd and "'pytest>=8,<9'" in cmd and "requests" not in cmd

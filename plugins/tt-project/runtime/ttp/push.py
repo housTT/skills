@@ -358,6 +358,12 @@ def venv_rebuild_cmd(venv: Path) -> str:
         opt = set(re.findall(r"^\s*\"?([A-Za-z0-9_.-]+)\"?\s*=", table.group(1), re.M)) if table else set()
         extras = ",".join(e for e in ("test", "dev") if e in opt)
         what = f"-e {q(str(src) + (f'[{extras}]' if extras else ''))}"
+        # declared upper bounds (mcp<2) hold wherever the pyproject lists them, dependency groups included
+        bounds = sorted({m for m in re.findall(r"\"([A-Za-z0-9_.-]+(?:\[[^\]\"]*\])?\s*[<>=!~][^\"]*<[^\"]*)\"", text)
+                         if "@" not in m and ";" not in m})
+        what += "".join(f" {q(b)}" for b in bounds)
+        if (src / "requirements.txt").is_file():
+            what += f" -r {q(str(src / 'requirements.txt'))}"
     elif (src / "requirements.txt").is_file():
         what = f"-r {q(str(src / 'requirements.txt'))}"
     else:
