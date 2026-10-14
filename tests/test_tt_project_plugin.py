@@ -1104,6 +1104,43 @@ def test_setup_box_extensions_and_ssh_run(tmp_path, monkeypatch):
     assert seen["argv"][-2:] == ["<box-alias>", "echo 'a b'"]
 
 
+def test_setup_box_copy_falls_back_to_tar_over_ssh_when_a_box_has_no_rsync(tmp_path):
+    """`box.py copy`: one shared helper for job inputs and results; rsync when both ends have it."""
+    import shutil
+    import subprocess
+    bindir, home, log = tmp_path / "bin", tmp_path / "boxhome", tmp_path / "ssh.log"
+    bindir.mkdir()
+    home.mkdir()
+    ssh = bindir / "ssh"     # stand-in: runs the remote command here, in a fake home folder
+    ssh.write_text('#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\necho "$*" >> "$SSH_LOG"\n'
+                   'case "$*" in *rsync*) [ -n "$NO_RSYNC" ] && exit 127;; esac\n'
+                   'cd "$BOX_HOME" && HOME="$BOX_HOME" exec /bin/sh -c "$*"\n')
+    ssh.chmod(0o755)
+    src = tmp_path / "results"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "a b.txt").write_text("x")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "SSH_LOG": str(log), "BOX_HOME": str(home),
+           "NO_RSYNC": "1"}
+    run = lambda *a: subprocess.run([sys.executable, str(BOX_PY), "copy", *a], capture_output=True, text=True,
+                                    timeout=60, env=env)
+    r = run(str(src), "box1:~/in")
+    assert r.returncode == 0 and "by tar" in r.stdout, r.stdout + r.stderr
+    assert (home / "in" / "results" / "sub" / "a b.txt").read_text() == "x"
+    assert "command -v rsync" in log.read_text() and "tar -C" in log.read_text()
+    back = tmp_path / "back"
+    r = run("box1:in/results", str(back))
+    assert r.returncode == 0 and "by tar" in r.stdout, r.stdout + r.stderr
+    assert (back / "results" / "sub" / "a b.txt").read_text() == "x"
+    r = run("box1:in/nothing", str(back))
+    assert r.returncode != 0 and "copy by tar failed" in r.stdout
+    assert run(str(src), str(back)).returncode == 2, "one side must be on a box"
+    if shutil.which("rsync"):
+        env.pop("NO_RSYNC")
+        r = run(str(src), "box1:viarsync")
+        assert r.returncode == 0 and "by rsync" in r.stdout, r.stdout + r.stderr
+        assert (home / "viarsync" / "results" / "sub" / "a b.txt").read_text() == "x"
+
+
 def test_setup_box_links_tt_buddy_instead_of_copying():
     agents = (SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8")
     for ref in ("recipes/developer-setup.md", "recipes/workspace.md", "recipes/tt-metal/build.md",

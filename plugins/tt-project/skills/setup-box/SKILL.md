@@ -50,7 +50,8 @@ and build/run recipes on the box).
   `git worktree` there (`ssh-workflow.md` names and cleans them).
 - It commits and pushes from the box, or reports a diff or commit id.
 - Never sync, mirror or copy the project box's files to the box (no rsync, no sshfs, no scp of
-  sources). The repository is the only channel.
+  sources). The repository is the only channel. A job input or result that must move goes through
+  `scripts/box.py copy` (rsync, else tar over ssh): `device-runs.md`.
 - Long work runs detached on the box with a log and an rc file (`ssh-workflow.md`); the task hands
   off `waiting` with a `retry_when` that reads the rc file.
 - Device jobs go through the box's queue or broker and carry a build stamp (commit, dirty flag,

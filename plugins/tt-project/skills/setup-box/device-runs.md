@@ -63,6 +63,21 @@ Each submit stamps the job with what it runs, taken on the box (`devq.build_stam
 - A `wedged` result means the device needs recovery before the next job (tt-buddy
   `skills/run/recovery.md`).
 
+## Copy inputs and results
+
+Read results on the box where you can. When a file must move (a job input, a log, a results folder),
+use the shared helper; it uses rsync when both ends have it and tar over ssh when the box has none:
+
+```
+<plugin-root>/skills/setup-box/scripts/box.py copy <alias>:<path on the box> <local folder>
+<plugin-root>/skills/setup-box/scripts/box.py copy <local file or folder> <alias>:<folder on the box>
+```
+
+- The source lands in the destination folder under its own name; `~/` paths on the box are under
+  its home folder. A failure prints the tool's error; exit 124 is a timeout (`--timeout`, default
+  1800 s).
+- Never copy a checkout or the project box's tree with it: the box keeps its own checkout.
+
 ## Report back
 
 Add to the box task's hand-off (`SKILL.md`): the job ids, each result's status, and its stamp's
