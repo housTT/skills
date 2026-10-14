@@ -750,7 +750,7 @@ def handoff_paths(p: Project) -> list[tuple[int, str]]:
 
 def _existing(entry: str, bases: list[Path]) -> list[Path]:
     """The files an artifact entry names. Entries may be absolute or relative to one of `bases`,
-    may be globs (tmp/px_*.pt), and may carry trailing text ("out.mp4 (the video)", "run.log:12"),
+    may be globs (tmp/*.pt), and may carry trailing text ("out.bin (the result)", "run.log:12"),
     so the longest leading part that exists wins."""
     import glob
     words = entry.strip().split()

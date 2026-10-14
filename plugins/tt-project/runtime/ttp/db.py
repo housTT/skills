@@ -631,7 +631,7 @@ SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
 
 
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (last HH:MM PDT), M runs lost ($X)' for the boots of the last day, as
+    """'host: N reboots in 24 h (last HH:MM <zone>), M runs lost ($X)' for the boots of the last day, as
     DB.boots returns them, in the home zone `where`; '' when there were none."""
     if not boots:
         return ""

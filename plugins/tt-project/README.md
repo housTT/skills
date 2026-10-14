@@ -495,9 +495,10 @@ prolonged whole-box outage.
   like a failing health check, while a disk in `disk_paths` (default `/` and the runner's folder) is
   fuller. A job may declare `--input <path>` (repeatable; must be readable on the host) and
   `--cold-start <s>` (a warning when it is longer than the job's limit).
-  `legacy_driver` (a regex for the command line of the project's old per-task drivers) closes the
-  race between the two paths: while one of the user's processes matches it, the runner does not
-  start or start a job, and the probe keeps a task with a pending job waiting until it ends.
+  `outside_user` (a regex for the command line of an outside device user to wait for, such as a
+  script that drives the device outside the runner) closes the race between the two: while one of
+  the user's processes matches it, the runner does not start or start a job, and the probe keeps a
+  task with a pending job waiting until it ends.
   Config `runner.device_timeout_max_s` (opt-in) caps device-job timeouts: `ttp devq submit` refuses a
   longer `--timeout` and gives a job without one the ceiling when the runner's `job_timeout_s` is
   unset or above it; each job sees its limit (also under a runner's `reservation_cap_s`) as

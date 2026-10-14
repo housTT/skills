@@ -5784,7 +5784,7 @@ class Daemon:
                 db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {**every, runner: st})
             return
         rc, out = self._devq_start(runner)
-        ok = rc in (0, waitheal.DEVQ_RUNNER_DOWN_RC)   # 3: an old per-task driver still runs, not a failure
+        ok = rc in (0, waitheal.DEVQ_RUNNER_DOWN_RC)   # 3: an outside device user still runs, not a failure
         st.update(last=now, n=int(st.get("n") or 0) + 1, fails=0 if ok else int(st.get("fails") or 0) + 1,
                   error="" if ok else waitheal.clip(out, 300))
         if ok:

@@ -1128,7 +1128,7 @@ BROKEN_START = "broken"   # starts_text's lead word for a start_when on a task t
 
 
 def _clock(ts: float, where=None) -> str:
-    """A time in the home zone `where`: today's as 'HH:MM PDT', another day's with its date."""
+    """A time in the home zone `where`: today's as 'HH:MM <zone>', another day's with its date."""
     tz = timefmt.tzinfo(where)
     t, today = datetime.fromtimestamp(ts, tz), datetime.now(tz)
     return t.strftime("%H:%M %Z" if t.date() == today.date() else "%Y-%m-%d %H:%M %Z")

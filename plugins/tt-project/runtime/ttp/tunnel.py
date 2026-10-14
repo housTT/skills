@@ -26,7 +26,7 @@ from .project import HOME_DIR, durable_write
 
 # The forward's own connection, never a shared master's (an agent without both is replaced).
 OWN = (re.compile(r"ControlMaster[=\s]+no\b", re.I), re.compile(r"ControlPath[=\s]+none\b", re.I))
-# Ours, and the shapes a hand-made service uses: `-L 8800:localhost:8700`, `-L127.0.0.1:8800:...`.
+# Ours, and the shapes a hand-made service uses: `-L <local>:localhost:<remote>`, `-L127.0.0.1:<local>:...`.
 FORWARD = re.compile(r"-L\s*(?:(?:127\.0\.0\.1|localhost):)?(\d+):(?:127\.0\.0\.1|localhost):(\d+)")
 
 

@@ -592,7 +592,7 @@ class ProgressWatch:
 
 
 def _clock(env: dict) -> str:
-    """'23:32:05 PDT': now in the home zone of the project in `env` (TTP_PROJECT); UTC without one."""
+    """'23:32:05 UTC': now in the home zone of the project in `env` (TTP_PROJECT); UTC without one."""
     from datetime import datetime
     from . import timefmt
     where = None

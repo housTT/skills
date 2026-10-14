@@ -128,18 +128,18 @@ def tzinfo(where) -> ZoneInfo:
 
 # formatting ---------------------------------------------------------------------------------------
 def long(ts: float, where) -> str:
-    """'2026-10-09 23:32 PDT': `ts` in the zone of `where` (a zone name, ZoneInfo, Project or settings)."""
+    """'2026-10-09 23:32 UTC': `ts` in the zone of `where` (a zone name, ZoneInfo, Project or settings)."""
     return datetime.fromtimestamp(ts, _tz(where)).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def short(ts: float, where, now: float | None = None) -> str:
-    """'23:32 PDT' within 20 hours of now, else 'Fri 23:32 PDT'."""
+    """'23:32 UTC' within 20 hours of now, else 'Fri 23:32 UTC'."""
     fmt = "%H:%M %Z" if abs(ts - (now if now is not None else time.time())) < 20 * 3600 else "%a %H:%M %Z"
     return datetime.fromtimestamp(ts, _tz(where)).strftime(fmt)
 
 
 def abbrev(where, ts: float | None = None) -> str:
-    """The zone's abbreviation at `ts` (now by default): 'PDT', 'PST', 'UTC'."""
+    """The zone's abbreviation at `ts` (now by default): 'UTC', or the zone's own ('<zone>')."""
     return datetime.fromtimestamp(ts if ts is not None else time.time(), _tz(where)).strftime("%Z")
 
 

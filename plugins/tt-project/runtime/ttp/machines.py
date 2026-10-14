@@ -210,16 +210,16 @@ REBOOT_RECENT_S = 6 * 3600   # a boot this close before an auth failure makes th
 
 
 def auth_failed_hint(stderr: str | None, booted_at: float | None = None, now: float | None = None) -> str:
-    """A hint for an ssh auth_failed (empty for any other failure). A host that rebooted may bring the
-    account's home back empty or owned by another user (e.g. a container on local disk), so its
-    authorized_keys is gone. `booted_at` (the host's last known boot, e.g. from `uptime -s`) narrows it."""
+    """A hint for an ssh auth_failed (empty for any other failure). One possible cause: on some hosts
+    (e.g. a container on local disk) a reboot brings the account's home back empty or owned by another
+    user, so its authorized_keys is gone. `booted_at` (the host's last known boot, e.g. from `uptime -s`) narrows it."""
     if not AUTH_FAILED_RE.search(stderr or ""):
         return ""
     now = time.time() if now is None else now
     if booted_at and 0 <= now - booted_at <= REBOOT_RECENT_S:
-        lead = f"The host rebooted {(now - booted_at) / 3600:.1f} h ago: its"
+        lead = f"The host rebooted {(now - booted_at) / 3600:.1f} h ago. One possible cause: its"
     else:
-        lead = "If the host rebooted shortly before this, its"
+        lead = "If the host rebooted shortly before this, one possible cause: its"
     return (f"{lead} account home may have come back empty or owned by another user, so authorized_keys "
             "is missing. Restore the home's ownership and authorized_keys through the provider's own "
             "console or connect path.")

@@ -41,7 +41,7 @@
 
 - `ttp note "<one line>"` at each milestone; humans read these live.
 - Write times for the user in the project's home zone from your task header, with its abbreviation
-  (`09:30 PDT`), never the host's or UTC.
+  (e.g. `09:30 CET`), never the host's or UTC.
 - `ttp notify "<text>"` (`--severity low|normal`) only when your spec asks you to tell the user
   something; say in your hand-off that you sent it.
 - Make durable progress early (commit, write files): a killed run keeps what is on disk.
@@ -94,7 +94,7 @@ Other workers run at the same time, on other tasks of this project.
 
 ## Shared clusters (Slurm and other machines other people use)
 
-Admins cancel idle jobs and name the owner in public. Hold a node only while work runs on it.
+Other people share these nodes: hold one only while work runs on it.
 
 - Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or
   limits, stay within them; going beyond them needs the user's word: hand off `blocked` asking,

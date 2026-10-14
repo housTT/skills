@@ -21,7 +21,7 @@ MANIFESTS = [PLUGIN / d / "plugin.json" for d in (".claude-plugin", ".codex-plug
 FORBIDDEN = [
     r"xox[abprs]-[0-9A-Za-z]", r"sk-ant-", r"\bsk-[A-Za-z0-9]{32,}", r"\bgh[pousr]_[A-Za-z0-9]{30,}",
     r"github_pat_", r"\bglpat-[0-9A-Za-z_-]{20}", r"\bAKIA[0-9A-Z]{16}\b", r"\bAIza[0-9A-Za-z_-]{35}\b",
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"/home/[a-z]+/", r"/Users/[a-z]+/",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"/home/[a-z]+/", r"/Users/[A-Za-z0-9._-]+/",
 ]
 
 # Setup-specific patterns (internal domains, host names, user names, project names) never live in
@@ -167,6 +167,16 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
 
 def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
+    # The plugin's tests ship in the same open-source repository. This file names the patterns
+    # themselves (as regex source), so it is checked with that list cut out.
+    assert_no_leaks([re.compile(p) for p in FORBIDDEN], [TESTS / "test_tt_project_runtime.py"])
+    own = (TESTS / "test_tt_project_plugin.py").read_text(encoding="utf-8")
+    own = own[:own.index("FORBIDDEN = [")] + own[own.index("]\n", own.index("FORBIDDEN = [")):]
+    for pattern in map(re.compile, FORBIDDEN):
+        m = pattern.search(own)
+        assert not m, f"tests/test_tt_project_plugin.py: contains {m.group(0)!r}"
+    for name in ("A.B-2", "ab"):   # built here so this file holds no such path itself
+        assert re.search(FORBIDDEN[-1], "/" + "Users/" + name + "/x"), name
 
 
 def test_no_local_leak_patterns_in_plugin():
@@ -420,7 +430,8 @@ def test_shipped_prompts_and_templates_hold_no_one_users_cluster_policy():
     # One user's rules (a node list, an idle threshold, a machine list) belong in their own charter;
     # the shipped prompts, templates and skills state only company-wide scheduler etiquette.
     personal = re.compile(r"(?i)exact nodes|idle (at least|as long)|LastBusyTime|default 2 ?h|nodes? the user "
-                          r"(listed|allows)|existing machine list|demo nodes?|any idle node")
+                          r"(listed|allows)|existing machine list|demo nodes?|any idle node|"
+                          r"admins cancel|owner in public|canary|live traffic")
     files = [f for d in ("template", "skills") for f in sorted((PLUGIN / d).rglob("*")) if f.is_file()]
     hits = [f"{f.relative_to(PLUGIN)}:{n}: {line.strip()}" for f in files if f.suffix in (".md", ".json", ".txt")
             for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1) if personal.search(line)]

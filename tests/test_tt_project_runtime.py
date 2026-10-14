@@ -3880,7 +3880,7 @@ def slack_daemon(env, monkeypatch, fake):
     monkeypatch.setattr(ttp.slack.urllib.request, "urlopen", fake)
     monkeypatch.setattr(ttp.slack.time, "sleep", lambda s: None)
     d = Daemon(p.base)
-    d._slack = Slack("xoxb-test", user_id="U1")
+    d._slack = Slack("test-bot-token", user_id="U1")
     d.slack = lambda: d._slack
     return p, d
 
@@ -8728,7 +8728,7 @@ def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_
                              "widget lever: trace the decode waves, at most 600 s",
                              f"Record a device trace of each wave. {limits}", usual)
     # A version in a name is not a bound.
-    assert tried.params("LTX-2.5 e2e timing with the LTX 2.3 VAE, Python 3.12") == set()
+    assert tried.params("Llama-3.1 e2e timing with the Llama 3.2 tokenizer, Python 3.12") == set()
 
 
 def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
@@ -8742,7 +8742,7 @@ def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
 
     def long_spec(i):
         lines = [f"{n}. Stage {i} {rng.choice(vocab)} {rng.choice(vocab)}: at most {rng.randint(10, 900)} s, "
-                 f"batch {rng.randint(1, 64)}, {rng.random() * 3:.2f}x, {rng.randint(1, 99)}% of LTX 2.{n % 9}."
+                 f"batch {rng.randint(1, 64)}, {rng.random() * 3:.2f}x, {rng.randint(1, 99)}% of Llama 3.{n % 9}."
                  for n in range(1, 120)]
         return f"Goal: speed up stage {i}.\n\n" + "\n".join(lines)[:8000]
 
@@ -8764,7 +8764,7 @@ def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
     big = tried.params(" ".join(new_spec for _ in range(8)))
     assert big and time.monotonic() - start < 2, "params rescans the text before each number"
     # The window before a number keeps the bound and name checks' results.
-    assert tried.params(("filler words " * 50) + "at most 600 and LTX 2.5 and 7 items") == {"600"}
+    assert tried.params(("filler words " * 50) + "at most 600 and Llama 3.1 and 7 items") == {"600"}
 
 
 def test_tried_work_ledger_skips_reviews_and_cancelled_tasks_that_never_ran(env):
@@ -9289,7 +9289,7 @@ def test_a_review_task_nothing_waits_on_is_not_raised(env):
 def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "# Unblocking" in text and "what is a reasonably non-disruptive way to proceed?" in text
-    for idea in ("canary", "roll back on regression", "lull", "cooperative queue",
+    for idea in ("roll it out to one first", "roll back on regression", "lull", "cooperative queue",
                  "is not a blocker and not a reason to `ask_user`"):
         assert idea in text, idea
 
@@ -15015,17 +15015,17 @@ def test_a_glob_hand_off_entry_is_archived_before_the_worktree_goes(env, monkeyp
     ta, a, _ = _code_task(p, "weights")
     _commit_file(a, "tracked")
     (a / "tmp").mkdir()
-    (a / "tmp" / "px_1.pt").write_bytes(b"w1")
-    (a / "tmp" / "px_2.pt").write_bytes(b"w2")
+    (a / "tmp" / "ckpt_1.pt").write_bytes(b"w1")
+    (a / "tmp" / "ckpt_2.pt").write_bytes(b"w2")
     tb, b, _ = _code_task(p, "no match")
     _commit_file(b, "tracked")
     (b / "tmp").mkdir()
     (b / "tmp" / "other.pt").write_bytes(b"w")
-    _handoff(p, ta, ["tmp/px_*.pt (weights)"])
-    _handoff(p, tb, ["tmp/px_*.pt"])
+    _handoff(p, ta, ["tmp/ckpt_*.pt (weights)"])
+    _handoff(p, tb, ["tmp/ckpt_*.pt"])
     res = {r["task"]: r for r in worktree.sweep(p)}
     assert not a.exists() and res[ta]["why"] is None and res[ta]["archived"]["files"] == 2
-    assert _archived(p, ta) == {"tmp/px_1.pt": (True, "tar"), "tmp/px_2.pt": (True, "tar")}
+    assert _archived(p, ta) == {"tmp/ckpt_1.pt": (True, "tar"), "tmp/ckpt_2.pt": (True, "tar")}
     assert not b.exists() and res[tb]["why"] is None and not res[tb].get("archived")
 
 
@@ -44592,21 +44592,21 @@ def test_devq_probe_exit_codes(devq_dir):
     assert sorted(p.name for p in d.iterdir()) == ["queue", "runner.lock"], "the probe writes nothing"
 
 
-def test_devq_runner_and_probe_wait_while_an_old_per_task_driver_runs(devq_dir, tmp_path):
+def test_devq_runner_and_probe_wait_while_an_outside_device_user_runs(devq_dir, tmp_path):
     # Both the runner and an old detached driver could pass "no other job of ours" at once: the runner
-    # does not start while one of the user's processes matches legacy_driver, and the probe keeps the
+    # does not start while one of the user's processes matches outside_user, and the probe keeps the
     # task asleep until the driver ends.
     d, marker = devq_dir, f"old-driver-{os.getpid()}-{time.time_ns()}"
-    cfg = {**DEVQ_FAST, "legacy_driver": f"{marker}\\.sh"}
+    cfg = {**DEVQ_FAST, "outside_user": f"{marker}\\.sh"}
     driver = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"{marker}.sh"])
     try:
         sub = _devq("submit", d, json.dumps(cfg), json.dumps({"id": "t9-a", "cmd": f"touch {tmp_path / 'ran'}"}))
-        assert sub.returncode == 0 and "queued t9-a" in sub.stdout and "old per-task driver" in sub.stdout
+        assert sub.returncode == 0 and "queued t9-a" in sub.stdout and "outside device user" in sub.stdout
         assert not (d / "runner.pid").exists()
         refused = _devq("start", d, json.dumps(cfg))
         assert refused.returncode == 3 and str(driver.pid) in refused.stdout
         probe = _devq("probe", d, "t9-a")
-        assert probe.returncode == 1 and "old per-task driver" in probe.stdout, "keep sleeping"
+        assert probe.returncode == 1 and "outside device user" in probe.stdout, "keep sleeping"
     finally:
         driver.kill()
         driver.wait()
@@ -44844,6 +44844,9 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert config_problems({"device": {"runners": {"dev": {"helth": "x", "max_drops": -1}}}}) == [
         "device.runners.dev.helth: unknown key", "device.runners.dev.max_drops: -1 is not a number >= 0"]
     assert "legacy_driver: not a regex" in " ".join(devq.config_problems("r", {"legacy_driver": "("}))
+    assert "outside_user: not a regex" in " ".join(devq.config_problems("r", {"outside_user": "("}))
+    assert devq.settings({"legacy_driver": "x"})["outside_user"] == "x", "the old key name is still read"
+    assert devq.settings({"legacy_driver": "x", "outside_user": "y"})["outside_user"] == "y"
     tid = p.db.add_task("run it", "s", kind="work", tier="light", origin="user")
     assert "device runners: dev (on this machine)" in worker_task(p, p.db.task(tid), str(p.root), None)
     p.set_config("device", {"runners": {}})
@@ -47307,13 +47310,13 @@ def test_a_runner_restart_failing_twice_posts_one_low_line_and_queues_one_fix_ta
     assert not _ready(p, tid)
 
 
-def test_a_legacy_driver_probe_stays_not_yet_and_restarts_nothing(env, tmp_path):
+def test_an_outside_user_probe_stays_not_yet_and_restarts_nothing(env, tmp_path):
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
     calls = []
     d._devq_start = lambda runner: (calls.append(runner), (0, ""))[1]
-    tid = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 1, 'an old per-task driver still runs')} devq probe r3 r3-1")
+    tid = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 1, 'an outside device user still runs')} devq probe r3 r3-1")
     _settle_probe(d, tid)
     assert not calls and not _ready(p, tid)
     # Exit 3 from any other probe is not a runner down: the probe is broken and wakes its task.
@@ -56806,8 +56809,8 @@ def test_ssh_auth_failed_gets_a_reboot_home_hint_and_other_failures_do_not(capsy
     assert machines.auth_failed_hint("ssh: connect to host x port 22: Connection timed out") == ""
     assert machines.auth_failed_hint(None) == ""
     hint = machines.auth_failed_hint(denied)
-    assert "If the host rebooted" in hint and "authorized_keys" in hint and "console" in hint
-    assert "rebooted 1.0 h ago" in machines.auth_failed_hint(denied, booted_at=1000.0, now=1000.0 + 3600)
+    assert "If the host rebooted" in hint and "one possible cause" in hint and "authorized_keys" in hint and "console" in hint
+    assert "rebooted 1.0 h ago. One possible cause" in machines.auth_failed_hint(denied, booted_at=1000.0, now=1000.0 + 3600)
     assert "If the host rebooted" in machines.auth_failed_hint(denied, booted_at=1.0, now=1.0 + 86400)
     cli._unreachable({"host": "box"}, denied)
     assert "authorized_keys" in capsys.readouterr().err

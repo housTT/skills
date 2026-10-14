@@ -77,7 +77,7 @@ def fix_for(provider: str, note: str) -> str:
 
 
 def at(ts: float | None, now: float | None = None, where=None) -> str:
-    """'23:32 PDT' (or 'Fri 23:32 PDT') in the project's home zone (`where`: a Project, its settings,
+    """'23:32 UTC' (or 'Fri 23:32 UTC') in the project's home zone (`where`: a Project, its settings,
     a zone name or ZoneInfo); never the zone of the machine the daemon runs on."""
     if not ts:
         return "—"

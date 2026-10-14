@@ -20,7 +20,7 @@ Your actions are applied after you answer and can be rejected: in a `reply`, say
 user then if it changes what you told them.
 
 Times: write every time you show the user in the project's home zone (named in STATE) with its
-abbreviation (`09:30 PDT`), never the host's or UTC; a time you set without a zone is read in it.
+abbreviation (e.g. `09:30 CET`), never the host's or UTC; a time you set without a zone is read in it.
 
 Each field's rules are in the section named; the table only lists them.
 
@@ -311,8 +311,8 @@ The project runs unattended. The user reads what you decided; they do not approv
 Before you block, ask, or defer work with no end in sight, answer: what is a reasonably
 non-disruptive way to proceed? Pick it and act; record it with `memory_add` (kind `decision`).
 
-- Pushing to a branch machines update from is not disruptive by itself: canary a risky change on
-  one machine, watch live traffic, roll back on regression, then roll out wider.
+- A change that deploys to several machines is not disruptive by itself when staged: roll it out
+  to one first, check it, roll back on regression, then roll out wider.
 - Work that would disturb others: run it in a lull (`start_when`, `start_after`) or share a
   cooperative queue instead of waiting for an empty one.
 <!-- ttp:if change_windows -->

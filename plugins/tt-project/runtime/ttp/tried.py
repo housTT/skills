@@ -52,7 +52,7 @@ _SAID = (("shelved", re.compile(r"\b(shelv\w*|parked|abandon\w*|not worth\w*|no 
          ("landed", re.compile(r"\b(landed|merged|pushed)\b", re.I)))
 _DATES = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?Z?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
 _VERSION = re.compile(r"(?<![\w.])v?\d+(?:\.\d+){2,}\b", re.I)   # 0.2.300: a release, not a parameter
-# A number standing alone: not part of a name (LTX-2.5, fp16, v1.0) or a hash (63e55ab).
+# A number standing alone: not part of a name (Llama-3.1, fp16, v1.0) or a hash (63e55ab).
 _NUMBER = re.compile(r"(?<![\w.])(?<![a-z]-)(\d+(?:\.\d+)?(?:e[-+]?\d+)?)"
                      r"(\s?(?:x|%|ms|us|ns|fps|[kmgt]i?b|gbps|[kmg]hz)\b|%)?(?![\w])", re.I)
 # A plain integer is a parameter only right after one of these (a bound, a size); else it is a count
@@ -97,7 +97,7 @@ def content(spec: str) -> str:
 def params(text: str) -> frozenset[str]:
     """The numbers a title or spec names that measure something (bounds, sizes, rates), normalised
     (1.50 -> 1.5): decimals, numbers with a unit (1.4x, 20%, 8 ms) and integers after a bound word
-    (bound 2, batch 32). Dates, times, task references, versions (0.2.300, LTX-2.5, Python 3.12),
+    (bound 2, batch 32). Dates, times, task references, versions (0.2.300, Llama-3.1, Python 3.12),
     counts and list numbering are not. Linear in the text: each check looks only at the
     BEFORE_CHARS before the number (its patterns end there), and results are cached, since task_add
     compares one spec with the whole ledger."""
@@ -111,7 +111,7 @@ def params(text: str) -> frozenset[str]:
             if not (bound or "." in n or "e" in n.lower()):
                 continue
             if not bound and _NAME_BEFORE.search(before):
-                continue   # 'LTX 2.5', 'Python 3.12': a name's version
+                continue   # 'Llama 3.1', 'Python 3.12': a name's version
             if _LIST_DOT.match(text, m.end()) and "." not in n:
                 continue   # '2.' numbering a list
         try:
@@ -240,7 +240,7 @@ def differs(spec: str, entry: dict) -> bool:
 
 
 def describe(entry: dict, where=None, now: float | None = None) -> str:
-    """'task #12 'title' was shelved today at 12:00 PDT (result: ...)'."""
+    """'task #12 'title' was shelved today at 12:00 UTC (result: ...)'."""
     when = (f"today at {timefmt.short(entry['ts'], where, now if now is not None else entry['ts'])}"
             if same_day(entry, where, now) else f"on {entry['date']}")
     title = entry["title"] if len(entry["title"]) <= TITLE_CHARS else entry["title"][: TITLE_CHARS - 1] + "…"

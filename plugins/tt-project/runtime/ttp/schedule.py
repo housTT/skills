@@ -75,7 +75,7 @@ def zone_of(row: dict, home: str | None) -> str | None:
 
 
 def at_text(row: dict, home: str | None, now: float | None = None) -> str:
-    """'at 09:00 PDT' (the zone's abbreviation at the next run), with the zone's name when a row
+    """'at 09:00 UTC' (the zone's abbreviation at the next run), with the zone's name when a row
     stamped before home zones keeps another zone: 'at 09:00 UTC (UTC)'. '' without an `at`."""
     if not row.get("at"):
         return ""

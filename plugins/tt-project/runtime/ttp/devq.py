@@ -63,10 +63,11 @@ RUNNER_DEFAULTS = {
     # stopped (TERM, then KILL after a short grace) and marked "wedged" with the pattern and the line, so
     # the caller can recover the device. A job's own wedge_patterns replace these ([] = no check).
     "wedge_patterns": WEDGE_PATTERNS,
-    # A regex matching the command line of the project's old per-task drivers ("" = none). While one
-    # of the user's processes matches, the runner does not start and starts no job, and the probe keeps
-    # a task with a pending job asleep: both checking "no other job of ours" at once could pass.
-    "legacy_driver": "",
+    # A regex matching the command line of an outside device user to wait for ("" = none): a process
+    # of this user that drives the device outside the runner. While one matches, the runner does not
+    # start and starts no job, and the probe keeps a task with a pending job asleep: both checking
+    # "no other job of ours" at once could pass. The old key name `legacy_driver` is still read.
+    "outside_user": "",
     # The job guard, run on the host by every submit (see guard); each part is off until set. It is the
     # host's policy, so --no-lint does not skip it.
     "script_lint": "",         # "refuse" or "warn": process-group isolation and a disk guard before downloads
@@ -107,11 +108,12 @@ def config_problems(name: str, cfg) -> list:
                 out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
     if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > 100:
         out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above 100")
-    if isinstance(cfg.get("legacy_driver"), str) and cfg["legacy_driver"]:
-        try:
-            re.compile(cfg["legacy_driver"])
-        except re.error as e:
-            out.append(f"{where}.legacy_driver: not a regex ({e})")
+    for key in ("outside_user", "legacy_driver"):
+        if isinstance(cfg.get(key), str) and cfg[key]:
+            try:
+                re.compile(cfg[key])
+            except re.error as e:
+                out.append(f"{where}.{key}: not a regex ({e})")
     cap, default = cfg.get("reservation_cap_s"), cfg.get("job_timeout_s")
     if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (cap, default)) and 0 < cap < default:
         out.append(f"{where}.job_timeout_s: {default} is above reservation_cap_s {cap}")
@@ -162,7 +164,10 @@ def scan_wedge(path: Path, offset: int, patterns: list) -> tuple:
 
 
 def settings(cfg: dict | None) -> dict:
-    return {**RUNNER_DEFAULTS, **{k: v for k, v in (cfg or {}).items() if k in RUNNER_DEFAULTS}}
+    cfg = cfg or {}
+    if "legacy_driver" in cfg and "outside_user" not in cfg:   # the key's old name
+        cfg = {**cfg, "outside_user": cfg["legacy_driver"]}
+    return {**RUNNER_DEFAULTS, **{k: v for k, v in cfg.items() if k in RUNNER_DEFAULTS}}
 
 
 # project side: how `ttp devq` reaches a runner -------------------------------------------------------
@@ -812,7 +817,7 @@ def runner_alive(d: Path) -> bool:
     return not _free(d / "runner.lock")
 
 
-def legacy_drivers(d: Path, pattern: str) -> list:
+def outside_users(d: Path, pattern: str) -> list:
     """This user's processes whose command line matches `pattern`: "<pid> <command>" each. Leaves out
     this process and its ancestors (whose command lines may carry the pattern as config), the runner's
     own processes and its jobs (their process groups)."""
@@ -844,7 +849,7 @@ def legacy_drivers(d: Path, pattern: str) -> list:
 
 def probe(d: Path, job: str) -> int:
     """retry_when probe, read-only: 0 once job's marker exists or the job is unknown; 1 while a live
-    runner has it (or an old per-task driver still runs); RUNNER_DOWN_RC while it is pending with no
+    runner has it (or an outside device user still runs); RUNNER_DOWN_RC while it is pending with no
     runner alive: the project's daemon then runs `ttp devq start` itself and the task sleeps on."""
     at = where_is(d, job)
     if at == "done":
@@ -857,9 +862,9 @@ def probe(d: Path, job: str) -> int:
         print(f"{job}: unknown to the runner in {d}")
         return 0
     if not runner_alive(d):
-        legacy = legacy_drivers(d, settings(_load(d / "config.json"))["legacy_driver"])
-        if legacy:
-            print(f"{job}: {at}; no runner yet: an old per-task driver still runs ({legacy[0]})")
+        outside = outside_users(d, settings(_load(d / "config.json"))["outside_user"])
+        if outside:
+            print(f"{job}: {at}; no runner yet: an outside device user still runs ({outside[0]})")
             return 1
         print(f"{job}: {at}, but no runner is alive (runner down): `ttp devq start` brings it back")
         return RUNNER_DOWN_RC
@@ -958,9 +963,9 @@ def start(d: Path, cfg: dict) -> int:
     if runner_alive(d):
         print(f"runner already running (pid {(d / 'runner.pid').read_text().strip() if (d / 'runner.pid').exists() else '?'})")
         return 0
-    legacy = legacy_drivers(d, settings(cfg)["legacy_driver"])
-    if legacy:
-        print(f"runner not started: an old per-task driver still runs ({legacy[0]}); the probe keeps the task "
+    outside = outside_users(d, settings(cfg)["outside_user"])
+    if outside:
+        print(f"runner not started: an outside device user still runs ({outside[0]}); the probe keeps the task "
               "asleep until it ends, and the runner starts on the first wake after that")
         return 3
     with open(d / "runner.out", "a") as out:
@@ -1094,17 +1099,17 @@ class Runner:
                     return f"the health gate refused for {self.cfg['health_wait_s']:.0f} s ({why})"
             time.sleep(self.cfg["health_poll_s"])
 
-    def no_legacy(self, job: str) -> None:
-        """Wait while an old per-task driver runs: it may start a device job of its own at any time."""
+    def no_outside_user(self, job: str) -> None:
+        """Wait while an outside device user runs: it may start a device job of its own at any time."""
         told = False
         while True:
-            legacy = legacy_drivers(self.d, self.cfg["legacy_driver"])
-            if not legacy:
+            outside = outside_users(self.d, self.cfg["outside_user"])
+            if not outside:
                 return
             if not told:
-                self.log(f"{job}: waiting: an old per-task driver still runs ({legacy[0]})")
+                self.log(f"{job}: waiting: an outside device user still runs ({outside[0]})")
                 told = True
-            self.set_state(f"{job}: waiting: an old per-task driver still runs ({legacy[0]})")
+            self.set_state(f"{job}: waiting: an outside device user still runs ({outside[0]})")
             time.sleep(self.cfg["health_poll_s"])
 
     def finish(self, job: str, st: dict, status: str, rc, reason: str, **extra) -> None:
@@ -1255,7 +1260,7 @@ class Runner:
                                 f"config {spec['config']} dropped {len(drops)} times in a row; "
                                 f"`ttp devq clear <runner> {spec['config']}` allows it again")
                     return
-                self.no_legacy(job)
+                self.no_outside_user(job)
                 why = self.healthy(need, job)
                 if why:
                     self.finish(job, st, "skipped", None, why)
