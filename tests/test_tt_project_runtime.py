@@ -36122,6 +36122,31 @@ def test_drafts_during_freeze_off_lets_an_ask_about_a_draft_pr_under_a_freeze_th
     assert "not even under a\n  project's own code freeze" not in role
 
 
+def test_a_change_windows_charter_line_brings_its_rule_into_the_coordinator_prompt(env):
+    """The template charter's `- Change windows: none` keeps the rule out; a team that lists its
+    windows there turns on `change_windows`, whose rule schedules disruptive work into them."""
+    from ttp.prompts import change_windows, coordinator_features, coordinator_role
+    p = make(env)
+    rule = "an `idle_capacity` event never moves it outside one"
+    assert "- Change windows: none." in (RUNTIME.parent / "template" / "CHARTER.md").read_text()
+    assert "change_windows" not in coordinator_features(p) and rule not in coordinator_role(p)
+    assert '"Waiting for a window"' in coordinator_role(p)
+    charter = p.charter_path.read_text() if p.charter_path.exists() else "# Charter\n\n## Policies\n\n"
+    if "## Policies" not in charter:
+        charter += "\n## Policies\n\n"
+    p.charter_path.write_text(charter.replace("## Policies\n", "## Policies\n\n- Change windows: None for now.\n", 1))
+    assert "change_windows" not in coordinator_features(p)
+    windows = "Sat 02:00-06:00 UTC for restarts and rollouts"
+    p.charter_path.write_text(charter.replace("## Policies\n", f"## Policies\n\n- Change windows: {windows}\n", 1))
+    assert "change_windows" in coordinator_features(p)
+    role = coordinator_role(p)
+    assert rule in role and "`start_after` or\n  `start_when` for the next declared window" in role
+    assert '"Waiting for a window"' in role
+    # Only the Policies section counts: the same words elsewhere turn nothing on.
+    assert change_windows(f"## Resources\n\n- Change windows: {windows}\n") == ""
+    assert change_windows(f"## Policies\n\n- Change windows: {windows}\n\n## Resources\n") == windows
+
+
 def test_rules_say_draft_prs_need_no_permission_and_no_reviewers_are_requested():
     template = RUNTIME.parent / "template"
     charter = " ".join((template / "CHARTER.md").read_text().split())

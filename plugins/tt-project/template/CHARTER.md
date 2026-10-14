@@ -27,6 +27,9 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
 - Shared clusters (Slurm, other people's machines): only the exact nodes listed under Resources;
   a node only when free and idle at least 2 h; one self-ending batch job per test, time limit sized
   to the run, nothing left running; never hold a node idle or touch another user's allocation.
+- Change windows: none. A team that only allows disruptive work (restarts, rollouts, anything
+  that disturbs others) in set windows lists them here instead, with their time zone; the
+  coordinator then schedules such work into the next window.
 
 ## Resources
 

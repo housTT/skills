@@ -91,12 +91,23 @@ def coordinator_features(p: Project) -> set[str]:
     tags = " ".join(str(m.get("tags") or "") for m in known.values())
     if re.search(r"\b(slurm|cluster)", f"{tags} {resources.group(0) if resources else ''}", re.I):
         on.add("clusters")
+    if change_windows(charter):
+        on.add("change_windows")
     try:
         if any(o.get("receipt") is None and o.get("dropped") is None for o in obligations.items(p.db)):
             on.add("obligations")
     except Exception:
         pass
     return on
+
+
+def change_windows(charter: str) -> str:
+    """The charter's `- Change windows:` Policies line, or "" while it says `none` (the template's
+    default) or is absent: a team that works in change windows lists them there."""
+    policies = re.search(r"(?ms)^## Policies\b.*?(?=^## |\Z)", charter)
+    m = re.search(r"(?mi)^- Change windows:[ \t]*(.*)$", policies.group(0) if policies else "")
+    value = m.group(1).strip() if m else ""
+    return "" if re.match(r"(?i)none\b", value) else value
 
 
 def coordinator_role(p: Project) -> str:

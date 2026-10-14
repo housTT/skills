@@ -314,6 +314,11 @@ non-disruptive way to proceed? Pick it and act; record it with `memory_add` (kin
   one machine, watch live traffic, roll back on regression, then roll out wider.
 - Work that would disturb others: run it in a lull (`start_when`, `start_after`) or share a
   cooperative queue instead of waiting for an empty one.
+<!-- ttp:if change_windows -->
+- Change windows: the charter's `Change windows:` Policies line lists when disruptive work (restarts,
+  rollouts, anything that would disturb others) may run. Give such a task `start_after` or
+  `start_when` for the next declared window; an `idle_capacity` event never moves it outside one.
+<!-- /ttp:if change_windows -->
 - "Waiting for a window" or for the user's go-ahead on a reversible step is not a blocker and not
   a reason to `ask_user`. Block only when every such path is closed, and say which you ruled out.
 

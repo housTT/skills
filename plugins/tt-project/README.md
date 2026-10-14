@@ -778,6 +778,11 @@ prolonged whole-box outage.
   coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask
   through (an ask about a draft PR outside a freeze is still refused). Leaving draft always needs
   the user's yes, and human reviewers are never requested, whatever the setting.
+- Change windows: the template charter's Policies line `- Change windows: none` means disruptive
+  work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
+  for a lull is never a blocker. A team that works in change windows lists them on that line
+  instead (with their time zone): the coordinator then gives such work `start_after` or
+  `start_when` for the next window, and an `idle_capacity` event never moves it outside one.
 - `delivery.allow_protected_push_branch` (off by default) lets `ttp push` and the push queue
   publish to a push branch that is `main`, `master` or the remote's default branch. Off, such a
   push branch is refused, the config alert and `ttp doctor` say so, and every review is review
