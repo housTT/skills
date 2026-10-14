@@ -6117,13 +6117,13 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
                         "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
     full, seen = coord.digest_parts(p, gates, [ev], [])
     keys = [k for k, _ in full]
-    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE)
+    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE) | {coord.LEDGER_SEEN_KEY}
     full_text = "\n".join(t for _, t in full)
     # The next routine turn, nothing changed: each background section is one line, with no reasons.
     short, again = coord.digest_parts(p, gates, [ev], [], seen)
     assert again == seen and [k for k, _ in short] == keys, "a section was dropped or reordered"
     text = dict(short)
-    for key in coord.COLLAPSIBLE:
+    for key in (*coord.COLLAPSIBLE, "machine_ledger"):
         assert "(as last turn" in text[key] and "\n" not in text[key], key
         assert len(text[key]) < len(dict(full)[key]), key
     assert "watcher:hw 'tray dropped': 0 muted" in text["muted"] and "hardware team" not in text["muted"]
@@ -6225,6 +6225,61 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     assert "a second change" in prompt, "a changed ledger is shown whole"
     prompt, _ = turn("observation", "box-c is slow")
     assert "a second change" not in prompt and "2 open (as last turn)" in prompt
+
+
+def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworded_lines(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-c", tags="device")
+    mm.add("box-d", tags="device")
+    _resources(p, "- box-c\n- box-d")
+    first = ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "other", expires="6h")
+    ml.report("proj-a", "box-d", "held", "a hold")
+    gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
+                        "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                (time.time(), "daemon", "observation", "normal", "box-c is slow", "queued"))
+    mev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "daemon", "machine_condition", "normal", "a condition opened", "queued"))
+
+    def ledger(seen, events=(ev,)):
+        parts, got = coord.digest_parts(p, gates, list(events), [], seen)
+        return dict(parts).get("machine_ledger", ""), got
+
+    whole, seen = ledger(None)
+    assert "zzzz" in whole and "box-d held" in whole and "No recovery owner" in whole
+    # Unchanged: one line, without the owner gap named once already.
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open (as last turn)"
+    # Reworded: a co-tenant also sees the hold; only that line is shown.
+    ml.report("proj-b", "box-d", "held", "a hold")
+    text, seen = ledger(seen)
+    assert "seen by proj-a, proj-b" in text and "zzzz" not in text and "1 as last turn" in text
+    assert len(text) < 600 < len(whole)
+    # New: an outage and a second change; the first change stays as last turn.
+    ml.set_outage("box-c", "planned maintenance", "other", "6h")
+    ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
+    text, seen = ledger(seen)
+    assert "known outage" in text and "a second change" in text and "zzzz" not in text and "box-d held" not in text
+    assert "4 open" in text and "2 as last turn" in text
+    # Removed: the first change closes and the hold clears; counted as gone, nothing else repeated.
+    ml.close_change(first["id"], "done", by="other")
+    ml.report("proj-a", "box-d", "held", cleared=True)
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open; new or changed since last turn below, 2 as last turn, 2 gone"
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open (as last turn)"
+    # A machine event shows it whole.
+    text, seen = ledger(seen, (ev, mev))
+    assert "known outage" in text and "a second change" in text and "(as last turn" not in text
+    # So does the turn after a snapshot refresh.
+    assert ledger(seen)[0].endswith("(as last turn)")
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    text, seen = ledger(seen)
+    assert "known outage" in text and "a second change" in text and "(as last turn" not in text
+    assert ledger(seen)[0].endswith("(as last turn)")
 
 
 def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):

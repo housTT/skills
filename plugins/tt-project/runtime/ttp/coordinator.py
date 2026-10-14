@@ -281,10 +281,15 @@ MUTE_CHARS = 200
 # Every coordinator turn is a fresh session whose digest the provider writes to its cache whole.
 # Every turn, at any effort, sees these background sections as one line while they are as the
 # previous turn saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused
-# resources and memory changes are always shown whole; so is the machine ledger on a turn with a
-# machine_* event.
+# resources and memory changes are always shown whole; the machine ledger collapses per line
+# (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger", "tried")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "tried")
+# The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
+# held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
+# whole ledger again after a machine event or a snapshot refresh (ledger_section).
+LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"snapshot": its time, "lines": {key: hash}}
+LEDGER_HEAD = "## Shared machines in your Resources"
 # Sections that change only when memory, the charter or the release does: they end the cached
 # context block (with_cached) instead of the digest, which a timestamp leads and so misses the cache
 # whole every turn. Their order is fixed, so the block is byte-identical while they are unchanged.
@@ -557,11 +562,40 @@ def held_at_reboots(boots: list[dict], where=None) -> str:
 def machine_events(db, event_ids: list[int]) -> bool:
     """Whether any of the events is a machine event (machine_condition, machine_change_overdue, ...).
     An event that only names a machine does not count: on a fleet nearly every event names one, and
-    an outage or a recovery reaches the ledger itself, whose changed hash shows it whole anyway."""
+    an outage or a recovery reaches the ledger itself, whose new or reworded lines show anyway."""
     if not event_ids:
         return False
     return bool(db.one(f"SELECT 1 FROM events WHERE id IN ({','.join('?' * len(event_ids))}) "
                        "AND kind LIKE 'machine%' LIMIT 1", list(event_ids)))
+
+
+def ledger_section(p: Project, db, seen: dict | None, machine_event: bool,
+                   now: float) -> tuple[list[str], dict] | None:
+    """The machine ledger's digest lines and what to store for the next turn under LEDGER_SEEN_KEY;
+    None when there is nothing to show. Whole on a turn with a machine event, without `seen` or
+    after a snapshot refresh; else only the lines new or reworded since the previous turn, and a
+    count of the ones gone. The line naming machines without a recovery owner is shown once anyway."""
+    items = machine_ledger.digest_items(p, now)
+    kept = [(k, ln) for k, ln in items if k != machine_ledger.GAP_ITEM]
+    snap = prompt_state(p, now)[0].get("at")
+    store = {"snapshot": snap, "lines": {k: _sha(ln) for k, ln in kept}}
+    before = (seen or {}).get(LEDGER_SEEN_KEY)
+    if machine_event or not isinstance(before, dict) or before.get("snapshot") != snap:
+        if not items:
+            return None
+        return ([f"{LEDGER_HEAD}: open changes (`ttp machines change`), conditions, owners"]
+                + [f"- {ln}" for _, ln in items]), store
+    old = before.get("lines") or {}
+    fresh = [(k, ln) for k, ln in items if k == machine_ledger.GAP_ITEM or old.get(k) != store["lines"].get(k)]
+    gone = len(set(old) - set(store["lines"]))
+    if not items and not gone:
+        return None
+    same = len(kept) - len([k for k, _ in fresh if k != machine_ledger.GAP_ITEM])
+    if not fresh and not gone:
+        return [f"{LEDGER_HEAD}: {len(kept)} open (as last turn)"], store
+    return ([f"{LEDGER_HEAD}: {len(kept)} open; new or changed since last turn below"
+             + (f", {same} as last turn" if same else "") + (f", {gone} gone" if gone else "")]
+            + [f"- {ln}" for _, ln in fresh]), store
 
 
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
@@ -581,7 +615,7 @@ def with_cached(context: str, cached: str) -> str:
 
 
 def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
-                 seen: dict | None = None) -> tuple[list[tuple[str, str]], dict[str, str]]:
+                 seen: dict | None = None) -> tuple[list[tuple[str, str]], dict]:
     """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section,
     to store as `seen` for the next turn. With `seen`, a collapsible section whose hash is unchanged
     is shown as one line."""
@@ -589,7 +623,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     now = time.time()
     home = timefmt.home(p)
     shown: list[tuple[str, list[str]]] = []
-    shas: dict[str, str] = {}
+    shas: dict = {}
 
     def section(key: str, body: list[str], ident: str | None = None, short: str | None = None) -> None:
         """`ident`: what makes a collapsible section different for the coordinator (no counters or
@@ -678,13 +712,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
     section("shared", lines)
-    lines = machine_ledger.digest_lines(p, now)
-    if lines:
-        kept = [ln for ln in lines if not ln.startswith("No recovery owner")]   # named once: not a change
-        section("machine_ledger", ["## Shared machines in your Resources: open changes (`ttp machines change`), "
-                                   "conditions, owners"] + [f"- {ln}" for ln in lines], "\n".join(kept),
-                None if machine_events(db, event_ids) else
-                f"## Shared machines in your Resources: {len(kept)} open (as last turn)")
+    ledger = ledger_section(p, db, seen, machine_events(db, event_ids), now)
+    if ledger:
+        shown.append(("machine_ledger", ledger[0]))
+        shas[LEDGER_SEEN_KEY] = ledger[1]
     section("prompt_delta", prompt_delta_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     section("memory_recent", recent_memory_lines(p))

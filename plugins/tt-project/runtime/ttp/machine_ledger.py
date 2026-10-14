@@ -751,30 +751,40 @@ def resource_machines(p) -> list[str]:
 def digest_lines(p, now: float | None = None) -> list[str]:
     """The open changes and conditions on the machines in `p`'s Resources, one line each, and each
     machine there without a recovery owner, named once per project."""
+    return [line for _, line in digest_items(p, now)]
+
+
+GAP_ITEM = "no_owner"   # digest_items' key of the line naming machines without a recovery owner
+
+
+def digest_items(p, now: float | None = None) -> list[tuple[str, str]]:
+    """digest_lines as (stable key, line): a change by its id, a condition by alias and condition, an
+    outage by alias, so a reworded line keeps its key (the digest shows only new or reworded lines)."""
     now = time.time() if now is None else now
     mine = resource_machines(p)
     if not mine:
         return []
     known = machines.load()
-    lines = [change_line(c, now, p) for c in changes(set(mine))]
-    for c in conditions().values():
+    items = [(f"change:{c.get('id')}", change_line(c, now, p)) for c in changes(set(mine))]
+    for key, c in conditions().items():
         if c.get("alias") in mine:
             owner = (known.get(c["alias"]) or {}).get("recovery_owner")
             held = (c.get("page") or {}).get("held")
             hush = (c.get("page") or {}).get("quiet")
-            lines.append(f"{c['alias']} {c['condition']} since {ends.shown(c['first'], p)} (seen by "
-                         f"{', '.join(c.get('seen_by', []))}; recovery owner: {owner or 'none set'}"
-                         + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "")
-                         + (f"; not escalated: {hush}" if hush else "") + ")")
-    lines += [outage_line(a, o, p) for a, o in sorted(outages(now).items()) if a in mine]
+            items.append((f"condition:{key}",
+                          f"{c['alias']} {c['condition']} since {ends.shown(c['first'], p)} (seen by "
+                          f"{', '.join(c.get('seen_by', []))}; recovery owner: {owner or 'none set'}"
+                          + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "")
+                          + (f"; not escalated: {hush}" if hush else "") + ")"))
+    items += [(f"outage:{a}", outage_line(a, o, p)) for a, o in sorted(outages(now).items()) if a in mine]
     named = list(p.db.kv(GAP_KV) or [])
     gaps = [a for a in mine if not (known.get(a) or {}).get("recovery_owner") and a not in named]
     if gaps:
-        lines.append("No recovery owner set for " + ", ".join(gaps) + ": a long down or held condition there "
-                     "reaches nobody. Set one: `ttp machines set <alias> --owner <project> [--fallback <project>]` "
-                     "(named once).")
+        items.append((GAP_ITEM, "No recovery owner set for " + ", ".join(gaps) + ": a long down or held condition "
+                      "there reaches nobody. Set one: `ttp machines set <alias> --owner <project> "
+                      "[--fallback <project>]` (named once)."))
         p.db.set_kv(GAP_KV, named + gaps)
-    return lines
+    return items
 
 
 def review_lines(p, now: float | None = None) -> list[str]:
