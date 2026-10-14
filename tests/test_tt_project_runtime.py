@@ -58049,7 +58049,7 @@ def test_failover_review_lines_say_when_a_logout_ended(env):
 
 
 # ssh-preflight @<resource> and stale harness git locks ----------------------------------------------
-def _fake_ssh(tmp_path, up: set[str]) -> dict:
+def _fake_preflight_ssh(tmp_path, up: set[str]) -> dict:
     """A stand-in ssh on PATH: logs its target, exits 0 for hosts in `up`, 255 for others."""
     bindir = tmp_path / "fakebin"
     bindir.mkdir(exist_ok=True)
@@ -58089,7 +58089,7 @@ def test_hostmap_resolves_a_resource_from_config_and_leaves_a_plain_host_alone()
 
 def test_ssh_preflight_follows_a_resource_to_its_current_host(env, tmp_path):
     p = make(env)
-    fake = _fake_ssh(tmp_path, {"boxA", "boxB"})
+    fake = _fake_preflight_ssh(tmp_path, {"boxA", "boxB"})
     run = lambda *a: _ttp_run(p, "ssh-preflight", *a, env={"PATH": fake["PATH"]})
     r = run("boxA")
     assert r.returncode == 0 and "boxA reachable" in r.stdout, r.stderr
