@@ -35497,6 +35497,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 DURABLE_EXEMPT = {
     ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
+    ("gitlocks.py", "os.replace(path, to)"): "moves a stale git lock aside, never its content; a rename lost to a crash leaves the lock for the next sweep",
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
     ("project.py", 'open(path, "a")'): "inside durable_append",
@@ -35561,7 +35562,6 @@ DURABLE_EXEMPT = {
     ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
     ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
     ("project.py", '"daemon.log", "a") as f'): "a log line",
-    ("project.py", "os.replace(f, dest / rel)"): "moves a stale git lock file aside, a rename within one directory tree; a lost move only leaves the lock to the next try",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
