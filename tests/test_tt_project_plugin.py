@@ -600,7 +600,7 @@ def shipped_text_files(root=PLUGIN):
 def test_shipped_inventory_without_git(tmp_path):
     import shutil
     copy = tmp_path / "tt-project"
-    shutil.copytree(PLUGIN, copy, ignore=shutil.ignore_patterns(".git"))
+    shutil.copytree(PLUGIN, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
     (copy / "runtime" / "ttp" / "__pycache__").mkdir(exist_ok=True)
     (copy / "runtime" / "ttp" / "__pycache__" / "cli.cpython-312.pyc").write_bytes(b"\0")
     source, rels = shipped_inventory(copy)
