@@ -77,7 +77,8 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 - A `ttp note --to` past 4,000 characters (whitespace joined) is refused whole, never cut; a
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.
-- Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>`, or a
+- Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>` (or `--wontfix "<reason>"` for a note that is not a
+  plugin bug: closed, no release), or a
   code task's hand-off lists the note in `resolves` and the push queue records it with the version
   its batch pushed. A sandboxed `--resolve` or `--ack` is queued in the run's directory and
   recorded when the run ends. Work

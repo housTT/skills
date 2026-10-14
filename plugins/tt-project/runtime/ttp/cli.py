@@ -1397,9 +1397,14 @@ def cmd_upstream(a) -> None:
         return
     if a.resolve or a.fixed or a.ack or a.mine or a.resolved:
         try:
+            if a.resolve and a.wontfix is not None:
+                me = here()
+                r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
+                print(f"note {r['fp']} closed without a release (wontfix): {r['note']}")
+                return
             if a.resolve:
                 if not a.fixed_in:
-                    die("ttp upstream --resolve needs --fixed-in <version>")
+                    die("ttp upstream --resolve needs --fixed-in <version> or --wontfix \"<reason>\"")
                 me = here()
                 try:
                     r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
@@ -5196,6 +5201,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
     s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in)")
     s.add_argument("--fixed-in", metavar="VERSION", help="with --resolve: the release with the fix")
+    s.add_argument("--wontfix", metavar="REASON", help="with --resolve: close note FP without a release (not a "
+                                                       "plugin bug); the reason is required and recorded")
     s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
     s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
                                                   "fix, 1 before, 2 when unknown")

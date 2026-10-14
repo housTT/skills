@@ -635,6 +635,23 @@ def resolve(fp: str, fixed_in: str, note: str = "", by: str = "", now: float | N
                     "by": by, "ts": now or time.time()})
 
 
+def wontfix(fp: str, reason: str, by: str = "", now: float | None = None) -> dict:
+    """Close note `fp` without a release: it is not a plugin bug. A reason is required. No push batch
+    marks it fixed (see `wontfixed`), and it leaves the open list."""
+    fp = _check_fp(fp)
+    reason = " ".join(str(reason or "").split())
+    if not reason:
+        raise ValueError("--wontfix needs a reason")
+    return _record({"kind": "wontfix", "fp": fp, "note": cut(reason, "it"), "by": by, "ts": now or time.time()})
+
+
+def wontfixed(fp: str, recs: list[dict] | None = None) -> dict | None:
+    """The wontfix record of note `fp` when no later resolution replaced it, else None."""
+    recs = _records() if recs is None else recs
+    got = [r for r in recs if r.get("fp") == fp and r.get("kind") in ("wontfix", "resolve")]
+    return got[-1] if got and got[-1].get("kind") == "wontfix" else None
+
+
 def resolution(fp: str, recs: list[dict] | None = None) -> dict | None:
     """The latest resolution of note `fp`, or None."""
     got = [r for r in (_records() if recs is None else recs) if r.get("kind") == "resolve" and r.get("fp") == fp]
@@ -713,9 +730,11 @@ def acked(fp: str, recs: list[dict] | None = None) -> dict | None:
 
 
 def state(fp: str, now: float | None = None, recs: list[dict] | None = None) -> str:
-    """"open", "resolved", SHIPPED (resolved CONFIRM_S ago, no ack) or "closed" (acked)."""
+    """"open", "resolved", SHIPPED (resolved CONFIRM_S ago, no ack), "closed" (acked) or "wontfix"."""
     recs = _records() if recs is None else recs
     res = resolution(fp, recs)
+    if wontfixed(fp, recs):
+        return "wontfix"
     if not res:
         return "open"
     if acked(fp, recs):
@@ -813,7 +832,7 @@ def listing(name: str | None, now: float | None = None) -> list[str]:
         notes = filed(name)
         fps = list(notes)
     else:
-        fps = list(dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve"))
+        fps = list(dict.fromkeys(r["fp"] for r in recs if r.get("kind") in ("resolve", "wontfix")))
         notes = {}
     out = []
     for fp in fps:
@@ -821,7 +840,8 @@ def listing(name: str | None, now: float | None = None) -> list[str]:
         n = notes.get(fp) or {}
         title = n.get("title") or (f"filed by {n.get('project')}" if n.get("project") else "")
         out.append(f"{fp} {st}" + (f" in {res['fixed_in']}" if res else "") + (f": {title[:120]}" if title else "")
-                   + (f" — {res['note'][:200]}" if res and res.get("note") and not name else ""))
+                   + (f" — {res['note'][:200]}" if res and res.get("note") and not name else "")
+                   + (f" — {wf['note'][:200]}" if (wf := wontfixed(fp, recs)) and wf.get("note") else ""))
     return out
 
 

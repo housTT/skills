@@ -63725,3 +63725,33 @@ def test_a_retried_read_only_task_sees_what_landed_after_its_worktree_was_made(e
     _git_out(p.root, "update-ref", f"refs/heads/{base}", old)
     worktree.ensure(p, p.db.task(tid))
     assert _git_out(path, "rev-parse", "HEAD") == new
+
+
+def test_upstream_wontfix_closes_a_note_with_a_reason_and_no_release(env, monkeypatch, capsys):
+    from ttp import cli, pushq, upstream
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: nb", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: nb", "y")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _upstream_cli(cli, "--resolve", fp, "--wontfix", "") != 0
+    assert upstream.state(fp) == "open"
+    assert _upstream_cli(cli, "--resolve", fp, "--wontfix", "not a plugin bug") == 0
+    assert upstream.state(fp) == "wontfix" and upstream.wontfixed(fp)["note"] == "not a plugin bug"
+    assert upstream.resolution(fp) is None and fp in "\n".join(upstream.listing("demo"))
+    assert "open" not in " ".join(upstream.listing("demo")).split(fp, 1)[1].split()[:1]
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.code, result=json.dumps({"status": "done", "resolves": [fp]}))
+    n = len(upstream._records())
+    pushq._resolve_upstream(s.p, [s.review], "0.3.1")
+    assert len(upstream._records()) == n and upstream.resolution(fp) is None
+
+
+def test_upstream_ack_still_works_for_a_release_resolved_note_and_wontfix_needs_resolve(env, monkeypatch):
+    from ttp import cli, upstream
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: ok", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: ok", "y")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    upstream.resolve(fp, "0.2.10")
+    assert _upstream_cli(cli, "--ack", fp, "works") == 0
+    assert upstream.state(fp) == "closed"

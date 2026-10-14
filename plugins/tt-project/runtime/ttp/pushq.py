@@ -1269,6 +1269,8 @@ def _resolve_upstream(p: Project, review_ids: list[int], version: str | None) ->
     for rid in dict.fromkeys(review_ids):
         for fp, t in resolves_of(p, rid):
             try:
+                if upstream.wontfixed(fp):
+                    continue
                 had = upstream.resolution(fp)
                 if had and had.get("fixed_in") == str(version).lstrip("v"):
                     continue
