@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import gitlocks
 from .db import DB
 
 FOLDER = "tt-project"                     # lives at the root of the user's project, ignored by it
@@ -270,10 +271,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
-    # A lock file in its .git older than stale_lock_s while no git runs there (one a killed commit left)
-    # is moved aside under .git/ttp-stale-locks/ before committing. Every sweep_every_s the daemon
-    # commits charter and memory files a failed commit left uncommitted (see Project.sweep_harness).
-    "harness_git": {"timeout_s": 120, "stale_lock_s": 600, "sweep_every_s": 600},
+    # A lock file in its .git older than stale_lock_s (unset: 600 s; 0: off) that no process holds (one a
+    # killed commit left) is moved aside under .git/ttp-stale-locks/ before committing and by the daemon's
+    # sweep (ttp.gitlocks). Every sweep_every_s the daemon commits charter and memory files a failed
+    # commit left uncommitted (see Project.sweep_harness).
+    "harness_git": {"timeout_s": 120, "sweep_every_s": 600},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     # same_subject_warn: a watcher that opens more issues than this on one subject in 24 h gets a log
@@ -289,9 +291,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
     # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
     # and the `restarts`-th in that window sends one high alert.
-    # stale_git_lock_s: a .git/*.lock in the harness repository this old that no process holds is
-    # removed (a killed git command left it; it blocks every harness commit; gitlocks.py; 0: off).
-    "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600, "stale_git_lock_s": 600},
+    "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
     # A conflicting merge queues one harness task a day at most (at once when the last one landed its
@@ -324,6 +324,9 @@ EXTRA_KEYS = {
     "coordinator": {"max_review_tasks_per_day", "charter_approval_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "review_backlog_h"},
     "notify": {"slack_poll_s"},
+    # stale_lock_s: see "harness_git" in DEFAULT_CONFIG; unset so that the old watchdog key below still counts.
+    "harness_git": {"stale_lock_s"},
+    "watchdog": {"stale_git_lock_s"},   # deprecated alias of harness_git.stale_lock_s, read only when that is unset
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
@@ -822,40 +825,27 @@ class Project:
             pass
 
     def clear_stale_git_locks(self, now: float | None = None) -> list[str]:
-        """Move aside the lock files a killed git left in the harness repo (.git/*.lock, including
-        index.lock and next-index-*.lock, and .git/refs/**/*.lock) older than harness_git.stale_lock_s,
-        when no git process runs in the repo. Each is kept under .git/ttp-stale-locks/<stamp>/, never
-        deleted. Returns the moved paths (relative to .git)."""
-        gitdir = self.harness / ".git"
-        if not gitdir.is_dir():
-            return []
+        """Move aside the lock files a killed git left in the harness repo, once they are older than
+        harness_git.stale_lock_s and no process holds them (ttp.gitlocks). Each is kept under
+        .git/ttp-stale-locks/<stamp>/, never deleted. Returns the moved paths (relative to .git)."""
+        try:
+            cfg = json.loads(self.config_path.read_text())   # directly, as _harness_git_cfg does
+        except (OSError, ValueError):
+            cfg = {}
+        gdir = gitlocks.git_dir(self.harness)
         now = time.time() if now is None else now
-        age = self._harness_git_cfg("stale_lock_s")
-        locks = []
-        for f in [*gitdir.glob("*.lock"), *(gitdir / "refs").glob("**/*.lock")]:
-            try:
-                if f.is_file() and now - f.stat().st_mtime > age:
-                    locks.append(f)
-            except OSError:
-                continue
-        if not locks:
+        try:
+            moved, held = gitlocks.clear(self.harness, gitlocks.settings(cfg if isinstance(cfg, dict) else {}), now)
+        except Exception as e:
+            self._git_log(f"stale lock check failed: {e!r}")
             return []
-        if git_running_in(self.harness):
-            self._git_log(f"{len(locks)} stale lock file(s) left alone: a git process runs in the repo")
+        if held:
+            self._git_log(f"old lock file(s) left alone: pid(s) {', '.join(map(str, held))} may hold them")
+        if not moved:
             return []
-        dest = gitdir / "ttp-stale-locks" / time.strftime("%Y%m%dT%H%M%S", time.localtime(now))
-        moved = []
-        for f in locks:
-            rel = f.relative_to(gitdir)
-            try:
-                (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-                os.replace(f, dest / rel)
-                moved.append(str(rel))
-            except OSError as e:
-                self._git_log(f"could not move stale lock {rel} aside: {e}")
-        if moved:
-            self._git_log(f"moved stale lock file(s) aside to {dest.relative_to(self.harness)}: {', '.join(moved)}")
-        return moved
+        rel = [str(x.relative_to(gdir)) for x in moved]
+        self._git_log(f"moved stale lock file(s) aside to {gitlocks.keep_dir(gdir, now)}: {', '.join(rel)}")
+        return rel
 
     def _git_commit(self, rel: list[str], message: str, gone: list[str] = (), sweep: bool = True) -> bool:
         """Commit these harness paths. A failure is logged with git's stderr and exit code; files it
@@ -1302,38 +1292,6 @@ def git_fsync_config() -> list[tuple[str, str]]:
     if git_version() >= (2, 36):
         return [("core.fsync", "committed")]
     return [("core.fsyncObjectFiles", "true")]
-
-
-def git_running_in(repo: Path) -> bool:
-    """Whether a git process runs in `repo` (its working directory, or a `-C` naming it). Without
-    /proc any running git counts, to stay on the safe side."""
-    repo = Path(repo).resolve()
-    proc = Path("/proc")
-    if not (proc / "self").is_dir():
-        try:
-            out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=30).stdout
-        except (OSError, subprocess.SubprocessError):
-            return True
-        return any(Path(c.strip()).name.startswith("git") for c in out.splitlines())
-    for d in proc.iterdir():
-        if not d.name.isdigit():
-            continue
-        try:
-            argv = (d / "cmdline").read_bytes().split(b"\0")
-            if not argv or not os.path.basename(argv[0]).startswith(b"git"):
-                continue
-            cwd = Path(os.readlink(d / "cwd"))
-        except OSError:
-            continue
-        dirs = [cwd] + [cwd / os.fsdecode(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == b"-C"]
-        for x in dirs:
-            try:
-                x = x.resolve()
-            except OSError:
-                continue
-            if x == repo or repo in x.parents:
-                return True
-    return False
 
 
 def git_fsync_args() -> list[str]:

@@ -158,8 +158,8 @@
   `"$VIRTUAL_ENV"/bin/python`: workers and reviewers run with the project venv active.
 - Harness commits (charter, memory, schedules) heal themselves. Each git command gets `harness_git.timeout_s`
   (default 120 s); every failure goes to `daemon.log` with git's exit code and stderr. Lock files in the
-  harness's `.git` older than `harness_git.stale_lock_s` (600 s) while no git runs there are moved to
-  `.git/ttp-stale-locks/`, never deleted. The next successful commit, and the daemon every
+  harness's `.git` older than `harness_git.stale_lock_s` (600 s; 0: off) that no process holds (none
+  has it open, no git runs there) are moved to `.git/ttp-stale-locks/`, never deleted. The next successful commit, and the daemon every
   `harness_git.sweep_every_s` (600 s), commit charter and memory files a failed commit left behind. Files that look like a
   power-cut write are left for the boot integrity check, and nothing is swept before it has run.
 - Making a task's worktree recovers by itself. Each git command gets `worktree.git_timeout_s`

@@ -8731,11 +8731,13 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
         os.utime(f, (old, old))
     fresh = gitdir / "packed-refs.lock"
     fresh.write_text("y\n")
-    # A git still running in the repo keeps even old locks in place.
-    monkeypatch.setattr(project, "git_running_in", lambda repo: True)
+    # A process that may hold them (a git running in the repo) keeps even old locks in place.
+    from ttp import gitlocks
+    holders = gitlocks.holders
+    monkeypatch.setattr(gitlocks, "holders", lambda *a, **k: [4242])
     assert p.clear_stale_git_locks() == []
-    assert all(f.exists() for f in left) and "left alone" in _daemon_log_text(p)
-    monkeypatch.setattr(project, "git_running_in", lambda repo: False)
+    assert all(f.exists() for f in left) and "left alone: pid(s) 4242" in _daemon_log_text(p)
+    monkeypatch.setattr(gitlocks, "holders", holders)
     fresh.unlink()
     p.add_memory("Locks a killed commit left are moved aside.")
     assert not any(f.exists() for f in left)
@@ -8749,14 +8751,17 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
     assert p.clear_stale_git_locks() == [] and fresh.exists()
 
 
-def test_git_running_in_sees_a_git_in_the_repo(env, tmp_path):
-    from ttp.project import git_running_in
+def test_git_lock_holders_see_a_real_git_in_the_repo(env, tmp_path):
+    from ttp import gitlocks
     p = make(env)
-    assert git_running_in(tmp_path) is False
+    gdir = gitlocks.git_dir(p.harness)
     proc = subprocess.Popen(["git", "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL)
     try:
-        assert git_running_in(p.harness)
+        assert proc.pid in gitlocks.holders(p.harness, gdir, [])
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        assert proc.pid not in gitlocks.holders(other, other / ".git", [])
     finally:
         proc.communicate(b"x")
 
@@ -61138,6 +61143,11 @@ def test_stale_git_locks_are_cleared_but_live_or_young_ones_kept(tmp_path):
     assert young.exists(), "a lock younger than the threshold is kept"
     assert obj.exists(), "object store locks are left alone"
     assert not old.exists() and not ref.exists()
+    kept = sorted(x.relative_to(repo / ".git" / gitlocks.KEEP_DIR).parts[1:]
+                  for x in (repo / ".git" / gitlocks.KEEP_DIR).rglob("*.lock"))
+    assert kept == [("index.lock",), ("refs", "heads", "main.lock")], "moved aside, never deleted"
+    # What was moved aside is never a candidate again.
+    assert gitlocks.clear(repo, 600, procs=[]) == ([], [])
 
 
 def test_a_git_lock_a_process_has_open_is_never_stale(tmp_path):
@@ -61162,26 +61172,43 @@ def test_a_git_lock_a_process_has_open_is_never_stale(tmp_path):
     assert gitlocks.clear(repo, 600, procs=[])[0] == [lock]
 
 
-def test_daemon_clears_a_stale_harness_git_lock_and_logs_it(env):
+def test_daemon_sweep_moves_a_stale_harness_git_lock_aside_and_logs_it(env):
     p = make(env)
     from ttp import gitlocks
     from ttp.daemon import Daemon
-    assert gitlocks.git_dir(p.harness) is not None
-    lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
+    gdir = gitlocks.git_dir(p.harness)
+    assert gdir is not None
+    lock = _harness_lock(gdir.parent, "index.lock", 3600)
     d = Daemon(p.base)
-    d.cfg = p.config()
-    assert gitlocks.settings(d.cfg) == 600
-    d.clear_git_locks()
-    assert not lock.exists()
-    assert "harness git locks: removed stale" in (p.logs / "daemon.log").read_text()
+    assert not hasattr(d, "clear_git_locks"), "one cleaner: the harness sweep"
+    d.heal_harness_git()
+    assert not lock.exists() and list((gdir / gitlocks.KEEP_DIR).rglob("index.lock"))
+    assert "moved stale lock file(s) aside" in _daemon_log_text(p)
     ev = p.db.one("SELECT severity,text FROM events WHERE kind='git_lock_cleared'")
     assert ev["severity"] == "low" and "index.lock" in ev["text"]
     # Off when the threshold is 0.
+    lock = _harness_lock(gdir.parent, "index.lock", 3600)
+    p.set_config("harness_git.stale_lock_s", 0)
+    assert p.clear_stale_git_locks() == [] and lock.exists()
+
+
+def test_stale_git_lock_setting_reads_the_old_watchdog_key_only_when_the_new_one_is_unset(env):
+    p = make(env)
+    from ttp import gitlocks
+    from ttp.project import unknown_key_hint
+    assert gitlocks.settings({}) == gitlocks.settings(p.config()) == 600
+    assert gitlocks.settings({"watchdog": {"stale_git_lock_s": 0}}) == 0
+    assert gitlocks.settings({"watchdog": {"stale_git_lock_s": 1200}}) == 1200
+    assert gitlocks.settings({"harness_git": {"stale_lock_s": 900}, "watchdog": {"stale_git_lock_s": 0}}) == 900
+    assert gitlocks.settings({"harness_git": {"stale_lock_s": "x"}}) == 600
+    assert unknown_key_hint("harness_git.stale_lock_s") is None
+    assert unknown_key_hint("watchdog.stale_git_lock_s") is None, "the old key stays quiet"
+    # The old key still turns it off for both callers.
     lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
     p.set_config("watchdog.stale_git_lock_s", 0)
-    d.cfg, d._git_locks_at = p.config(), 0.0
-    d.clear_git_locks()
-    assert lock.exists()
+    assert p.clear_stale_git_locks() == [] and lock.exists()
+    p.set_config("harness_git.stale_lock_s", 600)
+    assert p.clear_stale_git_locks() == ["index.lock"] and not lock.exists()
 
 
 def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):

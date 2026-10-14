@@ -254,9 +254,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   every completed tick. `status` and the web app report a stale heartbeat. `ttp restart` waits
   for a fresh one; without it, `runtime/` is restored to the last commit a daemon ran on.
 - A git command killed mid-write leaves its `.git/*.lock` behind and every harness commit fails
-  after it. Every 5 minutes the daemon removes such a lock in the harness repository once it is
-  older than `watchdog.stale_git_lock_s` (600 s) and no process holds it (none has it open, and no
-  git process of the user runs in or names the repository), and logs it (`ttp.gitlocks`).
+  after it. Before each harness commit, and in the daemon's harness sweep, such a lock in the
+  harness repository is moved aside to `.git/ttp-stale-locks/` once it is older than
+  `harness_git.stale_lock_s` (600 s; 0: off; the old `watchdog.stale_git_lock_s` counts while the new
+  key is unset) and no process holds it (none has it open, and no git process of the user runs in
+  or names the repository), and logged (`ttp.gitlocks`).
 - Stopping or restarting the daemon leaves running workers alone; the next daemon adopts them.
   A cancel ends the task's runs; `ttp stop --kill` ends all runs and requeues their tasks.
 - Generic lessons from a project come back as follow-ups titled `upstream: …`.
