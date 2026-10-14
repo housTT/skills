@@ -1220,6 +1220,8 @@ def _migrate_home(tmp_path, present):
         units = home / ".config" / "systemd" / "user"
         units.mkdir(parents=True)
         (units / "devsync.service").write_text("[Service]\n")
+        (units / "default.target.wants").mkdir()
+        (units / "default.target.wants" / "devsync.service").symlink_to(units / "devsync.service")
         (home / "Library" / "LaunchAgents").mkdir(parents=True)
         (home / "Library" / "LaunchAgents" / "org.example.devsync.plist").write_text("")
         with (home / ".ssh" / "config").open("a") as f:
@@ -1245,7 +1247,8 @@ def _migrate_home(tmp_path, present):
         (repo / "ttw.toml").write_text('[host]\ndevice_host = "<box-alias>"\nremote_root = "/<workdir>"\n')
         (repo / "run.sh").write_text("#!/bin/sh\n~/tt-workflows/scripts/devrun.sh make\n")
         (repo / "run.log").write_text("devrun.sh quoted in a log\n")
-    for name, body in (("mutagen", mutagen), ("crontab", crontab)):
+    systemctl = "exit 3"  # is-active: inactive
+    for name, body in (("mutagen", mutagen), ("crontab", crontab), ("systemctl", systemctl)):
         (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
         (stubs / name).chmod(0o755)
     return home, stubs, repo
@@ -1299,6 +1302,44 @@ def test_setup_box_migrate_check_is_clear_when_nothing_is_left(tmp_path):
                  "devrun-caller"):
         assert f"clear {kind}\n" in r.stdout, kind
     assert "found" not in r.stdout and "0 active leftover(s)" in r.stdout
+
+
+def test_setup_box_migrate_check_clears_a_devsync_unit_the_guide_disabled(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    units = home / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    (units / "devsync.service").write_text("[Service]\n")  # after `systemctl --user disable --now`
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"inactive devsync-unit: {units / 'devsync.service'} (disabled and stopped)" in r.stdout
+    (stubs / "systemctl").write_text('#!/bin/sh\n[ "$*" = "--user is-active --quiet devsync.service" ]\n')
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 1 and "found devsync-unit: " in r.stdout and "(running)" in r.stdout
+
+
+def test_setup_box_migrate_check_skips_tt_projects_own_files(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    import shutil
+    import subprocess
+    own = [("plugins/tt-project/skills/setup-box/scripts/box_migrate.py", BOX_PY.parent / "box_migrate.py"),
+           ("plugins/tt-project/skills/setup-box/migrate-off-sync.md",
+            SKILLS / "setup-box" / "migrate-off-sync.md"),
+           ("tests/test_tt_project_plugin.py", pathlib.Path(__file__))]
+    for rel, src in own:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, repo / rel)
+    (repo / "run.sh").write_text("#!/bin/sh\n~/tt-workflows/scripts/devrun.sh make\n")
+    (repo / "tools").mkdir()
+    (repo / "tools" / "go.py").write_text('import subprocess\nsubprocess.run(["devlock.sh", "x"])\n')
+    for git_repo in (False, True):
+        if git_repo:
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        r = _migrate_run(home, stubs, repo)
+        assert r.returncode == 1, r.stdout + r.stderr
+        callers = sorted(l for l in r.stdout.splitlines() if "devrun-caller" in l)
+        assert callers == [f"found devrun-caller: {repo / 'run.sh'}",
+                           f"found devrun-caller: {repo / 'tools' / 'go.py'}"], (git_repo, callers)
 
 
 def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():

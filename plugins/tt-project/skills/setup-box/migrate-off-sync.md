@@ -31,8 +31,10 @@ python3 <plugin-root>/skills/setup-box/scripts/box.py migrate check [--repo <che
    - Commit and push from the side that has them, to a branch.
    - Run `devsync is-finished` once, so nothing is mid-flight.
    - `mutagen sync terminate <session>` for each session `migrate check` lists, then stop the
-     devsync daemon (`devsync uninstall` removes its launchd agent; for a systemd user unit,
-     `systemctl --user disable --now <unit>`).
+     devsync daemon (`devsync uninstall` removes its launchd agent; a plist it leaves behind
+     still counts, so `launchctl bootout gui/$(id -u) <plist>` and delete it; for a systemd user
+     unit, `systemctl --user disable --now <unit>`, after which `migrate check` lists it as
+     inactive; delete the unit file and run `systemctl --user daemon-reload` to clear it).
 2. **Make a checkout on the box.** Clone or fetch on the box and make a `git worktree` from the
    pushed branch (`ssh-workflow.md`). No mirror: the box now runs git itself, and the old mirrored
    directory is no longer written by anyone. Delete it only once its content is pushed.

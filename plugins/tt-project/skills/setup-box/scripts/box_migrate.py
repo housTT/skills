@@ -23,6 +23,8 @@ PATH_RE = re.compile(r"(?:~|\$HOME|/)[^\s'\"`;|&<>()]*")
 SCRIPT_SUFFIXES = {"", ".sh", ".bash", ".zsh", ".py", ".mk"}
 SCRIPT_NAMES = {"Makefile", "justfile", "Justfile"}
 TTW_KEYS_RE = re.compile(r"^\s*(device_host|remote_root)\s*=\s*(.+?)\s*$", re.M)
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
+OWN_TESTS_RE = re.compile(r"^tests/test_(tt_project_\w+|plugin_catalogue)\.py$")
 
 
 def _expand(p: str, home: pathlib.Path) -> pathlib.Path:
@@ -71,11 +73,21 @@ def check_devsync(home: pathlib.Path, found: list) -> None:
     agents = home / "Library" / "LaunchAgents"
     if agents.is_dir():
         units += [p for p in sorted(agents.iterdir()) if "devsync" in p.name]
-    sd = home / ".config" / "systemd" / "user"
-    if sd.is_dir():
-        units += [p for p in sorted(sd.rglob("*")) if "devsync" in p.name and not p.is_dir()]
     for p in units:
         _add(found, "devsync-unit", str(p))
+    sd = home / ".config" / "systemd" / "user"
+    if sd.is_dir():
+        files = [p for p in sorted(sd.rglob("*")) if "devsync" in p.name and not p.is_dir()]
+        wanted = {p.name for p in files if p.parent.name.endswith((".wants", ".requires"))}
+        for p in files:
+            if p.parent.name.endswith((".wants", ".requires")):
+                continue
+            enabled, running = p.name in wanted, _unit_active(p.name)
+            if enabled or running:
+                why = ", ".join(w for w, on in (("enabled", enabled), ("running", running)) if on)
+                _add(found, "devsync-unit", str(p), note=why)
+            else:
+                _add(found, "devsync-unit", str(p), active=False, note="disabled and stopped")
     cfg = home / ".ssh" / "config"
     try:
         lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -86,6 +98,19 @@ def check_devsync(home: pathlib.Path, found: list) -> None:
         body = s.lstrip("#").strip()
         if body.lower().startswith("include") and "devsync" in body and "ssh-hosts" in body:
             _add(found, "ssh-include", f"{cfg}:{n}: {s}", active=not s.startswith("#"))
+
+
+def _unit_active(name: str) -> bool:
+    """Read-only `systemctl --user is-active`; no systemctl or no answer counts as not running."""
+    exe = shutil.which("systemctl")
+    if not exe:
+        return False
+    try:
+        r = subprocess.run([exe, "--user", "is-active", "--quiet", name], capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
 
 
 def check_mutagen(found: list) -> None:
@@ -202,8 +227,16 @@ def check_repo(repo: pathlib.Path, found: list) -> None:
         hits = "\n".join(str(p.relative_to(repo)) for p in _walk_text(repo) if _mentions_devrun(p))
     for rel in hits.splitlines():
         p = (repo / rel).resolve()
-        if rel and _is_script(p) and not ttw_root(p):
+        if rel and _is_script(p) and not ttw_root(p) and not _is_own(repo, rel, p):
             _add(found, "devrun-caller", str(repo / rel))
+
+
+def _is_own(repo: pathlib.Path, rel: str, p: pathlib.Path) -> bool:
+    """tt-project's own files (this script, its guide, its tests) name devrun.sh but call nothing."""
+    rel = rel.replace(os.sep, "/")
+    if p.is_relative_to(PLUGIN_ROOT) or rel.startswith("plugins/tt-project/"):
+        return True
+    return bool(OWN_TESTS_RE.match(rel)) and (repo / "plugins" / "tt-project").is_dir()
 
 
 def _is_script(p: pathlib.Path) -> bool:
