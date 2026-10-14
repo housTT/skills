@@ -4440,7 +4440,9 @@ class Daemon:
         for `waiting.unreachable_alert_s`. Only the user can restore the network (or sign back in); the alert
         says so once, stays in the top section and clears itself once the hosts answer again. Hosts
         reached through a tunnel from the user's workstation get a low feed line instead, raised once to
-        normal after `waiting.tunnel_outage_page_after_s` (netwait.py)."""
+        normal after `waiting.tunnel_outage_page_after_s`; so do hosts already known down. Only an
+        offline workstation gets the VPN advice; hosts down while others answer are named as down
+        (netwait.py)."""
         now = time.time()
         if now - getattr(self, "_net_checked", 0.0) < every_s:
             return
@@ -4456,25 +4458,34 @@ class Daemon:
         page_after = netwait.tunnel_page_after(self.cfg)
         new, action = netwait.step(st, blocking, len(unreachable), now, grace, debounce,
                                    healing=blocking and self._healing(), page_after=page_after)
-        severity = "normal"
+        severity, others = "normal", 0
+        if action in ("alert", "raise"):
+            others = self._net_others([tid for tid, _ in unreachable])
         if action == "alert":
-            names, tunnel = netwait.describe(list(dict.fromkeys(h for _, hs in unreachable for h in hs)))
-            new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel)
+            raw = list(dict.fromkeys(h for _, hs in unreachable for h in hs))
+            names, tunnel = netwait.describe(raw)
+            kind, known = self._net_kind(unreachable, raw, now) if not tunnel else ("offline", {})
+            new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel, kind=kind)
             if tunnel and now - float(new["since"]) < page_after:
                 severity = "low"   # a tunnel that reconnects by itself: a feed line until page_after
             elif tunnel:
                 new["raised"] = now
+            elif kind == "known":
+                severity = "low"   # every host is already known down: a feed line, never "needs you"
         if new != st:
             db.set_kv(netwait.STATE_KEY, new)
         if action == "alert":
-            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names, tunnel),
-                       severity=severity)
+            self.alert(netwait.KEY, netwait.text(
+                self.p, float(new["since"]), len(unreachable), names, tunnel, kind=kind,
+                advise=kind == "offline" and netwait.workstation(self.cfg), others=others,
+                known=[f"{h} ({why})" for h, why in known.items()]), severity=severity)
             log(self.p, f"network: {len(unreachable)} task(s) wait on unreachable hosts "
-                        f"({', '.join(names) or 'unnamed'}{', tunnel route' if tunnel else ''}); "
+                        f"({', '.join(names) or 'unnamed'}{', tunnel route' if tunnel else ''}; {kind}); "
                         f"alerted once ({severity})")
         elif action == "raise":
             names = list(new.get("hosts") or [])
-            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names, True, now),
+            self.alert(netwait.KEY, netwait.text(self.p, float(new["since"]), len(unreachable), names, True, now,
+                                                 others=others),
                        severity="normal")
             log(self.p, f"network: tunnel route to {', '.join(names) or 'unnamed hosts'} still down "
                         f"after {(now - float(new['since'])) / 60:.0f} min; raised to normal")
@@ -4510,6 +4521,57 @@ class Daemon:
             if self._start_hold(t, prov, ctx) != "paused":
                 return unreachable, True
         return unreachable, False
+
+    def _net_kind(self, unreachable: list[tuple[int, list[str]]], raw: list[str],
+                  now: float) -> tuple[str, dict[str, str]]:
+        """(netwait.classify's "offline" or "hosts", or "known" when every failing host is already known
+        down; {alias: why} of the known-down ones). Hosts that answer: another queued task's recent
+        probe that reached its ssh host (any exit but 255), a healthy heal check on a machine."""
+        hosts_ = [h for h in raw if not netwait.loopback(h)]
+        try:
+            known = netwait.known_down(self.p, hosts_, now)
+        except Exception:
+            log(self.p, "network: known-down check failed\n" + traceback.format_exc())
+            known = {}
+        if hosts_ and all(h in known for h in hosts_):
+            return "known", known
+        mine = {tid for tid, _ in unreachable}
+        outs = [o[0] for o in (self._probe_out.get(tid) for tid in mine) if o]
+        answering: list[str] = []
+        for t in self.p.db.q("SELECT * FROM tasks WHERE status='queued'"):
+            if t["id"] in mine:
+                continue
+            when = deferral(t).get("when")
+            probe = when or load_result(t["result"]).get("retry_when")
+            got = (self._start_rc if when else self._probe_rc).get(t["id"])
+            if probe and got and isinstance(got[0], int) and got[0] != netwait.UNREACHABLE_RC \
+                    and got[2] == probe and now - got[1] <= 3 * PROBE_EVERY_S:
+                answering += netwait.hosts(probe)
+        try:
+            for r, spec in heal.checks(self.p.db):
+                s = heal.state(self.p.db, r["name"])
+                alias = heal.machine_of(spec)
+                if alias and s.get("status") == "healthy" and \
+                        now - float(s.get("last_check") or 0) <= 3 * float(r["every_s"] or 0) + 300:
+                    answering.append(alias)
+        except Exception:
+            log(self.p, "network: heal checks unreadable\n" + traceback.format_exc())
+        return netwait.classify(outs, hosts_, answering), {h: w for h, w in known.items() if h in hosts_}
+
+    def _net_others(self, blocked: list[int]) -> int:
+        """Queued tasks outside the network-blocked set (and what depends on it) that can still run
+        later: on a timer or a probe of their own, not held by a paused resource."""
+        db = self.p.db
+        queued = db.q("SELECT * FROM tasks WHERE status='queued'")
+        unmet, paused, out = db.unmet_dependencies(queued), db.paused_resources(), set(blocked)
+        grew = True
+        while grew:
+            grew = False
+            for t in queued:
+                if t["id"] not in out and set(unmet[t["id"]]) & out:
+                    out.add(t["id"])
+                    grew = True
+        return sum(1 for t in queued if t["id"] not in out and not coord.task_resources(t) & paused.keys())
 
     def _healing(self) -> bool:
         """A heal check is still trying its own fix: unhealthy, not escalated, no self-fix task yet."""

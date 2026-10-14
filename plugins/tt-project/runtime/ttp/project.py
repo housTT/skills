@@ -113,6 +113,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # ends at loopback (a tunnel from the user's workstation) get a low feed line instead,
                 # raised once to normal when the outage is tunnel_outage_page_after_s old (0: at once)
                 "unreachable_alert_s": 900, "unreachable_debounce_s": 600, "tunnel_outage_page_after_s": 3600,
+                # whether this machine is a workstation, whose VPN or network sign-in the outage alert
+                # may ask the user to redo (null: detect; a server never gets that advice)
+                "workstation": None,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
                 "on_pass_timeout_s": 600,
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores

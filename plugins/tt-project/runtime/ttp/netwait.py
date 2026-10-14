@@ -35,6 +35,17 @@ whose host answers, failed its own remote command (e.g. lost quotes and `|| exit
 treats it as a broken probe against its task, never as an outage.
 The daemon checks the hosts of every probe that exited 255 in one tick together (reach), so an
 outage holds its tick for one ConnectTimeout, not one per probe; each host is asked once a minute.
+
+Which outage it is (classify): "this machine is offline" when every probed remote host fails, a host
+name does not resolve or ssh says the network itself is unreachable; "these hosts are down" when
+other hosts answer (another task's probe, a healthy heal check on a machine) and only these fail (no
+route, refused, timed out). Only an offline workstation (a laptop or desktop: `waiting.workstation`,
+else detected) gets the VPN or network sign-in advice; a server gets none, and hosts that are down
+say so and that this machine's own network is fine. A host already known down (a machine-ledger
+outage or down or held condition, a paused resource, an active observation mute or an open incident
+or outage task names it) raises nothing new: when every failing host is known down the alert is a low
+feed line. The alert counts the tasks it holds and, when other queued tasks can still run later, the
+ones that wait on their own timers or checks; it never claims that nothing else can start.
 """
 from __future__ import annotations
 
@@ -42,6 +53,7 @@ import ipaddress
 import re
 import shlex
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -60,6 +72,14 @@ _SSH_ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")   # ssh options that take a value
 _SUBST = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\$\(|`)+")   # `x=$(`, `$(` or a backtick before ssh
 REACH_THREADS = 32             # hosts checked at once in one reach() pass
 CONFIRM_TIMEOUT_S = 10         # ConnectTimeout of the check that a probe's host really is unreachable
+# ssh's own errors: a name that does not resolve, or no route out at all, means this machine is offline
+_OFFLINE = re.compile(r"[Cc]ould not resolve hostname|Name or service not known|nodename nor servname|"
+                      r"Temporary failure in name resolution|Network is unreachable")
+# SMBIOS chassis types of a laptop or desktop (desktop, low profile, mini tower, portable, laptop,
+# notebook, hand held, all in one, sub notebook, space-saving, lunch box, tablet, convertible,
+# detachable, mini PC, stick PC); servers (main server chassis, rack mount, blade, ...) are not.
+_WORKSTATION_CHASSIS = {3, 4, 6, 8, 9, 10, 11, 13, 14, 15, 16, 30, 31, 32, 35, 36}
+_DOWN_WORDS = re.compile(r"\b(outage|down|repair|out of service|offline|broken|rma)\b", re.I)
 
 
 def settings(cfg: dict) -> tuple[float, float]:
@@ -247,20 +267,104 @@ def step(st: dict | None, blocking: bool, unreachable: int, now: float, grace: f
     return st, None
 
 
-def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = False, now: float | None = None) -> str:
+def workstation(cfg: dict | None = None) -> bool:
+    """The machine running the project is a workstation (laptop or desktop), where a VPN or network
+    sign-in is the user's to redo: `waiting.workstation` when set, else macOS or Windows, else the
+    SMBIOS chassis type, else a battery. A server, VM or unknown box is not."""
+    v = ((cfg or {}).get("waiting") or {}).get("workstation")
+    if isinstance(v, bool):
+        return v
+    if sys.platform == "darwin" or sys.platform.startswith("win"):
+        return True
+    try:
+        return int(Path("/sys/class/dmi/id/chassis_type").read_text().strip()) in _WORKSTATION_CHASSIS
+    except (OSError, ValueError):
+        pass
+    try:
+        return any(Path("/sys/class/power_supply").glob("BAT*"))
+    except OSError:
+        return False
+
+
+def classify(outputs: list[str], failing: list[str], answering: list[str]) -> str:
+    """"offline" (this machine cannot reach the network: a name does not resolve, no route out, or no
+    other host answers) or "hosts" (other hosts answer; only the failing ones are down)."""
+    if any(_OFFLINE.search(o or "") for o in outputs):
+        return "offline"
+    return "hosts" if set(answering) - set(failing) else "offline"
+
+
+def names_host(host: str, text: str, hostname: str = "") -> bool:
+    """A free text (a mute's match, a task title, a reason) names the host or its resolved name as a word."""
+    for h in (host, hostname):
+        if h and re.search(rf"(?<![A-Za-z0-9_.\-]){re.escape(h)}(?![A-Za-z0-9_\-]|\.[A-Za-z0-9])", text or "", re.I):
+            return True
+    return False
+
+
+def known_down(p, aliases: list[str], now: float) -> dict[str, str]:
+    """{alias: why} of the hosts already known down: a machine-ledger outage or down or held condition
+    or a heal check's report (ttr.down_now), a paused resource on it, an active observation mute or an
+    open incident naming it, or an open task naming it as down or under repair."""
+    from . import responsibilities as rs
+    from . import screen, ttr
+    db, out = p.db, {}
+    names = {a: str(route(a).get("hostname") or "") for a in aliases}
+    try:
+        for a, rec in ttr.down_now(p, now, set(aliases)).items():
+            out[a] = str(rec.get("cause") or rec.get("kind") or "known down")
+    except Exception:   # an unreadable ledger is no reason to drop the alert
+        pass
+    for res, why in (db.paused_resources() or {}).items():
+        for a in aliases:
+            if a not in out and (rs._names(a, res) or (names[a] and rs._names(names[a], res))):
+                out[a] = f"{res} is paused" + (f" ({why.get('reason')})" if isinstance(why, dict) and why.get("reason") else "")
+    for m in screen.mutes(db, now):
+        for a in aliases:
+            if a not in out and names_host(a, str(m.get("match") or ""), names[a]):
+                out[a] = f"its {m.get('source') or 'observations'} are muted"
+    for r in db.q("SELECT alias, kind FROM ttr_incidents WHERE ended IS NULL"):
+        if r["alias"] in names and r["alias"] not in out:
+            out[r["alias"]] = f"open incident ({r['kind']})"
+    for t in db.q("SELECT id, title FROM tasks WHERE status NOT IN ('done','failed','cancelled')"):
+        if _DOWN_WORDS.search(t["title"] or ""):
+            for a in aliases:
+                if a not in out and names_host(a, t["title"], names[a]):
+                    out[a] = f"open task #{t['id']}"
+    return out
+
+
+def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = False, now: float | None = None,
+         kind: str = "offline", advise: bool = True, others: int = 0, known: list[str] | None = None) -> str:
     """The alert: what cannot be reached, since when (home zone), how many tasks wait, what to do.
     `tunnel`: every host is reached through a tunnel from the user's workstation (no VPN advice);
-    `now` (the raise to normal) adds how long it has been down."""
+    `now` (the raise to normal) adds how long it has been down. `kind` (classify): "offline" gives the
+    VPN or network sign-in advice only with `advise` (a workstation); "hosts" says they are down and
+    this machine's network is fine; "known": every host is already known down. `others`: queued tasks
+    that can still run later (0: none, and none are counted). `known`: "alias (why)" of the hosts already
+    known down."""
     shown_ = ", ".join(names[:HOSTS_MAX]) + (f" (+{len(names) - HOSTS_MAX} more)" if len(names) > HOSTS_MAX else "")
     what = f"{shown_} cannot" if names else "The hosts this project's work needs cannot"
     them, need = ("it", "it needs") if len(names) == 1 else ("them", "they need")
-    held = f"{n_tasks} queued task(s) that need {them} are held; the rest of the project keeps running."
+    verb_s = "s" if len(names) == 1 else ""
+    others_ = f"; {others} other task(s) wait on their own timers or checks" if others else ""
+    held = f"{n_tasks} queued task(s) that need {them} are held{others_}; the rest of the project keeps running."
     if tunnel:
         down = f", down {(now - since) / 3600:.1f} h" if now is not None else ""
         return (f"Tunnel: {what} be reached since {timefmt.long(since, where)}{down}: the tunnel from the "
                 f"user's workstation that reaches {them} is down. It reconnects by itself once the "
                 f"workstation is back; the held work then resumes. {held}")
+    told = f" Already known down: {'; '.join(known)}." if known else ""
+    if kind == "known":
+        return (f"Known down: {what} be reached since {timefmt.long(since, where)}; already known down: "
+                f"{'; '.join(known or [])}. The held work resumes by itself once {them} answer{verb_s}. {held}")
+    if kind == "hosts":
+        appear = "appears" if len(names) == 1 else "appear"
+        return (f"Hosts down: {what} be reached since {timefmt.long(since, where)}: {them} {appear} down or "
+                f"off the network; other hosts answer, so this machine's own network is fine.{told} "
+                f"The held work resumes by itself once {them} answer{verb_s}. {held}")
+    advice = (f"Check that machine's network, and its VPN or network sign-in if {need} one" if advise else
+              "That machine's own network looks down")
     return (f"Network: {what} be reached from the machine running this project since "
-            f"{timefmt.long(since, where)}. Check that machine's network, and its VPN or network sign-in "
-            f"if {need} one; the held work resumes by itself once {them} answer{'s' if len(names) == 1 else ''}. "
-            f"{held}")
+            f"{timefmt.long(since, where)}.{told} {advice}; the held work resumes by itself once {them} "
+            f"answer{verb_s}. {held}")

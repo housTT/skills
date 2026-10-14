@@ -511,6 +511,15 @@ prolonged whole-box outage.
   ProxyCommand, it is a tunnel from the user's workstation: the alert says the tunnel is down and
   reconnects by itself (no VPN advice) and is a low feed line, raised once to normal under the same
   key when the outage is `waiting.tunnel_outage_page_after_s` (3600; 0 pages at once) old.
+  The alert tells "this machine is offline" (every probed host fails, a name does not resolve, or
+  ssh finds no route out) from "these hosts are down" (other hosts answer, from another task's
+  probe or a healthy heal check, and only these fail). VPN or network sign-in advice is given only
+  when the machine is offline and is a workstation (`waiting.workstation`; null detects a laptop or
+  desktop, so a server never gets it); hosts that are down are named with no advice. When every
+  failing host is already known down (a `ttp machines outage`, a down or held condition, a paused
+  resource, an active mute, an open incident or a task naming it as down or under repair), the
+  alert is a low feed line, never "needs you". When other queued tasks can still run later, it also
+  counts the ones that wait on their own timers or checks.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - A task's row in the web app shows its chain's metric trend (the task, what continues it, its fixes

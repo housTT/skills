@@ -36930,7 +36930,7 @@ NET_PROBE = "ssh -o ConnectTimeout=5 jump.example true"
 NET_OUT = "ssh: connect to host jump.example port 22: Connection timed out"
 
 
-def _net_setup(env, monkeypatch, n=2, probe=NET_PROBE, out=NET_OUT, ssh_config=None):
+def _net_setup(env, monkeypatch, n=2, probe=NET_PROBE, out=NET_OUT, ssh_config=None, workstation=True):
     """Two tasks deferred on a start_when probe that reaches a host over ssh, a home zone that is not
     the machine's, a clock the test moves, and `check(at, rc)`: the probes' latest verdict (None: no
     verdict, as once a probe passed and the task started), one check, the alert sweep; it returns the
@@ -36940,6 +36940,7 @@ def _net_setup(env, monkeypatch, n=2, probe=NET_PROBE, out=NET_OUT, ssh_config=N
     from ttp.daemon import Daemon
     from ttp.db import deferral
     monkeypatch.setattr(netwait, "_ssh_config", lambda alias: dict((ssh_config or {}).get(alias) or {}))
+    monkeypatch.setattr(netwait, "workstation", lambda cfg=None: workstation)
     p = make(env)
     _no_events(p)
     assert timefmt.set_home(p, "America/Los_Angeles")
@@ -37035,6 +37036,103 @@ def test_network_outage_on_a_remote_route_keeps_the_vpn_wording_and_names_the_al
     assert "nothing else can start" not in sent[0]["text"], "says what is held and what still runs"
     assert "2 queued task(s) that need it are held" in sent[0]["text"] and "the project keeps running" in sent[0]["text"]
     assert len(check(now + 6 * 3600)) == 1, "a network route is never raised again"
+
+
+def _net_answering(p, d, at, host="other.example"):
+    """A third queued task whose start_when probe reached `host` (exit 1: it answered, not yet ready);
+    its verdict is dated ahead so it stays recent while the test moves the clock."""
+    from ttp import coordinator as coord
+    probe = f"ssh {host} test -e /tmp/marker"
+    assert coord.apply(p, [{"type": "task_add", "title": "other box job", "spec": "s", "start_when": probe}]) == []
+    tid = p.db.one("SELECT MAX(id) id FROM tasks")["id"]
+    d._start_rc[tid] = (1, at + 10 ** 6, probe)
+    return tid
+
+
+def test_network_outage_with_every_host_failing_is_offline_and_gives_vpn_advice_only_on_a_workstation(env, monkeypatch):
+    from ttp import netwait
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1 and sent[0]["text"].startswith("Network: jump.example cannot be reached from the machine")
+    assert "VPN or network sign-in" in sent[0]["text"] and "nothing else can start" not in sent[0]["text"]
+    assert "other task(s) wait on their own timers" not in sent[0]["text"], "no other task can run: none counted"
+    assert p.db.kv("network_outage")["kind"] == "offline"
+    # The outage ends; the next one on a server: offline, but no VPN advice.
+    check(now + 960, rc=None)
+    assert len(check(now + 1600, rc=None)) == 1 and not p.db.kv("network_outage")
+    monkeypatch.setattr(netwait, "workstation", lambda cfg=None: False)
+    check(now + 3600)
+    sent = check(now + 4500)
+    assert len(sent) == 2 and sent[1]["severity"] == "normal"
+    assert "VPN" not in sent[1]["text"] and "sign-in" not in sent[1]["text"], sent[1]["text"]
+    assert "own network looks down" in sent[1]["text"], sent[1]["text"]
+    # A name that does not resolve is this machine offline even while another host answers.
+    out = "ssh: Could not resolve hostname jump.example: Temporary failure in name resolution"
+    assert netwait.classify([out], ["jump.example"], ["other.example"]) == "offline"
+    assert netwait.classify(["ssh: connect to host jump.example port 22: Network is unreachable"],
+                            ["jump.example"], ["other.example"]) == "offline"
+    assert netwait.classify([NET_OUT], ["jump.example"], ["jump.example"]) == "offline", "no other host answers"
+    for err in ("No route to host", "Connection refused", "Connection timed out"):
+        assert netwait.classify([f"ssh: connect to host jump.example port 22: {err}"],
+                                ["jump.example"], ["other.example"]) == "hosts", err
+
+
+def test_network_outage_workstation_detection_honours_the_setting_and_never_takes_a_server_for_one(monkeypatch, tmp_path):
+    from ttp import netwait
+    assert netwait.workstation({"waiting": {"workstation": True}}) is True
+    assert netwait.workstation({"waiting": {"workstation": False}}) is False
+    from ttp.project import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["waiting"]["workstation"] is None, "detected unless set"
+
+
+def test_network_outage_while_other_hosts_answer_says_these_hosts_are_down_without_vpn_advice(env, monkeypatch):
+    p, d, tids, now, check = _net_setup(env, monkeypatch,
+                                        out="ssh: connect to host jump.example port 22: No route to host")
+    _net_answering(p, d, now)
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1, "the hosts are still down and nobody knows yet: one alert"
+    t = sent[0]["text"]
+    assert t.startswith("Hosts down: jump.example cannot be reached") and "appears down or off the network" in t, t
+    assert "this machine's own network is fine" in t, t
+    assert "VPN" not in t and "sign-in" not in t and "Reconnect" not in t, t
+    assert p.db.kv("network_outage")["kind"] == "hosts"
+
+
+@pytest.mark.parametrize("how", ["outage", "condition", "pause", "mute", "task"])
+def test_network_outage_on_hosts_already_known_down_raises_no_new_needs_you(env, monkeypatch, how):
+    from ttp import alerts, machine_ledger, machines, screen
+    from ttp import coordinator as coord
+    machines.add("jump.example", ["device"], "test box")
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    {"outage": lambda: machine_ledger.set_outage("jump.example", "hardware repair", "user", "2d"),
+     "condition": lambda: machine_ledger.report("other-project", "jump.example", "held", "held for repair"),
+     "pause": lambda: coord.pause_resource(p, "jump.example-device", True, reason="repair", by="user"),
+     "mute": lambda: screen.mute(p.db, "heal", "jump.example", 48, why="out for repair"),
+     "task": lambda: p.db.add_task("jump.example out of service: track its repair", "s", kind="work",
+                                   tier="light", origin="coordinator", not_before=now + 10 ** 6)}[how]()
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1 and sent[0]["severity"] == "low", sent
+    assert sent[0]["text"].startswith("Known down: jump.example") and "VPN" not in sent[0]["text"], sent[0]["text"]
+    assert not alerts.needs_you(p.db, now + 900), "an fyi feed line, never 'needs you'"
+    assert len(check(now + 6 * 3600)) == 1, "never raised later"
+
+
+def test_network_outage_counts_the_other_tasks_that_can_still_run_instead_of_nothing_else_can_start(env, monkeypatch):
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    later = p.db.add_task("on a timer", "s", kind="work", tier="light", origin="coordinator", not_before=now + 86400)
+    p.db.add_task("after the blocked job", "s", kind="work", tier="light", origin="coordinator",
+                  depends_on=[tids[0]])
+    p.db.add_task("after the timer", "s", kind="work", tier="light", origin="coordinator", depends_on=[later])
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1, sent
+    t = sent[0]["text"]
+    assert "nothing else can start" not in t, t
+    assert "2 queued task(s) that need it are held; 2 other task(s) wait on their own timers or checks" in t, t
+    assert d._net_others(tids) == 2, "what depends on the blocked tasks waits on the hosts too"
 
 
 def test_network_outage_counts_a_waiting_hand_off_whose_retry_when_cannot_reach_its_host(env, monkeypatch):
