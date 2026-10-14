@@ -43,7 +43,7 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `ird.pools` | `ird` | non-empty list of pool names the project may reserve from |
 | `ird.arch` | no | the arch `ird_e2e.sh` reserves (`ird.md`) |
 | `slurm.login` | `slurm` | ssh alias of the login node |
-| `slurm.partitions` | `slurm` | non-empty list: `name`, `chips` (whole number > 0), `board` (board type), optional `exclusive` (whole-node only) |
+| `slurm.partitions` | `slurm` | non-empty list: `name`, `chips` (whole number > 0; leave it out or `"unknown"` until the first job measures it, `slurm.md`), `board` (board type), optional `exclusive` (whole-node only) |
 | `demo_nodes` | no | nodes kept for demos: never allocate them |
 | `excluded_nodes` | no | nodes never to use |
 | `mcp` | no | site-only MCP endpoints by server name |

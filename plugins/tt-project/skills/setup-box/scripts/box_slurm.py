@@ -1,4 +1,4 @@
-"""setup-box Slurm route: `box.py slurm check|submit|status|verify-clean` (see slurm.md).
+"""setup-box Slurm route: `box.py slurm survey|check|submit|status|verify-clean` (see slurm.md).
 
 Every Slurm command runs on the box's login node (`slurm.login` in the site file) over ssh.
 """
@@ -121,9 +121,18 @@ def _rpath(p: str) -> str:
     return shlex.quote(p)
 
 
-def batch_script(checkout: str, command: str, rc: str, devices: Optional[str]) -> str:
-    """The job: own process group, cd into the checkout, run, kill the group, write rc."""
+def batch_script(checkout: str, command: str, rc: str, devices: Optional[str],
+                 chips: Optional[str] = None) -> str:
+    """The job: own process group, cd into the checkout, run, kill the group, write rc.
+
+    With `chips` (a partition whose chip count is not measured yet) it first writes the number of
+    devices in /dev/tenstorrent to that file and logs `tt-smi -ls` when the node has it."""
     env = f"export TT_VISIBLE_DEVICES={shlex.quote(devices)}\n" if devices is not None else ""
+    measure = "" if chips is None else (
+        "n=$(ls /dev/tenstorrent 2>/dev/null | grep -c '^[0-9][0-9]*$')\n"
+        f"echo \"$n\" > {_rpath(chips)}\n"
+        'echo "chips: $n devices in /dev/tenstorrent"\n'
+        "command -v tt-smi >/dev/null && timeout 120 tt-smi -ls\n")
     return f"""#!/bin/bash
 # written by setup-box box.py slurm submit
 if [ -z "$TTP_JOB_PGRP" ] && [ "$(ps -o pgid= -p $$ | tr -d ' ')" != "$$" ]; then
@@ -149,7 +158,7 @@ cleanup() {{
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
 rm -f "$rc_file"
-cd {_rpath(checkout)} || exit 97
+{measure}cd {_rpath(checkout)} || exit 97
 {env}echo "job ${{SLURM_JOB_ID:-?}} on $(hostname) in $PWD at $(date -Is)"
 /bin/bash -c {shlex.quote(command)} &
 wait $!
@@ -159,6 +168,107 @@ wait $!
 def _under(path: str, root: str) -> bool:
     root = root.rstrip("/")
     return ".." not in path.split("/") and (path == root or path.startswith(root + "/"))
+
+
+SHARED_BUSY = 3  # this many nodes with one LastBusyTime, to the second, point to a controller event
+
+
+def _since(now: str, then: Optional[str]) -> Optional[float]:
+    """Minutes from `then` to `now` (scontrol times), or None when `then` is not a time."""
+    try:
+        return (datetime.datetime.fromisoformat(now)
+                - datetime.datetime.fromisoformat(then or "")).total_seconds() / 60
+    except ValueError:
+        return None
+
+
+def survey(e: dict, login: str, partitions: List[str], min_idle_min: float = 0) -> List[str]:
+    """Read-only: per partition, node states, plain-IDLE nodes with LastBusyTime, reservations.
+
+    Runs only date, sinfo and scontrol on the login node; never sbatch, srun or salloc."""
+    for p in partitions:
+        _name("partition", p)
+    r = _login(login, "date +%Y-%m-%dT%H:%M:%S; echo ---; "
+                      f"sinfo -h -N -o '%N|%P|%T' -p {','.join(partitions)}; echo ---; "
+                      "scontrol -o show node; echo ---; scontrol -o show reservation")
+    now, nodes_out, info, res_out = (r.stdout.split("---\n") + ["", "", "", ""])[:4]
+    now = now.strip()
+    if not now or not nodes_out.strip():
+        raise box.SiteError(f"sinfo found no nodes (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    members = {p: {} for p in partitions}
+    for ln in nodes_out.splitlines():
+        node, part, state = (ln.strip().split("|") + ["", ""])[:3]
+        part = part.rstrip("*")  # sinfo marks the default partition
+        if part in members:
+            members[part][node] = state
+    show = {}
+    for ln in info.splitlines():
+        name = field(ln, "NodeName")
+        if name:
+            show[name] = ln
+    busy = {}
+    for ln in show.values():
+        if _since(now, field(ln, "LastBusyTime")) is not None:
+            busy.setdefault(field(ln, "LastBusyTime"), []).append(field(ln, "NodeName"))
+    reservations = []
+    for ln in res_out.splitlines():
+        if field(ln, "ReservationName"):
+            nodes = field(ln, "Nodes") or ""
+            reservations.append((ln, "ALL" if nodes == "ALL" else set(expand_hostlist(nodes))))
+    parts = {p.get("name"): p for p in (e.get("slurm") or {}).get("partitions", []) if isinstance(p, dict)}
+    out = [f"survey at {now} (login node clock); read-only: sinfo and scontrol only"]
+    for p in partitions:
+        site = parts.get(p, {})
+        size = (f"{site['chips']} chips" if box.chips_known(site)
+                else "chips not measured yet" if site else "not in the site file")
+        nodes = members[p]
+        counts = {}
+        for st in nodes.values():
+            counts[st] = counts.get(st, 0) + 1
+        out.append(f"partition {p} ({size}{', ' + site['board'] if site.get('board') else ''}): "
+                   f"{len(nodes)} nodes" + (": " + ", ".join(f"{st} {n}" for st, n in sorted(counts.items()))
+                                            if counts else ""))
+        for node in sorted(nodes):
+            ln = show.get(node, "")
+            if field(ln, "State") != "IDLE":
+                continue
+            last = field(ln, "LastBusyTime") or "None"
+            idle = _since(now, last)
+            why = [f"reservation {field(res, 'ReservationName')}" for res, ns in reservations
+                   if ns == "ALL" or node in ns]
+            why += [k for k in ("demo_nodes", "excluded_nodes") if node in (e.get(k) or [])]
+            if min_idle_min > 0 and (idle is None or idle < min_idle_min):
+                why.append(f"under --min-idle {min_idle_min:g}")
+            shared = len(busy.get(last, [])) if idle is not None else 0
+            out.append(f"  idle {node} LastBusyTime {last}"
+                       + (f" ({idle:.0f} min ago)" if idle is not None else " (unknown)")
+                       + (f" shared by {shared} nodes" if shared >= SHARED_BUSY else "")
+                       + (f": not takeable ({'; '.join(why)})" if why else ""))
+        for res, ns in reservations:
+            if ns == "ALL" or ns & set(nodes):
+                out.append(f"  reservation {field(res, 'ReservationName')} nodes {field(res, 'Nodes')} "
+                           f"{field(res, 'StartTime')} to {field(res, 'EndTime')} {field(res, 'State') or ''}".rstrip())
+    for last, names in sorted(busy.items()):
+        if len(names) >= SHARED_BUSY:
+            out.append(f"note: {len(names)} nodes share LastBusyTime {last}: likely a controller restart "
+                       f"or reconfigure, not jobs. A --min-idle check is then conservative; "
+                       f"`sacct -N <node>` shows when the last real job ended (where accounting is on)")
+    return out
+
+
+def cmd_survey(args) -> int:
+    try:
+        e, login = _box(args)
+        partitions = args.partition or [p.get("name") for p in e["slurm"].get("partitions", [])
+                                        if isinstance(p, dict) and p.get("name")]
+        if not partitions:
+            raise box.SiteError(f"{args.box} lists no partitions; pass --partition")
+        lines = survey(e, login, partitions, args.min_idle)
+    except (Refused, box.SiteError) as err:
+        print(f"error: {err}")
+        return 1
+    print("\n".join(lines))
+    return 0
 
 
 def cmd_check(args) -> int:
@@ -202,19 +312,21 @@ def cmd_submit(args) -> int:
         print(f"refused: {err}")
         return 1
     log, rc, script = f"{rundir}/job.log", f"{rundir}/job.rc", f"{rundir}/job.sbatch"
+    chips = None if box.chips_known(part) else f"{rundir}/job.chips"
     sbatch = ["sbatch", "--parsable", "--exclusive", "-w", args.node, "-p", args.partition,
               f"--time={args.time}", f"--job-name={args.name}"]
     remote = (f"mkdir -p {_rpath(rundir)} && cat > {_rpath(script)}.tmp && "
               f"mv -f {_rpath(script)}.tmp {_rpath(script)} && "
               f"{shlex.join(sbatch)} --output={_rpath(log)} --error={_rpath(log)} {_rpath(script)}")
-    r = box.ssh_run(login, remote, input=batch_script(args.checkout, command, rc, args.devices))
+    r = box.ssh_run(login, remote, input=batch_script(args.checkout, command, rc, args.devices, chips))
     job = r.stdout.strip().split(";")[0].splitlines()[-1] if r.stdout.strip() else ""
     if r.returncode != 0 or not job.isdigit():
         print(f"error: sbatch failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-500:]}")
         return 1
     start = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    print(f"job {job} node {args.node} partition {args.partition} ({part['chips']} chips, "
-          f"{part['board']}) log {log} rc {rc}")
+    size = f"{part['chips']} chips" if chips is None else "chips not measured yet: the job records them"
+    print(f"job {job} node {args.node} partition {args.partition} ({size}, "
+          f"{part.get('board', '?')}) log {log} rc {rc}")
     print("note: ttp note " + shlex.quote(
         f"slurm alloc: cluster {args.box} job {job} node {args.node} start {start} "
         f"limit {args.time} purpose: {args.purpose}"))
@@ -247,10 +359,16 @@ def cmd_status(args) -> int:
     rundir = args.rundir or (f"{e.get('workdir_root', '').rstrip('/')}/runs/{args.name}" if args.name else None)
     if rundir:
         r = _login(login, f"cat {_rpath(rundir)}/job.rc 2>/dev/null || echo missing; "
+                          f"echo ---; cat {_rpath(rundir)}/job.chips 2>/dev/null; "
                           f"echo ---; tail -n 20 {_rpath(rundir)}/job.log 2>/dev/null")
-        rc, _, tail = r.stdout.partition("---\n")
+        rc, _, rest = r.stdout.partition("---\n")
+        chips, _, tail = rest.partition("---\n")
         print(f"rc {rc.strip()} (missing: SIGKILL before its trap ran, node failure, or the job "
               f"never started)" if rc.strip() == "missing" else f"rc {rc.strip()}")
+        if chips.strip():
+            print(f"measured chips: {chips.strip()} devices in /dev/tenstorrent on the job's node; "
+                  f"record the partition's chips in the site file (site.md). A card with two chips "
+                  f"behind one device counts once: check the tt-smi -ls output in job.log")
         print(tail.rstrip())
     return 0
 
@@ -301,6 +419,13 @@ def _common(p, node=True):
 
 def register(sub) -> None:
     sl = sub.add_parser("slurm", help="Slurm route (slurm.md)").add_subparsers(dest="slurm_cmd", required=True)
+    p = sl.add_parser("survey", help="read-only: node states, idle nodes and reservations per partition")
+    _common(p, node=False)
+    p.add_argument("--partition", action="append", help="survey this partition (repeatable; default: "
+                                                         "the site file's partitions)")
+    p.add_argument("--min-idle", type=float, default=0, metavar="MIN",
+                   help="mark idle nodes last busy under MIN minutes ago (default 0: no minimum)")
+    p.set_defaults(func=cmd_survey)
     p = sl.add_parser("check", help="may this node be taken now?")
     _common(p)
     p.add_argument("node")

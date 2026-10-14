@@ -9,7 +9,7 @@ every rule and command in `slurm.md` applies. This page adds what is particular 
   placeholder CPU and memory and no GRES, so chips are not requested: the partition's board type
   decides them.
 - The site file maps each partition to its chips and board. Check it with `tt-smi -ls` inside the
-  first job on each partition.
+  first job on each partition; until then leave `chips` out and let that job measure it (`slurm.md`).
 - One-chip work: an exclusive node of the smallest board type, limited to one chip with
   `--devices 0` (`TT_VISIBLE_DEVICES`) or the test's mesh setting. Four-chip work: a node of a
   4-chip board type, or 4 chips of a larger node (`--devices 0,1,2,3`).

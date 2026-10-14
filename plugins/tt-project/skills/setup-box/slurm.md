@@ -37,6 +37,14 @@ Other people share the cluster's nodes. Hold a node only while work runs on it.
 - A default time limit may be short (often an hour); always pass `--time`.
 - With `PreemptMode=CANCEL` a higher-priority job may end yours; resubmit it.
 
+### Last busy time
+
+`LastBusyTime` is when Slurm last saw the node busy. Many unrelated nodes sharing one
+`LastBusyTime`, to the second, usually means a controller event (a restart or reconfigure), not
+jobs. A `--min-idle` check against it is then conservative (it may refuse a node that has been free
+longer), never unsafe. Where accounting is on, `sacct -N <node>` shows when the last real job on
+the node ended.
+
 ## Chips: one-chip and four-chip work
 
 How chips are allocated depends on the cluster:
@@ -52,8 +60,14 @@ How chips are allocated depends on the cluster:
 | Four chips | a node of a 4-chip board type, or 4 chips of a larger node (`TT_VISIBLE_DEVICES=0,1,2,3` or the test's mesh setting) |
 | A whole board | a node of that board type, no device limit |
 
-The site file maps each partition to its chips and board (`site.md`). Verify that mapping with
-`tt-smi -ls` inside the first job on each partition, and fix the site file if it differs.
+The site file maps each partition to its chips and board (`site.md`). On a new cluster the chip
+count is not known until a job measures it: leave `chips` out or set it to `"unknown"`. `site check`
+then warns instead of failing, and `check` and `submit` still work. A job on such a partition first
+writes the number of devices in `/dev/tenstorrent` to `job.chips` and logs `tt-smi -ls`; `status`
+prints the count once the job ended. Record it in the site file. A card with two chips behind one
+device (such as n300) counts once, so read the `tt-smi -ls` output in `job.log` before recording.
+Verify a recorded mapping the same way in the first job on each partition, and fix the site file
+if it differs.
 
 ## box.py slurm
 
@@ -62,10 +76,15 @@ login node (`slurm.login`) over ssh.
 
 | Command | What |
 |---|---|
+| `survey <box> [--partition P] [--min-idle MIN]` | read-only (`sinfo` and `scontrol` only, never `sbatch`, `srun` or `salloc`): per partition (default: the site file's), node counts by state, every plain `IDLE` node with its `LastBusyTime`, minutes since then and why it is not takeable (a reservation, `demo_nodes`, `excluded_nodes`, under `--min-idle` when given), and the reservations on its nodes; ends with a note for each `LastBusyTime` that several nodes share |
 | `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (minutes since the node was last busy) when given |
-| `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line |
-| `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc` and the last 20 lines of `job.log`; exit 2 when `squeue` fails (state unknown: never treat that as ended) |
+| `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line; on a partition without a measured chip count the job also measures it |
+| `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc`, the measured chip count when the job took one, and the last 20 lines of `job.log`; exit 2 when `squeue` fails (state unknown: never treat that as ended) |
 | `verify-clean <box> <node> [--ssh]` | exit 0 when no job of yours is on the node; with `--ssh`, also lists your processes there |
+
+`survey` takes no threshold of its own: an idle minimum is site or project policy, passed as
+`--min-idle` only when the charter sets one. Use it to pick a node, then `check` or `submit` it: the
+survey is a snapshot, and `check` runs again right before `sbatch`.
 
 `submit` refuses a missing or unlimited `--time`, `salloc` and `--no-shell`, a checkout or run dir
 outside `workdir_root`, a partition missing from the site file, and any node `check` refuses.

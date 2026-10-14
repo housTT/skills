@@ -85,6 +85,12 @@ def _abs(v) -> bool:
     return _str(v) and v.startswith(("/", "~", "$"))
 
 
+def chips_known(part: dict) -> bool:
+    """A slurm partition entry carries a measured chip count (whole number > 0)."""
+    c = part.get("chips")
+    return isinstance(c, int) and not isinstance(c, bool) and c > 0
+
+
 def check_box(alias: str, e, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
     """(errors, warnings) for one box entry."""
     if not isinstance(e, dict):
@@ -133,8 +139,12 @@ def check_box(alias: str, e, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
                     if not _str(p.get("name")):
                         err.append(f"{where}.name is missing")
                     c = p.get("chips")
-                    if isinstance(c, bool) or not isinstance(c, int) or c < 1:
-                        err.append(f"{where}.chips must be a whole number > 0")
+                    if not chips_known(p):
+                        if c is None or c == "unknown":
+                            warn.append(f"{where}.chips is not measured yet: the first job on it "
+                                        f"reports the count to record (slurm.md)")
+                        else:
+                            err.append(f"{where}.chips must be a whole number > 0, or \"unknown\"")
                     if not _str(p.get("board")):
                         err.append(f"{where}.board is missing")
                     if "exclusive" in p and not isinstance(p["exclusive"], bool):

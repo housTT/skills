@@ -1042,6 +1042,7 @@ def test_setup_box_site_check_accepts_a_valid_file(tmp_path):
     (lambda s: s["boxes"]["<box-alias>"].pop("workdir_root"), "workdir_root must be an absolute path"),
     (lambda s: s["boxes"]["<box-alias>"]["slurm"].pop("login"), "slurm.login"),
     (lambda s: s["boxes"]["<box-alias>"]["slurm"]["partitions"][0].update(chips=0), "chips must be"),
+    (lambda s: s["boxes"]["<box-alias>"]["slurm"]["partitions"][0].update(chips="many"), "chips must be"),
     (lambda s: s["boxes"]["<box-alias>"]["slurm"].update(partitions=[]), "non-empty list"),
     (lambda s: s["boxes"]["<box-alias>"].update(route="ird"), "route ird needs an ird object"),
     (lambda s: s["boxes"]["<box-alias>"].update(excluded_nodes="<node>"), "excluded_nodes must be a list"),
@@ -1053,6 +1054,21 @@ def test_setup_box_site_check_refuses_a_malformed_file(tmp_path, mutate, message
     mutate(site)
     r = _box_check(tmp_path, site)
     assert r.returncode == 1 and message in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("unmeasured", [None, "unknown", "absent"])
+def test_setup_box_site_check_warns_on_an_unmeasured_chip_count(tmp_path, unmeasured):
+    # A new site cannot know its chips before the first job measures them: a warning, not an error.
+    site = _site_example()
+    part = site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]
+    if unmeasured == "absent":
+        part.pop("chips")
+    else:
+        part["chips"] = unmeasured
+    r = _box_check(tmp_path, site)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "warning: <box-alias>: slurm.partitions[0].chips is not measured yet" in r.stdout
+    assert "error" not in r.stdout
 
 
 def test_setup_box_site_check_refuses_missing_or_broken_json(tmp_path):
@@ -1656,6 +1672,123 @@ def test_setup_box_slurm_status_and_verify_clean(tmp_path):
     (fake / "squeue.txt").write_text("4242 RUNNING\n")
     r = run("verify-clean", "<box-alias>", "node07")
     assert r.returncode == 1 and "not clean" in r.stdout
+
+
+def test_setup_box_slurm_submit_and_status_measure_unknown_chips(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    site = json.loads((tmp_path / "boxes.json").read_text())
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["chips"] = "unknown"
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    assert run("check", "<box-alias>", "node07", "--partition", "p4").returncode == 0
+    co = str(tmp_path / "work" / "repo")
+    r = run("submit", "<box-alias>", "--node", "node07", "--partition", "p4", "--name", "t1", "--time", "30",
+            "--checkout", co, "--purpose", "first job", "--command", "true")
+    assert r.returncode == 0 and "chips not measured yet" in r.stdout, r.stdout + r.stderr
+    script = (fake / "job.sbatch").read_text()
+    chips_file = str(tmp_path / "work" / "runs" / "t1" / "job.chips")
+    assert "/dev/tenstorrent" in script and chips_file in script and "tt-smi -ls" in script
+    assert script.index("job.chips") < script.index(f"cd {co}")
+    rundir = tmp_path / "work" / "runs" / "t1"
+    (rundir / "job.rc").write_text("0\n")
+    (rundir / "job.chips").write_text("4\n")
+    r = run("status", "<box-alias>", "4242", "--name", "t1")
+    assert "rc 0" in r.stdout and "measured chips: 4 devices" in r.stdout and "site file" in r.stdout, r.stdout
+    # A measured partition writes no measuring step and reports no measurement.
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["chips"] = 4
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    (rundir / "job.chips").unlink()
+    r = run("submit", "<box-alias>", "--node", "node07", "--partition", "p4", "--name", "t1", "--time", "30",
+            "--checkout", co, "--purpose", "next job", "--command", "true")
+    assert r.returncode == 0 and "(4 chips," in r.stdout
+    assert "/dev/tenstorrent" not in (fake / "job.sbatch").read_text()
+    assert "measured chips" not in run("status", "<box-alias>", "4242", "--name", "t1").stdout
+
+
+def test_setup_box_slurm_batch_script_records_the_device_count(tmp_path):
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_slurm
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    import subprocess
+    (tmp_path / "co").mkdir()
+    chips = tmp_path / "job.chips"
+    script = tmp_path / "job.sbatch"
+    script.write_text(box_slurm.batch_script(str(tmp_path / "co"), "true", str(tmp_path / "job.rc"), None, str(chips)))
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60,
+                       env={k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"})
+    assert (tmp_path / "job.rc").read_text().strip() == "0", r.stdout + r.stderr
+    assert chips.read_text().strip().isdigit() and "chips: " in r.stdout
+
+
+def _fake_survey(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    shared = "2000-01-01T00:00:00"
+    (fake / "sinfo.txt").write_text("node01|p4*|idle\nnode02|p4*|idle\nnode03|p4*|allocated\n"
+                                    "node04|p4*|drained\ndemo1|p4*|idle\nnode07|p4*|idle\nnode09|p1|idle\n")
+    (fake / "node.txt").write_text("".join(
+        f"NodeName={n} Arch=x86_64 State={st} LastBusyTime={t} Reason=x\n" for n, st, t in (
+            ("node01", "IDLE", shared), ("node02", "IDLE", shared), ("node03", "ALLOCATED", shared),
+            ("node04", "IDLE+DRAIN", "None"), ("demo1", "IDLE", "2000-01-01T05:00:00"),
+            ("node07", "IDLE", "2000-01-01T07:00:00"), ("node09", "IDLE", shared))))
+    (fake / "res.txt").write_text("ReservationName=maint1 StartTime=2000-01-02T00:00:00 "
+                                  "EndTime=2000-01-03T00:00:00 Nodes=node0[2,7] State=INACTIVE\n")
+    calls = tmp_path / "ssh.log"
+    (tmp_path / "bin" / "ssh").write_text(f'#!/bin/bash\nwhile [ "${{1#-}}" != "$1" ]; do shift 2; done; shift\n'
+                                          f'echo "$*" >> {calls}\nexec bash -c "$*"\n')
+    for tool in ("sbatch", "salloc", "srun", "scancel"):
+        (tmp_path / "bin" / tool).write_text(f"#!/bin/bash\necho {tool} >> {calls}.jobs\n")
+        (tmp_path / "bin" / tool).chmod(0o755)
+    return run, fake, calls
+
+
+def test_setup_box_slurm_survey_is_read_only_and_lists_idle_nodes_and_reservations(tmp_path):
+    run, fake, calls = _fake_survey(tmp_path)
+    r = run("survey", "<box-alias>")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "partition p4 (4 chips, " in out and "6 nodes: allocated 1, drained 1, idle 4" in out, out
+    assert "  idle node01 LastBusyTime 2000-01-01T00:00:00" in out and "shared by 4 nodes" in out
+    assert "idle node03" not in out and "idle node04" not in out and "node09" not in out  # p1 not surveyed
+    assert "idle node02" in out and "not takeable (reservation maint1)" in out
+    assert "not takeable (demo_nodes)" in out
+    assert "reservation maint1 nodes node0[2,7] 2000-01-02T00:00:00 to 2000-01-03T00:00:00 INACTIVE" in out
+    assert "note: 4 nodes share LastBusyTime 2000-01-01T00:00:00: likely a controller restart" in out
+    assert "sacct -N <node>" in out
+    assert "under --min-idle" not in out  # no idle threshold unless the caller supplies one
+    remote = calls.read_text()
+    for word in re.findall(r"[a-z]+", remote):
+        assert word not in ("sbatch", "salloc", "srun", "scancel"), remote
+    assert set(re.findall(r"(?:^|; )(\w+)", remote)) <= {"date", "echo", "sinfo", "scontrol"}, remote
+    assert not (tmp_path / "ssh.log.jobs").exists()
+
+
+def test_setup_box_slurm_survey_min_idle_and_partitions(tmp_path):
+    import datetime
+    run, fake, _ = _fake_survey(tmp_path)
+    recent = (datetime.datetime.now() - datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+    text = (fake / "node.txt").read_text().replace("2000-01-01T07:00:00", recent)
+    (fake / "node.txt").write_text(text)
+    r = run("survey", "<box-alias>", "--min-idle", "60")
+    assert r.returncode == 0, r.stdout + r.stderr
+    line = next(ln for ln in r.stdout.splitlines() if "idle node07" in ln)
+    assert "under --min-idle 60" in line and "reservation maint1" in line
+    line = next(ln for ln in r.stdout.splitlines() if "idle node01" in ln)
+    assert "not takeable" not in line
+    r = run("survey", "<box-alias>", "--partition", "p1")
+    assert "partition p1 (not in the site file): 1 nodes: idle 1" in r.stdout and "idle node09" in r.stdout
+    assert "partition p4" not in r.stdout
+    assert "not a plain name" in run("survey", "<box-alias>", "--partition", "p1;sbatch").stdout
+
+
+def test_setup_box_slurm_page_documents_survey_and_shared_last_busy_time():
+    page = " ".join((SKILLS / "setup-box" / "slurm.md").read_text(encoding="utf-8").split())
+    for part in ("`survey <box>", "never `sbatch`, `srun` or `salloc`", "controller event",
+                 "conservative", "never unsafe", "`sacct -N <node>`", "takes no threshold of its own",
+                 '`"unknown"`', "job.chips", "Get nodes only through the scheduler",
+                 "never the partition maximum", "Release the node as soon as the work ends",
+                 "allocated, drained, reserved for others or down"):
+        assert part in page, part
 
 
 def _run_batch_script(tmp_path, command, signal_after=None):
