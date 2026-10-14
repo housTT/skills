@@ -1577,7 +1577,7 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
     return None
 
 
-def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate") -> None:
+def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "") -> None:
     """Only passes are recorded. A failed write is said and never fails the checks."""
     if not p or not tree:
         return
@@ -1595,6 +1595,7 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
             passes.append({"tree": tree, "commands": _commands_hash(cmds),
                            "prefixes": [_commands_hash(cmds[:n]) for n in range(1, len(cmds))],
                            "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time(),
+                           **({"log": str(Path(run_dir) / "checks.log")} if run_dir else {}),
                            **({"purpose": purpose} if purpose != "candidate" else {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
@@ -1844,8 +1845,12 @@ def cmd_checks(a) -> None:
             passed, failed = False, push.NONE_APPLY
         elif hit:
             when = timefmt.long(float(hit.get("ts") or 0), p)
+            rl = str(hit.get("log") or "")
+            rec_out = (f"full output: {rl}" if rl and Path(rl).is_file() else
+                       "no commands ran in this call and the recorded run's output is not available; "
+                       "--fresh produces it")
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
-                    f"at {when} (recorded); --fresh runs them again (full output: {log})")
+                    f"at {when} (recorded); --fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -1929,7 +1934,7 @@ def cmd_checks(a) -> None:
         print(said)
         return
     if todo:
-        _record_pass(p, tree, todo, purpose)
+        _record_pass(p, tree, todo, purpose, run_dir)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "

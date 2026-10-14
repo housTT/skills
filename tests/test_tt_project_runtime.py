@@ -62742,6 +62742,10 @@ def test_ttp_checks_pass_stdout_names_checks_log(env, tmp_path, monkeypatch, cap
     monkeypatch.chdir(repo)
     cli.main(["checks", "--", "test -f a.txt"])
     assert f"(full output: {run / 'checks.log'})" in capsys.readouterr().out
+    run2 = tmp_path / "run2"
+    run2.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run2))
     cli.main(["checks", "--", "test -f a.txt"])
     out = capsys.readouterr().out
     assert "(recorded)" in out and f"(full output: {run / 'checks.log'})" in out
+    assert "$ test -f a.txt" in (run / "checks.log").read_text()
