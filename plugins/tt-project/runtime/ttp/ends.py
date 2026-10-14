@@ -36,10 +36,30 @@ PROBE_TIMEOUT_S = 60
 NOT_YET_RCS = (1, 75, 255)
 UNTIL_CHARS = 300
 PROBE_CHARS = 1000
+SH = "/bin/sh"   # what the daemon runs every stored probe with (subprocess shell=True)
 MAX_EXPIRES_S = 365 * 86400
 # Trailing charter body lines, in the order they are written.
 CHARTER_LINES = (("expires", "Expires: "), ("until", "Until: "), ("probe", "Until probe: "))
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def sh_syntax_error(probe: str) -> str:
+    """Why /bin/sh cannot parse `probe` (`sh -n`), or "" when it can or the check cannot run."""
+    try:
+        r = subprocess.run([SH, "-n", "-c", probe], capture_output=True, text=True, timeout=5,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return "" if r.returncode == 0 else " ".join((r.stderr or f"exit {r.returncode}").split())[:300]
+
+
+def check_sh(probe: str, what: str) -> None:
+    """Refuse a probe to be stored that /bin/sh cannot parse: the daemon would get exit 2 from it forever."""
+    err = sh_syntax_error(probe)
+    if err:
+        raise ValueError(f"{what} is not valid POSIX sh, which the daemon runs probes with ({SH} -n: {err}); "
+                         f"write it without bash-only syntax (a here-string <<<, process substitution <(...), "
+                         f"arrays) or wrap it in bash -c '...'")
 
 
 def stamp(ts: float) -> str:
@@ -95,6 +115,7 @@ def from_action(a: dict, now: float | None = None) -> dict:
     if probe:
         if not isinstance(probe, str) or "\n" in probe.strip() or len(probe) > PROBE_CHARS:
             raise ValueError(f"until_probe must be one shell command on one line, at most {PROBE_CHARS} characters")
+        check_sh(probe.strip(), "until_probe")
         out["probe"] = probe.strip()
     return out
 

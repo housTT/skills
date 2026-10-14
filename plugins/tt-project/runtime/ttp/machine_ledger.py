@@ -138,6 +138,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         raise ValueError("say what changed and give the --undo command")
     if not expires and not probe:
         raise ValueError("give an end: --expires <delay or time> or --until-probe <command>")
+    if probe:
+        ends.check_sh(probe, "--until-probe")
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
     with _locked():
@@ -211,6 +213,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         probe = _one_line(until_probe, ends.PROBE_CHARS)
         if not probe:
             raise ValueError("the --until-probe command cannot be empty")
+        ends.check_sh(probe, "--until-probe")
         new.update(probe=probe, expires=now + PROBE_END_S)
     elif expires:
         new.update(probe=None, expires=float(expires) if isinstance(expires, (int, float))

@@ -60,6 +60,7 @@ def from_action(a: dict, now: float | None = None, p: Project | None = None, by:
     if probe and ("\n" in probe.strip() or len(probe) > ends.PROBE_CHARS):
         raise ValueError(f"end_when must be one shell command on one line, at most {ends.PROBE_CHARS} characters")
     if probe and probe.strip():
+        ends.check_sh(probe.strip(), "end_when")
         out["end_when"] = probe.strip()
     elif p is not None and (by == "coordinator" or not out.get("until")):
         health = health_end(p, a.get("resource"))

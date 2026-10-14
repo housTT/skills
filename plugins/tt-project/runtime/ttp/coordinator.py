@@ -1077,6 +1077,8 @@ def check_probe(probe, what: str = "start_when") -> None:
         raise ValueError(f"{what} {probe.strip()[:60]!r} is not a landed probe: write it as landed:#<task id> "
                          f"(exactly `landed:#<id>`, one task id); to combine it with another check, use "
                          f"`ttp landed --task <id> && ...`")
+    if probe.strip() and not landed.LANDED_PROBE.fullmatch(probe):
+        ends.check_sh(probe.strip(), what)
 
 
 def start_why(a: dict, cur: dict, when: str | None) -> str | None:

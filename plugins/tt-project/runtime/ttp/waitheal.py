@@ -79,6 +79,12 @@ def never_passes(p, probe: str, rc=None, output: str = "") -> str:
     """Why a probe can never pass, in plain words, or "" when it may yet."""
     if rc == 127:
         return "its command is not found (exit 127)"
+    if rc in (None, 2):   # dash's exit for a syntax error; None: the wait just started
+        from .ends import SH, sh_syntax_error
+        from .landed import probe_command
+        err = sh_syntax_error(probe_command(probe))
+        if err:
+            return f"{SH}, which runs it, cannot parse it ({err}): it must be POSIX sh, not bash-only syntax"
     gone = gone_paths(p, probe)
     if gone:
         return f"it names {gone[0]}, a run dir or worktree that no longer exists"

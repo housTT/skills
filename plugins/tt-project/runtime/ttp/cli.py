@@ -3293,6 +3293,20 @@ def _machine_change(a) -> None:
     print(f"recorded {ml.change_line(c)}")
 
 
+def _pause_by(p: Project) -> str:
+    """Whom a `ttp pause --resource` is stamped for: the user only when they run it themselves; inside
+    a run, the coordinator (its own turn in this project) or a worker, whose pauses the coordinator may lift."""
+    from .project import in_run
+    if not in_run():
+        return "user"
+    run, mine = os.environ.get("TTP_RUN_ID"), os.environ.get("TTP_PROJECT")
+    if run and not os.environ.get("TTP_TASK") and mine and Path(mine).resolve() == Path(p.base).resolve():
+        row = p.db.one("SELECT role FROM runs WHERE id=?", (run,))
+        if row and row["role"] == "coordinator":
+            return "coordinator"
+    return "worker"
+
+
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if a.resource and getattr(a, "until_reboot", False):
@@ -3304,7 +3318,7 @@ def cmd_pause(a) -> None:
             end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from}) \
                 if a.cmd == "pause" else None
             print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
-                                                 by="user", end=end))
+                                                 by=_pause_by(p), end=end))
         except ValueError as e:
             die(str(e))
         return

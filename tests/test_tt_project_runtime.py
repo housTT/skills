@@ -27088,6 +27088,91 @@ def test_a_resource_pause_without_an_end_is_refused(env, capsys):
     assert p.db.paused_resources()["board"]["end_default"] is True
 
 
+# The daemon runs every stored probe with /bin/sh. Where that is dash, a bash here-string fails to parse.
+SH_BROKEN = ["if then"] + (['grep -q ready <<< "$(cat status)"']
+                           if os.path.realpath("/bin/sh").endswith("dash") else [])
+
+
+def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
+    p = make(env)
+    from ttp import cli, coordinator as coord, ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import screen as scr
+    mm.add("box-a", tags="device")
+    good = "test -e done && ttp lock --probe board"
+    for bad in SH_BROKEN:
+        actions = [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": bad},
+                   {"type": "memory_add", "text": "Stay off box A for now.", "until_probe": bad},
+                   {"type": "task_add", "title": "later", "start_when": bad},
+                   {"type": "observation_mute", "source": "watcher:hw", "match": "dropped", "end_when": bad}]
+        problems = coord.apply(p, actions)
+        assert len(problems) == 4 and all("not valid POSIX sh" in x for x in problems), problems
+        with pytest.raises(ValueError, match="until_probe is not valid POSIX sh"):
+            ends.from_action({"until_probe": bad})
+        with pytest.raises(ValueError, match="not valid POSIX sh"):
+            ml.add_change("box-a", "paused the queue", "resume-queue", "demo", until_probe=bad)
+        with pytest.raises(SystemExit):
+            cli.main(["pause", "demo", "--resource", "board", "--end-when", bad])
+        assert "not valid POSIX sh" in capsys.readouterr().err
+    assert p.db.paused_resources() == {} and scr.mutes(p.db) == [] and ml.changes() == []
+    assert not p.db.one("SELECT id FROM tasks WHERE title='later'")
+    assert [e for e in p._memory_entries() if e.get("end")] == []
+    # POSIX probes, and the daemon's own landed:#<id> form, are stored as written.
+    first = p.db.add_task("first", "s", kind="work", tier="light", origin="user")
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": good},
+                           {"type": "memory_add", "text": "Stay off box A for now.", "until_probe": good},
+                           {"type": "task_add", "title": "later", "start_when": good},
+                           {"type": "task_add", "title": "after", "start_when": f"landed:#{first}"},
+                           {"type": "observation_mute", "source": "watcher:hw", "match": "dropped",
+                            "end_when": good}]) == []
+    assert p.db.paused_resources()["board"]["end_when"] == good and scr.mutes(p.db)
+    c = ml.add_change("box-a", "paused the queue", "resume-queue", "demo", until_probe=good)
+    with pytest.raises(ValueError, match="not valid POSIX sh"):
+        ml.edit_change(c["id"], "demo", until_probe=SH_BROKEN[-1])
+    # A waiting task's retry_when, re-pointed by hand.
+    tid = _due_waiting_task(p, "exit 1")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), SH_BROKEN[-1]])
+    assert "retry_when is not valid POSIX sh" in capsys.readouterr().err
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == "exit 1"
+
+
+def test_a_hand_off_whose_retry_when_sh_cannot_parse_is_flagged_when_its_wait_starts(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.db import load_result
+    tid = _due_waiting_task(p, SH_BROKEN[-1])
+    d = dmod.Daemon(p.base)
+    d._wait_started(p.db.task(tid), load_result(p.db.task(tid)["result"]))
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind='probe_never_passes'")
+    assert "cannot parse it" in ev["text"] and "POSIX sh" in ev["text"], ev["text"]
+    ok = _due_waiting_task(p, "test -e done")
+    d._wait_started(p.db.task(ok), load_result(p.db.task(ok)["result"]))
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='probe_never_passes'")["n"] == 1
+
+
+@pytest.mark.parametrize("role", ["worker", "coordinator"])
+def test_a_pause_set_inside_a_run_is_not_the_users_and_the_coordinator_may_lift_it(env, monkeypatch, capsys, role):
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    run = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES(?,'claude',?,'running')",
+                 (role, time.time()))
+    monkeypatch.setenv("TTP_RUN_ID", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", "7" if role == "worker" else "")
+    cli.main(["pause", "demo", "--resource", "board", "--until", "1d", "--reason", "flaky fan"])
+    assert p.db.paused_resources()["board"]["by"] == role
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
+    assert p.db.paused_resources() == {}
+    # Run by the user directly, it stays theirs.
+    for var in ("TTP_RUN_ID", "TTP_PROJECT", "TTP_TASK"):
+        monkeypatch.delenv(var)
+    cli.main(["pause", "demo", "--resource", "board", "--until", "1d"])
+    assert p.db.paused_resources()["board"]["by"] == "user"
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}])
+
+
 def test_a_pause_without_an_end_gets_a_default_end_and_one_info_message(env):
     p = make(env)
     from ttp import coordinator as coord, pauseends
@@ -32511,7 +32596,8 @@ def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
     from ttp import cli
     from ttp import coordinator as coord
     # The daemon applies a turn inside one write transaction (BEGIN IMMEDIATE) and `ttp task set-when`
-    # holds one too: a probe run there would hold the project DB's write lock. Only static checks.
+    # holds one too: a probe run there would hold the project DB's write lock. Only static checks
+    # (`sh -n` parses a probe without running it).
     assert coord.apply(p, [{"type": "task_add", "title": "t", "spec": "s", "start_when": "test -f out/x"}]) == []
     tid = _added(p, "t")
     spawned = []
@@ -32528,7 +32614,8 @@ def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
         assert coord.apply(p, [{"type": "task_add", "title": "slow", "spec": "s", "start_when": slow},
                                {"type": "task_update", "id": tid, "start_when": "now-ish"}]) == []
     assert cli.set_when(p.db, tid, broken, p) == f"task #{tid} start_when set: {broken}"
-    assert time.time() - t0 < 5 and not spawned, spawned
+    ran = [c for c in spawned if list(c[:2]) != ["/bin/sh", "-n"]]
+    assert time.time() - t0 < 5 and not ran, spawned
     assert f"start_when:{slow}" in _labels(p, _added(p, "slow")) and f"start_when:{broken}" in _labels(p, tid)
 
 
