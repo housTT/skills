@@ -57534,3 +57534,22 @@ def test_a_passing_review_marks_the_reviewed_head_for_the_tasks_that_continue_it
     assert d._verified_review_line(p.db.task(code), head) == ""
     p.db.update_task(review, status="done", result=json.dumps({"summary": "passed", **extra}))
     assert f"verified through {reviewed[:12]}" in coord.digest(p, {}, [], []).split("## Recently finished")[1]
+
+
+def test_failover_review_lines_say_when_a_logout_ended(env):
+    """A logged-out cause whose breaker closed since shows its end and the task's status; an open one keeps 'no known end'."""
+    from ttp import alerts, failover
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("long job", "Run it.", kind="work", tier="standard", provider="claude")
+    line = (f"#{tid} long job: left running on claude, which cannot start new work (logged out) with no known end; "
+            "a later run of it moves unless its pin is required")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 5 * 3600, "daemon", failover.KIND, "low", line, "handled", tid))
+    p.db.set_kv(alerts.BREAKER + "claude", {"open": True, "opened": now - 6 * 3600})
+    assert failover.review_lines(p.db, now, where="America/Los_Angeles") == [line]
+    p.db.set_kv(alerts.BREAKER + "claude", {"open": False, "opened": now - 6 * 3600, "closed": now - 3.5 * 3600})
+    p.db.update_task(tid, status="done")
+    got = failover.review_lines(p.db, now, where="America/Los_Angeles")[0]
+    assert "no known end" not in got and "(ended " in got and "lasted 2.5 h)" in got, got
+    assert got.endswith(f"#{tid} is now done") and (" PDT, " in got or " PST, " in got), got

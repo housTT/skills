@@ -298,8 +298,27 @@ def report_running(db: DB, items: list[dict], now: float, where) -> list[str]:
     return out
 
 
-def review_lines(db: DB, now: float | None = None, hours: float = 24) -> list[str]:
-    """For the daily review: every failover event of the last `hours`."""
+def review_lines(db: DB, now: float | None = None, hours: float = 24, where=None) -> list[str]:
+    """For the daily review: every failover event of the last `hours`. A logged-out cause whose auth
+    breaker has closed since says when it ended and how long it lasted, with the task's status now,
+    instead of 'no known end' (that stays only while the outage is open)."""
+    from . import alerts
     now = time.time() if now is None else now
-    rows = db.q("SELECT text FROM events WHERE kind=? AND ts>=? ORDER BY ts", (KIND, now - hours * 3600))
-    return [r["text"] for r in rows]
+    rows = db.q("SELECT ts,text,task FROM events WHERE kind=? AND ts>=? ORDER BY ts", (KIND, now - hours * 3600))
+    out = []
+    for r in rows:
+        text = r["text"]
+        m = re.search(r"(?:left running on|moved (?:at once )?from) (\S+?)[,( ]", text)
+        if m and "(logged out) with no known end" in text:
+            rec = db.kv(alerts.BREAKER + m.group(1)) or {}
+            closed = rec.get("closed")
+            if not rec.get("open", True) and closed and float(closed) >= float(r["ts"]):
+                start = float(rec.get("opened") or r["ts"])
+                ended = (f"(logged out) (ended {timefmt.long(float(closed), where)}, lasted "
+                         f"{max(0.0, float(closed) - start) / 3600:.1f} h)")
+                text = text.replace("(logged out) with no known end", ended)
+                t = db.task(r["task"]) if r["task"] else None
+                if t:
+                    text += f"; #{t['id']} is now {t['status']}"
+        out.append(text)
+    return out
