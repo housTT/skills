@@ -169,7 +169,7 @@ def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
 
 
-def test_no_setup_specific_details_from_local_patterns():
+def test_no_local_leak_patterns_in_plugin():
     path = local_leak_patterns_file()
     if not path.is_file():
         pytest.skip(f"setup-specific leak check skipped: no local pattern file at {path} "
