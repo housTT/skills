@@ -2814,6 +2814,11 @@ def test_watcher_same_subject_warning_counts_only_one_key_kind_and_lists_the_key
         run("distinct", {"text": text, "severity": "high", "key": key})
     assert len(issues("distinct")) == 4 and "noisy watcher:" not in log()
     assert watchdup.counts(p.db, "watcher:distinct", time.time()) == [("box-a", 1)]
+    # The same with a subject whose number the issue's subject masks ('chip 0' is stored as 'chip <n>').
+    for cond in ["outage-ended", "drop-in", "recovered:3", "hold:7"]:
+        run("masked", {"text": f"chip 0: {cond}", "severity": "high", "key": f"chip 0:{cond}"})
+    assert len(issues("masked")) == 4 and "noisy watcher:" not in log()
+    assert watchdup.counts(p.db, "watcher:masked", time.time()) == [("chip <n>", 1)]
     # Four keys of one kind (one key per episode) on one subject still warn, and the warning lists them.
     for n in range(1, 5):
         run("episodes", {"text": f"box-a: hold episode {n}", "severity": "high", "key": f"hold:{n}"})
@@ -2827,12 +2832,20 @@ def test_watcher_same_subject_warning_counts_only_one_key_kind_and_lists_the_key
     # The kind rule: case, a leading subject and digit runs do not tell keys apart; ':', '/' and '#' end the kind.
     assert watchdup.key_kind("Retry 1") == watchdup.key_kind("retry 22") == "retry <n>"
     assert watchdup.key_kind("box-a:hold", "box-a") == watchdup.key_kind("hold#7", "box-a") == "hold"
+    assert watchdup.key_kind("box-02:hold:7", "box-<n>") == watchdup.key_kind("chip 0:Hold", "chip 0") == "hold"
+    assert watchdup.key_kind("box-02:drop-in", "box-<n>") == "drop-in"
     assert watchdup.key_kind("drop-in/x") != watchdup.key_kind("outage-ended") and watchdup.key_kind("") == ""
     # A warning recorded before keys were kept still reads as before; a long key list is cut.
     old = {"source": "watcher:x", "subject": "s", "n": 4}
     assert watchdup.describe(old) == f"watcher:x opened 4 issues on subject 's' within 24 h: {watchdup.FIX}"
     many = watchdup.describe({**old, "n": 9, "kind": "k", "keys": [f"k:{i}" for i in range(9)]})
     assert "k:5, +3 more)" in many and "k:6" not in many
+    # The stored key list is capped; the warning still counts every issue.
+    for n in range(watchdup.STORED_KEYS + 5):
+        run("flood", {"text": f"box-c: hold episode {n}", "severity": "high", "key": f"hold:{n}"})
+    w = p.db.kv(watchdup.KEY)["watcher:flood\nbox-c"]
+    assert w["n"] == watchdup.STORED_KEYS + 5 and len(w["keys"]) == watchdup.STORED_KEYS
+    assert f"+{watchdup.STORED_KEYS + 5 - watchdup.SHOWN_KEYS} more)" in watchdup.describe(w)
 
 
 def test_command_watcher_info_lines_clear_items_and_are_recorded_quietly(env, monkeypatch):

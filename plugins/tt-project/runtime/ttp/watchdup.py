@@ -11,16 +11,19 @@ review. It never wakes anyone and changes no issue: the fix is in the watcher's 
 
 Issues of one kind are duplicates; distinct stable keys are distinct conditions. All issues opened
 under no key on a subject are one kind (their text changed). A keyed issue's kind is its key's kind
-prefix: the key, lower-cased, without a leading '<subject>' and separator, up to its first ':', '/' or
-'#', with each run of digits counted as one number. So 'hold:3' and 'hold:4' (or 'retry 1' and
+prefix: the key, normalized as issue text and subjects are (lower-cased, numbers masked), without a
+leading '<subject>' and separator, up to its first ':', '/' or '#', with each run of digits counted as
+one number. So 'hold:3' and 'hold:4' (or 'retry 1' and
 'retry 2') are one kind, while 'outage ended', 'drop-in' and 'recovered' are three. The warning lists
-the keys it counted, so a reader can tell duplicates from distinct conditions."""
+the keys it counted (the first STORED_KEYS are kept), so a reader can tell duplicates from distinct
+conditions."""
 from __future__ import annotations
 
 import re
 import time
 
 from .db import DB
+from .screen import normalize
 
 WINDOW_S = 86400.0
 DEFAULT = 3
@@ -29,6 +32,7 @@ FIX = 'give its JSON lines a stable "key" (or "whole": true), see the tt-project
 KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see the tt-project-harness skill'
 NO_KEY = ""                    # the kind of every issue opened under no key
 SHOWN_KEYS = 6
+STORED_KEYS = 20             # keys kept per warning; n counts them all
 _SEP = re.compile(r"[:/#]")
 _DIGITS = re.compile(r"\d+")
 
@@ -42,10 +46,10 @@ def threshold(cfg: dict) -> int:
 
 def key_kind(key: str | None, subject: str = "") -> str:
     """The kind prefix of a watcher key (see the module doc); NO_KEY for none."""
-    k = (key or "").strip().lower()
+    k = normalize(key or "")
     if not k:
         return NO_KEY
-    subj = (subject or "").strip().lower()
+    subj = normalize(subject or "")   # an issue's subject is stored normalized; the key must match it
     if subj and k.startswith(subj) and len(k) > len(subj) and (_SEP.match(k, len(subj)) or k[len(subj)] == " "):
         k = k[len(subj) + 1:].strip() or k
     head = _SEP.split(k, 1)[0].strip() or k
@@ -84,14 +88,14 @@ def check(db: DB, cfg: dict, sources: list[str], now: float | None = None) -> li
         for subject, kind, keys in groups(db, source, now):
             if len(keys) > limit and len(keys) > len(noisy.get(subject, ("", []))[1]):
                 noisy[subject] = (kind, keys)
-        for subject, (kind, keys) in noisy.items():
-            k = f"{source}\n{subject}"
+        for subject, (kind, all_keys) in noisy.items():
+            k, keys = f"{source}\n{subject}", all_keys[:STORED_KEYS]
             if k in warned:
-                if warned[k]["n"] != len(keys) or warned[k].get("keys") != keys:
-                    warned[k].update(n=len(keys), kind=kind, keys=keys)
+                if warned[k]["n"] != len(all_keys) or warned[k].get("keys") != keys:
+                    warned[k].update(n=len(all_keys), kind=kind, keys=keys)
                     changed = True
                 continue
-            warned[k] = {"source": source, "subject": subject, "n": len(keys), "at": now, "kind": kind, "keys": keys}
+            warned[k] = {"source": source, "subject": subject, "n": len(all_keys), "at": now, "kind": kind, "keys": keys}
             new.append(describe(warned[k]))
     if new or changed or len(warned) != len(db.kv(KEY, {}) or {}):
         db.set_kv(KEY, warned)
@@ -102,7 +106,8 @@ def describe(w: dict) -> str:
     subject = f"subject '{w['subject']}'" if w["subject"] else "no subject"
     keys = [k for k in (w.get("keys") or []) if k]
     if keys:
-        shown = ", ".join(keys[:SHOWN_KEYS]) + (f", +{len(keys) - SHOWN_KEYS} more" if len(keys) > SHOWN_KEYS else "")
+        total = max(len(keys), int(w.get("n") or 0))
+        shown = ", ".join(keys[:SHOWN_KEYS]) + (f", +{total - SHOWN_KEYS} more" if total > SHOWN_KEYS else "")
         return f"{w['source']} opened {w['n']} issues on {subject} within 24 h under key kind " \
                f"'{w.get('kind') or ''}' (keys: {shown}): {KEYED_FIX}"
     if "keys" in w:
