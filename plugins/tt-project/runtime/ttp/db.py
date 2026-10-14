@@ -668,17 +668,25 @@ def counted_spend(since_ts: float, until_ts: float | None = None, provider: str 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
 
 
+def unplanned_abrupt(boot: dict) -> bool:
+    """Whether a reboot, as DB.boots returns it, was abrupt and nothing planned it: only these say the
+    host may be unstable (an orderly one was a shutdown or an update, a planned one was chosen)."""
+    return boot.get("shutdown") != "orderly" and not boot.get("planned")
+
+
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (last HH:MM <zone>), M runs lost ($X)' for the boots of the last day, as
-    DB.boots returns them, in the home zone `where`; '' when there were none."""
+    """'host: N reboots in 24 h (K planned) (last HH:MM <zone>), M runs lost ($X)' for the boots of the
+    last day, as DB.boots returns them, in the home zone `where`; '' when there were none."""
     if not boots:
         return ""
     lost = sum(len(b.get("lost") or []) for b in boots)
     usd = sum(float(b.get("lost_usd") or 0) for b in boots)
+    planned = sum(1 for b in boots if b.get("planned"))
     from .timefmt import short
     last = short(float(boots[-1]["ts"]), where)
-    return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h (last {last}), "
-            f"{lost} run{'' if lost == 1 else 's'} lost (${usd:.2f})")
+    return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h"
+            + (f" ({planned} planned)" if planned else "")
+            + f" (last {last}), {lost} run{'' if lost == 1 else 's'} lost (${usd:.2f})")
 
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:

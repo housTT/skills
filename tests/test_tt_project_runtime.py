@@ -26120,6 +26120,113 @@ def test_orderly_reboots_never_call_the_host_unstable(env, tmp_path, monkeypatch
     assert all("(orderly;" in n["text"] and "unstable" not in n["text"] for n in notes), notes
 
 
+def _reboot_series(p, tmp_path, monkeypatch, planned):
+    """Boots 1..len(planned) after boot-0, each cutting one run short; boot i was a planned host cycle
+    (a host-cycle record for boot i-1) when planned[i-1]."""
+    from ttp.daemon import Daemon
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    for i, plan in enumerate(planned, 1):
+        (tmp_path / f"b{i}").mkdir()
+        _lost_deep_runs(p, tmp_path / f"b{i}", f"boot-{i - 1}", costs=(1.0,))
+        booted = time.time() - (len(planned) + 1 - i) * 600
+        if plan:
+            _host_cycle_record(p.state, f"boot-{i - 1}", booted - 120, reason="firmware update", by="ttp drain")
+        _boot_as(monkeypatch, f"boot-{i}", booted)
+        d = Daemon(p.base)
+        d.tick()
+        d.tick()
+    return _reboot_notices(p)
+
+
+_UNSTABLE_WORDS = ("abrupt", "unstable", "power, cooling", "system logs")
+
+
+def test_planned_reboots_are_told_as_planned_at_low_severity_and_never_counted_as_unstable(env, tmp_path,
+                                                                                          monkeypatch):
+    """A reboot a host-cycle record planned gets a low-severity notice that says it was planned and
+    what planned it, with no abrupt/unstable wording or power and cooling advice, however many come."""
+    p = make(env)
+    from ttp import db as dbm
+    from ttp import machines as mm
+    notes = _reboot_series(p, tmp_path, monkeypatch, [True] * 4)
+    assert len(notes) == 4 and all(n["severity"] == "low" for n in notes), notes
+    for n in notes:
+        assert "(planned;" in n["text"] and "It was a planned host cycle (host-cycle record rec-" in n["text"], n
+        assert "firmware update" in n["text"] and not any(w in n["text"] for w in _UNSTABLE_WORDS), n
+    assert not p.db.kv("host_unstable_told")
+    boots = p.db.boots(0)
+    assert len(boots) == 4 and not any(dbm.unplanned_abrupt(b) for b in boots)
+    assert all(b["planned"]["by"].startswith("host-cycle record rec-") for b in boots), boots
+    assert dbm.host_line(boots).startswith("host: 4 reboots in 24 h (4 planned) (last "), dbm.host_line(boots)
+    texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE source='host' AND kind='boot'")]
+    assert texts and all(t.startswith("the host rebooted (planned);") for t in texts), texts
+    mm.add("box-a", tags="device")
+    for b in p.db.q("SELECT id, data FROM events WHERE source='host' AND kind='boot'"):
+        data = {**json.loads(b["data"]), "held": ["box-a-device: task #7 (run 3)"]}
+        p.db.x("UPDATE events SET data=? WHERE id=?", (json.dumps(data), b["id"]))
+    assert mm.stats(p.db).get("box-a", {}).get("reboots", 0) == 0, "a planned reboot counted against a machine"
+
+
+def test_only_unplanned_abrupt_reboots_count_toward_an_unstable_host(env, tmp_path, monkeypatch):
+    """Unplanned, planned, unplanned, unplanned: the planned 3rd is told as planned (low, no unstable
+    wording, though two abrupt ones came before it); the 4th is the 3rd unplanned one and raises
+    today's high 'looks unstable' warning, counting 3, not 4."""
+    p = make(env)
+    from ttp import db as dbm
+    notes = _reboot_series(p, tmp_path, monkeypatch, [False, False, True, False])
+    assert [n["severity"] for n in notes] == ["normal", "normal", "low", "high"], notes
+    assert all("(abrupt;" in notes[i]["text"] and "planned" not in notes[i]["text"] for i in (0, 1, 3)), notes
+    assert "(planned;" in notes[2]["text"] and not any(w in notes[2]["text"] for w in _UNSTABLE_WORDS), notes[2]
+    assert "The host looks unstable: 3 abrupt reboots cut runs short in 24 h; check its power, cooling and " \
+           "system logs." in notes[3]["text"], notes[3]
+    assert sum(1 for b in p.db.boots(0) if dbm.unplanned_abrupt(b)) == 3
+
+
+def test_a_power_cycle_intent_in_the_machine_ledger_makes_this_hosts_reboot_planned(env, tmp_path, monkeypatch):
+    """`ttp machines change add <this host> --power-cycle-at <t>` plans the reboot that comes around t:
+    the notice names the change; an intent for another machine, or far from the boot, plans nothing."""
+    p = make(env)
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    monkeypatch.setattr(mm, "here", lambda known=None: ("box-a", {}))
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    booted = time.time() - 600
+    ml.add_power_cycle("box-b", "1h", "other", "firmware", now=booted - 3600 - 60)   # another machine
+    ml.add_power_cycle("box-a", "1h", "other", "old", now=booted - 3 * 3600 - 3600)   # long before this boot
+    _lost_deep_runs(p, tmp_path, "boot-0", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-1", booted)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    (n,) = _reboot_notices(p)
+    assert "(abrupt;" in n["text"] and "planned" not in n["text"], n
+    pc = ml.add_power_cycle("box-a", "1h", "other", "new firmware", now=booted - 3600 - 60)
+    (tmp_path / "b2").mkdir()
+    _lost_deep_runs(p, tmp_path / "b2", "boot-1", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-2", time.time() - 60)
+    pc["at"] = time.time() - 120
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        for c in doc["changes"]:
+            if c["id"] == pc["id"]:
+                c["at"] = pc["at"]
+        ml._write(ml.LEDGER, doc)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    n = _reboot_notices(p)[-1]
+    assert n["severity"] == "low" and "(planned;" in n["text"], n
+    assert f"It was a planned host cycle (machine change #{pc['id']} by other): power-cycle intent" in n["text"], n
+    assert "new firmware" in n["text"] and not any(w in n["text"] for w in _UNSTABLE_WORDS), n
+
+
 def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -28052,7 +28159,9 @@ def test_the_boot_record_names_a_planned_host_cycle(env, tmp_path, monkeypatch):
     (row,) = p.db.q("SELECT data FROM events WHERE source='host' AND kind='boot'")
     assert json.loads(row["data"])["planned"]["reason"] == "chips off the bus; power cycled"
     note = _reboot_notices(p)
-    assert len(note) == 1 and "It was a planned host cycle: chips off the bus" in note[0]["text"], note
+    assert len(note) == 1 and note[0]["severity"] == "low", note
+    assert "It was a planned host cycle (host-cycle record rec-boot-a): chips off the bus" in note[0]["text"], note
+    assert "abrupt" not in note[0]["text"], note
 
 
 def test_a_coordinator_turn_lost_to_a_reboot_is_not_a_failed_turn(env, tmp_path):

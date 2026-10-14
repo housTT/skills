@@ -93,7 +93,7 @@ from . import shared
 from . import shorttmp
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
-                 dump_result, load_result, without_deferral)
+                 dump_result, load_result, unplanned_abrupt, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
@@ -1838,29 +1838,35 @@ class Daemon:
             booted = self.boot_at
             shutdown = prev.get("shutdown") or "abrupt"
             cycle = self._planned_cycle(prev["prev_boot"]) if prev.get("prev_boot") else None
+            # Decided once per reboot: a planned one is told as planned, never as abrupt or unstable.
+            how = "planned" if cycle else shutdown
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
-                    "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"]} if cycle else None,
+                    "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"],
+                                "by": cycle.get("planner") or ""} if cycle else None,
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
                     "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
                               "usd": round(float(r["cost_usd"] or 0), 2)} for r in lost]}
             # A record, not news: the coordinator sees it in its digest, not as a new event.
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                  (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
-                  f"the host rebooted ({shutdown}); {len(lost)} run(s) cut short", json.dumps(data), "record"))
+                  f"the host rebooted ({how}); {len(lost)} run(s) cut short", json.dumps(data), "record"))
             if not lost:
                 return
             boots = db.boots(now - 86400)
-            # Only abrupt reboots say the host is unstable: an orderly one was a shutdown or an update.
-            cut = sum(1 for b in boots if b.get("lost") and b.get("shutdown") != "orderly")
-            severity, unstable = "normal", ""
-            if shutdown != "orderly" and cut >= 3 and now - float(db.kv("host_unstable_told") or 0) >= 86400:
+            # Only abrupt, unplanned reboots say the host is unstable: an orderly one was a shutdown or an
+            # update, a planned one was chosen.
+            cut = sum(1 for b in boots if unplanned_abrupt(b) and b.get("lost"))
+            severity, unstable = ("low" if cycle else "normal"), ""
+            if not cycle and shutdown != "orderly" and cut >= 3 \
+                    and now - float(db.kv("host_unstable_told") or 0) >= 86400:
                 db.set_kv("host_unstable_told", now)
                 severity = "high"
                 unstable = (f" The host looks unstable: {cut} abrupt reboots cut runs short in 24 h; check its "
                             f"power, cooling and system logs.")
             then = f" Held at its last heartbeat: {', '.join(held)}." if held else ""
             if cycle:
-                then += f" It was a planned host cycle: {data['planned']['reason'] or 'no reason recorded'}."
+                then += (f" It was a planned host cycle ({cycle.get('planner') or 'a host-cycle record'}): "
+                         f"{data['planned']['reason'] or 'no reason recorded'}.")
             parts = []
             for r in lost:
                 task = db.task(r["task"]) if r["task"] else None
@@ -1868,7 +1874,7 @@ class Daemon:
                              else f"run {r['id']} ({r['role']})")
             nth = ordinal(max(len(boots), 1))
             # Information, never a "needs you" alert: the lost runs are already requeued.
-            db.post("out", f"The host rebooted ({shutdown}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
+            db.post("out", f"The host rebooted ({how}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
                            f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
                     kind="info", severity=severity, ref=f"reboot:{self.boot}")
 
@@ -5816,16 +5822,38 @@ class Daemon:
         return True
 
     def _planned_cycle(self, boot: str) -> dict | None:
-        """The record of a planned host cycle that ended boot `boot`, if any (hostcycle.planned); read
-        once per boot."""
+        """The record of a planned host cycle that ended boot `boot`, if any: a host-cycle record
+        (hostcycle.planned), or, for the boot just before this one, a power-cycle intent for this host
+        in the machine change ledger (_ledger_cycle). {reason, path, planner (what planned it)}; read once
+        per boot."""
         from . import hostcycle
         if boot not in self._cycles:
             try:
-                self._cycles[boot] = hostcycle.planned(self.p, boot, self.boot_at)
+                rec = hostcycle.planned(self.p, boot, self.boot_at)
+                self._cycles[boot] = {**rec, "planner": f"host-cycle record {rec.get('id') or Path(rec['path']).parent.name}"
+                                                       + (f" by {rec['by']}" if rec.get("by") else "")} if rec \
+                    else self._ledger_cycle(boot)
             except Exception:
                 log(self.p, "host-cycle records: " + traceback.format_exc().replace("\n", " | ")[:1000])
                 self._cycles[boot] = None
         return self._cycles[boot]
+
+    def _ledger_cycle(self, boot: str) -> dict | None:
+        """A power-cycle intent (`ttp machines change add <this host> --power-cycle-at <t>`) that explains
+        the reboot ending boot `boot`: only the boot just before this one, and only when this boot came
+        from POWER_CYCLE_LEAD_S before t up to hostcycle.WINDOW_S after it."""
+        from . import hostcycle
+        prev = self.p.db.kv("boot_prev") or {}
+        mine = machines.here()
+        if not (mine and self.boot_at and prev.get("prev_boot") == boot and self._this_boot(prev.get("boot"))):
+            return None
+        for c in reversed(machine_ledger.changes([mine[0]], open_only=False)):
+            at = c.get("at")
+            if c.get("kind") == machine_ledger.POWER_CYCLE and isinstance(at, (int, float)) \
+                    and -machine_ledger.POWER_CYCLE_LEAD_S <= self.boot_at - at <= hostcycle.WINDOW_S:
+                who = f"machine change #{c.get('id')}" + (f" by {c['by']}" if c.get("by") else "")
+                return {"reason": str(c.get("what") or ""), "path": who, "planner": who}
+        return None
 
     def _job_cut_by_reboot(self, tid: int) -> bool:
         """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
