@@ -62724,3 +62724,24 @@ def test_watcher_distinct_episodes_of_one_key_count_as_churn(env, monkeypatch):
     # Each superseded issue and its successor count once; the supersede itself adds no reopen.
     assert [r["cleared_why"] for r in p.db.q("SELECT cleared_why FROM issues ORDER BY id")][:3] == \
         ["superseded by a new episode"] * 3
+
+
+def test_ttp_checks_pass_stdout_names_checks_log(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p = make(env)
+    repo, run = tmp_path / "work", tmp_path / "run"
+    run.mkdir()
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    cli.main(["checks", "--", "test -f a.txt"])
+    assert f"(full output: {run / 'checks.log'})" in capsys.readouterr().out
+    cli.main(["checks", "--", "test -f a.txt"])
+    out = capsys.readouterr().out
+    assert "(recorded)" in out and f"(full output: {run / 'checks.log'})" in out

@@ -1845,7 +1845,7 @@ def cmd_checks(a) -> None:
         elif hit:
             when = timefmt.long(float(hit.get("ts") or 0), p)
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
-                    f"at {when} (recorded); --fresh runs them again")
+                    f"at {when} (recorded); --fresh runs them again (full output: {log})")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -1934,7 +1934,7 @@ def cmd_checks(a) -> None:
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
-             if purpose == "harness" else "recorded for the draft PR"))
+             if purpose == "harness" else "recorded for the draft PR") + f" (full output: {log})")
 
 
 HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
