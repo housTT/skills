@@ -2947,11 +2947,11 @@ _EXCEPTION_REF_RE = re.compile(r"\b(?:exceptions?|temporary|dated|one-time|expir
 _NO_LOOSEN_RE = re.compile(r"\b(?:loosens?|lifts?|relax(?:es)?|weakens?)\s+no\s+(?:\w+\s+)?restrictions?\b|"
                            r"\bdo(?:es)?\s+not\s+(?:loosen|lift|relax|weaken)\s+(?:any|a|the)\s+(?:\w+\s+)?"
                            r"restrictions?\b|\bloosens?\s+nothing\b", re.I)
-# Actions, by what they do. A generic verb ("touch", "modify", "use") covers every action (_ANY); a
-# write covers every action that changes something (_WRITES); two specific ones conflict only when
-# they are the same.
-_ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"any"}, "modifi": {"any"}, "edit": {"write"},
-            "touch": {"any"}, "alter": {"any"}, "disturb": {"any"}, "use": {"any"}, "using": {"any"},
+# Actions, by what they do. A generic verb ("touch", "use") covers every action (_ANY); a write
+# ("edit", "modify") covers every action that changes something (_WRITES), not running or opening
+# one; two specific ones conflict only when they are the same.
+_ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "modifi": {"write"}, "edit": {"write"},
+            "touch": {"any"}, "alter": {"write"}, "disturb": {"any"}, "use": {"any"}, "using": {"any"},
             "used": {"any"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
             "merg": {"merge"}, "delet": {"delete"}, "remov": {"delete"},
             "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "publish": {"deploy"},
@@ -2959,7 +2959,7 @@ _ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"any"}, "modifi
             "submit": {"run"}, "restart": {"stop"}, "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"},
             "stop": {"stop"}}
 _ANY = "any"
-_WRITES = {"write", "push", "merge", "delete"}
+_WRITES = {"write", "push", "merge", "delete", "install", "deploy"}
 # Words that are no target: rule, stance, actor and filler words, and verbs that let someone act.
 _NOT_TARGET = {x for w in _RULE_STOP | {
     "the", "and", "for", "nor", "not", "may", "can", "its", "own", "are", "was", "has", "had", "all", "but", "any",
@@ -2968,7 +2968,8 @@ _NOT_TARGET = {x for w in _RULE_STOP | {
     "nobody", "none", "anyone", "everyone", "someone", "worker", "agent", "task", "user", "owner", "maintainer",
     "human", "admin", "operator", "coordinator", "reviewer", "let", "tell", "ask", "make", "get", "enable",
     "instruct", "change", "work", "thing", "anything", "something", "everything", "explicit", "word", "directly",
-    "ever", "pull", "request", "prs", "new", "same", "many", "few"} for x in (w, _stem(w))}
+    "ever", "pull", "request", "prs", "new", "same", "many", "few", "another", "plus", "name", "named", "msg",
+    "message", "once"} for x in (w, _stem(w))}
 # Kinds of target: "the main branch" and "the release branch" share only a kind, which is no overlap.
 _KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "directory", "file", "path", "box",
                              "machine", "node", "host", "server", "service", "project")}
@@ -3011,19 +3012,24 @@ def _on_object(ao: set[str], bo: set[str]) -> bool:
 
 
 def _overlaps(a: str, b: str, strict: bool = False) -> bool:
-    """Whether two rules are about the same thing. For the guard (wide, a false hit costs one
-    resend): they name the same action (_same_action) whatever its objects or conditions, or share
-    an object word whatever their actions; sharing only a kind of target ("branch") counts only when
-    one of them names nothing else ("Deploying to box A" twice). For the lint (`strict`, a pair stays
-    in the digest until settled by key): they name the same action (_same_action), and they share an
-    object word the same way, or one names no object outside its conditions (a rule on the action
-    alone, "Pushing is fine once CI passes", covers every object)."""
-    aa, ao = _target(a, conditions=not strict)
-    ba, bo = _target(b, conditions=not strict)
+    """Whether two rules are about the same thing: the same action or object, never generic words
+    alone. Words of a condition clause name no object ("once CI passes" says when, not what to).
+    For the guard: they share an object word (_on_object) and name no two different actions
+    (one names none, or _same_action), or they name the same specific action (a generic verb such as
+    "use" names none) and one names no object. "Skill names must start with tt-" shares "tt-" words
+    with "Never force-push to the tt-project branch", but starting is not pushing; "Never push to
+    main" and "Pushing to the release branch is fine" push to different objects. For the lint
+    (`strict`, a pair stays in the digest until settled by key): they name the same action
+    (_same_action), and they share an object word the same way, or one names no object (a rule on
+    the action alone, "Pushing is fine once CI passes", covers every object)."""
+    aa, ao = _target(a, conditions=False)
+    ba, bo = _target(b, conditions=False)
     on_object = _on_object(ao, bo)
     if strict:
         return _same_action(aa, ba) and (not ao or not bo or on_object)
-    return _same_action(aa, ba) or on_object
+    named = aa & ba - {_ANY} or "write" in aa and ba & _WRITES or "write" in ba and aa & _WRITES
+    return (on_object and (not aa or not ba or _same_action(aa, ba))
+            or bool(named) and not (ao and bo))
 
 
 def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
@@ -3124,14 +3130,14 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
 
 def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
                       lifts_only: bool = False, strict: bool = False) -> list[tuple[str, str]]:
-    """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals
-    or Policies is about, as (item, its section): every item one of its sentences overlaps
+    """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals,
+    Policies or Resources is about, as (item, its section): every item one of its sentences overlaps
     (_overlaps), whatever either one says about it (a lift, a new ban, a condition, a scope). An item
     the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out. A
     false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
     workers obey it. `lifts_only`: only sentences that may permit or loosen something (_may_lift),
     and only items they may lift (_lifts_item; `strict`: the same action on the same object)."""
-    if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
+    if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic", "resource")):
         return []
     new, gone = _sentences(text.splitlines()), _loose(quote)
     if lifts_only:
@@ -3155,19 +3161,11 @@ def _may_lift(sentence: str) -> bool:
 
 def _lifts_item(item: str, sentence: str, strict: bool = False) -> bool:
     """Whether a sentence that may lift something (_may_lift) is about what a Restrictions item bans:
-    the item bans (_BAN_RE) and the sentence names the item's action or one of its objects (`strict`:
-    the same action on the same object, _overlaps, as for text that says it loosens no restriction).
-    A generic verb ("use", "modify", "touch") names no action here: it would match every ban, so a
-    goal saying "any view set may be reordered and cached results used" would lift "Code lands on
-    the work branch". It counts only with a shared object."""
-    if not _BAN_RE.search(item):
-        return False
-    if strict:
-        return _overlaps(item, sentence, strict=True)
-    ia, io = _target(item)
-    sa, so = _target(sentence)
-    named = ia & sa - {_ANY} or "write" in ia and sa & _WRITES or "write" in sa and ia & _WRITES
-    return bool(named) or _on_object(io, so)
+    the item bans (_BAN_RE) and the two are about the same action or object (_overlaps; `strict`: the
+    same action on the same object, as for text that says it loosens no restriction). A generic verb
+    ("use", "touch") names no action there: it would match every ban, so a goal saying "any view set
+    may be reordered and cached results used" would lift "Code lands on the work branch"."""
+    return bool(_BAN_RE.search(item)) and _overlaps(item, sentence, strict=strict)
 
 
 def _companion_clause(quote: str, text: str) -> str:
@@ -3768,12 +3766,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 6
+CHARTER_GUARD_VERSION = 7
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (6, "cbd069b1d38337ca89b078c15c43a0db516fae20b2686f983075c00987fb112d")
+CHARTER_GUARD_PIN = (7, "a6e70075e1a5240912b22ed3c48040983c598a30f465f9ab3866cc12af559423")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

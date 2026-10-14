@@ -6543,7 +6543,7 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
                               "## Policies\n- Push daily.\n- Review first, then push.\n- Draft PRs.\n\n"
                               "Notify only for decisions. Label every number.\n\n"
-                              "## Restrictions\nNever touch box A.\nNever merge.\n\n## Goals\nShip v1.\n")
+                              "## Restrictions\nNever push.\nNever merge.\n\n## Goals\nShip v1.\n")
     hist = p.harness / coord.CHARTER_HISTORY
     act = {"type": "charter_update", "section": "Policies", "quote": "Review first,\n  then push."}
     for _ in range(2):   # line breaks in the quote count as spaces; a retried turn removes it once
@@ -6555,8 +6555,9 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     # One sentence inside a paragraph goes and the paragraph stays whole.
     assert coord.apply(p, [{**act, "quote": "Notify only for decisions."}], turn=2) == []
     assert "\n\nLabel every number.\n\n## Restrictions" in p.charter_path.read_text()
-    # Replace in place (guarded like an append: pushing is about what "Never touch box A." bans).
-    assert "contradicts the Restrictions item \"Never touch box A.\"" in coord.apply(
+    # Replace in place (guarded like an append: pushing weekly is about what "Never push." bans:
+    # the same action, and that item names no object).
+    assert "contradicts the Restrictions item \"Never push.\"" in coord.apply(
         p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3)[0]
     act["both_hold"] = True
     assert coord.apply(p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3) == []
@@ -7257,8 +7258,8 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
 
 
 def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env):
-    """The guard (a false hit costs one `both_hold` resend) takes the same action whatever its
-    objects or conditions ("once CI passes" names no target) and a shared target whatever the verbs.
+    """The guard (a false hit costs one `both_hold` resend) takes the same action on a rule that names
+    no target ("once CI passes" names none) and a shared target unless they name two different verbs.
     A generic verb (touch, disturb, use, modify, alter) names no action of its own: with no shared
     target, permit words alone lift nothing and the text goes in on the user's word."""
     p = make(env)
@@ -7278,6 +7279,61 @@ def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env)
         p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
         assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                            turn=20 + k, user_turn=True) == [], (ban, text)
+
+
+# The 2026-10-13 refusals, names replaced: an exception added to a Policies or Resources item was
+# refused as contradicting every Restrictions item that shared a word with it ("names", "msg", a
+# branch named like the skills, a generic verb). An item contradicts another only when both are
+# about the same action or object.
+_REPLAY_RESTRICTIONS = (
+    "- Push only to branch team/acme-proj of org/skills, plus one tag, team/acme-proj-cut-1 on org/skills, at "
+    "the verified cut commit, pushed once (user msg #41). No other tags. Never push to main. Never open pull "
+    "requests (the user opens the PR).\n"
+    "- Keep content generic and safe to open-source: no hostnames, internal URLs, people's names, credentials "
+    "or setup-specific details.\n"
+    "- Project-b's acme-proj folder on this machine may be read, never modified. Never modify another "
+    "project's harness or state.\n"
+    "- Never force-push to team/acme-proj. Always fetch and rebase onto the latest tip immediately before "
+    "pushing; resolve conflicts keeping both sides' intents.\n"
+    "- Never disturb project-b's running jobs.\n"
+    "- The shared reports folder is read-only.\n")
+
+
+def test_guard_replays_the_exception_refusals_and_still_refuses_a_real_contradiction(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    skill = "Skill names must start with acme- (acme-proj, acme-proj-harness)."
+    box = "Box machines: box-a, box-b, reached by ssh from box-a."
+    base = (f"# demo\n\n## Restrictions\n{_REPLAY_RESTRICTIONS}\n## Policies\n- {skill}\n\n"
+            f"## Resources\n- {box}\n")
+    replays = (("Policies", skill, "Skill names must start with acme- (acme-proj, acme-proj-harness), except "
+                                   "setup-box, which the user named acme-proj:setup-box (user msg #48, 2026-10-13)."),
+               ("Resources", box, "Box machines: box-a, box-b, reached by ssh from box-a, except that box-b may "
+                                  "also be used for nightly benchmark runs (user msg #49)."))
+    for k, (section, quote, text) in enumerate(replays):
+        for user_turn in (True, False):
+            p.charter_path.write_text(base)
+            assert coord._append_conflicts(base, section, text, quote) == [], (section, user_turn)
+            assert coord.apply(p, [{"type": "charter_update", "section": section, "quote": quote, "text": text}],
+                               turn=30 + 2 * k + user_turn, user_turn=user_turn) == [], (section, user_turn)
+            assert text in p.charter_path.read_text() and quote not in p.charter_path.read_text()
+    # True contradictions are still refused, naming only the items about the same action or object
+    # (an edit is a write, as a push is: the branch named like the folder shares both).
+    generic = ("Keep content generic", "Never modify another")
+    for k, (section, text, want, unrelated) in enumerate((
+            ("Policies", "Workers may push to main once CI passes.", "Never push to main.",
+             generic + ("Never disturb", "Never force-push", "Project-b's", "The shared")),
+            ("Resources", "Workers may write to the shared reports folder.", "The shared reports folder is read-only.",
+             generic + ("Never disturb", "Never force-push", "Project-b's", "Push only")),
+            ("Resources", "Project-b's acme-proj folder may be edited by workers.",
+             "Project-b's acme-proj folder on this machine may be read, never modified.", generic + ("The shared",)))):
+        p.charter_path.write_text(base)
+        err = coord.apply(p, [{"type": "charter_update", "section": section, "text": text}],
+                          turn=40 + k, user_turn=True)
+        assert len(err) == 1 and f"\"{want}\" (section 'Restrictions')" in err[0], (text, err)
+        named = err[0].split(" contradicts ", 1)[1].split("which would stay standing")[0]
+        assert not any(u in named for u in unrelated), (text, named)
+        assert text not in p.charter_path.read_text()
 
 
 def test_a_quote_edit_outside_a_user_turn_is_guarded_unless_it_is_refused_anyway(env):
