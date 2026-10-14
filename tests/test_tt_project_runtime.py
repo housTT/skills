@@ -33544,7 +33544,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
-    ("daemon.py", 'open(stacks, "a")'): "a log (thread stacks of an overrunning tick)",
+    ("daemon.py", 'open(self.p.state / STACKS_FILE, "a")'): "the stack-dump log when no dump is registered, a diagnostic",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("daemon.py", '"daemon.start"'): "names a process, which a reboot ends",
     ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
@@ -33583,7 +33583,7 @@ DURABLE_EXEMPT = {
     ("devq.py", 'open(lockf, "a")'): "a flock guard file, never written",
     ("devq.py", 'runner.lock", "a")'): "a flock guard file, never written",
     ("detach.py", '.lock", "a")'): "the queue folder's flock guard file, never written",
-    ("daemon.py", 'open(path, "w" if big else "a")'): "the faulthandler stack-dump log, a diagnostic; ttp.watchdog copies each dump to an incident file",
+    ("daemon.py", 'f = open(path, "a")'): "the faulthandler stack-dump log, a diagnostic; ttp.watchdog copies each dump to an incident file",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
@@ -57883,10 +57883,10 @@ def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(
         d.stopping = True
     daemon_log = (p.logs / "daemon.log").read_text()
     assert "tick overrun: running 0 min, in step step_that_blocks" in daemon_log
-    stacks = (p.logs / dm.TICK_STACKS).read_text()
+    stacks = (p.state / dm.STACKS_FILE).read_text()
     assert "in step step_that_blocks" in stacks and "step_that_blocks" in stacks.split("in step", 1)[1].split("\n", 1)[1]
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='tick-overrun'")
-    assert told and "in step step_that_blocks" in told["text"] and dm.TICK_STACKS in told["text"]
+    assert told and "in step step_that_blocks" in told["text"] and dm.STACKS_FILE in told["text"]
     # Once per tick: a later look at the same tick and a quick next tick add nothing.
     assert d.check_overrun(time.monotonic() + 3600) is None
     d._tick_began = d._moved = time.monotonic()
@@ -57908,7 +57908,7 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
 
     def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
         time.sleep(1.0)
-        stacks = p.logs / dm.TICK_STACKS
+        stacks = p.state / dm.STACKS_FILE
         seen["stacks"] = stacks.read_text() if stacks.exists() else ""
     d.lift_boot_pause = step_stuck_silently
     d._watch_ticks(every_s=0.05)
@@ -57925,6 +57925,32 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
     assert told and "without progress" in told["text"] and "step_stuck_silently" in told["text"]
 
 
+def test_both_signals_and_the_tick_overrun_dump_write_to_the_one_stacks_file(env):
+    import ttp.daemon as dm
+    p = make(env)
+    stacks = p.state / dm.STACKS_FILE
+    stacks.write_text("x" * (dm.STACKS_MAX_BYTES + 1))
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    f = dm.register_stack_dump(p.state)
+    assert f and stacks.with_name(stacks.name + ".1").stat().st_size > dm.STACKS_MAX_BYTES   # rotated
+    try:
+        for sig in (signal.SIGUSR1, signal.SIGUSR2):
+            os.kill(os.getpid(), sig)
+            time.sleep(0.2)
+        d._tick_began = d._moved = time.monotonic() - dm.TICK_OVERRUN_S - 1
+        o = d.check_overrun()
+        assert o and o["stacks"] == str(stacks)
+        f.flush()
+        text = stacks.read_text()
+        assert text.count("Current thread") == 3 and "tick stalled" in text
+        assert not (p.logs / "tick-stacks.log").exists()
+    finally:
+        import faulthandler
+        faulthandler.unregister(signal.SIGUSR1)
+        faulthandler.unregister(signal.SIGUSR2)
+
+
 def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)
@@ -57936,7 +57962,7 @@ def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
     monkeypatch.setattr(dm.time, "time", lambda: real() + 3 * 3600)   # the wall clock jumps; monotonic did not
     assert d.check_overrun() is None
     d._tick_ended()
-    assert not (p.logs / dm.TICK_STACKS).exists()
+    assert not (p.state / dm.STACKS_FILE).exists()
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='tick-overrun'")
 
 

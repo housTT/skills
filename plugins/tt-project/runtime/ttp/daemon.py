@@ -12,6 +12,7 @@ Invariants:
 """
 from __future__ import annotations
 
+import contextlib
 import faulthandler
 import hashlib
 import json
@@ -105,17 +106,17 @@ LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
-# A tick still running this long gets every thread's stack written to TICK_STACKS (faulthandler) and,
+# A tick still running this long gets every thread's stack written to STACKS_FILE (faulthandler) and,
 # once it ends, an alert: a slow step that keeps telling the watchdogs it moves is never restarted.
 TICK_OVERRUN_S = 900
 # A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
 # (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
 TICK_STALL_S = HEARTBEAT_STALE_S
-TICK_STACKS = "tick-stacks.log"   # under logs/; also written on SIGUSR2, where ptrace is not allowed
-TICK_STACKS_MAX = 2_000_000   # bytes before the file is rotated to <name>.1
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
-STACKS_FILE = "daemon-stacks.log"   # SIGUSR1 appends every thread's stack here (register_stack_dump)
-STACKS_MAX_BYTES = 1 << 20          # a longer one is started afresh when the daemon starts
+# Under state/: every thread's stack, on SIGUSR1 or SIGUSR2 (register_stack_dump) and on a tick overrun
+# or stall (check_overrun). ttp.watchdog copies each new dump to state/incidents/.
+STACKS_FILE = "daemon-stacks.log"
+STACKS_MAX_BYTES = 1 << 20          # a longer one is moved to <name>.1 when the daemon starts
 RESULT_FILE = "result.json"
 NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
 NOTIFIES_PER_RUN = 3
@@ -788,25 +789,13 @@ class Daemon:
                 pass
 
     def _stacks_file(self):
-        """logs/TICK_STACKS opened for appending, rotated once past TICK_STACKS_MAX."""
-        stacks = self.p.logs / TICK_STACKS
-        stacks.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if stacks.stat().st_size > TICK_STACKS_MAX:
-                stacks.replace(stacks.with_name(stacks.name + ".1"))
-        except OSError:
-            pass
-        return open(stacks, "a")
+        """The open STACKS_FILE (register_stack_dump), else state/STACKS_FILE opened for appending."""
+        if _STACK_FILE and not _STACK_FILE[0].closed:
+            return contextlib.nullcontext(_STACK_FILE[0])
+        return open(self.p.state / STACKS_FILE, "a")
 
     def _watch_ticks(self, every_s: float = 30) -> None:
-        """A thread that dumps every thread's stack when a tick overruns (check_overrun), and SIGUSR2
-        for a dump on demand: a py-spy or gdb attach needs ptrace, which hardened hosts refuse."""
-        try:
-            self._sig_stacks = self._stacks_file()   # kept open: faulthandler writes to its fd
-            faulthandler.register(signal.SIGUSR2, file=self._sig_stacks, all_threads=True)
-        except (OSError, RuntimeError, ValueError, AttributeError):
-            pass   # no SIGUSR2 (Windows) or no logs/: the overrun dump still works
-
+        """A thread that dumps every thread's stack when a tick overruns (check_overrun)."""
         def watch() -> None:
             while not self.stopping:
                 time.sleep(every_s)
@@ -819,7 +808,7 @@ class Daemon:
     def check_overrun(self, now: float | None = None) -> dict | None:
         """Once per tick that has run TICK_OVERRUN_S, and once per stall of TICK_STALL_S without progress
         (before the watchdogs restart it): log it with the step it is in, and append every thread's
-        stack to logs/TICK_STACKS. Monotonic time, which stands still while the host sleeps, so a
+        stack to state/STACKS_FILE. Monotonic time, which stands still while the host sleeps, so a
         sleep is no overrun. Runs on the watch thread (files only, never the database)."""
         now = time.monotonic() if now is None else now
         began, moved, o = self._tick_began, self._moved, self._overrun or {}
@@ -829,7 +818,7 @@ class Daemon:
         stalled = now - moved >= TICK_STALL_S and not (same and o.get("moved") == moved)
         if not stalled and (same or now - began < TICK_OVERRUN_S):
             return None
-        path, step, mins = self.p.logs / TICK_STACKS, self._step_name, int((now - began) // 60)
+        path, step, mins = self.p.state / STACKS_FILE, self._step_name, int((now - began) // 60)
         what = (f"tick stalled: no progress for {int((now - moved) // 60)} min, running {mins} min" if stalled
                 else f"tick overrun: running {mins} min")
         with self._stacks_file() as fh:
@@ -7996,16 +7985,23 @@ _STACK_FILE: list = []   # the one file faulthandler writes to, kept open while 
 
 
 def register_stack_dump(state: Path):
-    """SIGUSR1 makes this process append every thread's stack to state/STACKS_FILE (faulthandler: it
-    works while the main thread is stuck, with no py-spy). ttp.watchdog sends it to a hung daemon;
-    the systemd unit's WatchdogSignal too. Returns the open file, or None where it cannot."""
+    """SIGUSR1 or SIGUSR2 makes this process append every thread's stack to state/STACKS_FILE
+    (faulthandler: it works while the main thread is stuck, and needs no ptrace, which hardened hosts
+    refuse to py-spy or gdb). ttp.watchdog sends SIGUSR1 to a hung daemon, the systemd unit's
+    WatchdogSignal too; SIGUSR2 is for a dump by hand. A file past STACKS_MAX_BYTES is moved to
+    <name>.1 first. Returns the open file, or None where it cannot."""
     path = state / STACKS_FILE
     try:
-        big = path.exists() and path.stat().st_size > STACKS_MAX_BYTES
-        f = open(path, "w" if big else "a")
+        if path.exists() and path.stat().st_size > STACKS_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+        f = open(path, "a")
         faulthandler.register(signal.SIGUSR1, file=f, all_threads=True)
     except (OSError, ValueError, AttributeError, RuntimeError):
         return None
+    try:
+        faulthandler.register(signal.SIGUSR2, file=f, all_threads=True)
+    except (ValueError, AttributeError, RuntimeError):
+        pass
     for old in _STACK_FILE:
         old.close()
     _STACK_FILE[:] = [f]
