@@ -30,6 +30,9 @@ CORES_PER_SLOT = 16
 HELD_ENV = "TTP_CHECKS_SLOT"
 POLL_S = 5.0
 TELL_S = 300.0
+# A `ttp checks` in a tool call waits this long for a slot at most, then hands over to detached checks
+# (cli.cmd_checks): a full queue can take many minutes, longer than a tool call may block.
+FOREGROUND_WAIT_S = 60.0
 
 
 def slot_dir() -> Path:
@@ -129,11 +132,12 @@ class Slot:
 
 
 def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
-            waiting: Callable[[bool], None] | None = None) -> Slot:
+            waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting in arrival order while all are held. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
-    `waiting(False)` once it ends. A slot directory that cannot be written runs the checks uncapped:
-    the cap must never stop them."""
+    `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
+    it waited that long. A slot directory that cannot be written runs the checks uncapped: the cap
+    must never stop them."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -167,6 +171,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
+            if max_wait_s is not None and time.time() - started >= max_wait_s:
+                return None
             time.sleep(poll_s(POLL_S))
     finally:
         locks.dequeue(ticket)

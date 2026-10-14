@@ -1854,9 +1854,15 @@ def cmd_checks(a) -> None:
                     f"at {when} (recorded); --fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
+        # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
+        handover = bool(todo) and not hit and slot is None
+        if handover:
+            out.write(f"ttp checks: {CHECKS_HANDOVER}\n")
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
-        for c in [] if hit else todo:
+        for c in [] if hit or handover else todo:
             executed.append(c)
+            # A progress line per check: the commands' own output goes only to checks.log.
+            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}", flush=True)
             out.write(f"$ {c}\n")
             out.flush()
             check_start = out.tell()
@@ -1877,6 +1883,13 @@ def cmd_checks(a) -> None:
                 break
         if slot:
             slot.close()
+    if handover:
+        print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
+        try:
+            _checks_detach(a, Path(run_dir), p, top, head)
+        except OSError as e:
+            die(f"ttp checks: {e}")
+        sys.exit(75)
     env_problem, also, not_executed = None, False, []
     if not passed:
         # The applicable checks a failure or refusal left unrun stay listed as such, never as passed;
@@ -2051,6 +2064,8 @@ def _harness_purpose(a) -> dict:
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
 
 
+CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run in this call; started them "
+                   "detached instead (exit 75): hand off waiting with the retry_when below")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
@@ -2059,7 +2074,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
-    clock."""
+    clock, and it ends after checkcap.FOREGROUND_WAIT_S: None then means the caller hands over to
+    detached checks."""
     from . import checkcap, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -2086,7 +2102,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
-    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting)
+    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
+                            checkcap.FOREGROUND_WAIT_S if foreground else None)
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:

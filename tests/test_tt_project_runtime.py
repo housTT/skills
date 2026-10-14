@@ -37424,6 +37424,47 @@ def test_checks_host_cap_foreground_wait_does_not_count_toward_the_run(env, tmp_
     assert json.loads((run / "checks.json").read_text())["passed"] is True
 
 
+def test_checks_in_a_tool_call_hand_over_to_detached_checks_when_every_slot_stays_busy(env, tmp_path, monkeypatch,
+                                                                                      capsys):
+    # Every host-wide slot held for longer than a tool call may block (a queue of other projects'
+    # full suites): a foreground `ttp checks` waited for its turn with no end and timed out (rc 124).
+    # It now gives up after FOREGROUND_WAIT_S, starts the same checks detached, prints their
+    # retry_when and exits 75; the detached run waits for the slot and then passes.
+    import time
+    from ttp import checkcap, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / "data").mkdir()
+    for i in range(200):   # a data directory the commit adds: never walked, never the cause
+        (repo / "data" / f"{i}.bin").write_bytes(os.urandom(2048))
+    subprocess.run([*git, "add", "data"], check=True)
+    subprocess.run([*git, "commit", "-qm", "data"], check=True)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 1.0)
+    ran = tmp_path / "ran"
+    holder = _cap_holder("other project task #3 (run 9)")
+    try:
+        start = time.time()
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        assert e.value.code == 75 and time.time() - start < 20, "a full queue never blocks a tool call"
+        out = capsys.readouterr().out
+        assert "queued for a host-wide checks slot: 1 of 1 running" in out, "the wait is told at once"
+        assert cli.CHECKS_HANDOVER in out and f"checks --result {run}" in out
+        assert cli.CHECKS_HANDOVER in (run / "checks.log").read_text()
+        assert not (run / "checks.json").exists(), "nothing is recorded as passed or failed"
+        assert all(w["end"] for w in json.loads((run / locks.WAITS_FILE).read_text()).values())
+        assert not ran.exists()
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists()), "the detached checks wait their turn"
+        assert cli._checks_result(run) == 1
+    finally:
+        holder.kill()
+        holder.wait()
+    assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
+    assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.exists()
+    assert "ttp checks: running 1/1: sh -c" in (run / cli.CHECKS_OUT).read_text(), "each check is announced"
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+
+
 def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env, monkeypatch):
     import threading
     from ttp import checkcap
