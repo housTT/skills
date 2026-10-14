@@ -59011,6 +59011,25 @@ def test_goal_artifact_fresh_passes_fails_and_reports_could_not_run(env, tmp_pat
     assert gc.exit_code([ok]) == 0 and gc.exit_code([err]) == 75 and gc.exit_code([err, miss]) == 1
 
 
+def test_goal_artifact_fresh_skips_a_match_that_vanishes(env, tmp_path, monkeypatch):
+    from ttp import goalchecks as gc
+    (tmp_path / "a.bin").write_text("aa")
+    (tmp_path / "b.bin").write_text("bb")
+    real = os.stat
+
+    def flaky(p, *a, **k):
+        if str(p).endswith("a.bin"):
+            raise FileNotFoundError(p)
+        return real(p, *a, **k)
+    monkeypatch.setattr(gc.os, "stat", flaky)
+    [o] = gc.artifact_fresh(str(tmp_path / "*.bin"))
+    assert o["ok"] and o["path"].endswith("b.bin"), o
+    monkeypatch.setattr(gc.os.path, "isfile", lambda p: True)  # the glob still saw them
+    monkeypatch.setattr(gc.os, "stat", lambda p, *a, **k: (_ for _ in ()).throw(FileNotFoundError(p)))
+    [o] = gc.artifact_fresh(str(tmp_path / "*.bin"))
+    assert o["error"] is True and "vanished" in o["text"], o
+
+
 def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, monkeypatch):
     import http.server
     from ttp import goalchecks as gc, heal
@@ -59032,6 +59051,9 @@ def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, m
         [up] = gc.service_up(url=f"{base}/ok", body_contains="ready")
         assert up["ok"] and up["status"] == 200 and up["key"] == f"service_up:{base}/ok" and "error" not in up, up
         assert gc.service_up(url=f"{base}/down", expect=[503])[0]["ok"]
+        # a non-2xx status's body is read too
+        assert gc.service_up(url=f"{base}/down", expect=[503], body_contains="no")[0]["ok"]
+        assert not gc.service_up(url=f"{base}/down", expect=[503], body_contains="ready")[0]["ok"]
         for kwargs in ({"url": f"{base}/down"}, {"url": f"{base}/ok", "body_contains": "never"},
                        {"url": f"{base}/ok", "expect": [204]}):
             [down] = gc.service_up(**kwargs)
@@ -59043,6 +59065,10 @@ def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, m
     assert not gone["ok"] and "error" not in gone and "does not answer" in gone["text"], gone
     [bad] = gc.service_up(url="not a url")
     assert bad["error"] is True
+    page = tmp_path / "page.html"
+    page.write_text("x")
+    [local] = gc.service_up(url=page.as_uri())
+    assert local["error"] is True and local["ok"] is False and gc.exit_code([local]) == gc.UNKNOWN, local
     # the unit: systemctl's answer decides; systemctl itself failing is could-not-run
     shown = {}
 

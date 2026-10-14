@@ -29,6 +29,7 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 UNKNOWN = 75
@@ -134,8 +135,16 @@ def artifact_fresh(pattern: str, max_age_h: float | None = None, newer_than_comm
     paths = [p for p in glob.glob(os.path.expanduser(pattern), recursive=True) if os.path.isfile(p)]
     if not paths:
         return [observation("artifact_fresh", key, False, "missing")]
-    newest = max(paths, key=os.path.getmtime)
-    st = os.stat(newest)
+    stats = {}
+    for p in paths:
+        try:
+            stats[p] = os.stat(p)
+        except OSError:
+            pass  # vanished between the glob and the stat
+    if not stats:
+        return [observation("artifact_fresh", key, None, "every match vanished while being read")]
+    newest = max(stats, key=lambda p: stats[p].st_mtime)
+    st = stats[newest]
     fields = {"path": newest, "mtime": int(st.st_mtime), "bytes": st.st_size}
     if st.st_size < min_bytes:
         return [observation("artifact_fresh", key, False, f"{newest} has {st.st_size} bytes (need {min_bytes})",
@@ -164,6 +173,8 @@ def artifact_fresh(pattern: str, max_age_h: float | None = None, newer_than_comm
 
 def _http(url: str, expect: list[int] | None, body_contains: str | None, timeout_s: float) -> dict:
     key = f"service_up:{url}"
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        return observation("service_up", key, None, "bad URL: only http and https are checked", url=url)
     try:
         req = urllib.request.Request(url)
     except ValueError as e:
@@ -172,7 +183,11 @@ def _http(url: str, expect: list[int] | None, body_contains: str | None, timeout
         with urllib.request.urlopen(req, timeout=timeout_s) as r:
             code, body = r.status, r.read(65536)
     except urllib.error.HTTPError as e:
-        code, body = e.code, b""
+        code = e.code
+        try:
+            body = e.read(65536) or b""
+        except OSError:
+            body = b""
     except (urllib.error.URLError, OSError) as e:
         return observation("service_up", key, False, f"does not answer: {getattr(e, 'reason', e)}", url=url,
                            status=None)
