@@ -66,6 +66,7 @@ CLEARED_TEXT = {
     "push_queue_dying": "Push batches finish again.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
+    "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
     "deploy-behind": "The deploy to {arg} no longer fails: it runs the release, or its upgrade is owned and pending again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
@@ -183,6 +184,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
         return heal.holds(db, arg, now)
+    if kind == "heal-hold":   # an untenanted hold's page lasts until a check run no longer reports it
+        from . import heal
+        return heal.hold_paged(db, arg)
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
@@ -228,7 +232,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang")
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang")
 
 
 def _since(ep: dict) -> float:

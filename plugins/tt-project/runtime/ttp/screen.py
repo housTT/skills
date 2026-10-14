@@ -451,6 +451,10 @@ MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
 MUTE_BELOW = ("normal", "high", "critical")
 MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
 MUTE_ESCALATE_MIN_H = 0.5
+# A device hold never stays silent long: a mute whose match (or a condition it covers) names a hold asks
+# after at most this long, whatever escalate_after_h says (0 included). A hold with no tenant blocks work.
+MUTE_HOLD_ESCALATE_H = 6.0
+MUTE_HOLD_RE = re.compile(r"\b(hold|holds|held|holder|holding)\b", re.I)
 # A muted condition not seen for this long has cleared: its next sighting starts a new clock. The
 # fallback for runs that never settle (failed or killed ones, sources other than command watchers).
 MUTE_CLEAR_GAP_S = 3 * 3600
@@ -514,6 +518,9 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
             raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
         if esc is None:
             esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
+        held = holds_mute(match, old)
+        if held and not 0 < esc <= MUTE_HOLD_ESCALATE_H:
+            esc = MUTE_HOLD_ESCALATE_H
         probe = probe or (old or {}).get("end_when") or None
         if probe is None and h is None:
             raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H} or an `end_when` probe")
@@ -530,12 +537,32 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
              "since": since, "until": until, "capped": until >= cap,
              "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None,
              "escalate_after_h": esc, "armed_at": now, "conds": conds}
+        if held:
+            m["hold"] = True
         if probe:
             m["end_when"] = probe
             if old and old.get("end_when") == probe and old.get("probe_broken"):
                 m["probe_broken"] = old["probe_broken"]   # reported once per probe, not again on each extension
         db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
     return m
+
+
+def holds_mute(match: str, m: dict | None = None) -> bool:
+    """Whether a mute of `match` (or a condition mute `m` already covers) names a device hold."""
+    texts = [match] + [str(c.get("text") or "") for c in ((m or {}).get("conds") or {}).values()]
+    return any(MUTE_HOLD_RE.search(t) for t in texts)
+
+
+def hold_cap_note(m: dict, asked: Any) -> str:
+    """The ack of a hold mute whose escalate_after_h was capped (MUTE_HOLD_ESCALATE_H), else ''."""
+    try:
+        want = float(asked)
+    except (TypeError, ValueError):
+        want = None if asked in (None, "") else -1.0
+    if not m.get("hold") or want is None or want == float(m["escalate_after_h"]):
+        return ""
+    return (f"observation_mute {m['source']} {m['match']!r}: it covers a device hold, so it asks after "
+            f"{_h(float(m['escalate_after_h']) * 3600)} h, not {asked!r} (a hold is never muted longer)")
 
 
 def _same_mute(m: dict, source: str, match: str) -> bool:
@@ -590,7 +617,10 @@ def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = Fa
     conds = m.setdefault("conds", {})
     armed = float(m.get("armed_at") or m["since"])
     esc_h = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
+    named = bool(key and MUTE_HOLD_RE.search(key.replace("_", " ").replace("-", " ")))   # the watcher's own key
     for key, item, cleared in _mute_conditions(m, source, text, whole, key):
+        held = named or MUTE_HOLD_RE.search(item)
+        esc_c = MUTE_HOLD_ESCALATE_H if held and not 0 < esc_h <= MUTE_HOLD_ESCALATE_H else esc_h
         c = conds.get(key)
         if cleared:
             if c:
@@ -603,7 +633,7 @@ def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = Fa
         c.update(last_at=now, text=item[:160])
         conds[key] = c
         age = now - float(c["first_at"])
-        if esc_h > 0 and not c["escalated"] and age >= esc_h * 3600:
+        if esc_c > 0 and not c["escalated"] and age >= esc_c * 3600:
             c["escalated"] = True
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, m["source"], "observation", "high",
@@ -675,6 +705,22 @@ def end_mute(db: DB, source: str, match: str, probe: str, why: str, now: float |
             return None
         db.set_kv(MUTES_KEY, [x for x in active if x is not m])
         _ended(db, m, now, now, why, where)
+    return m
+
+
+def end_mute_by(db: DB, source: str, match: str, who: str, now: float | None = None,
+                where: Any = None) -> dict | None:
+    """End the active mute of `source` and `match` at someone's word (`ttp mute end`), recording `who`
+    ended it, and queue its one summary event; None when no such mute is active."""
+    now = time.time() if now is None else now
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        m = next((x for x in active if _same_mute(x, source, match) and float(x["until"]) > now), None)
+        if m is None:
+            return None
+        db.set_kv(MUTES_KEY, [x for x in active if x is not m])
+        m["ended_by"] = who
+        _ended(db, m, now, now, f"ended by {who}", where)
     return m
 
 

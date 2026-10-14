@@ -2873,6 +2873,30 @@ def cmd_schedules(a) -> None:
               f"{f' timeout {t}s' if t else ''}{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
 
 
+def cmd_mute(a) -> None:
+    """Observation mutes: `list` shows a project's active mutes; `end <source> <match>` ends one now, without
+    a coordinator turn, with its usual end summary and who ended it."""
+    from . import screen
+    p = need(a.project, sys.argv[1:])
+    own = os.environ.get("TTP_PROJECT")
+    if a.action == "end" and os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() != Path(p.base).resolve():
+        die(f"a run may end only its own project's mutes, not {a.project}'s")
+    if a.action == "list":
+        ms = screen.mutes(p.db)
+        if not ms:
+            print("no active mutes")
+        for m in ms:
+            print(screen.mute_line(m, where=p))
+        return
+    task = os.environ.get("TTP_TASK")
+    who = f"task #{task}" if os.environ.get("TTP_RUN_DIR") and task else "the user (ttp mute end)"
+    m = screen.end_mute_by(p.db, a.source, a.match, who, where=p)
+    if m is None:
+        live = "; ".join(f"{x['source']} {x['match']!r}" for x in screen.mutes(p.db)) or "none"
+        die(f"no active mute of {a.source} {a.match!r} (source and match as `ttp mute list` shows them; active: {live})")
+    print(f"ended the mute of {m['source']} {m['match']!r} ({m['count']} muted); the coordinator gets its summary")
+
+
 def cmd_heal(a) -> None:
     """Heal checks (command schedules with a `heal` block): `list` shows each with its state,
     `test <name>` runs its check once as a dry run (no fix, no state change)."""
@@ -4700,6 +4724,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("check", nargs="?", help="test: the heal check (its schedule's name)")
     s.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     s.set_defaults(fn=cmd_heal)
+
+    s = sub.add_parser("mute", help="a project's observation mutes: list them, or end one now (list/end)")
+    ms = s.add_subparsers(dest="action", required=True)
+    m = ms.add_parser("list", help="the project's active mutes")
+    m.add_argument("project")
+    m = ms.add_parser("end", help="end a mute now, without a coordinator turn; its end summary still comes")
+    m.add_argument("project")
+    m.add_argument("source", help="the mute's source as `ttp mute list` shows it (e.g. watcher:<name>)")
+    m.add_argument("match", help="the mute's match text (any case)")
+    s.set_defaults(fn=cmd_mute)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/status/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)
