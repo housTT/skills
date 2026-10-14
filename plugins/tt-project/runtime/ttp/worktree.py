@@ -852,8 +852,8 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
             if tracked:
                 patch = subprocess.run(["git", "-C", str(path), "diff", "HEAD", "--binary"], capture_output=True,
                                        timeout=300, check=True).stdout
-                (dest / "tracked.patch").write_bytes(patch)
-            (dest / "manifest.json").write_text(json.dumps(
+                durable_write(dest / "tracked.patch", patch)
+            durable_write(dest / "manifest.json", json.dumps(
                 {"path": str(path), "repo": str(w["repo"]), "task": w["task"], "branch": res["branch"], "head": head,
                  "tracked": tracked, "files": files, "bytes": size, "at": now}, indent=1))
     if not dry_run:
