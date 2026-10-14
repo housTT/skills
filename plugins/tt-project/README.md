@@ -567,13 +567,14 @@ prolonged whole-box outage.
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
   for `ttp checks`). A check that should only gate the push branch tests
   `[ "$TTP_PUSH_MODE" != target ] || ...`.
-- `ttp checks` runs share a host-wide cap, across every project on the machine: each takes one of
+- `ttp checks` runs, and the checks of `ttp push` and the push queue, share a host-wide cap, across
+  every project on the machine: each takes one of
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap
   waits its turn in arrival order. The wait shows in `ttp status`, the task's notes and the
   `--result` probe; it never fails the checks. Slots are OS file locks, so a crash or reboot frees
   them. The default is one slot per 16 cores (at least one); set it with
   `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
-  `ttp checks` run inside a check command does not wait for its parent's slot.
+  `ttp checks` or push inside a check command does not wait for its parent's slot.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.

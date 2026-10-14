@@ -3478,6 +3478,21 @@ def _pid_gone(pid: int) -> bool:
         return not state.strip() or state.strip().startswith("Z")
 
 
+
+def _load_scaled(seconds: float) -> float:
+    """A subprocess timeout for a loaded host: `seconds` times TTP_TEST_TIMEOUT_SCALE, else times the
+    one-minute load per core when that is over 1 (at most 8x). A busy host is slow, not broken."""
+    try:
+        factor = float(os.environ.get("TTP_TEST_TIMEOUT_SCALE") or 0)
+    except ValueError:
+        factor = 0
+    if factor <= 0:
+        try:
+            factor = os.getloadavg()[0] / (os.cpu_count() or 1)
+        except OSError:
+            factor = 1
+    return seconds * min(max(factor, 1.0), 8.0)
+
 def _wait_for(pred, timeout=30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -11702,7 +11717,7 @@ def _stale_runtime(tmp_path, preload=False):
 def test_setup_installs_its_own_runtime_not_the_one_on_pythonpath(env, tmp_path):
     from ttp import __version__
     r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin")],
-                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=60)
+                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=_load_scaled(60))
     assert r.returncode == 0, r.stderr
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
     assert f'__version__ = "{__version__}"' in (env["home"] / "lib" / "current" / "runtime" / "ttp" /
@@ -11735,13 +11750,13 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
 
     def setup():
         r = subprocess.run([*NO_SYNC, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=_load_scaled(60))
         assert r.returncode == 0, r.stderr
         return r.stdout, (env["home"] / "lib" / __version__ / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
 
     def version():
         return subprocess.run([str(tmp_path / "bin" / "ttp"), "--version"], capture_output=True, text=True,
-                              timeout=60).stdout.strip()
+                              timeout=_load_scaled(60)).stdout.strip()
 
     out, got = setup()                                   # not a git checkout: a content hash of runtime/
     assert re.fullmatch(r"sha-[0-9a-f]{12}", got) and f"ttp {__version__} ({got}) installed" in out
@@ -11769,7 +11784,7 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
 
     def setup(*extra):
         r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=_load_scaled(60))
         assert r.returncode == 0, r.stderr
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
@@ -11804,7 +11819,7 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
 
     def setup(*extra):
         return subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=_load_scaled(60))
     r = setup()
     assert r.returncode != 0 and f"ttp {_newer(__version__)} is installed" in r.stderr and "--force" in r.stderr
     assert (env["home"] / "lib" / "current").resolve() == newer.resolve() and not (tmp_path / "bin").exists()
@@ -11931,7 +11946,7 @@ def test_version_shows_the_source_commit(env, capsys):
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=_load_scaled(60))
     assert r.returncode != 0 and "harness copy" in r.stderr
     assert str(env["home"] / "lib" / "current" / "bin" / "ttp") in r.stderr   # names the ttp it would run
     assert not (env["home"] / "lib" / "current").exists()
@@ -11945,7 +11960,7 @@ def test_setup_and_upgrade_from_an_old_harness_copy_run_the_installed_ttp(env, t
     (p.harness / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "0.0.1"\n')
     (p.harness / "runtime" / "ttp" / "cli.py").write_text("def main():\n    print('stale runtime ran')\n")
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), cmd, "--help"],
-                       cwd=p.root, capture_output=True, text=True, timeout=60)
+                       cwd=p.root, capture_output=True, text=True, timeout=_load_scaled(60))
     assert r.returncode == 0, r.stderr
     assert "stale runtime ran" not in r.stdout and f"usage: ttp {cmd}" in r.stdout
 
@@ -43828,9 +43843,9 @@ def devq_dir(tmp_path):
                 os.killpg(pid, signal.SIGKILL)
 
 
-def _devq(*args, timeout=30):
+def _devq(*args, timeout=None):
     return subprocess.run([sys.executable, str(DEVQ), *[str(a) for a in args]], capture_output=True, text=True,
-                          timeout=timeout)
+                          timeout=timeout or _load_scaled(30))
 
 
 def _devq_submit(d, cfg, job, cmd, **spec):
@@ -43839,8 +43854,8 @@ def _devq_submit(d, cfg, job, cmd, **spec):
     return r
 
 
-def _devq_marker(d, job, timeout=20):
-    assert _wait_for_path(d / "done" / f"{job}.json", timeout), (d / "runner.log").read_text()
+def _devq_marker(d, job, timeout=None):
+    assert _wait_for_path(d / "done" / f"{job}.json", timeout or _load_scaled(20)), (d / "runner.log").read_text()
     return json.loads((d / "done" / f"{job}.json").read_text())
 
 
@@ -44328,7 +44343,7 @@ def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch
                              *(f"{__file__}::{name}" for name in names)],
                             cwd=pathlib.Path(__file__).resolve().parents[1],
                             env={**os.environ, **{k: str(scratch) for k in ("TMPDIR", "TMP", "TEMP")},
-                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=300)
+                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=_load_scaled(300))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
