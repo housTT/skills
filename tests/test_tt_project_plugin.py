@@ -1329,6 +1329,18 @@ def test_setup_box_bare_check_names_its_box_when_ssh_fails(tmp_path):
     assert "ssh reaches box-a" in netwait.confirm(probe, out, lambda h: True)   # up: a broken probe
 
 
+@pytest.mark.parametrize("rc,want", [(255, 255), (124, 1), (1, 1)])
+def test_setup_box_bare_check_only_ssh_own_255_is_unreachable(monkeypatch, rc, want):
+    """A timeout or a failed remote probe is a broken check (1), not an unreachable box (255)."""
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box
+    import box_bare
+    monkeypatch.setattr(box, "ssh_run", lambda *a, **k: subprocess.CompletedProcess([], rc, "", "boom"))
+    got, lines, _ = box_bare.check("box-a", None, None, "dev")
+    assert got == want and any("box-a failed" in ln for ln in lines)
+
+
 def test_setup_box_bare_check_missing_probe_is_a_problem(tmp_path):
     env, _ = _bare_env(tmp_path)
     (tmp_path / "bin" / "ttp").unlink()

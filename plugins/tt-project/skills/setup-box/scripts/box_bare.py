@@ -152,7 +152,10 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
         problems.append("lock: could not probe")
     lines.append(f"lock {resource}: {lock}" + (": wait for it, never override it" if lock == "busy or paused" else ""))
 
-    rc = 255 if not ssh_ok else 1 if problems else 75 if lock == "busy or paused" else 0
+    if not ssh_ok:
+        problems.append("ssh")
+    # Only ssh's own 255 means unreachable; a timeout or failed remote probe is a broken check.
+    rc = (255 if r.returncode == 255 else 1) if not ssh_ok else 1 if problems else 75 if lock == "busy or paused" else 0
     facts["rc"] = rc
     lines.append("verdict: " + {0: "ready", 1: "not ready: " + ", ".join(problems),
                                 75: "wait for the device lock", 255: "unreachable over ssh"}[rc])
