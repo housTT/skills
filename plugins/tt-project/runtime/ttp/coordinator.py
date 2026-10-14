@@ -292,11 +292,12 @@ EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_
 HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
-BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation")
+BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation", "upstream_note")
 
 
 def batchable(kind: str, severity: str) -> bool:
-    return kind in BATCH_KINDS and severity in ("low", "normal")
+    # An info observation (a mute that ended, a recovery) never needs a turn of its own either.
+    return kind in BATCH_KINDS and (severity in ("low", "normal") or (kind == "observation" and severity == "info"))
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "

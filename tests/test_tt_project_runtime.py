@@ -58212,3 +58212,43 @@ def test_daemon_clears_a_stale_harness_git_lock_and_logs_it(env):
     d.cfg, d._git_locks_at = p.config(), 0.0
     d.clear_git_locks()
     assert lock.exists()
+
+
+def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("budget.max_parallel_workers", 2)
+    d = Daemon(p.base)
+    d.gates = {}
+    now = time.time()
+    done = p.db.add_task("finished", "s", status="done")
+    ev = {"ts": now - 10, "kind": "task_done", "severity": "normal", "task": done}
+    assert d._batch_hold([ev], now), "a plain hand-off with idle slots and no queued work waits for batch_s"
+    assert not d._batch_hold([ev], now + 400), "batch_s still bounds the wait"
+    assert not d._batch_hold([dict(ev, severity="high")], now)
+    assert not d._batch_hold([dict(ev, task=None)], now)
+    # A proposed follow-up is work the turn could queue into the idle slot.
+    fid = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, f"task:{done}", "followup_proposed", "normal", "f", "queued", done))
+    assert not d._batch_hold([ev], now)
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (fid,))
+    assert d._batch_hold([ev], now)
+    # A live task depending on it, or a waiting parent, may need the turn now.
+    dep = p.db.add_task("next", "s", status="waiting")
+    p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([done]), dep))
+    assert not d._batch_hold([ev], now)
+    p.db.update_task(dep, status="done")
+    assert d._batch_hold([ev], now)
+    parent = p.db.add_task("parent", "s", status="waiting")
+    p.db.x("UPDATE tasks SET parent=? WHERE id=?", (parent, done))
+    assert not d._batch_hold([ev], now)
+    p.db.update_task(parent, status="done")
+    assert d._batch_hold([ev], now)
+    # Normal upstream notes and info observations batch; they do not take the idle-slot hold.
+    assert coord.batchable("upstream_note", "normal") and coord.batchable("observation", "info")
+    assert not coord.batchable("upstream_note", "high") and not coord.batchable("task_done", "info")
+    note = {"ts": now - 10, "kind": "upstream_note", "severity": "normal", "task": None}
+    assert not d._batch_hold([ev, note], now)

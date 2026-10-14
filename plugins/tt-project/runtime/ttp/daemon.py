@@ -3942,7 +3942,7 @@ class Daemon:
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id LIMIT 30")
-        queued = db.q("SELECT id, ts, kind, severity FROM events WHERE status='queued' ORDER BY id")
+        queued = db.q("SELECT id, ts, kind, severity, task FROM events WHERE status='queued' ORDER BY id")
         evs = queued[:int(c.get("max_events_per_turn", 40))]
         # Each continuation has its own coverage. Never combine sweep batches back into one turn.
         sweep_event = next((e["id"] for e in evs if e["kind"] == sweep.SWEEP_KIND), None)
@@ -4077,9 +4077,10 @@ class Daemon:
             db.set_kv(f"auth_probe:{provider}", now)
 
     def _batch_hold(self, evs: list[dict], now: float) -> bool:
-        """Routine events (a task done, its follow-ups and notes, normal observations) wait up to
-        coordinator.batch_s so one turn reads several, but only while no worker slot would sit idle
-        for it: every slot is busy, or runnable queued work is there to fill each free one."""
+        """Routine events (a task done, its follow-ups and notes, normal upstream notes, info to normal
+        observations) wait up to coordinator.batch_s so one turn reads several, but only while no worker
+        slot would sit idle for it: every slot is busy, runnable queued work is there to fill each free
+        one, or the batch is only plain hand-offs (_plain_done) that leave the turn nothing to queue."""
         batch = float(self.cfg["coordinator"].get("batch_s", 300))
         if batch <= 0 or not evs or now - min(e["ts"] for e in evs) >= batch:
             return False
@@ -4092,12 +4093,29 @@ class Daemon:
             int(self.cfg["budget"].get("max_parallel_workers", 6))
         if busy >= slots:
             return True   # no slot is free; nothing the turn queues could start before one is
+        if all(self._plain_done(e) for e in evs):
+            return True   # a plain hand-off leaves the turn nothing to queue: it waits for company
         paused = db.paused_resources()
         # A review held for the checks the daemon started on its head (_precheck_holds) fills no slot yet.
         runnable = sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
                        and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE))
                        and not self._precheck_holds(t, now))
         return busy + runnable >= slots
+
+    def _plain_done(self, e: dict) -> bool:
+        """A normal task_done with no follow-up proposed, no live task depending on it and no waiting
+        parent: nothing for a turn to decide, so it may wait for batch_s even while a slot is idle."""
+        if e["kind"] != "task_done" or e["severity"] != "normal" or not e.get("task"):
+            return False
+        db, tid = self.p.db, e["task"]
+        if db.one("SELECT 1 FROM events WHERE task=? AND kind='followup_proposed' AND status='queued'", (tid,)):
+            return False
+        task = db.task(tid)
+        if task and task.get("parent") and (db.task(task["parent"]) or {}).get("status") == "waiting":
+            return False
+        live = db.q("SELECT * FROM tasks WHERE status NOT IN (?,?,?) "
+                    "AND depends_on NOT IN ('', '[]')", TERMINAL_TASK_STATES)
+        return not any(tid in dependency_ids(t) for t in live)
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
