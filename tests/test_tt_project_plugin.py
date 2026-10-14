@@ -1296,7 +1296,7 @@ def test_setup_box_bare_check_ready_box(tmp_path):
     (dict(broker=False, svc="inactive"), (), 0, "broker: none"),
     (dict(lock_rc=75), (), 75, "busy or paused: wait for it, never override it"),
     (dict(lock_rc=2), (), 1, "lock: could not probe"),
-    (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: failed (exit 255) connection refused"),
+    (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: connection to <box-alias> failed (exit 255) connection refused"),
     (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
     (dict(machines={}), (), 0, "not in `ttp machines list`"),
 ])
@@ -1304,6 +1304,24 @@ def test_setup_box_bare_check_problems(tmp_path, kw, args, rc, expect):
     env, _ = _bare_env(tmp_path, **kw)
     r = _bare_check(tmp_path, env, *args)
     assert r.returncode == rc and expect in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_bare_check_names_its_box_when_ssh_fails(tmp_path):
+    """As a retry_when, its 255 counts as unreachable only when the daemon cannot reach a host the
+    probe names: the failure line names the box even when ssh's own last line does not."""
+    import shlex
+    import subprocess
+    sys.path.insert(0, str(RUNTIME.parent))
+    from ttp import netwait
+    env, _ = _bare_env(tmp_path, ssh_down=True)
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"box-a": {"route": "bare"}}}), encoding="utf-8")
+    probe = shlex.join([sys.executable, str(BOX_PY), "--site", str(site), "bare", "check", "box-a"])
+    r = subprocess.run(probe, shell=True, capture_output=True, text=True, timeout=60, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 255 and netwait.hosts(probe, out) == ["box-a"], out
+    assert netwait.confirm(probe, out, lambda h: False) == ""   # the box is down: the task sleeps on
+    assert "ssh reaches box-a" in netwait.confirm(probe, out, lambda h: True)   # up: a broken probe
 
 
 def test_setup_box_bare_check_missing_probe_is_a_problem(tmp_path):

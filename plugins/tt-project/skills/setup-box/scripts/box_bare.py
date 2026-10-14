@@ -108,7 +108,8 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
     ssh_ok = r.returncode == 0
     if not ssh_ok:
         tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
-        lines.append(f"ssh: failed (exit {r.returncode}) {tail[0]}".rstrip())
+        # Names the box: as a retry_when, the daemon counts a 255 as unreachable only by checking it.
+        lines.append(f"ssh: connection to {alias} failed (exit {r.returncode}) {tail[0]}".rstrip())
     else:
         lines.append("ssh: ok")
         kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
