@@ -509,8 +509,8 @@ def system_prompt(p: Project, now: float | None = None) -> str:
 
 
 # Leads the prompt of a turn that continues the last turn's agent session (cachettl.pick_thread).
-THREAD_CONTINUED = ("This turn continues your earlier turns in this session: their actions were applied "
-                    "and their digests are out of date. Decide only on the digest below.")
+THREAD_CONTINUED = ("This turn continues your earlier turns in this session: their actions were applied, "
+                    "except any the digest below lists as rejected, and their digests are out of date. Decide only on the digest below.")
 
 
 def join_prompt(head: str, context: str) -> str:

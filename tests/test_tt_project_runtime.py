@@ -29189,6 +29189,7 @@ def test_codex_coordinator_turns_continue_the_warm_session_and_read_the_cache(en
         assert argv[-3:] == ["resume", first["session_id"], "-"], argv
         assert r["status"] == "ok" and r["session_id"] == first["session_id"] and thread["turn"] == k, thread
         assert prompt == coord.THREAD_CONTINUED + f"\n\nEVENTS {k}", "a continued turn is told its history is stale"
+        assert "except any the digest below lists as rejected" in coord.THREAD_CONTINUED, "rejected actions were not applied"
         assert any(a.startswith("developer_instructions=") for a in argv[:argv.index("resume")]), \
             "the same stable prefix goes with it"
         assert r["cache_read_tokens"] > 0 and r["cache_read_tokens"] >= r["input_tokens"], r
