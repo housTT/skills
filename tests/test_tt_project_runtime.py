@@ -165,6 +165,43 @@ def test_check_plan_cli_preserves_identity_exit(tmp_path, monkeypatch):
                   "--definition-path", "plan.json", "--purpose", "candidate"])
     assert e.value.code == 65
 
+
+def test_check_plan_at_head_takes_a_covered_change_and_its_digests_in_one_commit(tmp_path, monkeypatch, capsys):
+    import hashlib
+    from ttp import checkplan, cli
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    # One commit changes a covered input and refreshes its digest. The pinned definition needs a
+    # second commit to move the pin ("uncovered committed input"); a definition read at HEAD does not.
+    (repo / "control.sh").write_text("exit 0 # v2\n")
+    plan["coverage"]["paths"]["control.sh"] = hashlib.sha256(b"exit 0 # v2\n").hexdigest()
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", "-A")
+    git("commit", "-qm", "harness change with its digests")
+    capsys.readouterr()
+    assert checkplan.run(repo, definition, "plan.json", "harness") == 65
+    assert "uncovered committed input: control.sh" in capsys.readouterr().err
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    # A working copy of the definition still cannot change the commands: HEAD's commit is read.
+    (repo / "plan.json").write_text(json.dumps({**plan, "coverage": {**plan["coverage"], "commands": ["exit 9"]}}))
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    git("checkout", "-q", "plan.json")
+    # A covered change whose digest was not refreshed is still uncovered; the error names the new digest.
+    (repo / "control.sh").write_text("exit 0 # v3\n")
+    git("commit", "-qam", "digest not refreshed")
+    capsys.readouterr()
+    assert checkplan.run(repo, None, "plan.json", "harness") == 65
+    assert hashlib.sha256(b"exit 0 # v3\n").hexdigest() in capsys.readouterr().err
+    # Candidate identities are never read from the head they would admit.
+    assert checkplan.run(repo, None, "plan.json", "candidate") == 66
+    monkeypatch.chdir(repo)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["check-plan", "--definition-at-head", "--definition-path", "plan.json", "--purpose", "harness"])
+    assert e.value.code == 65
+    with pytest.raises(SystemExit) as e:   # one definition source, never both
+        cli.main(["check-plan", "--definition-at-head", "--definition-commit", definition,
+                  "--definition-path", "plan.json", "--purpose", "harness"])
+    assert e.value.code == 2
+
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 # `ttp setup` syncs every filesystem on the host (os.sync); on a busy machine that waits tens of seconds
@@ -57299,6 +57336,41 @@ def test_check_purpose_tag_is_validated_and_kept(tmp_path, monkeypatch):
         assert any("purpose harness check must be" in b for b in push.check_problems([{"run": cmd, "purpose": "harness"}])), cmd
     assert push.check_problems([{"run": HARNESS_PLAN.replace("--definition-commit ", "--definition-commit="),
                                  "purpose": "harness"}]) == []
+    at_head = HARNESS_PLAN.replace("--definition-commit " + "a" * 40, "--definition-at-head")
+    assert push.check_problems([{"run": at_head, "purpose": "harness"}]) == []
+    for cmd in (at_head + " --definition-commit " + "a" * 40, at_head.replace("-at-head", "-at-head=yes"),
+                at_head.replace(" --definition-path checks/harness.json", ""),
+                at_head.replace("--definition-at-head", "--definition-at-head --definition-at-head")):
+        assert any("purpose harness check must be" in b for b in push.check_problems([{"run": cmd, "purpose": "harness"}])), cmd
+
+
+def test_ttp_checks_tolerates_runtime_written_tracked_logs_the_repo_ignores(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    # A watcher's log committed before it was ignored, then appended to by the running watcher.
+    (repo / "logs").mkdir()
+    (repo / "logs" / "queue-wait.jsonl").write_text("{}\n")
+    (repo / ".gitignore").write_text("logs/*.jsonl\n")
+    subprocess.run([*git, "add", "-f", ".gitignore", "logs/queue-wait.jsonl"], check=True)
+    subprocess.run([*git, "commit", "-qm", "watcher log"], check=True)
+    with open(repo / "logs" / "queue-wait.jsonl", "a") as f:
+        f.write('{"wait": 1}\n')
+    count = tmp_path / "count"
+    cli.main(["checks", "--", "sh", "-c", f"echo x >> {count}"])
+    assert count.read_text() == "x\n"
+    assert "runtime-written changes to tracked files the repository ignores: logs/queue-wait.jsonl" in capsys.readouterr().out
+    # Any other change still blocks: an edit to a file not ignored, or a staged edit to an ignored one.
+    for staged, path in ((False, "a.txt"), (True, "logs/queue-wait.jsonl")):
+        subprocess.run([*git, "checkout", "-q", "--", "."], check=True)
+        with open(repo / path, "a") as f:
+            f.write("more\n")
+        if staged:
+            subprocess.run([*git, "add", "-f", path], check=True)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", "sh", "-c", f"echo x >> {count}"])
+        assert e.value.code and "commit first" in capsys.readouterr().err, path
+        subprocess.run([*git, "reset", "-q"], check=True)
+    assert count.read_text() == "x\n"
 
 
 def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_path, monkeypatch, capsys):

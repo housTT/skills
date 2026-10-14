@@ -118,10 +118,12 @@ def _check(c: Any) -> Check | None:
 
 def harness_plan_problem(cmd: str) -> str | None:
     """Why a `purpose: harness` check is not exactly `ttp check-plan --purpose harness
-    --definition-commit <full hex> --definition-path <repo path>`: its coverage must come from a
-    committed, reviewed definition, never from a selector that lists the harness head itself."""
+    (--definition-commit <full hex> | --definition-at-head) --definition-path <repo path>`: its
+    coverage must come from a committed definition (pinned, or HEAD's own), never from a selector
+    that lists the harness head itself."""
     want = (f"{cmd!r}: a purpose harness check must be `ttp check-plan --purpose harness "
-            "--definition-commit <full commit ID> --definition-path <repo path>`")
+            "--definition-commit <full commit ID> --definition-path <repo path>` (or --definition-at-head "
+            "in place of --definition-commit)")
     try:
         words = shlex.split(cmd)
     except ValueError:
@@ -132,15 +134,21 @@ def harness_plan_problem(cmd: str) -> str | None:
     rest = words[2:]
     while rest:
         flag, eq, value = rest.pop(0).partition("=")
-        if not eq:
+        if flag == "--definition-at-head":
+            if eq:
+                return want
+        elif not eq:
             if not rest:
                 return want
             value = rest.pop(0)
-        if flag not in ("--purpose", "--definition-commit", "--definition-path") or flag in opts:
+        if flag not in ("--purpose", "--definition-commit", "--definition-at-head",
+                        "--definition-path") or flag in opts:
             return want
         opts[flag] = value
-    if (opts.get("--purpose") != "harness" or len(opts) != 3
-            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", opts["--definition-commit"])
+    pinned = opts.get("--definition-commit")
+    if (opts.get("--purpose") != "harness" or len(opts) != 3 or "--definition-path" not in opts
+            or not ("--definition-at-head" in opts
+                    or pinned and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pinned))
             or not _inside(opts["--definition-path"])):
         return want
     return None

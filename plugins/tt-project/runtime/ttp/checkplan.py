@@ -71,8 +71,8 @@ def _scope(scope) -> dict:
 def _verify(repo: Path, head: str, scope: dict) -> None:
     for path, expected in scope["paths"].items():
         blob = _blob(repo, head, path)
-        if hashlib.sha256(blob).hexdigest() != expected:
-            raise PlanError(IDENTITY_ERROR, f"uncovered committed input: {path}")
+        if (digest := hashlib.sha256(blob).hexdigest()) != expected:
+            raise PlanError(IDENTITY_ERROR, f"uncovered committed input: {path} (sha256 at HEAD: {digest})")
         file = repo / path
         try:
             if not file.resolve().is_relative_to(repo.resolve()) or file.is_symlink():
@@ -83,18 +83,27 @@ def _verify(repo: Path, head: str, scope: dict) -> None:
             raise PlanError(INPUT_ERROR, f"missing or unreadable working input: {path}") from e
 
 
-def run(repo: Path, definition_commit: str, definition_path: str, purpose: str) -> int:
+def run(repo: Path, definition_commit: str | None, definition_path: str, purpose: str) -> int:
     """No skips or pass cache. Exit 65 identity/coverage, 66 input/definition, 20 git;
-    selected commands retain their exit code. Purpose is explicit, never inferred from HEAD."""
+    selected commands retain their exit code. Purpose is explicit, never inferred from HEAD.
+    A `None` definition commit reads a harness definition from HEAD's own commit (never the working
+    copy), so a change to covered inputs and its refreshed digests land in one commit, with no
+    second commit to move a pin."""
     try:
-        if not _OID.fullmatch(definition_commit) or not _path(definition_path):
+        at_head = definition_commit is None
+        if at_head and purpose != "harness":
+            raise PlanError(INPUT_ERROR, "only a harness definition can be read at HEAD; candidate "
+                            "identities need a pinned definition commit")
+        if not (at_head or _OID.fullmatch(definition_commit)) or not _path(definition_path):
             raise PlanError(INPUT_ERROR, "definition needs a full commit ID and exact repository path")
         # Paths are repository-relative: run from the top level even when started in a subdirectory.
         repo = Path(_read_git(repo, "rev-parse", "--show-toplevel").decode().strip())
+        head = _read_git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+        if at_head:
+            definition_commit = head
         resolved = _read_git(repo, "rev-parse", "--verify", f"{definition_commit}^{{commit}}").decode().strip()
         if resolved != definition_commit:
             raise PlanError(IDENTITY_ERROR, "definition commit did not resolve exactly")
-        head = _read_git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
         try:
             plan = json.loads(_blob(repo, definition_commit, definition_path))
         except (ValueError, UnicodeError) as e:
@@ -118,7 +127,8 @@ def run(repo: Path, definition_commit: str, definition_path: str, purpose: str) 
                 raise PlanError(INPUT_ERROR, "harness definition needs coverage")
             scope = _scope(plan["coverage"])
         _verify(repo, head, scope)
-        print(f"check-plan: {purpose} on {head}; definition {definition_commit}:{definition_path}", flush=True)
+        print(f"check-plan: {purpose} on {head}; definition {definition_commit}:{definition_path}"
+              + (" (at HEAD)" if at_head else ""), flush=True)
         for command in scope["commands"]:
             print(f"$ {command}", flush=True)
             rc = subprocess.run(push.check_argv(command, repo), cwd=repo).returncode
@@ -134,4 +144,5 @@ def run(repo: Path, definition_commit: str, definition_path: str, purpose: str) 
 
 
 def command(args) -> None:
-    raise SystemExit(run(Path.cwd(), args.definition_commit, args.definition_path, args.purpose))
+    raise SystemExit(run(Path.cwd(), None if args.definition_at_head else args.definition_commit,
+                         args.definition_path, args.purpose))

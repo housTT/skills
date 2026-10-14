@@ -1603,7 +1603,7 @@ def cmd_checks(a) -> None:
         if not any(c.purpose == "harness" for c in own):
             die("ttp checks --purpose harness: delivery.push_checks has no purpose harness check, so nothing "
                 "qualifies this head; add a reviewed `ttp check-plan --purpose harness --definition-commit "
-                "<full commit ID> --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
+                "<full commit ID> (or --definition-at-head) --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
         not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
         own = [c for c in own if c.purpose != "candidate"]
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own)
@@ -1625,9 +1625,12 @@ def cmd_checks(a) -> None:
     if p:
         from . import worktree
         worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
-    if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
-                      text=True).stdout.strip():
+    dirty, runtime_written = _checks_dirty(git)
+    if dirty:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
+    if runtime_written:
+        print("ttp checks: not counting runtime-written changes to tracked files the repository ignores: "
+              + ", ".join(runtime_written))
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     if a.detach:
         try:
@@ -1830,6 +1833,30 @@ def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
                         run=os.environ.get("TTP_RUN_ID") or "?")
     except Exception as e:
         print(f"ttp checks: could not record the verified-through marker: {e}", file=sys.stderr)
+
+
+def _checks_dirty(git: list[str]) -> tuple[bool, list[str]]:
+    """Whether the worktree has changes that block `ttp checks`, and the tracked files it tolerates:
+    unstaged edits to tracked files the repository's ignore rules match (a log a running watcher keeps
+    appending to), which no check is meant to read and which would otherwise force a fresh worktree
+    for every run. A staged edit, or any other change, still blocks."""
+    out = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--untracked-files=no"], capture_output=True,
+                         text=True)
+    if out.returncode:
+        return True, []
+    ignored = set(subprocess.run([*git, "ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
+                                 capture_output=True, text=True).stdout.split("\0")) - {""}
+    blocking, tolerated, items = False, [], iter(out.stdout.split("\0"))
+    for e in items:
+        if len(e) <= 3:
+            continue
+        if e[0] in "RC":
+            next(items, None)   # a rename's or copy's source follows its new path
+        if e[0] == " " and e[3:] in ignored:
+            tolerated.append(e[3:])
+        else:
+            blocking = True
+    return blocking, sorted(tolerated)
 
 
 def _harness_purpose(a) -> dict:
@@ -4715,7 +4742,11 @@ def main(argv: list[str] | None = None) -> None:
 
     from . import checkplan
     s = sub.add_parser("check-plan", help="run committed coverage independently of candidate publication identity")
-    s.add_argument("--definition-commit", required=True, help="full commit ID of the independently reviewed definition")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--definition-commit", help="full commit ID of the independently reviewed definition")
+    g.add_argument("--definition-at-head", action="store_true",
+                   help="harness only: read the definition from HEAD's commit, so covered inputs and their "
+                        "digests change in one commit")
     s.add_argument("--definition-path", required=True, help="exact repository path of its JSON file")
     s.add_argument("--purpose", required=True, choices=["harness", "candidate"])
     s.set_defaults(fn=checkplan.command)

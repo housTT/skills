@@ -630,6 +630,11 @@ prolonged whole-box outage.
   Prepare the inputs first, then commit the definition and have its purpose, coverage and commands
   independently reviewed; installation pins that definition commit. There is no self-referential
   requirement to include the definition's or a later selector-preparation commit's own SHA.
+  When a separate pinned review is more than a harness needs, `--definition-at-head` (purpose
+  harness only, in place of `--definition-commit`) reads the definition from HEAD's own commit, never
+  its working copy: a change to a covered input and its refreshed digest land in one commit, with no
+  second commit to move the pin, and the change's own review covers the definition. A covered input
+  whose digest was not refreshed still fails, and the error prints its digest at HEAD.
 
   A separate `--purpose candidate` definition keeps exact publication identities:
   `{"purpose":"candidate","candidates":{"<full-candidate-commit-id>":{"paths":{...},"commands":[...]}}}`.
@@ -648,6 +653,9 @@ prolonged whole-box outage.
   gate`, fails (exit 1) unless a harness entry ran or reused a recorded pass (one skipped by `if_exists`
   or `if_changed` does not count), and records a pass that never counts for a PR, an `on_pass` hand-off
   or `ttp push --own`, and opens no check gap. `ttp push` and the push queue run every entry.
+- `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
+  repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
+  forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
