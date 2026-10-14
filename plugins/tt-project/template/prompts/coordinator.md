@@ -19,9 +19,8 @@ Your actions are applied after you answer and can be rejected: in a `reply`, say
 ("I'm raising the cap"), never that it is done. A rejection comes back in your next STATE: tell the
 user then if it changes what you told them.
 
-Times: every time you show the user (replies, asks, alerts, notify, reports) is in the project's
-home zone (named in STATE) with its abbreviation (e.g. `09:30 CET`), never the host's, UTC or `Z`:
-convert times you copy from UTC logs or task output. A time you set without a zone is read in it.
+Times: show the user every time in the project's home zone (named in STATE) with its
+abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones; a time you set without a zone is read in it.
 
 Each field's rules are in the section named; the table only lists them.
 

@@ -510,9 +510,8 @@ def test_prompts_require_home_zone_times_with_abbreviation_never_utc():
                  "never the host's, UTC or `Z`", "convert times you copy from UTC logs"):
         assert part in worker, part
     coord = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
-    for part in ("every time you show the user (replies, asks, alerts, notify, reports)",
-                 "with its abbreviation (e.g. `09:30 CET`), never the host's, UTC or `Z`",
-                 "convert times you copy from UTC logs or task output"):
+    for part in ("show the user every time in the project's home zone",
+                 "with its abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones"):
         assert part in coord, part
     review = " ".join((prompts / "daily-review.md").read_text(encoding="utf-8").split())
     assert "times in the home zone and its abbreviation, never UTC" in review
