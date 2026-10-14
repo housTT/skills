@@ -20,8 +20,9 @@ note per episode naming the reporting projects (for `down`, likely their own rou
 A condition no co-tenant reported for CONDITION_GONE_S, or reported cleared, is over. With no owner set nothing is routed: each co-tenant's digest names the gap once.
 
 Quiet outages (quiet_reason). Nobody is paged about a condition the harness already knows: a known outage
-recorded with `ttp machines outage <alias> "<why>" [--owner <who>] --expires <t>` (a hardware repair, often
-owned by a human or an external ticket), or an open change that expects the condition (`--expect down`).
+recorded with `ttp machines outage <alias> "<why>" [--owner <who>] [--covers <parts>] --expires <t>` (a
+hardware repair, often owned by a human or an external ticket; `covers`, optional, lists the parts it explains
+from OUTAGE_COVERS for co-tenant watchers, while the harness quiets the whole machine either way), or an open change that expects the condition (`--expect down`).
 The owner's first page still goes, but nothing escalates to the fallback or the user, while: the user paused
 a resource on the machine, a reporting heal check carries a `known_fault`, or no open task of any project on
 this machine uses it (a task's resource on it that its project paused does not count). A reporter this
@@ -82,6 +83,8 @@ PROBE_END_S = 7 * 86400      # an entry with only an until-probe is overdue afte
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
+# what a known outage explains (`ttp machines outage --covers`); none given: the whole machine
+OUTAGE_COVERS = ("host", "power", "network", "tray", "chip", "fabric")
 QUIET_KEPT_S = 2 * 86400     # a quiet outage's daily-review record is kept this long after it was last seen
 REVIEW_S = 86400             # the daily review lists the quiet outages seen within this
 GAP_KV = "machine_owner_gap_named"
@@ -331,9 +334,11 @@ def conditions() -> dict[str, dict]:
 
 # known outages ------------------------------------------------------------------------------------
 
-def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None) -> dict:
+def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None,
+               covers: Any = None) -> dict:
     """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
-    about it meanwhile. `owner`: who has the repair, often a human or an external ticket."""
+    about it meanwhile. `owner`: who has the repair, often a human or an external ticket. `covers`: the
+    parts it explains (OUTAGE_COVERS), stored for co-tenant watchers; none: the whole machine."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -342,13 +347,27 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
         raise ValueError("say why the machine is out")
     if not expires:
         raise ValueError("give an end: --expires <delay or time>")
+    parts = outage_covers(covers)
     rec = {"why": why, "owner": _one_line(owner, 120), "by": by, "since": now,
            "until": ends.parse_expires(expires, now)}
+    if parts:
+        rec["covers"] = parts
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
         doc.setdefault("outages", {})[alias] = rec
         _write(ROUTES, doc)
     return rec
+
+
+def outage_covers(covers: Any) -> list[str]:
+    """`covers` (a list, or comma-separated words) checked against OUTAGE_COVERS, in that order."""
+    if isinstance(covers, str):
+        covers = [covers]
+    words = {w.strip().lower() for c in (covers or []) for w in str(c).split(",") if w.strip()}
+    bad = sorted(words - set(OUTAGE_COVERS))
+    if bad:
+        raise ValueError(f"--covers takes {', '.join(OUTAGE_COVERS)}; not {', '.join(bad)}")
+    return [c for c in OUTAGE_COVERS if c in words]
 
 
 def clear_outage(alias: str) -> bool:
@@ -369,6 +388,7 @@ def outages(now: float | None = None, doc: dict | None = None) -> dict[str, dict
 
 def outage_line(alias: str, o: dict, where=None) -> str:
     owner = f"; owner: {o['owner']}" if o.get("owner") else ""
+    owner += f"; covers: {', '.join(o['covers'])}" if o.get("covers") else ""
     return f"{alias}: known outage until {ends.shown(o['until'], where)} (by {o.get('by') or '?'}{owner}): {o['why']}"
 
 

@@ -61170,6 +61170,38 @@ def test_an_outage_owned_by_a_person_or_ticket_pages_nobody(env, capsys):
     assert "owned by hardware ticket" in ml.review_lines(alpha)[0]
 
 
+def test_an_outage_says_what_it_covers_for_watchers(env, capsys):
+    """[note e98d24284dafd149] `--covers` stores the parts an outage explains, shown in the list, the
+    JSON and `ttp machines status`; a record without it stays valid and covers the whole machine."""
+    import json as _json
+    from ttp.cli import main
+    alpha, ml, able = _quiet_box(env)
+    with pytest.raises(SystemExit):
+        main(["machines", "outage", "box-a", "tray swap", "--covers", "tray,toaster", "--expires", "1d"])
+    assert "toaster" in capsys.readouterr().err and "box-a" not in ml.outages()
+    main(["machines", "outage", "box-a", "tray swap", "--covers", "Fabric, tray", "--covers", "tray",
+          "--expires", "1d"])
+    assert "covers: tray, fabric" in capsys.readouterr().out
+    assert ml.outages()["box-a"]["covers"] == ["tray", "fabric"]
+    main(["machines", "outage", "--json"])
+    got = _json.loads(capsys.readouterr().out)
+    assert got["box-a"]["covers"] == ["tray", "fabric"] and got["box-a"]["why"] == "tray swap"
+    main(["machines", "outage"])
+    assert "covers: tray, fabric" in capsys.readouterr().out
+    main(["machines", "status", "box-a", "--json"])
+    assert _json.loads(capsys.readouterr().out)[0]["outage"]["covers"] == ["tray", "fabric"]
+    main(["machines", "status", "box-a"])
+    assert "covers: tray, fabric" in capsys.readouterr().out
+    # Without --covers the record has no field, reads and quiets as before.
+    main(["machines", "outage", "box-a", "fan repair", "--expires", "1d"])
+    assert "covers" not in capsys.readouterr().out and "covers" not in ml.outages()["box-a"]
+    main(["machines", "outage", "box-a", "--json"])
+    assert "covers" not in _json.loads(capsys.readouterr().out)["box-a"]
+    t0 = time.time()
+    ml.report("gamma", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == []
+
+
 def test_a_known_fault_or_an_expected_change_stops_the_escalation(env):
     alpha, ml, able = _quiet_box(env)
     t0 = time.time()

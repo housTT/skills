@@ -3552,6 +3552,9 @@ def _machine_outage(a) -> None:
         return
     if not a.why:
         got = ml.outages()
+        if a.json:
+            print(json.dumps({k: o for k, o in got.items() if not a.alias or k == a.alias}, indent=2, sort_keys=True))
+            return
         for alias, o in sorted(got.items()):
             if not a.alias or alias == a.alias:
                 print(ml.outage_line(alias, o))
@@ -3560,7 +3563,8 @@ def _machine_outage(a) -> None:
         return
     p = here()
     try:
-        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "")
+        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "",
+                            covers=a.covers)
     except ValueError as e:
         die(str(e))
     print(ml.outage_line(a.alias, rec))
@@ -5511,6 +5515,10 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--owner", help="who has the repair: a person's role or a ticket, not a project")
     m.add_argument("--expires", help="when it ends: a delay (3d) or a time (required to record one)")
     m.add_argument("--by", help="the project recording it (default: the project you are in)")
+    m.add_argument("--covers", action="append",
+                   help="what it explains, comma-separated: host, power, network, tray, chip, fabric "
+                        "(none: the whole machine); co-tenant watchers read it from --json")
+    m.add_argument("--json", action="store_true", help="list the known outages as JSON")
     m.add_argument("--clear", action="store_true", help="the outage is over")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
     cs = m.add_subparsers(dest="change", required=True)
