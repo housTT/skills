@@ -927,7 +927,9 @@ def status_text(p: Project) -> str:
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
-    from . import locks, shared
+    from . import checkcap, locks, shared
+    if host := checkcap.line():
+        lines.append(host)
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res, p)
         lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
@@ -1568,7 +1570,7 @@ def cmd_checks(a) -> None:
     project checks plus the commands after `--`, lists candidate-tagged ones as not run, and fails
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkdirs, prguard, push
+    from . import checkcap, checkdirs, prguard, push
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -1672,6 +1674,8 @@ def cmd_checks(a) -> None:
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again")
             out.write(f"{said}\n")
+        slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
+        child_env = {"PWD": top, **({checkcap.HELD_ENV: "1"} if slot else {})}
         for c in [] if hit else todo:
             out.write(f"$ {c}\n")
             out.flush()
@@ -1680,7 +1684,7 @@ def cmd_checks(a) -> None:
             group = bool(getattr(a, "own_group", False))
             proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
                                     start_new_session=group, env={**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
-                                         "PWD": top},
+                                         **child_env},
                                     pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             try:
                 rc = proc.wait()
@@ -1691,6 +1695,8 @@ def cmd_checks(a) -> None:
             if rc != 0:
                 passed, failed = False, c
                 break
+        if slot:
+            slot.close()
     env_problem, also = None, False
     if not passed:
         with open(log, "rb") as f:   # this call's part of the log
@@ -1754,6 +1760,44 @@ def _harness_purpose(a) -> dict:
     """What a detached or relaunched `ttp checks` keeps of `--purpose`: only harness, so a restart
     after a reboot qualifies the head for the same purpose."""
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
+
+
+CHECKS_QUEUED = "checks.queued"   # in the run's directory while its checks wait for a host-wide slot
+
+
+def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False):
+    """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
+    (progress.md) and CHECKS_QUEUED, which the `--result` probe and `ttp status` read. In the
+    foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
+    clock."""
+    from . import checkcap, locks as lk
+    task, run = os.environ.get("TTP_TASK") or "?", os.environ.get("TTP_RUN_ID") or "?"
+    who = f"{p.name if p else 'no project'} task #{task} (run {run})"
+    foreground = not detached and not os.environ.get("TTP_DETACHED")
+    key = f"checks:{os.getpid()}:{time.time()}"
+
+    def tell(line: str) -> None:
+        out.write(f"ttp checks: {line}\n")
+        out.flush()
+        print(f"ttp checks: {line}", flush=True)
+        try:
+            durable_append(run_dir / "progress.md", f"{time.strftime('%H:%M:%S')} checks: {line}\n")
+        except OSError:
+            pass
+
+    def waiting(on: bool) -> None:
+        try:
+            if on:
+                write_json(run_dir / CHECKS_QUEUED, {"since": time.time(), "pid": os.getpid(), "head": head})
+            else:
+                (run_dir / CHECKS_QUEUED).unlink(missing_ok=True)
+        except OSError:
+            pass
+        if foreground:
+            lk.record_wait(run_dir, key, start, None if on else time.time())
+
+    start = time.time()
+    return checkcap.acquire(who, f"ttp checks on {head[:12]}", tell, waiting)
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
@@ -1906,6 +1950,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         env['TTP_RUN_DIR'] = str(run_dir)
         env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
+        (run_dir / CHECKS_QUEUED).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []),
@@ -2015,7 +2060,12 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     alive = _checks_alive(info)
     if not rc_file.exists() and alive:
-        print(f"ttp checks: running (pid {info['pid']})")
+        if (run_dir / CHECKS_QUEUED).exists():
+            from . import checkcap
+            print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "
+                  + (checkcap.line() or "they start once one is free"))
+        else:
+            print(f"ttp checks: running (pid {info['pid']})")
         return 1
     if rc_file.exists():
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")

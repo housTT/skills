@@ -343,7 +343,8 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
-                "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH"):
+                "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH",
+                "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX"):
         monkeypatch.delenv(var, raising=False)
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
@@ -34367,6 +34368,119 @@ def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkey
                 os.killpg(info["pid"], signal.SIGKILL)
             except OSError:
                 pass
+
+
+_CAP_HOLDER = ("import sys, time; sys.path.insert(0, sys.argv[1]); from ttp import checkcap; "
+               "s = checkcap.acquire(sys.argv[2]); print('held', flush=True); time.sleep(120)")
+
+
+def _cap_holder(label):
+    proc = subprocess.Popen([sys.executable, "-c", _CAP_HOLDER, str(RUNTIME), label], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+def test_checks_host_cap_default_follows_cores_and_the_account_setting_overrides_it(env, monkeypatch):
+    from ttp import checkcap, project
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    assert checkcap.limit() == 4
+    monkeypatch.setattr(checkcap, "cores", lambda: 8)
+    assert checkcap.limit() == 1, "a small host still runs one at a time"
+    project.set_account_setting("checks.host_max", 3)
+    assert checkcap.limit() == 3
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")
+    assert checkcap.limit() == 0
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "junk")
+    assert checkcap.limit() == 3, "an unreadable override falls back to the setting"
+
+
+def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    a, b = checkcap.acquire("a"), checkcap.acquire("b")
+    assert a.f and b.f
+    got, told, waits = [], [], []
+
+    def take(label):
+        s = checkcap.acquire(label, tell=told.append, waiting=waits.append)
+        got.append(label)
+        s.close()
+
+    first = threading.Thread(target=take, args=("c",))
+    first.start()
+    assert _wait_for(lambda: len(checkcap.state()["queued"]) == 1)
+    second = threading.Thread(target=take, args=("d",))
+    second.start()
+    assert _wait_for(lambda: len(checkcap.state()["queued"]) == 2)
+    time.sleep(0.3)
+    assert got == [], "nobody runs past the cap"
+    assert checkcap.state()["running"] == ["a", "b"]
+    assert "2 running (cap 2), 2 queued: c; d" in checkcap.line()
+    assert any("queued for a host-wide checks slot: 2 of 2 running" in t for t in told) and waits[0] is True
+    a.close()
+    first.join(10)
+    second.join(10)
+    assert got == ["c", "d"], "waiters are served in arrival order"
+    assert False in waits
+    b.close()
+    # Nested in a check command (its parent holds a slot): it never waits.
+    full = [checkcap.acquire("x"), checkcap.acquire("y")]
+    monkeypatch.setenv(checkcap.HELD_ENV, "1")
+    assert checkcap.acquire("nested").f is None
+    for s in full:
+        s.close()
+
+
+def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_dies(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TASK", "7")
+    holder = _cap_holder("other project task #3 (run 9)")
+    ran, seen = tmp_path / "ran", tmp_path / "seen"
+    try:
+        cli.main(["checks", "--detach", "--", "sh", "-c", f'echo "${checkcap.HELD_ENV}" > {seen}; touch {ran}'])
+        assert _wait_for(lambda: (run / cli.CHECKS_QUEUED).exists())
+        capsys.readouterr()
+        assert cli._checks_result(run) == 1, "a queued run is still waiting, not finished"
+        out = capsys.readouterr().out
+        assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
+        assert "queued for a host-wide checks slot" in (run / "progress.md").read_text()
+        assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p)
+        assert f"{p.name} task #7 (run 41)" in checkcap.line()
+        assert not ran.exists(), "nothing runs over the cap"
+    finally:
+        holder.kill()
+        holder.wait()
+    # The holder died without releasing anything: its slot is free with it.
+    assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
+    assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.exists()
+    assert seen.read_text().strip() == "1", "check commands know their run holds a slot"
+    assert not (run / cli.CHECKS_QUEUED).exists()
+    assert "slot taken after" in (run / "progress.md").read_text()
+    assert checkcap.line() == "", "the slot is released once the checks end"
+
+
+def test_checks_host_cap_foreground_wait_does_not_count_toward_the_run(env, tmp_path, monkeypatch, capsys):
+    import threading
+    from ttp import cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    holder = _cap_holder("other")
+    done = []
+    t = threading.Thread(target=lambda: done.append(cli.main(["checks", "--", "true"])))
+    t.start()
+    try:
+        assert _wait_for(lambda: (run / cli.CHECKS_QUEUED).exists())
+        assert locks.waited(run) >= 0 and json.loads((run / locks.WAITS_FILE).read_text())
+    finally:
+        holder.kill()
+        holder.wait()
+    t.join(30)
+    assert done and not (run / cli.CHECKS_QUEUED).exists()
+    assert all(w["end"] for w in json.loads((run / locks.WAITS_FILE).read_text()).values()), "the wait is closed"
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
 
 
 def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeypatch, capsys):
