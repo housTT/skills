@@ -82,6 +82,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,
         "max_reboot_losses": 3,         # a task lost to this many abrupt host reboots is blocked: it may cause them
+        "max_job_relaunches": 3,        # a `ttp detach --resumable` job is started again after at most this many reboots
         # A run the host took away (reboot, sleep, lost supervisor) after this much spend or time
         # continues its agent session where the provider can; below both, or with `false`, it starts fresh.
         "resume_lost": {"min_usd": 0.5, "min_s": 600},

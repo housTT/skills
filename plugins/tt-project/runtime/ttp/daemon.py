@@ -91,7 +91,7 @@ from . import shorttmp
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, without_deferral)
-from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
+from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
@@ -5581,8 +5581,8 @@ class Daemon:
             if not since or since >= self.boot_at:
                 continue
             asleep, relaunched = self._relaunch_checks(t, prev)
-            if asleep:
-                continue   # asleep on its retry_when: the same checks run again
+            if asleep or self._relaunch_jobs(t, prev):
+                continue   # asleep on its retry_when: the same checks or resumable jobs run again
             self._probe_rc.pop(t["id"], None)
             counts = bool(relaunched) or self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
@@ -5666,6 +5666,55 @@ class Daemon:
               f"no model run", "handled", tid))
         log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
         return True, 0
+
+    def _relaunch_jobs(self, t: dict, prev: dict) -> bool:
+        """A task waiting on local detached jobs (retry_when `ttp detach --check <rc...>`) that all
+        opted in with `--resumable`: start each the reboot cut short (no .rc) again, model-free, note
+        it on the task and keep the task asleep on its retry_when. True when it stays asleep (relaunched
+        now, or already on this boot: a daemon restart). False wakes it as before: a job it waits on
+        that did not opt in, one found lost on an earlier boot, one that cannot start, or one past
+        budget.max_job_relaunches relaunches (noted on the task, so its run reads why)."""
+        tid = t["id"]
+        rcs = _waited_jobs(str(prev.get("retry_when") or ""))
+        dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
+        if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
+            return False   # not only its own runs' jobs: not ours to start
+        todo, again, cap = [], False, int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
+        for rc in rcs:
+            m = detach.read_resume(rc)
+            if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
+                again = True   # relaunched on this boot already
+                continue
+            if rc.exists():
+                continue
+            lost = detach.lost(rc)
+            if m is None or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
+                return False
+            n = int(m.get("relaunches") or 0)
+            if n >= cap:
+                why = (f"the reboot cut short detached job {rc.stem} again; it was relaunched {n} times "
+                       f"already (cap {cap}), so the task wakes instead")
+                _task_note(rc.parent, why)
+                log(self.p, f"task {tid}: {why}")
+                return False
+            todo.append((rc, n))
+        if not todo:
+            return again   # all ended before the reboot: woken as before
+        nice = nice_level(self.cfg.get("runner"))[0]
+        for rc, n in todo:
+            if why := detach.relaunch(rc, self.boot, nice):
+                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+                log(self.p, f"task {tid}: detached job {rc.stem} not relaunched: {why}")
+                return False
+            text = (f"the host reboot cut short detached job {rc.stem}; relaunched it "
+                    f"({n + 1} of {cap}), no model run")
+            _task_note(rc.parent, text)
+            self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (time.time(), "daemon", "job_relaunched", f"job_relaunched:{tid}:{self.boot}:{rc}", "low",
+                         f"#{tid} {t['title']}: {text}", "handled", tid))
+            log(self.p, f"task {tid}: {text} ({rc})")
+        return True
 
     def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
         """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,
@@ -7816,6 +7865,30 @@ def _end_group(pgid: int, grace_s: float) -> None:
         time.sleep(0.2)
     try:
         os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _waited_jobs(retry_when: str) -> list[Path]:
+    """The .rc paths of a `ttp detach --check <rc...>` retry_when; [] for anything else (a remote
+    check, more than that one command)."""
+    try:
+        words = shlex.split(retry_when)
+    except ValueError:
+        return []
+    i = next((k for k in range(len(words) - 1) if words[k] == "detach" and words[k + 1] == "--check"), None)
+    if i is None or i > 1 or i == 1 and Path(words[0]).name != "ttp":
+        return []
+    rcs = words[i + 2:]
+    if not rcs or any(w.startswith("-") or not w.endswith(".rc") or not Path(w).is_absolute() for w in rcs):
+        return []
+    return [Path(w) for w in rcs]
+
+
+def _task_note(run_dir: Path, text: str) -> None:
+    """A progress note on the task, in its run's notes, as `ttp note` writes it."""
+    try:
+        durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} daemon: {text}\n")
     except OSError:
         pass
 

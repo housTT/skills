@@ -120,7 +120,10 @@ do not run while the project is paused. A task that must reboot the host its har
    Never leave a paused project with a waiting task: probes do not run while paused, so it never wakes.
    Drain also lists the project's `ttp detach` jobs still running on this host: the reboot ends them.
    `--jobs` waits for them too. A chain that only drives another machine belongs there instead
-   (`ttp detach --remote`), where this host's reboot cannot end it.
+   (`ttp detach --remote`), where this host's reboot cannot end it. A job started with
+   `ttp detach --resumable` (only one that is safe to rerun from the start) is started again by
+   the daemon after the reboot while its task still waits on it, with no model run, up to
+   `budget.max_job_relaunches` times (default 3).
 2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no

@@ -25,6 +25,12 @@ sweeps those of jobs gone without doing so (killed, or the host restarted). The 
 short one (shorttmp), so a socket bound beneath it stays within the AF_UNIX path limit; the job's
 record under the state names it in its `path` file. Without a usable short root the record is the
 temp dir.
+
+A job started with `ttp detach --resumable` also gets <name>.resume.json: its argv, cwd and
+environment (secrets left out, as for a queued job) and how often the daemon relaunched it. When a
+host reboot cut it short, the daemon starts the same command again on the next boot (relaunch),
+model-free, while its task still waits on it, up to RELAUNCH_CAP times; past that the task wakes as
+before. Only a job that is safe to run again from the start opts in.
 """
 from __future__ import annotations
 
@@ -46,6 +52,7 @@ from .project import Project, durable_write, nice_level, renice, write_json
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
+RELAUNCH_CAP = 3         # default relaunches of a resumable job after reboots (budget.max_job_relaunches)
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
@@ -65,6 +72,10 @@ def queued(rc: Path) -> Path:
 
 def lost(rc: Path) -> Path:
     return Path(rc).with_suffix(".lost")
+
+
+def resume_file(rc: Path) -> Path:
+    return Path(rc).with_suffix(".resume.json")
 
 
 def scratch(rc: Path) -> Path:
@@ -118,13 +129,85 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
     returns the queue file. The request and its marker are published together, under the lock."""
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
-    keep = {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
+    keep = _kept_env(env)
     rid = uuid.uuid4().hex
     with _locked(q.parent):
         write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
                        "queued": time.time(), **({"checks": checks} if checks is not None else {})}, mode=0o600)
         durable_write(queued(rc), f"{q}\n{rid}\n")
     return q
+
+
+def _kept_env(env: dict) -> dict:
+    return {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
+
+
+def save_resume(rc: Path, log: Path, cmd: list, cwd: str, env: dict, boot: str) -> None:
+    """Record what `relaunch` needs to start a resumable job again: written before the job starts."""
+    write_json(resume_file(rc), {"command": list(cmd), "cwd": cwd, "env": _kept_env(env), "log": str(log),
+                                 "boot": boot, "relaunches": 0}, mode=0o600)
+
+
+def read_resume(rc: Path) -> dict | None:
+    """The job's resume record, or None for a job that did not opt in (or a malformed record)."""
+    try:
+        m = json.loads(resume_file(rc).read_text())
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(m, dict) and isinstance(m.get("command"), list) and m["command"] and \
+        isinstance(m.get("cwd"), str) and isinstance(m.get("env") or {}, dict)
+    return m if ok else None
+
+
+def relaunch(rc: Path, boot: str, nice: int = 0) -> str:
+    """Start a resumable job a reboot cut short again, with the command, cwd and environment it was
+    started with (secrets from the caller's own environment). Its old log is kept as <name>.log.<n>.
+    Returns "" once started, else why not."""
+    rc = Path(rc)
+    m = read_resume(rc)
+    if m is None:
+        return "it has no resume record"
+    if rc.exists():
+        return "it already ended"
+    lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(map(str, m["command"])))
+    if lock is None:
+        return "it is still running"
+    try:
+        n = int(m.get("relaunches") or 0) + 1
+        log = Path(m.get("log") or rc.with_suffix(".log"))
+        if log.exists():
+            log.replace(log.with_name(f"{log.name}.{n}"))
+        lost(rc).unlink(missing_ok=True)
+        started(rc).unlink(missing_ok=True)
+        # Counted before it starts: a crash here never relaunches it past the cap.
+        write_json(resume_file(rc), {**m, "boot": boot, "relaunches": n, "relaunched": time.time()}, mode=0o600)
+        pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
+                    machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
+    except (OSError, ValueError, TypeError) as e:
+        return f"it could not start: {e}"
+    finally:
+        lock.close()
+    renice(pid, nice)
+    _restamp(rc, pid, boot)
+    return ""
+
+
+def _restamp(rc: Path, pid: int, boot: str) -> None:
+    """Point the run's registry entry of the job at its new process and boot (state reads the boot)."""
+    reg = rc.parent / "detached.json"
+    try:
+        jobs = json.loads(reg.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(jobs, list):
+        return
+    for j in jobs:
+        if isinstance(j, dict) and j.get("rc") == str(rc):
+            j.update(pid=pid, boot=boot, started=time.time(), queued=False)
+    try:
+        durable_write(reg, json.dumps(jobs, indent=1))
+    except OSError:
+        pass
 
 
 _held = threading.local()

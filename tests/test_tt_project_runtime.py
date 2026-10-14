@@ -26881,6 +26881,121 @@ def test_a_malformed_checks_pid_does_not_stop_other_tasks_waking(env, tmp_path):
     assert not any(_relaunches(p, x) for x in bad)
 
 
+def _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job", resumable=True):
+    """Task tid waits on `ttp detach [--resumable] <name>` of its own run; a reboot cut it short: no
+    .rc, its resume record and registry entry name an earlier boot. Returns (rc, counter file)."""
+    from ttp import detach
+    run_dir = p.runs / f"jobs-{tid}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    counter = tmp_path / f"runs-{tid}-{name}"
+    rc = run_dir / f"{name}.rc"
+    if not detach.resume_file(rc).exists() and not rc.exists():
+        r = _ttp_run(p, "detach", *(["--resumable"] if resumable else []), name, "--", "sh", "-c",
+                     f'echo run >>{counter}; echo "token=${{MY_API_TOKEN:-}}"',
+                     env={"TTP_RUN_DIR": str(run_dir), "MY_API_TOKEN": "s3cret"})
+        assert r.returncode == 0, r.stderr
+        assert _wait_for_path(rc)
+    rc = rc.resolve()
+    rc.unlink()
+    if resumable:
+        m = json.loads(detach.resume_file(rc).read_text())
+        detach.resume_file(rc).write_text(json.dumps({**m, "boot": "an-earlier-boot"}))
+    reg = run_dir / "detached.json"
+    reg.write_text(json.dumps([{**j, "boot": "an-earlier-boot"} for j in json.loads(reg.read_text())]))
+    if not p.db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(rc.parent))):
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time() - 1800, time.time() - 900, "ok", str(rc.parent), "an-earlier-boot"))
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
+        {"status": "waiting", "summary": "job running", "retry_after_s": 3600,
+         "retry_when": f"ttp detach --check {rc}", "waiting_since": time.time() - 900}))
+    return rc, counter
+
+
+def _job_relaunches(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='job_relaunched' AND task=?", (tid,))
+
+
+def _boot_daemon(p, boot="a-later-boot"):
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.boot, d.boot_at = boot, time.time() - 300
+    d.wake_after_reboot()
+    return d
+
+
+def _woken(p, tid):
+    t = p.db.task(tid)
+    return t["not_before"] is None and json.loads(t["result"]).get("woke") == "the host rebooted"
+
+
+def test_a_resumable_job_a_reboot_cut_short_is_relaunched_without_a_model_run(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    m = json.loads(detach.resume_file(rc).read_text())
+    assert m["command"][:2] == ["sh", "-c"] and m["cwd"] and m["relaunches"] == 0
+    assert "MY_API_TOKEN" not in m["env"], "a secret went to disk"
+    assert oct(detach.resume_file(rc).stat().st_mode & 0o777) == "0o600"
+    assert json.loads((rc.parent / "detached.json").read_text())[0]["resumable"] is True
+    _boot_daemon(p)
+    assert not _woken(p, tid) and p.db.task(tid)["not_before"], "the task was woken for a model run"
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    assert counter.read_text().split() == ["run", "run"], "not the same command"
+    assert (rc.parent / "job.log.1").exists(), "the cut-short run's log was lost"
+    (ev,) = _job_relaunches(p, tid)
+    assert ev["status"] == "handled" and ev["severity"] == "low", dict(ev)
+    assert "relaunched it (1 of 3), no model run" in (rc.parent / "progress.md").read_text()
+    m = json.loads(detach.resume_file(rc).read_text())
+    assert m["relaunches"] == 1 and m["boot"] == "a-later-boot"
+    # A daemon restart on the same boot starts nothing more and wakes nothing.
+    rc.unlink()
+    _boot_daemon(p)
+    assert len(_job_relaunches(p, tid)) == 1 and not _woken(p, tid)
+    assert counter.read_text().split() == ["run", "run"]
+
+
+def test_no_relaunch_of_a_job_that_ended_did_not_opt_in_or_whose_task_no_longer_waits(env, tmp_path):
+    p = make(env)
+    ended = p.db.add_task("ended", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, ended)
+    rc.write_text("0\n")
+    plain = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
+    _, counter2 = _resumable_job_cut_by_reboot(p, tmp_path, plain, resumable=False)
+    done = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    _, counter3 = _resumable_job_cut_by_reboot(p, tmp_path, done)
+    p.db.update_task(done, status="done", not_before=None, result=json.dumps({"status": "done", "summary": "ok"}))
+    _boot_daemon(p)
+    assert _woken(p, ended) and _woken(p, plain), "woken as before"
+    assert p.db.task(done)["status"] == "done"
+    assert not any(_job_relaunches(p, t) for t in (ended, plain, done))
+    time.sleep(0.5)
+    assert [len(c.read_text().split()) for c in (counter, counter2, counter3)] == [1, 1, 1]
+
+
+def test_a_resumable_job_past_its_relaunch_cap_wakes_the_task_with_a_note(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("crashy", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    for i in range(3):
+        _boot_daemon(p, f"boot-{i}")
+        assert not _woken(p, tid), i
+        assert _wait_for_path(rc)
+        _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    assert json.loads(detach.resume_file(rc).read_text())["relaunches"] == 3
+    _boot_daemon(p, "boot-3")
+    assert _woken(p, tid), "a job that keeps dying with the host was relaunched forever"
+    assert len(_job_relaunches(p, tid)) == 3 and len(counter.read_text().split()) == 4
+    assert "relaunched 3 times already (cap 3), so the task wakes instead" in (rc.parent / "progress.md").read_text()
+
+
+def test_detach_resumable_is_refused_for_a_remote_job(env):
+    p = make(env)
+    r = _ttp_run(p, "detach", "--resumable", "--remote", "box", "job", "--", "true")
+    assert r.returncode != 0 and "--resumable is for a local job" in r.stderr
+
+
 def test_boot_time_wakes_and_reboot_losses_count_together(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon

@@ -2529,7 +2529,9 @@ def cmd_detach(a) -> None:
     why, see detach.state), else 1. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
-    resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py)."""
+    resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
+    `--resumable` records the job's argv, cwd and environment (no secrets) so the daemon can start it
+    again after a host reboot cut it short, while its task still waits on it (daemon._relaunch_jobs)."""
     from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
@@ -2540,6 +2542,8 @@ def cmd_detach(a) -> None:
             die("usage: ttp detach --check <rc path...>  |  ttp detach --check --host <ssh alias> <dir>/<name>...")
         if a.host:
             sys.exit(_detach_check_remote(a.host, a.check))
+    if getattr(a, "resumable", False) and (a.remote or a.check is not None):
+        die("--resumable is for a local job: a --remote one already outlives a reboot here")
     if a.remote:
         _detach_remote(a, _own_ttp())
         return
@@ -2569,6 +2573,8 @@ def cmd_detach(a) -> None:
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
         die(f"a detached job named {a.name} already ran in this run; pick another name")
     pid = None
+    if getattr(a, "resumable", False):   # before it starts: a reboot right after still finds it
+        detach.save_resume(rc, logf, cmd, os.getcwd(), dict(os.environ), boot_id())
     if _boxed() and rd.parent.name == "runs":   # this command's sandbox would end the job: the daemon starts it
         detach.enqueue(rd.parent.parent, rc, logf, cmd, os.getcwd(), dict(os.environ))
     else:
@@ -2589,6 +2595,7 @@ def cmd_detach(a) -> None:
     jobs = jobs if isinstance(jobs, list) else []
     jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
+                 **({"resumable": True} if getattr(a, "resumable", False) else {}),
                  "requested": jobuse.requested(cmd, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                jobuse.daemon_env(rd.parent.parent / "daemon.pid")
@@ -4903,6 +4910,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
+    s.add_argument("--resumable", action="store_true",
+                   help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
+                   "starts it again while the task still waits on it, with no model run (up to "
+                   "budget.max_job_relaunches times, default 3)")
     s.add_argument("--cores", type=int, help="cores the job is meant to keep busy (default: read from -j N, "
                    "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
     s.add_argument("--devices", type=int, help="devices the job is meant to use")

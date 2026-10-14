@@ -203,7 +203,8 @@ never write to a run folder named in earlier context):
   timeouts, each driver step; a devq job sees it as `TTP_DEVQ_TIMEOUT_S`); split longer runs.
 <!-- /ttp:if devq -->
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with
-  it. The next run is a light wake unless you set `wake_tier` standard (only for real work). A wake
+  it. A local job that is safe to rerun from the start can use `ttp detach --resumable`: after a
+  reboot the daemon starts it again, with no model run, up to 3 times. Never use it otherwise. The next run is a light wake unless you set `wake_tier` standard (only for real work). A wake
   that hands back the same `waiting_for` and `retry_when` with no new commit made no progress; after
   3 the task goes to the coordinator. `next_step` is one short mechanical command, never a plan or an
   "if ... then"; a wake that needs judgment sets `wake_tier` standard and no `next_step`.
