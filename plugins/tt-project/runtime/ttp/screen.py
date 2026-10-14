@@ -677,7 +677,7 @@ def end_mute(db: DB, source: str, match: str, probe: str, why: str, now: float |
         if m is None:
             return None
         db.set_kv(MUTES_KEY, [x for x in active if x is not m])
-        _ended(db, m, now, now, why, where)
+        _ended(db, m, now, now, why, where, settled=True)
     return m
 
 
@@ -701,8 +701,10 @@ def mute_probe_broken(db: DB, source: str, match: str, probe: str, why: str, now
     return True
 
 
-def _ended(db: DB, m: dict, end: float, now: float, why: str, where: Any) -> None:
-    """Queue the one summary event of mute `m`, which ended at `end` (`why`, if given)."""
+def _ended(db: DB, m: dict, end: float, now: float, why: str, where: Any, settled: bool = False) -> None:
+    """Record the one summary event of mute `m`, which ended at `end` (`why`, if given). It is queued
+    for a turn only when observations were muted; one with none, or `settled` (its end_when probe, the
+    recovery condition, passed), is recorded handled: there is nothing to decide."""
     n = int(m["count"])
     seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'], where)}" if n
             else "no observations")
@@ -710,7 +712,7 @@ def _ended(db: DB, m: dict, end: float, now: float, why: str, where: Any) -> Non
          (now, m["source"], "observation", "info",
           f"mute ended: muted {m['source']} {m['match']!r} below {m['below']} for "
           f"{_h(end - float(m['since']))} h" + (f" ({why})" if why else "") + f": {seen}"
-          + (f". Muted because: {m['why']}" if m.get("why") else ""), "queued"))
+          + (f". Muted because: {m['why']}" if m.get("why") else ""), "handled" if settled or not n else "queued"))
 
 
 def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:

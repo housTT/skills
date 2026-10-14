@@ -58252,3 +58252,33 @@ def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
     assert not coord.batchable("upstream_note", "high") and not coord.batchable("task_done", "info")
     note = {"ts": now - 10, "kind": "upstream_note", "severity": "normal", "task": None}
     assert not d._batch_hold([ev, note], now)
+
+
+def test_a_mute_that_ended_with_nothing_muted_or_by_its_probe_settles_without_a_turn(env):
+    p = make(env)
+    from ttp import screen as scr
+    now = time.time()
+
+    def ended():
+        return [(e["text"], e["status"]) for e in
+                p.db.q("SELECT text, status FROM events WHERE text LIKE 'mute ended:%' ORDER BY id")]
+    scr.mute(p.db, "watcher:hw", "dropped", 1, now=now - 7200)
+    scr.expire_mutes(p.db, now)
+    [(text, status)] = ended()
+    assert "no observations" in text and status == "handled", (text, status)
+    # Observations were muted: the summary still goes to a turn.
+    scr.mute(p.db, "watcher:hw", "dropped", 1, now=now - 7200)
+    with p.db.tx():
+        [m] = p.db.kv(scr.MUTES_KEY)
+        m.update(count=3, last_at=now - 600)
+        p.db.set_kv(scr.MUTES_KEY, [m])
+    scr.expire_mutes(p.db, now)
+    assert ended()[-1][1] == "queued" and "3 observations" in ended()[-1][0]
+    # Ended by its end_when probe (the recovery condition passed): settled, whatever it counted.
+    scr.mute(p.db, "watcher:hw", "held", 6, now=now, end_when="true")
+    with p.db.tx():
+        [m] = p.db.kv(scr.MUTES_KEY)
+        m.update(count=2, last_at=now)
+        p.db.set_kv(scr.MUTES_KEY, [m])
+    assert scr.end_mute(p.db, "watcher:hw", "held", "true", "probe `true` passed", now=now + 1)
+    assert ended()[-1][1] == "handled" and "2 observations" in ended()[-1][0]
