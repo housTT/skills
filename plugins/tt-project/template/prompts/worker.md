@@ -83,9 +83,8 @@ Other workers run at the same time, on other tasks of this project.
   entry to a later task (no entry: hand off `blocked` naming it). Undo it and
   `ttp machines change close <id>` when it is over.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
-  `killall`): you would end other workers' runs.
-- The same goes for scripts and test stubs you run: `pkill -f <name>` also matches your own tool
-  shell, and a separate session or process group does not protect it. Check a script with
+  `killall`), nor let scripts and test stubs you run do so: that ends other workers' runs and your
+  own tool shell (a separate session or process group does not protect it). Check a script with
   `ttp killscan <script>` (it flags `pkill`, `killall`, `pgrep`/`pidof` as in `kill $(pgrep -f ...)`,
   and `ps | grep` feeding a kill). If it finds one, run it with stand-ins first on PATH
   (`ttp killscan --shim <dir>`, then `PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or
@@ -138,7 +137,7 @@ never write to a run folder named in earlier context):
  "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
 <!-- ttp:if wait -->
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
- "next_step": "only when waiting: one short mechanical command left after it; a light wake does it",
+ "next_step": "only when waiting: one short mechanical command a light wake runs",
  "on_pass": {"status": "done", "summary": "only when waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "on_pass_cmd": "only when waiting: a command that checks the finished job and writes the final hand-off to $TTP_RESULT",
  "wait_kind": "only when waiting: self (your own detached checks or jobs, a window you planned) or external",

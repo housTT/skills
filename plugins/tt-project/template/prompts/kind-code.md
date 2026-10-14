@@ -11,7 +11,7 @@
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a pass already recorded for the same tree and commands. If they take longer than one tool call may,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
-  the worktree, where a commit picks them up. Hand off `waiting` with the `retry_when` it prints;
+  the worktree. Hand off `waiting` with the `retry_when` it prints;
   that probe also wakes the task if the checks were killed. If nothing is left after them but
   recording the result, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
   the same head records it without a model run; a failure wakes the task at its tier with the output.
@@ -36,8 +36,8 @@
   `git push` to a shared branch.
 - It refuses uncommitted changes, rebases onto the project's target branch, runs the project's
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
-- Its checks can take longer than one tool call may: run `ttp push --detach`. It starts the push in
-  a process of its own, prints `marker:` and `retry_when:` lines, and returns at once. Hand off
+- Its checks can outlast a tool call: run `ttp push --detach`. It pushes in a process of its own,
+  prints `marker:` and `retry_when:` lines, and returns at once. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when` command: it prints `pushed <sha>`, or `not pushed` with the
@@ -58,8 +58,8 @@
 
 ## Pull requests (when the task asks for delivery)
 
-- Open a DRAFT PR only once the change is fully tested: commit, run `ttp checks` (the project's
-  checks, plus the repository's test commands after `--`) and fix what fails. `gh` opens a PR only
+- Open a DRAFT PR only once the change is fully tested: commit, run `ttp checks` (as above) and
+  fix what fails. `gh` opens a PR only
   after they passed on HEAD, in this run or an earlier one of this task (a clean tree, no rerun). Say in `summary` what ran and passed. One PR per change.
 - Publish your own branch with `ttp push --own --detach` (same probe and exit codes as above): it
   runs the checks on your HEAD and pushes it as it is under its own name, never a shared branch.
@@ -67,14 +67,12 @@
   only as a fast-forward of the remote's (never main/master, the default or the push branch).
   It prints its target first. Another task's branch your spec names in no `pr_branch:` line is
   refused; `ttp push --own-branch --detach` then publishes your own branch under its own name.
-- NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out
-  of draft. The harness's `gh` refuses it until the user's approval is recorded; never work around it.
-  If it refuses, hand off `blocked` with the PR's URL in `pr`: the coordinator asks the user.
-- Bot review comments and CI failures on your PR are part of the work: fix each, or answer it on
-  the PR saying briefly why not, until CI is green.
+- NEVER mark a PR ready for review: only the user takes a PR out of draft. If `gh` refuses, hand off
+  `blocked` with the PR's URL in `pr`.
+- Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
+  answer it on the PR saying briefly why not, until CI is green.
 - Description: what improved and why, one line of how, key numbers. Short, for humans.
 - Keep the description and your PR comments current with the latest push.
-- Answer every review comment: fix it, or explain briefly why not.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   does not report it back as someone else's comment.
 - NEVER merge, unless the charter lists this repo for auto-merge.
