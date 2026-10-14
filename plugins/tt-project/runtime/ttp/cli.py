@@ -1664,11 +1664,15 @@ def cmd_checks(a) -> None:
             passed, todo = False, []
         # A continuation's if_changed checks that passed at its lineage's marker, with nothing under their
         # scope changed since, are verified through it (verified.py); `ttp push` never reads the marker.
-        mark, verified_cmds = _verified_scope(p, Path(top), head, todo, lambda m: (print(f"ttp checks: {m}"),
-                                                                                    out.write(f"{m}\n"))) \
-            if passed and todo and purpose == "candidate" else (None, [])
-        todo = [c for c in todo if c not in verified_cmds]
+        # A recorded pass of every check on this tree comes first: the marker only covers what it lacks.
         hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
+        mark, verified_cmds = _verified_scope(p, Path(top), head, todo, lambda m: (print(f"ttp checks: {m}"),
+                                                                                    out.write(f"{m}\n")),
+                                              a.fresh) \
+            if passed and todo and purpose == "candidate" and not hit else (None, [])
+        todo = [c for c in todo if c not in verified_cmds]
+        if verified_cmds and todo and not a.fresh:
+            hit = _recorded_pass(p, tree, todo, purpose)
         if not todo and passed and verified_cmds:
             said = f"every applicable check was {mark['line']}"
             out.write(f"{said}\n")
@@ -1779,23 +1783,25 @@ def _run_task(p: Project | None) -> dict | None:
         return None
 
 
-def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say) -> tuple[dict | None, list]:
+def _verified_scope(p: Project | None, top: Path, head: str, todo: list, say,
+                    fresh: bool = False) -> tuple[dict | None, list]:
     """(the run's task's inherited checks marker, the if_changed checks in `todo` it verifies): each passed
-    at the marker, and the commits after it change nothing under its scope. A marker that is no longer an
-    ancestor of `head` (rewritten history) verifies none: every check runs, and that is said. Checks without
-    an if_changed scope always run, as they cover the whole tree."""
+    at the marker, and the commits after it change nothing under its scope. A marker at `head` itself (a
+    rerun on the same head) verifies the scoped checks it recorded, unless `fresh`. A marker that is no
+    longer an ancestor of `head` (rewritten history) verifies none: every check runs, and that is said.
+    Checks without an if_changed scope always run, as they cover the whole tree."""
     from . import push, verified
     t = _run_task(p)
     try:
         m = verified.scope(p.db, t, top, head, "checks", include_self=True) if t else None
     except Exception:
         return None, []
-    if not m or m["sha"] == head:
+    if not m or (m["sha"] == head and fresh):
         return m, []
     if not m["ok"]:
         say(m["line"])
         return m, []
-    files = verified.changed_since(top, m["sha"], head)
+    files = [] if m["sha"] == head else verified.changed_since(top, m["sha"], head)
     if files is None:
         say(f"cannot tell what changed since {m['sha'][:12]}: full verification")
         return m, []

@@ -57452,10 +57452,27 @@ def test_a_continuation_checks_only_the_commits_after_its_inherited_marker(env, 
     todo, _ = push.applicable(repo, head, push.check_list(p.config()["delivery"]["push_checks"]),
                               lambda m: None, "origin/proj")
     assert len(todo) == 2
+    # A rerun on the same head by the same task (e.g. the daemon's pre-started checks) reuses what is
+    # known: the scoped check through its own marker at HEAD, the unscoped one through its recorded pass.
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert counts() == (2, 1), out
+    assert "(recorded)" in out
+    # --fresh runs every check again.
+    cli.main(["checks", "--fresh"])
+    assert counts() == (3, 2)
+    # The first hop's own rerun on its head still hits its recorded pass of every check.
+    monkeypatch.setenv("TTP_TASK", str(first))
+    subprocess.run([*git, "checkout", "-q", marked], check=True)
+    cli.main(["checks"])
+    assert counts() == (3, 2)
+    subprocess.run([*git, "checkout", "-q", "-"], check=True)
+    monkeypatch.setenv("TTP_TASK", str(nxt))
     # A commit after the marker under src/** runs the scoped check again.
     _commit_in(git, repo, "src/b.py", "b = 1\n")
     cli.main(["checks"])
-    assert counts() == (3, 2)
+    assert counts() == (4, 3)
 
 
 def test_a_rewritten_history_falls_back_to_full_verification(env, tmp_path, monkeypatch, capsys):
@@ -57469,9 +57486,9 @@ def test_a_rewritten_history_falls_back_to_full_verification(env, tmp_path, monk
     assert counts() == (1, 1)
     line = prompts.verified_line(p, p.db.task(nxt), str(repo))
     assert f"verified through {marked[:12]}" in line and f"git log {marked[:12]}..HEAD" in line
-    # The marker's commit is rewritten away (an amend, as a rebase would): not an ancestor any more.
-    (repo / "src/a.py").write_text("a = 2\n")
-    subprocess.run([*git, "commit", "-qa", "--amend", "-m", "src/a.py"], check=True)
+    # The marker's commit is rewritten away (an amend of its message only, as a rebase would): not an
+    # ancestor any more, though nothing under src/** changed, so only the fallback reruns the scoped check.
+    subprocess.run([*git, "commit", "-q", "--amend", "-m", "src/a.py, reworded"], check=True)
     _commit_in(git, repo, "notes.txt", "notes\n")
     monkeypatch.setenv("TTP_TASK", str(nxt))
     capsys.readouterr()
