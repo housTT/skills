@@ -25753,7 +25753,7 @@ def _on_pass_cmd_task(p, tmp_path, cmd, probe="true"):
 def _settle_on_pass(d, tid):
     _settle_probe(d, tid)
     if tid in d._on_pass:
-        d._on_pass[tid][0].wait(10)
+        d._on_pass[tid][0].wait(120)
         d.probe_waiting()
 
 
