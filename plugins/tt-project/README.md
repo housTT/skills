@@ -259,6 +259,11 @@ prolonged whole-box outage.
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
+- A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
+  halved down to single items; a single item runs once more alone at the ceiling
+  (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit
+  or the dollar caps). One that fails even then is parked and you get one alert naming every parked
+  item; it runs again once you raise the cap or the ceiling. The other items go on.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and no code file
   with a risky name (`review.risky_names`: state, database, schema, migration, push, budget, billing,
   spend, spend cap, release and upgrade files by default; `[]` turns it off), and is docs and tests

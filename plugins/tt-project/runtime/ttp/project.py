@@ -180,6 +180,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # under thread_warm_min minutes ago (cachettl.pick_thread).
                     "thread_warm_min": 10, "thread_max_turns": 8,
                     "turn_budget_usd": 1.0,
+                    # The most the daemon raises one turn's cap to, once, for a single item that went
+                    # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly
+                    # coordinator limit or the dollar caps (turnsize.py). project.json is not changed.
+                    "turn_budget_ceiling_usd": 0,
                     # Turn timeout (coordlimits.turn_timeout): turn_timeouts_s.<provider>.<effort> set
                     # here wins, then a flat turn_timeout_s (0: unset; a stored 600, the old default,
                     # counts as unset), then the built-in table. The ceiling can be lowered, never

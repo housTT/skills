@@ -83,6 +83,7 @@ from . import sweep
 from . import timefmt
 from . import ttr
 from . import turngate
+from . import turnsize
 from . import unblock
 from . import upstream
 from . import verified
@@ -2392,6 +2393,8 @@ class Daemon:
                     f"{usage.error} {usage.final_text or ''}"):
                 log(self.p, f"coordinator run {r['id']}: the API refused the extra cache breakpoint; "
                             f"later turns on this {r['provider']} build go without it")
+            if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
+                return
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
@@ -2514,6 +2517,28 @@ class Daemon:
                      (time.time(), "harness", "rejected_repeat", "normal",
                       f"The coordinator repeated an action that was rejected: {x}", "handled"))
         db.set_kv(coord.REPEATS_KEY, seen[-50:])
+
+    def _turn_over_budget(self, note: dict) -> bool:
+        """A turn over its cap: its items are recorded so the next turn splits the batch, raises a
+        single item once or parks it (turnsize.py). False leaves it to the usual failure backoff (a
+        turn with no batch, or a bookkeeping error)."""
+        try:
+            got = turnsize.on_fail(self.p.db, self.cfg, self.p.name, note, log=lambda t: log(self.p, t))
+        except Exception:
+            log(self.p, "coordinator over-budget handling failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return False
+        if not got:
+            return False
+        self._turn_budget_alert()
+        return True
+
+    def _turn_budget_alert(self) -> None:
+        """One normal alert each time an item is parked, naming every parked item; it clears once
+        none is (alerts.holds)."""
+        text = turnsize.alert_text(self.p.db, self.cfg, self.p.name)
+        if text:
+            self.alert(turnsize.ALERT_KEY, text, "normal", every_s=0)
+            self.p.db.x("UPDATE alerts SET text=? WHERE key=? AND cleared IS NULL", (text[:2000], turnsize.ALERT_KEY))
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db
@@ -3974,9 +3999,24 @@ class Daemon:
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
-        msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id LIMIT 30")
+        msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task FROM events WHERE status='queued' ORDER BY id")
-        evs = queued[:int(c.get("max_events_per_turn", 40))]
+        max_evs = int(c.get("max_events_per_turn", 40))
+        budget = float(c.get("turn_budget_usd", 1.0))
+        # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
+        try:
+            g = self.gates.get(self.cfg.get("core_provider", "claude"))
+            sized = turnsize.plan(db, self.cfg, msgs, queued, (g.as_dict().get("numbers") or {}) if g else {},
+                                  max_msgs=30, max_evs=max_evs)
+            msgs, evs, budget = sized["msgs"], sized["evs"], sized["budget"]
+        except Exception:   # sizing only bounds spend: a failure runs the batch as before
+            log(self.p, "coordinator turn sizing failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            sized = {"info": {}}
+            msgs, evs = msgs[:30], queued[:max_evs]
+        try:
+            self._turn_budget_alert()   # a setting changed since: the parked set the alert names
+        except Exception:
+            log(self.p, "coordinator turn budget alert failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         # Each continuation has its own coverage. Never combine sweep batches back into one turn.
         sweep_event = next((e["id"] for e in evs if e["kind"] == sweep.SWEEP_KIND), None)
         evs = [e for e in evs if e["kind"] != sweep.SWEEP_KIND or e["id"] == sweep_event]
@@ -4080,8 +4120,9 @@ class Daemon:
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
                            cache_ttl=str(c.get("cache_ttl", cachettl.AUTO) or ""),
-                           budget_usd=float(c.get("turn_budget_usd", 1.0)),
+                           budget_usd=budget,
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
+                                 "budget_usd": budget, **({"sizing": sized["info"]} if sized["info"] else {}),
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
                                  **({"wake_due": due} if due else {}),

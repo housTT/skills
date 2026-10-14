@@ -60948,3 +60948,318 @@ def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_tu
     # The same text resent: applied.
     assert coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)"}], turn=13) == []
     assert approved in p.charter_path.read_text()
+
+
+def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
+    """A daemon whose coordinator turns run in-process: `cost_of(msg_ids, ev_ids)` is what a turn over
+    that batch would cost; one over its cap ends as the agent CLI does, with error_max_budget_usd.
+    `flaky(note)` True fails a turn for another reason (not over budget)."""
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    p.set_config("coordinator.max_turns_per_hour", 100000)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_coord_check", lambda *a, **k: None)
+    turns = []
+
+    def start_run(role, prompt, provider, tier, cwd, **kw):
+        note = kw["note"]
+        rid = p.db.x("INSERT INTO runs(role,provider,started,status,note) VALUES('coordinator','fake',?,'running',?)",
+                     (time.time(), json.dumps(note)))
+        cost, cap = cost_of(note["messages"], note["events"]), kw["budget_usd"]
+        other = flaky(note)
+        ok = cost <= cap and not other
+        turns.append({"messages": list(note["messages"]), "events": list(note["events"]), "cap": cap, "ok": ok,
+                      **({"other": True} if other else {})})
+        p.db.x("UPDATE runs SET status=?, ended=?, cost_usd=? WHERE id=?",
+               ("ok" if ok else "failed", time.time(), min(cost, cap), rid))
+        err = "" if ok else "boom" if other else "error_max_budget_usd: Reached maximum budget"
+        usage = SimpleNamespace(structured={"actions": [], "summary": "ok"} if ok else None, final_text="", error=err,
+                                extra={"subtype": "success" if ok else "error" if other else "error_max_budget_usd"})
+        d._finish_coordinator({"id": rid, "dir": "", "provider": "fake"}, usage, "ok" if ok else "failed", note)
+        return rid
+    monkeypatch.setattr(d, "start_run", start_run)
+
+    def step():
+        p.db.x("DELETE FROM kv WHERE key='coordinator_backoff_until'")
+        p.db.set_kv("last_coordinator_turn", time.time())   # no idle wake: only the backlog starts turns
+        d.cfg = p.config()
+        d.maybe_coordinate()
+        d.sweep_alerts()
+    return d, turns, step
+
+
+def _backlog(p, msgs, events, age=3600):
+    old = time.time() - age
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # what the project started with
+    p.db.x("UPDATE events SET status='handled' WHERE status='queued'")
+    mids = [p.db.post("in", f"message {i}", chat="cli") for i in range(msgs)]
+    p.db.x("UPDATE messages SET ts=? WHERE direction='in'", (old,))
+    eids = [p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (old, "daemon", "task_done", "normal", f"#{i} done", "queued")) for i in range(events)]
+    return mids, eids
+
+
+def _turn_budget_invariant(p):
+    """Every pending item is eligible for a next batch (alone at its raise, or in a batch) or parked,
+    and every parked one is named in the open coord-budget alert."""
+    from ttp import turnsize
+    cfg = p.config()
+    recs = turnsize.records(p.db)
+    pending = [turnsize.item_key("m", r["id"]) for r in
+               p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0")] + \
+        [turnsize.item_key("e", r["id"]) for r in p.db.q("SELECT id FROM events WHERE status='queued'")]
+    ep = p.db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL", (turnsize.ALERT_KEY,))
+    parked = []
+    for k in pending:
+        st, _ = turnsize.status(cfg, recs.get(k))
+        assert st in ("batch", "solo", "parked"), (k, st)
+        if st == "parked":
+            parked.append(k)
+            assert ep and re.search(re.escape(turnsize.label(k)) + r"\b", ep["text"]), \
+                f"{k} is parked but not named in the alert: {ep and ep['text']}"
+    if not parked:
+        assert not ep, f"the alert is open with nothing parked: {ep['text']}"
+    return parked
+
+
+def test_an_over_budget_backlog_is_split_in_halves_never_retried_as_is_and_handled_once(env, monkeypatch):
+    """A daemon resumes on 22 user messages and 10 events; a turn over the whole batch costs more than
+    the $1.00 cap. Each failed batch is halved, every item is handled by exactly one turn at the
+    configured cap, and nothing is parked or alerted."""
+    p = make(env)
+    from ttp import turnsize
+    mids, eids = _backlog(p, 22, 10)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 0.1 + 0.07 * (len(m) + len(e)))
+    for _ in range(12):
+        step()
+        _turn_budget_invariant(p)
+    assert turns[0] == {"messages": mids, "events": eids, "cap": 1.0, "ok": False}, turns[0]
+    assert turns[1]["messages"] == mids[:16] and not turns[1]["events"] and not turns[1]["ok"]
+    assert turns[2] == {"messages": mids[:8], "events": [], "cap": 1.0, "ok": True}, turns[2]
+    failed = [(tuple(t["messages"]), tuple(t["events"]), t["cap"]) for t in turns if not t["ok"]]
+    assert len(failed) == len(set(failed)), f"a failed batch was retried at the same cap: {failed}"
+    assert all(t["cap"] == 1.0 for t in turns), "a split needs no raise"
+    done_m = [i for t in turns if t["ok"] for i in t["messages"]]
+    done_e = [i for t in turns if t["ok"] for i in t["events"]]
+    assert sorted(done_m) == mids and sorted(done_e) == eids, "an item was dropped or handled twice"
+    assert not turnsize.records(p.db), "a handled item kept its record"
+    assert not p.db.q("SELECT id FROM messages WHERE ref=?", (turnsize.ALERT_KEY,)), "a split is no alert"
+    assert not p.db.kv("coordinator_failures"), "a handled over-budget turn is no coordinator failure"
+    assert p.config()["coordinator"]["turn_budget_usd"] == 1.0
+
+
+def test_a_normal_backlog_runs_as_one_turn_at_the_configured_cap(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    mids, eids = _backlog(p, 3, 2)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 0.3)
+    step()
+    step()
+    assert turns == [{"messages": mids, "events": eids, "cap": 1.0, "ok": True}], turns
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE role='coordinator'")["note"])
+    assert note["budget_usd"] == 1.0 and "sizing" not in note
+    assert not p.db.q("SELECT id FROM events WHERE kind='turn_budget'") and not turnsize.records(p.db)
+
+
+def test_turn_cap_ceiling_is_clipped_by_the_hourly_coordinator_and_dollar_caps(env):
+    p = make(env)
+    from ttp import turnsize
+    cfg = p.config()
+    assert turnsize.ceiling(cfg) == 2.0 and cfg["coordinator"]["turn_budget_ceiling_usd"] == 0
+    cfg["coordinator"]["turn_budget_ceiling_usd"] = 50
+    cfg["budget"].update(hourly_coordinator_usd=3.0, daily_usd=2.5, global_daily_usd=0)
+    assert turnsize.ceiling(cfg) == 2.5
+    cfg["budget"]["global_daily_usd"] = 1.2
+    assert turnsize.ceiling(cfg) == 1.2
+    room = turnsize.headroom(cfg, {"coordinator_1h": 1.0, "coordinator_user_1h": 0.5, "daily_cap": 20,
+                                   "spent_today": 19.0, "global_cap": 100, "global_today": 10})
+    assert room == pytest.approx(1.0)
+
+
+def test_a_single_item_over_budget_runs_once_at_the_ceiling_when_there_is_room(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 1.5 if mid in m else 0.2)
+    step()
+    # The hourly coordinator limit leaves no room for the raise yet: it waits, other items go on.
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 0.5)
+    other = p.db.post("in", "other", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (other,))
+    step()
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [([mid], 1.0, False), ([other], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == []
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 10.0)
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"], turns[-1]["ok"]) == ([mid], 2.0, True), turns
+    assert "runs it alone once more at $2.00" in p.db.one("SELECT text FROM events WHERE kind='turn_budget'")["text"]
+    assert not turnsize.records(p.db)
+    later = p.db.post("in", "later", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (later,))
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"]) == ([later], 1.0), "the cap did not fall back"
+    assert p.config()["coordinator"]["turn_budget_usd"] == 1.0
+
+
+def test_a_single_item_over_the_ceiling_is_parked_with_one_normal_alert_until_the_cap_rises(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 5.0 if mid in m else 0.2)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(4):
+        step()
+    assert [(t["cap"], t["ok"]) for t in turns] == [(1.0, False), (2.0, False)], turns
+    assert _turn_budget_invariant(p) == [f"m:{mid}"]
+    sent = p.db.q("SELECT severity, text FROM messages WHERE kind='alert' AND ref=?", (turnsize.ALERT_KEY,))
+    assert [s["severity"] for s in sent] == ["normal"], sent
+    assert f"user message #{mid}" in sent[0]["text"] and "turn_budget_usd" in sent[0]["text"]
+    other = p.db.post("in", "next", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (other,))
+    step()
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[2:]] == [([other], 1.0, True)], turns
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 0, "the parked item was dropped"
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] is None, "the alert cleared with an item parked"
+    p.set_config("coordinator.turn_budget_usd", 6.0)
+    step()
+    assert (turns[-1]["messages"], turns[-1]["cap"], turns[-1]["ok"]) == ([mid], 6.0, True), turns
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] and _turn_budget_invariant(p) == []
+    assert not turnsize.records(p.db) and not p.db.kv(turnsize.PARKED_KEY)
+
+
+def test_an_item_unparked_by_a_higher_ceiling_runs_at_it_even_after_another_item_succeeds(env, monkeypatch):
+    """#2064 probe 1: A parked at $2 and B at $4; the ceiling goes to $3 while the caps leave $2 of
+    room. C's turn succeeds meanwhile; A must then run at $3, never be dropped, and B stays parked."""
+    p = make(env)
+    from ttp import turnsize
+    (a, b, c), _ = _backlog(p, 3, 0)
+    rec = {"attempts": 2, "base": 1.0, "size": 1, "ts": time.time()}
+    p.db.set_kv(turnsize.STATE_KEY, {f"m:{a}": {**rec, "cap": 2.0, "ceiling": 2.0},
+                                     f"m:{b}": {**rec, "cap": 4.0, "ceiling": 4.0}})
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 2.5 if a in m else 5.0 if b in m else 0.2)
+    p.set_config("coordinator.turn_budget_ceiling_usd", 3.0)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 2.0)
+    step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [([c], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == [f"m:{b}"]
+    assert turnsize.records(p.db)[f"m:{a}"]["cap"] == 2.0, "C's turn touched A's record"
+    assert turnsize.status(p.config(), turnsize.records(p.db)[f"m:{a}"]) == ("solo", 3.0)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(3):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[1:]] == [([a], 3.0, True)], turns
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (a,))["handled"] == 1
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (b,))["handled"] == 0
+    assert list(turnsize.records(p.db)) == [f"m:{b}"]
+
+
+def test_two_heavy_items_parked_run_at_a_raised_ceiling_with_no_wasted_base_turn(env, monkeypatch):
+    """#2064 probe 2: two items costing $3.00 each are parked at the default $2.00 ceiling, the rest and
+    new messages go on in one batch; the ceiling set to $6 (clipped to the $4 hourly coordinator limit)
+    runs each alone at $4, with no turn at the $1 base in between."""
+    p = make(env)
+    from ttp import turnsize
+    (a, b, c, dd), _ = _backlog(p, 4, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 3.0 * len({a, b} & set(m)) + 0.2)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 100.0)
+    for _ in range(10):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns] == [
+        ([a, b, c, dd], 1.0, False), ([a, b], 1.0, False), ([a], 1.0, False), ([a], 2.0, False),
+        ([b], 1.0, False), ([b], 2.0, False), ([c, dd], 1.0, True)], turns
+    assert _turn_budget_invariant(p) == [f"m:{a}", f"m:{b}"]
+    sent = p.db.q("SELECT severity, text FROM messages WHERE kind='alert' AND ref=?", (turnsize.ALERT_KEY,))
+    assert [s["severity"] for s in sent] == ["normal", "normal"], sent
+    assert f"user message #{a}" in sent[1]["text"] and f"user message #{b}" in sent[1]["text"]
+    new = [p.db.post("in", f"later {i}", chat="cli") for i in range(3)]
+    p.db.x(f"UPDATE messages SET ts=ts-60 WHERE id IN ({','.join('?' * len(new))})", new)
+    n = len(turns)
+    for _ in range(3):
+        step()
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [(new, 1.0, True)], turns[n:]
+    p.set_config("coordinator.turn_budget_ceiling_usd", 6.0)
+    n = len(turns)
+    for _ in range(4):
+        step()
+        _turn_budget_invariant(p)
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [([a], 4.0, True), ([b], 4.0, True)], turns[n:]
+    assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] and not turnsize.records(p.db)
+
+
+def test_an_item_parked_by_a_lowered_ceiling_is_named_in_the_alert(env, monkeypatch):
+    p = make(env)
+    from ttp import turnsize
+    (mid,), _ = _backlog(p, 1, 0)
+    d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 1.5)
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 0.0)
+    step()
+    assert _turn_budget_invariant(p) == []   # due alone at $2.00 once there is room
+    p.set_config("coordinator.turn_budget_ceiling_usd", 1.0)
+    step()
+    assert _turn_budget_invariant(p) == [f"m:{mid}"] and len(turns) == 1
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_turn_budget_invariant_holds_over_random_failures_and_setting_changes(env, monkeypatch, seed):
+    """Random backlogs, item costs, other failures, headroom and setting changes: after every daemon
+    step every pending item is eligible or parked and named in the alert; no over-budget batch is
+    retried at the same cap; no item is handled by two turns; once the settings allow, all drain."""
+    import random
+    p = make(env)
+    from ttp import turnsize
+    rnd = random.Random(seed)
+    weight: dict = {}
+
+    def cost(m, e):
+        return 0.05 + sum(weight[("m", i)] for i in m) + sum(weight[("e", i)] for i in e)
+
+    room = {"v": 100.0}
+    monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: room["v"])
+    d, turns, step = _turn_budget_rig(p, monkeypatch, cost, flaky=lambda note: rnd.random() < 0.1)
+    _backlog(p, 0, 0)
+    old = time.time() - 3600
+
+    def add():
+        for _ in range(rnd.randint(1, 6)):
+            w = rnd.choice([0.02, 0.05, 0.1, 0.3, 1.5, 2.5, 5.0])
+            if rnd.random() < 0.5:
+                i = p.db.post("in", "m", chat="cli")
+                p.db.x("UPDATE messages SET ts=? WHERE id=?", (old, i))
+                weight[("m", i)] = w
+            else:
+                i = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                           (old, "daemon", "task_done", "normal", f"e{rnd.random()}", "queued"))
+                weight[("e", i)] = w
+    for _ in range(80):
+        r = rnd.random()
+        if r < 0.25:
+            add()
+        elif r < 0.35:
+            p.set_config("coordinator.turn_budget_usd", rnd.choice([0.5, 1.0, 2.0]))
+        elif r < 0.45:
+            p.set_config("coordinator.turn_budget_ceiling_usd", rnd.choice([0, 1.0, 3.0, 6.0]))
+        elif r < 0.5:
+            room["v"] = rnd.choice([0.0, 1.0, 3.0, 100.0])
+        step()
+        _turn_budget_invariant(p)
+    p.set_config("coordinator.turn_budget_usd", 10.0)
+    p.set_config("coordinator.turn_budget_ceiling_usd", 0)
+    p.set_config("budget.hourly_coordinator_usd", 50.0)
+    room["v"] = 100.0
+    d2, turns2, step2 = _turn_budget_rig(p, monkeypatch, cost)
+    for _ in range(60):
+        step2()
+        _turn_budget_invariant(p)
+    over = [(frozenset(t["messages"]), frozenset(t["events"]), t["cap"]) for t in turns + turns2
+            if not t["ok"] and not t.get("other")]
+    assert len(over) == len(set(over)), "an over-budget batch was retried at the same cap"
+    done = [("m", i) for t in turns + turns2 if t["ok"] for i in t["messages"]] + \
+        [("e", i) for t in turns + turns2 if t["ok"] for i in t["events"]]
+    assert len(done) == len(set(done)), "an item was handled by two turns"
+    assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0"), "an item never ran"
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "an event never ran"
+    assert not turnsize.records(p.db) and not _turn_budget_invariant(p)
