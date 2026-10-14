@@ -122,17 +122,20 @@ def _rpath(p: str) -> str:
 
 
 def batch_script(checkout: str, command: str, rc: str, devices: Optional[str],
-                 chips: Optional[str] = None) -> str:
+                 chips: Optional[str] = None, *, dev_dir: str = "/dev/tenstorrent",
+                 tt_smi: str = "tt-smi") -> str:
     """The job: own process group, cd into the checkout, run, kill the group, write rc.
 
     With `chips` (a partition whose chip count is not measured yet) it first writes the number of
-    devices in /dev/tenstorrent to that file and logs `tt-smi -ls` when the node has it."""
+    devices in /dev/tenstorrent to that file and logs `tt-smi -ls` when the node has it.
+    `dev_dir` and `tt_smi` exist for tests, so they never reach the host's own devices."""
     env = f"export TT_VISIBLE_DEVICES={shlex.quote(devices)}\n" if devices is not None else ""
+    d, smi = shlex.quote(dev_dir), shlex.quote(tt_smi)
     measure = "" if chips is None else (
-        "n=$(ls /dev/tenstorrent 2>/dev/null | grep -c '^[0-9][0-9]*$')\n"
+        f"n=$(ls {d} 2>/dev/null | grep -c '^[0-9][0-9]*$')\n"
         f"echo \"$n\" > {_rpath(chips)}\n"
-        'echo "chips: $n devices in /dev/tenstorrent"\n'
-        "command -v tt-smi >/dev/null && timeout 120 tt-smi -ls\n")
+        f'echo "chips: $n devices in "{d}\n'
+        f"command -v {smi} >/dev/null && timeout 120 {smi} -ls\n")
     return f"""#!/bin/bash
 # written by setup-box box.py slurm submit
 if [ -z "$TTP_JOB_PGRP" ] && [ "$(ps -o pgid= -p $$ | tr -d ' ')" != "$$" ]; then
@@ -315,7 +318,9 @@ def cmd_submit(args) -> int:
     chips = None if box.chips_known(part) else f"{rundir}/job.chips"
     sbatch = ["sbatch", "--parsable", "--exclusive", "-w", args.node, "-p", args.partition,
               f"--time={args.time}", f"--job-name={args.name}"]
-    remote = (f"mkdir -p {_rpath(rundir)} && cat > {_rpath(script)}.tmp && "
+    # A job reusing --name must not leave an earlier job's count for status to print.
+    remote = (f"mkdir -p {_rpath(rundir)} && rm -f {_rpath(rundir)}/job.chips && "
+              f"cat > {_rpath(script)}.tmp && "
               f"mv -f {_rpath(script)}.tmp {_rpath(script)} && "
               f"{shlex.join(sbatch)} --output={_rpath(log)} --error={_rpath(log)} {_rpath(script)}")
     r = box.ssh_run(login, remote, input=batch_script(args.checkout, command, rc, args.devices, chips))

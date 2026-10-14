@@ -1696,7 +1696,7 @@ def test_setup_box_slurm_submit_and_status_measure_unknown_chips(tmp_path):
     # A measured partition writes no measuring step and reports no measurement.
     site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["chips"] = 4
     (tmp_path / "boxes.json").write_text(json.dumps(site))
-    (rundir / "job.chips").unlink()
+    # The earlier job's count stays in the run dir: the next submit with that --name clears it.
     r = run("submit", "<box-alias>", "--node", "node07", "--partition", "p4", "--name", "t1", "--time", "30",
             "--checkout", co, "--purpose", "next job", "--command", "true")
     assert r.returncode == 0 and "(4 chips," in r.stdout
@@ -1712,13 +1712,28 @@ def test_setup_box_slurm_batch_script_records_the_device_count(tmp_path):
         sys.path.remove(str(BOX_PY.parent))
     import subprocess
     (tmp_path / "co").mkdir()
+    # A fake device dir and a stub tt-smi: the test never reaches the host's devices.
+    dev = tmp_path / "dev"
+    (dev / "by-id").mkdir(parents=True)
+    for n in ("0", "1", "3"):
+        (dev / n).write_text("")
+    smi, called = tmp_path / "stub" / "tt-smi", tmp_path / "tt-smi.called"
+    smi.parent.mkdir()
+    smi.write_text(f'#!/bin/bash\necho "$*" >> {called}\n')
+    smi.chmod(0o755)
     chips = tmp_path / "job.chips"
     script = tmp_path / "job.sbatch"
-    script.write_text(box_slurm.batch_script(str(tmp_path / "co"), "true", str(tmp_path / "job.rc"), None, str(chips)))
-    r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60,
-                       env={k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"})
+    script.write_text(box_slurm.batch_script(str(tmp_path / "co"), "true", str(tmp_path / "job.rc"), None,
+                                             str(chips), dev_dir=str(dev), tt_smi=str(smi)))
+    assert "/dev/tenstorrent" not in script.read_text() and " tt-smi -ls" not in script.read_text()
+    # Belt and braces: no PATH dir holding a real tt-smi either.
+    path = ":".join(d for d in os.environ["PATH"].split(":") if d and not os.path.exists(os.path.join(d, "tt-smi")))
+    env = {k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"}
+    env["PATH"] = path
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60, env=env)
     assert (tmp_path / "job.rc").read_text().strip() == "0", r.stdout + r.stderr
-    assert chips.read_text().strip().isdigit() and "chips: " in r.stdout
+    assert chips.read_text().strip() == "3" and "chips: 3 devices in " in r.stdout, r.stdout
+    assert called.read_text().strip() == "-ls"
 
 
 def _fake_survey(tmp_path):
