@@ -58767,7 +58767,10 @@ def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypa
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
     _fake_check_plan_ttp(tmp_path, monkeypatch, log)
-    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    # The harness repo: it has the definition commit, so the candidate default runs the harness check.
+    plan = HARNESS_PLAN.replace("a" * 40, subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True,
+                                                         text=True).stdout.strip())
+    p.set_config("delivery.push_checks", [{"run": plan, "purpose": "harness"}, f"echo consumer >> {log}"])
     ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
     cli.main(["checks"])
     assert ran() == 2
@@ -58780,6 +58783,55 @@ def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypa
     assert json.loads((run / "checks.json").read_text())["purpose"] == "candidate"
     assert cli._recorded_pass(p, subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True,
                                                 text=True).stdout.strip(), [], "other") is None
+
+
+def test_ttp_checks_skips_a_harness_check_of_another_repo(env, tmp_path, monkeypatch, capsys):
+    """A worktree of a repo other than the harness's (its definition commit is not there): the candidate
+    `ttp checks` passes on the repo's own checks and reports the harness check skipped, never passed;
+    `--purpose harness` still runs it, and with no other check nothing applies."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert log.read_text().split() == ["consumer"], "the other repo's harness check ran"
+    assert "definition commit aaaaaaaaaaaa is not in this repository" in out and "1 skipped" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["purpose"] == "candidate" and HARNESS_PLAN not in rec["commands"]
+    assert len(rec["skipped"]) == 1 and HARNESS_PLAN in rec["skipped"][0]
+    log.unlink()
+    cli.main(["checks", "--purpose", "harness"])
+    assert log.read_text().split() == ["plan", "consumer"], "a harness qualification skipped its check"
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["checks"])
+    assert exc.value.code == 1
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+
+
+def test_push_own_skips_a_harness_check_of_another_repo_but_push_runs_it(env, monkeypatch, tmp_path):
+    from ttp import push
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    checks = push.check_list([{"run": HARNESS_PLAN, "purpose": "harness"}, f"echo consumer >> {log}"])
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    _commit(repo, "x.txt", "x\n")
+    said = []
+    assert push.publish(repo, "origin", "own", checks, say=said.append) == 0
+    assert log.read_text().split() == ["consumer"], said
+    assert any("is not in this repository" in m for m in said)
+    # The repo that has the definition commit runs it.
+    log.unlink()
+    head = _git_out(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "y.txt", "y\n")
+    mine = push.check_list([{"run": HARNESS_PLAN.replace("a" * 40, head), "purpose": "harness"}])
+    assert push.publish(repo, "origin", "own", mine, say=said.append) == 0
+    assert log.read_text().split() == ["plan"]
 
 
 def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, capsys):

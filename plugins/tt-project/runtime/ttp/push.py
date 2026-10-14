@@ -665,15 +665,32 @@ def recorded_extras(recorded: dict | None, head: str, checks: list[Check]) -> li
     return [c for c in recorded.get("commands") or [] if c not in own]
 
 
+def foreign_harness_reason(repo: Path, check: Check) -> str | None:
+    """Why a `purpose: harness` check cannot apply in `repo`: the repository lacks its definition
+    commit, so the plan belongs to another repository (the harness's), e.g. when the project's
+    checks run in a worktree of a different repo. None for any other check, or when it has it."""
+    if getattr(check, "purpose", "") != "harness" or harness_plan_problem(str(check)):
+        return None
+    words = shlex.split(str(check))
+    sha = next((w.partition("=")[2] or words[i + 1] for i, w in enumerate(words)
+                if w.partition("=")[0] == "--definition-commit"), "")
+    if not sha or _git(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0:
+        return None
+    return f"its definition commit {sha[:12]} is not in this repository"
+
+
 def applicable(repo: Path, head: str, checks: list[Check], say: Callable[[str], None],
-               base: str = "") -> tuple[list[Check], list[str]]:
+               base: str = "", foreign_harness: bool = False) -> tuple[list[Check], list[str]]:
     """(checks to run on `head`, a `Skipped` line per check that does not apply there, each also said).
     `base` is the push target `if_changed` compares with. Callers treat "none to run" from a non-empty
-    list as a failure (NONE_APPLY), never as a pass, unless `outside_scope`. Raises ScopeError."""
+    list as a failure (NONE_APPLY), never as a pass, unless `outside_scope`. `foreign_harness` (the
+    candidate `ttp checks` and `ttp push --own`, never the push branch) also skips a harness check
+    whose definition commit `repo` lacks (foreign_harness_reason). Raises ScopeError."""
     todo, skipped = [], []
     for c in checks:
         changed = _changed_reason(repo, head, c, base)
-        why = changed or _scoped_exists_reason(repo, head, c, base)
+        why = (changed or _scoped_exists_reason(repo, head, c, base)
+               or (foreign_harness_reason(repo, c) if foreign_harness else None))
         if why:
             line = Skipped(skipped_line(c, why))
             line.scoped = bool(changed)
@@ -2340,7 +2357,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     try:
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
-            todo, skipped = applicable(repo, head, checks, say, base or "")
+            todo, skipped = applicable(repo, head, checks, say, base or "", foreign_harness=True)
         except ScopeError as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
