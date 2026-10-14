@@ -54,7 +54,19 @@ def load_site(path: Optional[Union[str, pathlib.Path]] = None) -> dict:
         raise SiteError(f"{p}: {e}") from None
 
 
+WRAPPER_HINT = ('missing version/boxes wrapper: the site file must look like '
+                '{"version": 1, "boxes": {"<alias>": {"route": ..., ...}}} (see site.md)')
+
+
+def missing_wrapper(site) -> bool:
+    """A file of bare box entries, without the {"version": 1, "boxes": {...}} wrapper."""
+    return isinstance(site, dict) and "boxes" not in site and "version" not in site and \
+        any(isinstance(v, dict) and "route" in v for v in site.values())
+
+
 def box_entry(site: dict, alias: str) -> dict:
+    if missing_wrapper(site):
+        raise SiteError(WRAPPER_HINT)
     boxes = site.get("boxes") if isinstance(site, dict) else None
     if not isinstance(boxes, dict) or not isinstance(boxes.get(alias), dict):
         raise SiteError(f"no box {alias!r} in the site file")
@@ -137,6 +149,8 @@ def check_site(site, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
     """(errors, warnings) for the whole site file."""
     if not isinstance(site, dict):
         return ["the site file is not a JSON object"], []
+    if missing_wrapper(site):
+        return [WRAPPER_HINT], []
     err: List[str] = []
     warn: List[str] = []
     if site.get("version") != 1:

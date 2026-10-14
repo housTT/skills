@@ -8,7 +8,8 @@
 # flags override them. Steps: 1 pick a free, non-draining machine; 2 reserve it; 3 ssh in through
 # the managed ssh include (ProxyJump); 4 clone a small public repo into a per-run worktree, edit
 # it, build a trivial target, run `tt-smi -s`; 5 extend once; 6 release and check `ird list`.
-# On any failure or Ctrl-C the trap releases the reservation this run made, and only that one.
+# Before step 2 it snapshots your reservations; on exit, failure, Ctrl-C or TERM the trap diffs
+# them again and releases every new one this run's box.py claimed, never one without that claim.
 # --dry-run runs step 1 only and prints the rest. Ends with a short report to paste back.
 # Needs bash 3.2+, python3 and ssh. Exit: 0 pass, 1 a step failed, 2 bad usage, 130 interrupted.
 
@@ -49,6 +50,7 @@ export TTP_PROJECT="ird-e2e" TTP_TASK="ird-e2e-$RUN_ID"
 unset TTP_RUN_DIR
 
 RID="" MACHINE="" REMOTE_ROOT="" RESERVING=0 STEP="setup" RESULT="" RELEASED="n/a"
+BEFORE_IDS="" RES_LINE=""
 NOTES=()
 
 say() { printf '%s\n' "$*"; }
@@ -68,7 +70,7 @@ report() {
       "$HERE/../../../.claude-plugin/plugin.json" 2>/dev/null || echo '?')  mode: $([ "$DRY" = 1 ] && echo dry-run || echo live)"
     say "pool: ${POOL:-?}  arch: ${ARCH:-?}  timeout: $TIMEOUT  repo: $REPO"
     for l in "${NOTES[@]+"${NOTES[@]}"}"; do say "$l"; done
-    say "reservation: ${RID:-none}  released: $RELEASED"
+    say "reservation: ${RES_LINE:-none}  released: $RELEASED"
     say "result: ${RESULT:-PASS}"
     say "--- end ---"
   } > "$REPORT"
@@ -77,23 +79,58 @@ report() {
   say "(saved to $REPORT)"
 }
 
+ids_of() { awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}'; }
+
+# Diff your reservations against the snapshot taken before step 2 and release each new one that
+# this run's box.py claimed (task $TTP_TASK). A new one without that claim is left alone, and said.
+cleanup_reservations() {
+  local st id m rest made="" rel="" n=0 one=""
+  if ! st=$(box ird status "$BOX" 2>&1); then
+    if [ -n "$RID" ] && [ "$RELEASED" != "yes" ]; then
+      say "releasing reservation $RID (made by this run) ..."
+      if box ird release "$BOX" "$RID"; then RELEASED="yes (by the trap)"
+      else RELEASED="NO: release it by hand: python3 $BOX_PY ird release $BOX $RID"; fi
+    else
+      RELEASED="unknown: box.py ird status failed; check python3 $BOX_PY ird status $BOX"
+    fi
+    return
+  fi
+  while read -r id m rest; do
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case " $BEFORE_IDS " in *" $id "*) continue ;; esac
+    n=$((n + 1)); one=$id; made="$made, $id on $m"
+    case "$rest" in
+      *"task='$TTP_TASK'"*)
+        say "releasing reservation $id (made by this run) ..."
+        if box ird release "$BOX" "$id"; then rel="$rel, $id yes (by the trap)"
+        else rel="$rel, $id NO: release it by hand: python3 $BOX_PY ird release $BOX $id"; fi ;;
+      *) rel="$rel, $id no: it has no claim of this run, so the trap leaves it alone; if it is yours, release it with ird release $id" ;;
+    esac
+  done <<< "$st"
+  if [ $n -gt 0 ]; then
+    RES_LINE=${made#, }
+    if [ $n -eq 1 ]; then RELEASED=${rel#, "$one" }; else RELEASED=${rel#, }; fi
+  elif [ -z "$RES_LINE" ] && grep -q '^released ' "$RUN_DIR/reserve.out" 2>/dev/null; then
+    RES_LINE="$(sed -n 's/^released \([0-9]*\) \([^ ]*\).*/\1 on \2/p' "$RUN_DIR/reserve.out" | head -n 1)"
+    RELEASED="yes (by box.py reserve, which was cut off)"
+  elif [ -n "$RID" ] && [ "$RELEASED" != "yes" ]; then
+    RELEASED="yes (gone from ird list)"
+  fi
+}
+
 on_exit() {
   local rc=$?
   trap '' INT TERM HUP
+  exec 1>&3 2>&4  # a signal during a redirected step runs this inside that redirect
   [ $rc -ne 0 ] && [ -z "$RESULT" ] && RESULT="FAIL at $STEP (exit $rc)"
   if [ -n "$REMOTE_ROOT" ]; then
     on_machine "rm -rf -- $(q "$REMOTE_ROOT")" >/dev/null 2>&1 || note "cleanup: could not remove $REMOTE_ROOT"
   fi
-  if [ -n "$RID" ] && [ "$RELEASED" != "yes" ]; then
-    say "releasing reservation $RID (made by this run) ..."
-    if box ird release "$BOX" "$RID"; then RELEASED="yes (by the trap)"
-    else RELEASED="NO: release it by hand: python3 $BOX_PY ird release $BOX $RID"; fi
-  elif [ "$RESERVING" = 1 ] && [ -z "$RID" ]; then
-    RELEASED="unknown: reserve did not finish; check python3 $BOX_PY ird status $BOX"
-  fi
+  [ "$RESERVING" = 1 ] && cleanup_reservations
   report
   exit $rc
 }
+exec 3>&1 4>&2
 trap on_exit EXIT
 trap 'RESULT="interrupted at $STEP"; exit 130' INT TERM HUP
 
@@ -106,11 +143,16 @@ cat > "$RUN_DIR/values.py" <<'PY'
 import json, os, sys
 src, alias, mgmt, pool, arch, workdir, out = sys.argv[1:]
 try:
-    boxes = json.load(open(os.path.expanduser(src))).get("boxes") or {}
+    data = json.load(open(os.path.expanduser(src)))
 except FileNotFoundError:
-    boxes = {}
+    data = {}
 except ValueError as e:
     sys.exit(f"site file {src} is not JSON: {e}")
+if isinstance(data, dict) and "boxes" not in data and "version" not in data and any(
+        isinstance(v, dict) and "route" in v for v in data.values()):
+    sys.exit(f"site file {src}: missing version/boxes wrapper: it must look like "
+             '{"version": 1, "boxes": {"<alias>": {"route": "ird", ...}}} (see site.md)')
+boxes = (data.get("boxes") if isinstance(data, dict) else None) or {}
 if not alias:
     ird = [k for k, v in boxes.items() if isinstance(v, dict) and v.get("route") == "ird"]
     if len(ird) == 1:
@@ -172,15 +214,23 @@ fi
 
 # --- 2 reserve ------------------------------------------------------------------------------------
 STEP="2 reserve"; T0=$(date +%s)
+# The snapshot the trap diffs against: never trust the reserve's exit code alone.
+SNAP=$(box ird status "$BOX") || fail "box.py ird status before reserving: $(printf '%s' "$SNAP" | tail -n 3)"
+BEFORE_IDS=$(printf '%s\n' "$SNAP" | ids_of)
+PICKED=$MACHINE
 RESERVING=1
-OUT=$(box "${RESERVE[@]}"); rc=$?
+box "${RESERVE[@]}" > "$RUN_DIR/reserve.out" 2>&1; rc=$?
+OUT=$(cat "$RUN_DIR/reserve.out")
 RID=$(printf '%s\n' "$OUT" | awk '$1 == "reserved" {print $2; exit}')
-case "$OUT" in *"made no reservation"*) RESERVING=0 ;; esac
-[ $rc -eq 0 ] && [ -n "$RID" ] || fail "box.py ird reserve (rc $rc): $(printf '%s' "$OUT" | tail -n 3)"
+while IFS= read -r l; do note "  $l"; done < <(printf '%s\n' "$OUT" | grep '^warning: ')
+[ $rc -eq 0 ] && [ -n "$RID" ] || fail "box.py ird reserve (rc $rc): $(printf '%s' "$OUT" | grep -v '^warning: ' | tail -n 3)"
 EXPIRES=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* expires=\([^ ]*\).*/\1/p')
 MACHINE=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* machine=\([^ ]*\).*/\1/p')
+RES_LINE="$RID on $MACHINE"
 ROW1=$(row_of "$RID")
-note "step 2 reserve: PASS id $RID on $MACHINE, expires $EXPIRES ($(( $(date +%s) - T0 ))s)"
+LANDED=""
+[ "$MACHINE" = "$PICKED" ] || LANDED=" (asked for $PICKED; using the machine ird reserved)"
+note "step 2 reserve: PASS id $RID on $MACHINE$LANDED, expires $EXPIRES ($(( $(date +%s) - T0 ))s)"
 note "  ird list row: ${ROW1:-<none>}"
 
 # --- 3 ssh in -------------------------------------------------------------------------------------

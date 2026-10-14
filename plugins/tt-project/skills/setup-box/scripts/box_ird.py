@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -336,6 +337,43 @@ def reserve_lock(wait: float):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+# Lines ird prints on stderr that say nothing about the reservation (home-directory ownership and
+# CA-bundle rehash on the management host): reported as warnings, never as the reserve's outcome.
+NOISE_RE = re.compile(r"^(chown: changing ownership of .*: Operation not permitted"
+                      r"|rehash: warning: skipping .*)$")
+COMPLETE_RE = re.compile(r"\bon\s+(\S+?):?\s+Reservation complete", re.I)
+
+
+def same_machine(a: str, b: str) -> bool:
+    """`a` and `b` name one machine: `ird list-machines` may print a site prefix that `ird list`
+    does not (or a domain suffix), so compare case-insensitively up to such a prefix or suffix."""
+    a, b = a.strip().lower(), b.strip().lower()
+    if not a or not b:
+        return False
+    if a == b or a.split(".")[0] == b.split(".")[0]:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return any(long_.endswith(sep + short) for sep in "-_.:/")
+
+
+class Interrupted(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def interruptible():
+    """SIGTERM and SIGHUP raise Interrupted (as Ctrl-C raises KeyboardInterrupt), so the reserve
+    can clean up whatever landed before it exits."""
+    def raise_(signum, _frame):
+        raise Interrupted(signal.Signals(signum).name)
+    old = {s: signal.signal(s, raise_) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
 def cmd_reserve(ctx: Ctx, args) -> int:
     m = TIMEOUT_RE.match(args.timeout)
     if not m:
@@ -344,16 +382,18 @@ def cmd_reserve(ctx: Ctx, args) -> int:
     if pool not in ctx.pools:
         raise IrdError(f"pool {pool!r} is not in ird.pools of the site file")
     if args.machine:
-        found = [x for x in ctx.machines() if x["machine"] == args.machine]
+        found = [x for x in ctx.machines() if same_machine(x["machine"], args.machine)]
         if not found:
             raise IrdError(f"no machine {args.machine} in ird list-machines")
         if found[0]["why"] and not found[0]["why"].startswith("busy"):
             raise IrdError(f"refused: {args.machine}: {found[0]['why']}")
-    with reserve_lock(args.wait):
+    with reserve_lock(args.wait), interruptible():
         return _reserve(ctx, args, m, pool)
 
 
 def _reserve(ctx: Ctx, args, m, pool: str) -> int:
+    # Never trust ird's exit code alone: it can fail after the reservation completed, or be cut
+    # off by a timeout or a signal. The diff of `ird list` against this snapshot decides.
     before = set(ctx.mine())
     argv = ["reserve", "--cluster", pool, "--timeout", args.timeout]
     if args.machine:
@@ -361,23 +401,75 @@ def _reserve(ctx: Ctx, args, m, pool: str) -> int:
     if args.ssh_port:
         argv += ["--ssh-port", str(args.ssh_port)]
     argv += ["--no-shell", args.arch]  # every flag before the arch positional
-    r = ctx.call(*argv, timeout=args.wait)
-    # Another reserve of the same user (another host, or by hand) may land meanwhile: keep only
-    # unclaimed new rows matching the request, and refuse to guess between several.
-    new = {k: v for k, v in ctx.mine().items() if k not in before and read_claim(ctx.alias, k) is None
-           and (not args.machine or v["machine"] == args.machine)
-           and (not args.ssh_port or v["port"] == str(args.ssh_port))}
-    if not new:
-        if r.returncode == 124:
-            raise IrdError(f"ird reserve timed out after {args.wait:g}s; the reservation may still land: "
-                           f"check `box.py ird status {ctx.alias}` and release what you do not use")
-        raise IrdError(f"ird reserve made no reservation (rc {r.returncode}): "
-                       f"{(r.stdout + r.stderr).strip()[-400:]}")
-    if len(new) > 1:
-        raise IrdError(f"refused: several new reservations of yours ({', '.join(sorted(new, key=int))}) "
-                       "appeared at once, so which one is this run's is unclear; no claim written. "
-                       f"Check `box.py ird status {ctx.alias}`, retry with --machine, and release what you do not use")
-    rid, row = next(iter(new.items()))
+    try:
+        r = ctx.call(*argv, timeout=args.wait)
+        text = r.stdout + "\n" + r.stderr
+        landed = [x.group(1) for x in COMPLETE_RE.finditer(text)]
+        rid, row, others = _pick_new(ctx, args, before, landed[-1] if landed else "")
+        if rid and r.returncode != 124:
+            expires = _claim(ctx, args, rid, row, pool, m)
+    except (KeyboardInterrupt, Interrupted) as e:
+        _abort(ctx, args, before, pool, m, f"interrupted ({e or 'SIGINT'})")
+        raise IrdError(f"interrupted during ird reserve ({e or 'SIGINT'})", 130)
+    warnings = [f"ird: {l.strip()}" for l in r.stderr.splitlines() if NOISE_RE.match(l.strip())]
+    if r.returncode == 124:
+        if rid:
+            done = _abort(ctx, args, before, pool, m, f"ird reserve timed out after {args.wait:g}s")
+            raise IrdError(f"ird reserve timed out after {args.wait:g}s; reservation {rid} on "
+                           f"{row['machine']} landed anyway: {done}")
+        raise IrdError(f"ird reserve timed out after {args.wait:g}s; the reservation may still land: "
+                       f"check `box.py ird status {ctx.alias}` and release what you do not use")
+    if not rid:
+        if others:
+            raise IrdError(_ambiguous(ctx, others))
+        rest = "\n".join(l for l in text.splitlines() if l.strip() and not NOISE_RE.match(l.strip()))
+        raise IrdError(f"ird reserve made no reservation (rc {r.returncode}): {rest.strip()[-400:]}")
+    for w in warnings:
+        print(f"warning: {w}")
+    if r.returncode:
+        print(f"warning: ird reserve exited {r.returncode}, but reservation {rid} is in ird list: claimed it")
+    if args.machine and not same_machine(row["machine"], args.machine):
+        print(f"warning: asked for {args.machine}, ird reserved {row['machine']}: use {row['machine']}")
+    print(f"reserved {rid} machine={row['machine']} port={row['port'] or '?'} expires={expires}")
+    hint = include_hint()
+    if hint:
+        print(hint)
+    return 0
+
+
+def _pick_new(ctx: Ctx, args, before: set, landed: str) -> Tuple[str, Optional[dict], Dict[str, dict]]:
+    """(id, row, {}) of this reserve's new reservation, or ('', None, candidates) when none or
+    several. New = in the caller's `ird list` now, not in the snapshot, with no claim yet. Another
+    reserve of the same user (another host, or by hand) may land meanwhile: narrow by the port
+    asked for, then the machine ird says it reserved, then the machine asked for; never guess."""
+    new = {k: v for k, v in ctx.mine().items() if k not in before and _unclaimed_or_ours(ctx, k)}
+    if args.ssh_port:
+        new = {k: v for k, v in new.items() if v["port"] == str(args.ssh_port)}
+    for name in (landed, args.machine):
+        if len(new) > 1 and name:
+            narrowed = {k: v for k, v in new.items() if same_machine(v["machine"], name)}
+            new = narrowed or new
+    if len(new) == 1:
+        rid, row = next(iter(new.items()))
+        return rid, row, {}
+    return "", None, new
+
+
+def _unclaimed_or_ours(ctx: Ctx, rid: str) -> bool:
+    """No claim yet, or the claim this very process wrote (a signal right after writing it)."""
+    c = read_claim(ctx.alias, rid)
+    return c is None or (c.get("host") == socket.gethostname() and c.get("reserver") == os.getpid())
+
+
+def _ambiguous(ctx: Ctx, rows: Dict[str, dict]) -> str:
+    listed = ", ".join(f"{k} on {v['machine']}" for k, v in sorted(rows.items(), key=lambda kv: int(kv[0])))
+    return (f"refused: several new reservations of yours ({listed}) appeared at once, so which one is "
+            f"this run's is unclear; no claim written and none released. Check `box.py ird status "
+            f"{ctx.alias}`, retry with --machine, and release by hand what you do not use")
+
+
+def _claim(ctx: Ctx, args, rid: str, row: dict, pool: str, m) -> str:
+    """Record the claim (and its ssh block) before anything reports or uses the reservation."""
     h, mi, s = map(int, m.groups())
     now = dt.datetime.now().astimezone()
     expires = (now + dt.timedelta(hours=h, minutes=mi, seconds=s)).isoformat(timespec="minutes")
@@ -386,13 +478,39 @@ def _reserve(ctx: Ctx, args, m, pool: str) -> int:
         "port": row["port"], "pool": pool, "arch": args.arch, "project": ctx.project,
         "task": ctx.task, "run_id": os.environ.get("TTP_RUN_ID", ""), "host": socket.gethostname(),
         "pid": owner_pid(args.pid), "reserved_at": now.isoformat(timespec="seconds"),
-        "heartbeat": time.time(), "expires": expires})
+        "heartbeat": time.time(), "expires": expires, "reserver": os.getpid()})
     write_ssh_block(rid, row["machine"], row["port"], ctx.mgmt)
-    print(f"reserved {rid} machine={row['machine']} port={row['port'] or '?'} expires={expires}")
-    hint = include_hint()
-    if hint:
-        print(hint)
-    return 0
+    return expires
+
+
+def _abort(ctx: Ctx, args, before: set, pool: str, m, why: str) -> str:
+    """The reserve is being abandoned: claim what it made (so the release passes the claim gate
+    and nothing unclaimed is touched), then release it. Signals wait until this is done."""
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        rid, row, others = _pick_new(ctx, args, before, "")
+        if not rid:
+            if others:
+                print(f"error: {_ambiguous(ctx, others)}")
+                return "not released (unclear which is this run's)"
+            print(f"{why}: no new reservation in ird list; if one lands later, "
+                  f"`box.py ird status {ctx.alias}` shows it")
+            return "none landed"
+        _claim(ctx, args, rid, row, pool, m)
+        print(f"{why}: reservation {rid} on {row['machine']} landed; releasing it")
+        try:
+            _release(ctx, rid)
+            print(f"released {rid} {row['machine']}")
+            return "released it"
+        except IrdError as e:
+            print(f"error: {e}; release it with `box.py ird release {ctx.alias} {rid}`")
+            return f"NOT released; release it with `box.py ird release {ctx.alias} {rid}`"
+    except IrdError as e:
+        print(f"error: {why}, and checking ird list failed: {e}; check `box.py ird status {ctx.alias}`")
+        return f"unknown; check `box.py ird status {ctx.alias}`"
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
 
 
 def cmd_extend(ctx: Ctx, args) -> int:
