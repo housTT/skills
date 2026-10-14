@@ -293,7 +293,9 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
 EXTRA_KEYS = {
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_coordinator_usd",
                "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
-    "coordinator": {"max_review_tasks_per_day", "charter_approval_days"},
+    # blocker_sweep_h, blocker_sweep_min_gap_h, review_backlog_h: the blocker sweep's timing (sweep.py).
+    "coordinator": {"max_review_tasks_per_day", "charter_approval_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
+                    "review_backlog_h"},
     "notify": {"slack_poll_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).

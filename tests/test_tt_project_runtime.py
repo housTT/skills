@@ -58344,3 +58344,10 @@ def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_t
     sweep.start(db, cfg, "every 6h", now + 14 * 3600)
     assert db.kv(sweep.STATE_KEY)["carried"] == []
     assert db.kv(sweep.STATE_KEY)["flags"] == {f"task:{a}": "no outcome at the last sweep"}
+
+
+def test_the_blocker_sweep_timing_keys_are_known_config_keys():
+    from ttp.project import unknown_key_hint
+    for key in ("blocker_sweep_h", "blocker_sweep_min_gap_h", "review_backlog_h"):
+        assert unknown_key_hint(f"coordinator.{key}") is None, key
+    assert unknown_key_hint("coordinator.blocker_sweep_hh")
