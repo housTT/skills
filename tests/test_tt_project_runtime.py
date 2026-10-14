@@ -60921,3 +60921,30 @@ def test_host_cycle_docs_pass_a_reason_and_tell_helpers_to_fsync():
             if "--until-reboot" in line and "ttp pause" in line:
                 assert "--reason" in line, (f, line)
     assert "fsync" in (root / "tt-project-harness/SKILL.md").read_text()
+
+
+def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_turn(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(RESTR_CHARTER)
+    said = db.post("in", "goals: as below", chat=None, channel="web", kind="user", provenance="web-session")
+    approved = " ".join(f"Keep docs page {i} generic, with no setup details." for i in range(45))
+    assert len(approved) > 2000
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": approved}
+    assert "matches 2" in coord.apply(p, [act], turn=1, user_turn=True, messages=[said])[0]
+    # A later turn rewords it: refused, with the approved text whole and the file that holds it.
+    err = coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)", "text": approved[:-1] + "!"}], turn=2)
+    assert len(err) == 1 and "was for other text" in err[0] and repr(approved) in err[0], err
+    [rec] = db.kv(coord.CHARTER_APPROVALS_KEY)
+    path = f"tt-project/state/charter-approved/{rec['id']}.txt"
+    assert path in err[0] and (p.root / path).read_text() == approved
+    # Both ways it reaches the next turn keep it whole: the rejected line and the immediate retry.
+    db.set_kv(coord.REJECTED_KEY, err)
+    ids = [r["id"] for r in db.q("SELECT id FROM events WHERE kind='charter_retry' AND status='queued'")]
+    assert len(ids) == 1
+    d = coord.digest(p, {}, ids, [])
+    assert d.count(repr(approved)) == 2 and "[cut]" not in d, d
+    # The same text resent: applied.
+    assert coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)"}], turn=13) == []
+    assert approved in p.charter_path.read_text()
