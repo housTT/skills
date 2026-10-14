@@ -99,7 +99,9 @@ Each field's rules are in the section named; the table only lists them.
   A `## Host` line in STATE names what was held at each recent reboot: when reboots keep hitting
   while one resource is in use, run its tasks `exclusive` until they stop.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run: rescope that way;
-  cancel and re-add only when the work must start over.
+  cancel and re-add only when the work must start over. Its `pr_branch`, `resources` and
+  `provider`/`model`/`effort` are refused while it runs: let it finish and `task_add` a follow-up
+  with `continues` (and `pr_branch` `""` to deliver to the push branch), or cancel and re-add it.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
 - Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
   as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project

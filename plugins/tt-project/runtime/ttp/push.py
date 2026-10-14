@@ -1159,7 +1159,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
-    Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched) is refused.
+    Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched) is
+    refused, unless the run was given a branch not its own that it was not told to deliver on
+    (_fresh): that fresh branch goes under its own name.
     Another task's ttp/t<id>-... branch the task only inherited is refused (foreign_pr_branch).
     With `--own-branch` (OWN_BRANCH_ENV) the task's own checked-out ttp/t<id>-... branch is published
     under its own name, never onto a pr_branch it carries.
@@ -1169,7 +1171,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
-    as_is = bool(m and task and m.group(1) == task and os.environ.get(OWN_BRANCH_ENV))
+    fresh = bool(m and task and m.group(1) == task and _fresh(p, task, branch))
+    as_is = bool(m and task and m.group(1) == task and (fresh or os.environ.get(OWN_BRANCH_ENV)))
     onto = _labelled(p, task, "pr_branch") if task and not as_is else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
     if m and task and m.group(1) == task and not notes and not as_is and (why := _switched(p, task, branch)):
@@ -1403,6 +1406,24 @@ def _switched(p: Project, task: str, branch: str) -> str:
     return (f"this worktree has {branch} checked out, but task #{task} delivers from {given}{to}: "
             f"--own publishes neither. Switch back to {given} (bring the commits over, e.g. "
             f"`git checkout {given} && git merge --ff-only {branch}`) and rerun")
+
+
+def _fresh(p: Project, task: str, branch: str) -> bool:
+    """Whether `branch`, one of task `task`'s own ttp/t<id>-... branches, is a fresh one the task made
+    off a branch its run was given that is not its own and that it was not told to deliver on (e.g.
+    one inherited through `continues`, when its spec asked for a new branch): neither that branch
+    nor its pr_branch is named in a `pr_branch:` line of its spec, and it is no fix of a PR's
+    findings (`pr_fix:`). It publishes under its own name, never onto either, and _switched does
+    not apply."""
+    t = _task_row(p, task) or {}
+    given = str(t.get("branch") or "")
+    mg = OWN_BRANCH.fullmatch(given)
+    if not given or given == branch or (mg and mg.group(1) == task):
+        return False
+    onto = _labelled(p, task, "pr_branch")
+    spec = str(t.get("spec") or "")
+    return not any(b and worktree.spec_names_pr_branch(spec, b) for b in (given, onto)) \
+        and not any(x.startswith("pr_fix:") for x in _labels(t))
 
 
 def _carries(p: Project, task: str, owner: str, branch: str) -> bool:

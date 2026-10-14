@@ -2342,24 +2342,26 @@ class Daemon:
 
     def _record_rejections(self, problems: list[str]) -> None:
         """Rejected actions reach the next turn's digest; they never start a turn by themselves.
-        A rejection repeated on consecutive turns is a harness problem and is recorded once."""
+        A rejection repeated on consecutive turns is a harness problem and is recorded once; the next
+        digest marks it as a repeat so it is not sent again as is."""
         db = self.p.db
         before = set(db.kv(coord.REJECTED_KEY, []) or [])
         db.set_kv(coord.REJECTED_KEY, problems)
+        db.set_kv(coord.AGAIN_KEY, [coord.rejection_key(x) for x in problems if x in before])
         if not problems:
             return
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500],
               json.dumps(problems), "handled"))
-        seen = db.kv("rejected_repeats", []) or []
+        seen = db.kv(coord.REPEATS_KEY, []) or []
         for x in problems:
-            key = hashlib.sha256(x.encode()).hexdigest()[:16]
+            key = coord.rejection_key(x)
             if x in before and key not in seen:
                 seen.append(key)
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                      (time.time(), "harness", "rejected_repeat", "normal",
                       f"The coordinator repeated an action that was rejected: {x}", "handled"))
-        db.set_kv("rejected_repeats", seen[-50:])
+        db.set_kv(coord.REPEATS_KEY, seen[-50:])
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db

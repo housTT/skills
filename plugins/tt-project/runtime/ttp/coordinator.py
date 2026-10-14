@@ -222,6 +222,9 @@ CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replac
 CHARTER_APPROVALS_KEY = "charter_approvals"
 CHARTER_APPROVAL_DAYS = 7.0
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
+REJECTED_REPLY_KEY = "rejected_after_reply"   # kv: that turn also sent the user a reply
+REPEATS_KEY = "rejected_repeats"   # kv: hashes of rejections already recorded as repeated (an event each, once)
+AGAIN_KEY = "rejected_again"   # kv: hashes of the last turn's rejections that repeat the turn before's
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
@@ -789,8 +792,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
         lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {text}")
     rejected = db.kv(REJECTED_KEY, []) or []
+    again = set(db.kv(AGAIN_KEY, []) or [])
+    told = " Your reply already went out: correct it in a reply only if it told the user otherwise." \
+        if rejected and db.kv(REJECTED_REPLY_KEY, False) else ""
     for x in rejected:
-        lines.append(f"- [your previous turn's action was rejected; fix or drop it] {x[:500]}")
+        tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
+            else "your previous turn's action was rejected; fix or drop it"
+        lines.append(f"- [{tag}] {x[:500]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     if not msg_ids and not event_ids and not rejected:
@@ -798,6 +806,11 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines.append("\nRespond with the JSON actions object only.")
     section("events", lines)
     return [(key, "\n".join(body)) for key, body in shown], shas
+
+
+def rejection_key(text: str) -> str:
+    """A rejected action's identity across turns (REPEATS_KEY, AGAIN_KEY)."""
+    return hashlib.sha256(str(text).encode()).hexdigest()[:16]
 
 
 def digest_size(parts: list[tuple[str, str]]) -> dict:
@@ -1795,11 +1808,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     if user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
     db.set_kv(NOTES_KEY, notes)
-    if problems and replies:
-        # The reply may say the work is under way; the user must not read that when it is not.
-        note = clip("; ".join(problems), 240)
-        db.x(f"UPDATE messages SET text=text||? WHERE id IN ({','.join('?' * len(replies))})",
-             [f"\n\n(not done: {note})", *replies])
+    # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
+    # already sent is corrected there by the coordinator itself, only when it told the user otherwise.
+    db.set_kv(REJECTED_REPLY_KEY, bool(problems and replies))
     return problems
 
 

@@ -16495,7 +16495,50 @@ def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, 
     assert "no task #999" not in coord.digest(p, {}, [], []), "a fixed rejection kept being shown"
 
 
-def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_then(env, monkeypatch):
+def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, monkeypatch):
+    """A rejected action never edits the reply the user reads: it reaches the next digest, which says
+    the reply already went out. The same rejection on consecutive turns is marked a repeat there
+    (not to be sent again as is) and recorded once; a running task's branch refusal names the remedy."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("busy", "s", kind="code")
+    p.db.update_task(tid, status="running")
+    bad = SimpleNamespace(structured={"actions": [
+        {"type": "reply", "text": "Moving it to the push branch.", "chat": "c1"},
+        {"type": "task_update", "id": tid, "pr_branch": ""}], "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    assert p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"] == "Moving it to the push branch."
+    [x] = p.db.kv(coord.REJECTED_KEY)
+    assert "is running" in x and "continues" in x, x
+    text = coord.digest(p, {}, [], [])
+    assert "action was rejected; fix or drop it" in text and "Your reply already went out" in text, text
+    assert "rejected again" not in text
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    text = coord.digest(p, {}, [], [])
+    assert "rejected again, as on the turn before: do not send it as is" in text, text
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE kind='reply' AND text LIKE '%not done%'")["n"] == 0
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    assert len(p.db.q("SELECT id FROM events WHERE kind='rejected_repeat'")) == 1
+    # Without a reply in the turn, nothing to correct is suggested.
+    quiet = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": 999, "status": "queued"}],
+                                        "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, quiet, "ok", {})
+    text = coord.digest(p, {}, [], [])
+    assert "no task #999" in text and "Your reply already went out" not in text and "rejected again" not in text
+
+
+def test_the_coordinator_prompt_states_the_running_task_rule_and_its_remedy():
+    prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    rule = prompt[prompt.index("for a running task reaches its worker mid-run"):][:400]
+    for part in ("`pr_branch`", "`resources`", "`provider`/`model`/`effort`", "refused while it runs",
+                 "`continues`", "`pr_branch` `\"\"`"):
+        assert part in rule, (part, rule)
+
+
+def test_the_task_cap_names_its_next_slot_and_wakes_then(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord, timefmt
     from ttp.daemon import Daemon
@@ -16515,7 +16558,7 @@ def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_the
     assert clock_text.endswith((" PDT", " PST")), clock_text
     assert len(problems) == 1 and f"next slot frees at {clock_text}," in problems[0], problems
     reply = p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"]
-    assert reply.startswith("Starting the fix now.") and "(not done: task_add: cap of 2 new tasks" in reply
+    assert reply == "Starting the fix now.", "a rejection was appended to the user's reply"
     assert abs(p.db.kv(coord.RETRY_WAKE_KEY)["at"] - free_at) < 1
     # A clean turn leaves its reply alone.
     assert coord.apply(p, [{"type": "reply", "text": "All fine.", "chat": "c1"}]) == []
@@ -37186,6 +37229,38 @@ def test_own_push_refuses_a_task_branch_other_than_the_one_its_run_was_given(env
     # Its notes branch still publishes itself.
     _git_out(repo, "checkout", "-q", "-B", f"ttp/t{plain}-notes")
     assert push.own_target(p, repo) == ("origin", f"ttp/t{plain}-notes")
+
+
+def test_own_push_publishes_a_fresh_own_branch_made_off_an_inherited_one(env, monkeypatch):
+    """A task given another task's branch it only inherited (through `continues`, no `pr_branch:` line
+    in its spec) whose spec asks for a fresh branch publishes its own ttp/t<id>-... branch under its
+    own name with `ttp push --own`, never onto the inherited one. Another task's branch stays refused,
+    and so does a second own branch when the given one is the task's own."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    owner = p.db.add_task("Earlier", "s", kind="code")
+    inherited = f"ttp/t{owner}-earlier"
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{inherited}")
+    theirs = _git_out(origin, "rev-parse", inherited)
+    p.db.update_task(owner, status="done", branch=inherited)
+    tid = p.db.add_task("Fresh", "start a new ttp/* branch from the named base", kind="code",
+                        labels=[f"continues:{owner}", f"pr_branch:{inherited}"])
+    p.db.update_task(tid, status="running", branch=inherited)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    fresh = f"ttp/t{tid}-from-base"
+    _git_out(repo, "checkout", "-q", "-B", fresh)
+    _commit(repo, "fresh.py", "x\n")
+    assert push.own_target(p, repo) == ("origin", fresh)
+    assert _git_out(origin, "rev-parse", inherited) == theirs
+    # Another task's branch checked out is still not this task's to publish.
+    _git_out(repo, "checkout", "-q", "-B", f"ttp/t{owner + 1000}-elsewhere")
+    with pytest.raises(ValueError, match="only this task's own branch"):
+        push.own_target(p, repo)
+    # Its spec naming the inherited branch makes it the one to deliver on: the fresh branch is refused.
+    p.db.update_task(tid, spec=f"pr_branch: {inherited}")
+    _git_out(repo, "checkout", "-q", fresh)
+    with pytest.raises(ValueError, match=rf"{re.escape(fresh)} checked out.*delivers from {re.escape(inherited)}"):
+        push.own_target(p, repo)
 
 
 def test_a_review_publishes_the_pr_branch_its_subject_carries_and_nothing_else(env, monkeypatch, capsys):
