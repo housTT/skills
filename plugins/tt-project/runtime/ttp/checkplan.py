@@ -101,6 +101,13 @@ def run(repo: Path, definition_commit: str | None, definition_path: str, purpose
         head = _read_git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
         if at_head:
             definition_commit = head
+        try:
+            found = _git(repo, "cat-file", "-e", f"{definition_commit}^{{commit}}")
+        except OSError as e:
+            raise PlanError(GIT_ERROR, f"git unavailable: {e}") from e
+        if found.returncode:
+            raise PlanError(INPUT_ERROR, f"definition commit {definition_commit} is not in repository {repo}; "
+                                         "a purpose harness check runs only in the harness repo")
         resolved = _read_git(repo, "rev-parse", "--verify", f"{definition_commit}^{{commit}}").decode().strip()
         if resolved != definition_commit:
             raise PlanError(IDENTITY_ERROR, "definition commit did not resolve exactly")

@@ -145,6 +145,18 @@ def test_check_plan_invalid_or_missing_coverage_never_passes(tmp_path, case):
     assert checkplan.run(repo, definition, "plan.json", "harness") == 66
 
 
+def test_check_plan_absent_definition_commit_names_commit_and_repo(tmp_path):
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    absent = "b" * 40
+    env = {**os.environ, "PYTHONPATH": str(RUNTIME)}
+    result = subprocess.run([sys.executable, "-m", "ttp", "check-plan", "--purpose", "harness",
+                             "--definition-commit", absent, "--definition-path", "checks/harness-plan.json"],
+                            cwd=repo, env=env, capture_output=True, text=True)
+    assert result.returncode == 66
+    assert f"definition commit {absent} is not in repository {repo.resolve()}" in result.stderr
+    assert "Needed a single revision" not in result.stderr
+
+
 def test_check_plan_keeps_all_required_commands_and_first_failure(tmp_path):
     from ttp import checkplan
     repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
