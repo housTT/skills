@@ -5194,11 +5194,12 @@ class Daemon:
         return results
 
     def _run_swept(self, r: dict, logged: dict, now: float) -> None:
-        """Log one sweep result for a worktree inside a run directory (worktree.run_worktrees) and
+        """Log one sweep result for a worktree inside a run directory (worktree.run_worktrees) or a stray
+        one elsewhere under the project root (worktree.stray_worktrees) and
         remember a kept one: rechecked after KEEP_RECHECK_S, a held one every sweep. `logged` (path ->
         the keep reason last logged) gives each reason one log line."""
-        key, what = r["path"], f"worktree {r['path']} of run {r['run'] or '?'}" + (
-            f" (task {r['task']})" if r["task"] else "")
+        key, what = r["path"], (f"stray worktree {r['path']} (task {r['task']})" if r.get("stray") else
+                                f"worktree {r['path']} of run {r['run'] or '?'}" + (f" (task {r['task']})" if r["task"] else ""))
         if r.get("archived"):
             ar = r["archived"]
             log(self.p, f"{what}: archived {ar['files']} file(s) ({ar['bytes'] / 1e6:.1f} MB) to {ar['dir']}")

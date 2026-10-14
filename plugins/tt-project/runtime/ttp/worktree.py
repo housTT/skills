@@ -742,6 +742,125 @@ def run_worktrees(p: Project) -> list[dict]:
     return sorted(out, key=lambda w: str(w["path"]))
 
 
+STRAY_NAME = re.compile(r"(?:wt-|t|r)(\d+)(?!\d)")   # a stray worktree's folder name: its task id first
+STRAY_ARCHIVE_DIR = "archive/worktrees"   # under state/: a stray worktree's dirty files, by folder name
+STRAY_ARCHIVE_MAX_MB = 5   # a stray worktree with more dirty files than this is kept, not archived
+
+
+def stray_worktrees(p: Project) -> list[dict]:
+    """Linked worktrees under the project root that neither the task sweep (worktrees/t<id>) nor the
+    run-directory sweep (run_worktrees) looks at: ones workers made elsewhere (state/worktrees/t<id>,
+    state/wt-<id>, worktrees/t<id>-review or r<id>, <repo>/.wt/t<id>). Found from git's records of
+    the project's repository and of each repository directly in the project root; nothing else is
+    scanned. Only a folder whose name starts with t, r or wt- and a number counts: that number is
+    its task's id. Left out: the harness's own worktrees and anything inside another tt-project
+    project's folder. Each is {"path", "repo", "task" (the id), "rec" (git's record, see _records)};
+    a repository whose git fails is skipped."""
+    root = p.root.resolve()
+    base, runs, own = p.base.resolve(), p.runs.resolve(), p.worktrees.resolve()
+    repos = {root} if is_git(root) else set()
+    try:
+        repos |= {Path(d.path) for d in os.scandir(root) if d.is_dir(follow_symlinks=False)
+                  and Path(d.path) != base and os.path.isdir(os.path.join(d.path, ".git"))}
+    except OSError:
+        pass
+    out, seen = [], set()
+    for repo in sorted(repos):
+        try:
+            recs = _records(p, repo)
+        except Exception:
+            continue
+        for rec in recs.values():
+            path = Path(rec["path"]).resolve()
+            m = STRAY_NAME.match(path.name)
+            if (rec["prunable"] or not m or path in seen or path == repo or root not in path.parents
+                    or runs in path.parents or (path.parent == own and re.fullmatch(r"t\d+", path.name))
+                    or (p.state.resolve() / "harness-worktrees") in path.parents):
+                continue
+            # Another project's folder below this root (<dir>/tt-project) holds its own tasks' worktrees.
+            if base not in path.parents and any((a / base.name).is_dir() for a in path.parents if root in a.parents):
+                continue
+            seen.add(path)
+            out.append({"path": path, "repo": repo, "task": int(m.group(1)), "rec": rec})
+    return sorted(out, key=lambda w: str(w["path"]))
+
+
+def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_than_s: float,
+                 entries: list, dry_run: bool) -> dict:
+    """Sweep one stray worktree (see stray_worktrees): it goes once its task is done or cancelled, no
+    run, process or other task holds it (held_by) and its HEAD is on a remote branch. Its dirty files
+    (changed tracked and untracked ones, and hand-off artifacts) are first copied to
+    state/archive/worktrees/<folder name>/ with a patch of the tracked changes, when they total at
+    most STRAY_ARCHIVE_MAX_MB; more keeps it. A worktree of an open task is never touched."""
+    from .db import TERMINAL_TASK_STATES
+    path, rec = w["path"], w["rec"]
+    task = p.db.task(w["task"])
+    res = {"task": w["task"], "run": None, "stray": True, "path": str(path),
+           "branch": rec["branch"] or (task or {}).get("branch"), "status": (task or {}).get("status") or "?",
+           "updated": (task or {}).get("updated"), "cleared": []}
+    held = None
+    if task is None:
+        why = f"no task #{w['task']} in this project"
+    elif task["status"] not in TERMINAL_TASK_STATES:
+        why = held = f"its task #{task['id']} ({task['status']}) is still open"
+    elif task["status"] not in ("done", "cancelled"):
+        why = f"its task #{task['id']} {task['status']}: only a done or cancelled task's stray worktree goes"
+    elif now - float(task["updated"] or now) < older_than_s:
+        why = held = "its task ended within disk.worktree_retention_days"
+    elif p.db.one("SELECT id FROM runs WHERE task=? AND status='running' LIMIT 1", (task["id"],)):
+        why = held = f"a run of task #{task['id']} is still going"
+    else:
+        why = held = held_by(p, task, open_tasks, now, path=path)
+    users = [] if why else _users(path)
+    if users:
+        why = held = f"process {users[0]} runs in it" + (f" (+{len(users) - 1} more)" if len(users) > 1 else "")
+    if why:
+        return {**res, "why": why, **({"held": True} if held else {})}
+    if rec["locked"] is not None:
+        return {**res, "why": f"locked ({rec['locked'] or 'no reason given'})"}
+    if not is_git(path):
+        return {**res, "why": "not a git checkout"}
+    head = _git(path, "rev-parse", "HEAD", check=False).strip()
+    if not _git(path, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/remotes", check=False).strip():
+        return {**res, "why": "its HEAD is on no remote branch"}
+    info = inspect(path)
+    if info["why"] and not info["dirty"]:   # submodules, or git failed
+        return {**res, "why": info["why"]}
+    tracked = [f for f in _git(path, "diff", "HEAD", "--name-only", "-z", check=False).split("\0") if f]
+    untracked = [f for f in _git(path, "ls-files", "--others", "--exclude-standard", "-z", check=False).split("\0") if f]
+    arts = handoff_artifacts(p, w["task"], path, entries=entries)
+    files = [f for f in dict.fromkeys(tracked + untracked + arts) if (path / f).exists() or (path / f).is_symlink()]
+    if tracked or files:
+        size = _size(path, files)
+        if size > STRAY_ARCHIVE_MAX_MB * 1e6:
+            return {**res, "why": f"{len(files)} uncommitted file(s) of {size / 1e6:.1f} MB, over the "
+                                  f"{STRAY_ARCHIVE_MAX_MB} MB archived before a stray worktree goes"}
+        dest = p.state / STRAY_ARCHIVE_DIR / path.name
+        n = 1
+        while dest.exists():
+            dest, n = p.state / STRAY_ARCHIVE_DIR / f"{path.name}.{n}", n + 1
+        res["archived"] = {"files": len(files), "bytes": size, "dir": str(dest), "dropped": 0, "dropped_bytes": 0}
+        if not dry_run:
+            dest.mkdir(parents=True)
+            for f in files:
+                src, to = path / f, dest / "files" / f
+                to.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir() and not src.is_symlink():
+                    shutil.copytree(src, to, symlinks=True)
+                else:
+                    shutil.copy2(src, to, follow_symlinks=False)
+            if tracked:
+                patch = subprocess.run(["git", "-C", str(path), "diff", "HEAD", "--binary"], capture_output=True,
+                                       timeout=300, check=True).stdout
+                (dest / "tracked.patch").write_bytes(patch)
+            (dest / "manifest.json").write_text(json.dumps(
+                {"path": str(path), "repo": str(w["repo"]), "task": w["task"], "branch": res["branch"], "head": head,
+                 "tracked": tracked, "files": files, "bytes": size, "at": now}, indent=1))
+    if not dry_run:
+        remove_path(w["repo"], path, force=bool(tracked or files))
+    return {**res, "why": None}
+
+
 def keep_reason(path: Path) -> str | None:
     """Why this worktree must stay, or None when removing it loses nothing: no submodules set up in
     it, no uncommitted or untracked files, and its HEAD is on a local or remote branch (the task's
@@ -1138,7 +1257,9 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     (paths) and `fingerprint`. A stale lock git or the harness set (HARNESS_LOCKS: a `git worktree
     add` that never finished) is cleared (`unlocked`); a half-made worktree goes. Any other lock keeps
     the worktree. Branches stay, so a task that `continues` one starts from its commits. `dry_run`
-    changes nothing and reports what a sweep would do (`why` None: it would go). One sweep at a time
+    changes nothing and reports what a sweep would do (`why` None: it would go). Worktrees workers made
+    elsewhere under the project root (stray_worktrees) are swept last (_sweep_stray), reported with
+    `stray` set (and `run` None; `skip_run(w)` leaves one out). One sweep at a time
     per project; a busy lock returns no results.
     Removing, unlocking and clearing caches is cheap and always done. Archiving (hashing, compressing,
     patching) is the costly part: `archive_limit` caps how many worktrees one call archives, and none
@@ -1311,6 +1432,17 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             except Exception as e:
                 res["why"] = f"error: {e}"[:300]
             out.append(res)
+        for w in stray_worktrees(p):
+            if skip_run(w):
+                continue
+            progress()
+            entries = handoff_paths(p) if entries is None else entries
+            try:
+                out.append(_sweep_stray(p, w, open_tasks, now, older_than_s, entries, dry_run))
+            except Exception as e:
+                out.append({"task": w["task"], "run": None, "stray": True, "path": str(w["path"]),
+                            "branch": w["rec"]["branch"], "status": "?", "updated": None, "cleared": [],
+                            "why": f"error: {e}"[:300]})
         return out
     finally:
         os.close(fd)

@@ -16573,6 +16573,108 @@ def test_run_directory_worktrees_go_when_finished_and_clean_and_stay_with_a_reas
     assert (p.runs / str(clean_run)).is_dir(), "the run directory itself stays"
 
 
+def test_stray_worktrees_of_finished_tasks_go_and_open_tasks_keep_theirs(env, tmp_path):
+    """Note 7a885770f745d36e: worktrees workers made outside worktrees/t<id> and run directories
+    (state/worktrees/t<id>, state/wt-<id>, worktrees/t<id>-review, <repo>/.wt/r<id>) were never swept.
+    Found from git's records and mapped to a task by their folder name, a done or cancelled task's
+    one whose HEAD is on a remote branch goes, its small dirty files archived first; an open task's,
+    a failed task's, one with commits on no remote branch and one with too many dirty files stay."""
+    import json
+    import subprocess as sp
+    from pathlib import Path
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    root = p.root
+    remote = tmp_path / "remote.git"
+    sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git_out(root, "remote", "add", "origin", str(remote))
+    _git_out(root, "push", "-q", "origin", "HEAD:refs/heads/main")
+    _git_out(root, "fetch", "-q", "origin")
+
+    def task(status):
+        t = p.db.add_task(f"a {status} task", "s", kind="code", tier="light", origin="user")
+        p.db.update_task(t, status=status)
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (1.0, t))
+        return t
+
+    def add(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _git_out(root, "worktree", "add", "-q", "--detach", str(path))
+        return path
+    clean, dirty, local, big = task("done"), task("done"), task("done"), task("done")
+    cancelled, open_, failed, own = task("cancelled"), task("waiting"), task("failed"), task("done")
+    w_clean = add(p.state / "worktrees" / f"t{clean}")
+    w_dirty = add(p.state / f"wt-{dirty}")
+    readme = next(f for f in w_dirty.iterdir() if f.is_file() and f.name != ".git")
+    readme.write_text("edited, never committed\n")
+    (w_dirty / "notes.txt").write_text("a small untracked file")
+    w_review = add(p.worktrees / f"t{cancelled}-review")
+    w_open = add(root / ".wt" / f"r{open_}")
+    (w_open / "wip.txt").write_text("work in progress")
+    w_local = add(p.state / "worktrees" / f"t{local}")
+    (w_local / "new.txt").write_text("x")
+    _git_out(w_local, "add", "new.txt")
+    _git_out(w_local, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "local only")
+    w_big = add(p.state / "worktrees" / f"t{big}")
+    (w_big / "big.bin").write_bytes(b"0" * (worktree.STRAY_ARCHIVE_MAX_MB * 10 ** 6 + 1))
+    w_failed = add(p.state / "worktrees" / f"t{failed}")
+    w_own = add(p.worktrees / f"t{own}")             # the task sweep's own: not a stray
+    w_name = add(p.state / "scratch" / "notes")      # no task id in its name
+    (root / "sub" / p.base.name).mkdir(parents=True)  # another project's folder below this root
+    w_other = add(root / "sub" / "wt" / f"t{clean}")
+    found = {w["path"]: w["task"] for w in worktree.stray_worktrees(p)}
+    want = {w_clean: clean, w_dirty: dirty, w_review: cancelled, w_open: open_, w_local: local, w_big: big,
+            w_failed: failed}
+    assert found == {k.resolve(): v for k, v in want.items()}, found
+    assert w_own.resolve() not in found and w_name.resolve() not in found and w_other.resolve() not in found
+
+    dry = {Path(r["path"]): r for r in worktree.sweep(p, dry_run=True) if r.get("stray")}
+    assert dry[w_clean.resolve()]["why"] is None and dry[w_dirty.resolve()]["why"] is None
+    assert all(w.exists() for w in want), "a dry run removed one"
+    assert not (p.state / worktree.STRAY_ARCHIVE_DIR).exists(), "a dry run archived"
+
+    d = Daemon(p.base)
+    res = {Path(r["path"]): r for r in d.prune_worktrees(every_s=0, force=True) if r.get("stray")}
+    assert set(res) == {k.resolve() for k in want}, res
+    for gone in (w_clean, w_dirty, w_review):
+        assert res[gone.resolve()]["why"] is None and not gone.exists(), res[gone.resolve()]
+    ar = p.state / worktree.STRAY_ARCHIVE_DIR / w_dirty.name
+    assert res[w_dirty.resolve()]["archived"]["dir"] == str(ar)
+    assert (ar / "files" / "notes.txt").read_text() == "a small untracked file"
+    assert (ar / "files" / readme.name).read_text() == "edited, never committed\n"
+    assert readme.name in (ar / "tracked.patch").read_text()
+    man = json.loads((ar / "manifest.json").read_text())
+    assert man["task"] == dirty and set(man["files"]) == {"notes.txt", readme.name} and man["tracked"] == [readme.name]
+    assert res[w_open.resolve()]["held"] and f"task #{open_} (waiting) is still open" in res[w_open.resolve()]["why"]
+    assert "no remote branch" in res[w_local.resolve()]["why"]
+    assert f"over the {worktree.STRAY_ARCHIVE_MAX_MB} MB" in res[w_big.resolve()]["why"]
+    assert f"#{failed} failed" in res[w_failed.resolve()]["why"]
+    assert all(w.exists() for w in (w_open, w_local, w_big, w_failed, w_name, w_other))
+    assert (w_open / "wip.txt").read_text() == "work in progress"
+    listed = _git_out(root, "worktree", "list")
+    assert str(w_clean) not in listed and str(w_dirty) not in listed and str(w_open) in listed
+    log = (p.logs / "daemon.log").read_text()
+    assert f"stray worktree {w_clean.resolve()} (task {clean}) removed" in log, log
+    assert f"stray worktree {w_dirty.resolve()} (task {dirty}): archived 2 file(s)" in log, log
+
+
+def test_stray_worktrees_of_a_repository_in_the_project_root_are_found(env):
+    """A repository directly in the project root (<repo>/.wt/t<id>) is asked for its worktrees too."""
+    p = make(env)
+    from ttp import worktree
+    lib = p.root / "lib"
+    lib.mkdir()
+    _git_out(lib, "init", "-q")
+    (lib / "a.txt").write_text("a")
+    _git_out(lib, "add", "a.txt")
+    _git_out(lib, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "first")
+    t = p.db.add_task("done", "s", kind="code", tier="light", origin="user")
+    _git_out(lib, "worktree", "add", "-q", "--detach", str(lib / ".wt" / f"t{t}"))
+    got = worktree.stray_worktrees(p)
+    assert [(w["path"], w["repo"], w["task"]) for w in got] == [((lib / ".wt" / f"t{t}").resolve(), lib.resolve(), t)]
+
+
 def _big_artifact_runs(p, contents, name="model.out"):
     """A done task with one finished run worktree per content, each leaving an ignored hand-off artifact."""
     import json

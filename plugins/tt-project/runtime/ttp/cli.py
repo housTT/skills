@@ -3248,7 +3248,8 @@ def cmd_prune(a) -> None:
             moved += f"{'would save' if dry else 'saved'} its {len(r['patched'])} changed tracked file(s) as a verified patch; "
         if r.get("unlocked") is not None:
             moved += f"{'would clear' if dry else 'cleared'} its stale lock ({r['unlocked'] or 'no reason'}); "
-        who = (f"run {r['run'] or '?'}'s worktree {r['path']}" + (f" (#{r['task']})" if r["task"] else "")
+        who = (f"stray worktree {r['path']} (#{r['task']})" if r.get("stray") else
+               f"run {r['run'] or '?'}'s worktree {r['path']}" + (f" (#{r['task']})" if r["task"] else "")
                if "run" in r else f"#{r['task']}")
         print(f"{who} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
                                                    + (r["branch"] or "?") + " kept"
