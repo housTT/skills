@@ -7176,11 +7176,15 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
                            turn=turn, user_turn=True)
     for k, (ban, text) in enumerate((
             ("Never let workers push to main.", "Workers may push to the work branch."),
-            ("Never let workers touch the shared folder.", "Workers may push to their own branch."),
             ("Never let workers delete files on the shared box.", "Workers may write logs to their run folder."))):
         assert lint(ban, text) == [], text
         # The guard (one resend) flags the same action on another target; the lint does not.
         assert "`both_hold`: true" in guard(ban, text, 10 + k)[0], text
+    # A generic verb ("touch") names no action: without a shared object nothing is flagged.
+    ban, text = "Never let workers touch the shared folder.", "Workers may push to their own branch."
+    assert lint(ban, text) == [] and guard(ban, text, 15) == [], text
+    ban, text = "Never let workers touch the shared folder.", "Workers may push to the shared folder."
+    assert f"\"{ban}\" (section 'Restrictions')" in guard(ban, text, 16)[0], text
     for k, (ban, text) in enumerate((
             ("Never let workers push to main.", "Workers may push to main."),
             ("Never push to main.", "Only after review may the coordinator push to main."),
