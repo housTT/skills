@@ -3313,6 +3313,11 @@ def cmd_memory(a) -> None:
     for dst in done:
         print(f"retired to {dst}")
     memory_budget_check(p)
+    if spaced := [n for n in a.forget or [] if len(n.split()) > 1]:
+        # --forget takes every word after it, so text written after it was read as an entry name.
+        errors.append(f"{spaced[0]!r} is no entry name (names have no spaces): --forget takes every word "
+                      f"after it as a name, so put the memory's text before it: "
+                      f"ttp memory {p.name} \"<text>\" --forget <entry>")
     if errors:
         sys.exit("\n".join(errors))
 
@@ -5435,7 +5440,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
                    help="retire entries (names in [brackets]) to memory/archive/: several names after one "
                         "--forget, or the flag repeated, make one harness commit; an unknown name is "
-                        "reported and the others are still retired")
+                        "reported and the others are still retired. It takes every word after it, so "
+                        "give the text first: ttp memory <name> \"<text>\" --forget <entry>")
     s.add_argument("--standing", action="store_true",
                    help="an instruction that applies every time its case comes up (kept as a preference); "
                         "one finished instance never retires it")

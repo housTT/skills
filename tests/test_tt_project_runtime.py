@@ -21477,6 +21477,27 @@ def test_memory_cli_reports_an_unknown_name_and_still_retires_the_others(env):
     assert done == [] and len(errors) == 1
 
 
+def test_memory_cli_says_to_put_the_text_before_forget_when_a_name_has_spaces(env):
+    """`ttp memory demo --forget old "new fact"`: --forget takes every word after it, so the new fact was
+    read as an entry name; the old entry still retires, and the error says to give the text first."""
+    p = make(env)
+    old = p.add_memory("Old news.", kind="fact")
+    from ttp import cli
+    with pytest.raises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", old.stem, "The new fact."])
+    msg = str(e.value)
+    assert "no memory entry 'The new fact.'" in msg
+    assert "put the memory's text before it" in msg and 'ttp memory demo "<text>" --forget <entry>' in msg
+    assert not old.exists() and "The new fact" not in p.memory_text()
+    # Text first works; a name without spaces gets no such hint.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "The new fact.", "--forget", old.stem])
+    assert "The new fact." in p.memory_text()
+    with pytest.raises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", "no-such-entry"])
+    assert "before it" not in str(e.value)
+
+
 def test_a_standing_entry_is_refused_retirement_without_a_why(env):
     p = make(env)
     from ttp import cli, coordinator as coord
