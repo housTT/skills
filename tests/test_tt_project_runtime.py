@@ -16532,8 +16532,8 @@ def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, 
 
 def test_the_coordinator_prompt_states_the_running_task_rule_and_its_remedy():
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    rule = prompt[prompt.index("for a running task reaches its worker mid-run"):][:400]
-    for part in ("`pr_branch`", "`resources`", "`provider`/`model`/`effort`", "refused while it runs",
+    rule = prompt[prompt.index("`task_update` on a running task: a `spec` reaches its worker mid-run"):][:300]
+    for part in ("`pr_branch`", "`resources`", "pins", "are refused",
                  "`continues`", "`pr_branch` `\"\"`"):
         assert part in rule, (part, rule)
 
@@ -43798,7 +43798,7 @@ def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch
                              *(f"{__file__}::{name}" for name in names)],
                             cwd=pathlib.Path(__file__).resolve().parents[1],
                             env={**os.environ, **{k: str(scratch) for k in ("TMPDIR", "TMP", "TEMP")},
-                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=120)
+                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

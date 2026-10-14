@@ -28,7 +28,7 @@ Each field's rules are in the section named; the table only lists them.
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5; optional `reply_chat`, `depends_on`, `budget_usd`, `resources`, `exclusive`, `user_deep` (the user asked for `deep`), `continues`, `start_after` / `start_when` + `why`, `force`, pins `provider` / `model` / `effort` / `pin_required` (all in Tasks) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (not while it runs), `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: it carries no branch; before it starts), `provider`/`model`/`effort` (`""` clears one; not while it runs), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>`; the daemon requeues it once that is over) | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: no branch), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>`; the daemon requeues it once that is over) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `classify`, `least_disruptive` (Decide; do not wait) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know (a worker's `ttp notify`, low or normal, is already sent: never resend it) |
@@ -93,16 +93,15 @@ Each field's rules are in the section named; the table only lists them.
   a match with open or 14-day work, naming it: update or continue it; if the work really differs,
   resend with `force: true` and `differs from #<id>: <how>` in the spec.
 - On a plan, unused capacity is lost at each reset: when slots are free and the plan is below its
-  line, add independent tasks, split so pieces run side by side.
+  line, add independent tasks that run side by side.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`; the
   worker locks it per command. Set `exclusive: true` only when the whole task must hold it alone.
   A `## Host` line in STATE names what was held at each recent reboot: when reboots keep hitting
   while one resource is in use, run its tasks `exclusive` until they stop.
-- A `spec` sent in `task_update` for a running task reaches its worker mid-run: rescope that way;
-  cancel and re-add only when the work must start over. Its `pr_branch`, `resources` and
-  `provider`/`model`/`effort` are refused while it runs: let it finish and `task_add` a follow-up
-  with `continues` (and `pr_branch` `""` to deliver to the push branch), or cancel and re-add it.
-- A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- `task_update` on a running task: a `spec` reaches its worker mid-run (cancel and re-add only to
+  start over); `pr_branch`, `resources` and pins are refused: `task_add` one with `continues`
+  (`pr_branch` `""`: push branch).
+- A task whose resource is busy comes back `waiting` and retries itself; do not re-add it.
 - Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
   as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project
   root: exit 0 = start; 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet; any other exit
@@ -111,7 +110,7 @@ Each field's rules are in the section named; the table only lists them.
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
   entries a deferred follow-up replaces in the same turn.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status),
-  never a marker file a box going down leaves behind.
+  never a marker file a dead box leaves behind.
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
 <!-- ttp:if push_branch -->
