@@ -46,6 +46,7 @@ DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
 SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
+MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
@@ -785,8 +786,8 @@ class Batch:
     def _close(self, k: int, outcome: str, carried: list | None = None, failed: tuple | None = None) -> str:
         """Settle every entry once the first `k` carried entries are pushed: the one after them is
         check_failed when `failed` names its failure, and later ones are requeued; one whose replay
-        settled a conflict by taking both sides' changes ("hunks") is sent back as a conflict instead,
-        as that merge may be what fails. An entry that added nothing on top of carried entries (a
+        settled a conflict by keeping both sides' changes (MERGED_KINDS) is sent back as a conflict
+        instead, as that merge may be what fails: such a settlement is kept only when the checks pass. An entry that added nothing on top of carried entries (a
         rider), or conflicted with them, follows them: if they did not go, it is requeued, as it may
         apply to the tip as it is."""
         for n, (i, h) in enumerate(carried or [], 1):
@@ -794,9 +795,9 @@ class Batch:
                 self._set(i, "pushed")
                 self.landed_at[i] = h
             elif n == k + 1 and failed and failed[0] not in (STALE, push.NONE_APPLY) \
-                    and "hunks" in self.settled.get(i, {}).get("settled_by", []):
-                say(f"entry {self.entries[i].get('id')}: its checks failed after the batch merged changes of "
-                    "different lines; sent back for a rebase")
+                    and MERGED_KINDS & set(self.settled.get(i, {}).get("settled_by", [])):
+                say(f"entry {self.entries[i].get('id')}: its checks failed after the batch merged both sides' "
+                    "changes; sent back for a rebase")
                 self._set(i, "conflict", files=self.settled[i]["settled"], cmd=failed[0], tail=failed[1])
             elif n == k + 1 and failed:
                 self._set(i, "check_failed", cmd=failed[0], tail=failed[1])

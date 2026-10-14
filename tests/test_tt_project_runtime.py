@@ -23933,6 +23933,33 @@ def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(e
     assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
 
 
+@pytest.mark.parametrize("passes", [True, False])
+def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(env, monkeypatch, passes):
+    """Two changes each append a new test function at the end of one test file: a conflict to git
+    that the batch settles without a model by keeping both. With checks that pass on the result both
+    land; when the checks fail only on the merged file, the second entry goes back as a conflict (for
+    a rebase), not check_failed, and the first lands alone."""
+    check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    _commit(other, "test_x.py", "def test_base():\n    assert True\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"test_x.py": "def test_base():\n    assert True\n\n\ndef test_one():\n    pass\n"}),
+             _entry(repo, "e2", {"test_x.py": "def test_base():\n    assert True\n\n\ndef test_two():\n    pass\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed", m
+    landed = _git_out(origin, "show", "proj:test_x.py")
+    if passes:
+        assert _statuses(m) == ["pushed", "pushed"]
+        assert m["results"][1]["detail"] == {"settled": ["test_x.py"], "settled_by": ["added"]}
+        assert "def test_one" in landed and "def test_two" in landed
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        d = m["results"][1]["detail"]
+        assert d["files"] == ["test_x.py"] and d["settled_by"] == ["added"] and d["cmd"] == check, d
+        assert "def test_one" in landed and "def test_two" not in landed
+        assert m["conflicts"]["sent_back"] == 1 and m["conflicts"]["auto_resolved"] == 0
+
+
 def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkeypatch):
     """An entry that conflicts with one that then fails its checks is requeued, and still counts as
     conflicted; a rebase that stops without a conflict is sent back but counts as none."""
@@ -25175,7 +25202,7 @@ def test_a_push_conflict_from_failed_checks_after_a_hunks_merge_names_the_check(
     _pq_batch(s)
     _pq_tend(s)
     woke = json.loads(s.p.db.task(s.review)["result"])["woke"]
-    assert "its checks failed after the batch merged changes of different lines: pytest -q" in woke, woke
+    assert "its checks failed after the batch merged both sides' changes: pytest -q" in woke, woke
     assert "assert 1 == 2" in woke
 
 
@@ -25199,6 +25226,64 @@ def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_lan
     assert t["status"] == "pushing"
     [q] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_queued"]
     assert "settle the conflict" in q["text"] and q["status"] == "handled"
+
+
+def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_reaches_the_coordinator(env, monkeypatch):
+    """A review whose approved head conflicts on its last attempt does not fail to the coordinator: the
+    daemon queues one review that continues it and rebases that head (labelled with it), and the
+    rebase may approve a commit it made. Tending again queues no second one. When the rebase's own
+    head keeps conflicting, it fails to the coordinator as before, with no third task."""
+    s = _pq(env, monkeypatch)
+    onto = "ef" * 20
+    s.p.db.update_task(s.review, max_attempts=1)
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["tests/test_a.py"], "onto": onto})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    _pq_tend(s)
+    rebases = s.p.db.q("SELECT * FROM tasks WHERE labels LIKE '%push_rebase:%'")
+    assert len(rebases) == 1, rebases
+    rb = rebases[0]
+    t = s.p.db.task(s.review)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["auto_rebase"] == rb["id"], res
+    assert "rebase" in rb["title"].lower() and rb["kind"] == "review" and rb["status"] == "queued"
+    assert json.loads(rb["labels"]) == [f"continues:{s.review}", f"push_rebase:{s.head}"]
+    assert json.loads(rb["depends_on"]) == [s.code] and s.branch in rb["spec"] and s.head in rb["spec"]
+    assert "push conflict" in rb["spec"] and "delivery.push_checks" in rb["spec"]
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
+    assert ev["status"] == "handled" and f"queued #{rb['id']}" in ev["text"], ev
+    # The rebase approves the head it made over the conflicting one.
+    fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "rebase onto the tip")
+    s.p.db.update_task(rb["id"], max_attempts=1)
+    assert _pq_hand_off(env, s, push=[{"branch": s.branch, "head": fix}], task=rb["id"])["status"] == "pushing"
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(rb["id"])
+    assert t["status"] == "failed" and "auto_rebase" not in json.loads(t["result"])
+    assert len(s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")) == 1
+    [ev] = [e for e in _pq_events(s.p, mark, task=rb["id"]) if e["kind"] == "task_failed"]
+    assert ev["status"] == "queued" and "keeps conflicting" in ev["text"], ev
+
+
+def test_a_conflicting_head_gets_no_rebase_review_past_the_review_cap_or_after_one_already_ran(env, monkeypatch):
+    """The rolling review-task cap holds the automatic rebase back: the review fails to the coordinator
+    as before. A head that already had a rebase review gets none again, whoever re-approves it."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    s.p.set_config("coordinator.max_review_tasks_per_day", 0)
+    s.p.db.update_task(s.review, max_attempts=1)
+    row = {"head": s.head, "branch": s.branch}
+    with s.p.db.tx():
+        assert pushq.auto_rebase(s.p, s.p.db.task(s.review), row, "origin/proj", "push conflict: x") is None
+    s.p.set_config("coordinator.max_review_tasks_per_day", 50)
+    other = s.p.db.add_task("Review again", "r", kind="review", origin="coordinator", depends_on=[s.code])
+    with s.p.db.tx():
+        first = pushq.auto_rebase(s.p, s.p.db.task(s.review), row, "origin/proj", "push conflict: x")
+        assert first and pushq.auto_rebase(s.p, s.p.db.task(other), row, "origin/proj", "push conflict: x") is None
+    assert pushq.rebase_head(s.p.db.task(first)) == s.head
 
 
 def test_a_code_task_in_review_is_closed_when_a_review_that_settled_its_push_conflict_pushes_it(env, monkeypatch):
