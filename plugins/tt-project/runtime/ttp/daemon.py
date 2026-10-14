@@ -38,6 +38,7 @@ from . import awake
 from . import budget as bud
 from . import budgetkind
 from . import cachettl
+from . import chaincap
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -46,7 +47,6 @@ from . import coordlimits
 from . import detach
 from . import effort
 from . import failover
-from . import gitlocks
 from . import grants
 from . import ends
 from . import harnesstree
@@ -509,6 +509,7 @@ class Daemon:
         self._step_name = ""     # the tick step running now
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
+        self._last_leftovers = 0.0   # when prune_leftovers last ran
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
@@ -538,6 +539,7 @@ class Daemon:
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
+        self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
@@ -879,9 +881,9 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
-                     self.prune_worktrees, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
+                     self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
-                     self.check_integrity, self.clear_git_locks, self.heal_harness_git,
+                     self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
             self._step_name = step.__name__
             step()
@@ -2389,10 +2391,6 @@ class Daemon:
             return   # its breaker holds the next turn until the login is back; the messages stay queued
         if status != "ok" or not isinstance(actions, list):
             self._settle_coord_check(checked, status, None, [])
-            if (self._run_dir(r) / "input.jsonl").exists() and get_provider(r["provider"]).cache_mark_refused(
-                    f"{usage.error} {usage.final_text or ''}"):
-                log(self.p, f"coordinator run {r['id']}: the API refused the extra cache breakpoint; "
-                            f"later turns on this {r['provider']} build go without it")
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
                 return
             self._coordinator_failed(f"{status} {usage.error[:200]}")
@@ -2437,7 +2435,9 @@ class Daemon:
             return
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
-                               turn=r.get("id"), messages=note.get("messages") or [])
+                               turn=r.get("id"), messages=note.get("messages") or [],
+                               high_effort=bool(note.get("unblock")))
+        chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         if ids:
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
@@ -2938,7 +2938,12 @@ class Daemon:
         # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
         # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
         plain = not fups and not notes and sev == "normal"
-        review = self._auto_review(dict(task, **upd), summary, add=plain) \
+        # A done hop whose only proposal is the next `continue:` hop, with progress and under the
+        # chain caps, gets it from the daemon (chaincap). That hop starts from the base, not this
+        # branch, so a code hop's own commits get their review now, as a plain hand-off's do.
+        ready = self._continue_ready(dict(task, **upd), fups) \
+            if new == "done" and not approval and not notes and sev == "normal" else ""
+        review = self._auto_review(dict(task, **upd), summary, add=plain or bool(ready)) \
             if new == "done" and task["kind"] == "code" else None
         if review:
             known = None if review[1] else db.task(review[0])
@@ -2971,10 +2976,19 @@ class Daemon:
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
-        routine = (review is not None and plain) or fix is not None
+        # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
+        # no review stays with the coordinator, or its commits would never be reviewed or delivered.
+        hop = self._auto_continue(dict(task, **upd), fups, ready) \
+            if ready and not fix and (review or task["kind"] != "code" or not self._has_changes(task)) else None
+        if hop:
+            folded.add(id(fups[0]))
+            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})."
+        routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
+        if hop:
+            chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
             data = json.dumps({"plain": True}) if outcome == "review" and plain else None
@@ -4562,13 +4576,19 @@ class Daemon:
 
     def heal_harness_git(self) -> None:
         """Every harness_git.sweep_every_s, commit the charter and memory files a failed harness commit
-        left behind (Project.sweep_harness), moving aside any stale git lock first."""
+        left behind (Project.sweep_harness), moving aside any stale git lock first (ttp.gitlocks): such
+        a lock blocks every harness commit. Each move is logged and kept as a handled event."""
         now = time.time()
         if now - getattr(self, "_harness_swept", 0.0) < self.p._harness_git_cfg("sweep_every_s"):
             return
         self._harness_swept = now
         try:
-            self.p.clear_stale_git_locks(now)
+            moved = self.p.clear_stale_git_locks(now)
+            if moved:
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now, "daemon", "git_lock_cleared", "low",
+                             f"Moved stale git lock file(s) no process held aside: {', '.join(moved)}"[:500],
+                             "handled"))
             self.p.sweep_harness()
         except Exception:
             log(self.p, "harness git sweep: " + traceback.format_exc().replace("\n", " | ")[:1000])
@@ -4604,29 +4624,6 @@ class Daemon:
         text = integrity.problem_text(res)
         if text:
             self.alert("integrity", text, severity="high", every_s=86400)
-
-    def clear_git_locks(self, every_s: float = 300) -> None:
-        """Remove `.git/*.lock` files a killed git command left in the harness repository, once no
-        process holds them and they are older than watchdog.stale_git_lock_s (see ttp.gitlocks):
-        such a lock blocks every harness commit until removed. Each removal is logged."""
-        now = time.time()
-        if now - getattr(self, "_git_locks_at", 0.0) < every_s:
-            return
-        self._git_locks_at = now
-        try:
-            removed, held = gitlocks.clear(self.p.harness, gitlocks.settings(self.cfg))
-        except Exception:
-            log(self.p, "harness git locks: check failed\n" + traceback.format_exc())
-            return
-        if held and held != getattr(self, "_git_locks_held", None):
-            log(self.p, f"harness git locks: old lock files kept, still held by pid(s) {', '.join(map(str, held))}")
-        self._git_locks_held = held
-        if removed:
-            names = ", ".join(str(x) for x in removed)
-            log(self.p, f"harness git locks: removed stale {names}")
-            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                        (now, "daemon", "git_lock_cleared", "low",
-                         f"Removed stale git lock file(s) no process held: {names}"[:500], "handled"))
 
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and
@@ -4811,13 +4808,22 @@ class Daemon:
                 live[key] = {"branch": b, "head": head, "ahead": ahead, "since": (told.get(key) or {}).get("since", now)}
                 if key not in told:
                     log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
+                    # A hop whose continuation the daemon queued, with a review still carrying its
+                    # branch: the notice goes to the next digest without a turn of its own (chaincap).
+                    # The next hop starts from the base, so without that review it stays queued.
+                    folded = _carrying_review(db, t["id"]) if chaincap.auto_continued(db, t["id"]) else None
                     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                          (now, f"task:{t['id']}", "local_only", "normal",
                           f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
                           f"{'' if ahead == 1 else 's'} ahead of every remote ({t['title']}). Nothing pushes it "
                           f"automatically: deliver it as the charter allows, or cancel the task if the work is "
                           f"not wanted. If it already landed as another commit (re-landed), a task records that "
-                          f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.", "queued", t["id"]))
+                          f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.",
+                          "handled" if folded else "queued", t["id"]))
+                    if folded:
+                        chaincap.add_notice(db, f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} "
+                                                f"commit{'' if ahead == 1 else 's'} ahead of every remote; its "
+                                                f"review #{folded} carries it.")
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
 
@@ -5059,6 +5065,19 @@ class Daemon:
         if not self._disk_low:
             return False
         return task["kind"] not in DISK_LIGHT_KINDS or (self._disk_free or 0) < DISK_FLOOR_GB * 1e9
+
+    def prune_leftovers(self, every_s: float = 3600) -> list[str]:
+        """Hourly: delete recovered worktrees' leftovers folders (state/worktree-leftovers/) older than
+        disk.worktree_leftovers_keep_days (worktree.prune_leftovers; 0 keeps them all)."""
+        now = time.time()
+        if now - self._last_leftovers < every_s:
+            return []
+        self._last_leftovers = now
+        gone = worktree.prune_leftovers(self.p, self.cfg.get("disk", {}).get("worktree_leftovers_keep_days"), now)
+        if gone:
+            log(self.p, f"deleted {len(gone)} worktree leftovers folder(s) past disk.worktree_leftovers_keep_days: "
+                        f"{', '.join(gone[:10])}")
+        return gone
 
     def prune_worktrees(self, every_s: float = 300, force: bool = False) -> list[dict]:
         """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and
@@ -5449,7 +5468,7 @@ class Daemon:
         `retry_after_s` timer runs out while the probe still says "not yet", the task sleeps another
         `retry_after_s` instead of spending a worker run to find that out. "Not yet" is any exit in
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
-        lives on). A broken probe
+        lives on; only when the host named really does not answer, _own_255). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
         fix the probe. Past `waiting.max_hold_s` after the hand-off a "not yet" keeps it asleep too (a
         model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
@@ -5458,6 +5477,7 @@ class Daemon:
         self._poll_on_pass(now)
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
+        done = []
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
             if rc is None and now - started < PROBE_TIMEOUT_S:
@@ -5467,6 +5487,11 @@ class Daemon:
                 _kill_group(proc)
             if id(proc) not in outs:
                 outs[id(proc)] = self._probe_text(proc)
+            done.append((tid, proc, probe, rc))
+        # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
+        self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
+                           for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
+        for tid, proc, probe, rc in done:
             task = db.task(tid)
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
@@ -5476,6 +5501,8 @@ class Daemon:
                 # Its device runner is down: the daemon brings it back, and the task sleeps on.
                 self._restart_runner(runner, tid, now)
                 rc = 1
+            if rc == netwait.UNREACHABLE_RC:
+                rc = self._own_255(tid, probe, outs[id(proc)], now)
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
@@ -5512,7 +5539,7 @@ class Daemon:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
         probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
         yet, and so do 75 (EX_TEMPFAIL, e.g. a busy `ttp lock`) and 255 (ssh could not reach the
-        host: a reboot or a network blip). A broken
+        host: a reboot or a network blip; a 255 whose host answers is broken, _own_255). A broken
         probe (another exit, a timeout, a probe that cannot start) is raised to the
         coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
         met after `coordinator.defer_max_days`."""
@@ -5538,6 +5565,27 @@ class Daemon:
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+
+    def _own_255(self, tid: int, probe: str, out: str, now: float) -> int | str:
+        """A probe's 255 means "host unreachable" only when it is ssh's own: each host it names is
+        checked (netwait.confirm). One that names none, or whose host answers, failed its own remote
+        command: why it is broken, which takes the broken-probe path, never the network outage."""
+        why = netwait.confirm(probe, out, lambda h: self._host_answers(h, now))
+        if why:
+            log(self.p, f"task {tid} probe is broken, not waiting on an unreachable host: {why}")
+        return why or netwait.UNREACHABLE_RC
+
+    def _host_answers(self, host: str, now: float) -> bool:
+        """ssh reaches `host`, asked at most once a minute for all the probes that name it."""
+        self._check_hosts([host], now)
+        return self._host_up[host][0]
+
+    def _check_hosts(self, hosts: list[str], now: float) -> None:
+        """Asks ssh about each host not asked in the last minute, all in one parallel pass."""
+        stale = [h for h in dict.fromkeys(hosts) if now - self._host_up.get(h, (False, -1e18))[1] >= 60]
+        if stale:
+            env = self._probe_env()
+            self._host_up.update((h, (ok, now)) for h, ok in netwait.reach(stale, env).items())
 
     def _drop_stale_probe(self, tid: int, probe: str) -> None:
         """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget
@@ -5572,8 +5620,8 @@ class Daemon:
         elif rc != 0:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
-                                 f"its start_when probe is broken ({why}; only 0 = start and 1, 75 or 255 = not "
-                                 f"yet are valid): {d.get('when', '')[:300]}")
+                                 f"its start_when probe is broken ({why}; only 0 = start, 1 or 75 = not yet and "
+                                 f"ssh's own 255 = host unreachable are valid): {d.get('when', '')[:300]}")
 
     def _start_resource_stale(self, task: dict, d: dict, now: float) -> None:
         """A start_when that has said not yet for waiting.start_resource_stale_s while the task names a
@@ -6997,6 +7045,35 @@ class Daemon:
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 
+    def _continue_ready(self, task: dict, fups: list[dict]) -> str:
+        """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
+        otherwise or when it cannot be read (the coordinator decides then)."""
+        if len(fups) != 1 or upstream.is_note(fups[0]) or fups[0].get("start_after") or fups[0].get("start_when") \
+                or not chaincap.CONT_TITLE.match(str(fups[0]["title"])):
+            return ""
+        try:
+            return chaincap.hop_ready(self.p, self.cfg, task, fups[0])
+        except Exception:
+            log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return ""
+
+    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
+        """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
+        try:
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
+        except Exception:
+            log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return None
+
+    def _has_changes(self, task: dict) -> bool:
+        """Whether a task's branch changes anything against the base; True when that cannot be read."""
+        if not task.get("branch"):
+            return False
+        try:
+            return bool(worktree.diff_lines(self.p, [task["branch"]]))
+        except Exception:
+            return True
+
     def _review_area(self, review: dict) -> dict | None:
         """reviewcap.area for a review failing now; None when it cannot be read (a fix still follows)."""
         try:
@@ -7270,13 +7347,14 @@ class Daemon:
         full...; worktree.ensure already recovered what an earlier attempt left behind). It goes back
         to the queue after a backoff (`worktree.retry_backoff_s`, doubling) up to
         `worktree.create_retries` times without a model run; only a failure that outlasts them is
-        blocked as `workspace:`, for the coordinator."""
+        blocked as `workspace:`, for the coordinator. One that retrying cannot fix (`final`, e.g.
+        worktree.WorkspaceStuck) is blocked at once."""
         db = self.p.db
         w = self.cfg.get("worktree") or {}
         limit = int(w.get("create_retries", 3) or 0)
         with db.tx():
             tries = db.kv(WORKSPACE_TRIES_KEY, {}) or {}
-            n = int(tries.get(str(task["id"]), 0)) + 1
+            n = limit + 1 if getattr(e, "final", False) else int(tries.get(str(task["id"]), 0)) + 1
             tries[str(task["id"])] = n
             db.set_kv(WORKSPACE_TRIES_KEY, tries)
             if n <= limit:
@@ -7284,8 +7362,9 @@ class Daemon:
                 db.update_task(task["id"], status="queued", not_before=time.time() + delay,
                                blocked_reason=f"{WORKSPACE_RETRY_NOTE} ({n}/{limit}): {e}"[:400])
             else:
-                db.update_task(task["id"], status="blocked",
-                               blocked_reason=f"workspace: {e} (after {n} tries)"[:400])
+                db.update_task(task["id"], status="blocked", blocked_reason=(
+                    f"workspace: {e} (not retried: it cannot recover by itself)" if getattr(e, "final", False)
+                    else f"workspace: {e} (after {n} tries)")[:400])
         log(self.p, f"task {task['id']} workspace failed ({n}/{limit + 1}): {e}")
 
     def retry_workspaces(self) -> None:
@@ -7649,6 +7728,15 @@ LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
+
+
+def _carrying_review(db, task_id: int) -> int | None:
+    """A review of the task that has not failed or been cancelled: it reviews, and pushes, its branch."""
+    for r in db.q("SELECT id, depends_on FROM tasks WHERE kind='review' AND status NOT IN ('failed','cancelled') "
+                  "ORDER BY id DESC"):
+        if task_id in dependency_ids(r):
+            return r["id"]
+    return None
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:

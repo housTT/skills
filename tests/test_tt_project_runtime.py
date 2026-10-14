@@ -240,6 +240,55 @@ def test_check_plan_at_head_takes_a_covered_change_and_its_digests_in_one_commit
                   "--definition-path", "plan.json", "--purpose", "harness"])
     assert e.value.code == 2
 
+
+def test_check_plan_covers_a_committed_watcher_input_in_one_step(tmp_path, capsys):
+    """A watcher's JSON (box-watch.json) committed with the definition that binds it to "committed"
+    passes at once, and a later change to it passes under the same pinned definition commit."""
+    import hashlib
+    from ttp import checkplan
+    repo, git, plan, definition, candidate = _check_plan_repo(tmp_path)
+    (repo / "box-watch.json").write_text('{"boxes": []}\n')
+    plan["coverage"]["paths"]["box-watch.json"] = "committed"
+    plan["coverage"]["commands"].append("python3 -m json.tool box-watch.json")
+    (repo / "plan.json").write_text(json.dumps(plan))
+    git("add", "-A")
+    git("commit", "-qm", "watcher input and its definition, one commit")
+    pinned = git("rev-parse", "HEAD")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 0
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    # The watcher input changes again: no digest to refresh and no pin to move.
+    (repo / "box-watch.json").write_text('{"boxes": ["a"]}\n')
+    git("commit", "-qam", "watcher input only")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 0
+    assert checkplan.run(repo, None, "plan.json", "harness") == 0
+    # Still bound: the committed file must parse, match the working copy and exist.
+    (repo / "box-watch.json").write_text("{\n")
+    git("commit", "-qam", "broken watcher input")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") != 0
+    git("revert", "--no-edit", "HEAD")
+    (repo / "box-watch.json").write_text('{"boxes": ["b"]}\n')
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 65   # uncommitted edit
+    git("checkout", "-q", "box-watch.json")
+    git("rm", "-q", "box-watch.json")
+    git("commit", "-qm", "watcher input removed")
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 66
+    git("revert", "--no-edit", "HEAD")
+    # A digest-bound input still fails when stale, and the error says how to cover it.
+    (repo / "selector.py").write_text("# selector v2\n")
+    git("commit", "-qam", "selector change")
+    capsys.readouterr()
+    assert checkplan.run(repo, pinned, "plan.json", "harness") == 65
+    err = capsys.readouterr().err
+    assert "uncovered committed input: selector.py" in err and 'plan.json, or bind it to "committed"' in err
+    assert hashlib.sha256(b"# selector v2\n").hexdigest() in err
+    # Candidate identities keep exact digests: "committed" is not a candidate binding.
+    (tmp_path / "c").mkdir()
+    crepo, cgit, cplan, _, cand = _check_plan_repo(tmp_path / "c", "candidate")
+    cplan["candidates"][cand]["paths"]["selector.py"] = "committed"
+    (crepo / "plan.json").write_text(json.dumps(cplan))
+    cgit("commit", "-qam", "candidate bound to committed")
+    assert checkplan.run(crepo, cgit("rev-parse", "HEAD"), "plan.json", "candidate") == 66
+
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 # `ttp setup` syncs every filesystem on the host (os.sync); on a busy machine that waits tens of seconds
@@ -6139,13 +6188,13 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
                         "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
     full, seen = coord.digest_parts(p, gates, [ev], [])
     keys = [k for k, _ in full]
-    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE)
+    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE) | {coord.LEDGER_SEEN_KEY}
     full_text = "\n".join(t for _, t in full)
     # The next routine turn, nothing changed: each background section is one line, with no reasons.
     short, again = coord.digest_parts(p, gates, [ev], [], seen)
     assert again == seen and [k for k, _ in short] == keys, "a section was dropped or reordered"
     text = dict(short)
-    for key in coord.COLLAPSIBLE:
+    for key in (*coord.COLLAPSIBLE, "machine_ledger"):
         assert "(as last turn" in text[key] and "\n" not in text[key], key
         assert len(text[key]) < len(dict(full)[key]), key
     assert "watcher:hw 'tray dropped': 0 muted" in text["muted"] and "hardware team" not in text["muted"]
@@ -6247,6 +6296,61 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     assert "a second change" in prompt, "a changed ledger is shown whole"
     prompt, _ = turn("observation", "box-c is slow")
     assert "a second change" not in prompt and "2 open (as last turn)" in prompt
+
+
+def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworded_lines(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-c", tags="device")
+    mm.add("box-d", tags="device")
+    _resources(p, "- box-c\n- box-d")
+    first = ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "other", expires="6h")
+    ml.report("proj-a", "box-d", "held", "a hold")
+    gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
+                        "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                (time.time(), "daemon", "observation", "normal", "box-c is slow", "queued"))
+    mev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "daemon", "machine_condition", "normal", "a condition opened", "queued"))
+
+    def ledger(seen, events=(ev,)):
+        parts, got = coord.digest_parts(p, gates, list(events), [], seen)
+        return dict(parts).get("machine_ledger", ""), got
+
+    whole, seen = ledger(None)
+    assert "zzzz" in whole and "box-d held" in whole and "No recovery owner" in whole
+    # Unchanged: one line, without the owner gap named once already.
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open (as last turn)"
+    # Reworded: a co-tenant also sees the hold; only that line is shown.
+    ml.report("proj-b", "box-d", "held", "a hold")
+    text, seen = ledger(seen)
+    assert "seen by proj-a, proj-b" in text and "zzzz" not in text and "1 as last turn" in text
+    assert len(text) < 600 < len(whole)
+    # New: an outage and a second change; the first change stays as last turn.
+    ml.set_outage("box-c", "planned maintenance", "other", "6h")
+    ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
+    text, seen = ledger(seen)
+    assert "known outage" in text and "a second change" in text and "zzzz" not in text and "box-d held" not in text
+    assert "4 open" in text and "2 as last turn" in text
+    # Removed: the first change closes and the hold clears; counted as gone, nothing else repeated.
+    ml.close_change(first["id"], "done", by="other")
+    ml.report("proj-a", "box-d", "held", cleared=True)
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open; new or changed since last turn below, 2 as last turn, 2 gone"
+    text, seen = ledger(seen)
+    assert text == "## Shared machines in your Resources: 2 open (as last turn)"
+    # A machine event shows it whole.
+    text, seen = ledger(seen, (ev, mev))
+    assert "known outage" in text and "a second change" in text and "(as last turn" not in text
+    # So does the turn after a snapshot refresh.
+    assert ledger(seen)[0].endswith("(as last turn)")
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    text, seen = ledger(seen)
+    assert "known outage" in text and "a second change" in text and "(as last turn" not in text
+    assert ledger(seen)[0].endswith("(as last turn)")
 
 
 def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
@@ -6551,11 +6655,13 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
 
 
 def test_claude_leaves_its_own_breakpoints_room_on_later_calls(monkeypatch):
+    # The extra mark was measured on the one build that left a breakpoint free (2.1.296) and cost
+    # more per coordinator turn: every build, that one too, keeps all four for the CLI.
+    import subprocess
     from ttp.providers import base, claude
-    monkeypatch.setattr(claude, "_VERSIONS", {})
-    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.285 (Claude Code)")
-    assert claude.Claude().own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, \
-        "unverified builds reserve all four"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a[0] if a else [], 0, "2.1.296 (Claude Code)\n", ""))
+    assert claude.Claude().own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
     logged: list[str] = []
     monkeypatch.setattr(base, "_TRIM_LOGGED", set())
@@ -8696,11 +8802,13 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
         os.utime(f, (old, old))
     fresh = gitdir / "packed-refs.lock"
     fresh.write_text("y\n")
-    # A git still running in the repo keeps even old locks in place.
-    monkeypatch.setattr(project, "git_running_in", lambda repo: True)
+    # A process that may hold them (a git running in the repo) keeps even old locks in place.
+    from ttp import gitlocks
+    holders = gitlocks.holders
+    monkeypatch.setattr(gitlocks, "holders", lambda *a, **k: [4242])
     assert p.clear_stale_git_locks() == []
-    assert all(f.exists() for f in left) and "left alone" in _daemon_log_text(p)
-    monkeypatch.setattr(project, "git_running_in", lambda repo: False)
+    assert all(f.exists() for f in left) and "left alone: pid(s) 4242" in _daemon_log_text(p)
+    monkeypatch.setattr(gitlocks, "holders", holders)
     fresh.unlink()
     p.add_memory("Locks a killed commit left are moved aside.")
     assert not any(f.exists() for f in left)
@@ -8714,14 +8822,17 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
     assert p.clear_stale_git_locks() == [] and fresh.exists()
 
 
-def test_git_running_in_sees_a_git_in_the_repo(env, tmp_path):
-    from ttp.project import git_running_in
+def test_git_lock_holders_see_a_real_git_in_the_repo(env, tmp_path):
+    from ttp import gitlocks
     p = make(env)
-    assert git_running_in(tmp_path) is False
+    gdir = gitlocks.git_dir(p.harness)
     proc = subprocess.Popen(["git", "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL)
     try:
-        assert git_running_in(p.harness)
+        assert proc.pid in gitlocks.holders(p.harness, gdir, [])
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        assert proc.pid not in gitlocks.holders(other, other / ".git", [])
     finally:
         proc.communicate(b"x")
 
@@ -20236,16 +20347,18 @@ def test_a_workspace_locked_initializing_with_an_index_and_edits_is_kept_and_reu
         "the kept worktree stayed locked"
 
 
-def test_a_workspace_on_another_branch_is_left_alone(env):
+def test_a_workspace_on_another_branch_without_commits_keeps_its_files_and_is_made_again(env):
     p = make(env)
     from ttp import worktree
     task = p.db.task(p.db.add_task("moved", "s", kind="code", tier="light", origin="user"))
     path, branch = worktree.ensure(p, task)
     _git_out(path, "checkout", "-q", "-b", "elsewhere")
     (path / "work.txt").write_text("mine")
-    with pytest.raises(RuntimeError, match="elsewhere"):
-        worktree.ensure(p, task)
-    assert (path / "work.txt").read_text() == "mine"
+    assert worktree.ensure(p, task) == (path, branch)
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch and not (path / "work.txt").exists()
+    moved = list((p.state / worktree.LEFTOVERS_DIR).glob(f"t{task['id']}-*/work.txt"))
+    assert [f.read_text() for f in moved] == ["mine"], "the worktree's file was not kept"
+    assert _git_out(p.root, "rev-parse", "--verify", "elsewhere"), "the other branch was deleted"
 
 
 def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(env, monkeypatch):
@@ -20269,7 +20382,8 @@ def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(e
     _git_out(repo, "worktree", "remove", "--force", str(path))
     assert worktree.ensure(p, other_task) == (opath, obranch)
     _git_out(opath, "checkout", "-q", "-b", "elsewhere")
-    with pytest.raises(RuntimeError, match="elsewhere"):
+    _git_out(opath, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "theirs")
+    with pytest.raises(worktree.WorkspaceStuck, match="elsewhere"):
         worktree.ensure(p, other_task)
 
 
@@ -20316,6 +20430,145 @@ def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run
     p.db.update_task(tid, status="cancelled")
     d.retry_workspaces()
     assert d._workspace_tries(tid) == 0, "a cancelled task's workspace tries were kept"
+
+
+def _moved_branch(p, worktree):
+    """A task continuing another whose worktree was made on its own branch, after which its recorded
+    branch changed to the continued task's (the reported case). Returns (task, path, own branch)."""
+    old = p.db.add_task("first try", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, branch=f"ttp/t{old}-first-try", status="failed")
+    _git_out(p.root, "branch", f"ttp/t{old}-first-try", worktree.resolve_base(p))
+    tid = p.db.add_task("second try", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    path, own = worktree.ensure(p, dict(p.db.task(tid), branch=None))
+    assert own == f"ttp/t{tid}-second-try"
+    p.db.update_task(tid, branch=f"ttp/t{old}-first-try")
+    return p.db.task(tid), path, own
+
+
+def _commit_file_in(path, name, text="x"):
+    (path / name).write_text(text)
+    _git_out(path, "add", name)
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
+    return _git_out(path, "rev-parse", "HEAD")
+
+
+def test_a_worktree_on_another_branch_with_the_tasks_own_commits_is_adopted(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.prompts import worker_task
+    task, path, own = _moved_branch(p, worktree)
+    head = _commit_file_in(path, "work.txt")
+    (path / "notes.txt").write_text("loose")
+    assert worktree.ensure(p, task) == (path, own), "the worktree's branch with this task's commits was not adopted"
+    assert _git_out(path, "rev-parse", "HEAD") == head and (path / "notes.txt").read_text() == "loose"
+    ev = p.db.one("SELECT * FROM events WHERE task=? AND kind=?", (task["id"], worktree.RECOVERED_EVENT))
+    assert ev and json.loads(ev["data"])["adopted"] == own and ev["status"] == "handled"
+    assert "now works on it" in worker_task(p, task, str(path), own)
+
+
+def test_a_worktree_on_another_branch_with_only_loose_output_moves_it_and_is_made_again(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.prompts import worker_task
+    task, path, own = _moved_branch(p, worktree)
+    exclude = p.root / _git_out(p.root, "rev-parse", "--git-common-dir") / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(exclude.read_text() + "\nbuild/\nout/\n" if exclude.exists() else "build/\nout/\n")
+    (path / "out").mkdir()
+    (path / "out" / "frame.png").write_text("png")
+    (path / "build").mkdir()
+    (path / "build" / "lib.so").write_bytes(b"\0" * 4096)
+    (path / "shot.png").write_text("png2")
+    tracked = _git_out(path, "ls-files").splitlines()[0]
+    (path / tracked).write_bytes(b"edited \xff\xfe not utf-8")
+    path2, branch = worktree.ensure(p, task)
+    assert (path2, branch) == (path, task["branch"])
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == task["branch"]
+    assert _git_out(path, "status", "--porcelain") == "", "the remade worktree is not clean"
+    assert _git_out(p.root, "rev-parse", "--verify", own), "the worktree's old branch was deleted"
+    data = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
+                               (task["id"], worktree.RECOVERED_EVENT))["data"])
+    from pathlib import Path
+    dest = Path(data["leftovers"])
+    assert dest.parent == p.state / worktree.LEFTOVERS_DIR and dest.name.startswith(f"t{task['id']}-")
+    assert (dest / "out" / "frame.png").read_text() == "png" and (dest / "shot.png").read_text() == "png2"
+    assert (dest / tracked).read_bytes() == b"edited \xff\xfe not utf-8"
+    assert b"edited" in (dest / "uncommitted.patch").read_bytes()
+    # An ignored build cache is regenerable: it goes with the old worktree, not to the leftovers.
+    assert not (dest / "build").exists() and not (path / "build").exists() and data["caches"] == ["build"]
+    assert data["bytes"] == len("png") + len("png2") + len(b"edited \xff\xfe not utf-8")
+    assert str(dest) in worker_task(p, task, str(path), branch), "the start note does not name the leftovers"
+    # Once a run started, the note is not repeated.
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (task["id"], "worker", time.time() + 1, "done"))
+    assert str(dest) not in worker_task(p, task, str(path), branch)
+
+
+def test_old_worktree_leftovers_folders_are_pruned_after_the_configured_days(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    root = p.state / worktree.LEFTOVERS_DIR
+    now = time.time()
+    old, recent, stamped = root / "t1-20200101-000000", root / "t2-20200101-000000", root / "t3-29990101-000000"
+    for d in (old, recent, stamped):
+        (d / "out").mkdir(parents=True)
+        (d / "out" / "f.txt").write_text("x")
+        os.utime(d, (now - 40 * 86400,) * 2)
+    os.utime(recent, (now - 86400,) * 2)   # its name is old, but the folder is recent: kept
+    assert worktree.prune_leftovers(p, 0, now) == [] and old.exists(), "0 keeps all"
+    assert worktree.prune_leftovers(p, None, now) == [old.name]
+    assert not old.exists() and recent.exists() and stamped.exists()
+    p.set_config("disk.worktree_leftovers_keep_days", 0.5)
+    d = Daemon(p.base)
+    assert d.prune_leftovers() == [recent.name] and stamped.exists()
+    assert d.prune_leftovers() == [], "ran again within the hour"
+
+
+def test_a_worktree_on_another_branch_moves_hand_off_artifacts_inside_ignored_caches(env):
+    # Caches go with the old worktree, but a hand-off artifact inside one is output, not cache.
+    p = make(env)
+    from ttp import worktree
+    task, path, own = _moved_branch(p, worktree)
+    exclude = p.root / _git_out(p.root, "rev-parse", "--git-common-dir") / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(exclude.read_text() + "\nbuild/\n.cache/\n" if exclude.exists() else "build/\n.cache/\n")
+    (path / "build").mkdir()
+    (path / "build" / "report.html").write_text("<html>")
+    (path / "build" / "lib.so").write_bytes(b"\0" * 4096)
+    (path / ".cache").mkdir()
+    (path / ".cache" / "blob").write_text("cached")
+    _handoff(p, task["id"], [str(path / "build" / "report.html")])
+    worktree.ensure(p, task)
+    data = json.loads(p.db.one("SELECT data FROM events WHERE task=? AND kind=?",
+                               (task["id"], worktree.RECOVERED_EVENT))["data"])
+    from pathlib import Path
+    dest = Path(data["leftovers"])
+    assert (dest / "build" / "report.html").read_text() == "<html>", "a hand-off artifact in a cache was lost"
+    assert not (dest / "build" / "lib.so").exists() and not (dest / ".cache").exists()
+    assert data["bytes"] == len("<html>") and "build/report.html" in data["moved"]
+
+
+def test_a_worktree_on_an_unrelated_tasks_branch_with_commits_blocks_at_once(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    p.set_config("worktree.create_retries", 3)
+    task, path, own = _moved_branch(p, worktree)
+    _git_out(path, "switch", "-qc", "ttp/t9999-unrelated")
+    head = _commit_file_in(path, "theirs.txt")
+    (path / "out.log").write_text("log")
+    with pytest.raises(worktree.WorkspaceStuck, match="not this task's"):
+        worktree.ensure(p, task)
+    assert _git_out(path, "rev-parse", "HEAD") == head and (path / "out.log").exists(), "the worktree was touched"
+    d = Daemon(p.base)
+    try:
+        worktree.ensure(p, task)
+    except worktree.WorkspaceStuck as e:
+        d._workspace_failed(p.db.task(task["id"]), e)
+    t = p.db.task(task["id"])
+    assert t["status"] == "blocked" and "cannot recover by itself" in t["blocked_reason"], t["blocked_reason"]
+    d.retry_workspaces()
+    assert p.db.task(task["id"])["status"] == "blocked", "a workspace that cannot recover was retried"
 
 
 def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):
@@ -23310,6 +23563,64 @@ def test_push_refuses_a_worktree_on_another_tasks_branch_at_once(env, monkeypatc
         monkeypatch.setenv("TTP_TASK", str(tid))
         assert push.resolve(p, repo) == ("origin", "proj", False), tid
     monkeypatch.delenv("TTP_TASK")          # outside a run: the configured target as before
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+
+
+def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says_so(env, monkeypatch, capsys):
+    # Replays the upstream note: from a task worktree on ttp/t<id>-..., whose spec allows pushing only that
+    # branch, `ttp push --detach` targeted the push branch. It is refused at once, naming --own and --land.
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(own_only))
+    for args in (["push"], ["push", "--detach"]):
+        assert _ttp(*args) == 2, args
+        captured = capsys.readouterr()
+        assert "pushing" not in captured.out and "origin/proj" not in captured.out, captured.out
+        assert "does not ask it to land on origin/proj" in captured.err and "ttp push --own --detach" in captured.err \
+            and "ttp push --land --detach" in captured.err, captured.err
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # --own publishes the own branch, never the push branch.
+    assert push.resolve(p, repo, True) == ("origin", f"ttp/t{own_only}-fix", True)
+    # --land is the explicit target: it lands, also in the detached process (QUEUE_ENV).
+    assert push.LAND_ENV in push.QUEUE_ENV
+    monkeypatch.setenv(push.LAND_ENV, "1")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv(push.LAND_ENV)
+    assert _ttp("push", "--land", "--own") != 0
+    # A spec with a landing step lands as before; a `no_push:` line or a negated step never counts.
+    for spec, lands in (("Then land it with `ttp push`.", True), ("Land it on the push branch.", True),
+                        ("Run `ttp push`.\nno_push: experiment only", False), ("Do not run `ttp push`.", False)):
+        p.db.conn.execute("UPDATE tasks SET spec=? WHERE id=?", (spec, own_only))
+        p.db.conn.commit()
+        try:
+            got = push.resolve(p, repo)
+        except ValueError as e:
+            got = str(e)
+        assert (got == ("origin", "proj", False)) is lands, (spec, got)
+    # A pr_branch label naming the push branch is an explicit target; with own pushes off the push
+    # branch is the only one. Both land without a landing step in the spec.
+    p.db.conn.execute("UPDATE tasks SET spec=? WHERE id=?", ("Fix it.", own_only))
+    p.db.conn.commit()
+    with pytest.raises(ValueError, match="does not ask it to land"):
+        push.resolve(p, repo)
+    p.db.conn.execute("UPDATE tasks SET labels=? WHERE id=?", ('["pr_branch:proj"]', own_only))
+    p.db.conn.commit()
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    p.db.conn.execute("UPDATE tasks SET labels=? WHERE id=?", ("[]", own_only))
+    p.db.conn.commit()
+    p.set_config("delivery.own_push", "off")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    p.set_config("delivery.own_push", "on")
+    # A review lands from its own branch as before; outside a run nothing is gated.
+    review = p.db.add_task("review", kind="review")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{review}-review")
+    monkeypatch.setenv("TTP_TASK", str(review))
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv("TTP_TASK")
     assert push.resolve(p, repo) == ("origin", "proj", False)
 
 
@@ -26859,6 +27170,21 @@ def _ready(p, tid):
     return tid in [t["id"] for t in p.db.ready_tasks()]
 
 
+def _ssh_255(p, up=False):
+    """A stand-in `ssh` first on the probes' PATH (the harness bin): a host that does not answer
+    (exit 255, ssh's own error), or with `up` one that answers: `true` passes, any other remote
+    command fails (exit 1). No real host is contacted. Returns a probe that reaches box-a over it."""
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    act = ('[ "$*" = true ] && exit 0; exit 1' if up
+           else 'echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255')
+    (b / "ssh").write_text("#!/bin/sh\n"
+                           "while [ $# -gt 0 ]; do case $1 in -o) shift 2;; -*) shift;; *) break;; esac; done\n"
+                           f"host=$1; shift\n{act}\n")
+    (b / "ssh").chmod(0o755)
+    return "ssh -o BatchMode=yes box-a test -e /tmp/marker"
+
+
 def test_a_due_waiting_task_sleeps_on_while_its_probe_says_not_yet(env):
     p = make(env)
     from ttp import daemon as dmod
@@ -27681,7 +28007,7 @@ def test_an_unreachable_host_probe_keeps_the_task_asleep_past_the_hold_cap(env):
     p = make(env)
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
-    tid = _due_waiting_task(p, "exit 255")
+    tid = _due_waiting_task(p, _ssh_255(p))
     _settle_probe(d, tid)
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()          # due with a fresh 255: extended like "not yet", no worker run
@@ -27727,11 +28053,12 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
 
 
-@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "exit 255"])
+@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "unreachable"])
 def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_coordinator_once(env, probe):
     """A model run cannot make a "not yet" probe pass: past max_hold_s the task sleeps on and the
     coordinator gets one wait_stale event per wait, not one per check."""
     p = make(env)
+    probe = _ssh_255(p) if probe == "unreachable" else probe
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
@@ -34640,7 +34967,7 @@ def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
-    coord.apply(p, [{"type": "task_add", "title": "remote", "spec": "s", "start_when": "exit 255"}])
+    coord.apply(p, [{"type": "task_add", "title": "remote", "spec": "s", "start_when": _ssh_255(p)}])
     tid = _added(p, "remote")
     d = dmod.Daemon(p.base)
     for _ in range(2):
@@ -35241,6 +35568,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 DURABLE_EXEMPT = {
     ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
+    ("gitlocks.py", "os.replace(path, to)"): "moves a stale git lock aside, never its content; a rename lost to a crash leaves the lock for the next sweep",
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
     ("project.py", 'open(path, "a")'): "inside durable_append",
@@ -35305,7 +35633,6 @@ DURABLE_EXEMPT = {
     ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
     ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
     ("project.py", '"daemon.log", "a") as f'): "a log line",
-    ("project.py", "os.replace(f, dest / rel)"): "moves a stale git lock file aside, a rename within one directory tree; a lost move only leaves the lock to the next try",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
@@ -41561,8 +41888,10 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
         assert not push.is_notes_branch(p, own)
         if labels:
             assert push.own_target(p, repo) == ("origin", "feature/x")
-        else:
+        else:   # its spec has no landing step: `--land` says it may land
+            monkeypatch.setenv(push.LAND_ENV, "1")
             assert push.resolve(p, repo) == ("origin", "proj", False)
+            monkeypatch.delenv(push.LAND_ENV)
     # A branch recorded on the task row is its own code branch too; the slug then no longer is.
     p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/t{tid}-fix-notes", tid))
     assert not push.is_notes_branch(p, f"ttp/t{tid}-fix-notes")
@@ -42051,6 +42380,166 @@ def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
     # 0 turns the cap off.
     p.set_config("review.area_fail_cap", 0)
     assert reviewcap.area(p, p.config(), p.db.task(s4["id"])) is None
+
+
+def _cont(title):
+    return {"status": "done", "summary": f"{title}: part done",
+            "followups": [{"title": f"continue: {title}", "spec": f"Carry on with {title} from its branch."}]}
+
+
+def _hop(env, p, tid, files, result):
+    """Run queued task `tid`: commit `files` (name -> lines) on its branch, then hand off `result`."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    for name, lines in files.items():
+        (path / name).write_text("".join(f"{tid} {i}\n" for i in range(lines)))
+    if files:
+        _git_out(path, "add", ".")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f"hop {tid}")
+    p.db.update_task(tid, status="running", branch=branch)
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+
+
+def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordinator_turn(env):
+    p = make(env)
+    from ttp import audit, chaincap
+    from ttp import coordinator as coord
+    root, _, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    # The next hop starts from the base, not this branch: this hop's commits get their review first.
+    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and len(reviews) == 1
+    assert reviews[0]["status"] == "queued" and f"Review #{reviews[0]['id']} queued by the daemon" in done["text"]
+    assert done["status"] == "handled" and f"Continue hop #{hop1['id']} queued by the daemon (1 new commit)" in done["text"]
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "a hop with progress woke the coordinator"
+    assert [t["id"] for t in chaincap.chain(p.db, hop1["id"])] == [root, hop1["id"]]
+    # The next hop commits too: queued again, though its title repeats the earlier hops'.
+    _hop(env, p, hop1["id"], {"b.py": 5}, _cont("feature, part 2"))
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop1["id"],))
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'")
+    assert p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
+    digest = coord.digest(p, {}, [], [])
+    assert "continue hop queued by the daemon" in digest and f"Continue hop #{hop2['id']}" in digest
+    # A local-only notice for a hop the daemon continued, while its review carries the branch, is
+    # folded into the digest too; without that review it goes to the coordinator.
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t1 = p.db.task(hop1["id"])
+    (r1,) = p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
+    d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
+    lo = p.db.one("SELECT * FROM events WHERE kind='local_only'")
+    assert lo["status"] == "handled" and any(f"its review #{r1['id']} carries it" in n for n in chaincap.notices(p.db))
+    p.db.update_task(r1["id"], status="cancelled")
+    p.db.set_kv("local_only", None)
+    p.db.x("DELETE FROM events WHERE kind='local_only'")
+    d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
+    assert p.db.one("SELECT status FROM events WHERE kind='local_only'")["status"] == "queued"
+    chaincap.clear_notices(p.db, time.time())
+    assert chaincap.notices(p.db) == []
+    # A hop with no new commit and no new evidence goes to the coordinator.
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() + 2, hop2["id"]))
+    _hop(env, p, hop2["id"], {}, _cont("feature, part 3"))
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (hop2["id"],)), "a hop without progress was continued"
+    assert p.db.one("SELECT status FROM events WHERE task=? AND kind='task_done'", (hop2["id"],))["status"] == "queued"
+    assert p.db.one("SELECT status FROM events WHERE task=? AND kind='followup_proposed'", (hop2["id"],))["status"] == "queued"
+    # New passing evidence is progress: a metric that is new or changed against the previous hop's.
+    ch = chaincap.chain(p.db, hop2["id"])
+    assert chaincap.progress(p, ch, 2) == ""
+    p.db.update_task(hop2["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
+    assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == "new evidence: passed"
+    p.db.update_task(hop1["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
+    assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == ""
+    line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
+    assert f"#{root} feature: 2 hops to #{hop2['id']}" in line and "2 auto" in line
+    # A code hop with changes whose review cannot be queued goes to the coordinator: the next hop
+    # would start without its commits and nothing would review or deliver them.
+    p.set_config("review.auto", False)
+    other, _, done, reviews = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
+    assert not reviews and not p.db.q("SELECT id FROM tasks WHERE parent=?", (other,))
+    assert done["status"] == "queued" and "Continue hop" not in done["text"]
+
+
+def _chain(p, n, status="done"):
+    """A root code task and `n` `continue:` hops after it, all `status`: their ids."""
+    ids = [p.db.add_task("parser", "s", kind="code", origin="coordinator")]
+    for i in range(n):
+        ids.append(p.db.add_task(f"continue: parser {i}", "s", kind="code", parent=ids[-1]))
+    for i in ids:
+        p.db.update_task(i, status=status)
+    return ids
+
+
+def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_what_changed(env):
+    p = make(env)
+    from ttp import audit, chaincap
+    from ttp import coordinator as coord
+    from ttp.db import continues_id
+    p.set_config("chains.max_hops", 2)
+    root, _, tip = _chain(p, 2)
+    act = {"type": "task_add", "title": "continue: parser, next", "spec": "carry on", "kind": "code", "continues": tip}
+    problems = coord.apply(p, [act])
+    assert any("refused" in x and "chains.max_hops is 2" in x for x in problems), problems
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tip,))
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (chaincap.CAP_EVENT,))
+    assert ev["status"] == "queued" and json.loads(ev["data"])["root"] == root and "Re-plan" in ev["text"]
+    labels, _ = coord.effort_triggers(p.db, p.config(), [ev["id"]], None)
+    assert chaincap.TRIGGER in labels
+    coord.apply(p, [act])
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.CAP_EVENT,))) == 1, "one event per lineage and hop"
+    why = "new approach: parse the header once instead of per line"
+    problems = coord.apply(p, [dict(act, reason=why)])
+    assert any("only in a high-effort turn" in x for x in problems), "a routine turn passed the cap"
+    problems = coord.apply(p, [dict(act, reason="keep going, it is almost there")], high_effort=True)
+    assert any("does not name what changed" in x for x in problems)
+    assert coord.apply(p, [dict(act, reason=why)], high_effort=True) == []
+    (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
+    assert p.db.one("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))
+    assert any("past its cap" in x for x in p.db.kv(coord.NOTES_KEY))
+    line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
+    assert f"#{root} parser: 3 hops to #{new['id']}" in line and "1 refused" in line and "1 overridden" in line
+    # Dollars and failed hops in a row cap a lineage too.
+    p.set_config("chains.max_hops", 0)
+    ids = _chain(p, 2)
+    p.db.x("UPDATE tasks SET spent_usd=25 WHERE id IN (?,?)", ids[:2])
+    assert "chains.max_usd is $40" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-1]))
+    ids = _chain(p, 2, status="failed")
+    assert "2 failed or no-progress hops" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-1]))
+    assert chaincap.refusal(p, p.config(), chaincap.chain(p.db, ids[-2])) == ""
+    # A hop added with `continues` on a done task stays in its lineage whatever its title.
+    p.set_config("chains.max_hops", 2)
+    root, tip = _chain(p, 1)
+    assert coord.apply(p, [{"type": "task_add", "title": "parser part three", "spec": "s", "kind": "code",
+                            "continues": tip}]) == []
+    (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
+    assert chaincap.FOLLOWS + str(tip) in json.loads(new["labels"]) and continues_id(new) is None
+    assert [t["id"] for t in chaincap.chain(p.db, new["id"])] == [root, tip, new["id"]]
+    assert "chains.max_hops is 2" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, new["id"]))
+    p.db.update_task(new["id"], status="done")
+    problems = coord.apply(p, [{"type": "task_add", "title": "parser, the rest", "spec": "s", "kind": "code",
+                                "continues": new["id"]}])
+    assert any("refused" in x and "chains.max_hops is 2" in x for x in problems), problems
+
+
+def test_a_continue_hop_in_an_area_under_review_area_cap_is_refused(env):
+    p = make(env)
+    from ttp import chaincap, reviewcap
+    from ttp import coordinator as coord
+    root, tip = _chain(p, 1)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "task:9", reviewcap.REVIEW_AREA_EVENT, "normal", "area", json.dumps({"root": root, "tasks": [root]}),
+            "handled"))
+    problems = coord.apply(p, [{"type": "task_add", "title": "continue: parser again", "spec": "s", "kind": "code",
+                                "continues": tip}])
+    assert any(f"review area of #{root}" in x for x in problems), problems
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tip,))
+    assert p.db.one("SELECT 1 FROM events WHERE kind=?", (chaincap.CAP_EVENT,))
+    # Past the review window the area no longer holds it.
+    p.db.x("UPDATE events SET ts=? WHERE kind=?", (time.time() - reviewcap.AREA_WINDOW_S - 60, reviewcap.REVIEW_AREA_EVENT))
+    assert chaincap.refusal(p, p.config(), chaincap.chain(p.db, tip)) == ""
 
 
 def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_the_changes_overlap(env):
@@ -46961,7 +47450,7 @@ def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch
                              *(f"{__file__}::{name}" for name in names)],
                             cwd=pathlib.Path(__file__).resolve().parents[1],
                             env={**os.environ, **{k: str(scratch) for k in ("TMPDIR", "TMP", "TEMP")},
-                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=max(900, _load_scaled(300)))
+                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=max(1200, _load_scaled(300)))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -52834,6 +53323,14 @@ def test_network_outage_names_the_hosts_from_ssh_errors_or_the_probe(env):
         == ["gw.example"], "no alias in the probe: ssh's own error"
     assert netwait.hosts("test -e /tmp/x") == []
     assert "The hosts this project's work needs cannot be reached" in netwait.text("UTC", 0.0, 1, [])
+    # ssh inside a command substitution, as a probe captures the remote answer, and ending one.
+    assert netwait.hosts("m=$(ssh -o BatchMode=yes h1 stat x) || exit 255") == ["h1"]
+    assert netwait.hosts("m=`ssh -o BatchMode=yes h1 stat x` || exit 255") == ["h1"]
+    assert netwait.hosts('[ "$(ssh box-a)" ] || exit 255') == ["box-a"]
+    assert netwait.confirm("test -e /x || exit 255", "", lambda h: False) == \
+        "exit 255 from a probe that names no ssh host"
+    assert netwait.confirm("ssh h1 true", "", lambda h: False) == "", "every host it names is unreachable"
+    assert "ssh reaches h1" in netwait.confirm("ssh h1 true", "", lambda h: h == "h1")
 
 
 def test_network_outage_classes_loopback_proxyjump_and_proxycommand_routes_as_tunnels(monkeypatch):
@@ -52956,6 +53453,7 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     from ttp.db import deferral
     p = make(env)
     _no_events(p)
+    _ssh_255(p)   # the check that the named host is out of reach gets ssh's own 255 too
     stub = p.root / "reach.sh"
     stub.write_text("echo 'ssh: connect to host gw.example port 22: Connection timed out' >&2; exit 255\n")
     probe = f"sh {stub}"
@@ -53002,6 +53500,95 @@ def test_network_outage_sees_real_start_when_probe_verdicts_and_clears_once_they
     assert len(cycle(at)) == 1, "clearing posts no new alert"
     assert not alerts.needs_you(p.db, at) and not p.db.kv("network_outage"), "the outage ended after the debounce"
     assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved' AND ref='network:unreachable'")) == 1
+
+
+@pytest.mark.parametrize("up", [True, False])
+def test_a_probe_255_is_a_network_outage_only_when_its_host_does_not_answer(env, monkeypatch, up):
+    """A start_when that exits 255 through its own `|| exit 255` after its remote command failed, while
+    the host answers ssh, is a broken probe against its task, never a network outage. With the host
+    really out of reach (ssh stubbed to 255) the outage is alerted, naming the alias."""
+    from ttp import alerts, netwait
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    p = make(env)
+    _no_events(p)
+    _ssh_255(p, up=up)
+    monkeypatch.setattr(netwait, "_ssh_config", lambda alias: {})
+    probe = "m=$(ssh -o BatchMode=yes box-a stat /x) || exit 255"
+    d = dmod.Daemon(p.base)
+    assert coord.apply(p, [{"type": "task_add", "title": "device job", "spec": "s", "start_when": probe}]) == []
+    tid = _added(p, "device job")
+    clock = {"now": time.time()}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    at = start = clock["now"]
+    while at < start + 1200:
+        clock["now"] = at
+        d.probe_waiting()
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(timeout=30)
+        d.probe_waiting()
+        d._net_checked = 0.0
+        d.check_unreachable()
+        alerts.sweep(p.db, at)
+        at += dmod.PROBE_EVERY_S + 20
+    sent = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='network:unreachable'")
+    broken = _events(p, tid, "deferral_probe_broken")
+    if up:
+        assert sent == [] and not p.db.kv("network_outage"), "the host answers: no network outage"
+        assert len(broken) == 1 and f"#{tid}" in broken[0]["text"] and "ssh reaches box-a" in broken[0]["text"], broken
+        assert "task %d probe is broken" % tid in (p.logs / "daemon.log").read_text()
+    else:
+        assert len(sent) == 1 and "box-a" in sent[0]["text"], sent
+        assert p.db.kv("network_outage")["hosts"] and not broken
+    assert p.db.task(tid)["status"] == "queued"
+
+
+def test_a_retry_when_255_whose_host_answers_wakes_its_task_as_a_broken_probe(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "`ssh box-a stat /x` || exit 255")
+    _ssh_255(p, up=True)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert _ready(p, tid)
+    assert json.loads(p.db.task(tid)["result"])["woke"] == \
+        "probe broken: exit 255 though ssh reaches box-a: its remote command failed"
+
+
+def test_unreachable_hosts_in_separate_probes_cost_the_tick_one_ssh_timeout_not_one_each(env, monkeypatch):
+    """Four probes, each naming its own unreachable host, finish in one tick: their hosts are asked
+    all at once (each check waits for the others, as one ConnectTimeout would), once a minute, and
+    every task still waits on the outage."""
+    import threading
+    p = make(env)
+    from ttp import daemon as dmod, netwait
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _ssh_255(p)
+    together, asked = threading.Barrier(4, timeout=5), []
+
+    def answers(host, env=None):
+        asked.append(host)
+        together.wait()   # breaks (5 s) unless all four are asked at once
+        return False
+    monkeypatch.setattr(netwait, "answers", answers)
+    d = dmod.Daemon(p.base)
+    tids = [_due_waiting_task(p, f"ssh -o BatchMode=yes box-{c} test -e /tmp/marker") for c in "abcd"]
+    for tid in tids:
+        p.db.update_task(tid, not_before=time.time() + 3600)
+    d.probe_waiting()
+    for tid in tids:
+        d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert sorted(asked) == ["box-a", "box-b", "box-c", "box-d"] and not together.broken
+    assert {d._probe_rc[t][0] for t in tids} == {netwait.UNREACHABLE_RC}, "each still waits on the outage"
+    d.probe_waiting()
+    for tid in tids:
+        if tid in d._probes:
+            d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert len(asked) == 4, "a host is asked at most once a minute"
 
 
 def test_ssh_pipe_bypasses_controlmaster_so_host_key_is_checked(monkeypatch):
@@ -59560,95 +60147,6 @@ def test_a_task_already_waiting_on_a_missing_task_is_flagged_once_and_shown_brok
     assert "broken: waits on #0, which does not exist (start_when: landed:#0)" in coord.digest(p, {}, [], [])
 
 
-def test_claude_verified_cache_capacity_and_unknown_builds(monkeypatch):
-    from ttp.providers import claude
-    monkeypatch.setattr(claude, '_FLAGS', {claude.INPUT_FORMAT: True})
-    monkeypatch.setattr(claude, "_VERSIONS", {})
-    monkeypatch.setattr(claude, '_probe_version', lambda path: '2.1.296 (Claude Code)')
-    prov = claude.Claude()
-    assert prov.own_cache_breakpoints == 3
-    assert prov.cached_input('STABLE', 'EVENTS', '1h') is not None
-    for version in ('2.1.285 (Claude Code)', '2.1.297 (Claude Code)', ''):
-        monkeypatch.setattr(claude, '_probe_version', lambda path: version)
-        monkeypatch.setattr(claude, '_VERSIONS', {})
-        logged = []
-        assert prov.own_cache_breakpoints == 4
-        assert prov.cached_input('STABLE', 'EVENTS', '1h', log=logged.append) is None
-        assert logged == [], 'no doomed mark should be constructed or logged'
-
-
-def test_claude_cache_capacity_follows_an_in_place_cli_update(monkeypatch, tmp_path):
-    # A long-running daemon must not keep a verified build's capacity after the CLI is replaced
-    # at the same path (npm and similar update in place): a stale answer means a 400 every turn.
-    from ttp.providers import base, claude
-    cli = tmp_path / "claude"
-    cli.write_text("build one")
-    versions = {"build one": "2.1.296 (Claude Code)", "build two, longer": "2.1.297 (Claude Code)"}
-    probes = []
-    monkeypatch.setattr(claude, "_VERSIONS", {})
-    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
-    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
-    monkeypatch.setattr(claude, "_probe_version", lambda path: probes.append(path) or versions[open(path).read()])
-    prov = claude.Claude()
-    assert prov.own_cache_breakpoints == 3 and prov.own_cache_breakpoints == 3
-    assert len(probes) == 1, "an unchanged build is probed once"
-    cli.write_text("build two, longer")
-    os.utime(cli, ns=(cli.stat().st_atime_ns, cli.stat().st_mtime_ns + 10**9))
-    assert prov.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, "same path, new build: probed again"
-    assert len(probes) == 2
-
-
-def test_claude_cache_mark_refused_reserves_every_breakpoint_for_that_build(monkeypatch, tmp_path):
-    from ttp.providers import base, claude
-    cli = tmp_path / "claude"
-    cli.write_text("build")
-    monkeypatch.setattr(claude, "_VERSIONS", {})
-    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
-    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
-    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
-    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.296 (Claude Code)")
-    prov = claude.Claude()
-    assert not prov.cache_mark_refused("error_during_execution: API Error: 529 overloaded")
-    assert prov.cached_input("STABLE", "EVENTS", "1h") is not None
-    assert prov.cache_mark_refused('success: API Error: 400 {"type":"error","error":{"type":'
-                                   '"invalid_request_error","message":"A maximum of 4 blocks with '
-                                   'cache_control may be provided. Found 5."}}')
-    assert prov.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS
-    assert prov.cached_input("STABLE", "EVENTS", "1h") is None
-    assert not base.Provider.cache_mark_refused(prov, "blocks with cache_control"), "agents without the mark"
-
-
-def test_coordinator_turn_refused_for_its_cache_mark_retries_without_it(env, monkeypatch, tmp_path):
-    from ttp.providers import claude
-    from ttp.providers.base import RunUsage
-    from ttp.daemon import Daemon
-    from ttp import coordinator as coord
-    cli = tmp_path / "claude-cli"
-    cli.write_text("build")
-    monkeypatch.setattr(claude, "_VERSIONS", {})
-    monkeypatch.setattr(claude, "_MARK_REFUSED", set())
-    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
-    monkeypatch.setattr(claude.Claude, "binary", lambda self: str(cli))
-    monkeypatch.setattr(claude, "_probe_version", lambda path: "2.1.296 (Claude Code)")
-    p = make(env)
-    head, context = coord.prompt_parts(p)
-    d = Daemon(p.base)
-
-    def turn():
-        rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
-                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl="1h")
-        (p.runs / str(rid) / "STOP").touch()
-        return rid, (p.runs / str(rid) / "input.jsonl").exists()
-
-    rid, marked = turn()
-    assert marked, "a verified build gets the stable-context mark"
-    row = dict(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
-    d._finish_coordinator(row, RunUsage(error="success: API Error: 400 A maximum of 4 blocks with "
-                                              "cache_control may be provided. Found 5."), "failed", {})
-    assert int(p.db.kv("coordinator_failures", 0)) == 1, "still a failed turn; its messages stay queued"
-    assert turn()[1] is False, "the retry goes without the mark that was refused"
-
-
 def test_coordinator_cache_distinguishes_zero_partial_full_and_unknown(env):
     from ttp import budget as bud, audit
     from ttp.cli import status_text
@@ -59928,6 +60426,63 @@ def test_ttp_checks_purpose_harness_never_counts_as_candidate_evidence(env, tmp_
     (run / "checks.json").write_text(json.dumps({"head": head, "worktree": str(repo), "passed": True,
                                                  "commands": ["true"], "skipped": [], "ts": 0}))
     assert prguard._checks_problem(str(repo)) is None and push.recorded_checks(run)["head"] == head
+
+
+def test_ttp_checks_purpose_harness_tolerates_harness_state_it_does_not_own(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
+    # Tracked state files other writers keep appending to while the worker's head is committed.
+    (repo / "state").mkdir()
+    for f in ("queue-wait.jsonl", "state/tasks.json", "project.json"):
+        (repo / f).write_text("{}\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "state"], check=True)
+    for f in ("queue-wait.jsonl", "state/tasks.json"):
+        with open(repo / f, "a") as fh:
+            fh.write('{"wait": 1}\n')
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 1
+    assert ("not counting uncommitted harness state files the runtime or other tasks write: "
+            "queue-wait.jsonl, state/tasks.json") in capsys.readouterr().out
+    # The candidate purpose is unchanged: they still block it.
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    assert e.value.code and "commit first" in capsys.readouterr().err
+    # The worker's own sources still block: an edited source, a staged state file, and project.json
+    # outside the project's harness repo.
+    for staged, path in ((False, "a.txt"), (True, "queue-wait.jsonl"), (False, "project.json")):
+        subprocess.run([*git, "checkout", "-q", "--", "."], check=True)
+        with open(repo / path, "a") as fh:
+            fh.write("more\n")
+        if staged:
+            subprocess.run([*git, "add", path], check=True)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--purpose", "harness", "--fresh"])
+        assert e.value.code and "commit first" in capsys.readouterr().err, path
+        subprocess.run([*git, "reset", "-q"], check=True)
+    assert ran() == 1
+    # In the project's own harness repo, the config, charter and memory the coordinator writes do not block.
+    h = ["git", "-C", str(p.harness), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*h, "add", "-A"], check=True)
+    subprocess.run([*h, "commit", "-qm", "base", "--allow-empty"], check=True)
+    monkeypatch.chdir(p.harness)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, "true"])
+    with open(p.memory_index, "a") as fh:
+        fh.write("- a lesson\n")
+    cli.main(["checks", "--purpose", "harness"])
+    assert ran() == 2
+    assert "harness state files the runtime or other tasks write: MEMORY.md, project.json" in capsys.readouterr().out
+    # A harness source the worker changed still blocks there.
+    with open(p.harness / "prompts" / "worker.md", "a") as fh:
+        fh.write("more\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--purpose", "harness", "--fresh"])
+    assert e.value.code and "commit first" in capsys.readouterr().err
+    assert ran() == 2
 
 
 def test_ttp_checks_purpose_cache_never_crosses_purposes(env, tmp_path, monkeypatch, capsys):
@@ -60796,6 +61351,11 @@ def test_stale_git_locks_are_cleared_but_live_or_young_ones_kept(tmp_path):
     assert young.exists(), "a lock younger than the threshold is kept"
     assert obj.exists(), "object store locks are left alone"
     assert not old.exists() and not ref.exists()
+    kept = sorted(x.relative_to(repo / ".git" / gitlocks.KEEP_DIR).parts[1:]
+                  for x in (repo / ".git" / gitlocks.KEEP_DIR).rglob("*.lock"))
+    assert kept == [("index.lock",), ("refs", "heads", "main.lock")], "moved aside, never deleted"
+    # What was moved aside is never a candidate again.
+    assert gitlocks.clear(repo, 600, procs=[]) == ([], [])
 
 
 def test_a_git_lock_a_process_has_open_is_never_stale(tmp_path):
@@ -60820,26 +61380,43 @@ def test_a_git_lock_a_process_has_open_is_never_stale(tmp_path):
     assert gitlocks.clear(repo, 600, procs=[])[0] == [lock]
 
 
-def test_daemon_clears_a_stale_harness_git_lock_and_logs_it(env):
+def test_daemon_sweep_moves_a_stale_harness_git_lock_aside_and_logs_it(env):
     p = make(env)
     from ttp import gitlocks
     from ttp.daemon import Daemon
-    assert gitlocks.git_dir(p.harness) is not None
-    lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
+    gdir = gitlocks.git_dir(p.harness)
+    assert gdir is not None
+    lock = _harness_lock(gdir.parent, "index.lock", 3600)
     d = Daemon(p.base)
-    d.cfg = p.config()
-    assert gitlocks.settings(d.cfg) == 600
-    d.clear_git_locks()
-    assert not lock.exists()
-    assert "harness git locks: removed stale" in (p.logs / "daemon.log").read_text()
+    assert not hasattr(d, "clear_git_locks"), "one cleaner: the harness sweep"
+    d.heal_harness_git()
+    assert not lock.exists() and list((gdir / gitlocks.KEEP_DIR).rglob("index.lock"))
+    assert "moved stale lock file(s) aside" in _daemon_log_text(p)
     ev = p.db.one("SELECT severity,text FROM events WHERE kind='git_lock_cleared'")
     assert ev["severity"] == "low" and "index.lock" in ev["text"]
     # Off when the threshold is 0.
+    lock = _harness_lock(gdir.parent, "index.lock", 3600)
+    p.set_config("harness_git.stale_lock_s", 0)
+    assert p.clear_stale_git_locks() == [] and lock.exists()
+
+
+def test_stale_git_lock_setting_reads_the_old_watchdog_key_only_when_the_new_one_is_unset(env):
+    p = make(env)
+    from ttp import gitlocks
+    from ttp.project import unknown_key_hint
+    assert gitlocks.settings({}) == gitlocks.settings(p.config()) == 600
+    assert gitlocks.settings({"watchdog": {"stale_git_lock_s": 0}}) == 0
+    assert gitlocks.settings({"watchdog": {"stale_git_lock_s": 1200}}) == 1200
+    assert gitlocks.settings({"harness_git": {"stale_lock_s": 900}, "watchdog": {"stale_git_lock_s": 0}}) == 900
+    assert gitlocks.settings({"harness_git": {"stale_lock_s": "x"}}) == 600
+    assert unknown_key_hint("harness_git.stale_lock_s") is None
+    assert unknown_key_hint("watchdog.stale_git_lock_s") is None, "the old key stays quiet"
+    # The old key still turns it off for both callers.
     lock = _harness_lock(gitlocks.git_dir(p.harness).parent, "index.lock", 3600)
     p.set_config("watchdog.stale_git_lock_s", 0)
-    d.cfg, d._git_locks_at = p.config(), 0.0
-    d.clear_git_locks()
-    assert lock.exists()
+    assert p.clear_stale_git_locks() == [] and lock.exists()
+    p.set_config("harness_git.stale_lock_s", 600)
+    assert p.clear_stale_git_locks() == ["index.lock"] and not lock.exists()
 
 
 def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
@@ -61954,3 +62531,32 @@ def test_upgrade_keeps_a_light_tier_model_coordinator(env):
     p.set_config("coordinator.model_tier", "standard")   # the project's own choice stays
     assert cli._keep_light_coordinator(p) == ""
     assert p.config()["coordinator"]["model_tier"] == "standard"
+
+
+def test_push_result_line_matches_the_documented_format_and_pushed_flag_exit_codes(tmp_path, capsys):
+    import json
+    from pathlib import Path
+    from ttp import push
+    root = Path(__file__).resolve().parents[1] / "plugins/tt-project/template/prompts"
+    for f in ("kind-code.md", "kind-review.md"):
+        assert "ttp push: pushed <sha> to <branch>" in (root / f).read_text()
+    marker = tmp_path / "m.json"
+    marker.write_text(json.dumps({"status": "pushed", "sha": "abc123", "target": "b"}))
+    assert push.result(marker, pushed_only=True) == 0
+    assert capsys.readouterr().out.startswith("ttp push: pushed abc123 to b")
+    marker.write_text(json.dumps({"status": "failed", "exit": 4, "log": "/nonexistent"}))
+    assert push.result(marker, pushed_only=True) == push.NOT_PUSHED
+    assert push.result(marker) == 0
+
+
+def test_watcher_distinct_episodes_of_one_key_count_as_churn(env, monkeypatch):
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    for n in range(1, 5):
+        run("eps", {"text": "box-a: job failed", "severity": "high", "key": "job", "episode": f"e{n}"})
+    assert watchdup.counts(p.db, "watcher:eps", time.time()) == [("box-a", 4)]
+    assert "watcher:eps opened 4 issues on subject 'box-a'" in log()
+    # Each superseded issue and its successor count once; the supersede itself adds no reopen.
+    assert [r["cleared_why"] for r in p.db.q("SELECT cleared_why FROM issues ORDER BY id")][:3] == \
+        ["superseded by a new episode"] * 3

@@ -104,8 +104,8 @@ Each field's rules are in the section named; the table only lists them.
 - A task whose resource is busy comes back `waiting` and retries itself; do not re-add it.
 - Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
   as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project
-  root: exit 0 = start; 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet; any other exit
-  is a broken probe, so end a test with `|| exit 1`; `now` or `""` = start now) with `why` (the user
+  root: exit 0 = start; 1, 75 (busy `ttp lock`) or ssh's own 255 = not yet; any other exit is a
+  broken probe, so end a test, remote too, with `|| exit 1`; `now` or `""` = start now) with `why` (the user
   sees 'starts when <why>'). A broken probe, or one unmet after `coordinator.defer_max_days`, comes
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
   entries a deferred follow-up replaces in the same turn.
@@ -150,35 +150,36 @@ Each field's rules are in the section named; the table only lists them.
   own pause in a turn where the user's words ask to pause something else (unset, that turn makes it
   theirs). Your pause of a resource with a heal check ends after 3 healthy results over 30 min;
   otherwise give an `end_when` probe of the cause. A `pause_end_due` event: lift it, or extend it with a new end and a reason.
-- Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
-  `continues` to its id: its dependents move to the new task, a continued blocked task is
-  cancelled, and a code task starts from the old task's branch. Replacing a task without
-  `continues` leaves its dependents blocked. `continues` on a done task adds a follow-up instead:
-  it takes over no dependents and a code task starts from the base branch.
+- Re-adding, scoping down or finishing a failed, cancelled or exhausted task: set `continues` to
+  its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
+  a replacement without `continues` leaves its dependents blocked. On a done task it adds a
+  follow-up (no dependents move; code starts from the base branch). The daemon queues a
+  progressing hop's sole `continue:` follow-up itself. A `continue_cap` event refuses more hops:
+  re-plan, or give a `reason` naming what changed.
 - A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
   `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
-  without it `ttp push --own` refuses that branch. A rebase cannot fast-forward a branch: put "rebase" in its title.
+  without it `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put "rebase" in its title.
   A follow-up carries a branch only through its own `pr_branch:` line; a task that `continues` a
   failed or cancelled one carries its branch, unless its spec names only the push branch, that
   branch was never published, it is a third task's branch no `pr_branch:` line names, or you set
   `pr_branch` to `""`.
-- An `idle_capacity` event: a device the project holds sits idle with nothing queued for it. Queue
-  useful charter work that uses it, or say once in your note that nothing useful remains.
+- An `idle_capacity` event: a device the project holds sits idle with nothing queued. Queue useful
+  charter work for it, or say once in your note that none remains.
 - A resource that keeps failing (`## Resource trouble`, a `resource_trouble` event) through no
   fault of the task is something to route around, not to wait out ("waits only" lines are just busy):
   move its open tasks to a healthy alternative the charter allows (`task_update` `resources`,
   `queued`, a `spec` note), `resource_pause` it, `memory_add` the decision, `notify` at `normal`.
   Only when the charter allows no alternative: `ask_user` (`blocking` `access`) naming the machines
   that would do.
-- A `local_only` event: a done code task's branch is on no remote. Deliver it as the charter allows,
-  or cancel it if unwanted. A task that re-lands such work as another commit records
+- A `local_only` event: a done code task's branch is on no remote. Deliver it as the charter allows
+  or cancel it. A task that re-lands such work as another commit records
   `ttp task <project> superseded <id> <sha>`; say so in its spec.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it.
-- A `review_stall` event: a task sat in `review` too long while queued tasks depend on it. Get it
-  reviewed, mark it done once its work is verified, or re-point or cancel the dependents.
-- A question you can answer from the digest: `reply` directly. Otherwise a `question` task with
-  `reply_chat` set; do NOT send an acknowledgement unless the answer will take over ~10 minutes.
+- A `review_stall` event: a task sat in `review` too long with queued dependents. Get it reviewed,
+  mark it done once verified, or re-point or cancel the dependents.
+- A question the digest answers: `reply` directly. Otherwise a `question` task with `reply_chat`
+  set; send no acknowledgement unless the answer will take over ~10 minutes.
 
 # User instructions
 

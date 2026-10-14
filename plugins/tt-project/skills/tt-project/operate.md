@@ -159,16 +159,23 @@
   `"$VIRTUAL_ENV"/bin/python`: workers and reviewers run with the project venv active.
 - Harness commits (charter, memory, schedules) heal themselves. Each git command gets `harness_git.timeout_s`
   (default 120 s); every failure goes to `daemon.log` with git's exit code and stderr. Lock files in the
-  harness's `.git` older than `harness_git.stale_lock_s` (600 s) while no git runs there are moved to
-  `.git/ttp-stale-locks/`, never deleted. The next successful commit, and the daemon every
+  harness's `.git` older than `harness_git.stale_lock_s` (600 s; 0: off) that no process holds (none
+  has it open, no git runs there) are moved to `.git/ttp-stale-locks/`, never deleted. The next successful commit, and the daemon every
   `harness_git.sweep_every_s` (600 s), commit charter and memory files a failed commit left behind. Files that look like a
   power-cut write are left for the boot integrity check, and nothing is swept before it has run.
 - Making a task's worktree recovers by itself. Each git command gets `worktree.git_timeout_s`
   (default 120 s), scaled by the host's load per CPU up to `worktree.git_timeout_max_s` (900 s). After
   a timeout or a failure left behind by one, a whole worktree is reused and a half-made one (still
   locked "initializing", with no index or HEAD) is removed and made again (`worktree.create_attempts`,
-  default 2). A check that fails, or a worktree on another branch, is left as it is and counts as a
-  failure: an error never deletes a worktree. A branch with its own commits is never reset. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
+  default 2). A check that fails is left as it is and counts as a failure: an error never deletes a
+  worktree. A branch with its own commits is never reset. A worktree on another branch than the
+  task's is recovered: a branch with commits of this task (or the task it continues) is adopted; one
+  with no commits of its own has its untracked, ignored and modified files (and `uncommitted.patch`)
+  moved to `state/worktree-leftovers/t<id>-<date>/` and is made again on the task's branch. Ignored
+  build and tool caches (`disk.cache_dirs`) are not moved: they go with the old worktree, except
+  hand-off artifacts inside them, which move. Leftovers
+  folders are deleted after `disk.worktree_leftovers_keep_days` (30; 0 keeps them). Any other case
+  (another task's commits, submodules, the branch checked out elsewhere) blocks at once. If that still fails, the task is queued again `worktree.create_retries` times (default 3)
   after `worktree.retry_backoff_s` (120 s, doubling). Only then is it blocked (`workspace:`) for the
   coordinator. Tasks an older daemon blocked this way are queued again on their own. Checkouts
   leave Git LFS files as pointers (`GIT_LFS_SKIP_SMUDGE=1`), so a large download never outlasts the

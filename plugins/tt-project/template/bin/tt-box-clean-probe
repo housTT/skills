@@ -15,7 +15,8 @@ queued); a running job, or a hold still on, counts as now. The broker writes nai
 the probe compares them with the host's local clock (it runs on the broker's own host).
 
 Exit 0: clean for the window. 1: not yet (prints the newest incident and the earliest clean
-time). 255: cannot tell (uptime or the broker unreadable). The harness reads 1 and 255 as not yet.
+time). 75: cannot tell (uptime or the broker unreadable). The harness reads 1 and 75 as not yet;
+255 stays ssh's own (the box out of reach) when the probe runs on another box over ssh.
 With no broker installed it judges on uptime alone, unless --require-broker.
 Stdlib only, Python 3.9+.
 """
@@ -27,7 +28,7 @@ import re
 import subprocess
 import sys
 
-CLEAN, NOT_YET, UNKNOWN = 0, 1, 255
+CLEAN, NOT_YET, UNKNOWN = 0, 1, 75
 BROKER_PY = "/opt/tt-device-broker/venv/bin/python3"
 # Broker-run jobs (owner "[broker]<kind>") that mean a drop or a reset. Startup, fabric checks and
 # hold-ended are routine.
@@ -177,7 +178,7 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=2000, help="recent jobs to read (default 2000)")
     ap.add_argument("--timeout", type=int, default=40, help="broker query timeout in seconds (default 40)")
     ap.add_argument("--require-broker", action="store_true",
-                    help="exit 255 when no broker is installed instead of judging on uptime alone")
+                    help="exit 75 when no broker is installed instead of judging on uptime alone")
     ap.add_argument("--jobs-file", help="read recent jobs JSON from this file ('-': stdin) instead of the broker")
     ap.add_argument("--uptime-file", default="/proc/uptime", help=argparse.SUPPRESS)
     ap.add_argument("--now", help=argparse.SUPPRESS)  # naive local ISO time, for tests

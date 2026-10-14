@@ -57,7 +57,7 @@ Claude Code (a branch or tag goes after `#`):
 ```bash
 claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#smartonTT/tt-project-dogfood-1'
 claude plugin install tt-project@tenstorrent-skills
-claude plugin details tt-project    # Skills (2): tt-project, tt-project-harness
+claude plugin details tt-project    # Skills (3): setup-box, tt-project, tt-project-harness
 "$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
 ```
 
@@ -111,7 +111,7 @@ claude plugin marketplace update tenstorrent-skills && claude plugin update tt-p
 ```
 
 Uninstall: stop every project (`ttp list` names them), then remove the shortcut, the plugin and
-the per-user files (project registry, saved keys and the installed `ttp`):
+the per-user files (project registry, saved keys, ttp's cache and the installed `ttp`):
 
 ```bash
 ttp stop <name> --kill          # each project: ends its daemon and workers, removes its service
@@ -119,7 +119,7 @@ ttp setup --no-shortcut
 claude plugin marketplace remove tenstorrent-skills
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 rm -rf ~/.cursor/plugins/local/tt-project
-rm -rf ~/.tt-project ~/.local/bin/ttp
+rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
@@ -417,7 +417,8 @@ prolonged whole-box outage.
   database: its next idle stretch waits both the grace and the doubling rearm from its last event,
   until a task names the device again.
 - Network outage (model-free): when every task that could start waits on a probe saying this
-  machine cannot reach its host (ssh exit 255), no worker runs and nothing else can start, for
+  machine cannot reach its host (ssh exit 255, confirmed by `ssh <alias> true` failing too; a 255
+  that names no host, or whose host answers, is a broken probe for its task), no worker runs and nothing else can start, for
   `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect
   the VPN or network sign-in on the machine running the project. It names the hosts, when the outage
   began (home time zone) and how many tasks wait, stays in the top section, is sent once per outage
@@ -697,6 +698,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   its working copy: a change to a covered input and its refreshed digest land in one commit, with no
   second commit to move the pin, and the change's own review covers the definition. A covered input
   whose digest was not refreshed still fails, and the error prints its digest at HEAD.
+  A harness definition may bind a path to `"committed"` instead of a digest, for an input that changes
+  often and is checked by its own commands (a watcher's or schedule's JSON): whatever HEAD commits there
+  is covered, under a pinned or an at-HEAD definition, with no digest to refresh and no pin to move.
+  The file must still exist at HEAD as a regular file and match its working copy. Candidate
+  definitions keep exact digests.
 
   A separate `--purpose candidate` definition keeps exact publication identities:
   `{"purpose":"candidate","candidates":{"<full-candidate-commit-id>":{"paths":{...},"commands":[...]}}}`.
@@ -722,6 +728,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.
+  `ttp checks --purpose harness` also tolerates unstaged edits to harness state no worker's change
+  owns: `*.jsonl` records and files under a `state/` directory, and in the project's own harness repo
+  `project.json`, `schedules.json`, `CHARTER*`, `MEMORY.md` and `memory/`. It lists them; any other
+  uncommitted edit, or a staged one, still blocks.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
@@ -767,7 +777,7 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `ttp push --detach` runs the same push in a process of its own and returns at once, for
   checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
   `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,
-  printing the pushed sha (and version) or the exit code and the log tail. A push killed by a
+  printing `ttp push: pushed <sha> to <branch>` (and version) or `ttp push: not pushed (...)` and the log tail. For an `on_pass_cmd`, add `--pushed`: exit 0 only if the push landed, 1 while it runs, 3 if it finished without pushing; no grep needed. A push killed by a
   crash or a reboot frees its locks; the probe (or the daemon) then records it as failed, saying
   whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
   each command in a PID namespace of its own (Codex on Linux), which kills a background process

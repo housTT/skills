@@ -28,6 +28,13 @@ host is reached through a tunnel from the user's workstation that reconnects by 
 says so, gives no VPN advice, and is a low feed line (no page, not in the top section) until the
 outage is `waiting.tunnel_outage_page_after_s` old (3600 s), when it is raised once to normal under
 the same key, so it stays one issue that clears the same way.
+
+A probe's 255 counts as unreachable only when it is ssh's own: every host the probe names is checked
+with `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> true` (confirm). A probe that names no host, or
+whose host answers, failed its own remote command (e.g. lost quotes and `|| exit 255`): the daemon
+treats it as a broken probe against its task, never as an outage.
+The daemon checks the hosts of every probe that exited 255 in one tick together (reach), so an
+outage holds its tick for one ConnectTimeout, not one per probe; each host is asked once a minute.
 """
 from __future__ import annotations
 
@@ -35,6 +42,7 @@ import ipaddress
 import re
 import shlex
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import timefmt
@@ -49,6 +57,9 @@ HOSTS_MAX = 4
 _OUT_HOST = re.compile(r"(?:connect to host|resolve hostname|[Cc]onnection to|connection to host) "
                        r"([A-Za-z0-9_.\-]+)")
 _SSH_ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")   # ssh options that take a value
+_SUBST = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\$\(|`)+")   # `x=$(`, `$(` or a backtick before ssh
+REACH_THREADS = 32             # hosts checked at once in one reach() pass
+CONFIRM_TIMEOUT_S = 10         # ConnectTimeout of the check that a probe's host really is unreachable
 
 
 def settings(cfg: dict) -> tuple[float, float]:
@@ -72,7 +83,7 @@ def _ssh_target(words: list[str]) -> str:
         if w.startswith("-") and len(w) > 1:
             i += 2 if len(w) == 2 and w[1] in _SSH_ARG_OPTS else 1
             continue
-        return w.rpartition("@")[2]
+        return w.rpartition("@")[2].rstrip(")`;")
     return ""
 
 
@@ -83,9 +94,11 @@ def hosts(probe: str, output: str = "") -> list[str]:
         words = shlex.split(str(probe or ""))
     except ValueError:
         words = str(probe or "").split()
+    # A quoted command substitution ("$(ssh h1 cat f)") is one word: its own words count too.
+    words = [x for w in words for x in ([w, *w.split()] if " " in w and ("$(" in w or "`" in w) else [w])]
     out = []
     for i, w in enumerate(words):
-        if Path(w).name == "ssh":
+        if Path(_SUBST.sub("", w)).name == "ssh":
             target = _ssh_target(words[i + 1:])
         elif w == "--host" and i + 1 < len(words):
             target = words[i + 1]
@@ -94,6 +107,40 @@ def hosts(probe: str, output: str = "") -> list[str]:
         if target and target not in out:
             out.append(target)
     return out or list(dict.fromkeys(_OUT_HOST.findall(output or "")))
+
+
+def answers(alias: str, env: dict | None = None) -> bool:
+    """ssh reaches `alias`: anything but ssh's own 255 (or no answer at all) means the host answered."""
+    if not alias or alias.startswith("-"):
+        return False
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={CONFIRM_TIMEOUT_S}", alias, "true"],
+                           env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=CONFIRM_TIMEOUT_S + 20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode != UNREACHABLE_RC
+
+
+def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
+    """answers() for each alias, all at once: in an outage the pass waits out one timeout, not one each."""
+    names = list(dict.fromkeys(aliases))
+    if not names:
+        return {}
+    with ThreadPoolExecutor(min(len(names), REACH_THREADS)) as ex:
+        return dict(zip(names, ex.map(lambda h: answers(h, env), names)))
+
+
+def confirm(probe: str, output: str = "", answered=None) -> str:
+    """Why a probe's exit 255 is not ssh's own ("" when every host it names is unreachable): it names
+    no ssh host, or one answers, so its own remote command failed. `answered(alias)` checks one host."""
+    names = hosts(probe, output)[:HOSTS_MAX]
+    if not names:
+        return "exit 255 from a probe that names no ssh host"
+    with ThreadPoolExecutor(len(names)) as ex:   # at once: in an outage each waits out its timeout
+        up = [h for h, ok in zip(names, ex.map(answered or answers, names)) if ok]
+    if up:
+        return f"exit 255 though ssh reaches {', '.join(up)}: its remote command failed"
+    return ""
 
 
 def loopback(host: str) -> bool:

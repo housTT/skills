@@ -222,10 +222,11 @@ def same_day(entry: dict, where=None, now: float | None = None) -> bool:
 
 def match(db, title: str, spec: str, where=None, skip=None, now: float | None = None) -> dict | None:
     """The ledger entry new work repeats: today's settled results first, then the newest. `skip` is
-    the task the new one continues."""
+    the task the new one continues (or a set of ids: its lineage)."""
     ledger = entries(db, where, now)
     usual = common(ledger)
-    hits = [e for e in ledger if str(e["id"]) != str(skip)
+    skips = {str(x) for x in skip} if isinstance(skip, (set, list, tuple)) else {str(skip)}
+    hits = [e for e in ledger if str(e["id"]) not in skips
             and similar(title, spec or "", e["title"], e["spec"], usual)]
     if not hits:
         return None

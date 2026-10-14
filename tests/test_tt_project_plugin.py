@@ -153,6 +153,11 @@ def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
                 f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
                 "bin/ttp\" setup", "ttp new ", "ttp stop <name> --kill"):
         assert cmd in section, cmd
+    # `claude plugin details` lists the skills the plugin ships, sorted.
+    skills = sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
+    assert f"# Skills ({len(skills)}): {', '.join(skills)}\n" in section
+    # Uninstall removes every per-user path ttp writes, its cache included.
+    assert '"${XDG_CACHE_HOME:-$HOME/.cache}/ttp"' in section
 
 
 def test_runtime_is_standard_library_only_and_python39_compatible():
@@ -891,23 +896,23 @@ def test_box_clean_probe_counts_a_recent_boot_and_short_history(tmp_path):
     assert _box_probe(tmp_path, {"jobs": [_job(1), _job(30)]}, args=["--limit", "2"])[0] == 0
 
 
-def test_box_clean_probe_degrades_without_a_broker_and_255_when_unreadable(tmp_path):
+def test_box_clean_probe_degrades_without_a_broker_and_75_when_unreadable(tmp_path):
     rc, out = _box_probe(tmp_path)
     assert rc == 0 and "no broker installed, uptime only" in out
     assert _box_probe(tmp_path, up_h=3)[0] == 1
     rc, out = _box_probe(tmp_path, args=["--require-broker"])
-    assert rc == 255 and out.startswith("UNKNOWN: no broker python at")
+    assert rc == 75 and out.startswith("UNKNOWN: no broker python at")
     for body in ("exit 3", "echo not json", "echo '{\"error\": \"held\"}'"):
         fake = tmp_path / "broker-python"
         fake.write_text("#!/bin/sh\n%s\n" % body)
         fake.chmod(0o755)
         rc, out = _box_probe(tmp_path, broker=fake)
-        assert rc == 255 and out.startswith("UNKNOWN: broker"), out
+        assert rc == 75 and out.startswith("UNKNOWN: broker"), out
     (tmp_path / "jobs.json").write_text("{")
     import subprocess
     r = subprocess.run([sys.executable, str(BOX_PROBE), "--jobs-file", str(tmp_path / "jobs.json"),
                         "--uptime-file", str(tmp_path / "missing")], capture_output=True, text=True)
-    assert r.returncode == 255 and r.stdout.startswith("UNKNOWN: uptime unreadable")
+    assert r.returncode == 75 and r.stdout.startswith("UNKNOWN: uptime unreadable")
 
 
 def test_box_clean_probe_queries_the_broker_python(tmp_path):
@@ -1296,7 +1301,7 @@ def test_setup_box_bare_check_ready_box(tmp_path):
     (dict(broker=False, svc="inactive"), (), 0, "broker: none"),
     (dict(lock_rc=75), (), 75, "busy or paused: wait for it, never override it"),
     (dict(lock_rc=2), (), 1, "lock: could not probe"),
-    (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: failed (exit 255) connection refused"),
+    (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: connection to <box-alias> failed (exit 255) connection refused"),
     (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
     (dict(machines={}), (), 0, "not in `ttp machines list`"),
 ])
@@ -1304,6 +1309,24 @@ def test_setup_box_bare_check_problems(tmp_path, kw, args, rc, expect):
     env, _ = _bare_env(tmp_path, **kw)
     r = _bare_check(tmp_path, env, *args)
     assert r.returncode == rc and expect in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_bare_check_names_its_box_when_ssh_fails(tmp_path):
+    """As a retry_when, its 255 counts as unreachable only when the daemon cannot reach a host the
+    probe names: the failure line names the box even when ssh's own last line does not."""
+    import shlex
+    import subprocess
+    sys.path.insert(0, str(RUNTIME.parent))
+    from ttp import netwait
+    env, _ = _bare_env(tmp_path, ssh_down=True)
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"box-a": {"route": "bare"}}}), encoding="utf-8")
+    probe = shlex.join([sys.executable, str(BOX_PY), "--site", str(site), "bare", "check", "box-a"])
+    r = subprocess.run(probe, shell=True, capture_output=True, text=True, timeout=60, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 255 and netwait.hosts(probe, out) == ["box-a"], out
+    assert netwait.confirm(probe, out, lambda h: False) == ""   # the box is down: the task sleeps on
+    assert "ssh reaches box-a" in netwait.confirm(probe, out, lambda h: True)   # up: a broken probe
 
 
 def test_setup_box_bare_check_missing_probe_is_a_problem(tmp_path):
@@ -1542,7 +1565,7 @@ def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", re
     (fake / "sinfo.txt").write_text("node07\n")
     tools = {
         "ssh": 'while [ "${1#-}" != "$1" ]; do shift 2; done; shift; exec bash -c "$*"',
-        "scontrol": 'case "$*" in *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
+        "scontrol": 'case "$*" in *partition*) cat "$FAKE/part.txt" 2>/dev/null;; *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
                     '{ echo "No reservations in the system"; exit 1; };; *) cat "$FAKE/node.txt";; esac',
         "sinfo": 'cat "$FAKE/sinfo.txt"',
         "squeue": 'cat "$FAKE/squeue.txt"',
@@ -1645,6 +1668,40 @@ def test_setup_box_slurm_submit_refuses_unsafe_jobs_and_prints_note_and_probe(tm
     assert subprocess.run(probe, shell=True, env=env).returncode == 0
 
 
+def test_setup_box_slurm_submit_without_node_lets_slurm_place_the_job(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    co = str(tmp_path / "work" / "repo")
+    base = ["submit", "<box-alias>", "--partition", "p4", "--name", "t1", "--time", "30",
+            "--checkout", co, "--purpose", "smoke test", "--command", "true"]
+    (fake / "node.txt").write_text("NodeName=node07 State=ALLOCATED\n")  # no node is checked
+    site = json.loads((tmp_path / "boxes.json").read_text())
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["exclusive"] = False
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    r = run(*base)
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = (fake / "sbatch.args").read_text()
+    assert args.startswith("--parsable --nodes=1 --exclude=demo1,bad1 -p p4 --time=30 "), args
+    assert "-w" not in args.split() and "--exclusive" not in args
+    assert "node: assigned by Slurm" in r.stdout
+    note = next(ln for ln in r.stdout.splitlines() if ln.startswith("note: ttp note "))
+    assert "node assigned by Slurm" in note and "job 4242" in note
+    # A whole-node partition gets --exclusive, unless the partition already enforces it.
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["exclusive"] = True
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=NO State=UP\n")
+    assert run(*base).returncode == 0
+    assert "--nodes=1 --exclude=demo1,bad1 --exclusive -p p4" in (fake / "sbatch.args").read_text()
+    (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=EXCLUSIVE State=UP\n")
+    assert run(*base).returncode == 0
+    assert "--exclusive" not in (fake / "sbatch.args").read_text()
+    # --allow and --min-idle narrow a named node only.
+    (fake / "sbatch.args").unlink()
+    for extra in (["--allow", "node07"], ["--min-idle", "60"]):
+        r = run(*base, *extra)
+        assert r.returncode == 1 and "pass it as --node" in r.stdout, r.stdout
+    assert not (fake / "sbatch.args").exists()
+
+
 def test_setup_box_slurm_status_and_verify_clean(tmp_path):
     run, fake = _fake_slurm(tmp_path, queue="4242|RUNNING|node07|5:00|1:10:00|node07\n")
     r = run("status", "<box-alias>", "4242")
@@ -1672,6 +1729,14 @@ def test_setup_box_slurm_status_and_verify_clean(tmp_path):
     (fake / "squeue.txt").write_text("4242 RUNNING\n")
     r = run("verify-clean", "<box-alias>", "node07")
     assert r.returncode == 1 and "not clean" in r.stdout
+    (fake / "squeue.txt").write_text("")
+    ssh = tmp_path / "bin" / "ssh"
+    ssh.write_text('#!/bin/bash\nwhile [ "${1#-}" != "$1" ]; do shift 2; done\n'
+                   '[ "$1" = node07 ] && { echo "Host key verification failed." >&2; exit 255; }\n'
+                   'shift; exec bash -c "$*"\n')
+    r = run("verify-clean", "<box-alias>", "node07", "--ssh")
+    assert r.returncode == 1 and "cannot check processes on node07: Host key verification failed" in r.stdout, r.stdout
+    assert "Traceback" not in r.stderr and "ssh <box-alias> failed" not in r.stdout
 
 
 def test_setup_box_slurm_submit_and_status_measure_unknown_chips(tmp_path):

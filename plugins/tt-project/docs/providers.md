@@ -98,18 +98,12 @@ unknown, never misses. Raw counters remain available in `coordinator_cache.raw_t
 status API and audit JSON. Missing HTTP request counts also stay unknown: CLI turn counts
 and assistant-message IDs do not prove how many transport retries occurred.
 
-A local API-stub capture with Claude Code 2.1.296 observed three CLI breakpoints on eight
-requests, including tool results and structured-output follow-up calls. Adding the harness's
-stable-context mark produced four on each request. CLI 2.1.285 previously used four itself
-on later requests and rejected an extra mark with HTTP 400. The adapter enables the extra
-mark only for the captured build; other builds keep charter and memory in the system prompt
-without constructing or logging a mark destined to be dropped. This is a compatibility check,
-not an installation pin. Capture a new build's first and later requests before extending it.
-The build check is keyed by the executable's resolved path, inode, size and modification
-time, so an in-place CLI update is probed again without a daemon restart. If the API still
-answers a marked coordinator turn with the too-many-cache_control 400, that build stops getting
-the mark for the rest of the daemon's life and the turn's retry goes without it.
-These captures verify request shape, not cache retention or savings at the real provider.
+A local API-stub capture with Claude Code 2.1.296 observed three CLI breakpoints per request
+(2.1.285 used four on later requests and rejected an extra mark with HTTP 400). Giving the
+spare one to the coordinator's charter-and-memory block was tried and measured over about a
+day and a half of coordinator turns: cost per turn rose at both low and high effort and the
+token hit rate barely moved. The adapter therefore reserves all four for the CLI; charter and
+memory end the system prompt, and the cache telemetry above stays to judge any later attempt.
 
 The whole coordinator system prompt (rules, role, charter, STANDING and MEMORY) is a snapshot.
 It is re-rendered only when the gap since the last turn exceeds `coordinator.cache_ttl` (the

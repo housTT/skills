@@ -18,7 +18,8 @@ of digits counted as one number. So 'hold:3' and 'hold:4' (or 'retry 1' and 'ret
 while 'outage ended', 'drop-in', 'recovered' and '<watcher>:<box>:reboot' next to '<watcher>:<box>:fsm'
 are distinct. A keyed issue counts once each time it opens: when it is new and each time it reopens
 after a close (the reopen churn of one key), so a condition that keeps clearing and coming back warns
-too. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
+too. Distinct episodes of one key count too: an issue superseded by a new episode and its successor are
+two issues of the key, each counted once, and the supersede itself is not a reopen. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
 duplicates from distinct conditions."""
 from __future__ import annotations
 

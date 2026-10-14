@@ -159,7 +159,8 @@ never write to a run folder named in earlier context):
   `retry_when`: the harness runs it every few minutes in the project root, without a model. Keep it
   read-only and under a minute. It must exit 0 once the wait is over whatever the outcome (the job
   finished or failed), and 1 while it is not (75, a busy `ttp lock`, or 255, ssh not reaching the
-  host, also keep it asleep); any other exit wakes it as broken. A wait only time ends:
+  host, also keep it asleep); any other exit wakes it as broken. A failing remote command exits
+  1, never `|| exit 255`; quote the remote command as one string. A wait only time ends:
   `test "$(date +%s)" -ge <epoch>`.
 <!-- ttp:if wait -->
   GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`). It also exits 0 when a

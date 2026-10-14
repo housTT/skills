@@ -65,7 +65,9 @@ count is not known until a job measures it: leave `chips` out or set it to `"unk
 then warns instead of failing, and `check` and `submit` still work. A job on such a partition first
 writes the number of devices in `/dev/tenstorrent` to `job.chips` and logs `tt-smi -ls`; `status`
 prints the count once the job ended. Record it in the site file. A card with two chips behind one
-device (such as n300) counts once, so read the `tt-smi -ls` output in `job.log` before recording.
+device (such as n300) counts once, so read the `tt-smi -ls` output in `job.log` before recording:
+count the rows of its "All available boards" table, not the `/dev/tenstorrent` entries (a node of
+32 chips may show 33 entries there).
 Verify a recorded mapping the same way in the first job on each partition, and fix the site file
 if it differs.
 
@@ -78,16 +80,18 @@ login node (`slurm.login`) over ssh.
 |---|---|
 | `survey <box> [--partition P] [--min-idle MIN]` | read-only (`sinfo` and `scontrol` only, never `sbatch`, `srun` or `salloc`): per partition (default: the site file's), node counts by state, every plain `IDLE` node with its last busy time, minutes since then and why it is not takeable (a reservation, `demo_nodes`, `excluded_nodes`, under `--min-idle` when given), and the reservations on its nodes; ends with a note for each last busy time that several nodes share |
 | `check <box> <node> [--partition P]` | exit 0 only when the node is plain `IDLE`, in no reservation, not in the site file's `demo_nodes` or `excluded_nodes`, and in partition P; also checks `--allow` and `--min-idle` (minutes since the node was last busy) when given |
-| `submit <box> --node N --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--devices 0]` | runs `check`, writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it with `sbatch --parsable --exclusive -w N -p P --time=T`; prints the job, a `note:` line and a `retry_when:` line; on a partition without a measured chip count the job also measures it |
+| `submit <box> --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD [--node N] [--devices 0]` | writes `job.sbatch` under `<workdir_root>/runs/<NAME>` and submits it. Without `--node`, Slurm places it: `sbatch --parsable --nodes=1 -p P --time=T`, with `--exclude` for the site file's `demo_nodes` and `excluded_nodes`, and `--exclusive` only when the site file marks the partition `exclusive` and the partition does not already enforce it (`OverSubscribe=EXCLUSIVE`); it prints `node: assigned by Slurm` and `status` shows the node once the job runs. With `--node N` it runs `check` first and submits with `sbatch --parsable --exclusive -w N -p P --time=T`. Prints the job, a `note:` line and a `retry_when:` line; on a partition without a measured chip count the job also measures it |
 | `status <box> <job> [--name NAME]` | the job's state from `squeue` while it lives; after it ends, its `job.rc`, the measured chip count when the job took one, and the last 20 lines of `job.log`; exit 2 when `squeue` fails (state unknown: never treat that as ended) |
 | `verify-clean <box> <node> [--ssh]` | exit 0 when no job of yours is on the node; with `--ssh`, also lists your processes there |
 
 `survey` takes no threshold of its own: an idle minimum is site or project policy, passed as
-`--min-idle` only when the charter sets one. Use it to pick a node, then `check` or `submit` it: the
-survey is a snapshot, and `check` runs again right before `sbatch`.
+`--min-idle` only when the charter sets one. By default let Slurm place the job (`submit` without
+`--node`). Where the charter names nodes or an idle minimum, use `survey` to pick a node, then
+`check` it or `submit --node` it with `--allow` and `--min-idle`: the survey is a snapshot, and
+`check` runs again right before `sbatch`. `--allow` and `--min-idle` need `--node`.
 
 `submit` refuses a missing or unlimited `--time`, `salloc` and `--no-shell`, a checkout or run dir
-outside `workdir_root`, a partition missing from the site file, and any node `check` refuses.
+outside `workdir_root`, a partition missing from the site file, and any `--node` that `check` refuses.
 
 The job script it writes:
 

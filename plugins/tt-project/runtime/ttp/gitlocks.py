@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Stale `.git/*.lock` files in the harness repository, cleared model-free (Daemon.clear_git_locks).
+"""Stale `.git/*.lock` files in the harness repository, moved aside model-free.
 
 A git command killed mid-write (a crash, a reboot, a timeout) leaves its lock file behind, and every
 later harness commit then fails until someone removes it. A lock counts as stale only when it is
-older than `watchdog.stale_git_lock_s` (600 s; 0: off), far past any harness git command's timeout,
-and nothing holds it: no process has the file open (Linux) and no git process of this user runs in
-or names the repository. A git process whose working directory cannot be read counts as holding it.
-Only the harness's own repository is ever touched, never a user's checkout or a task's worktree.
+older than `harness_git.stale_lock_s` (600 s; 0: off; the old `watchdog.stale_git_lock_s` is read
+when only it is set), far past any harness git command's timeout, and nothing holds it: no process
+has the file open (Linux) and no git process of this user runs in or names the repository. A git
+process whose working directory cannot be read counts as holding it. Stale locks are moved to
+`.git/ttp-stale-locks/<stamp>/`, never deleted. Project.clear_stale_git_locks runs this before each
+harness commit and in the daemon's harness sweep. Only the harness's own repository is ever touched,
+never a user's checkout or a task's worktree.
 """
 from __future__ import annotations
 
@@ -17,11 +20,16 @@ import time
 from pathlib import Path
 
 STALE_S = 600.0
-_SKIP_DIRS = {"objects", "lfs"}
+KEEP_DIR = "ttp-stale-locks"
+_SKIP_DIRS = {"objects", "lfs", KEEP_DIR}
 
 
 def settings(cfg: dict) -> float:
-    v = ((cfg or {}).get("watchdog") or {}).get("stale_git_lock_s", STALE_S)
+    """The age in seconds at which a lock counts as stale (0: off) from project.json's settings."""
+    cfg = cfg or {}
+    v = (cfg.get("harness_git") or {}).get("stale_lock_s")
+    if v is None:
+        v = (cfg.get("watchdog") or {}).get("stale_git_lock_s")
     try:
         return max(float(STALE_S if v is None else v), 0.0)
     except (TypeError, ValueError):
@@ -142,10 +150,15 @@ def holders(repo: Path, gdir: Path, locks: list[Path], procs: list[tuple[int, st
     return out
 
 
+def keep_dir(gdir: Path, now: float) -> Path:
+    """Where clear() moves the stale locks it finds at `now`."""
+    return Path(gdir) / KEEP_DIR / time.strftime("%Y%m%dT%H%M%S", time.localtime(now))
+
+
 def clear(repo: Path, min_age_s: float = STALE_S, now: float | None = None,
           procs: list[tuple[int, str]] | None = None) -> tuple[list[Path], list[int]]:
-    """Remove the repository's stale lock files: (removed, pids that kept them). Nothing is removed
-    while any process may hold one."""
+    """Move the repository's stale lock files aside to keep_dir(): (moved, pids that kept them), the
+    moved ones by their old paths. Nothing is moved while any process may hold one."""
     if min_age_s <= 0:
         return [], []
     gdir = git_dir(Path(repo))
@@ -158,13 +171,16 @@ def clear(repo: Path, min_age_s: float = STALE_S, now: float | None = None,
     held = holders(Path(repo), gdir, locks, procs)
     if held:
         return [], held
-    removed = []
+    dest = keep_dir(gdir, now)
+    moved = []
     for path in locks:
         try:
             if now - path.lstat().st_mtime < min_age_s:   # written again since: a live holder
                 continue
-            path.unlink()
-            removed.append(path)
+            to = dest / path.relative_to(gdir)
+            to.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, to)
+            moved.append(path)
         except OSError:
             continue
-    return removed, []
+    return moved, []
