@@ -82,7 +82,7 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
         facts["tags"] = tags
         lines.append(f"machines: tags {', '.join(tags) or 'none'}" + (f"; note: {m['note']}" if m.get("note") else ""))
         if "serving" in tags:
-            lines.append("serving: it serves live traffic; use it last, only while its service is idle")
+            lines.append("serving: it runs a service for others; use it last, only while that service is idle")
         if "unstable" in tags:
             lines.append("unstable: tagged unstable; read its note before using it")
     if min_free_gb is None:
