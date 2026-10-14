@@ -23620,7 +23620,9 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
     mark, runs = _pq_mark(s.p), s.p.db.one("SELECT COUNT(*) n FROM runs")["n"]
     s.p.db.set_kv("last_coordinator_turn", time.time())   # no idle wake while it runs: that is not the queue's
     d = Daemon(s.p.base)
-    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done", timeout=60)
+    # the review closes before the batch's after-push step settles: wait for both
+    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done" and not s.p.db.one(
+        "SELECT id FROM push_batches WHERE after_finalized IS NULL"), timeout=60)
     assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == runs, "the push cycle started a model run"
     t = s.p.db.task(s.review)
     res = json.loads(t["result"])
