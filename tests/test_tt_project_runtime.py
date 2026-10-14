@@ -63375,3 +63375,26 @@ def test_failed_why_names_the_jobs_rc_not_the_probes(tmp_path):
     assert detach.failed_why("ttp detach --check j.rc", 4, tmp_path) == "job rc=7"
     assert detach.failed_why("ttp detach --check missing.rc", 4, tmp_path) == "probe exit 4"
     assert detach.failed_why("exit 4", 4, tmp_path) == "probe exit 4"
+
+
+def test_a_retried_read_only_task_sees_what_landed_after_its_worktree_was_made(env):
+    p = make(env)
+    from ttp import worktree
+    tid = p.db.add_task("measure", "s", kind="measure", tier="light", origin="user")
+    path, _ = worktree.ensure(p, p.db.task(tid))
+    old = _git_out(path, "rev-parse", "HEAD")
+    base = worktree.resolve_base(p)
+    other = env["repo"].parent / "lander"
+    _git_out(p.root, "worktree", "add", "--detach", str(other), base)
+    (other / "landed.txt").write_text("x")
+    _git_out(other, "add", ".")
+    _git_out(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "landed")
+    new = _git_out(other, "rev-parse", "HEAD")
+    _git_out(p.root, "update-ref", f"refs/heads/{base}", new)
+    path, _ = worktree.ensure(p, p.db.task(tid))
+    assert old != new and _git_out(path, "rev-parse", "HEAD") == new
+    # A worktree with changes of its own stays as it is.
+    (path / "mine.txt").write_text("y")
+    _git_out(p.root, "update-ref", f"refs/heads/{base}", old)
+    worktree.ensure(p, p.db.task(tid))
+    assert _git_out(path, "rev-parse", "HEAD") == new
