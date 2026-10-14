@@ -1510,10 +1510,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     _count_refusal(db, key, "self-health", text)
                     raise ValueError(f"ask_user rejected: {why}")
                 if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
-                        and prguard.draft_permission_ask(text)):
+                        and prguard.draft_permission_ask(text, not prguard.drafts_during_freeze(p.config()))):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
-                                     "draft PR is always allowed, even under a code freeze; only leaving draft needs "
-                                     "the user's yes")
+                                     "draft PR is always allowed" + (", even under a code freeze"
+                                     if prguard.drafts_during_freeze(p.config()) else
+                                     " outside a code freeze (an ask about one under a freeze names the freeze)") +
+                                     "; only leaving draft needs the user's yes")
                 why = _needless_ask(a, text)
                 if why:
                     raise ValueError(f"ask_user rejected: {why}")

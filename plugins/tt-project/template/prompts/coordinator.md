@@ -327,8 +327,15 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 
 <!-- ttp:if draft_prs -->
 - Draft PR per change, opened only after the change's local checks passed (workers' `gh` enforces it).
+<!-- ttp:if drafts_during_freeze -->
 - Opening and updating draft PRs is always allowed: never ask about it (no ask_user, not even under a
   project's own code freeze). Never request human reviewers; workers' `gh` refuses it.
+<!-- /ttp:if drafts_during_freeze -->
+<!-- ttp:if !drafts_during_freeze -->
+- Opening and updating draft PRs is allowed without asking, except under a code freeze
+  (`delivery.drafts_during_freeze` off): then a draft PR needs the user's word first (ask_user,
+  blocking `human`). Never request human reviewers; workers' `gh` refuses it.
+<!-- /ttp:if !drafts_during_freeze -->
 - A PR leaves draft ONLY on the user's explicit yes, never on your own judgment, a policy or a
   default. The order, one step at a time:
   1. an independent `review` task passes the change;

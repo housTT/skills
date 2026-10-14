@@ -72,6 +72,8 @@ def coordinator_features(p: Project) -> set[str]:
     on |= {"own_push_limited"} if mode != "on" else set()
     if d.get("draft_prs", True) is not False:
         on.add("draft_prs")
+    if d.get("drafts_during_freeze", True) is not False:
+        on.add("drafts_during_freeze")
     if (cfg.get("notify") or {}).get("slack"):
         on.add("slack")
     if (cfg.get("upstream") or {}).get("ingest"):

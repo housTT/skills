@@ -468,10 +468,20 @@ DRAFT_ASK_MORE_RE = re.compile(r"\b(?:ready|merg\w*|undraft\w*|restrict\w*|forbi
                                r"leaving\s+draft)\b", re.I)
 
 
-def draft_permission_ask(text: str) -> bool:
-    """`text` (an ask) only asks leave to open or update a draft PR."""
+FREEZE_RE = re.compile(r"\b(?:code|change|merge|release)?\s*freez\w*|\bfrozen\b", re.I)
+
+
+def drafts_during_freeze(cfg: dict) -> bool:
+    """`delivery.drafts_during_freeze` (default on): opening and updating draft PRs needs no one's
+    word even under a code freeze. Off: a draft PR under a code freeze needs the user's word."""
+    return (cfg.get("delivery") or {}).get("drafts_during_freeze", True) is not False
+
+
+def draft_permission_ask(text: str, freeze_needs_ask: bool = False) -> bool:
+    """`text` (an ask) only asks leave to open or update a draft PR. With `freeze_needs_ask`
+    (delivery.drafts_during_freeze off), one about a code freeze is a real ask."""
     bare = PR_URL_RE.sub("the PR", text or "")
-    if DRAFT_ASK_MORE_RE.search(bare):
+    if DRAFT_ASK_MORE_RE.search(bare) or (freeze_needs_ask and FREEZE_RE.search(bare)):
         return False
     return any(DRAFT_OPEN_RE.search(s) and PERMISSION_RE.search(s)
                for s in re.split(r"(?<=[.!?])\s+|\n", bare))

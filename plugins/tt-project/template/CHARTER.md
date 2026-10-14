@@ -17,8 +17,9 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
 ## Policies
 
 - Pull requests: opening and updating draft PRs is always allowed and needs no permission or ask,
-  even under a code freeze. Never request human reviewers. An independent review passes the
-  change, and the PR leaves draft only on the user's explicit OK. The user merges.
+  even under a code freeze (`delivery.drafts_during_freeze`; turn it off if a freeze covers drafts
+  too). Never request human reviewers. An independent review passes the change, and the PR
+  leaves draft only on the user's explicit OK. The user merges.
 - Auto-merge repositories: none.
 - Notify the user only for decisions, reviews, merges, funds and outages.
 - Self-healing: keeping the project stable is a prime directive; check everything it is responsible

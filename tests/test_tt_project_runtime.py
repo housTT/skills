@@ -36100,11 +36100,33 @@ def test_an_ask_that_only_seeks_leave_to_open_a_draft_pr_is_rejected(env):
         assert not any("draft PRs need no permission" in x for x in problems) and ask is not None, (text, problems)
 
 
+def test_drafts_during_freeze_off_lets_an_ask_about_a_draft_pr_under_a_freeze_through(env):
+    """delivery.drafts_during_freeze (default on) keeps today's rule; off, a draft PR under a code
+    freeze needs the user's word: the ask gate lets that ask through and the prompt says to ask."""
+    from ttp.prompts import coordinator_role
+    freeze = "Permission to open a draft PR on acme/widgets while the code freeze holds?"
+    plain = "May I open a draft PR for the fix?"
+    p = make(env)
+    assert p.config()["delivery"]["drafts_during_freeze"] is True
+    problems, ask = _ask(p, freeze, blocking="human", recommendation="yes")
+    assert problems and "even under a code freeze" in problems[0] and ask is None
+    role = coordinator_role(p)
+    assert "not even under a\n  project's own code freeze" in role and "drafts_during_freeze` off" not in role
+    p.set_config("delivery.drafts_during_freeze", False)
+    problems, ask = _ask(p, plain, blocking="human", recommendation="yes")   # no freeze: still refused
+    assert problems and "draft PRs need no permission" in problems[0] and ask is None
+    problems, ask = _ask(p, freeze, blocking="human", recommendation="yes")
+    assert not any("draft PRs need no permission" in x for x in problems) and ask is not None, problems
+    role = coordinator_role(p)
+    assert "`delivery.drafts_during_freeze` off): then a draft PR needs the user's word" in role
+    assert "not even under a\n  project's own code freeze" not in role
+
+
 def test_rules_say_draft_prs_need_no_permission_and_no_reviewers_are_requested():
     template = RUNTIME.parent / "template"
     charter = " ".join((template / "CHARTER.md").read_text().split())
     assert ("Pull requests: opening and updating draft PRs is always allowed and needs no permission or ask, even "
-            "under a code freeze. Never request human reviewers.") in charter
+            "under a code freeze (`delivery.drafts_during_freeze`;") in charter and "Never request human reviewers." in charter
     assert "the PR leaves draft only on the user's explicit OK" in charter
     coord_text = " ".join((template / "prompts" / "coordinator.md").read_text().split())
     assert "Opening and updating draft PRs is always allowed: never ask about it" in coord_text

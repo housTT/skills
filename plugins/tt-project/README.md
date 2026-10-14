@@ -773,6 +773,11 @@ prolonged whole-box outage.
   when the project may push to one branch only. An unknown value reads as `off`. The coordinator
   may turn it `off` itself; `on` and `existing_only` need the user's word. The default stays `on`
   so projects that publish draft PRs keep working without a change.
+- `delivery.drafts_during_freeze` (on by default): opening and updating draft PRs needs no one's
+  word, even under a project's code freeze. Off, for teams whose freeze also covers drafts: the
+  coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask
+  through (an ask about a draft PR outside a freeze is still refused). Leaving draft always needs
+  the user's yes, and human reviewers are never requested, whatever the setting.
 - `delivery.allow_protected_push_branch` (off by default) lets `ttp push` and the push queue
   publish to a push branch that is `main`, `master` or the remote's default branch. Off, such a
   push branch is refused, the config alert and `ttp doctor` say so, and every review is review

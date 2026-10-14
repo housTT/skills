@@ -190,8 +190,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
     # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
+    # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.
+    # Off: a draft PR under a code freeze needs the user's word (coordinator prompt and ask gate).
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
-                 "push_allowed": True, "code_tasks_may_push": False},
+                 "push_allowed": True, "code_tasks_may_push": False, "drafts_during_freeze": True},
     # Review tasks run light when the diff under review touches no risky_paths glob and no code file
     # with a risky name (risky_names, default budget.RISKY_NAMES) and is docs and tests only or at
     # most light_max_lines non-doc lines; otherwise standard, as is every re-review after a failed
