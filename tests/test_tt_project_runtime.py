@@ -18505,6 +18505,79 @@ def test_the_login_check_backs_off_and_closes_the_breaker_and_its_alert(env, mon
     assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0, "the login was checked with a model run"
 
 
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_login_back_on_another_account_holds_one_check_then_starts_and_says_so(env, monkeypatch, switch):
+    """A login that comes back as another account than before the logout may be a user mid-switch:
+    nothing starts until one more check; still another account then, work starts, the chat hears
+    the change (account kind only) and an event records it. The same account starts at once."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import ACCOUNT_SWITCH_EVENT, AUTH_CHECK_S, Daemon
+    from ttp.providers import get_provider
+    cls = type(get_provider("fake"))
+    who = {"account": "one@example.com | plan_a", "kind": "plan_a"}
+    monkeypatch.setattr(cls, "account", lambda self: who["account"])
+    monkeypatch.setattr(cls, "account_kind", lambda self: who["kind"])
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status) VALUES('worker','fake',?,?,?,'ok')",
+           (who["account"], time.time() - 60, time.time() - 50))
+    d = Daemon(p.base)
+    d.open_breaker("fake", "401")
+    d.alert("auth:fake", "fake is logged out", "high")
+    if switch:
+        who.update(account="two@example.com | plan_b", kind="plan_b")
+    login.write_text("")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    events = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (ACCOUNT_SWITCH_EVENT,))
+    cleared = lambda: p.db.q("SELECT text FROM messages WHERE text LIKE 'Cleared: fake is logged in again%'")
+    if not switch:
+        assert alerts.breaker(p.db, "fake") is None, "the same account waited"
+        assert not events() and len(cleared()) == 1 and "another account" not in cleared()[0]["text"]
+        return
+    b = alerts.breaker(p.db, "fake")
+    assert b and b["account_hold"] and d._logged_out("fake"), "another account started at once"
+    assert round(b["next_check"] - time.time()) == AUTH_CHECK_S[0] and not events() and not cleared()
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake"), "the hold ended before its check was due"
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None and not d._logged_out("fake")
+    ev = events()
+    assert len(ev) == 1 and ev[0]["status"] == "handled" and "plan_a before, plan_b now" in ev[0]["text"]
+    text = cleared()[0]["text"]
+    assert len(cleared()) == 1 and "another account than before the logout (plan_a before, plan_b now)" in text
+    assert "@" not in text + ev[0]["text"] + ev[0]["data"], "an email address was shown or kept"
+
+
+def test_a_login_back_on_the_old_account_after_its_hold_starts_without_a_note(env, monkeypatch):
+    """A user who switches back within the hold's check gets the plain 'logged in again'."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import ACCOUNT_SWITCH_EVENT, Daemon
+    from ttp.providers import get_provider
+    cls = type(get_provider("fake"))
+    who = {"account": "a | plan_a"}
+    monkeypatch.setattr(cls, "account", lambda self: who["account"])
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d = Daemon(p.base)
+    from ttp import budget as bud
+    bud.note_account(p.db, "fake", who["account"])
+    d.open_breaker("fake", "401")
+    who["account"] = "b | plan_b"
+    login.write_text("")
+    for _ in range(2):
+        p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+        d.check_logins()
+        if alerts.breaker(p.db, "fake"):
+            who["account"] = "a | plan_a"   # switched back during the hold
+    assert alerts.breaker(p.db, "fake") is None
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (ACCOUNT_SWITCH_EVENT,))
+    assert not (p.db.kv("auth_breaker:fake") or {}).get("switched")
+
+
 def test_a_refusal_right_after_a_passed_login_check_falls_back_to_one_probe_run(env, monkeypatch):
     """A CLI whose status says logged in while the service still refuses it must not release the
     whole queue to fail again after every check."""

@@ -3046,27 +3046,60 @@ class Daemon:
             stamp = get_provider(prov).credentials_stamp()
         except Exception:
             stamp = ""
+        # The account it ran as before the logout, as runs record it (opaque), and its kind: a login
+        # that comes back on another account is held for one more check, then named (check_logins).
+        acct = budgetkind.account_hash(bud.current_accounts(db).get(prov) or "")
         # Its CLI said logged in, yet a run was refused again before any got through: that check
         # proves nothing for this logout, or every close would release the queue to fail once more.
         distrust = prev.get("closed_why") == LOGIN_CHECK_PASSED and \
             not alerts.login_proven(db, prov, float(prev.get("closed") or 0))
         db.set_kv(alerts.BREAKER + prov, {"open": True, "opened": now, "checks": 0, "creds": stamp,
+                                          **({"account": acct, "account_kind": self._account(prov)[1]} if acct else {}),
                                           "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200],
                                           **({"distrust": True} if distrust else {})})
         log(self.p, f"{prov}: logged out; no runs start on it until a login check passes")
 
-    def _close_breaker(self, prov: str, rec: dict, why: str) -> None:
+    def _account(self, prov: str) -> tuple[str, str]:
+        """The account `prov` is logged in as now: its opaque id (budgetkind.account_hash of the label
+        runs record) and its kind (never an email address)."""
+        try:
+            agent = get_provider(prov)
+            return budgetkind.account_hash(agent.account() or ""), agent.account_kind() or ""
+        except Exception:
+            return "", ""
+
+    def _account_switched(self, prov: str, rec: dict) -> dict | None:
+        """{"from", "to"} kinds when `prov` is logged in again as another account than before the
+        logout; None when it is the same one, or either is unknown."""
+        now_acct, kind = self._account(prov)
+        if not rec.get("account") or not now_acct or now_acct == rec["account"]:
+            return None
+        return {"from": rec.get("account_kind") or "", "to": kind}
+
+    def _close_breaker(self, prov: str, rec: dict, why: str, switched: dict | None = None) -> None:
         now = time.time()
-        self.p.db.set_kv(alerts.BREAKER + prov, {"open": False, "opened": rec.get("opened"), "closed": now,
-                                                 "checks": rec.get("checks", 0), "closed_why": why})
-        self.p.db.set_kv(f"auth_probe:{prov}", 0)
-        log(self.p, f"{prov}: {why}; runs start on it again")
+        with self.p.db.tx():
+            self.p.db.set_kv(alerts.BREAKER + prov, {"open": False, "opened": rec.get("opened"), "closed": now,
+                                                     "checks": rec.get("checks", 0), "closed_why": why,
+                                                     **({"switched": switched} if switched else {})})
+            self.p.db.set_kv(f"auth_probe:{prov}", 0)
+            if switched:
+                # Recorded only: the budget fingerprint (budgetkind) re-plans for the new account.
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                            (now, "daemon", ACCOUNT_SWITCH_EVENT, "low",
+                             f"{prov} is logged in again as another account than before the logout "
+                             f"({alerts.switch_text(switched)}).", "handled",
+                             json.dumps({"provider": prov, **switched})))
+        log(self.p, f"{prov}: {why}; runs start on it again"
+                    + (f" (another account: {alerts.switch_text(switched)})" if switched else ""))
 
     def check_logins(self) -> None:
         """Close each open auth breaker once its provider is logged in again: its CLI says so (a
         model-free status check on the AUTH_CHECK_S backoff, at once when its credential files
         change), or a run started since it opened got past the login. A CLI without a status check
-        says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe)."""
+        says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe). A login back as
+        another account than before the logout waits one more check; still another then, it closes
+        and says so (_close_breaker)."""
         db, now = self.p.db, time.time()
         # A logged-out alert from before the breaker existed (an upgrade) opens it.
         for ep in db.q("SELECT key, MIN(raised) raised FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL "
@@ -3081,7 +3114,7 @@ class Daemon:
             if not rec:
                 continue
             if alerts.login_proven(db, prov, float(rec.get("opened") or 0)):
-                self._close_breaker(prov, rec, "a run on it got past the login")
+                self._close_breaker(prov, rec, "a run on it got past the login", self._account_switched(prov, rec))
                 continue
             try:
                 agent = get_provider(prov)
@@ -3089,7 +3122,8 @@ class Daemon:
             except Exception:
                 agent, stamp = None, ""
             changed = bool(stamp) and stamp != rec.get("creds")
-            if now < float(rec.get("next_check") or 0) and not changed:
+            # Held for another account (below): the next check waits its step, so a switch can finish.
+            if now < float(rec.get("next_check") or 0) and (not changed or rec.get("account_hold")):
                 continue
             try:
                 ok = agent.login_check() if agent and not rec.get("distrust") else None
@@ -3097,7 +3131,15 @@ class Daemon:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None
             if ok or (ok is None and changed):
-                self._close_breaker(prov, rec, LOGIN_CHECK_PASSED if ok else "its credentials changed")
+                switched = self._account_switched(prov, rec)
+                if switched and not rec.get("account_hold"):
+                    # Logged in again as another account than before the logout: the user may be
+                    # mid-switch. Nothing starts until one more check; still another account then, it starts.
+                    db.set_kv(alerts.BREAKER + prov, {**rec, "account_hold": now, "last_check": now, "creds": stamp,
+                                                      "next_check": now + AUTH_CHECK_S[0]})
+                    log(self.p, f"{prov}: logged in again as another account; one more login check before runs start")
+                    continue
+                self._close_breaker(prov, rec, LOGIN_CHECK_PASSED if ok else "its credentials changed", switched)
                 continue
             n = int(rec.get("checks") or 0) + 1
             db.set_kv(alerts.BREAKER + prov, {**rec, "checks": n, "last_check": now, "creds": stamp, "probe": ok is None,
@@ -7250,6 +7292,7 @@ PAUSED_NOTE = "waits for a paused resource:"
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
+ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:
