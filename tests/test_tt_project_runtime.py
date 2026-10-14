@@ -42792,8 +42792,10 @@ def test_detach_inside_a_pid_namespace_that_ends_with_the_command_still_runs_the
     run_dir = p.runs / "8"
     run_dir.mkdir(parents=True)
     e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run_dir), "TTP_PIDNS": push.pid_ns()}
-    for name, pidns in (("bare", ""), ("job", push.pid_ns())):   # bare: as before, no run namespace to compare
-        r = subprocess.run([*box, sys.executable, str(TTP), "detach", name, "--", "sh", "-c", "sleep 1; echo done; exit 5"],
+    # bare: as before, no run namespace to compare. Its job outlives a slow exit of `ttp detach` under
+    # load, so only the namespace's end stops it.
+    for name, pidns, nap in (("bare", "", 300), ("job", push.pid_ns(), 1)):
+        r = subprocess.run([*box, sys.executable, str(TTP), "detach", name, "--", "sh", "-c", f"sleep {nap}; echo done; exit 5"],
                            env={**e, "TTP_PIDNS": pidns}, cwd=str(p.root), capture_output=True, text=True, timeout=30)
         assert r.returncode == 0, r
     bare = _check_until_ended(p, run_dir / "bare.rc")
