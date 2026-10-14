@@ -6510,21 +6510,36 @@ def test_split_cached_keeps_a_fixed_order_and_the_rest_of_the_digest():
     assert coord.with_cached("CTX\n", "") == "CTX\n" and coord.with_cached("CTX\n", "R") == "CTX\n\nR\n"
 
 
-def test_the_host_line_counts_a_lock_held_at_several_reboots_once_with_the_latest(env):
+def test_the_host_line_names_each_reboot_a_lock_was_held_at_and_merges_one_holders_locks(env):
     p = make(env)
     from ttp import coordinator as coord, timefmt
     t0 = time.time() - 4 * 3600
+
+    def batch(n):
+        return [f"push:origin%2Fwork: push batch batch-2026101{n}-0{n}0000-{n}1 since 0{n}:02",
+                f"push:run-batch-2026101{n}-0{n}0000-{n}1: push batch batch-2026101{n}-0{n}0000-{n}1 since 0{n}:02"]
     boots = [{"ts": t0, "held": []},
-             {"ts": t0 + 3600, "held": ["push:origin: push batch b-1 since 01:02", "push:run-b-101: batch b-1"]},
-             {"ts": t0 + 7200, "held": ["push:origin: push batch b-2 since 02:02", "push:run-b-202: batch b-2"]},
-             {"ts": t0 + 9000, "held": ["board: task #7"]},
-             {"ts": t0 + 10800, "held": ["push:origin: push batch b-3 since 03:02", "push:run-b-303: batch b-3"]}]
+             {"ts": t0 + 3600, "held": batch(1)},
+             {"ts": t0 + 7200, "held": batch(2)},
+             {"ts": t0 + 9000, "held": ["board: task #7 since 02:30"]},
+             {"ts": t0 + 10800, "held": batch(3)},
+             {"ts": t0 + 12600, "held": batch(4)}]
     line = coord.held_at_reboots(boots, p)
     at = [timefmt.short(b["ts"], p) for b in boots]
-    assert line == (f"{at[0]} nothing; {at[3]} board: task #7; "
-                    f"3x, latest {at[4]} push:origin: push batch b-3 since 03:02; "
-                    f"3x, latest {at[4]} push:run-b-303: batch b-3"), line
-    assert "b-1" not in line and "b-2" not in line
+    hm = [a.rsplit(" ", 1)[0] for a in at]
+    zone = timefmt.abbrev(p, boots[-1]["ts"])
+    assert line == (f"{at[0]} nothing; {at[3]} board: task #7 since 02:30; "
+                    f"push batch held at 4 reboots ({hm[1]}, {hm[2]}, {hm[4]}, {hm[5]} {zone}), "
+                    f"latest batch-20261014-040000-41"), line
+    assert "4x" not in line and "push:" not in line and "batch-20261011" not in line
+
+    # One batch at one reboot: its two locks are one entry, not two.
+    one = coord.held_at_reboots([{"ts": t0, "held": batch(5)}], p)
+    assert one == f"{at[0]} push batch batch-20261015-050000-51", one
+
+    # Many reboots: only the latest times are listed.
+    many = coord.held_at_reboots([{"ts": t0 + i * 60, "held": batch(i % 10)} for i in range(9)], p)
+    assert many.startswith("push batch held at 9 reboots (…, ") and many.count(":") == coord.HELD_TIMES_SHOWN, many
 
 
 def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block(monkeypatch):
