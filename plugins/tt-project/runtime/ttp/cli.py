@@ -3457,7 +3457,7 @@ def cmd_pause(a) -> None:
     from . import projpause
     by = projpause.caller(p)
     try:
-        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or "")
+        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or ("host power cycle (until reboot)" if boot else ""))
     except ValueError as e:
         die(f"{e}: pass --reason")
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"

@@ -126,7 +126,7 @@ do not run while the project is paused. A task that must reboot the host its har
    the daemon after the reboot while its task still waits on it, with no model run, up to
    `budget.max_job_relaunches` times (default 3). Abrupt reboots it relaunches through count toward
    `budget.max_reboot_losses`, so a job that takes the host down still gets its task blocked.
-2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
+2. `ttp pause <name> --until-reboot --reason "host power cycle"`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no
    `survives_reboot`: a reboot then wakes the task at once), and start the reboot a little later
@@ -138,7 +138,11 @@ add `--reboot "<why>"` to the drain. It records the cycle in `state/host-cycle/<
 every project here reads the records of all projects on this host: a detached job that a matching
 cycle (not a dry run, started at most 2 h before the boot) cut short is not counted toward the
 task's `budget.max_reboot_losses`, and the boot notice and the woken task's next run say it was planned.
-A recovery tool of its own may write the same record itself.
+A recovery tool of its own may write the same record itself, and must fsync it (and any other state
+it writes) before the cycle: on some filesystems a record written seconds before a power cycle is
+lost otherwise. Such a helper pauses the project with `ttp pause <name> --until-reboot --reason
+"host power cycle"`, never a plain pause: a plain pause outlives the cycle and nothing lifts it.
+`--until-reboot` without `--reason` records the reason "host power cycle (until reboot)".
 
 The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else kern.boottime); where none can be read,
 `--until-reboot` is refused.

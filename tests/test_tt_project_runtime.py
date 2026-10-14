@@ -60725,3 +60725,26 @@ def test_a_review_only_verdict_does_not_stand_in_for_a_review_that_pushes(env, m
     remote, branch = pushq.target(s.p)
     _git_out(s.p.root, "update-ref", f"refs/remotes/{remote}/{branch}", head)
     assert reviewreuse.delivered(s.p, head)
+
+
+def test_pause_until_reboot_without_reason_records_a_default_but_a_plain_pause_needs_one(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, projpause, runner
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-a")
+    monkeypatch.setattr(projpause, "caller", lambda _p: "worker")
+    cli.main(["pause", "demo", "--until-reboot"])
+    assert projpause.current(p.db)["reason"] == "host power cycle (until reboot)"
+    cli.main(["resume", "demo"])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["pause", "demo"])
+    assert e.value.code == 2
+
+
+def test_host_cycle_docs_pass_a_reason_and_tell_helpers_to_fsync():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "skills"
+    for f in ("tt-project-harness/SKILL.md", "tt-project/SKILL.md", "tt-project/operate.md"):
+        for line in (root / f).read_text().splitlines():
+            if "--until-reboot" in line and "ttp pause" in line:
+                assert "--reason" in line, (f, line)
+    assert "fsync" in (root / "tt-project-harness/SKILL.md").read_text()
