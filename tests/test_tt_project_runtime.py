@@ -34485,6 +34485,43 @@ def test_checks_host_cap_foreground_wait_does_not_count_toward_the_run(env, tmp_
     assert json.loads((run / "checks.json").read_text())["passed"] is True
 
 
+def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    log = env["tmp"] / "slot"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f'echo "${{{checkcap.HELD_ENV}:-none}}" >> {log}'])
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    for push_args in (["push"], ["push", "--own"]):
+        if push_args[-1] == "--own":
+            _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+            monkeypatch.setenv("TTP_TASK", "30")
+        _commit(repo, f"{len(push_args)}.txt", "x\n")
+        holder = _cap_holder("other")
+        done = []
+        t = threading.Thread(target=lambda: done.append(_ttp(*push_args)))
+        t.start()
+        try:
+            assert _wait_for(lambda: any("ttp push" in q for q in checkcap.state()["queued"])), push_args
+            time.sleep(0.3)
+            assert not log.exists() or len(log.read_text().splitlines()) < len(push_args), "no push check runs over the cap"
+        finally:
+            holder.kill()
+            holder.wait()
+        t.join(60)
+        assert done == [0], push_args
+        assert log.read_text().splitlines()[-1] == "1", "push checks know they hold a slot"
+        assert checkcap.line() == ""
+    # A push nested in a check that holds the slot runs at once instead of waiting for itself.
+    holder = _cap_holder("parent")
+    try:
+        monkeypatch.setenv(checkcap.HELD_ENV, "1")
+        _commit(repo, "nested.txt", "x\n")
+        assert _ttp("push", "--own") == 0
+    finally:
+        holder.kill()
+        holder.wait()
+
+
 def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, detach, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

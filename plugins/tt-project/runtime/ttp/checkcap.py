@@ -64,6 +64,13 @@ def limit() -> int:
     return default_limit()
 
 
+def label(project_name: str | None, what: str = "") -> str:
+    """Who holds or waits for a slot, as status lines show it: the project and the task's run."""
+    task, run = os.environ.get("TTP_TASK"), os.environ.get("TTP_RUN_ID")
+    who = f"{project_name or 'no project'}" + (f" task #{task} (run {run or '?'})" if task else "")
+    return who + (f" {what}" if what else "")
+
+
 def paths(n: int | None = None) -> list[Path]:
     return locks.slot_paths(slot_dir(), RESOURCE, limit() if n is None else n)
 
@@ -104,6 +111,10 @@ class Slot:
 
     def __init__(self, f=None):
         self.f = f
+
+    def env(self) -> dict[str, str]:
+        """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
+        return {HELD_ENV: "1"} if self.f is not None else {}
 
     def close(self) -> None:
         if self.f is not None:

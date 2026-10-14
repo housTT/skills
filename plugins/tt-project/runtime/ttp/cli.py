@@ -1675,7 +1675,7 @@ def cmd_checks(a) -> None:
                     f"at {when} (recorded); --fresh runs them again")
             out.write(f"{said}\n")
         slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
-        child_env = {"PWD": top, **({checkcap.HELD_ENV: "1"} if slot else {})}
+        child_env = {"PWD": top, **(slot.env() if slot else {})}
         for c in [] if hit else todo:
             out.write(f"$ {c}\n")
             out.flush()
@@ -1772,8 +1772,6 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
     clock."""
     from . import checkcap, locks as lk
-    task, run = os.environ.get("TTP_TASK") or "?", os.environ.get("TTP_RUN_ID") or "?"
-    who = f"{p.name if p else 'no project'} task #{task} (run {run})"
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -1799,7 +1797,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
-    return checkcap.acquire(who, f"ttp checks on {head[:12]}", tell, waiting)
+    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting)
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkdirs, landed, locks, machines, prguard, runner, worktree
+from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
@@ -385,6 +385,16 @@ def _in_repo(name: str, top: str | Path) -> bool:
                 parts[-1].startswith(f"{name}.") and parts[-1].endswith((".so", ".pyd")):
             return True
     return False
+
+
+def check_slot(head: str, say: Callable[[str], None], who: str = ""):
+    """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push`, `ttp push
+    --own` and the push queue count toward the same cap as `ttp checks`. Nested in a check that
+    holds one already (checkcap.HELD_ENV), it does not wait."""
+    if not who:
+        base = os.environ.get("TTP_PROJECT")
+        who = checkcap.label(Project(base).name if base else None, "ttp push")
+    return checkcap.acquire(who, f"push checks on {head[:12]}", say)
 
 
 def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str, str]:
@@ -2329,13 +2339,14 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             else:
                 say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
                     f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
-        started = time.time()
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
-        env = check_env("own", tip, check_run_dir)
-        for cmd in todo:
-            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
-                say(f"check failed on {head[:10]}: {cmd}; not pushing")
-                return CHECKS_FAILED
+        with check_slot(head, say) if todo else checkcap.Slot() as slot:
+            started = time.time()
+            env = {**check_env("own", tip, check_run_dir), **slot.env()}
+            for cmd in todo:
+                if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
+                    say(f"check failed on {head[:10]}: {cmd}; not pushing")
+                    return CHECKS_FAILED
         if todo and timed:
             timed(time.time() - started)
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
@@ -2518,12 +2529,13 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        started = time.time()
-        env = check_env("target", tip, check_run_dir)
-        for cmd in todo:
-            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
-                say(f"check failed on {head[:10]}: {cmd}; not pushing")
-                return CHECKS_FAILED
+        with check_slot(head, say) if todo else checkcap.Slot() as slot:
+            started = time.time()
+            env = {**check_env("target", tip, check_run_dir), **slot.env()}
+            for cmd in todo:
+                if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
+                    say(f"check failed on {head[:10]}: {cmd}; not pushing")
+                    return CHECKS_FAILED
         if todo and timed:
             timed(time.time() - started)
         if _fetch(repo, remote, branch) != tip:

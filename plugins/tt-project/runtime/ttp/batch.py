@@ -37,7 +37,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkdirs, locks, push, runner, worktree
+from . import checkcap, checkdirs, locks, push, runner, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1023,16 +1023,19 @@ class Batch:
             say(f"{head[:10]}: {push.NONE_APPLY}")
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
-        started = time.time()
         self.checks["runs"] += 1
+        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"))
+        started = time.time()   # a wait for the host-wide slot is not check time
         try:
             for cmd in todo:
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
-                                      env=push.check_env("target", self.tip, self.check_run_dir), pass_fds=checkdirs.inherited())
+                                      env={**push.check_env("target", self.tip, self.check_run_dir), **slot.env()},
+                                      pass_fds=checkdirs.inherited())
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail
         finally:
+            slot.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
         push.record_check_s(self.p, time.time() - started)
         return None
