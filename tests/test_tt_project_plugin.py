@@ -1525,6 +1525,129 @@ def test_setup_box_migrate_check_skips_tt_projects_own_files(tmp_path):
                            f"found devrun-caller: {repo / 'tools' / 'go.py'}"], (git_repo, callers)
 
 
+def _ttw_clone(home):
+    ttw = home / "tt-workflows"
+    (ttw / "scripts").mkdir(parents=True)
+    (ttw / "skills").mkdir()
+    (ttw / "scripts" / "cron_lap.sh").write_text("#!/bin/sh\n")
+    return ttw
+
+
+def test_setup_box_migrate_check_lists_launchd_agents_running_a_tt_workflows_clone(tmp_path):
+    import plistlib
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    ttw = _ttw_clone(home)
+    loops = {name: home / ".loops" / name for name in ("live", "done")}
+    for d in loops.values():
+        d.mkdir(parents=True)
+    (loops["done"] / "DONE").write_text("")
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    for name, loop in loops.items():
+        with (agents / f"com.tt-workflows.loop.{name}.plist").open("wb") as f:
+            plistlib.dump({"Label": f"com.tt-workflows.loop.{name}", "ProgramArguments": [
+                "/bin/bash", str(ttw / "scripts" / "cron_lap.sh"), "--dir", str(loop)]}, f)
+    with (agents / "org.example.other.plist").open("wb") as f:
+        plistlib.dump({"Label": "org.example.other", "ProgramArguments": ["/usr/bin/true"]}, f)
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"found agent: {agents / 'com.tt-workflows.loop.live.plist'}: " in r.stdout
+    assert f"inert agent: {agents / 'com.tt-workflows.loop.done.plist'}: " in r.stdout
+    assert f"(inert: {loops['done'] / 'DONE'})" in r.stdout and "org.example.other" not in r.stdout
+    assert "1 active leftover(s)" in r.stdout
+    (loops["live"] / "STOP").write_text("")
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 0 and "found agent" not in r.stdout, r.stdout
+
+
+def test_setup_box_migrate_check_lists_systemd_user_units_running_a_tt_workflows_clone(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    ttw = _ttw_clone(home)
+    units = home / ".config" / "systemd" / "user"
+    (units / "timers.target.wants").mkdir(parents=True)
+    (units / "ttw-loop.service").write_text(
+        f"[Service]\nExecStart=/bin/bash {ttw}/scripts/cron_lap.sh --dir %h/loop\n")
+    (units / "ttw-loop.timer").write_text("[Timer]\nOnCalendar=*:0/5\n")
+    (units / "timers.target.wants" / "ttw-loop.timer").symlink_to(units / "ttw-loop.timer")
+    (units / "ttw-old.service").write_text(f"[Service]\nExecStart={ttw}/scripts/cron_lap.sh\n")
+    (units / "other.service").write_text("[Service]\nExecStart=/usr/bin/true\n")
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"found agent: {units / 'ttw-loop.service'}: " in r.stdout and "(enabled)" in r.stdout
+    assert f"inactive agent: {units / 'ttw-old.service'}: " in r.stdout
+    assert "(disabled and stopped)" in r.stdout and "other.service" not in r.stdout
+    assert "ttw-loop.timer" not in r.stdout.replace("ttw-loop.service", "")
+
+
+def test_setup_box_migrate_check_marks_a_cron_loop_with_a_done_marker_inert(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    ttw = _ttw_clone(home)
+    loop = home / ".loops" / "a"
+    loop.mkdir(parents=True)
+    (stubs / "crontab").write_text(f"#!/bin/sh\necho '*/5 * * * * {ttw}/scripts/cron_lap.sh --dir {loop}'\n")
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 1 and "found cron: crontab line 1:" in r.stdout, r.stdout
+    (loop / "DONE").write_text("")
+    r = _migrate_run(home, stubs, repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "inert cron: crontab line 1:" in r.stdout and f"(inert: {loop / 'DONE'})" in r.stdout
+    data = json.loads(_migrate_run(home, stubs, repo, "--json").stdout)
+    assert [f["inert"] for f in data["found"] if f["kind"] == "cron"] == [True]
+
+
+def test_setup_box_migrate_check_warns_when_the_devsync_include_holds_a_live_reservation_alias(tmp_path):
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    (home / ".devsync").mkdir()
+    (home / ".devsync" / "ssh-hosts").write_text(
+        "Host <live-alias>\n    HostName m-live\n    Port 4242\n    ProxyJump <jump>\n"
+        "Host <old-alias>\n    HostName m-gone\n\nHost *\n    User <user>\n")
+    with (home / ".ssh" / "config").open("a") as f:
+        f.write("Include ~/.devsync/ssh-hosts\n")
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"<ird-box>": {
+        "route": "ird", "workdir_root": "/<workdir>", "ird": {"mgmt": "<ird-mgmt-alias>", "user": "me"}}}}))
+    (stubs / "ssh").write_text('#!/bin/sh\ncase "$*" in *"<ird-mgmt-alias> ird list --noheader"*)\n'
+                               "  echo '17 me a b m-live c d e f g 4242'; echo '18 other a b m-gone';;\n"
+                               "  *) exit 255;;\nesac\n")
+    (stubs / "ssh").chmod(0o755)
+    import subprocess
+    env = dict(os.environ, HOME=str(home), PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    run = lambda site_arg: subprocess.run(  # noqa: E731
+        [sys.executable, str(BOX_PY), "--site", str(site_arg), "migrate", "check", "--home", str(home),
+         "--repo", str(repo)], capture_output=True, text=True, timeout=60, env=env)
+    r = run(site)
+    assert r.returncode == 1, r.stdout + r.stderr
+    inc = home / ".devsync" / "ssh-hosts"
+    assert f"found ssh-include: {inc}: Host <live-alias> -> live reservation 17 on m-live" in r.stdout
+    assert "plain alias before removing the Include" in r.stdout
+    assert "<old-alias>" not in r.stdout and "could not check" not in r.stdout
+    (stubs / "ssh").write_text("#!/bin/sh\nexit 255\n")
+    r = run(site)
+    assert "could not check its hosts for live reservations (`ird list` on <ird-mgmt-alias> exit 255)" \
+        in r.stdout, r.stdout
+    r = run(tmp_path / "no-site.json")
+    assert "live reservation" not in r.stdout and "found ssh-include: " in r.stdout
+
+
+def test_setup_box_migrate_check_skips_registry_projects_on_other_hosts(tmp_path):
+    import subprocess
+    home, stubs, repo = _migrate_home(tmp_path, present=False)
+    gone = tmp_path / "not-here"
+    (home / ".tt-project").mkdir()
+    (home / ".tt-project" / "registry.json").write_text(json.dumps({"projects": {
+        "local": {"host": "this-host", "dir": str(repo)},
+        "remote": {"host": "other-host", "dir": "/<remote-dir>"},
+        "unknown": {"dir": str(gone)}}}))
+    env = dict(os.environ, HOME=str(home), PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}",
+               TTP_HOST="this-host")
+    r = subprocess.run([sys.executable, str(BOX_PY), "migrate", "check", "--home", str(home)],
+                       capture_output=True, text=True, timeout=60, env=env, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    scanned = next(l for l in r.stdout.splitlines() if "repos scanned:" in l)
+    assert str(repo) in scanned and "/<remote-dir>" not in scanned and str(gone) not in scanned
+    assert "skipped: /<remote-dir> on other-host" in r.stdout and str(gone) not in r.stdout
+
+
 def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
     text = (SKILLS / "setup-box" / "migrate-off-sync.md").read_text(encoding="utf-8")
     steps = ["devsync is-finished", "mutagen sync terminate", "git worktree", "tt-buddy:run",
@@ -1533,6 +1656,10 @@ def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
     pos = [text.find(s) for s in steps]
     assert -1 not in pos and pos == sorted(pos), dict(zip(steps, pos))
     assert "box.py migrate check" in text and "ttp note --to <project>" in text
+    for step in ("launchctl bootout gui/$(id -u) <plist>", "systemctl --user disable --now <unit>",
+                 "Operation not permitted", "run `crontab -e` in Terminal", "as a plain alias"):
+        assert step in text, step
+    assert text.find("as a plain alias") < text.find("Remove the old `Include` line")
     assert "Never edit another project's harness" in text
     assert "nothing to turn on" in text and "released\n   right after" in text
 

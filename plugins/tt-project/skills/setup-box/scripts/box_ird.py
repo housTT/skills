@@ -101,6 +101,18 @@ def _probe_tcp(alias: str, host: str, port: int) -> None:
     raise IrdError(f"unreachable: {alias}: no route to its ssh port {port}. {hint}", UNREACHABLE)
 
 
+def parse_list(text: str) -> List[dict]:
+    """Rows of `ird list --noheader` output: id, user, machine, port and the raw fields."""
+    rows = []
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) < 5 or not f[0].isdigit():
+            continue  # header or log lines
+        port = f[10] if len(f) > 10 and f[10].isdigit() else ""
+        rows.append({"id": f[0], "user": f[1], "machine": f[4], "port": port, "fields": f})
+    return rows
+
+
 # --- ird over ssh -------------------------------------------------------------------------------
 
 class Ctx:
@@ -146,14 +158,7 @@ class Ctx:
         r = self.call("list", "--noheader")
         if r.returncode:
             raise IrdError(f"ird list failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
-        rows = []
-        for line in r.stdout.splitlines():
-            f = line.split()
-            if len(f) < 5 or not f[0].isdigit():
-                continue  # header or log lines
-            port = f[10] if len(f) > 10 and f[10].isdigit() else ""
-            rows.append({"id": f[0], "user": f[1], "machine": f[4], "port": port, "fields": f})
-        return rows
+        return parse_list(r.stdout)
 
     def mine(self) -> Dict[str, dict]:
         return {r["id"]: r for r in self.reservations() if r["user"] == self.user}
