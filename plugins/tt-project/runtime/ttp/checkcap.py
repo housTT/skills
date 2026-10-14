@@ -33,6 +33,8 @@ TELL_S = 300.0
 # A `ttp checks` in a tool call waits this long for a slot at most, then hands over to detached checks
 # (cli.cmd_checks): a full queue can take many minutes, longer than a tool call may block.
 FOREGROUND_WAIT_S = 60.0
+# The arrival time a foreground run hands to its detached checks, so they keep its place in the queue.
+ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
 
 
 def slot_dir() -> Path:
@@ -132,11 +134,12 @@ class Slot:
 
 
 def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
-            waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None) -> Slot | None:
+            waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
+            since: float | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting in arrival order while all are held. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
-    it waited that long. A slot directory that cannot be written runs the checks uncapped: the cap
+    it waited that long. `since` is the arrival time to queue at (default now). A slot directory that cannot be written runs the checks uncapped: the cap
     must never stop them."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
@@ -146,7 +149,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         f = locks.try_take(ps, holder, what) if not locks.queued(slot_dir(), RESOURCE) else None
         if f:
             return Slot(f)
-        ticket = locks.enqueue(slot_dir(), RESOURCE, holder)
+        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since)
     except OSError as e:
         if tell:
             tell(f"host-wide checks cap not applied: {slot_dir()} is not writable ({e.strerror or e})")

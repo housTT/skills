@@ -13,6 +13,7 @@ import datetime as _dt
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import secrets as pysecrets
@@ -1853,11 +1854,11 @@ def cmd_checks(a) -> None:
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
-        slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
+        arrived = _checks_arrived()
+        slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived)
+                if todo and not hit else None)
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
-        if handover:
-            out.write(f"ttp checks: {CHECKS_HANDOVER}\n")
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         for c in [] if hit or handover else todo:
             executed.append(c)
@@ -1884,11 +1885,14 @@ def cmd_checks(a) -> None:
         if slot:
             slot.close()
     if handover:
-        print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
         try:
-            _checks_detach(a, Path(run_dir), p, top, head)
+            _checks_detach(a, Path(run_dir), p, top, head, arrived)
         except OSError as e:
             die(f"ttp checks: {e}")
+        # Told only once they were started: a failed start says so, never that they run.
+        with open(log, "a") as out:
+            out.write(f"ttp checks: {CHECKS_HANDOVER}\n")
+        print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
         sys.exit(75)
     env_problem, also, not_executed = None, False, []
     if not passed:
@@ -2065,17 +2069,32 @@ def _harness_purpose(a) -> dict:
 
 
 CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run in this call; started them "
-                   "detached instead (exit 75): hand off waiting with the retry_when below")
+                   "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
+                   "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
 
-def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False):
+def _checks_arrived() -> float:
+    """When these checks joined the host-wide queue: the time a foreground run handed over with
+    (checkcap.ARRIVED_ENV, taken out of the environment so no check command inherits it), else now."""
+    from . import checkcap
+    now = time.time()
+    try:
+        t = float(os.environ.pop(checkcap.ARRIVED_ENV, ""))
+    except ValueError:
+        return now
+    return t if math.isfinite(t) and 0 < t <= now else now
+
+
+def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
+                 arrived: float | None = None):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
     clock, and it ends after checkcap.FOREGROUND_WAIT_S: None then means the caller hands over to
-    detached checks."""
+    detached checks. With no project there is nobody to start them detached, so it waits on. `arrived`
+    is the place in the queue (default now)."""
     from . import checkcap, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -2103,7 +2122,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
 
     start = time.time()
     return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
-                            checkcap.FOREGROUND_WAIT_S if foreground else None)
+                            checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived)
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
@@ -2179,15 +2198,19 @@ def _read_checks_pid(run_dir: Path) -> dict:
     return info if isinstance(info, dict) else {}
 
 
-def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "") -> None:
+def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
+                   arrived: float | None = None) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`.
     A tool sandbox queues the launch and cancellation through the daemon (detach.tend).
     checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
-    again, model-free, after a reboot killed them (Daemon._relaunch_checks)."""
-    from . import detach, push
+    again, model-free, after a reboot killed them (Daemon._relaunch_checks). `arrived`: a foreground
+    run's place in the host-wide queue, which they keep."""
+    from . import checkcap, detach, push
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    if arrived is not None:
+        env[checkcap.ARRIVED_ENV] = repr(arrived)
     rc = run_dir / CHECKS_RC
     detach.lost(rc).unlink(missing_ok=True)
     # A request the daemon has not finished starting is replaced through the queue too, so the daemon

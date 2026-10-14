@@ -37589,6 +37589,121 @@ def test_checks_in_a_tool_call_hand_over_to_detached_checks_when_every_slot_stay
     assert json.loads((run / "checks.json").read_text())["passed"] is True
 
 
+def test_checks_handed_over_to_detached_checks_keep_their_place_in_the_host_wide_queue(env, tmp_path, monkeypatch,
+                                                                                       capsys):
+    # The handover gave up the foreground run's ticket and the detached run joined again at the back,
+    # behind every waiter that came after it. It now queues at the foreground run's arrival time, so
+    # it takes the freed slot before a later waiter (which here never takes it).
+    import threading
+    from ttp import checkcap, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 1.0)
+    ran = tmp_path / "ran"
+    holder = _cap_holder("other project task #3 (run 9)")
+    later = []
+
+    def join_later():
+        if _wait_for(lambda: locks.queued(checkcap.slot_dir(), checkcap.RESOURCE), 20):
+            time.sleep(0.05)
+            later.append(locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "a later waiter"))
+
+    t = threading.Thread(target=join_later)
+    t.start()
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        t.join(20)
+        assert e.value.code == 75 and later, "a waiter joined after the foreground run"
+        assert cli.CHECKS_HANDOVER in capsys.readouterr().out
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists()), "the detached checks wait their turn"
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)) == 2)
+        assert locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)[-1] == later[0], "the later waiter stays behind"
+        assert checkcap.ARRIVED_ENV not in os.environ
+    finally:
+        holder.kill()
+        holder.wait()
+    try:
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists()), "the freed slot goes to the earlier arrival"
+        assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.exists()
+    finally:
+        locks.dequeue(later[0])
+
+
+def test_checks_arrival_handed_over_is_taken_out_of_the_environment_and_never_in_the_future(monkeypatch):
+    import time
+    from ttp import checkcap, cli
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, "12345.5")
+    assert cli._checks_arrived() == 12345.5 and checkcap.ARRIVED_ENV not in os.environ, "no check command inherits it"
+    for bad in ("junk", "nan", "inf", "-1", str(time.time() + 3600)):
+        monkeypatch.setenv(checkcap.ARRIVED_ENV, bad)
+        assert abs(cli._checks_arrived() - time.time()) < 5, bad
+
+
+@pytest.mark.parametrize("project", ["unset", "missing"])
+def test_checks_with_no_project_keep_waiting_in_the_foreground_instead_of_handing_over(env, tmp_path, monkeypatch,
+                                                                                         capsys, project):
+    # With no project there is nobody to start detached checks: the handover said "started them
+    # detached" and then died on the missing TTP_PROJECT. It now waits on and runs them here.
+    import threading
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    if project == "unset":
+        monkeypatch.delenv("TTP_PROJECT")
+    else:
+        monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "no-such-project"))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.2)
+    ran = tmp_path / "ran"
+    holder = _cap_holder("other project task #3 (run 9)")
+    ended = []
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+            ended.append(0)
+        except SystemExit as e:
+            ended.append(e.code)
+
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
+        time.sleep(1.5)
+        assert t.is_alive() and not ended, "it waits past FOREGROUND_WAIT_S"
+    finally:
+        holder.kill()
+        holder.wait()
+    t.join(30)
+    out = capsys.readouterr().out
+    assert ended in ([0], [None]) and ran.exists()
+    assert cli.CHECKS_HANDOVER not in out and "started in the background" not in out
+    assert not (run / cli.CHECKS_PID).exists()
+
+
+def test_checks_handover_says_they_started_only_once_they_did(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.2)
+
+    def refuse(*_a, **_k):
+        raise OSError("cannot start them")
+
+    monkeypatch.setattr(cli, "_checks_detach", refuse)
+    holder = _cap_holder("other project task #3 (run 9)")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "true"])
+    finally:
+        holder.kill()
+        holder.wait()
+    captured = capsys.readouterr()
+    assert e.value.code not in (0, 75) and "cannot start them" in captured.err
+    assert cli.CHECKS_HANDOVER not in captured.out
+    assert cli.CHECKS_HANDOVER not in (run / "checks.log").read_text()
+
+
 def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env, monkeypatch):
     import threading
     from ttp import checkcap

@@ -645,7 +645,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap
   waits its turn in arrival order. The wait shows in `ttp status`, the task's notes and the
   `--result` probe; it never fails the checks. A foreground `ttp checks` (a tool call) waits a
-  minute at most: then it starts the same checks detached, prints their `retry_when` and exits 75.
+  minute at most: then it starts the same checks detached, in the same place in the queue, prints
+  their `retry_when` and exits 75 (with no project it waits on in the foreground).
   Slots are OS file locks, so a crash or reboot frees them. The default is one slot per 16 cores (at least one); set it with
   `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
   `ttp checks` or push inside a check command does not wait for its parent's slot.
