@@ -987,7 +987,7 @@ def test_worker_prompt_says_device_hosts_hide_devices_from_direct_opens():
     and a worker never unsets or overrides the masking variables."""
     worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES`" in worker
-    assert ("Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource."
+    assert ("Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource"
             in worker)
     assert "Never unset or override the masking variables to work around this." in worker
 
@@ -1000,7 +1000,8 @@ def test_runs_without_a_device_never_open_one_through_tests():
     assert "`TTP_NO_DEVICE=1` in your environment means your task holds no device" in worker
     assert "exact test ids or `-k` expression" in worker
     assert "only after `pytest --markers` shows the repo defines it" in worker
-    assert "open one only through the device broker, `ttp devq` or `ttp lock` on a device resource" in worker
+    assert ("only through the device broker, `ttp devq` or `ttp lock` on a device resource, never directly, "
+            "not even through a test fixture") in worker
     # The `ttp lock` bullet stays whole: its exit-75 guidance is not split off by another bullet.
     raw = (prompts / "worker.md").read_text(encoding="utf-8")
     start = raw.index("wrap each command that touches one in `ttp lock")
