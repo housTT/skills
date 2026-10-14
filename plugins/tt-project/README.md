@@ -511,7 +511,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that
   host's boot id changed), 1 while it runs and 255 while ssh fails. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
-  and 255 while not; `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`
+  and 255 while not (12 with `--classified`), 10 when its host key does not verify and 11 when
+  authentication fails (ssh runs with strict host-key checking and no connection sharing);
+  `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`
   ({resource: host}, else `device.runners.<name>.host`) each time it runs, so a waiting probe follows
   a resource moved to another box (an unknown resource exits 2). Config `device.runners.<name>` (opt-in) sets up one serial
   device-job runner per device host instead of a driver per task: `host` (ssh alias; empty = this

@@ -2569,7 +2569,9 @@ def cmd_killscan(a) -> None:
 
 
 def cmd_ssh_preflight(a) -> None:
-    """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when). `@<resource>`
+    """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when; 12 with
+    --classified), 10 when its host key does not verify, 11 when authentication fails (both wake a
+    waiting task). ssh runs with strict host-key checking and no connection sharing. `@<resource>`
     finds the host in the project's config `device.hosts` (or `device.runners`) each time it runs,
     so a probe follows its resource to another box; an unknown resource exits 2."""
     from . import hostmap
@@ -2585,12 +2587,14 @@ def cmd_ssh_preflight(a) -> None:
             die(f"ssh-preflight: {e.args[0]}", hostmap.UNKNOWN_RC)
     else:
         host = target
-    rc, out = hostmap.preflight(host, a.timeout)
+    rc, out = hostmap.preflight(host, a.timeout, a.classified)
     shown = f"{host} ({target})" if host != target else host
+    why = {hostmap.HOST_KEY_RC: "host key not verified (changed, or not in known_hosts)",
+           hostmap.AUTH_RC: "authentication failed"}.get(rc, "not reachable")
     if rc == 0:
         print(f"ssh-preflight: {shown} reachable")
     else:
-        print(f"ssh-preflight: {shown} not reachable (ssh exit {rc})" + (f": {out}" if out else ""),
+        print(f"ssh-preflight: {shown} {why} (exit {rc})" + (f": {out}" if out else ""),
               file=sys.stderr)
     sys.exit(rc)
 
@@ -5461,9 +5465,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_lock)
 
     s = sub.add_parser("ssh-preflight", help="exit 0 once a host answers over ssh, 255 while not (for "
-                                             "retry_when); @<resource> takes the host from config device.hosts")
+                                             "retry_when), 10 host key not verified, 11 auth failed; "
+                                             "@<resource> takes the host from config device.hosts")
     s.add_argument("target", help="an ssh host, or @<resource> (config device.hosts or device.runners)")
     s.add_argument("--timeout", type=float, default=30.0, help="give up on ssh after this many seconds")
+    s.add_argument("--classified", action="store_true",
+                   help="exit 12 instead of 255 when the host is not reachable (not for retry_when: "
+                        "only 255 keeps a waiting task asleep)")
     s.set_defaults(fn=cmd_ssh_preflight)
 
     s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "

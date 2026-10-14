@@ -187,7 +187,7 @@ never write to a run folder named in earlier context):
 <!-- /ttp:if remote -->
 <!-- ttp:if hostmap -->
   A wait for a box to answer over ssh probes `ttp ssh-preflight @<resource>` (0 once it answers, 255
-  while not) for a resource your task header lists under resource hosts, never its hostname: the
+  while not; 10 host key changed and 11 auth failed wake you) for a resource your task header lists under resource hosts, never its hostname: the
   probe then follows the resource when it moves to another box. Other hosts: `ttp ssh-preflight <host>`.
 <!-- /ttp:if hostmap -->
 <!-- ttp:if devq -->

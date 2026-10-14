@@ -63227,6 +63227,58 @@ def test_ssh_preflight_follows_a_resource_to_its_current_host(env, tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+def test_ssh_preflight_forces_strict_host_keys_and_classifies_ssh_failures(env, tmp_path):
+    """Strict host keys and no shared connection whatever the user's ssh config says; ssh's own
+    failures exit 10 (host key), 11 (auth) or 255 (unreachable; 12 with --classified)."""
+    p = make(env)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "ssh-args.log"
+    (bindir / "ssh").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$*\" >> {shlex.quote(str(log))}\n"
+        "for a; do h=$a; done; for a; do [ \"$a\" = true ] && break; h=$a; done\n"
+        "case \"$h\" in\n"
+        "  up) exit 0;;\n"
+        "  changed) echo '@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@' >&2;"
+        " echo 'Host key verification failed.' >&2; exit 255;;\n"
+        "  unknown) echo 'No ED25519 host key is known for unknown and you have requested strict checking.' >&2;"
+        " echo 'Host key verification failed.' >&2; exit 255;;\n"
+        "  noauth) echo 'user@noauth: Permission denied (publickey,password).' >&2; exit 255;;\n"
+        "  remote1) exit 1;;\n"
+        "  *) echo \"ssh: connect to host $h port 22: Connection timed out\" >&2; exit 255;;\n"
+        "esac\n")
+    (bindir / "ssh").chmod(0o755)
+    path = f"{bindir}:{os.environ['PATH']}"
+    run = lambda *a: _ttp_run(p, "ssh-preflight", *a, env={"PATH": path})
+    r = run("up")
+    assert r.returncode == 0 and "up reachable" in r.stdout, r.stderr
+    args = log.read_text().splitlines()[0].split()
+    for opt in ("BatchMode=yes", "StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
+        assert opt in args and args[args.index(opt) - 1] == "-o", (opt, args)
+    assert args[-2:] == ["up", "true"]
+    for host, rc, says in (("changed", 10, "host key not verified"), ("unknown", 10, "host key not verified"),
+                           ("noauth", 11, "authentication failed"), ("gone", 255, "not reachable")):
+        r = run(host)
+        assert r.returncode == rc and f"{host} {says}" in r.stderr and f"(exit {rc})" in r.stderr, \
+            (host, r.returncode, r.stderr)
+        r = run(host, "--classified")
+        assert r.returncode == (12 if rc == 255 else rc), (host, r.returncode, r.stderr)
+    # A remote command's own exit is not ssh failing: kept as it is.
+    assert run("remote1").returncode == 1
+    # Through a resource too; the default 255 is what keeps a waiting retry_when asleep.
+    p.set_config("device", {"hosts": {"dev": "changed", "far": "gone"}})
+    r = run("@dev")
+    assert r.returncode == 10 and "changed (@dev) host key not verified" in r.stderr, r.stderr
+    from ttp import daemon, hostmap
+    assert run("@far").returncode == hostmap.UNREACHABLE_RC in daemon.NOT_YET_RCS
+    assert not {hostmap.HOST_KEY_RC, hostmap.AUTH_RC} & set(daemon.NOT_YET_RCS)
+    assert run("@far", "--classified").returncode == 12
+    # A timeout or a missing ssh is unreachable too.
+    assert hostmap.classify(255, "") == 255 and hostmap.classify(255, "", classified=True) == 12
+    assert hostmap.classify(0, "Host key verification failed.") == 0
+
+
 def test_worker_prompt_says_to_probe_a_mapped_resource_by_name(env):
     p = make(env)
     from ttp.prompts import worker_features

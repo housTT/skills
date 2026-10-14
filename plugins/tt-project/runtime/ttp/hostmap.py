@@ -8,16 +8,32 @@ A waiting task's probe that names a host keeps probing it after its resource mov
 device lock name (`device.locks`) also finds the entry of the name it shares the lock with. A plain
 host is probed as it is. Moving a resource is then one config change, and every waiting probe
 follows it.
+
+The probe checks the host itself: strict host-key checking (a `StrictHostKeyChecking no` in the
+user's ssh config does not apply) and no connection sharing (an open ControlMaster connection would
+answer for a host that is gone or now presents another key). ssh's own failures are classified:
+10 the host key did not verify (changed, or not yet known), 11 authentication failed, 255 the host
+is not reachable (12 with `classified=True`: callers that want a distinct code; retry_when probes
+keep 255, which keeps a waiting task asleep and counts towards the network-outage alert).
 """
 from __future__ import annotations
 
+import re
 import subprocess
 
 from . import locks
 
 UNREACHABLE_RC = 255   # what ssh exits with; netwait counts it as the network, the task sleeps on
 UNKNOWN_RC = 2         # a resource no map names: the probe is broken and wakes the task
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+HOST_KEY_RC = 10       # the host key did not verify: wakes a waiting task, waiting will not fix it
+AUTH_RC = 11           # authentication failed: likewise
+CLASSIFIED_UNREACHABLE_RC = 12
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes",
+       "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+_HOST_KEY = re.compile(r"Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|"
+                       r"host key for .* has changed|No \S+ host key is known for", re.I)
+_AUTH = re.compile(r"Permission denied \(|Too many authentication failures|"
+                   r"No more authentication methods|Authentication failed", re.I)
 
 
 def table(cfg: dict) -> dict[str, str]:
@@ -62,13 +78,28 @@ def problems(cfg: dict) -> list[str]:
             if not isinstance(v, str) or not v.strip() or v.strip().startswith(("-", "@"))]
 
 
-def preflight(host: str, timeout: float = 30.0) -> tuple[int, str]:
-    """(exit code, ssh's output) of `ssh <host> true`: 0 reachable, 255 not."""
+def classify(rc: int, out: str, classified: bool = False) -> int:
+    """The probe's exit for ssh's exit `rc` and output: ssh's own failure (255) becomes 10 (host
+    key), 11 (auth) or unreachable (255, or 12 when `classified`); any other exit is kept."""
+    if rc != UNREACHABLE_RC:
+        return rc
+    if _HOST_KEY.search(out or ""):
+        return HOST_KEY_RC
+    if _AUTH.search(out or ""):
+        return AUTH_RC
+    return CLASSIFIED_UNREACHABLE_RC if classified else UNREACHABLE_RC
+
+
+def preflight(host: str, timeout: float = 30.0, classified: bool = False) -> tuple[int, str]:
+    """(exit code, ssh's output) of `ssh <host> true`: 0 reachable, 10 host key not verified,
+    11 auth failed, 255 not reachable (12 when `classified`)."""
     try:
         r = subprocess.run([*SSH, host, "true"], capture_output=True, text=True, timeout=timeout,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return UNREACHABLE_RC, f"ssh: connect to host {host}: timed out after {timeout:g} s"
+        return classify(UNREACHABLE_RC, "", classified), \
+            f"ssh: connect to host {host}: timed out after {timeout:g} s"
     except OSError as e:
-        return UNREACHABLE_RC, f"ssh: {e}"
-    return r.returncode, (r.stderr or r.stdout or "").strip()
+        return classify(UNREACHABLE_RC, "", classified), f"ssh: {e}"
+    out = (r.stderr or r.stdout or "").strip()
+    return classify(r.returncode, out, classified), out
