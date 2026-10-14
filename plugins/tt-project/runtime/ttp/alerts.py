@@ -66,6 +66,7 @@ CLEARED_TEXT = {
     "push_queue_dying": "Push batches finish again.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
+    "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
     "deploy-behind": "The deploy to {arg} no longer fails: it runs the release, or its upgrade is owned and pending again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
@@ -194,6 +195,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
         return heal.holds(db, arg, now)
+    if kind == "heal-hold":   # an untenanted hold's page: the heal alert's lifecycle (heal.cleared_why)
+        from . import heal
+        return heal.cleared_why(db, arg, now, hold=True) is None
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
@@ -242,7 +246,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
-                                         "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused")
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused")
 
 
 def _since(ep: dict) -> float:
@@ -373,9 +377,9 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
         for ep in db.q("SELECT * FROM alerts WHERE cleared IS NULL ORDER BY id"):
             kind, _, arg = ep["key"].partition(":")
             why = "no longer reported" if not _checkable(ep["key"]) else "condition cleared"
-            if kind == "heal":
+            if kind in ("heal", "heal-hold"):
                 from . import heal
-                why = heal.cleared_why(db, arg, now)
+                why = heal.cleared_why(db, arg, now, hold=kind == "heal-hold")
                 if why is None:
                     continue
             elif holds(db, ep["key"], _since(ep), now):
@@ -387,7 +391,7 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 text = "Cleared: " + CLEARED_TEXT[kind].format(arg=arg)
                 if kind == "auth" and (sw := (db.kv(BREAKER + arg) or {}).get("switched")):
                     text += f" It is on another account than before the logout ({switch_text(sw)})."
-            if kind == "heal" and why != "condition cleared":
+            if kind in ("heal", "heal-hold") and why != "condition cleared":
                 text, sev = f"Cleared: {ep['key']} user alert: {why}.", "low"
             closed.append(_close(db, ep, now, why, text, sev))
     return closed

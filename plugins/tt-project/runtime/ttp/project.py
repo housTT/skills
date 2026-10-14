@@ -273,7 +273,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
     # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
     # does not name the check, before the coordinator is asked once whether the pause is still right.
-    "heal": {"escalate": "user", "paused_quiet_s": 21600},
+    # untenanted_hold_s: how long a check may report a device held with no tenant before it pages, even
+    # under a known machine outage or a mute.
+    "heal": {"escalate": "user", "paused_quiet_s": 21600, "untenanted_hold_s": 14400},
     # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
     # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
     # and the `restarts`-th in that window sends one high alert.
