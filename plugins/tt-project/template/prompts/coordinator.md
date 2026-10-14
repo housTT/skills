@@ -104,8 +104,8 @@ Each field's rules are in the section named; the table only lists them.
 - A task whose resource is busy comes back `waiting` and retries itself; do not re-add it.
 - Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
   as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project
-  root: exit 0 = start; 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet; any other exit
-  is a broken probe, so end a test with `|| exit 1`; `now` or `""` = start now) with `why` (the user
+  root: exit 0 = start; 1, 75 (busy `ttp lock`) or ssh's own 255 = not yet; any other exit is a
+  broken probe, so end a test, remote too, with `|| exit 1`; `now` or `""` = start now) with `why` (the user
   sees 'starts when <why>'). A broken probe, or one unmet after `coordinator.defer_max_days`, comes
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
   entries a deferred follow-up replaces in the same turn.

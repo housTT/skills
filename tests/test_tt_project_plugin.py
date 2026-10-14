@@ -891,23 +891,23 @@ def test_box_clean_probe_counts_a_recent_boot_and_short_history(tmp_path):
     assert _box_probe(tmp_path, {"jobs": [_job(1), _job(30)]}, args=["--limit", "2"])[0] == 0
 
 
-def test_box_clean_probe_degrades_without_a_broker_and_255_when_unreadable(tmp_path):
+def test_box_clean_probe_degrades_without_a_broker_and_75_when_unreadable(tmp_path):
     rc, out = _box_probe(tmp_path)
     assert rc == 0 and "no broker installed, uptime only" in out
     assert _box_probe(tmp_path, up_h=3)[0] == 1
     rc, out = _box_probe(tmp_path, args=["--require-broker"])
-    assert rc == 255 and out.startswith("UNKNOWN: no broker python at")
+    assert rc == 75 and out.startswith("UNKNOWN: no broker python at")
     for body in ("exit 3", "echo not json", "echo '{\"error\": \"held\"}'"):
         fake = tmp_path / "broker-python"
         fake.write_text("#!/bin/sh\n%s\n" % body)
         fake.chmod(0o755)
         rc, out = _box_probe(tmp_path, broker=fake)
-        assert rc == 255 and out.startswith("UNKNOWN: broker"), out
+        assert rc == 75 and out.startswith("UNKNOWN: broker"), out
     (tmp_path / "jobs.json").write_text("{")
     import subprocess
     r = subprocess.run([sys.executable, str(BOX_PROBE), "--jobs-file", str(tmp_path / "jobs.json"),
                         "--uptime-file", str(tmp_path / "missing")], capture_output=True, text=True)
-    assert r.returncode == 255 and r.stdout.startswith("UNKNOWN: uptime unreadable")
+    assert r.returncode == 75 and r.stdout.startswith("UNKNOWN: uptime unreadable")
 
 
 def test_box_clean_probe_queries_the_broker_python(tmp_path):

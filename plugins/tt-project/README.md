@@ -417,7 +417,8 @@ prolonged whole-box outage.
   database: its next idle stretch waits both the grace and the doubling rearm from its last event,
   until a task names the device again.
 - Network outage (model-free): when every task that could start waits on a probe saying this
-  machine cannot reach its host (ssh exit 255), no worker runs and nothing else can start, for
+  machine cannot reach its host (ssh exit 255, confirmed by `ssh <alias> true` failing too; a 255
+  that names no host, or whose host answers, is a broken probe for its task), no worker runs and nothing else can start, for
   `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect
   the VPN or network sign-in on the machine running the project. It names the hosts, when the outage
   began (home time zone) and how many tasks wait, stays in the top section, is sent once per outage
