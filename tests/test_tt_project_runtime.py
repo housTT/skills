@@ -25925,6 +25925,71 @@ def test_an_on_pass_cmd_still_runs_model_free_after_a_resource_move_rewrites_its
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+@pytest.mark.parametrize("change", ["probe", "cmd", "both", "unrelated"])
+def test_an_on_pass_cmd_runs_model_free_after_set_when_rewrites_the_hand_off(env, monkeypatch, tmp_path, capsys,
+                                                                            change):
+    """`ttp task set-when` re-points the probe and/or sets the on_pass_cmd of a waiting task; the run's
+    result.json keeps what it wrote, and the daemon still takes it as the hand-off the task waits on."""
+    p = make(env)
+    from ttp import cli, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    cmd = f"touch {flag}; printf '{{\"status\":\"done\",\"summary\":\"verified\"}}' > \"$TTP_RESULT\""
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, cmd, probe="exit 1" if change != "cmd" else "true")
+    if change in ("cmd", "both", "unrelated"):   # the run named no on_pass_cmd
+        hand = json.loads((run_dir / "result.json").read_text())
+        hand.pop("on_pass_cmd")
+        (run_dir / "result.json").write_text(json.dumps(hand))
+        res = json.loads(p.db.task(tid)["result"])
+        res.pop("on_pass_cmd")
+        p.db.update_task(tid, result=json.dumps(res))
+    args = {"probe": ["true"], "cmd": ["--on-pass-cmd", cmd]}.get(change, ["true", "--on-pass-cmd", cmd])
+    cli.main(["task", "demo", "set-when", str(tid), *args])
+    out = capsys.readouterr().out
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == "true" and res["on_pass_cmd"] == cmd, res
+    assert ("retry_when set: true" in out) == (change != "cmd") and ("on_pass_cmd set" in out) == (change != "probe")
+    if change == "unrelated":   # a result.json naming some other probe is still not the hand-off the task waits on
+        hand = json.loads((run_dir / "result.json").read_text())
+        (run_dir / "result.json").write_text(json.dumps({**hand, "retry_when": "test -e /tmp/other"}))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    if change == "unrelated":
+        assert _ready(p, tid) and not flag.exists()
+        assert "its on_pass_cmd was not run: the task's last run's result.json is not the hand-off" in res["woke"]
+    else:
+        assert task["status"] == "done" and flag.exists(), (task["status"], task["blocked_reason"], res)
+        assert res["summary"] == "verified" and res["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_set_when_keeps_the_runs_own_probe_across_rewrites_and_clears_an_on_pass_cmd(env, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = _due_waiting_task(p, "exit 1", on_pass_cmd="true")
+    cli.main(["task", "demo", "set-when", str(tid), "exit 2"])
+    cli.main(["task", "demo", "set-when", str(tid), "exit 3", "--on-pass-cmd", ""])
+    assert "on_pass_cmd cleared" in capsys.readouterr().out
+    res = json.loads(p.db.task(tid)["result"])
+    assert (res["retry_when"], res["retry_when_orig"], res["on_pass_cmd_orig"]) == ("exit 3", "exit 1", "true")
+    assert "on_pass_cmd" not in res
+
+
+def test_set_when_on_pass_cmd_needs_a_waiting_task(env, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), "--on-pass-cmd", "true"])
+    assert "only a waiting task has an on_pass_cmd" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "requeue", str(tid), "--on-pass-cmd", "true"])
+    assert "--on-pass-cmd goes with set-when" in capsys.readouterr().err
+    assert p.db.task(tid)["result"] is None
+
+
 def test_passed_checks_still_record_on_pass_after_a_resource_move_rewrites_the_probe(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import coordinator as coord, daemon as dmod

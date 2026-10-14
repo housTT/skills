@@ -5976,7 +5976,7 @@ class Daemon:
         r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND dir IS NOT NULL "
                           "ORDER BY id DESC LIMIT 1", (tid,))
         full = _read_result(Path(r["dir"]) / RESULT_FILE) if r and r["dir"] else None
-        if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
+        if not full or full.get("status") != "waiting" or not _same_probe(full, prev, "on_pass_cmd") \
                 or not _same_probe(full, prev):
             return "the task's last run's result.json is not the hand-off the task waits on"
         if r["status"] == "running":
@@ -7710,11 +7710,12 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     return [x[:300] for x in lines if x.strip()][-n:]
 
 
-def _same_probe(full: dict, prev: dict) -> bool:
-    """Whether a run's result.json `full` wrote the retry_when the task waits on (`prev`): the same one,
-    or the one a resource move rewrote (task_update keeps it as retry_when_orig)."""
-    probe = full.get("retry_when")
-    return probe == prev.get("retry_when") or probe is not None and probe == prev.get("retry_when_orig")
+def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:
+    """Whether a run's result.json `full` wrote the retry_when (or `key`) the task waits on (`prev`): the
+    same one, or the one a resource move or `ttp task set-when` rewrote (kept as `<key>_orig`, None when
+    the run wrote none)."""
+    probe = full.get(key)
+    return probe == prev.get(key) or f"{key}_orig" in prev and probe == prev[f"{key}_orig"]
 
 
 def _wait_key(result: dict) -> str:
