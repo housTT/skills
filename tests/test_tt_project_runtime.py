@@ -12570,7 +12570,7 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
     def setup(*extra):
         # 300 s at least: one setup copies the plugin and took 28 s alone at host load 120.
         r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
-                           capture_output=True, text=True, timeout=max(300, _load_scaled(60)))
+                           capture_output=True, text=True, timeout=max(300, _load_scaled(300)))
         assert r.returncode == 0, r.stderr
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
         return r.stdout.replace(str(tmp_path), "<tmp>").replace(str(env["tmp"]), "<tmp>")
