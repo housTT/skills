@@ -60565,3 +60565,50 @@ def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_
     p.db.update_task(forced["id"], provider="claude")
     d.dispatch()
     assert started == [first, forced["id"]], "a forced review runs"
+
+
+def test_a_review_only_verdict_does_not_stand_in_for_a_review_that_pushes(env, monkeypatch):
+    """A review-only review (kept off, delivered as a PR, no push allowed) accepts a head without
+    pushing it. In a project that pushes, a later code task or review of that head still gets its
+    review, so the change is delivered; a later review-only review may reuse the verdict."""
+    from ttp import coordinator as coord, push, pushq, reviewreuse
+    s = _pq(env, monkeypatch)
+    fix, _, _, head = _re_plan(s, f"pr_branch:{s.branch}")
+    d, started = _reuse_daemon(s.p, monkeypatch)
+    key = reviewreuse.check_key(d.cfg)
+    ro = s.p.db.add_task("Review only", "Review only: do not push.", kind="review", origin="coordinator",
+                         labels=[push.REVIEW_ONLY_LABEL, reviewreuse.head_label(head, key)])
+    s.p.db.update_task(ro, status="done", result=json.dumps({"status": "done", "summary": "ok, review only"}))
+    assert not reviewreuse.delivered(s.p, head)
+    # The code task that ends on that head gets a review, not the review-only verdict.
+    done = _finish_fix(env, s.p, fix)
+    assert "already accepted" not in done["text"]
+    queued = s.p.db.q("SELECT id, title FROM tasks WHERE kind='review' AND status='queued'")
+    assert [r["title"][:len(f"Review #{fix}")] for r in queued] == [f"Review #{fix}"]
+    s.p.db.update_task(queued[0]["id"], status="cancelled")
+    # The coordinator may add one, and a review that would push runs at dispatch.
+    add = {"type": "task_add", "title": f"Review #{fix} by hand", "kind": "review", "spec": "check it",
+           "depends_on": [fix]}
+    assert coord.apply(s.p, [add]) == []
+    s.p.db.update_task(s.p.db.one("SELECT id FROM tasks WHERE title=?", (add["title"],))["id"], status="cancelled")
+    runs = _reuse_review(s.p, fix)
+    d.dispatch()
+    assert started == [runs] and s.p.db.task(runs)["status"] != "done"
+    # A later review-only review of the head may take the review-only verdict.
+    only = s.p.db.add_task("Review only again", "Review only.", kind="review", tier="light", origin="coordinator",
+                           provider="claude", budget_usd=8.0, depends_on=[fix], labels=[push.REVIEW_ONLY_LABEL])
+    d.dispatch()
+    assert started == [runs] and json.loads(s.p.db.task(only)["result"])["reused_review"] == ro
+    # Once the head is delivered, its verdict covers a review that would push.
+    s.p.db.update_task(runs, status="cancelled")
+    s.p.db.x("INSERT INTO push_queue(task,run,branch,head,target,status,created,updated) "
+             "VALUES(?,1,'b',?,'origin/proj','pushed',0,0)", (ro, head))
+    after = _reuse_review(s.p, fix, "Review it after the push")
+    d.dispatch()
+    assert started == [runs] and s.p.db.task(after)["status"] == "done"
+    # A cancelled row does not deliver it; the push target's tip containing it does.
+    s.p.db.x("UPDATE push_queue SET status='cancelled'")
+    assert not reviewreuse.delivered(s.p, head)
+    remote, branch = pushq.target(s.p)
+    _git_out(s.p.root, "update-ref", f"refs/remotes/{remote}/{branch}", head)
+    assert reviewreuse.delivered(s.p, head)

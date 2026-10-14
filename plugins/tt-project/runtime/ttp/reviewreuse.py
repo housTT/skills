@@ -3,7 +3,9 @@ project's check set (a label); once it is accepted (`done`: a changes_needed ver
 failed), a later review of the same head under the same checks reuses its verdict instead of
 running again. The daemon looks before it queues or starts a review, and the coordinator's
 task_add of such a review is refused unless forced with a reason. A different head, other checks
-or an earlier review that failed or asked for changes still get a review."""
+or an earlier review that failed or asked for changes still get a review. A review that would push
+(or a code task's review in a project that pushes) takes only a verdict whose head was delivered:
+a review-only verdict never pushed it, so reusing it would drop the delivery."""
 from __future__ import annotations
 
 import hashlib
@@ -40,10 +42,33 @@ def with_head(labels: list, sha: str, key: str) -> list:
     return [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(HEAD_LABEL))] + [head_label(sha, key)]
 
 
-def accepted(db, sha: str, key: str, skip: int | None = None) -> dict | None:
+def pushes(cfg: dict, labels: list | tuple = ()) -> bool:
+    """Whether a review with `labels` (a code task's review: no labels) would deliver its head to the
+    push branch: the project pushes to one and the review is not labelled review only."""
+    from .project import push_allowed
+    from .push import REVIEW_ONLY_LABEL
+    d = cfg.get("delivery") or {}
+    return push_allowed(d) and bool(str(d.get("push_branch") or "").strip()) and REVIEW_ONLY_LABEL not in labels
+
+
+def delivered(p, sha: str) -> bool:
+    """Whether head `sha` is on its way or already there: a live push_queue row for it, or the push
+    target's tip as last fetched contains it."""
+    from . import pushq
+    if p.db.one("SELECT 1 FROM push_queue WHERE head=? AND status IN ('approved','batched','pushed',"
+                "'landed') LIMIT 1", (sha,)):
+        return True
+    tgt = pushq.target(p)
+    tip = pushq._tracking_tip(p, *tgt) if tgt else ""
+    return bool(tip) and pushq._contains(p, [tip], sha)
+
+
+def accepted(db, sha: str, key: str, skip: int | None = None, p=None) -> dict | None:
     """The review that first accepted `sha` under check set `key` (a review that reused one points at
-    it), or None. Only a `done` review counts: failed, changes_needed and cancelled ones do not."""
-    if not sha:
+    it), or None. Only a `done` review counts: failed, changes_needed and cancelled ones do not. With
+    project `p` the caller would push `sha` (pushes): only a delivered head counts, as a review-only
+    verdict stands in for no push."""
+    if not sha or (p is not None and not delivered(p, sha)):
         return None
     for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='done' AND labels LIKE ? ORDER BY id",
                   (f'%"{head_label(sha, key)}"%',)):

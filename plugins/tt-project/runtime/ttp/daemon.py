@@ -6647,7 +6647,9 @@ class Daemon:
             if passed:
                 return passed["task"], False
             # Or one accepted it without the push queue (review only, an own push): its verdict stands.
-            prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg)) if tip else None
+            # A review that would push takes only a delivered head's verdict (reviewreuse.pushes).
+            prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg),
+                                         p=self.p if reviewreuse.pushes(cfg) else None) if tip else None
             if prior:
                 return prior["id"], False
             if not add:
@@ -6826,7 +6828,8 @@ class Daemon:
             return False
         key = reviewreuse.check_key(self.cfg)
         labels = json.loads(task["labels"] or "[]")
-        prior = None if reviewreuse.FORCED_LABEL in labels else reviewreuse.accepted(db, sha, key, skip=task["id"])
+        prior = None if reviewreuse.FORCED_LABEL in labels else reviewreuse.accepted(
+            db, sha, key, skip=task["id"], p=self.p if reviewreuse.pushes(self.cfg, labels) else None)
         if not prior:
             db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
             return False

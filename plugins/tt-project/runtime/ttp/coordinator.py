@@ -1254,7 +1254,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # A head a review already accepted under the same checks keeps that verdict
                 # (reviewreuse): another review of it runs only when forced with a reason.
                 head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
-                prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg)) if head else None
+                prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg),
+                                             p=p if reviewreuse.pushes(cfg, labels) else None) if head else None
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
                     raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
                 if prior:
