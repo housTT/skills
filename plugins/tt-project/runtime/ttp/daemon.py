@@ -5891,7 +5891,9 @@ class Daemon:
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
             # probe pass, so past `max_hold_s` the coordinator decides instead of a wake.
             held = now >= since + max_hold
-            if held:
+            gate = time_gate(str(prev.get("retry_when") or ""))
+            # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
+            if held and (gate is None or gate <= now):
                 self._stale_wait_event(task, prev, since, max_hold)
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
@@ -7892,6 +7894,16 @@ def _retry_s(result: dict) -> float:
         return min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
     except (TypeError, ValueError):
         return 1800.0
+
+
+# A probe that is only a clock comparison (`test "$(date +%s)" -ge <epoch>`, or in [ ] / [[ ]]).
+_TIME_GATE_RE = re.compile(r'^\s*(?:test|\[\[?)\s+"?\$\(date \+%s\)"?\s+-(ge|gt)\s+"?(\d+)"?\s*(?:\]\]?)?\s*$')
+
+
+def time_gate(probe: str) -> float | None:
+    """The epoch a bare date-comparison probe passes at, else None: only time ends such a wait."""
+    m = _TIME_GATE_RE.match(probe or "")
+    return float(m.group(2)) + (m.group(1) == "gt") if m else None
 
 
 def _current_probe(task: dict) -> str | None:

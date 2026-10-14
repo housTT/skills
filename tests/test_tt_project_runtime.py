@@ -58282,3 +58282,25 @@ def test_a_mute_that_ended_with_nothing_muted_or_by_its_probe_settles_without_a_
         p.db.set_kv(scr.MUTES_KEY, [m])
     assert scr.end_mute(p.db, "watcher:hw", "held", "true", "probe `true` passed", now=now + 1)
     assert ended()[-1][1] == "handled" and "2 observations" in ended()[-1][0]
+
+
+def test_wait_stale_skips_a_bare_time_gate_until_its_epoch_passes(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    assert dmod.time_gate('test "$(date +%s)" -ge 1760000000') == 1760000000
+    assert dmod.time_gate('[ $(date +%s) -gt 5 ]') == 6 and dmod.time_gate('[[ "$(date +%s)" -ge "7" ]]') == 7
+    assert dmod.time_gate('test "$(date +%s)" -ge 1 && test -e x') is None and dmod.time_gate("exit 1") is None
+    d = dmod.Daemon(p.base)
+    ahead = int(time.time()) + 3 * 3600
+    tid = _due_waiting_task(p, f'test "$(date +%s)" -ge {ahead}', since_ago=6 * 3600 + 60)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind IN ('wait_stale', 'probe_never_passes')", (tid,))
+    assert not _ready(p, tid) and p.db.task(tid)["not_before"] > time.time() + 200, "it sleeps on, no busy loop"
+    # A gate that is more than the clock is still raised past the cap.
+    tid = _due_waiting_task(p, f'test "$(date +%s)" -ge {ahead} && exit 1', since_ago=6 * 3600 + 60)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))
