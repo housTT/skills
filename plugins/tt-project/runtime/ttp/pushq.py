@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, locks, push, timefmt, upstream
+from . import checkdirs, batch, coordinator as coord, locks, push, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -986,7 +986,6 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
     to the coordinator as before, when the review is itself such a rebase or continues one, the head
     already had one, a task already continues the review, or the rolling review-task cap
     (coordinator.max_review_tasks_per_day) allows no new review now."""
-    from . import coordinator as coord
     db, head = p.db, str(row["head"] or "")
     if not _HEX40.fullmatch(head):
         return None
