@@ -10011,10 +10011,11 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli
     results = iter([255, 255, 0])
     calls, naps = [], []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(quiet) or next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None:
+                        calls.append(quiet) or next(results))
     monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
-    assert calls == [False, True, True], "the unreachable message should print once, not on every retry"
+    assert calls == [True, True, True], "the listener explains a drop itself, once, not forward() per retry"
     assert naps == [5.0, 10.0]
 
 
@@ -10067,7 +10068,7 @@ def test_remote_listen_once_ack_reconnects_after_an_ssh_drop_and_acks_once(env, 
     assert cli.forward_listen(entry, argv, "demo") == 0
     out, err = capsys.readouterr()
     assert len(calls) == 2 and naps == [5.0], (calls, naps)
-    assert "Broken pipe" in err and err.count("will keep retrying until --timeout runs out") == 1, err
+    assert "Broken pipe" not in err and "etrying" not in err, "a reconnect within the grace says nothing: " + err
     assert out.count(f"[#{new} ") == 1 and "fresh reply" in out and "already shown" not in out, out
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == old, \
         "only --ack marks messages read; the reconnect neither lost nor acknowledged the new reply"
@@ -10096,7 +10097,7 @@ def test_streaming_remote_listener_reconnects_on_any_dropped_session_and_shows_e
     assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     out, err = capsys.readouterr()
     assert out == "[#7 coordinator] hi\nmore of 7\n[#8 demo (alert, high)] x\n", out
-    assert len(calls) == 2 and naps == [5.0] and err.count("will keep retrying and deliver") == 1, err
+    assert len(calls) == 2 and naps == [5.0] and err == "", err
 
 
 def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, monkeypatch, capsys):
@@ -10117,9 +10118,122 @@ def test_remote_listen_whose_timeout_runs_out_while_unreachable_exits_75(env, mo
     calls.clear()
     assert cli.forward_listen(entry, ["listen", "demo", "--chat", "c1", "--timeout=12"]) == 75
     err = capsys.readouterr().err
-    assert err.count("will keep retrying until --timeout runs out") == 1 and "(exit 75)" in err, err
+    assert err.count("cannot reach far right now (client_loop") == 1 and "(exit 75)" in err, err
     assert calls[0].endswith("--timeout=12") and calls[1].endswith("--timeout=7"), calls
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stderr,connected,kind", [
+    ("ssh: Could not resolve hostname box: Name or service not known", True, "network"),
+    ("ssh: Could not resolve hostname box: Temporary failure in name resolution", False, "network"),
+    ("ssh: connect to host box port 22: Connection timed out", True, "network"),
+    ("ssh: connect to host box port 22: Network is unreachable", True, "network"),
+    ("Connection to 10.1.2.3 closed by remote host.", True, "host"),
+    ("Connection to 10.1.2.3 closed by remote host.", False, "host"),
+    ("ssh: connect to host box port 22: Connection refused", True, "host"),
+    ("ssh: connect to host box port 22: Connection refused", False, "host"),
+    ("kex_exchange_identification: read: Connection reset by peer", True, "host"),
+    ("ssh: connect to host box port 22: No route to host", True, "host"),
+    ("ssh: connect to host box port 22: No route to host", False, "network"),
+    ("client_loop: send disconnect: Broken pipe", True, "other"),
+    ("client_loop: send disconnect: Broken pipe", False, "network"),
+    ("", False, "network"),
+])
+def test_ssh_failure_kind_says_which_side_dropped(stderr, connected, kind):
+    from ttp import sshfail
+    assert sshfail.kind(stderr, connected) == kind
+
+
+_ADDRS = ["10.1.2.3", "192.168.0.17", "2001:db8::5", "fe80::1%eth0", "::ffff:10.0.0.7",
+          "2001:0db8:0000:0000:0000:ff00:0042:8329", "::1"]
+
+
+@pytest.mark.parametrize("addr", _ADDRS)
+@pytest.mark.parametrize("tmpl", ["Connection to {a} closed by remote host.",
+                                  "ssh: connect to host {a} port 22: No route to host",
+                                  "ssh: connect to host {a} port 22: Connection timed out",
+                                  "Warning: Permanently added '{a}' (ED25519) to the list of known hosts.\nPermission denied (publickey)."])
+@pytest.mark.parametrize("connected", [False, True])
+def test_no_ip_address_reaches_the_user_only_the_ssh_alias(capsys, addr, tmpl, connected):
+    from ttp import cli, sshfail
+    err = tmpl.format(a=addr)
+    cli._unreachable({"host": "box-host", "ssh": "box"}, err, connected=connected)
+    cli._unreachable({"host": "box-host", "ssh": "box"}, err, connected=connected, retrying="")
+    said = capsys.readouterr().err
+    assert addr not in said and addr.split("%")[0] not in said and "box" in said, said
+    assert addr not in sshfail.scrub(err + "\n", "box")
+    # Only ssh's own lines are scrubbed, and a time is no address.
+    assert sshfail.scrub("ran at 14:23:05 on 10.0.0.1\n", "box") == "ran at 14:23:05 on 10.0.0.1\n"
+    assert sshfail.no_ips("at 14:23:05", "box") == "at 14:23:05"
+
+
+def _listener_on_a_clock(cli, monkeypatch, attempts):
+    """forward_listen against a fake forward(): each attempt is (seconds it lasts, rc, ssh stderr)."""
+    clock, calls = [1000.0], []
+    monkeypatch.setattr(cli.time, "time", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def fwd(entry, argv, quiet=False, shown=None, failure=None):
+        took, rc, err = attempts.pop(0)
+        calls.append(quiet)
+        clock[0] += took
+        if cli._dropped(rc) and failure is not None:
+            failure.append(err)
+        return rc
+    monkeypatch.setattr(cli, "forward", fwd)
+    return calls
+
+
+def test_a_host_that_restarts_under_a_listener_is_named_as_restarting_once_past_the_grace(env, monkeypatch, capsys):
+    """The reported case: the project's host rebooted, and the listener blamed this machine's network
+    and printed the host's address. Now it names the ssh alias, says the host dropped it, and says so once."""
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    refused = "ssh: connect to host 10.1.2.3 port 22: Connection refused\n"
+    no_route = "ssh: connect to host 10.1.2.3 port 22: No route to host\n"
+    calls = _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone), (0, 255, no_route), (0, 255, refused),
+                                                    (0, 255, refused), (0, 255, no_route), (0, 255, refused), (1, 0, "")])
+    assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert len(calls) == 7 and set(calls) == {True}
+    assert err.count("ttp: box dropped the connection (probably restarting;") == 1, err
+    assert "Retrying; messages are delivered once it is back." in err, err
+    assert "back on that network" not in err and "10.1.2.3" not in err, err
+
+
+def test_a_listener_reconnecting_within_the_grace_prints_nothing(env, monkeypatch, capsys):
+    from ttp import cli
+    gone = "Connection to 10.1.2.3 closed by remote host.\n"
+    refused = "ssh: connect to host box port 22: Connection refused\n"
+    _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone), (0, 255, refused), (0, 255, refused), (1, 0, "")])
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_listener_whose_name_does_not_resolve_keeps_the_network_advice(env, monkeypatch, capsys):
+    from ttp import cli
+    dns = "ssh: Could not resolve hostname box: Temporary failure in name resolution\n"
+    _listener_on_a_clock(cli, monkeypatch, [(0, 255, dns)] * 5 + [(1, 0, "")])
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("ttp: cannot reach box right now (ssh: Could not resolve hostname box") == 1, err
+    assert "retrying; messages are delivered once this machine is back on that network." in err, err
+    assert "restarting" not in err
+
+
+@pytest.mark.parametrize("stderr,says,not_says", [
+    ("ssh: connect to host 10.1.2.3 port 22: Connection refused\n", "box is not accepting connections (probably restarting",
+     "back on that network"),
+    ("ssh: Could not resolve hostname box: Name or service not known\n", "try again once this machine is back on that network",
+     "restarting"),
+])
+def test_a_forwarded_command_explains_an_ssh_failure_from_the_right_side(env, monkeypatch, capsys, stderr, says, not_says):
+    """`ttp status`, `ttp say`, `ttp connect` and `ttp web` share forward()/_unreachable."""
+    from ttp import cli
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: subprocess.CompletedProcess([], 255, "", stderr))
+    assert cli.forward({"host": "box", "dir": "/x"}, ["status", "demo"]) == 255
+    err = capsys.readouterr().err
+    assert says in err and not_says not in err and "10.1.2.3" not in err, err
 
 
 _REPLACED = "ttp: replaced by a newer listener for chat c1 (pid 4242); this one stops without reconnecting (exit 3)\n"
@@ -10255,7 +10369,8 @@ def test_remote_listener_sends_the_outbox_on_every_reconnect(env, monkeypatch):
     flushes = iter([failed, None])
     calls = []
     monkeypatch.setattr(cli, "flush_outbox", lambda name, entry, quiet=False: calls.append(("flush", name)) or next(flushes))
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: calls.append(("listen", quiet)) or 0)
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None:
+                        calls.append(("listen", quiet)) or 0)
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
     assert calls == [("flush", "demo"), ("flush", "demo"), ("listen", True)]
@@ -10290,7 +10405,7 @@ def test_a_stuck_queued_message_does_not_keep_the_listener_away(env, monkeypatch
     from ttp import cli, outbox
     _stuck_outbox(cli, outbox, monkeypatch, 127)
     results, naps = iter([255, 0]), []
-    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None: next(results))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False, shown=None, failure=None: next(results))
     def nap(s):
         naps.append(s)
         assert len(naps) < 3, "the listener backs off on the stuck message instead of connecting"
