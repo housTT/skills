@@ -4082,13 +4082,13 @@ def _keep_out_runtime_data(h: Path, since: float | None) -> list[str]:
     if staged & set(data):
         _git(h, "--literal-pathspecs", "rm", "-q", "--cached", "--", *sorted(staged & set(data)))
     exclude = h / _git(h, "rev-parse", "--git-path", "info/exclude")
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    have = set(exclude.read_text().splitlines()) if exclude.exists() else set()
+    cur = exclude.read_text() if exclude.exists() else ""
+    have = set(cur.splitlines())
     lines = ["/" + re.sub(r"([\\*?\[])", r"\\\1", n) for n in data]
     add = [ln for ln in lines if ln not in have]
     if add:
-        with exclude.open("a") as fh:
-            fh.write("# runtime data kept out of commits by `ttp upgrade`\n" + "\n".join(add) + "\n")
+        durable_write(exclude, cur + ("" if not cur or cur.endswith("\n") else "\n")
+                      + "# runtime data kept out of commits by `ttp upgrade`\n" + "\n".join(add) + "\n")
     return data
 
 
