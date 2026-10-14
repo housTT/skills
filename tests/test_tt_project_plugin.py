@@ -710,6 +710,7 @@ def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
     for part in ("While you iterate, run only the tests your change affects", "never the full suite",
                  "Run `ttp checks` once at the end, committed, before the hand-off",
                  "A direct full-suite run is refused",
+                 "`PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=. ...` (`ttp checks` does so itself)",
                  "each command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`)"):
         assert part in code, part
     review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())

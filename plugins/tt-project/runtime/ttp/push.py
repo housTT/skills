@@ -403,18 +403,47 @@ def editable_outside(venv: Path, top: str | Path, main: Path) -> str:
     return ""
 
 
+# Files above a worktree that pytest picks up: a conftest.py it loads, or a config file that makes
+# that directory its rootdir (and so its confcutdir).
+PYTEST_FILES = ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "setup.py")
+
+
+def nested_pytest(top: str | Path) -> bool:
+    """A directory above the worktree `top` has a file pytest would pick up (PYTEST_FILES): a worktree
+    nested in a project root that has a conftest.py, say. A plain pytest there may take that directory as
+    its rootdir, load its conftest.py and import its package instead of the worktree's."""
+    try:
+        return any((d / f).is_file() for d in Path(top).resolve().parents for f in PYTEST_FILES)
+    except OSError:
+        return False
+
+
 def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     """`cmd` with each bare pytest run (`pytest`, `py.test`, `python[3] -m pytest`) made
     `<venv>/bin/python -m pytest` when the repository has a venv (venv_python); else `cmd` as it is.
     A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies.
     When the main checkout's venv is skipped for an editable install from outside the worktree, the
-    command stays as written and first prints why to the checks output."""
+    command stays as written and first prints why to the checks output.
+    In a worktree nested below pytest files (nested_pytest), each such run is also kept to the worktree:
+    `--rootdir` and `--confcutdir` set to it (unless the command sets them) and it first on PYTHONPATH
+    (a PYTHONPATH the run itself sets still wins), so it tests the worktree's code, not the outer one's."""
     if not _PYTEST_RUN.search(cmd):
         return cmd
     py, why = _venv(top, env)
-    if not py:
+    nested = nested_pytest(top)
+    if not py and not nested:
         return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{cmd}" if why else cmd
-    return _PYTEST_RUN.sub(lambda m: f"{m.group(1)}{m.group(2)}{shlex.quote(str(py))} -m pytest", cmd)
+    q = shlex.quote(str(top))
+    pre = f" PYTHONPATH={q}${{PYTHONPATH:+:$PYTHONPATH}} " if nested else ""
+    flags = "".join(f" --{f}={q}" for f in ("rootdir", "confcutdir") if nested and f"--{f}" not in cmd)
+
+    def run(m: re.Match) -> str:
+        bare = m.group(0)[len(m.group(1)) + len(m.group(2)):]
+        tail = (f"{shlex.quote(str(py))} -m pytest" if py else bare) + flags
+        return f"{m.group(1)}{pre}{m.group(2).lstrip() if pre else m.group(2)}{tail}"
+
+    out = _PYTEST_RUN.sub(run, cmd)
+    return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
 ENV_FIX = "check command lacks dependencies: point delivery checks at a venv"

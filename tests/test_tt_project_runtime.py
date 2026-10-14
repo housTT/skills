@@ -36648,6 +36648,59 @@ def test_ttp_checks_runs_a_bare_pytest_with_the_venv(env, tmp_path, monkeypatch,
     assert rec["passed"] is True and rec["commands"] == ["pytest -q"]   # recorded as written
 
 
+def _nested_worktree(tmp_path):
+    """A project root with a pytest config, a conftest.py and a package `pkg`, and a git worktree nested
+    below it whose `pkg` differs (it alone has `pkg.only_here`), with a test that imports it."""
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pytest.ini").write_text("[pytest]\n")
+    (root / "conftest.py").write_text("")
+    (root / "pkg" / "__init__.py").write_text("WHERE = 'root'\n")
+    wt = root / "tt-project" / "worktrees" / "t1"
+    (wt / "pkg").mkdir(parents=True)
+    (wt / "tests").mkdir()
+    (wt / "pkg" / "__init__.py").write_text("WHERE = 'worktree'\n")
+    (wt / "pkg" / "only_here.py").write_text("")
+    (wt / "tests" / "test_pkg.py").write_text(
+        "import pkg\nfrom pkg import only_here\n\ndef test_pkg():\n    assert pkg.WHERE == 'worktree'\n")
+    git = ["git", "-C", str(wt), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(wt)], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    shim = tmp_path / "shim"   # the python3 a check command names: this interpreter, which has pytest
+    shim.mkdir()
+    (shim / "python3").symlink_to(sys.executable)
+    return root, wt, shim
+
+
+def test_pytest_in_a_nested_worktree_imports_the_worktrees_package(env, tmp_path, monkeypatch):
+    from ttp import cli, push
+    root, wt, shim = _nested_worktree(tmp_path)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    cmd = "python3 -m pytest -q -p no:cacheprovider tests/test_pkg.py"
+    # As written, pytest takes the project root as rootdir, loads its conftest.py and imports its pkg.
+    plain = subprocess.run(["bash", "-c", cmd], cwd=wt, capture_output=True, text=True)
+    assert plain.returncode != 0 and "only_here" in plain.stdout, plain.stdout
+    assert push.nested_pytest(wt) and not push.nested_pytest(tmp_path / "shim")
+    q = shlex.quote(str(wt))
+    assert push.venv_cmd(cmd, wt) == (f" PYTHONPATH={q}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m pytest "
+                                      f"--rootdir={q} --confcutdir={q} -q -p no:cacheprovider tests/test_pkg.py")
+    # A command's own --rootdir and PYTHONPATH stay its own.
+    assert push.venv_cmd("cd x && PYTHONPATH=src pytest --rootdir=x", wt) == \
+        f"cd x && PYTHONPATH={q}${{PYTHONPATH:+:$PYTHONPATH}} PYTHONPATH=src pytest --confcutdir={q} --rootdir=x"
+    assert push.venv_cmd("make test", wt) == "make test"
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(wt)
+    cli.main(["checks", "--", cmd])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["commands"] == [cmd], (run / "checks.log").read_text()
+
+
 def test_check_commands_run_wrapped_pytest_with_the_venv(tmp_path):
     from ttp import push
     repo, py = _venv_repo(tmp_path)
