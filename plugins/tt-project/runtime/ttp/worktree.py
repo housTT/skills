@@ -264,8 +264,7 @@ def _other_branch(p: Project, task: dict, path: Path, there: str, branch: str) -
         if not any(e.startswith(d + "/") for d in loose) and not ((path / e).is_symlink() and e in links):
             loose.append(e)
     if patch:
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / "uncommitted.patch").write_text(patch + "\n")
+        durable_write(dest / "uncommitted.patch", patch + "\n")
     moved = move_leftovers(path, loose, dest)
     _git(p.root, "worktree", "remove", "--force", "--force", str(path), timeout=t)
     _git(p.root, "worktree", "prune", check=False, timeout=t)
