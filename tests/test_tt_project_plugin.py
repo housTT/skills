@@ -1211,7 +1211,7 @@ def test_setup_box_bare_remote_root_with_odd_characters_keeps_home():
     sys.path.insert(0, str(BOX_PY.parent))
     import box_bare
     assert box_bare._remote_root("~/<workdir>/a b") == "\"$HOME\"'/<workdir>/a b'"
-    assert box_bare._remote_root("~/<workdir>") == '"$HOME/<workdir>"'
+    assert box_bare._remote_root("~/work") == '"$HOME/work"'
     assert box_bare._remote_root("~") == '"$HOME"'
 
 
