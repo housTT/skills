@@ -66,7 +66,7 @@ Each submit stamps the job with what it runs, taken on the box (`devq.build_stam
 ## Copy inputs and results
 
 Read results on the box where you can. When a file must move (a job input, a log, a results folder),
-use the shared helper; it uses rsync when both ends have it and tar over ssh when the box has none:
+use the shared helper; it uses rsync when both ends have rsync 3 or later, else tar over ssh:
 
 ```
 <plugin-root>/skills/setup-box/scripts/box.py copy <alias>:<path on the box> <local folder>

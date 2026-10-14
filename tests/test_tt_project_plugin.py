@@ -1141,6 +1141,54 @@ def test_setup_box_copy_falls_back_to_tar_over_ssh_when_a_box_has_no_rsync(tmp_p
         assert (home / "viarsync" / "results" / "sub" / "a b.txt").read_text() == "x"
 
 
+def test_setup_box_copy_uses_tar_when_rsync_lacks_protect_args(tmp_path):
+    """macOS rsync 2.6.9 and openrsync reject -s: box.py copy goes by tar, never fails on it; an
+    rsync that rejects the call anyway (exit 1 or 2) is retried once by tar. A sender writing much
+    to stderr never stalls the tar pipeline."""
+    import subprocess
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_copy
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    assert box_copy.rsync_major("rsync  version 2.6.9  protocol version 29\n") == 2
+    assert box_copy.rsync_major("openrsync: protocol version 29\nrsync version 2.6.9 compatible\n") == 2
+    assert box_copy.rsync_major("rsync  version 3.2.7  protocol version 31\n") == 3
+    assert box_copy.rsync_major("") == 0
+    bindir, home, log = tmp_path / "bin", tmp_path / "boxhome", tmp_path / "ssh.log"
+    bindir.mkdir()
+    home.mkdir()
+    ssh = bindir / "ssh"
+    ssh.write_text('#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done\nshift\necho "$*" >> "$SSH_LOG"\n'
+                   '[ -n "$CHATTY" ] && head -c 400000 /dev/zero | tr "\\0" e >&2\n'
+                   'cd "$BOX_HOME" && HOME="$BOX_HOME" exec /bin/sh -c "$*"\n')
+    rsync = bindir / "rsync"  # stand-in: an old rsync, or one that says 3 but rejects -s anyway
+    rsync.write_text('#!/bin/sh\necho "rsync $*" >> "$SSH_LOG"\n'
+                     'if [ "$1" = --version ]; then echo "rsync  version $RSYNC_VER  protocol version 29"; exit 0; fi\n'
+                     'for a in "$@"; do [ "$a" = -s ] && { echo "rsync: -s: unknown option" >&2; exit 1; }; done\n'
+                     'exit 0\n')
+    for f in (ssh, rsync):
+        f.chmod(0o755)
+    src = tmp_path / "results"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "a b.txt").write_text("x")
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "SSH_LOG": str(log), "BOX_HOME": str(home)}
+    run = lambda *a, **e: subprocess.run([sys.executable, str(BOX_PY), "copy", *a], capture_output=True,
+                                         text=True, timeout=60, env={**env, **e})
+    r = run(str(src), "box1:~/old", RSYNC_VER="2.6.9")
+    assert r.returncode == 0 and "by tar" in r.stdout, r.stdout + r.stderr
+    assert (home / "old" / "results" / "sub" / "a b.txt").read_text() == "x"
+    assert "rsync -a" not in log.read_text(), "an rsync without -s is never called to copy"
+    r = run(str(src), "box1:~/rejected", RSYNC_VER="3.2.7")
+    assert r.returncode == 0 and "by tar" in r.stdout, r.stdout + r.stderr
+    assert "rsync -a -s" in log.read_text(), "the rsync was tried first"
+    assert (home / "rejected" / "results" / "sub" / "a b.txt").read_text() == "x"
+    back = tmp_path / "back"
+    r = run("box1:old/results", str(back), RSYNC_VER="2.6.9", CHATTY="1")
+    assert r.returncode == 0 and "by tar" in r.stdout, r.stdout + r.stderr
+    assert (back / "results" / "sub" / "a b.txt").read_text() == "x"
+
+
 def test_setup_box_links_tt_buddy_instead_of_copying():
     agents = (SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8")
     for ref in ("recipes/developer-setup.md", "recipes/workspace.md", "recipes/tt-metal/build.md",
