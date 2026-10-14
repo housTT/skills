@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
-  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL, watch_key TEXT);
+  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL, watch_key TEXT, reopens TEXT);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -290,12 +290,16 @@ class DB:
                 self.x("UPDATE issues SET opened=first_seen")
 
     def _migrate_issue_watch_key(self) -> None:
-        # The stable key a watcher JSON line gave its issue (screen.py); watchdup groups issues by its kind.
-        if "watch_key" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+        # The stable key a watcher JSON line gave its issue (screen.py), and the times a keyed issue
+        # reopened lately (JSON list): watchdup groups issues by the key's kind and counts each reopen.
+        want = ("watch_key", "reopens")
+        if set(want) <= {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
             return
         with self.tx():
-            if "watch_key" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
-                self.x("ALTER TABLE issues ADD COLUMN watch_key TEXT")
+            have = {r["name"] for r in self.q("PRAGMA table_info(issues)")}
+            for col in want:
+                if col not in have:
+                    self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
 
     def _migrate_push_landed(self) -> None:
         # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older

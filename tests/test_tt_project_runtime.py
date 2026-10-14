@@ -2848,6 +2848,38 @@ def test_watcher_same_subject_warning_counts_only_one_key_kind_and_lists_the_key
     assert f"+{watchdup.STORED_KEYS + 5 - watchdup.SHOWN_KEYS} more)" in watchdup.describe(w)
 
 
+def test_watcher_same_subject_warning_counts_reopen_churn_per_key_not_distinct_keys(env, monkeypatch):
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    # Nine distinct stable keys on one subject, each with the watcher's and the subject's names in
+    # front, are nine conditions: no warning.
+    conds = ["reboot", "unreachable", "fsm", "chips-low", "held", "power-cycle", "fabric", "broker-down", "drop-in"]
+    for c in conds:
+        run("box", {"text": f"box-c: {c} seen", "severity": "high", "key": f"box-watch:box-c:{c}"})
+    assert len(issues("box")) == 9 and "noisy watcher:" not in log()
+    assert watchdup.counts(p.db, "watcher:box", time.time()) == [("box-c", 1)]
+    # One key that keeps closing and reopening is churn: each open counts, and the warning says so.
+    for _ in range(4):
+        run("flap", {"text": "box-d: rebooted", "severity": "high", "key": "box-d:reboot"})
+        run("flap", {"text": "box-d: cleared: rebooted", "severity": "high", "key": "box-d:reboot"})
+    assert len(issues("flap")) == 1
+    assert ("watcher:flap opened 4 issues on subject 'box-d' within 24 h under key kind 'reboot' "
+            f"(keys: box-d:reboot x4): {watchdup.CHURN_FIX}") in log()
+    # Reopens older than 24 h drop out, and an issue first seen earlier still counts its recent ones.
+    now = time.time()
+    p.db.x("UPDATE issues SET first_seen=first_seen-?, reopens=? WHERE source='watcher:flap'",
+           (watchdup.WINDOW_S + 60, json.dumps([now - watchdup.WINDOW_S - 60, now - 60])))
+    assert watchdup.counts(p.db, "watcher:flap", now) == [("box-d", 1)]
+    assert json.loads(watchdup.reopened(json.dumps([now - watchdup.WINDOW_S - 1, now - 5]), now)) == [now - 5, now]
+    assert watchdup.reopen_times("junk") == [] and watchdup.reopen_times(None) == []
+    # The condition class: the subject's segment anywhere, and trailing number segments, do not tell keys apart.
+    kind = watchdup.key_kind
+    assert kind("box-watch:box-c:reboot", "box-c") == "box-watch:reboot" != kind("box-watch:box-c:fsm", "box-c")
+    assert kind("hold:2026-10-13t20:29") == kind("box-c:hold:ep7", "box-c") == kind("box-c hold#2", "box-c") == "hold"
+    assert kind("chips-low:3of4") == "chips-low" and kind("42") == "<n>"
+
+
 def test_command_watcher_info_lines_clear_items_and_are_recorded_quietly(env, monkeypatch):
     from ttp import screen as scr
     run, issues, p = _json_watcher(env, monkeypatch)

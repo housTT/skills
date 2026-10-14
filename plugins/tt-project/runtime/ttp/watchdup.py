@@ -10,15 +10,19 @@ review. It never wakes anyone and changes no issue: the fix is in the watcher's 
 `key`, or `"whole": true`).
 
 Issues of one kind are duplicates; distinct stable keys are distinct conditions. All issues opened
-under no key on a subject are one kind (their text changed). A keyed issue's kind is its key's kind
-prefix: the key, normalized as issue text and subjects are (lower-cased, numbers masked), without a
-leading '<subject>' and separator, up to its first ':', '/' or '#', with each run of digits counted as
-one number. So 'hold:3' and 'hold:4' (or 'retry 1' and
-'retry 2') are one kind, while 'outage ended', 'drop-in' and 'recovered' are three. The warning lists
-the keys it counted (the first STORED_KEYS are kept), so a reader can tell duplicates from distinct
-conditions."""
+under no key on a subject are one kind (their text changed). A keyed issue's kind is its condition
+class: the key, normalized as issue text and subjects are (lower-cased, numbers masked), split at ':',
+'/' and '#', without the segments that name its subject (and a leading '<subject>' and separator), and
+without the trailing segments that hold a number (a value, a count, an episode, a time), each other run
+of digits counted as one number. So 'hold:3' and 'hold:4' (or 'retry 1' and 'retry 2') are one kind,
+while 'outage ended', 'drop-in', 'recovered' and '<watcher>:<box>:reboot' next to '<watcher>:<box>:fsm'
+are distinct. A keyed issue counts once each time it opens: when it is new and each time it reopens
+after a close (the reopen churn of one key), so a condition that keeps clearing and coming back warns
+too. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
+duplicates from distinct conditions."""
 from __future__ import annotations
 
+import json
 import re
 import time
 
@@ -30,11 +34,14 @@ DEFAULT = 3
 KEY = "watcher_same_subject"   # kv: "<source>\n<subject>" -> {source, subject, n, at, kind, keys}
 FIX = 'give its JSON lines a stable "key" (or "whole": true), see the tt-project-harness skill'
 KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see the tt-project-harness skill'
+CHURN_FIX = ('it keeps closing and reopening: report the condition on every run while it holds, see the '
+             'tt-project-harness skill')
 NO_KEY = ""                    # the kind of every issue opened under no key
 SHOWN_KEYS = 6
 STORED_KEYS = 20             # keys kept per warning; n counts them all
 _SEP = re.compile(r"[:/#]")
 _DIGITS = re.compile(r"\d+")
+_NUMBER = re.compile(r"\d|<(?:n|hex|ts|dur)>")   # a segment holding a number, raw or masked by normalize
 
 
 def threshold(cfg: dict) -> int:
@@ -45,25 +52,48 @@ def threshold(cfg: dict) -> int:
 
 
 def key_kind(key: str | None, subject: str = "") -> str:
-    """The kind prefix of a watcher key (see the module doc); NO_KEY for none."""
+    """The condition class of a watcher key (see the module doc); NO_KEY for none."""
     k = normalize(key or "")
     if not k:
         return NO_KEY
     subj = normalize(subject or "")   # an issue's subject is stored normalized; the key must match it
     if subj and k.startswith(subj) and len(k) > len(subj) and (_SEP.match(k, len(subj)) or k[len(subj)] == " "):
         k = k[len(subj) + 1:].strip() or k
-    head = _SEP.split(k, 1)[0].strip() or k
-    return _DIGITS.sub("<n>", head)
+    parts = [x.strip() for x in _SEP.split(k)]
+    parts = [x for x in parts if x and x != subj] or [k]
+    while len(parts) > 1 and _NUMBER.search(parts[-1]):
+        parts.pop()
+    return _DIGITS.sub("<n>", ":".join(parts))
 
 
 def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[tuple[str, str, list[str]]]:
-    """(subject, kind, keys) for each kind of issue `source` opened over the last `window_s`; one key per
-    issue, '' for an issue under no key; no subject is ''."""
+    """(subject, kind, keys) for each kind of issue `source` opened over the last `window_s`: an issue
+    under no key once ('') when it is new, a keyed one once per open (new or reopened); no subject is ''."""
     out: dict[tuple[str, str], list[str]] = {}
-    for r in db.q("SELECT COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k FROM issues "
-                  "WHERE source=? AND first_seen>? ORDER BY first_seen, id", (source, now - window_s)):
-        out.setdefault((r["subject"], key_kind(r["k"], r["subject"])), []).append(r["k"])
+    since = now - window_s
+    for r in db.q("SELECT COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k, first_seen, reopens "
+                  "FROM issues WHERE source=? AND (first_seen>? OR COALESCE(opened,0)>?) ORDER BY first_seen, id",
+                  (source, since, since)):
+        opens = int(float(r["first_seen"] or 0) > since)
+        if r["k"]:
+            opens += sum(1 for t in reopen_times(r["reopens"]) if t > since)
+        if opens:
+            out.setdefault((r["subject"], key_kind(r["k"], r["subject"])), []).extend([r["k"]] * opens)
     return [(subject, kind, keys) for (subject, kind), keys in out.items()]
+
+
+def reopen_times(raw) -> list[float]:
+    """An issue's `reopens` column: the times it reopened lately (JSON list), [] when unset or bad."""
+    try:
+        got = json.loads(raw or "[]")
+        return [float(t) for t in got] if isinstance(got, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def reopened(raw, now: float, window_s: float = WINDOW_S) -> str:
+    """The `reopens` value after one more reopen at `now`, keeping only the last `window_s`."""
+    return json.dumps([t for t in reopen_times(raw) if now - t < window_s] + [now])
 
 
 def counts(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[tuple[str, int]]:
@@ -106,10 +136,14 @@ def describe(w: dict) -> str:
     subject = f"subject '{w['subject']}'" if w["subject"] else "no subject"
     keys = [k for k in (w.get("keys") or []) if k]
     if keys:
-        total = max(len(keys), int(w.get("n") or 0))
-        shown = ", ".join(keys[:SHOWN_KEYS]) + (f", +{total - SHOWN_KEYS} more" if total > SHOWN_KEYS else "")
+        seen: dict[str, int] = {}
+        for k in keys:
+            seen[k] = seen.get(k, 0) + 1
+        names = [k if n == 1 else f"{k} x{n}" for k, n in seen.items()]
+        more = len(names) - SHOWN_KEYS + max(0, int(w.get("n") or 0) - len(keys))   # + issues past STORED_KEYS
+        shown = ", ".join(names[:SHOWN_KEYS]) + (f", +{more} more" if more > 0 else "")
         return f"{w['source']} opened {w['n']} issues on {subject} within 24 h under key kind " \
-               f"'{w.get('kind') or ''}' (keys: {shown}): {KEYED_FIX}"
+               f"'{w.get('kind') or ''}' (keys: {shown}): {CHURN_FIX if len(seen) == 1 else KEYED_FIX}"
     if "keys" in w:
         how = " under no key (changing text)"
     else:   # recorded before keys were

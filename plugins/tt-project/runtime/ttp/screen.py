@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import jevuse, timefmt
+from . import jevuse, timefmt, watchdup
 from .db import DB, SEVERITY_RANK
 from .providers.jev import JevOutOfFunds
 
@@ -154,14 +154,15 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
                 # Closed by a quiet run moments ago and sent again unchanged: counted, not reopened.
                 return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a quiet run",
                                fp, row["id"], "dedupe")
-            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=? WHERE id=?",
-                 ("open" if sev != "info" else "ignored", sev, now, row["id"]))
+            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=?, reopens=? WHERE id=?",
+                 ("open" if sev != "info" else "ignored", sev, now, _reopens(row, now), row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
             return _jev_missed(db, row, v)
         if seen_at > rank and seen_at >= floor:
             # The watcher now rates it higher than before (a condition kept quiet that turned serious).
-            db.x("UPDATE issues SET status='open', severity=?, opened=CASE WHEN status='open' THEN opened ELSE ? END "
-                 "WHERE id=?", (hint, now, row["id"]))
+            db.x("UPDATE issues SET status='open', severity=?, opened=CASE WHEN status='open' THEN opened ELSE ? END, "
+                 "reopens=? WHERE id=?",
+                 (hint, now, row.get("reopens") if row["status"] == "open" else _reopens(row, now), row["id"]))
             return _jev_missed(db, row, Verdict(True, str(hint), f"now {hint}", fp, row["id"], "dedupe"))
         reason = "known issue"
         if row["status"] == "open" and rank >= floor:
@@ -179,6 +180,11 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
     if info.get("jev_call"):
         jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
+
+
+def _reopens(row: dict, now: float) -> str | None:
+    """A keyed issue's reopen times with this one (watchdup counts its churn); others keep none."""
+    return watchdup.reopened(row.get("reopens"), now) if row.get("watch_key") else row.get("reopens")
 
 
 JEV_USE = "screen"
