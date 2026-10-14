@@ -3731,9 +3731,8 @@ def _approved_text_file(p: Project, rec: dict) -> str:
     name = re.sub(r"[^0-9a-zA-Z_-]", "", str(rec.get("id") or "")) or str(rec.get("sha") or "")[:12]
     path = p.state / "charter-approved" / f"{name}.txt"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or path.read_text() != rec["text"]:
-            path.write_text(rec["text"])
+            durable_write(path, rec["text"])
     except OSError:
         return ""
     return str(path.relative_to(p.root))
