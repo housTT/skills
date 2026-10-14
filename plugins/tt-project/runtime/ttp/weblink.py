@@ -116,11 +116,13 @@ def _ssh_ok(host: str) -> str:
 
 def remote(name: str, entry: dict, remote_port: int, tok: str) -> tuple[str, int]:
     """(line, exit code) for a project on another machine: open the kept local forward exactly as
-    `ttp web <name> --tunnel --keep` does (a local view forward needs no ask), check the link
-    through it, and repair: restart the kept tunnel, then the daemon there."""
-    from . import tunnel
+    `ttp web <name> --tunnel --keep` does (the user's one yes to local view tunnels, consent.gate),
+    check the link through it, and repair: restart the kept tunnel, then the daemon there."""
+    from . import consent, tunnel
     from .web import free_port
     host = entry.get("ssh") or entry["host"]
+    if not tunnel.installed(name) and (why := consent.gate("tunnel", f"ttp web {name} --tunnel --keep")):
+        return f"web app: not opened: a local view tunnel to {host} is {why}", UNVERIFIED
     local_port, did = tunnel.keep(name, host, remote_port, free_port)
     url = f"http://127.0.0.1:{local_port}/#token={tok}"
     kind, why = verify(url, name)

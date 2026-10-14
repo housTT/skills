@@ -37,7 +37,7 @@
 | `ttp alerts <name> --ack <id> --why "<reason>"` | acknowledge the keyed alert episode of a message id shown by `ttp alerts`: closes it if its condition is over, else moves it to the feed, quiet until it clears; a live outage (logout, network, disk, machine, whole-box heal) is refused; keeps history, retries leave the original receipt unchanged, unknown ids are refused |
 | `ttp stats [<name>] [--days N] [--since T] [--until T] [--split-at T] [--tools] [--json]` | context re-read (cache-read) tokens per run (mean and median) and per $, model calls per run and first-call context, by role, task kind, tier and effort, and the runs that re-read most; runs with no model call (failed sign-in) are counted apart, outside the averages; `--split-at` compares before and after a change; `--tools`: the runs' tool output by category, with the share that is file reads |
 | `ttp audit [<name>] [--hours N] [--json]` | the daily review's self-efficiency audit: every ask with its blocking reason and answer, failed, lost, retried and continued runs, idle wakes, $ per done task by kind and tier, review-loop spend per change, stuck work and overrides held past their end |
-| `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; a local view forward needs no ask) |
+| `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; local view forwards are asked once per user, `ttp consent tunnel`) |
 
 ## What needs the user
 

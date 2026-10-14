@@ -81,5 +81,6 @@ ttp new <name> [--dir <root>] [--host <ssh-alias>] --describe-file <brief.md>
 
 - `ttp connect <name> --label "<chat label>"` and start the listener (`hosts.md`).
 - The coordinator restates goals and asks what it still needs. Relay its message.
-- On the user's own workstation, run `ttp notifier install` and say so.
+- On the user's own workstation, the notifier is asked once: if `ttp consent notifier` says `ask`, ask,
+  record `ttp consent notifier yes|no`, and on a yes run `ttp notifier install` and say so.
 - Reply with the verified web app link `connect` printed last (never an unverified one).

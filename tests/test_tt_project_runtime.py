@@ -36729,9 +36729,11 @@ def test_connect_repairs_or_names_what_is_broken_instead_of_a_dead_link(env, mon
 
 def _remote(env, monkeypatch, tmp_path, connect_out):
     """A project on another machine: ssh is faked, the kept tunnel is installed for real (into a
-    test home) with systemctl faked, and the web app it would reach is served here."""
-    from ttp import cli, tunnel, web
+    test home) with systemctl faked, and the web app it would reach is served here. The user said
+    yes to local view tunnels (test_local_view_tunnels_ask_once covers the ask)."""
+    from ttp import cli, consent, tunnel, web
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    consent.record("tunnel", "yes")
     monkeypatch.setattr(tunnel.sys, "platform", "linux")
     calls = []
     monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
@@ -36745,6 +36747,97 @@ def _remote(env, monkeypatch, tmp_path, connect_out):
     monkeypatch.setattr(cli, "_ssh", lambda e, argv, capture=False: ssh.append(argv) or subprocess.CompletedProcess(
         argv, 0, out, ""))
     return p, port, calls, ssh
+
+
+def test_desktop_notifier_install_asks_once_and_the_answer_is_kept(env, monkeypatch, tmp_path, capsys):
+    """Installing the desktop notifier asks the user once: unasked, an agent's install is refused and
+    says to ask; a yes installs and is never asked again; a no is respected and never re-asked. An
+    installed notifier counts as a yes; the user running it at a terminal says yes by doing it."""
+    from ttp import cli, consent, notifier
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    installs = []
+    monkeypatch.setattr(notifier, "install", lambda: installs.append(1) or "installed (test)")
+    monkeypatch.setattr(consent, "interactive", lambda: False)   # an agent's shell, not the user's terminal
+
+    def install():
+        with pytest.raises(SystemExit) as e:
+            cli.main(["notifier", "install"])
+            raise SystemExit(0)
+        return e.value.code, capsys.readouterr()
+
+    assert consent.answer("notifier") == "ask"
+    rc, out = install()
+    assert rc == consent.NEEDS_ANSWER and installs == [] and "ask the user" in out.err, out
+    assert "ttp consent notifier yes" in out.err
+    cli.main(["consent", "notifier", "yes"])
+    assert (consent.path().parent == tmp_path / "home") and consent.answer("notifier") == "yes"
+    for _ in range(2):
+        rc, out = install()
+        assert rc == 0 and "installed (test)" in out.out
+    assert installs == [1, 1]
+    cli.main(["consent", "notifier", "no"])
+    rc, out = install()
+    assert rc == consent.NEEDS_ANSWER and installs == [1, 1] and "do not ask again" in out.err
+    assert consent.answer("notifier") == "no"
+    cli.main(["consent"])
+    assert "notifier: no" in capsys.readouterr().out
+    # Already installed: a yes, with no ask. At a terminal: running it is the user's yes.
+    consent.path().unlink()
+    unit = tmp_path / "userhome" / ".config" / "systemd" / "user" / "tt-project-notifier.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    assert consent.answer("notifier") == "yes"
+    consent.path().unlink()
+    unit.unlink()
+    monkeypatch.setattr(consent, "interactive", lambda: True)
+    rc, out = install()
+    assert rc == 0 and consent.answer("notifier") == "yes"
+
+
+def test_local_view_tunnels_ask_once_per_user(env, monkeypatch, tmp_path, capsys):
+    """The first local view tunnel a user opens asks once (stored under ~/.tt-project, not per
+    project): a yes is remembered, a no respected, and a user with a kept tunnel already said yes."""
+    from ttp import cli, consent, project, tunnel, weblink
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(tunnel.sys, "platform", "linux")
+    monkeypatch.setattr(consent, "interactive", lambda: False)
+    kept = []
+    monkeypatch.setattr(tunnel, "keep", lambda *a, **k: kept.append(a) or pytest.fail("no tunnel before a yes"))
+    entry = {"host": "box", "dir": "/srv/p"}
+    assert consent.path() == project.HOME_DIR / "consent.json"
+    line, rc = weblink.remote("demo", entry, 18700, "tok")
+    assert rc == weblink.UNVERIFIED and line.startswith("web app: not opened") and kept == [], line
+    assert "ask the user" in line and "ttp consent tunnel yes" in line and "#token=" not in line
+    assert consent.answer("tunnel") == "ask"   # refusing records nothing: still to ask
+    # `ttp web NAME --tunnel` (the plain forward) asks the same way.
+    monkeypatch.setattr(cli, "resolve", lambda name: (None, entry))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 0, "web app: http://127.0.0.1:18700/#token=abc123\n", ""))
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: pytest.fail("no forward before a yes"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["web", "demo", "--tunnel"])
+    out = capsys.readouterr().out
+    assert e.value.code == consent.NEEDS_ANSWER and "tunnel not opened" in out and "ask the user" in out, out
+    # No: respected, never re-asked.
+    consent.record("tunnel", "no")
+    line, rc = weblink.remote("demo", entry, 18700, "tok")
+    assert rc == weblink.UNVERIFIED and "do not ask again" in line and kept == []
+    # Yes: remembered for every later open, any project.
+    consent.record("tunnel", "yes")
+    monkeypatch.setattr(tunnel, "keep", lambda *a, **k: kept.append(a[0]) or (18800, "kept"))
+    monkeypatch.setattr(weblink, "verify", lambda url, name: ("", ""))
+    for name in ("demo", "other"):
+        line, rc = weblink.remote(name, entry, 18700, "tok")
+        assert rc == 0 and "#token=tok" in line, line
+    assert kept == ["demo", "other"] and consent.answer("tunnel") == "yes"
+    # A user who already has a kept tunnel service counts as a yes and is not asked.
+    consent.path().unlink()
+    unit = tunnel.service_file("old-project", "linux")
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("[Service]\nExecStart=ssh -N -L 127.0.0.1:1:127.0.0.1:2 box\n")
+    line, rc = weblink.remote("demo", entry, 18700, "tok")
+    assert rc == 0 and consent.answer("tunnel") == "yes", line
+    assert "kept tunnel" in json.loads(consent.path().read_text())["tunnel"]["how"]
 
 
 @needs_sockets

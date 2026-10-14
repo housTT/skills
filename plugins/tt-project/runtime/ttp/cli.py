@@ -1133,7 +1133,7 @@ def cmd_spend_today(a) -> None:
 
 
 def cmd_web(a) -> None:
-    from . import tunnel, weblink
+    from . import consent, tunnel, weblink
     if a.unkeep:
         print(tunnel.unkeep(a.name))
         return
@@ -1173,6 +1173,10 @@ def cmd_web(a) -> None:
     else:
         local = free_port(remote_port + 100)
         cmd = tunnel.ssh_argv(host, local, remote_port, ssh="ssh")
+        why = a.tunnel and consent.gate("tunnel", f"ttp web {a.name} --tunnel")
+        if why:
+            print(f"tunnel not opened: {why}\n  {' '.join(cmd)}")
+            sys.exit(consent.NEEDS_ANSWER)
         if a.tunnel:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
@@ -4453,9 +4457,25 @@ def cmd_alerts(a) -> None:
                 print(f"#{r['id']} [{r['severity']}] {r['text']}")
 
 
+def cmd_consent(a) -> None:
+    from . import consent
+    if a.answer:
+        if not a.topic:
+            die("name the topic: `ttp consent notifier|tunnel yes|no`")
+        consent.record(a.topic, a.answer)
+        print(f"recorded {a.topic}: {a.answer} (never asked again; {consent.path()})")
+        return
+    for t in [a.topic] if a.topic else list(consent.TOPICS):
+        got = consent.answer(t)
+        print(f"{t}: {got}" + (f" (ask the user once: {consent.TOPICS[t]})" if got == "ask" else ""))
+
+
 def cmd_notifier(a) -> None:
-    from . import notifier
+    from . import consent, notifier
     if a.action == "install":
+        why = consent.gate("notifier", "ttp notifier install")
+        if why:
+            die(f"notifier not installed: {why}", consent.NEEDS_ANSWER)
         print(notifier.install())
     elif a.action == "run":
         sys.exit(notifier.main())
@@ -4562,8 +4582,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name")
-    s.add_argument("--tunnel", action="store_true", help="open the local forward now (no need to ask: it only "
-                   "lets this machine view the web app)")
+    s.add_argument("--tunnel", action="store_true", help="open the local forward now (it only lets this machine "
+                   "view the web app; asked once per user: `ttp consent tunnel`)")
     s.add_argument("--keep", action="store_true", help="with --tunnel: keep it up as a user service across drops "
                    "and reboots (adopts or replaces an existing com.tt-project.tunnel.<name> service)")
     s.add_argument("--unkeep", action="store_true", help="stop and remove the kept tunnel")
@@ -5059,6 +5079,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the keyed alert of this message id: it closes, or moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)
+
+    s = sub.add_parser("consent", help="the user's one answer per question asked once (desktop notifier, local "
+                       "view tunnels): show it, or record it")
+    s.add_argument("topic", nargs="?", choices=["notifier", "tunnel"])
+    s.add_argument("answer", nargs="?", choices=["yes", "no"])
+    s.set_defaults(fn=cmd_consent)
 
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")
     s.add_argument("action", choices=["install", "run", "test"])

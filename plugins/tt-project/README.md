@@ -882,13 +882,15 @@ reaches the coordinator once as a normal observation, not once per deploy.
 
 Alerts go to every attached chat, to the web app (one-click browser notifications), and, if you
 install it, to a desktop notifier on your workstation that covers all your projects
-(`ttp notifier install`). Only decisions, reviews, merges, funds and outages notify by default.
+(`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
 Workers can read Slack links you paste, using your Slack connector if you have one.
 
 ## Security
 
 - The web app listens on localhost with a per-project token. From another machine,
-  `ttp web <name> --tunnel --keep` opens and keeps an SSH local forward to it.
+  `ttp web <name> --tunnel --keep` opens and keeps an SSH local forward to it. The first one is
+  asked once per user (`ttp consent tunnel yes|no`, kept in `~/.tt-project/consent.json`); a kept
+  tunnel already installed counts as a yes.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - Text from logs, issues and chats is treated as data, not instructions.

@@ -2,8 +2,10 @@
 
 - Commands for a remote project forward over ssh automatically.
 - The web app binds to localhost on its machine. Reach it with a local forward.
-- A local forward to view a project's web app: open it without asking and keep it up. Tell the
-  user it is open and give the link.
+- A local forward to view a project's web app: the user's first one is asked once, per user
+  (`ttp consent tunnel` says `ask`; record `ttp consent tunnel yes|no`, kept in ~/.tt-project). A
+  kept tunnel already installed counts as a yes. After a yes, open it and keep it up without asking,
+  tell the user it is open and give the link. After a no, never re-ask; give the command instead.
 - Ask the user before any tunnel that exposes their machine to others: a reverse forward into
   the laptop, or a port bound on anything but localhost. Say what it connects and why.
 

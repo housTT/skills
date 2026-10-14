@@ -61,9 +61,10 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 ## Web app and notifications
 
 - `ttp web <name>` prints the checked link. Remote project → `ttp web <name> --tunnel --keep` opens a
-  kept local forward without asking (`remote.md`).
+  kept local forward; the user's first one is asked once (`ttp consent tunnel`, `remote.md`).
 - The web app has a one-click "Turn on notifications" button.
-- On the user's own workstation, run `ttp notifier install` once and say so (desktop alerts).
+- On the user's own workstation, the desktop notifier is asked once: `ttp consent notifier` says
+  `ask`: ask, record `ttp consent notifier yes|no`, on a yes run `ttp notifier install`. Never re-ask.
 - Details and optional Slack: `notifications.md`.
 
 ## Operating
@@ -92,6 +93,6 @@ More: `operate.md`.
 | "I'll just do this quick task myself" | The project owns the work. Relay it. |
 | "I'll poll until the answer comes" | The listener wakes you. End your turn. |
 | "I'll paste the key here" | Secrets go through `ttp secret`, typed by the user. |
-| "Shall I open a tunnel to the web app?" | Local forwards to view it: open and keep them, then say so. Ask only before a tunnel that exposes the user's machine. |
+| "Shall I open a tunnel to the web app?" | A local forward to view it is asked once per user (`ttp consent tunnel`); after a yes or a kept tunnel, open and keep them, then say so. A no is never re-asked. A tunnel that exposes the user's machine is asked each time. |
 | "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |
 | "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |
