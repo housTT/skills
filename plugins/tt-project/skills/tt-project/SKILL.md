@@ -75,6 +75,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
 | reboot the project's own host | `ttp drain <name> --wait 240` (exit 1: repeat up to 3 times; still busy: `ttp resume <name>`, hand off `waiting` on a time-based `retry_when`), then `ttp pause <name> --until-reboot`, then reboot (see tt-project-harness) |
 | stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..." --until 2d` (or `--end-when "<probe>"`) / `ttp resume <name> --resource <r>` |
+| get or set up a device box, work on it over ssh | the `tt-project:setup-box` skill |
 | record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | read a schedule | `ttp schedules <name> show <schedule>` (or `list`): read-only, writes nothing |

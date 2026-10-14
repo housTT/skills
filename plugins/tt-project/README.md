@@ -27,11 +27,15 @@ only requirements; the runtime uses the standard library.
 
 To call the skill directly instead of just asking for a project:
 
-| Host | Main skill | Harness skill |
-|---|---|---|
-| Claude Code | `/tt-project` | `/tt-project:tt-project-harness` |
-| Codex | `$tt-project:tt-project` | `$tt-project:tt-project-harness` |
-| Cursor | `/tt-project` | `/tt-project-harness` |
+| Host | Main skill | Harness skill | Device box skill |
+|---|---|---|---|
+| Claude Code | `/tt-project` | `/tt-project:tt-project-harness` | `/tt-project:setup-box` |
+| Codex | `$tt-project:tt-project` | `$tt-project:tt-project-harness` | `$tt-project:setup-box` |
+| Cursor | `/tt-project` | `/tt-project-harness` | `/setup-box` |
+
+The device box skill gets a box (bare metal, a reservation or a Slurm job) and has agents edit,
+build and run in their own checkout on it over ssh. Site values stay in a local
+`~/.tt-project/boxes.json`, never in a repository.
 
 Claude Code always shows a plugin's skills under the plugin's name, so its own entry for the main
 skill is `/tt-project:tt-project`. `ttp setup` adds a small personal skill,

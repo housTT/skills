@@ -59,13 +59,20 @@ def load_leak_patterns(path: pathlib.Path) -> list:
 PUBLISHED_REFS = ("smartonTT/tt-project-dogfood-1", "smartonTT/tt-project")
 
 
-def assert_no_leaks(patterns: list, files) -> None:
+def published_plugin_names() -> set:
+    """Plugins this marketplace publishes. Their names are public even when a local project
+    shares one, so a local pattern matching exactly such a name is not a leak."""
+    data = json.loads((PLUGIN.parents[1] / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    return {p["name"].lower() for p in data["plugins"]}
+
+
+def assert_no_leaks(patterns: list, files, allow=frozenset()) -> None:
     for f in files:
         text = f.read_text(encoding="utf-8", errors="replace")
         for ref in PUBLISHED_REFS:
             text = text.replace(ref, "")
         for pattern in patterns:
-            m = pattern.search(text)
+            m = next((m for m in pattern.finditer(text) if m.group(0).lower() not in allow), None)
             assert not m, f"{f}: contains {m.group(0)!r}"
 
 
@@ -92,11 +99,12 @@ def test_manifests_agree():
 
 def test_skills_are_discoverable_and_self_contained():
     skills = sorted(SKILLS.glob("*/SKILL.md"))
-    assert {p.parent.name for p in skills} == {"tt-project", "tt-project-harness"}
+    assert {p.parent.name for p in skills} == {"tt-project", "tt-project-harness", "setup-box"}
     for path in skills:
         fm = frontmatter(path)
         assert fm["name"] == path.parent.name
-        assert fm["name"].startswith("tt-"), f"{path}: skill names start with tt-"
+        # The one exception: setup-box, shown as tt-project:setup-box (charter Policies, user msg #548).
+        assert fm["name"].startswith("tt-") or fm["name"] == "setup-box", f"{path}: skill names start with tt-"
         assert len(fm["description"]) > 40
     for md in SKILLS.rglob("*.md"):
         text = md.read_text(encoding="utf-8")
@@ -185,7 +193,8 @@ def test_no_local_leak_patterns_in_plugin():
         pytest.skip(f"setup-specific leak check skipped: no local pattern file at {path} "
                     f"(set {LEAK_PATTERNS_ENV} or create it)")
     patterns = load_leak_patterns(path)
-    assert_no_leaks(patterns, plugin_text_files() + sorted(TESTS.glob("test_tt_project_*.py")))
+    assert_no_leaks(patterns, plugin_text_files() + sorted(TESTS.glob("test_tt_project_*.py")),
+                    allow=published_plugin_names())
 
 
 def test_local_leak_patterns_are_found_and_checked(tmp_path, monkeypatch):
@@ -214,6 +223,15 @@ def test_local_leak_patterns_are_found_and_checked(tmp_path, monkeypatch):
     (tree / "docs" / "notes.md").write_text(f"install from {owner}/elsewhere\n")
     with pytest.raises(AssertionError, match="contains"):
         assert_no_leaks(owner_patterns, plugin_text_files(tree))
+
+    # A published plugin's exact name is allowed; the same pattern still catches anything longer.
+    (tree / "docs" / "notes.md").write_text("see the tt-buddy plugin\n")
+    buddy = [re.compile(r"(?i)tt-buddy\w*")]
+    assert "tt-buddy" in published_plugin_names()
+    assert_no_leaks(buddy, plugin_text_files(tree), allow=published_plugin_names())
+    (tree / "docs" / "notes.md").write_text("see the tt-buddy plugin, not tt-buddyhost\n")
+    with pytest.raises(AssertionError, match="tt-buddyhost"):
+        assert_no_leaks(buddy, plugin_text_files(tree), allow=published_plugin_names())
 
     patterns_file.write_text("fine\n(unclosed\n")
     with pytest.raises(AssertionError, match=r"patterns\.txt:2: malformed leak pattern"):
@@ -974,3 +992,107 @@ def test_worker_prompt_detached_driver_retries_transient_faults():
     assert "Retry transient faults" in text
     assert "bounded backoff" in text
     assert "Prefer `on_pass_cmd` to a light-wake `next_step`" in text
+
+
+BOX_PY = SKILLS / "setup-box" / "scripts" / "box.py"
+
+
+def _site_example():
+    """The schema example in site.md, which must itself pass `site check`."""
+    text = (SKILLS / "setup-box" / "site.md").read_text(encoding="utf-8")
+    return json.loads(re.search(r"```json\n(.*?)```", text, re.S).group(1))
+
+
+def _box_check(tmp_path, site):
+    import subprocess
+    path = tmp_path / "boxes.json"
+    path.write_text(site if isinstance(site, str) else json.dumps(site), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "TTP_BOXES_FILE"}
+    return subprocess.run([sys.executable, str(BOX_PY), "--site", str(path), "site", "check"],
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+def test_setup_box_site_check_accepts_a_valid_file(tmp_path):
+    site = _site_example()
+    site["boxes"]["<bare-alias>"] = {"route": "bare", "workdir_root": "/<workdir>"}
+    site["boxes"]["<ird-alias>"] = {"route": "ird", "workdir_root": "~/<workdir>",
+                                    "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>"]}}
+    r = _box_check(tmp_path, site)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ok <box-alias> route=slurm" in r.stdout and "error" not in r.stdout
+
+
+@pytest.mark.parametrize("mutate, message", [
+    (lambda s: s["boxes"]["<box-alias>"].update(route="cloud"), "route must be one of"),
+    (lambda s: s["boxes"]["<box-alias>"].pop("workdir_root"), "workdir_root must be an absolute path"),
+    (lambda s: s["boxes"]["<box-alias>"]["slurm"].pop("login"), "slurm.login"),
+    (lambda s: s["boxes"]["<box-alias>"]["slurm"]["partitions"][0].update(chips=0), "chips must be"),
+    (lambda s: s["boxes"]["<box-alias>"]["slurm"].update(partitions=[]), "non-empty list"),
+    (lambda s: s["boxes"]["<box-alias>"].update(route="ird"), "route ird needs an ird object"),
+    (lambda s: s["boxes"]["<box-alias>"].update(excluded_nodes="<node>"), "excluded_nodes must be a list"),
+    (lambda s: s.update(boxes={}), "boxes must be a non-empty object"),
+    (lambda s: s.pop("version"), "version must be 1"),
+])
+def test_setup_box_site_check_refuses_a_malformed_file(tmp_path, mutate, message):
+    site = _site_example()
+    mutate(site)
+    r = _box_check(tmp_path, site)
+    assert r.returncode == 1 and message in r.stdout, r.stdout + r.stderr
+
+
+def test_setup_box_site_check_refuses_missing_or_broken_json(tmp_path):
+    r = _box_check(tmp_path, "{not json")
+    assert r.returncode == 1 and "error:" in r.stdout
+    import subprocess
+    r = subprocess.run([sys.executable, str(BOX_PY), "--site", str(tmp_path / "none.json"), "site", "check"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1 and "no site file" in r.stdout
+
+
+def test_setup_box_extensions_and_ssh_run(tmp_path, monkeypatch):
+    """Route tasks extend box.py through box_<name>.py files; ssh_run is non-interactive."""
+    import importlib.util
+    import shutil
+    import subprocess
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copy(BOX_PY, scripts / "box.py")
+    (scripts / "box_demo.py").write_text(
+        "KNOWN_KEYS = {'demo'}\n"
+        "CHECKS = {'slurm': lambda alias, e: [] if e.get('demo') else [alias + ': demo missing']}\n"
+        "def register(sub):\n"
+        "    sub.add_parser('demo').set_defaults(func=lambda args: print('demo ran') or 0)\n")
+    site = _site_example()
+    path = tmp_path / "boxes.json"
+    path.write_text(json.dumps(site))
+    run = lambda *a: subprocess.run([sys.executable, str(scripts / "box.py"), "--site", str(path), *a],
+                                    capture_output=True, text=True, timeout=30)
+    r = run("site", "check")
+    assert r.returncode == 1 and "demo missing" in r.stdout
+    site["boxes"]["<box-alias>"]["demo"] = True
+    path.write_text(json.dumps(site))
+    r = run("site", "check")
+    assert r.returncode == 0 and "warning" not in r.stdout, r.stdout
+    assert run("demo").stdout.strip() == "demo ran"
+
+    spec = importlib.util.spec_from_file_location("box_under_test", BOX_PY)
+    box = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(box)
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(box.subprocess, "run", fake_run)
+    box.ssh_run("<box-alias>", ["echo", "a b"])
+    assert seen["argv"][:5] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+    assert seen["argv"][-2:] == ["<box-alias>", "echo 'a b'"]
+
+
+def test_setup_box_links_tt_buddy_instead_of_copying():
+    agents = (SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8")
+    for ref in ("recipes/developer-setup.md", "recipes/workspace.md", "recipes/tt-metal/build.md",
+                "recipes/tt-metal/env.md", "recipes/tt-metal/test.md", "tt-buddy:run", "skills/run/mcp.md"):
+        assert ref in agents, ref
+    for page in ("ird", "slurm", "exabox", "bare-metal", "migrate-off-sync"):
+        assert (SKILLS / "setup-box" / f"{page}.md").is_file(), page
