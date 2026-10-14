@@ -1,0 +1,473 @@
+"""setup-box IRD route: `box.py ird list|status|reserve|extend|release|reboot` (see ird.md).
+
+Every call is `ssh -n -o BatchMode=yes <ird.mgmt> ird ...`: ird runs only on the management host.
+Acts only on reservations whose user column is the caller. A claim file per reservation (project,
+task, pid, heartbeat) lets `release --stale` free only this project's abandoned reservations.
+State lives under $TTP_IRD_DIR (default ~/.tt-project/ird): claims/ and the ssh include file.
+Exit codes: 0 ok, 1 refused or failed, 255 the management host is unreachable.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+import box
+
+UNREACHABLE = 255
+BAD_STATES = ("drain", "down", "fail", "maint", "reboot", "unknown")
+FREE_STATES = ("free", "idle", "mixed")
+DEFAULT_TTL_S = 3600
+BEGIN = "# >>> tt-project ird {id}"
+END = "# <<< tt-project ird {id}"
+
+
+class IrdError(Exception):
+    def __init__(self, msg: str, code: int = 1):
+        super().__init__(msg)
+        self.code = code
+
+
+def state_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("TTP_IRD_DIR") or "~/.tt-project/ird").expanduser()
+
+
+def ssh_include() -> pathlib.Path:
+    return state_dir() / "ssh-hosts"
+
+
+# --- reachability -------------------------------------------------------------------------------
+
+def _ssh_g(alias: str) -> Dict[str, str]:
+    try:
+        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    cfg: Dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        cfg.setdefault(k.lower(), v.strip())
+    return cfg
+
+
+def probe(alias: str, depth: int = 0) -> None:
+    """Fail fast (IrdError 255) when `alias`'s first ssh hop has no DNS name or no route."""
+    cfg = _ssh_g(alias)
+    if not cfg or cfg.get("proxycommand", "none") != "none" or depth > 3:
+        return  # ssh decides; a proxy command cannot be probed from here
+    jump = cfg.get("proxyjump", "none")
+    if jump != "none":
+        hop = jump.split(",")[0].rsplit("@", 1)[-1]
+        name, _, port = hop.partition(":")
+        if port or "." in name:
+            return _probe_tcp(alias, name, int(port or 22))
+        return probe(name, depth + 1)
+    _probe_tcp(alias, cfg.get("hostname") or alias, int(cfg.get("port") or 22))
+
+
+def _probe_tcp(alias: str, host: str, port: int) -> None:
+    hint = ("IRD is reachable only from networks that can reach the IRD service "
+            "(e.g. the corporate VPN); run this from such a host")
+    try:
+        addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise IrdError(f"unreachable: {alias}: no DNS name for its ssh host. {hint}", UNREACHABLE)
+    for fam, typ, proto, _, addr in addrs:
+        try:
+            with socket.socket(fam, typ, proto) as s:
+                s.settimeout(5)
+                s.connect(addr)
+                return
+        except OSError:
+            continue
+    raise IrdError(f"unreachable: {alias}: no route to its ssh port {port}. {hint}", UNREACHABLE)
+
+
+# --- ird over ssh -------------------------------------------------------------------------------
+
+class Ctx:
+    def __init__(self, args):
+        try:
+            self.entry = box.box_entry(box.load_site(args.site), args.alias)
+        except box.SiteError as e:
+            raise IrdError(str(e))
+        if self.entry.get("route") != "ird" or not isinstance(self.entry.get("ird"), dict):
+            raise IrdError(f"{args.alias} is not an ird box (route {self.entry.get('route')!r})")
+        self.alias = args.alias
+        self.cfg = self.entry["ird"]
+        self.mgmt = self.cfg.get("mgmt", "")
+        self.pools = self.cfg.get("pools") or []
+        self.avoid = set(self.entry.get("excluded_nodes") or []) | set(self.entry.get("demo_nodes") or [])
+        self.project = getattr(args, "project", None) or os.environ.get("TTP_PROJECT", "")
+        self.task = getattr(args, "task", None) or os.environ.get("TTP_TASK", "")
+        self._user = getattr(args, "user", None) or self.cfg.get("user")
+        probe(self.mgmt)
+
+    def run(self, *argv: str, timeout: float = 120) -> subprocess.CompletedProcess:
+        r = box.ssh_run(self.mgmt, list(argv), timeout=timeout, opts=("-n",))
+        if r.returncode == 255:
+            raise IrdError(f"unreachable: ssh to {self.mgmt} failed: {r.stderr.strip()[-300:]}. "
+                           "IRD is reachable only from networks that can reach the IRD service",
+                           UNREACHABLE)
+        return r
+
+    def call(self, *argv: str, timeout: float = 120) -> subprocess.CompletedProcess:
+        return self.run("ird", *argv, timeout=timeout)
+
+    @property
+    def user(self) -> str:
+        if not self._user:
+            r = self.run("id", "-un", timeout=30)
+            self._user = r.stdout.strip()
+            if r.returncode or not self._user:
+                raise IrdError(f"cannot tell your user on {self.mgmt}; set ird.user in the site file")
+        return self._user
+
+    def reservations(self) -> List[dict]:
+        """All rows of `ird list --noheader`: id, user, machine, port."""
+        r = self.call("list", "--noheader")
+        if r.returncode:
+            raise IrdError(f"ird list failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+        rows = []
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) < 5 or not f[0].isdigit():
+                continue  # header or log lines
+            port = f[10] if len(f) > 10 and f[10].isdigit() else ""
+            rows.append({"id": f[0], "user": f[1], "machine": f[4], "port": port})
+        return rows
+
+    def mine(self) -> Dict[str, dict]:
+        return {r["id"]: r for r in self.reservations() if r["user"] == self.user}
+
+    def machines(self) -> List[dict]:
+        r = self.call("list-machines")
+        if r.returncode:
+            raise IrdError(f"ird list-machines failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+        out = []
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) < 5 or f[0].isupper():
+                continue  # header or log lines
+            out.append({"machine": f[0], "state": f[4], "why": classify(f[0], f[4], line, self.avoid)})
+        return out
+
+
+def classify(machine: str, state: str, line: str, avoid=()) -> str:
+    """'' when the machine can be reserved now, else why not."""
+    s = state.lower().strip("*~#!%$@+-")
+    if machine in avoid:
+        return "excluded in the site file"
+    if "reboot asap" in line.lower():
+        return "reboot pending (Reboot ASAP)"
+    if s.startswith(BAD_STATES):
+        return f"state {state}"
+    if not s.startswith(FREE_STATES):
+        return f"busy ({state})"
+    return ""
+
+
+# --- claims and the ssh include -----------------------------------------------------------------
+
+def claim_path(alias: str, rid: str) -> pathlib.Path:
+    return state_dir() / "claims" / f"{alias}.{rid}.json"
+
+
+def read_claim(alias: str, rid: str) -> Optional[dict]:
+    try:
+        c = json.loads(claim_path(alias, rid).read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+
+
+def write_claim(alias: str, rid: str, claim: dict) -> None:
+    p = claim_path(alias, rid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(claim, indent=1) + "\n", encoding="utf-8")
+    tmp.replace(p)
+
+
+def owner_pid(arg: Optional[int]) -> int:
+    if arg:
+        return arg
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir:
+        try:
+            return int(pathlib.Path(run_dir, "runner.pid").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+    return os.getppid()
+
+
+def claim_live(c: dict, ttl: float) -> bool:
+    """Fresh heartbeat, or its owner pid still runs on this host."""
+    try:
+        if time.time() - float(c.get("heartbeat", 0)) <= ttl:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if c.get("host") != socket.gethostname():
+        return False
+    try:
+        os.kill(int(c.get("pid") or 0), 0)
+        return int(c.get("pid") or 0) > 0
+    except (OSError, ValueError):
+        return False
+
+
+def write_ssh_block(rid: str, machine: str, port: str, mgmt: str) -> None:
+    lines = [BEGIN.format(id=rid), f"Host {machine}", f"    HostName {machine}"]
+    if port:
+        lines.append(f"    Port {port}")
+    lines += [f"    ProxyJump {mgmt}", END.format(id=rid)]
+    _edit_include(rid, "\n".join(lines) + "\n")
+
+
+def drop_ssh_block(rid: str) -> None:
+    _edit_include(rid, "")
+
+
+def _edit_include(rid: str, block: str) -> None:
+    p = ssh_include()
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    pat = re.compile(re.escape(BEGIN.format(id=rid)) + r"\n.*?" + re.escape(END.format(id=rid)) + r"\n?", re.S)
+    text = pat.sub("", text) + block
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(p)
+
+
+def include_hint() -> str:
+    cfg = pathlib.Path("~/.ssh/config").expanduser()
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if str(ssh_include()) in text or "tt-project/ird/ssh-hosts" in text:
+        return ""
+    return (f"note: ~/.ssh/config does not include {ssh_include()}; ask the user to add "
+            f"`Include {ssh_include()}` at its top")
+
+
+# --- subcommands --------------------------------------------------------------------------------
+
+def _gate(ctx: Ctx, rid: str, ttl: float, verb: str) -> Tuple[dict, Optional[dict]]:
+    """The caller's own reservation `rid` and its claim; IrdError when we may not touch it."""
+    rows = {r["id"]: r for r in ctx.reservations()}
+    row = rows.get(rid)
+    if row is None:
+        raise IrdError(f"no reservation {rid} (already released?)")
+    if row["user"] != ctx.user:
+        raise IrdError(f"refused: reservation {rid} belongs to {row['user']}, not you; never {verb} it")
+    c = read_claim(ctx.alias, rid)
+    if c is None:
+        raise IrdError(f"refused: reservation {rid} has no claim, so no task of this project made it; "
+                       f"{verb} it by hand if it is yours to end")
+    if c.get("project") != ctx.project:
+        raise IrdError(f"refused: reservation {rid} is claimed by project {c.get('project')!r}")
+    if c.get("task") != ctx.task and claim_live(c, ttl):
+        raise IrdError(f"refused: reservation {rid} has a live claim of task {c.get('task')!r}")
+    return row, c
+
+
+def cmd_list(ctx: Ctx, args) -> int:
+    for m in ctx.machines():
+        if not m["why"]:
+            print(f"free {m['machine']} {m['state']}")
+        elif args.all:
+            print(f"skip {m['machine']} {m['why']}")
+    return 0
+
+
+def cmd_status(ctx: Ctx, args) -> int:
+    mine = ctx.mine()
+    for rid, r in sorted(mine.items(), key=lambda kv: int(kv[0])):
+        c = read_claim(ctx.alias, rid)
+        if c is None:
+            who = "no claim"
+        else:
+            who = (f"claim project={c.get('project')!r} task={c.get('task')!r} "
+                   f"{'live' if claim_live(c, args.ttl) else 'stale'} expires={c.get('expires', '?')}")
+        print(f"{rid} {r['machine']} port={r['port'] or '?'} {who}")
+    if not mine:
+        print(f"no reservations of {ctx.user}")
+    return 0
+
+
+TIMEOUT_RE = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
+
+
+def cmd_reserve(ctx: Ctx, args) -> int:
+    m = TIMEOUT_RE.match(args.timeout)
+    if not m:
+        raise IrdError("--timeout must be hh:mm:ss: reserve only for the run")
+    pool = args.pool or (ctx.pools[0] if ctx.pools else "")
+    if pool not in ctx.pools:
+        raise IrdError(f"pool {pool!r} is not in ird.pools of the site file")
+    if args.machine:
+        found = [x for x in ctx.machines() if x["machine"] == args.machine]
+        if not found:
+            raise IrdError(f"no machine {args.machine} in ird list-machines")
+        if found[0]["why"] and not found[0]["why"].startswith("busy"):
+            raise IrdError(f"refused: {args.machine}: {found[0]['why']}")
+    before = set(ctx.mine())
+    argv = ["reserve", "--cluster", pool, "--timeout", args.timeout]
+    if args.machine:
+        argv += ["--machine", args.machine]
+    if args.ssh_port:
+        argv += ["--ssh-port", str(args.ssh_port)]
+    argv += ["--no-shell", args.arch]  # every flag before the arch positional
+    r = ctx.call(*argv, timeout=args.wait)
+    new = {k: v for k, v in ctx.mine().items() if k not in before}
+    if not new:
+        raise IrdError(f"ird reserve made no reservation (rc {r.returncode}): "
+                       f"{(r.stdout + r.stderr).strip()[-400:]}")
+    rid, row = sorted(new.items(), key=lambda kv: int(kv[0]))[-1]
+    h, mi, s = map(int, m.groups())
+    now = dt.datetime.now().astimezone()
+    expires = (now + dt.timedelta(hours=h, minutes=mi, seconds=s)).isoformat(timespec="minutes")
+    write_claim(ctx.alias, rid, {
+        "id": rid, "box": ctx.alias, "mgmt": ctx.mgmt, "user": ctx.user, "machine": row["machine"],
+        "port": row["port"], "pool": pool, "arch": args.arch, "project": ctx.project,
+        "task": ctx.task, "run_id": os.environ.get("TTP_RUN_ID", ""), "host": socket.gethostname(),
+        "pid": owner_pid(args.pid), "reserved_at": now.isoformat(timespec="seconds"),
+        "heartbeat": time.time(), "expires": expires})
+    write_ssh_block(rid, row["machine"], row["port"], ctx.mgmt)
+    print(f"reserved {rid} machine={row['machine']} port={row['port'] or '?'} expires={expires}")
+    hint = include_hint()
+    if hint:
+        print(hint)
+    return 0
+
+
+def cmd_extend(ctx: Ctx, args) -> int:
+    _, c = _gate(ctx, args.id, args.ttl, "extend")
+    r = ctx.call("change-timeout", args.id, str(args.minutes))
+    if r.returncode:
+        raise IrdError(f"ird change-timeout failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+    c.update(task=ctx.task or c.get("task", ""), heartbeat=time.time(),
+             expires=(dt.datetime.now().astimezone() + dt.timedelta(minutes=args.minutes)).isoformat(timespec="minutes"))
+    write_claim(ctx.alias, args.id, c)
+    print(f"extended {args.id} by {args.minutes} min, expires~{c['expires']}")
+    return 0
+
+
+def _release(ctx: Ctx, rid: str) -> None:
+    r = ctx.call("release", rid)
+    if r.returncode and rid in ctx.mine():
+        raise IrdError(f"ird release {rid} failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+    claim_path(ctx.alias, rid).unlink(missing_ok=True)
+    drop_ssh_block(rid)
+
+
+def cmd_release(ctx: Ctx, args) -> int:
+    if not args.stale:
+        if not args.id:
+            raise IrdError("give a reservation id, or --stale")
+        _gate(ctx, args.id, args.ttl, "release")
+        if args.dry_run:
+            print(f"would release {args.id}")
+        else:
+            _release(ctx, args.id)
+            print(f"released {args.id}")
+        return 0
+    # Port of reap.sh: only the caller's own reservations with a stale claim of this project.
+    for rid, row in sorted(ctx.mine().items(), key=lambda kv: int(kv[0])):
+        c = read_claim(ctx.alias, rid)
+        if c is None:
+            print(f"skip {rid} {row['machine']}: no claim (not made by this project)")
+        elif c.get("project") != ctx.project:
+            print(f"skip {rid} {row['machine']}: claimed by project {c.get('project')!r}")
+        elif claim_live(c, args.ttl):
+            print(f"keep {rid} {row['machine']}: live claim of task {c.get('task')!r}")
+        elif args.dry_run:
+            print(f"would release {rid} {row['machine']}: stale claim of task {c.get('task')!r}")
+        else:
+            _release(ctx, rid)
+            print(f"released {rid} {row['machine']}: stale claim of task {c.get('task')!r}")
+    # Claims whose reservation is gone (expired) are dropped, with their ssh blocks.
+    if not args.dry_run:
+        live_ids = set(ctx.mine())
+        for p in (state_dir() / "claims").glob(f"{ctx.alias}.*.json"):
+            rid = p.name[len(ctx.alias) + 1:-len(".json")]
+            c = read_claim(ctx.alias, rid) or {}
+            if rid not in live_ids and c.get("project") == ctx.project:
+                p.unlink(missing_ok=True)
+                drop_ssh_block(rid)
+    return 0
+
+
+def cmd_reboot(ctx: Ctx, args) -> int:
+    row, c = _gate(ctx, args.id, args.ttl, "reboot")
+    r = ctx.call("reboot", args.id)
+    if r.returncode:
+        raise IrdError(f"ird reboot failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+    _release(ctx, args.id)  # the reboot is drain-gated: it fires only once the reservation ends
+    again = ["box.py", "ird", "reserve", ctx.alias, "--arch", c.get("arch") or "<arch>",
+             "--machine", row["machine"], "--timeout", "<hh:mm:ss>"]
+    if row["port"]:
+        again += ["--ssh-port", row["port"]]
+    print(f"reboot scheduled and {args.id} released; once `box.py ird list {ctx.alias}` shows "
+          f"{row['machine']} free again, re-reserve it: {shlex.join(again)}")
+    return 0
+
+
+def _wrap(fn):
+    def run(args) -> int:
+        try:
+            return fn(Ctx(args), args)
+        except IrdError as e:
+            print(f"error: {e}")
+            return e.code
+    return run
+
+
+def register(sub) -> None:
+    ird = sub.add_parser("ird", help="IRD reservations (ird.md)").add_subparsers(dest="ird_cmd", required=True)
+
+    def add(name, fn, help_):
+        p = ird.add_parser(name, help=help_)
+        p.add_argument("alias", help="the box's alias in the site file")
+        p.add_argument("--user", help="your user on the management host (default ird.user, else id -un there)")
+        p.add_argument("--project", help="claim owner project (default $TTP_PROJECT)")
+        p.add_argument("--task", help="claim owner task (default $TTP_TASK)")
+        p.add_argument("--ttl", type=float, default=DEFAULT_TTL_S,
+                       help="a claim with an older heartbeat and a dead owner pid is stale (seconds)")
+        p.set_defaults(func=_wrap(fn))
+        return p
+
+    p = add("list", cmd_list, "machines you can reserve now")
+    p.add_argument("--all", action="store_true", help="also show skipped machines and why")
+    add("status", cmd_status, "your reservations and their claims")
+    p = add("reserve", cmd_reserve, "reserve a machine for this run")
+    p.add_argument("--arch", required=True)
+    p.add_argument("--timeout", required=True, help="hh:mm:ss, the run's length")
+    p.add_argument("--pool", help="default: the first of ird.pools")
+    p.add_argument("--machine")
+    p.add_argument("--ssh-port", type=int)
+    p.add_argument("--pid", type=int, help="owner pid (default the run's runner.pid)")
+    p.add_argument("--wait", type=float, default=600, help="seconds to wait for ird reserve")
+    p = add("extend", cmd_extend, "extend your reservation (on demand, never automatically)")
+    p.add_argument("id")
+    p.add_argument("minutes", type=int)
+    p = add("release", cmd_release, "release your reservation, or --stale ones of this project")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--stale", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p = add("reboot", cmd_reboot, "schedule a reboot of your reservation's machine and release it")
+    p.add_argument("id")

@@ -1580,3 +1580,244 @@ def test_setup_box_exabox_agrees_with_worker_shared_clusters():
         assert "allocated, drained, reserved" in flat and "ttp note" in flat
     for name, text in pages.items():
         assert "--min-idle" in text, name  # a charter's narrowing, never a default
+
+
+# --- setup-box IRD route: box.py ird against a fake `ird` behind a fake ssh ----------------------
+
+FAKE_SSH = r'''#!/bin/sh
+echo "$*" >> "$FAKE_DIR/ssh.log"
+if [ "$1" = "-G" ]; then printf 'hostname %s\nport %s\n' "$FAKE_SSH_HOST" "$FAKE_SSH_PORT"; exit 0; fi
+while [ $# -gt 1 ]; do case "$1" in -o) shift 2;; -*) shift;; *) shift; break;; esac; done
+exec sh -c "$1"
+'''
+
+FAKE_IRD = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+path = os.path.join(d, "ird.json")
+st = json.load(open(path))
+a = sys.argv[1:]
+open(os.path.join(d, "ird.log"), "a").write(" ".join(a) + "\n")
+cmd = a[0]
+if cmd == "list-machines":
+    print("MACHINE POOL ARCH MODEL STATE REASON")
+    for m in st["machines"]:
+        print(" ".join(m))
+elif cmd == "list":
+    print("2026-10-14 08:00:00 INFO connected")
+    for r in st["reservations"]:
+        print(f"{r['id']} {r['user']} pool part {r['machine']} a b c d e {r['port']}")
+elif cmd == "reserve":
+    flags, rest, i = {}, a[1:], 0
+    while i < len(rest) and rest[i].startswith("--"):
+        if rest[i] == "--no-shell":
+            flags["no-shell"] = True; i += 1
+        else:
+            flags[rest[i][2:]] = rest[i + 1]; i += 2
+    if len(rest) - i != 1 or os.environ.get("FAKE_IRD_NOOP"):
+        print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
+        sys.exit(0)
+    rid = str(st["next_id"]); st["next_id"] += 1
+    machine = flags.get("machine") or next(m[0] for m in st["machines"] if m[4] == "idle")
+    st["reservations"].append({"id": rid, "user": os.environ["FAKE_IRD_USER"], "machine": machine,
+                               "port": flags.get("ssh-port", str(40000 + int(rid)))})
+elif cmd in ("release", "change-timeout", "reboot"):
+    r = [r for r in st["reservations"] if r["id"] == a[1]]
+    if not r:
+        print("no such reservation"); sys.exit(1)
+    if cmd == "release":
+        st["reservations"].remove(r[0])
+    if cmd == "reboot":
+        for m in st["machines"]:
+            if m[0] == r[0]["machine"]:
+                m[4:] = ["draining@", "Reboot", "ASAP"]
+json.dump(st, open(path, "w"))
+'''
+
+
+class FakeIrd:
+    def __init__(self, tmp_path, port):
+        import stat
+        self.dir = tmp_path / "fake"
+        bin_ = self.dir / "bin"
+        bin_.mkdir(parents=True)
+        for name, body in (("ssh", FAKE_SSH), ("ird", FAKE_IRD)):
+            (bin_ / name).write_text(body)
+            (bin_ / name).chmod(0o755)
+        self.state = {"next_id": 100, "reservations": [], "machines": [
+            ["m-idle", "p", "arch", "x", "idle"], ["m-mixed", "p", "arch", "x", "mixed"],
+            ["m-alloc", "p", "arch", "x", "alloc"], ["m-drain", "p", "arch", "x", "draining"],
+            ["m-down", "p", "arch", "x", "down*"], ["m-fail", "p", "arch", "x", "failed"],
+            ["m-asap", "p", "arch", "x", "idle", "Reboot", "ASAP"], ["m-excl", "p", "arch", "x", "idle"]]}
+        self.save()
+        self.site = tmp_path / "boxes.json"
+        self.site.write_text(json.dumps({"version": 1, "boxes": {"<ird-box>": {
+            "route": "ird", "workdir_root": "/<workdir>", "excluded_nodes": ["m-excl"],
+            "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>", "<pool2>"], "user": "me"}}}}))
+        self.home = tmp_path / "home"
+        self.home.mkdir()
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
+        self.env.update(PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(self.home), FAKE_DIR=str(self.dir),
+                        FAKE_SSH_HOST="127.0.0.1", FAKE_SSH_PORT=str(port), FAKE_IRD_USER="me",
+                        TTP_IRD_DIR=str(tmp_path / "ird"), TTP_PROJECT="proj", TTP_TASK="t1")
+        self.ird_dir = tmp_path / "ird"
+
+    def save(self):
+        (self.dir / "ird.json").write_text(json.dumps(self.state))
+
+    def load(self):
+        self.state = json.loads((self.dir / "ird.json").read_text())
+        return self.state
+
+    def ird_log(self):
+        p = self.dir / "ird.log"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def run(self, *args, **env):
+        import subprocess
+        r = subprocess.run([sys.executable, str(BOX_PY), "--site", str(self.site), "ird", *args],
+                           capture_output=True, text=True, timeout=60, env={**self.env, **env})
+        return r.returncode, r.stdout + r.stderr
+
+    def add(self, rid, user="me", machine="m-mixed", port="4242"):
+        self.load()["reservations"].append({"id": rid, "user": user, "machine": machine, "port": port})
+        self.save()
+
+    def claim(self, rid, **kw):
+        c = {"id": rid, "project": "proj", "task": "t0", "host": "elsewhere", "pid": 1, "heartbeat": 0}
+        c.update(kw)
+        p = self.ird_dir / "claims" / f"<ird-box>.{rid}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(c))
+
+
+@pytest.fixture
+def fake_ird(tmp_path):
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    yield FakeIrd(tmp_path, srv.getsockname()[1])
+    srv.close()
+
+
+def test_setup_box_ird_list_skips_draining_down_and_reboot_pending(fake_ird):
+    rc, out = fake_ird.run("list", "<ird-box>")
+    assert rc == 0, out
+    assert out.split("\n")[:2] == ["free m-idle idle", "free m-mixed mixed"] and out.count("free") == 2
+    rc, out = fake_ird.run("list", "<ird-box>", "--all")
+    for line in ("skip m-alloc busy (alloc)", "skip m-drain state draining", "skip m-down state down*",
+                 "skip m-fail state failed", "skip m-asap reboot pending", "skip m-excl excluded"):
+        assert line in out, out
+    assert all(l.startswith("list-machines") for l in fake_ird.ird_log())
+    assert "-o BatchMode=yes -o ConnectTimeout=15 -n <ird-mgmt-alias> ird list-machines" in \
+        (fake_ird.dir / "ssh.log").read_text()
+
+
+def test_setup_box_ird_reserve_puts_every_flag_before_the_arch(fake_ird):
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "02:30:00",
+                           "--machine", "m-idle", "--ssh-port", "4100")
+    assert rc == 0, out
+    assert re.search(r"^reserved 100 machine=m-idle port=4100 expires=\S+", out, re.M), out
+    reserve = [l for l in fake_ird.ird_log() if l.startswith("reserve")]
+    assert reserve == ["reserve --cluster <pool> --timeout 02:30:00 --machine m-idle --ssh-port 4100 --no-shell <arch>"]
+    claim = json.loads((fake_ird.ird_dir / "claims" / "<ird-box>.100.json").read_text())
+    assert (claim["project"], claim["task"], claim["machine"], claim["port"]) == ("proj", "t1", "m-idle", "4100")
+    assert claim["pid"] > 0 and claim["heartbeat"] > 0
+    hosts = (fake_ird.ird_dir / "ssh-hosts").read_text()
+    assert "Host m-idle\n    HostName m-idle\n    Port 4100\n    ProxyJump <ird-mgmt-alias>\n" in hosts
+    assert "StrictHostKeyChecking" not in hosts
+    assert "Include" in out  # ~/.ssh/config lacks the include: say so, never edit it
+    assert not (fake_ird.home / ".ssh" / "config").exists()
+
+
+@pytest.mark.parametrize("args, message", [
+    (("--timeout", "max"), "--timeout must be hh:mm:ss"),
+    (("--timeout", "01:00:00", "--pool", "<other>"), "not in ird.pools"),
+    (("--timeout", "01:00:00", "--machine", "m-drain"), "refused: m-drain: state draining"),
+    (("--timeout", "01:00:00", "--machine", "m-asap"), "refused: m-asap: reboot pending"),
+    (("--timeout", "01:00:00", "--machine", "m-excl"), "refused: m-excl: excluded"),
+])
+def test_setup_box_ird_reserve_refuses_bad_requests(fake_ird, args, message):
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", *args)
+    assert rc == 1 and message in out, out
+    assert not [l for l in fake_ird.ird_log() if l.startswith("reserve")]
+
+
+def test_setup_box_ird_reserve_fails_when_ird_silently_reserves_nothing(fake_ird):
+    fake_ird.add("7", user="other")
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", FAKE_IRD_NOOP="1")
+    assert rc == 1 and "made no reservation" in out, out
+    assert not (fake_ird.ird_dir / "claims").exists()
+
+
+def test_setup_box_ird_acts_only_on_the_callers_reservations(fake_ird):
+    fake_ird.add("5", user="other", machine="m-alloc")
+    fake_ird.claim("5")
+    fake_ird.add("6")
+    fake_ird.claim("6", task="t1")
+    rc, out = fake_ird.run("status", "<ird-box>")
+    assert rc == 0 and "6 m-mixed port=4242" in out and "m-alloc" not in out, out
+    for verb in (("release", "5"), ("extend", "5", "30"), ("reboot", "5")):
+        rc, out = fake_ird.run(verb[0], "<ird-box>", *verb[1:])
+        assert rc == 1 and "belongs to other" in out, out
+    rc, out = fake_ird.run("release", "<ird-box>", "--stale")
+    assert rc == 0 and "released 6" in out and "5" not in out, out
+    assert [r["id"] for r in fake_ird.load()["reservations"]] == ["5"]
+    assert not any(l.startswith(("release 5", "change-timeout", "reboot")) for l in fake_ird.ird_log())
+
+
+def test_setup_box_ird_release_follows_claims(fake_ird):
+    import time
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00")
+    assert rc == 0, out
+    fake_ird.add("8")  # no claim: made by hand or elsewhere
+    fake_ird.add("9", machine="m-idle")
+    fake_ird.claim("9", project="other-proj")
+    rc, out = fake_ird.run("release", "<ird-box>", "100", TTP_TASK="t2")
+    assert rc == 1 and "live claim of task 't1'" in out, out
+    rc, out = fake_ird.run("release", "<ird-box>", "8")
+    assert rc == 1 and "no claim" in out, out
+    rc, out = fake_ird.run("release", "<ird-box>", "9")
+    assert rc == 1 and "claimed by project 'other-proj'" in out, out
+    rc, out = fake_ird.run("release", "<ird-box>", "--stale", TTP_TASK="t2")
+    assert rc == 0, out
+    assert "keep 100" in out and "skip 8" in out and "skip 9" in out, out
+    assert {r["id"] for r in fake_ird.load()["reservations"]} == {"100", "8", "9"}
+    rc, out = fake_ird.run("release", "<ird-box>", "100")  # the task that made it
+    assert rc == 0 and "released 100" in out, out
+    assert not (fake_ird.ird_dir / "claims" / "<ird-box>.100.json").exists()
+    assert "Host" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
+    fake_ird.claim("10", heartbeat=time.time())  # its reservation already ended
+    fake_ird.claim("11", project="other-proj")
+    rc, out = fake_ird.run("release", "<ird-box>", "--stale")
+    assert (fake_ird.ird_dir / "claims" / "<ird-box>.11.json").exists()
+    assert not (fake_ird.ird_dir / "claims" / "<ird-box>.10.json").exists()
+
+
+def test_setup_box_ird_extend_on_demand_and_reboot_then_re_reserve(fake_ird):
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "m-mixed", "--ssh-port", "4300")
+    assert rc == 0, out
+    rc, out = fake_ird.run("extend", "<ird-box>", "100", "45")
+    assert rc == 0 and "extended 100 by 45 min" in out, out
+    rc, out = fake_ird.run("reboot", "<ird-box>", "100")
+    assert rc == 0, out
+    assert [l for l in fake_ird.ird_log() if l.startswith(("reboot", "release"))] == ["reboot 100", "release 100"]
+    assert "--machine m-mixed" in out and "--ssh-port 4300" in out and "--arch '<arch>'" in out, out
+    assert not fake_ird.load()["reservations"]
+    rc, out = fake_ird.run("list", "<ird-box>")
+    assert "m-mixed" not in out  # draining until it reboots
+
+
+def test_setup_box_ird_says_so_when_ird_is_unreachable(fake_ird, tmp_path):
+    import socket
+    rc, out = fake_ird.run("status", "<ird-box>", FAKE_SSH_HOST="ird-mgmt.invalid")
+    assert rc == 255 and "no DNS name" in out and "reachable only from networks" in out, out
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    closed = s.getsockname()[1]
+    s.close()
+    rc, out = fake_ird.run("list", "<ird-box>", FAKE_SSH_PORT=str(closed))
+    assert rc == 255 and "no route to its ssh port" in out, out
+    assert fake_ird.ird_log() == []
