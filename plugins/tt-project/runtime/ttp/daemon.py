@@ -319,17 +319,30 @@ def _mount_of(path: Path) -> Path:
     return p
 
 
-def _measured(sizes: dict[str, int], root: Path) -> int:
-    """Bytes du measured under `root`: its own line once du finished it, else the outermost finished
-    entries below it (du prints a directory once its whole subtree is counted)."""
-    if str(root) in sizes:
-        return sizes[str(root)]
-    done: list[Path] = []
-    for k in sorted(sizes, key=lambda k: len(Path(k).parts)):
+def _ancestry(sizes: dict[str, int]) -> list[tuple[str, str, set[str]]]:
+    """du's entries for _measured, shallowest first: (key, its path as a string, its ancestors')."""
+    out = []
+    for k in sizes:
         q = Path(k)
-        if root in q.parents and not any(d in q.parents for d in done):
-            done.append(q)
-    return sum(sizes[str(d)] for d in done)
+        out.append((k, str(q), {str(a) for a in q.parents}))
+    return sorted(out, key=lambda e: len(e[2]))
+
+
+def _measured(sizes: dict[str, int], root: Path, entries: list | None = None) -> int:
+    """Bytes du measured under `root`: its own line once du finished it, else the outermost finished
+    entries below it (du prints a directory once its whole subtree is counted). Linear in the
+    entries: each one's ancestors are a set of strings (`entries`, from _ancestry; built when not
+    given), checked against the set already counted."""
+    top = str(root)
+    if top in sizes:
+        return sizes[top]
+    done: set[str] = set()
+    total = 0
+    for k, path, anc in _ancestry(sizes) if entries is None else entries:
+        if top in anc and not anc & done:
+            done.add(path)
+            total += sizes[k]
+    return total
 
 
 def own_usage(p: Project, dev: int, nets: list[Path], timeout: float) -> dict:
@@ -355,13 +368,14 @@ def own_usage(p: Project, dev: int, nets: list[Path], timeout: float) -> dict:
         sizes, done = _du(["-x", "-d", str(depth), str(d)], deadline - time.monotonic())
         complete = complete and done
         any_line = any_line or bool(sizes)
-        total += _measured(sizes, d)
+        entries = _ancestry(sizes)   # once per du output: _measured is called per run worktree and subfolder
+        total += _measured(sizes, d, entries)
         if d == p.state.resolve():
-            wt_bytes = sum(_measured(sizes, w) for w in run_wts)
+            wt_bytes = sum(_measured(sizes, w, entries) for w in run_wts)
             if run_wts:
                 consumers.append(("run worktrees", wt_bytes, len(run_wts)))
-            for sub in sorted({Path(k).relative_to(d).parts[0] for k in sizes if d in Path(k).parents}):
-                n = _measured(sizes, d / sub) - (wt_bytes if d / sub == p.runs.resolve() else 0)
+            for sub in sorted({Path(k).relative_to(d).parts[0] for k, _, anc in entries if str(d) in anc}):
+                n = _measured(sizes, d / sub, entries) - (wt_bytes if d / sub == p.runs.resolve() else 0)
                 consumers.append((f"state/{sub}" + (" (other run files)" if sub == p.runs.name else ""), n, None))
         else:
             kids = [k for k in sizes if Path(k).parent == d]

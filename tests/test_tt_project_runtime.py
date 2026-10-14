@@ -17828,6 +17828,66 @@ def test_the_disk_breakdown_keeps_what_du_measured_before_its_time_ran_out(env, 
     assert "this project's own data (state/ and worktrees/) was not measured" in line and " 0.0 GB" not in line, line
 
 
+def _measured_by_pairs(sizes, root):
+    """The disk breakdown's former _measured (every path pair compared): the reference its fast one must equal."""
+    from pathlib import Path
+    if str(root) in sizes:
+        return sizes[str(root)]
+    done = []
+    for k in sorted(sizes, key=lambda k: len(Path(k).parts)):
+        q = Path(k)
+        if root in q.parents and not any(d in q.parents for d in done):
+            done.append(q)
+    return sum(sizes[str(d)] for d in done)
+
+
+def test_the_disk_breakdown_sums_a_partial_du_output_in_linear_time(env, monkeypatch):
+    """Note 7ef8a2c60a779672: du cut off at its time limit prints no line for the folders it had not
+    finished, and _measured then compared every path pair, stalling the dispatch tick for minutes on a
+    big state/. It must give the same bytes as before, and replaying a large partial du output (root
+    lines dropped) through own_usage must take well under a second or two."""
+    import random
+    import time as _t
+    from pathlib import Path
+    p = make(env)
+    from ttp import daemon as dm
+    root = Path("/x/state")
+    cases = [
+        {},
+        {"/x/state": 9, "/x/state/a": 4},                                    # root finished: its own line
+        {"/x/state/a": 4, "/x/state/a/b": 3, "/x/state/c/d": 2},             # outermost finished entries
+        {"/x/state/a/b": 3, "/x/state/a/b/c": 1, "/x/state/ab": 5},          # a sibling sharing a prefix
+        {"/x/stateful/a": 7, "/x/state/q": 1, "/y/state/q": 6, "/x": 99},    # outside the root: not counted
+        {"/x/state/a/b/c": 1, "/x/state/a/b/d": 2, "/x/state/a/e": 3},
+    ]
+    rng = random.Random(7)
+    for _ in range(200):
+        sizes = {}
+        for _ in range(rng.randint(1, 30)):
+            parts = [rng.choice("abc") for _ in range(rng.randint(1, 4))]
+            sizes["/x/state/" + "/".join(parts)] = rng.randint(1, 100)
+        cases.append(sizes)
+    for sizes in cases:
+        for r in (root, root / "a", root / "a" / "b", Path("/x"), Path("/x/stat")):
+            assert dm._measured(sizes, r) == _measured_by_pairs(sizes, r), (sizes, r)
+            assert dm._measured(sizes, r, dm._ancestry(sizes)) == _measured_by_pairs(sizes, r), (sizes, r)
+    # A big state/ whose du was stopped: run directories finished, runs/ and state/ themselves not.
+    state, runs = p.state.resolve(), p.runs.resolve()
+    lines = [f"4\t{runs / str(r) / sub}" for r in range(4000) for sub in ("wt", "logs", "tmp")]
+    lines += [f"12\t{runs / str(r)}" for r in range(4000)] + [f"8\t{state / 'archive'}"]
+    big = "\n".join(lines).encode()
+    for r in range(30):   # own_usage asks _measured for each run worktree it finds
+        (runs / str(r) / "wt").mkdir(parents=True)
+        (runs / str(r) / "wt" / ".git").write_text("gitdir: /nowhere\n")
+    monkeypatch.setattr(dm, "_run_bounded", lambda cmd, timeout: (big if cmd[-1] == str(state) else b"", False))
+    start = _t.monotonic()
+    own = dm.own_usage(p, dm.os.stat(state).st_dev, [], 30)
+    took = _t.monotonic() - start
+    assert own["bytes"] == (4000 * 12 + 8) * 1024 and not own["complete"], own
+    assert ("run worktrees", 30 * 4 * 1024, 30) in own["consumers"], own["consumers"]
+    assert took < 5, f"own_usage took {took:.1f} s on a partial du output of {len(lines)} lines"
+
+
 def test_disk_scans_never_walk_root_home_or_network_mounts(env, monkeypatch, tmp_path):
     from pathlib import Path
     p = make(env)
