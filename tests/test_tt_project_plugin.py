@@ -653,6 +653,49 @@ def test_worker_prompt_driver_chain_fails_fast_and_shared_watchers_lock():
     assert "flock -n" in harness and "condition key" in harness
 
 
+
+def test_shared_watcher_git_scan_is_bounded_and_still_catches_changes(tmp_path):
+    """A watcher workers run at start or hand-off must not walk a big untracked folder (a virtualenv,
+    data, build output) file by file: the scan the harness skill prescribes stays small and still sees
+    tracked edits and new untracked files."""
+    import subprocess
+    import time
+    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text()
+    row = next(ln for ln in harness.splitlines() if ln.startswith("| Shared watchers |"))
+    for want in ("--untracked-files=no --ignore-submodules=all", "--untracked-files=normal",
+                 "never `--untracked-files=all`", "timeout 20 git", "GIT_TERMINAL_PROMPT=0",
+                 "skipped: <step> timed out", '"error": true'):
+        assert want in row, want
+
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(tmp_path), "GIT_TERMINAL_PROMPT": "0"}
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, env=env,
+                              check=True, timeout=60).stdout
+
+    repo.mkdir()
+    git("init", "-q")
+    (repo / "a.txt").write_text("a\n")
+    git("add", "a.txt")
+    git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init")
+    for i in range(40):
+        d = repo / ".venv" / f"d{i}" / "sub"
+        d.mkdir(parents=True)
+        for j in range(100):
+            (d / f"f{j}.py").touch()
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "new.txt").write_text("new\n")
+
+    walked = git("status", "--porcelain", "--untracked-files=all").splitlines()
+    assert len(walked) > 4000                       # what the guard must not do
+    t0 = time.monotonic()
+    tracked = git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all").splitlines()
+    normal = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all").splitlines()
+    assert time.monotonic() - t0 < 10
+    assert tracked == [" M a.txt"]                  # tracked edits still caught, no untracked walk
+    assert sorted(normal) == [" M a.txt", "?? .venv/", "?? new.txt"]   # one line per untracked folder
+
 def test_worker_prompt_driver_marker_uses_exit_trap():
     text = (PLUGIN / "template" / "prompts" / "worker.md").read_text()
     assert "EXIT trap" in text
