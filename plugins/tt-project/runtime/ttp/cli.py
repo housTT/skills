@@ -2290,6 +2290,12 @@ def cmd_ssh_preflight(a) -> None:
     sys.exit(rc)
 
 
+def cmd_goal(a) -> None:
+    """Run one stock goal check (suite_green, artifact_fresh, service_up); see goalchecks."""
+    from . import goalchecks
+    sys.exit(goalchecks.run(a))
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -4877,6 +4883,35 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for pkill, killall, pgrep and pidof "
                                                  "into DIR (put DIR first on PATH)")
     s.set_defaults(fn=cmd_killscan)
+
+    s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "
+                                    "75 could not check")
+    gs = s.add_subparsers(dest="goal", required=True)
+    g = gs.add_parser("suite_green", help="a test command exits 0 at the current head")
+    g.add_argument("--name", help="the suite's name (its key; default: the command)")
+    g.add_argument("--cwd", default=".", help="run in this folder (its HEAD is reported)")
+    g.add_argument("--min-tests", type=int, default=0, help="fail unless at least this many tests ran")
+    g.add_argument("--count-regex", help="regex whose first group is the test count (default: pytest, "
+                                         "unittest and ctest summaries)")
+    g.add_argument("--timeout", type=float, default=3600, help="seconds; past it the check could not run")
+    g.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
+    g = gs.add_parser("artifact_fresh", help="a file or glob's newest match exists, is not trivially small "
+                                             "and is newer than the bounds given")
+    g.add_argument("path", help="a path or glob (** allowed)")
+    g.add_argument("--max-age-h", type=float, help="no older than this many hours")
+    g.add_argument("--newer-than-commit", metavar="REV", help="newer than this commit's commit time")
+    g.add_argument("--repo", default=".", help="the repository of --newer-than-commit")
+    g.add_argument("--newer-than", metavar="PATH", help="newer than this input file")
+    g.add_argument("--min-bytes", type=int, default=1, help="at least this size (default 1)")
+    g = gs.add_parser("service_up", help="a systemd unit is active and/or a URL answers an expected status")
+    g.add_argument("--unit", help="a systemd unit")
+    g.add_argument("--user", action="store_true", help="a user unit (systemctl --user)")
+    g.add_argument("--host", help="check the unit on this ssh alias")
+    g.add_argument("--url", help="an http(s) URL")
+    g.add_argument("--expect", type=int, nargs="+", help="accepted status codes (default: any 2xx or 3xx)")
+    g.add_argument("--body-contains", help="text the answer must contain")
+    g.add_argument("--timeout", type=float, default=30, help="seconds per probe")
+    s.set_defaults(fn=cmd_goal)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("--probe", action="store_true",

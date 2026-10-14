@@ -58936,3 +58936,128 @@ def test_ttr_cli_reports_json_and_text_for_one_machine(env, capsys):
     cli.main(["ttr", "alpha", "box-c"])
     assert capsys.readouterr().out.strip() == "no machine incidents in 30 d on box-c"
     assert ttr.lines(p.db, "UTC", "box-c") == []
+
+
+def _goal_lines(r) -> list[dict]:
+    return [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+
+
+def test_goal_suite_green_passes_fails_and_reports_could_not_run(env, tmp_path):
+    from ttp import goalchecks as gc
+    repo = tmp_path / "goalrepo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    [ok] = gc.suite_green(["echo '===== 4 passed, 1 xfailed in 0.2s ====='"], "unit", str(repo), min_tests=5)
+    assert ok["ok"] and ok["head"] == head and ok["tests"] == 5 and ok["key"] == "suite_green:unit", ok
+    assert ok["severity"] == "info" and ok["text"].startswith("suite_green:unit: cleared: green at ") and "error" not in ok
+    [few] = gc.suite_green(["echo '3 passed in 0.1s'"], "unit", str(repo), min_tests=5)
+    assert not few["ok"] and "error" not in few and "only 3 tests ran" in few["text"], few
+    [red] = gc.suite_green(["sh", "-c", "echo '1 failed, 2 passed in 0.1s'; exit 1"], "unit", str(repo))
+    assert not red["ok"] and "error" not in red and red["rc"] == 1 and red["severity"] == "normal", red
+    for cmd, timeout in ((["ttp-no-such-test-runner"], 30), (["sleep 5"], 0.5), ([], 30)):
+        [err] = gc.suite_green(cmd, "unit", str(repo), timeout_s=timeout)
+        assert err["error"] is True and not err["ok"], err
+    [nocount] = gc.suite_green(["true"], "unit", str(repo), min_tests=1)
+    assert nocount.get("error") is True and "no test count" in nocount["text"], nocount
+    assert gc.test_count("Ran 12 tests in 0.3s\n\nOK") == 12
+    assert gc.test_count("100% tests passed, 0 tests failed out of 7") == 7
+    assert gc.test_count("== no tests ran in 0.01s ==") == 0
+    assert gc.test_count("checked 9 cases", r"checked (\d+) cases") == 9
+    # the CLI: one JSON line, exit 0 met, 1 not met, 75 could not check
+    def ttp(*args):
+        return subprocess.run([sys.executable, str(TTP), "goal", "suite_green", "--cwd", str(repo), *args],
+                              capture_output=True, text=True)
+    for args, rc in ((["--", "echo '2 passed in 0.1s'"], 0), (["--", "false"], 1), (["--", "ttp-no-such-test-runner"], 75)):
+        r = ttp(*args)
+        assert r.returncode == rc and len(_goal_lines(r)) == 1, (args, r.returncode, r.stdout, r.stderr)
+
+
+def test_goal_artifact_fresh_passes_fails_and_reports_could_not_run(env, tmp_path):
+    from ttp import goalchecks as gc
+    repo = tmp_path / "goalrepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+                   cwd=repo, check=True, env={**os.environ, "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"})
+    out = tmp_path / "out"
+    out.mkdir()
+    old, new, empty, src = out / "a.bin", out / "b.bin", out / "c.txt", tmp_path / "input.txt"
+    old.write_bytes(b"x" * 10)
+    new.write_bytes(b"y" * 10)
+    empty.write_bytes(b"")
+    now = time.time()
+    os.utime(old, (now - 10 * 3600, now - 10 * 3600))
+    src.write_text("in")
+    os.utime(src, (now - 3600, now - 3600))
+    [ok] = gc.artifact_fresh(str(out / "*.bin"), max_age_h=2, newer_than_commit="HEAD", repo=str(repo),
+                             newer_than=str(src), now=now)
+    assert ok["ok"] and ok["path"] == str(new) and ok["key"] == f"artifact_fresh:{out / '*.bin'}" and "error" not in ok, ok
+    for kwargs, why in (({"pattern": str(old), "max_age_h": 2}, "h old"),
+                        ({"pattern": str(out / "*.none")}, "missing"),
+                        ({"pattern": str(empty)}, "0 bytes"),
+                        ({"pattern": str(old), "newer_than": str(src)}, "older than")):
+        [miss] = gc.artifact_fresh(now=now, **kwargs)
+        assert not miss["ok"] and "error" not in miss and why in miss["text"], (kwargs, miss)
+    future = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                             "-m", "y"], cwd=repo, env={**os.environ, "GIT_COMMITTER_DATE": f"@{int(now) + 60} +0000"})
+    assert future.returncode == 0
+    [stale] = gc.artifact_fresh(str(new), newer_than_commit="HEAD", repo=str(repo), now=now)
+    assert not stale["ok"] and "older than commit HEAD" in stale["text"], stale
+    for kwargs in ({"newer_than_commit": "no-such-rev", "repo": str(repo)}, {"newer_than": str(tmp_path / "gone")}):
+        [err] = gc.artifact_fresh(str(new), now=now, **kwargs)
+        assert err["error"] is True and not err["ok"], (kwargs, err)
+    assert gc.exit_code([ok]) == 0 and gc.exit_code([err]) == 75 and gc.exit_code([err, miss]) == 1
+
+
+def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, monkeypatch):
+    import http.server
+    from ttp import goalchecks as gc, heal
+    replies = {"/ok": (200, b"ready: yes"), "/down": (503, b"no")}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            code, body = replies.get(self.path, (404, b""))
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        [up] = gc.service_up(url=f"{base}/ok", body_contains="ready")
+        assert up["ok"] and up["status"] == 200 and up["key"] == f"service_up:{base}/ok" and "error" not in up, up
+        assert gc.service_up(url=f"{base}/down", expect=[503])[0]["ok"]
+        for kwargs in ({"url": f"{base}/down"}, {"url": f"{base}/ok", "body_contains": "never"},
+                       {"url": f"{base}/ok", "expect": [204]}):
+            [down] = gc.service_up(**kwargs)
+            assert not down["ok"] and "error" not in down, (kwargs, down)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    [gone] = gc.service_up(url=base)
+    assert not gone["ok"] and "error" not in gone and "does not answer" in gone["text"], gone
+    [bad] = gc.service_up(url="not a url")
+    assert bad["error"] is True
+    # the unit: systemctl's answer decides; systemctl itself failing is could-not-run
+    shown = {}
+
+    def fake_shell(cmd, cwd, timeout, env=None):
+        shown["cmd"] = cmd
+        return shown["reply"]
+    monkeypatch.setattr(heal, "_shell", fake_shell)
+    for reply, ok in (((0, "ActiveState=active\nNRestarts=0"), True), ((0, "ActiveState=failed\nNRestarts=2"), False),
+                      ((1, "Failed to connect to bus"), None)):
+        shown["reply"] = reply
+        [o] = gc.service_up(unit="demo.service", user=True)
+        assert o["key"] == "service_up:demo.service" and "--user" in shown["cmd"], (o, shown)
+        assert (o["ok"], o.get("error")) == ((True, None) if ok else (False, None) if ok is False else (False, True)), o
+    shown["reply"] = (0, "ActiveState=active\nNRestarts=0")
+    both = gc.service_up(unit="demo.service", url=base)
+    assert [o["ok"] for o in both] == [True, False] and gc.exit_code(both) == 1
+    [none] = gc.service_up()
+    assert none["error"] is True and gc.exit_code([none]) == 75
