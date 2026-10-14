@@ -12571,6 +12571,83 @@ def test_upgrade_leaves_a_running_harness_tasks_new_files_for_it_to_commit(env, 
         assert not _git_out(h, "status", "--porcelain") and "left " not in out
 
 
+def test_pre_upgrade_commit_lists_its_files_keeps_runtime_data_out_and_tells_the_owning_task(env, monkeypatch,
+                                                                                            capsys):
+    """A harness task's run ended mid-edit (an auth failure); the next template upgrade swept its edits and
+    runtime data (an append-only queue log) into one bare "local harness changes before template upgrade"
+    commit, and the task's retry had to dig through it. The commit now lists its files, leaves runtime data
+    out (local ignore rules keep it out later too), and the open harness tasks whose runs may have made the
+    edits get a spec update naming the commit; a running one's steer file gets it too."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    mark = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    _install_template(env)
+    mark.write_text("aaaa1111\n")
+    cli.main(["upgrade", "demo"])
+    now = time.time()
+    owner = p.db.add_task("Add a queue check", "spec of the check", kind="harness")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'failed')",
+           (owner, now - 7200))
+    later = p.db.add_task("Started after the edits", "spec", kind="harness")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'failed')",
+           (later, now + 3600))
+    closed = p.db.add_task("Finished", "spec", kind="harness")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'done')",
+           (closed, now - 7200))
+    p.db.update_task(closed, status="done")
+    never = p.db.add_task("Never ran", "spec", kind="harness")
+    (h / "tools").mkdir(exist_ok=True)
+    (h / "tools" / "queue_check.py").write_text("print('half done')\n")
+    (h / "tools" / "queue-wait.jsonl").write_text('{"wait": 1}\n')
+    (h / "state.db").write_text("x")
+    _git_out(h, "add", "state.db")      # staged runtime data is unstaged and kept out too
+    (h / "odd[1]*.log").write_text("a log with glob characters in its name\n")
+    for f in ("tools/queue_check.py", "tools/queue-wait.jsonl", "state.db", "odd[1]*.log"):
+        os.utime(h / f, (now - 600, now - 600))
+    capsys.readouterr()
+    mark.write_text("bbbb2222\n")
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    sha = _git_out(h, "log", "--format=%H", "--grep", "before template upgrade", "-1")
+    files = _git_out(h, "show", "--name-only", "--format=", sha).split("\n")
+    body = _git_out(h, "log", "-1", "--format=%B", sha)
+    assert files == ["tools/queue_check.py"]
+    assert "Files committed (1):\n  tools/queue_check.py" in body
+    for f in ("tools/queue-wait.jsonl", "state.db", "odd[1]*.log"):
+        assert f"  {f}" in body.split("Runtime data kept out")[1] and (h / f).exists()
+    assert not _git_out(h, "status", "--porcelain")         # ignored locally from now on
+    assert f"committed the harness's local changes as {sha[:12]}" in out
+    spec = p.db.task(owner)["spec"]
+    assert spec.startswith("spec of the check") and f"as {sha[:12]}" in spec and "tools/queue_check.py" in spec
+    assert f"told harness task #{owner} " in out
+    for t in (later, closed, never):
+        assert "## Update" not in p.db.task(t)["spec"]
+    # Another change, owned by a running task: it hears it in its steer file too; runtime data is not
+    # committed again, and nothing is committed when only runtime data changed.
+    run_dir = env["home"] / "run-x"
+    run_dir.mkdir()
+    p.db.x("UPDATE runs SET status='running', dir=? WHERE task=?", (str(run_dir), owner))
+    p.db.x("UPDATE runs SET started=? WHERE task=?", (time.time() + 60, owner))     # its next run, started now
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'failed')",
+           (owner, now - 7200))
+    (h / "tools" / "queue_check.py").write_text("print('more')\n")
+    os.utime(h / "tools" / "queue_check.py", (now - 300, now - 300))
+    with open(h / "tools" / "queue-wait.jsonl", "a") as fh:
+        fh.write('{"wait": 2}\n')
+    mark.write_text("cccc3333\n")
+    cli.main(["upgrade", "demo"])
+    sha2 = _git_out(h, "log", "--format=%H", "--grep", "before template upgrade", "-1")
+    assert sha2 != sha and _git_out(h, "show", "--name-only", "--format=", sha2) == "tools/queue_check.py"
+    assert sha2[:12] in (run_dir / "steer.md").read_text() and sha2[:12] in p.db.task(owner)["spec"]
+    with open(h / "tools" / "queue-wait.jsonl", "a") as fh:
+        fh.write('{"wait": 3}\n')
+    mark.write_text("dddd4444\n")
+    cli.main(["upgrade", "demo"])
+    assert _git_out(h, "log", "--format=%H", "--grep", "before template upgrade", "-1") == sha2
+
+
 def test_a_merged_runtime_that_does_not_import_is_not_applied(env, monkeypatch):
     p = make(env)
     from ttp import cli, service

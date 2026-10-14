@@ -4009,17 +4009,21 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     h = p.harness
     if not _git(h, "status", "--porcelain"):
         return []
-    msg = "local harness changes before template upgrade"
-    running = _running_harness_start(p)
-    if not running:
-        _git(h, "add", "-A")
-        _git(h, *ident, "commit", "-q", "-m", msg)
-        return []
-    since, tid = running
 
     def names(*args: str) -> set[str]:
         out = subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True).stdout
         return {n for n in out.split("\0") if n}
+
+    msg = "local harness changes before template upgrade"
+    running = _running_harness_start(p)
+    kept_out = _keep_out_runtime_data(h, running[0] if running else None)
+    if not running:
+        _git(h, "add", "-A")
+        files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if files:
+            _commit_listing(p, ident, msg, files, kept_out)
+        return []
+    since, tid = running
 
     changed = (names("ls-files", "-z", "--modified", "--others", "--deleted", "--exclude-standard")
                | names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
@@ -4036,14 +4040,108 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
             files = ["--pathspec-from-file", str(spec), "--pathspec-file-nul"]
             _git(h, "--literal-pathspecs", "add", "-A", *files)
             # --only: the worker's own staged files stay staged and out of this commit
-            if names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD") & set(old):
-                _git(h, "--literal-pathspecs", *ident, "commit", "-q", "--only", "-m", msg, *files)
+            done = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD") & set(old))
+            if done:
+                _commit_listing(p, ident, msg, done, kept_out, ["--literal-pathspecs"], ["--only", *files])
         finally:
             spec.unlink(missing_ok=True)
     if left:
         print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
               f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
     return left
+
+
+# Untracked files with these names are runtime data a harness's tools write as they run (append-only logs,
+# queues, pid and lock files, databases), not edits: the pre-upgrade commit leaves them out.
+_RUNTIME_DATA = ("*.jsonl", "*.ndjson", "*.log", "*.pid", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*.sqlite")
+
+
+def _keep_out_runtime_data(h: Path, since: float | None) -> list[str]:
+    """Runtime data files (_RUNTIME_DATA) git does not track yet, or only staged: unstaged and added to
+    the harness's local ignore rules (.git/info/exclude), so neither the pre-upgrade commit nor a later
+    `git add -A` sweeps them in. A tracked file stays tracked; one changed after `since` (a running harness
+    task's start) is left to that task. Returns the files kept out."""
+    import fnmatch
+
+    def names(*args: str) -> list[str]:
+        out = subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True).stdout
+        return [n for n in out.split("\0") if n]
+
+    new = set(names("ls-files", "-z", "--others", "--exclude-standard"))
+    staged = set(names("diff", "--cached", "--name-only", "--no-renames", "--diff-filter=A", "-z", "HEAD"))
+    def mine(n: str) -> bool:
+        try:
+            return since is None or (h / n).lstat().st_mtime <= since
+        except OSError:
+            return False
+
+    data = sorted(n for n in new | staged
+                  if any(fnmatch.fnmatch(Path(n).name, g) for g in _RUNTIME_DATA) and mine(n))
+    if not data:
+        return []
+    if staged & set(data):
+        _git(h, "--literal-pathspecs", "rm", "-q", "--cached", "--", *sorted(staged & set(data)))
+    exclude = h / _git(h, "rev-parse", "--git-path", "info/exclude")
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    have = set(exclude.read_text().splitlines()) if exclude.exists() else set()
+    lines = ["/" + re.sub(r"([\\*?\[])", r"\\\1", n) for n in data]
+    add = [ln for ln in lines if ln not in have]
+    if add:
+        with exclude.open("a") as fh:
+            fh.write("# runtime data kept out of commits by `ttp upgrade`\n" + "\n".join(add) + "\n")
+    return data
+
+
+def _listed(names: list[str], cap: int = 40) -> str:
+    return "\n".join(f"  {n}" for n in names[:cap]) + (f"\n  ... and {len(names) - cap} more" if len(names) > cap else "")
+
+
+def _commit_listing(p: Project, ident: list[str], msg: str, files: list[str], kept_out: list[str],
+                    pre: list[str] | None = None, post: list[str] | None = None) -> str:
+    """Commit `files` (what is staged, or `post`'s paths) with a message that lists them and the runtime
+    data kept out, then tell the open harness tasks that may own those edits. Returns the sha."""
+    h = p.harness
+    body = f"Files committed ({len(files)}):\n{_listed(files)}"
+    if kept_out:
+        body += (f"\n\nRuntime data kept out (in .git/info/exclude; `git add -f` to commit one):\n"
+                 f"{_listed(kept_out)}")
+    _git(h, *(pre or []), *ident, "commit", "-q", *(post or []), "-m", msg, "-m", body)
+    sha = _git(h, "rev-parse", "HEAD")
+    print(f"committed the harness's local changes as {sha[:12]} ({len(files)} file(s): "
+          f"{', '.join(files[:10])}{f' and {len(files) - 10} more' if len(files) > 10 else ''})")
+    _tell_harness_tasks(p, sha, files)
+    return sha
+
+
+def _tell_harness_tasks(p: Project, sha: str, files: list[str]) -> None:
+    """A harness task whose run ended mid-edit (an auth failure, a kill) left its work uncommitted in the
+    live harness; the pre-upgrade commit took it. Every open harness task with a run that started before
+    the newest of those edits may own them: its spec, and the steer file of a run still going, name the
+    commit so its next attempt continues from it instead of redoing or hunting for the work."""
+    from .coordinator import _append_update
+    h = p.harness
+    newest = 0.0
+    for n in files:
+        try:
+            newest = max(newest, (h / n).lstat().st_mtime)
+        except OSError:
+            newest = time.time()       # deleted: its age is unknown
+    me = os.environ.get("TTP_RUN_ID") if _own_run(p) else None
+    mine = p.db.one("SELECT task FROM runs WHERE CAST(id AS TEXT)=?", (me,)) if me else None
+    shown = ", ".join(files[:10]) + (f" and {len(files) - 10} more" if len(files) > 10 else "")
+    upd = (f"The template upgrade committed the live harness's uncommitted changes as {sha[:12]} "
+           f"(\"local harness changes before template upgrade\": {shown}). If they are an earlier attempt's "
+           f"edits of this task, continue from that commit (`git show {sha[:12]}`) instead of redoing them.")
+    for t in p.db.q("SELECT id, spec FROM tasks WHERE kind='harness' AND status NOT IN "
+                    "('done','failed','cancelled','review') AND EXISTS (SELECT 1 FROM runs r WHERE r.task=tasks.id "
+                    "AND r.started IS NOT NULL AND r.started <= ?) ORDER BY id", (newest,)):
+        if mine and t["id"] == mine["task"]:
+            continue        # the run doing this upgrade made the commit itself
+        p.db.x("UPDATE tasks SET spec=? WHERE id=?", (f"{(t['spec'] or '').rstrip()}\n\n## Update\n{upd}\n", t["id"]))
+        for r in p.db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (t["id"],)):
+            if r["dir"]:
+                _append_update(Path(r["dir"], "steer.md"), upd, f"pre-upgrade-{sha[:12]}")
+        print(f"told harness task #{t['id']} that {sha[:12]} holds the harness's uncommitted changes")
 
 
 def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:
