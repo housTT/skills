@@ -1762,12 +1762,13 @@ def _harness_purpose(a) -> dict:
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
 
 
-CHECKS_QUEUED = "checks.queued"   # in the run's directory while its checks wait for a host-wide slot
+CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
+# (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
-    (progress.md) and CHECKS_QUEUED, which the `--result` probe and `ttp status` read. In the
+    (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
     clock."""
     from . import checkcap, locks as lk
@@ -1786,15 +1787,16 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     def waiting(on: bool) -> None:
-        try:
-            if on:
-                write_json(run_dir / CHECKS_QUEUED, {"since": time.time(), "pid": os.getpid(), "head": head})
-            else:
-                (run_dir / CHECKS_QUEUED).unlink(missing_ok=True)
-        except OSError:
-            pass
+        # The wait is recorded before the marker shows it, so whoever sees the marker sees both.
         if foreground:
             lk.record_wait(run_dir, key, start, None if on else time.time())
+        try:
+            if on:
+                write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head})
+            else:
+                (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     start = time.time()
     return checkcap.acquire(who, f"ttp checks on {head[:12]}", tell, waiting)
@@ -1950,7 +1952,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         env['TTP_RUN_DIR'] = str(run_dir)
         env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
-        (run_dir / CHECKS_QUEUED).unlink(missing_ok=True)
+        (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []),
@@ -2060,7 +2062,7 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     alive = _checks_alive(info)
     if not rc_file.exists() and alive:
-        if (run_dir / CHECKS_QUEUED).exists():
+        if (run_dir / CHECKS_SLOT_WAIT).exists():
             from . import checkcap
             print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "
                   + (checkcap.line() or "they start once one is free"))

@@ -34433,7 +34433,7 @@ def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, mon
 
 
 def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_dies(env, tmp_path, monkeypatch, capsys):
-    from ttp import checkcap, cli
+    from ttp import checkcap, cli, detach
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setenv("TTP_TASK", "7")
@@ -34441,8 +34441,10 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
     ran, seen = tmp_path / "ran", tmp_path / "seen"
     try:
         cli.main(["checks", "--detach", "--", "sh", "-c", f'echo "${checkcap.HELD_ENV}" > {seen}; touch {ran}'])
-        assert _wait_for(lambda: (run / cli.CHECKS_QUEUED).exists())
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
         capsys.readouterr()
+        assert detach.queued(run / cli.CHECKS_RC) != run / cli.CHECKS_SLOT_WAIT, \
+            "the slot wait is not the daemon's launch marker, which the probe clears as an orphan"
         assert cli._checks_result(run) == 1, "a queued run is still waiting, not finished"
         out = capsys.readouterr().out
         assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
@@ -34457,7 +34459,7 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
     assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
     assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.exists()
     assert seen.read_text().strip() == "1", "check commands know their run holds a slot"
-    assert not (run / cli.CHECKS_QUEUED).exists()
+    assert not (run / cli.CHECKS_SLOT_WAIT).exists()
     assert "slot taken after" in (run / "progress.md").read_text()
     assert checkcap.line() == "", "the slot is released once the checks end"
 
@@ -34472,13 +34474,13 @@ def test_checks_host_cap_foreground_wait_does_not_count_toward_the_run(env, tmp_
     t = threading.Thread(target=lambda: done.append(cli.main(["checks", "--", "true"])))
     t.start()
     try:
-        assert _wait_for(lambda: (run / cli.CHECKS_QUEUED).exists())
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
         assert locks.waited(run) >= 0 and json.loads((run / locks.WAITS_FILE).read_text())
     finally:
         holder.kill()
         holder.wait()
     t.join(30)
-    assert done and not (run / cli.CHECKS_QUEUED).exists()
+    assert done and not (run / cli.CHECKS_SLOT_WAIT).exists()
     assert all(w["end"] for w in json.loads((run / locks.WAITS_FILE).read_text()).values()), "the wait is closed"
     assert json.loads((run / "checks.json").read_text())["passed"] is True
 

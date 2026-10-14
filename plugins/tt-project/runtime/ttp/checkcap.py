@@ -89,8 +89,14 @@ def line() -> str:
     cap = f"cap {s['limit']}" if s["limit"] else "no cap"
     out = f"host checks: {len(s['running'])} running ({cap})"
     if s["queued"]:
-        out += f", {len(s['queued'])} queued: " + "; ".join(s["queued"][:4]) + ("; ..." if len(s["queued"]) > 4 else "")
+        out += f", {len(s['queued'])} queued: " + _some(s["queued"])
+    if s["running"]:
+        out += f" (running: {_some(s['running'])})"
     return out
+
+
+def _some(labels: list[str]) -> str:
+    return "; ".join(labels[:4]) + ("; ..." if len(labels) > 4 else "")
 
 
 class Slot:

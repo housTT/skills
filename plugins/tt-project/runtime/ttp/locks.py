@@ -314,12 +314,13 @@ def queued(locks_dir: Path, resource: str) -> list[Path]:
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int) -> bool:
     """Whether this ticket is among the first `slots` waiters, so it may take a free slot."""
     q = queued(locks_dir, resource)
-    return ticket not in q or q.index(ticket) < max(int(slots or 1), 1)
+    return ticket not in q or q.index(ticket) < max(int(slots or 0), 0)
 
 
 def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = ""):
-    """try_take, but only when this ticket's turn has come."""
-    if not my_turn(locks_dir, resource, ticket, len(paths)):
+    """try_take, but only when this ticket's turn has come: it is among the first waiters, one per
+    free slot, so a later waiter never takes the one slot an earlier one is about to."""
+    if not my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths))):
         return None
     return try_take(paths, holder, what)
 
