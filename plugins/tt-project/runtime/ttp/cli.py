@@ -1477,7 +1477,7 @@ def cmd_push(a) -> None:
     (`delivery.push_queue`). Exit codes are in `push.py`."""
     from . import push
     if a.result:
-        sys.exit(push.result(Path(a.result)))
+        sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
         os.environ[push.OWN_BRANCH_ENV] = "1"
@@ -5100,6 +5100,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="push in a process of its own; print its marker and a --result probe, and return at once")
     s.add_argument("--result", metavar="MARKER",
                    help="push nothing: report a detached push; exit 0 once it finished (or died), 1 while it runs")
+    s.add_argument("--pushed", action="store_true",
+                   help="with --result: exit 0 only if the push landed, 1 while it runs, 3 if it finished "
+                        "without pushing (for an on_pass_cmd; no grep needed)")
     s.add_argument("--own", action="store_true",
                    help="publish the checked-out branch under its name, as it is (checks, no rebase): this task's "
                         "ttp/t<id>-... branch, or another named branch as a fast-forward only; "

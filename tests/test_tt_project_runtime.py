@@ -62383,3 +62383,19 @@ def test_upgrade_keeps_a_light_tier_model_coordinator(env):
     p.set_config("coordinator.model_tier", "standard")   # the project's own choice stays
     assert cli._keep_light_coordinator(p) == ""
     assert p.config()["coordinator"]["model_tier"] == "standard"
+
+
+def test_push_result_line_matches_the_documented_format_and_pushed_flag_exit_codes(tmp_path, capsys):
+    import json
+    from pathlib import Path
+    from ttp import push
+    root = Path(__file__).resolve().parents[1] / "plugins/tt-project/template/prompts"
+    for f in ("kind-code.md", "kind-review.md"):
+        assert "ttp push: pushed <sha> to <branch>" in (root / f).read_text()
+    marker = tmp_path / "m.json"
+    marker.write_text(json.dumps({"status": "pushed", "sha": "abc123", "target": "b"}))
+    assert push.result(marker, pushed_only=True) == 0
+    assert capsys.readouterr().out.startswith("ttp push: pushed abc123 to b")
+    marker.write_text(json.dumps({"status": "failed", "exit": 4, "log": "/nonexistent"}))
+    assert push.result(marker, pushed_only=True) == push.NOT_PUSHED
+    assert push.result(marker) == 0

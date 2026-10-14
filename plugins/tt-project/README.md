@@ -777,7 +777,7 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `ttp push --detach` runs the same push in a process of its own and returns at once, for
   checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
   `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,
-  printing the pushed sha (and version) or the exit code and the log tail. A push killed by a
+  printing `ttp push: pushed <sha> to <branch>` (and version) or `ttp push: not pushed (...)` and the log tail. For an `on_pass_cmd`, add `--pushed`: exit 0 only if the push landed, 1 while it runs, 3 if it finished without pushing; no grep needed. A push killed by a
   crash or a reboot frees its locks; the probe (or the daemon) then records it as failed, saying
   whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
   each command in a PID namespace of its own (Codex on Linux), which kills a background process

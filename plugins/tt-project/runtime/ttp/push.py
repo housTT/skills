@@ -3226,10 +3226,15 @@ def _malformed(marker: Path, e: Exception) -> None:
     _forget_lock(marker)
 
 
-def result(marker: Path) -> int:
+NOT_PUSHED = 3   # `--result --pushed`: finished without pushing
+
+
+def result(marker: Path, pushed_only: bool = False) -> int:
     """`ttp push --result <marker>`, the probe: 0 once the push finished (pushed, failed or died),
     1 while it runs or waits for the daemon, 2 when there is no such marker. A push whose run lock is
-    free but that wrote no outcome died; it is recorded as failed here, so nobody waits for it."""
+    free but that wrote no outcome died; it is recorded as failed here, so nobody waits for it.
+    With `pushed_only` (`--pushed`): 0 only when the push landed, 1 while it runs, 3 when it finished
+    without pushing, so an on_pass_cmd tests the exit code and needs no grep."""
     marker = Path(marker)
     if not _read(marker):
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
@@ -3271,6 +3276,7 @@ def result(marker: Path) -> int:
         tail = _tail(m.get("log"))
         if tail:
             print(tail)
+        return NOT_PUSHED if pushed_only else 0
     return 0
 
 

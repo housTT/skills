@@ -59,7 +59,7 @@
   A head the PR branch already has reports `pushed` at once, with no checks run again.
 - It prints `marker:` and `retry_when:` lines and returns at once. Hand off `waiting` with that
   `retry_when`, `next_step` "report the push" and `retry_after_s` 900. On resume, run that
-  `retry_when`: report `pushed <sha>`, or `not pushed` with its exit code and log tail. One that
+  `retry_when`: report `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with its exit code and log tail. One that
   "ended without writing an outcome" was killed (e.g. a reboot): rerun it once.
 - Exit codes: 0 pushed. 3: rebase conflict; resolving it (keeping both sides' intents) is the one
   edit you may make; commit, rerun. 4: a check failed; hand off `failed` with the output. 5: the
@@ -77,7 +77,7 @@
   a process of its own, prints `marker:` and `retry_when:` lines, and returns at once. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
-- On resume, run that `retry_when` command: it prints `pushed <sha>`, or `not pushed` with the
+- On resume, run that `retry_when` command: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
   exit code and the log tail. Report the sha, or the failure with its log tail. A push that "ended
   without writing an outcome" was killed (e.g. a reboot): rerun `ttp push --detach` once.
 - Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
