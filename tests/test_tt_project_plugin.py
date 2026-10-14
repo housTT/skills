@@ -1452,7 +1452,8 @@ def _migrate_home(tmp_path, present):
 
 def _migrate_run(home, stubs, repo, *extra):
     import subprocess
-    env = dict(os.environ, HOME=str(home), PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    env = dict(os.environ, HOME=str(home), PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}",
+               GIT_CEILING_DIRECTORIES=str(pathlib.Path(home).resolve().parent))   # a TMPDIR inside a checkout stays out of git's reach
     return subprocess.run([sys.executable, str(BOX_PY), "migrate", "check", "--home", str(home),
                            "--repo", str(repo), *extra], capture_output=True, text=True, timeout=60, env=env)
 

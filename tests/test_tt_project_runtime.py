@@ -47266,8 +47266,10 @@ DEVQ_FAST = {"poll_s": 0.05, "health_poll_s": 0.05, "idle_exit_s": 30, "health_t
 
 
 @pytest.fixture
-def devq_dir(tmp_path):
+def devq_dir(tmp_path, monkeypatch):
     """A runner state folder; any runner or job still alive at the end is stopped by its own pid."""
+    # A TMPDIR inside a checkout must not let git in the scratch dirs find the outer repository.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent.resolve()))
     d = tmp_path / "devq"
     yield d
     for pidf in [d / "runner.pid"]:
@@ -63193,3 +63195,9 @@ def test_venv_rebuild_cmd_hash_in_string_and_include_group(tmp_path):
         '[dependency-groups]\ndev = [{include-group = "test"}, "ruff"]\n')
     cmd = push.venv_rebuild_cmd(tmp_path / ".venv")
     assert " ruff" in cmd and " test" not in cmd
+
+
+def test_scratch_git_dirs_do_not_see_a_repo_enclosing_the_tmp_base(devq_dir, tmp_path):
+    """Regression: with the tmp base inside a git checkout, a scratch dir is still not in a repo."""
+    out = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    assert out.returncode != 0 or Path(out.stdout.strip()) == tmp_path
