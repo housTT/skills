@@ -57059,10 +57059,11 @@ def test_checks_record_missing_target_and_probe_config_change(env, tmp_path, mon
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.checks_fast_globs", [])
     base = _git_out(p.root, "rev-parse", "HEAD").strip()
     _git_out(p.root, "update-ref", "refs/remotes/origin/work", base)
-    (p.root / "src").mkdir(exist_ok=True)
-    _commit_files(p.root, {"src/new.dat": "docs\n"}, "docs")
+    (p.root / "docs").mkdir(exist_ok=True)
+    _commit_files(p.root, {"docs/new.md": "docs\n"}, "docs")
     run = tmp_path / "missing-run"
     run.mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
