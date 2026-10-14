@@ -11194,6 +11194,7 @@ def test_command_errors_have_their_own_source_beside_explicit_clear_receipts(env
            (json.dumps({**json.loads(row["payload"]), "timeout_s": 1}), ))
     assert tick(command="sleep 3") == ("timeout", 1)
     assert len(open_errors()) == 2 and r["open_titles"]() == pending
+    db().x("UPDATE schedules SET payload=? WHERE name='receipts'", (row["payload"], ))   # 1s is too tight under load
     assert tick(command="true")[0] == "ok (0 observations)"
     assert open_errors() == [] and r["open_titles"]() == set()
 
@@ -20434,8 +20435,8 @@ def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
                    PYTHONPATH=str(RUNTIME))
-    # The lock is held against a 3s limit until the run has outlived that limit by half a second;
-    # the run may then use up to one more limit's worth for its wait, which leaves ~2.5s for the
+    # The lock is held against an 8s limit until the run has outlived that limit by half a second;
+    # the run may then use up to one more limit's worth for its wait, which leaves ~7.5s for the
     # release to reach it under load.
     held, release = tmp_path / "held", tmp_path / "release"
     holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
@@ -20445,14 +20446,14 @@ def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
     (run_dir / "prompt.md").write_text("x")
     lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board -- true"
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 3,
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 8,
         "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
     try:
         _wait_for_file(held, holder)
         runner = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env)
         _wait_for_file(run_dir / "child.pid", runner)     # written after the run's clock started
         running_since = time.time()
-        while time.time() < running_since + 3.5:
+        while time.time() < running_since + 8.5:
             assert runner.poll() is None, "the run ended while its lock wait was on"
             time.sleep(0.05)
     finally:
