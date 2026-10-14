@@ -3181,12 +3181,12 @@ def cmd_memory(a) -> None:
         sys.exit("give the memory's text, or --forget <entry>")
     if a.text:
         print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
-    for name in a.forget or []:
-        try:
-            print(f"retired to {p.forget_memory(name, why=a.why)}")
-        except ValueError as e:
-            sys.exit(str(e))
+    done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
+    for dst in done:
+        print(f"retired to {dst}")
     memory_budget_check(p)
+    if errors:
+        sys.exit("\n".join(errors))
 
 
 def cmd_schedules(a) -> None:
@@ -5273,8 +5273,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name")
     s.add_argument("text", nargs="?")
     s.add_argument("--kind", default="fact")
-    s.add_argument("--forget", action="append", metavar="ENTRY",
-                   help="retire an entry (its name in [brackets]) to memory/archive/; repeatable")
+    s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
+                   help="retire entries (names in [brackets]) to memory/archive/: several names after one "
+                        "--forget, or the flag repeated, make one harness commit; an unknown name is "
+                        "reported and the others are still retired")
     s.add_argument("--standing", action="store_true",
                    help="an instruction that applies every time its case comes up (kept as a preference); "
                         "one finished instance never retires it")

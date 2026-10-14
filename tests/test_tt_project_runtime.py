@@ -20955,6 +20955,42 @@ def test_memory_cli_retires_an_entry(env):
     assert (p.memory_dir / "archive" / stale.name).exists() and "Old news." not in p.memory_text()
 
 
+def test_memory_cli_retires_several_entries_with_one_commit(env):
+    p = make(env)
+    olds = [p.add_memory(f"Old news {i}.", kind="fact", title=f"Old news {i}") for i in range(3)]
+    keep = p.add_memory("Still true.", kind="fact")
+    git = ["git", "-C", str(p.harness)]
+    count = lambda: int(subprocess.run([*git, "rev-list", "--count", "HEAD"], capture_output=True,
+                                       text=True).stdout)
+    before = count()
+    from ttp import cli
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--forget", olds[0].stem, f"[{olds[1].stem}]", "--forget", olds[2].stem])
+    assert count() == before + 1, "several names make one harness commit"
+    assert out.getvalue().count("retired to") == 3
+    for f in olds:
+        assert (p.memory_dir / "archive" / f.name).exists() and not f.exists()
+        assert f"memory/{f.name}" not in p.memory_index.read_text()
+    assert keep.exists() and "Still true." in p.memory_text() and "Old news" not in p.memory_text()
+    assert subprocess.run([*git, "status", "--porcelain", "--", "memory", "MEMORY.md"], capture_output=True,
+                          text=True).stdout.strip() == "", "the moves and the index are all committed"
+
+
+def test_memory_cli_reports_an_unknown_name_and_still_retires_the_others(env):
+    p = make(env)
+    a, b = (p.add_memory(f"Stale {i}.", kind="fact", title=f"Stale {i}") for i in range(2))
+    from ttp import cli
+    with pytest.raises(SystemExit, match="no-such-entry"), contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", a.stem, "no-such-entry", b.stem])
+    assert not a.exists() and not b.exists() and "Stale" not in p.memory_text()
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "-1", "--format=%s"], capture_output=True,
+                         text=True).stdout
+    assert a.stem in log and b.stem in log
+    # Nothing retirable: no commit, the error still reported.
+    done, errors = p.forget_memories(["no-such-entry"])
+    assert done == [] and len(errors) == 1
+
+
 def test_a_standing_entry_is_refused_retirement_without_a_why(env):
     p = make(env)
     from ttp import cli, coordinator as coord

@@ -1089,26 +1089,51 @@ class Project:
         `keep` names an entry that must survive (the one a `supersedes` adds). A standing entry is
         refused unless `why` names its end condition or the user's words ending it: one finished
         instance, a review's tidy-up or memory pressure never retires a duty that recurs."""
-        name, archived = self._resolve_memory_name(Path(name.strip().strip("[]")).stem, keep)
-        src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
-        if archived:
-            return dst
+        done, errors = self.forget_memories([name], keep, why)
+        if errors:
+            raise ValueError(errors[0])
+        return done[0]
+
+    def forget_memories(self, names: list[str], keep: str | None = None,
+                        why: str | None = None) -> tuple[list[Path], list[str]]:
+        """forget_memory for several entries with one MEMORY.md rewrite and one harness commit:
+        (archived paths, one error per name refused). A refused name (unknown, ambiguous, standing
+        without `why`) leaves the others retired."""
         why = " ".join((why or "").split())
-        if not why and re.search(r"^standing:[ \t]*true[ \t]*$", src.read_text().split("\n---\n", 1)[0], re.M):
-            raise ValueError(f"[{name}] is a standing instruction; nothing retired. It applies every time its "
-                             "case comes up, so one finished instance does not end it. Retire it only with a "
-                             "`why` naming its end condition or quoting the user's words ending it; to make "
-                             "it shorter, add a standing entry that supersedes it")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(src, dst)
-        fsync_dir(dst.parent)
-        fsync_dir(src.parent)
+        done, errors, moved = [], [], []
+        for raw in names:
+            try:
+                name, archived = self._resolve_memory_name(Path(raw.strip().strip("[]")).stem, keep)
+            except ValueError as e:
+                errors.append(str(e))
+                continue
+            src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
+            if archived:
+                done.append(dst)
+                continue
+            if not why and re.search(r"^standing:[ \t]*true[ \t]*$", src.read_text().split("\n---\n", 1)[0], re.M):
+                errors.append(f"[{name}] is a standing instruction; nothing retired. It applies every time its "
+                              "case comes up, so one finished instance does not end it. Retire it only with a "
+                              "`why` naming its end condition or quoting the user's words ending it; to make "
+                              "it shorter, add a standing entry that supersedes it")
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dst)
+            done.append(dst)
+            moved.append(name)
+        if not moved:
+            return done, errors
+        fsync_dir(self.memory_dir / "archive")
+        fsync_dir(self.memory_dir)
         if self.memory_index.exists():
             lines = self.memory_index.read_text().splitlines(keepends=True)
-            durable_write(self.memory_index, "".join(x for x in lines if f"](memory/{name}.md)" not in x))
-        self.commit_harness([dst, self.memory_index], f"memory retired: {name}" + (f" ({why})" if why else ""),
-                            removed=[src])
-        return dst
+            durable_write(self.memory_index, "".join(x for x in lines
+                                                     if not any(f"](memory/{n}.md)" in x for n in moved)))
+        self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in moved), self.memory_index],
+                            f"memory retired: {', '.join(moved)}" + (f" ({why})" if why else ""),
+                            removed=[self.memory_dir / f"{n}.md" for n in moved])
+        return done, errors
+
 
 OUTPUT_TAIL = 2000   # chars of a failed daemon-run command's output kept for its event or observation
 
