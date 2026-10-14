@@ -167,6 +167,11 @@ def test_check_plan_cli_preserves_identity_exit(tmp_path, monkeypatch):
 
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
+# `ttp setup` syncs every filesystem on the host (os.sync); on a busy machine that waits tens of seconds
+# for other processes' writes. The env fixture skips it in-process; subprocess runs of setup skip it the
+# same way through this launcher. The sync itself is tested in-process.
+TTP_NO_SYNC = [sys.executable, "-c", "import os, runpy, sys; os.sync = lambda: None; del sys.argv[0]; "
+               "runpy.run_path(sys.argv[0], run_name='__main__')", str(TTP)]
 # Tests without the env fixture import ttp too; each must also pass when run alone.
 sys.path.insert(0, str(RUNTIME))
 
@@ -11644,7 +11649,7 @@ def _stale_runtime(tmp_path, preload=False):
 
 def test_setup_installs_its_own_runtime_not_the_one_on_pythonpath(env, tmp_path):
     from ttp import __version__
-    r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin")],
+    r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin")],
                        env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
@@ -11711,7 +11716,7 @@ def test_setup_installs_the_plain_tt_project_shortcut_for_claude_code(env, tmp_p
     f = claude / "skills" / "tt-project" / "SKILL.md"
 
     def setup(*extra):
-        r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
+        r = subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
                            capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
         # Mask temp paths: they may hold "/tt-project" when the suite runs under a harness folder.
@@ -11746,7 +11751,7 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
     (env["home"] / "lib" / "current").symlink_to(newer)
 
     def setup(*extra):
-        return subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
+        return subprocess.run([*TTP_NO_SYNC, "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
                               capture_output=True, text=True, timeout=60)
     r = setup()
     assert r.returncode != 0 and f"ttp {_newer(__version__)} is installed" in r.stderr and "--force" in r.stderr
