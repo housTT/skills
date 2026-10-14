@@ -2968,7 +2968,7 @@ _NOT_TARGET = {x for w in _RULE_STOP | {
     "nobody", "none", "anyone", "everyone", "someone", "worker", "agent", "task", "user", "owner", "maintainer",
     "human", "admin", "operator", "coordinator", "reviewer", "let", "tell", "ask", "make", "get", "enable",
     "instruct", "change", "work", "thing", "anything", "something", "everything", "explicit", "word", "directly",
-    "ever", "pull", "request", "prs"} for x in (w, _stem(w))}
+    "ever", "pull", "request", "prs", "new", "same", "many", "few"} for x in (w, _stem(w))}
 # Kinds of target: "the main branch" and "the release branch" share only a kind, which is no overlap.
 _KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "directory", "file", "path", "box",
                              "machine", "node", "host", "server", "service", "project")}
@@ -3003,6 +3003,13 @@ def _target(sentence: str, conditions: bool = True) -> tuple[set[str], set[str]]
     return acts, objs
 
 
+def _on_object(ao: set[str], bo: set[str]) -> bool:
+    """Whether two rules' object words (_target) name the same thing: a shared word beyond a kind of
+    target, or a shared kind when one of them names nothing else."""
+    shared = ao & bo
+    return bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
+
+
 def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     """Whether two rules are about the same thing. For the guard (wide, a false hit costs one
     resend): they name the same action (_same_action) whatever its objects or conditions, or share
@@ -3013,8 +3020,7 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     alone, "Pushing is fine once CI passes", covers every object)."""
     aa, ao = _target(a, conditions=not strict)
     ba, bo = _target(b, conditions=not strict)
-    shared = ao & bo
-    on_object = bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
+    on_object = _on_object(ao, bo)
     if strict:
         return _same_action(aa, ba) and (not ao or not bo or on_object)
     return _same_action(aa, ba) or on_object
@@ -3149,9 +3155,19 @@ def _may_lift(sentence: str) -> bool:
 
 def _lifts_item(item: str, sentence: str, strict: bool = False) -> bool:
     """Whether a sentence that may lift something (_may_lift) is about what a Restrictions item bans:
-    the item bans (_BAN_RE) and the two overlap (_overlaps; `strict`: the same action on the same
-    object, as for text that says it loosens no restriction)."""
-    return bool(_BAN_RE.search(item)) and _overlaps(item, sentence, strict=strict)
+    the item bans (_BAN_RE) and the sentence names the item's action or one of its objects (`strict`:
+    the same action on the same object, _overlaps, as for text that says it loosens no restriction).
+    A generic verb ("use", "modify", "touch") names no action here: it would match every ban, so a
+    goal saying "any view set may be reordered and cached results used" would lift "Code lands on
+    the work branch". It counts only with a shared object."""
+    if not _BAN_RE.search(item):
+        return False
+    if strict:
+        return _overlaps(item, sentence, strict=True)
+    ia, io = _target(item)
+    sa, so = _target(sentence)
+    named = ia & sa - {_ANY} or "write" in ia and sa & _WRITES or "write" in sa and ia & _WRITES
+    return bool(named) or _on_object(io, so)
 
 
 def _companion_clause(quote: str, text: str) -> str:
@@ -3752,12 +3768,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 5
-CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_quote_hits",
+CHARTER_GUARD_VERSION = 6
+CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (5, "903e90fc4d2dbb1d7f5396f2078d50dfeb77d3a788f295c8af379320e7ae0723")
+CHARTER_GUARD_PIN = (6, "cbd069b1d38337ca89b078c15c43a0db516fae20b2686f983075c00987fb112d")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

@@ -7254,8 +7254,9 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
 
 def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env):
     """The guard (a false hit costs one `both_hold` resend) takes the same action whatever its
-    objects or conditions ("once CI passes" names no target), a shared target whatever the verbs,
-    and a generic verb (touch, disturb, use, modify, alter) as every action."""
+    objects or conditions ("once CI passes" names no target) and a shared target whatever the verbs.
+    A generic verb (touch, disturb, use, modify, alter) names no action of its own: with no shared
+    target, permit words alone lift nothing and the text goes in on the user's word."""
     p = make(env)
     from ttp import coordinator as coord
     for k, (ban, text) in enumerate((
@@ -7263,13 +7264,16 @@ def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env)
             ("Never push to main.", "Workers may push after a green review."),
             ("Never deploy to production.", "Workers may deploy when tests pass."),
             ("Never disturb project-b's running jobs.", "Killing project-b's stuck jobs is allowed."),
-            ("Never touch box-a.", "Rebooting box-a is fine."),
-            ("Never use the shared device.", "Workers may restart services."),
-            ("Never alter the release notes.", "Workers may deploy the docs."))):
+            ("Never touch box-a.", "Rebooting box-a is fine."))):
         p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
         err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                           turn=10 + k, user_turn=True)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
+    for k, (ban, text) in enumerate((("Never use the shared device.", "Workers may restart services."),
+                                     ("Never alter the release notes.", "Workers may deploy the docs."))):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=20 + k, user_turn=True) == [], (ban, text)
 
 
 def test_a_quote_edit_outside_a_user_turn_is_guarded_unless_it_is_refused_anyway(env):
@@ -7688,6 +7692,44 @@ def test_a_duty_that_shares_words_with_bans_and_loosens_nothing_is_not_refused(e
         assert text in " ".join(p.charter_path.read_text().split())
     assert not coord._may_lift("A harness upgrade can never be blocked.")
     assert coord._may_lift("Workers may push to main.")
+
+
+_LANDING = ("Code lands on the work branch, new task branches, or main (main moves forward only by "
+            "fast-forward merges after review).")
+_LAND_CHARTER = ("# demo\n\n## Goals\nShip it.\n\n## Restrictions\n- " + _LANDING + "\n"
+                 "- Never disturb the other project's running jobs.\n\n## Policies\nReview first.\n")
+
+
+def test_a_user_goal_with_permit_words_on_another_subject_is_not_taken_for_a_lift(env):
+    """Replays a refusal: a user's Goals update about a benchmark metric ("any view set may be
+    reordered", "now allowed", a generic verb such as "use") was refused as lifting an item about where
+    code lands. A lift must name the item's action or one of its objects; a true one is still refused."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    said = db.post("in", "new goal: parallel view rendering", chat=None, channel="web", kind="user",
+                   provenance="web-session")
+    goal = ("The metric is the throughput of rendering many views of the same scene in parallel. Any view set "
+            "may be reordered or batched, and cross-view caching that uses new kernels is now allowed.")
+    # A Goals append, and a Restrictions item the user adds: both share only generic words with the bans.
+    for turn, section, text in ((1, "Goals", goal),
+                                (2, "Restrictions", "Workers may use the scratch folder for build outputs.")):
+        p.charter_path.write_text(_LAND_CHARTER)
+        add = {"type": "charter_update", "section": section, "text": text}
+        assert coord.apply(p, [add], turn=turn, user_turn=True, messages=[said]) == [], text
+        assert text in " ".join(p.charter_path.read_text().split())
+    # A sentence that names the item's action or object is still refused on the user's word.
+    for turn, text in ((3, "Workers may merge to main without review."),
+                       (4, "Code may now land on the release branch."),
+                       (5, "Workers may now stop the other project's running jobs.")):
+        p.charter_path.write_text(_LAND_CHARTER)
+        err = coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": text}], turn=turn,
+                          user_turn=True, messages=[said])
+        assert len(err) == 1 and "contradicts the Restrictions item" in err[0], (text, err)
+        assert p.charter_path.read_text() == _LAND_CHARTER
+    # A generic verb names no action, but with a shared object it still lifts.
+    assert coord._lifts_item("Never modify the shared cache folder.", "Workers may now edit the shared cache folder.")
+    assert not coord._lifts_item(_LANDING, "Any view set may be reordered and cached results used.")
 
 
 def test_a_fixable_charter_refusal_raises_a_capped_immediate_retry(env):
