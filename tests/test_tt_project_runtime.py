@@ -42925,6 +42925,27 @@ def test_lock_queue_is_first_come_first_served(env, tmp_path):
     lk.dequeue(second)
 
 
+def test_lock_queue_gives_one_freed_slot_to_the_first_waiter(env, tmp_path):
+    from ttp import locks as lk
+    # Two slots, both held, two waiters; one slot frees. Only the first waiter may take it: a check
+    # against the slot count (index < len(paths)) would let the second one jump the queue.
+    paths = lk.slot_paths(tmp_path, "r", 2)
+    h1 = lk.try_take(paths, "h1")
+    h2 = lk.try_take(paths, "h2")
+    assert h1 is not None and h2 is not None
+    first = lk.enqueue(tmp_path, "r", "a")
+    second = lk.enqueue(tmp_path, "r", "b")
+    h1.close()
+    assert lk.take_in_turn(tmp_path, "r", second, paths, "b") is None, "the first waiter is still waiting"
+    f = lk.take_in_turn(tmp_path, "r", first, paths, "a")
+    assert f is not None, "the first waiter gets the freed slot"
+    lk.dequeue(first)
+    assert lk.take_in_turn(tmp_path, "r", second, paths, "b") is None   # its turn, but none free
+    f.close()
+    h2.close()
+    lk.dequeue(second)
+
+
 def test_lock_queue_drops_a_dead_waiter_and_keeps_fifo_order(env, tmp_path):
     from ttp import locks as lk
     # A waiter that died (killed, or the host restarted) leaves its ticket file behind, unlocked.
