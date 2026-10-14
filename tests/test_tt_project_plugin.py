@@ -1869,8 +1869,14 @@ exec sh -c "$1"
 '''
 
 FAKE_IRD = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 d = os.environ["FAKE_DIR"]
+now = time.time()
+def left(s):  # Slurm's form for time used and time left: [d-][h:]m:ss
+    if os.environ.get("FAKE_IRD_NO_LEFT"):
+        return "-"
+    d_, s = divmod(max(0, int(s)), 86400); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+    return f"{d_}-{h:02}:{m:02}:{s:02}" if d_ else f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 path = os.path.join(d, "ird.json")
 st = json.load(open(path))
 a = sys.argv[1:]
@@ -1887,8 +1893,9 @@ elif cmd == "list":
         open(fails, "w").write(str(n - 1))
         print("ssh: connect to host <ird-mgmt>: Connection timed out", file=sys.stderr); sys.exit(255)
     print("2026-10-14 08:00:00 INFO connected")
-    for r in st["reservations"]:
-        print(f"{r['id']} {r['user']} pool part {r['machine']} a b c d e {r['port']}")
+    for r in st.get("busy", []) + st["reservations"]:  # busy: other users' reservations
+        start, end = r.get("start", now - 60), r.get("end", now + 3600)
+        print(f"{r['id']} {r['user']} pool part {r['machine']} a {left(now - start)} {left(end - now)} d e {r['port']}")
 elif cmd == "reserve":
     flags, rest, i = {}, a[1:], 0
     while i < len(rest) and rest[i].startswith("--"):
@@ -1900,11 +1907,14 @@ elif cmd == "reserve":
         print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
         sys.exit(int(os.environ.get("FAKE_IRD_RC", "0")))
     rid = str(st["next_id"]); st["next_id"] += 1
-    machine = flags.get("machine", "")[len(os.environ.get("FAKE_IRD_PREFIX", "")):] or \
-        next(m[0] for m in st["machines"] if m[4] == "idle")
+    machine = flags.get("machine", "")  # `ird list`'s form; ird places a name it does not know anywhere
+    if machine not in [m[0] for m in st["machines"]]:
+        machine = next(m[0] for m in st["machines"] if m[4] == ("mixed" if machine else "idle"))
+    h, m_, s_ = map(int, flags["timeout"].split(":"))
     machine = os.environ.get("FAKE_IRD_LAND") or machine  # ird may land on another machine
     st["reservations"].append({"id": rid, "user": os.environ["FAKE_IRD_USER"], "machine": machine,
-                               "port": flags.get("ssh-port", str(40000 + int(rid)))})
+                               "port": flags.get("ssh-port", str(40000 + int(rid))),
+                               "start": now, "end": now + h * 3600 + m_ * 60 + s_})
     if os.environ.get("FAKE_IRD_ALSO"):  # another task of the same user reserves at the same time
         other = str(st["next_id"]); st["next_id"] += 1
         st["reservations"].append({"id": other, "user": os.environ["FAKE_IRD_USER"],
@@ -1930,6 +1940,14 @@ elif cmd in ("release", "change-timeout", "reboot"):
         print("no such reservation"); sys.exit(1)
     if cmd == "release":
         st["reservations"].remove(r[0])
+    if cmd == "change-timeout":  # sets the time left to the minutes given; it does not add them
+        how = os.environ.get("FAKE_IRD_EXTEND", "")
+        if how == "fail":
+            print("change-timeout: permission denied", file=sys.stderr); sys.exit(3)
+        if how == "half":  # a shorter time left than before: the expiry moves earlier
+            r[0]["end"] = now + int(a[2]) * 30
+        elif how != "noop":
+            r[0]["end"] = now + int(a[2]) * 60
     if cmd == "reboot":
         for m in st["machines"]:
             if m[0] == r[0]["machine"]:
@@ -1947,7 +1965,8 @@ class FakeIrd:
         for name, body in (("ssh", FAKE_SSH), ("ird", FAKE_IRD)):
             (bin_ / name).write_text(body)
             (bin_ / name).chmod(0o755)
-        self.state = {"next_id": 100, "reservations": [], "machines": [
+        self.state = {"next_id": 100, "reservations": [], "busy": [
+            {"id": "1", "user": "other", "machine": "m-alloc", "port": "4001"}], "machines": [
             ["m-idle", "p", "arch", "x", "idle"], ["m-mixed", "p", "arch", "x", "mixed"],
             ["m-alloc", "p", "arch", "x", "alloc"], ["m-drain", "p", "arch", "x", "draining"],
             ["m-down", "p", "arch", "x", "down*"], ["m-fail", "p", "arch", "x", "failed"],
@@ -2303,6 +2322,86 @@ def test_setup_box_ird_extend_on_demand_and_reboot_then_re_reserve(fake_ird):
     assert "m-mixed" not in out  # draining until it reboots
 
 
+def _extend_after_reserve(fake_ird, **env):
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "00:30:00", "--machine", "m-idle")
+    assert rc == 0, out
+    old = re.search(r"expires=(\S+)", out).group(1)
+    rc, out = fake_ird.run("extend", "<ird-box>", "100", "15", **env)
+    return old, rc, out
+
+
+def test_setup_box_ird_extend_passes_only_when_ird_list_shows_the_time_added(fake_ird):
+    import datetime as dt
+    old, rc, out = _extend_after_reserve(fake_ird)
+    assert rc == 0, out
+    # ird change-timeout sets the time left, so extend asks for what is left plus the minutes.
+    assert [l for l in fake_ird.ird_log() if l.startswith("change-timeout")] == ["change-timeout 100 45"]
+    new = re.search(r"^extended 100 by 15 min: expires=(\S+) \(was (\S+), \+1[45] min per ird list\)$", out, re.M)
+    assert new and new.group(2) == old, out
+    gained = dt.datetime.fromisoformat(new.group(1)) - dt.datetime.fromisoformat(old)
+    assert dt.timedelta(minutes=14) <= gained <= dt.timedelta(minutes=16), out
+    claim = json.loads((fake_ird.ird_dir / "claims" / "<ird-box>.100.json").read_text())
+    assert claim["expires"] == new.group(1)
+
+
+@pytest.mark.parametrize("how, message", [
+    ("noop", r"exited 0, but ird list shows it expiring \S+ \(was \S+, [+-]0 min, asked \+15\)"),
+    ("half", r"exited 0, but ird list shows it expiring \S+ \(was \S+, -[0-9]+ min, asked \+15\)"),
+    ("fail", r"ird change-timeout 100 45 failed \(rc 3\): change-timeout: permission denied"),
+])
+def test_setup_box_ird_extend_fails_when_no_time_was_added(fake_ird, how, message):
+    _, rc, out = _extend_after_reserve(fake_ird, FAKE_IRD_EXTEND=how)
+    assert rc == 1 and re.search(message, out) and "extended 100" not in out, out
+
+
+def test_setup_box_ird_extend_fails_on_an_expiry_it_cannot_parse(fake_ird):
+    # No time left in the ird list row: change-timeout ran, but the new expiry cannot be read.
+    _, rc, out = _extend_after_reserve(fake_ird, FAKE_IRD_NO_LEFT="1")
+    assert rc == 1 and "has no time left to read the new expiry from" in out, out
+    # A claim expiry that is no time: refuse before touching ird.
+    path = fake_ird.ird_dir / "claims" / "<ird-box>.100.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "expires": "soon"}))
+    n = len(fake_ird.ird_log())
+    rc, out = fake_ird.run("extend", "<ird-box>", "100", "15")
+    assert rc == 1 and "cannot parse the expiry 'soon' in the claim of 100; not extending" in out, out
+    assert not [l for l in fake_ird.ird_log()[n:] if l.startswith("change-timeout")]
+
+
+def test_setup_box_ird_machine_name_takes_ird_lists_form():
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_ird
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    machines = ["s1-m-a", "s1-m-b", "s1-m-c"]
+    assert box_ird.ird_name("s1-m-a", machines, ["m-b"]) == ("m-a", "")  # prefix learned from m-b
+    assert box_ird.ird_name("m-a", machines, ["m-b"]) == ("m-a", "")
+    assert box_ird.ird_name("m-a", ["m-a", "m-b"], ["m-b"]) == ("m-a", "")  # no prefix
+    assert box_ird.ird_name("s1-m-a", machines, ["s1-m-a"]) == ("s1-m-a", "")
+    name, why = box_ird.ird_name("s1-m-a", machines, [])
+    assert name == "" and "no machine in both ird lists" in why
+    name, why = box_ird.ird_name("s1-m-a", machines + ["s2-m-d"], ["m-b", "m-d"])
+    assert name == "" and "disagree" in why
+
+
+def test_setup_box_ird_reserve_passes_ird_lists_name_or_no_machine(fake_ird):
+    # list-machines prints a site prefix; ird reserve takes the name without it.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "site1-m-idle", FAKE_IRD_PREFIX="site1-")
+    assert rc == 0 and "reserved 100 machine=m-idle" in out and "warning" not in out, out
+    assert "reserve --cluster <pool> --timeout 01:00:00 --machine m-idle --no-shell <arch>" in fake_ird.ird_log()
+    # Nothing in ird list to learn the form from: leave --machine out, and still warn where it landed.
+    fake_ird.load().update(busy=[], reservations=[])
+    fake_ird.save()
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
+                           "--machine", "site1-m-mixed", FAKE_IRD_PREFIX="site1-")
+    assert rc == 0, out
+    assert "warning: cannot tell the `ird list` form of site1-m-mixed (no machine in both ird lists); " \
+        "reserving without --machine" in out, out
+    assert "reserve --cluster <pool> --timeout 01:00:00 --no-shell <arch>" in fake_ird.ird_log()
+    assert "warning: asked for site1-m-mixed, ird reserved m-idle: use m-idle" in out, out
+
+
 def test_setup_box_ird_says_so_when_ird_is_unreachable(fake_ird, tmp_path):
     import socket
     rc, out = fake_ird.run("status", "<ird-box>", FAKE_SSH_HOST="ird-mgmt.invalid")
@@ -2400,7 +2499,8 @@ def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird
         assert line in out, (line, out)
     log = fake_ird.ird_log()
     assert "reserve --cluster <pool> --timeout 00:30:00 --machine m-idle --no-shell <arch>" in log, log
-    assert [l for l in log if l.startswith("change-timeout")] == ["change-timeout 100 15"], log
+    # change-timeout sets the time left: 30 minutes left plus the 15 asked.
+    assert [l for l in log if l.startswith("change-timeout")] == ["change-timeout 100 45"], log
     assert fake_ird.load()["reservations"] == []
     assert "tt-project ird 100" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
     assert list((work / "ird-e2e").iterdir()) == []  # the per-run tree is removed
@@ -2472,6 +2572,22 @@ def test_setup_box_ird_e2e_notes_a_different_machine_only_when_it_differs(fake_i
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "PASS id 101 on m-mixed (asked for site1-m-idle; using the machine ird reserved)" in out, out
+
+
+def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env["FAKE_IRD_EXTEND"] = "noop"  # rc 0, but the time left (and so the expiry) does not move
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert re.search(r"result: FAIL at 5 extend: box.py ird extend \(rc 1\): error: ird change-timeout "
+                     r"100 45 exited 0, but ird list shows it expiring", out), out
+    assert "released: yes" in out and fake_ird.load()["reservations"] == [], out
+    env["FAKE_IRD_EXTEND"] = "fail"
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "(rc 1): error: ird change-timeout 101 45 failed (rc 3)" in out, out
 
 
 def test_setup_box_ird_e2e_trap_releases_what_an_interrupted_reserve_left(fake_ird, tmp_path):
