@@ -14760,6 +14760,70 @@ def test_an_unreachable_service_manager_with_no_live_daemon_is_not_taken_for_a_b
     _no_rollback(p, head)
 
 
+def _restart_times_out(env, monkeypatch, age=1.0):
+    """A systemd project whose `systemctl --user restart` times out (the old daemon still ends its step)."""
+    from ttp import service
+    p, head, calls = _sandboxed_systemd(env, monkeypatch, age=age)
+
+    def run(*a):
+        calls.append(a)
+        if a[:3] == ("systemctl", "--user", "restart"):
+            raise subprocess.TimeoutExpired(list(a), 60)
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    monkeypatch.setattr(service, "_run", run)
+    return p, head
+
+
+def _new_daemon_beat(p, version):
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 4343, "started": time.time(),
+                                                   "receipt": {"version": version}}))
+
+
+def test_a_timed_out_restart_whose_daemon_comes_up_on_the_new_runtime_in_the_window_succeeds(env, monkeypatch):
+    """A restart the service manager did not confirm in time is pending, not failed: the new daemon
+    reporting the runtime on disk within the re-check window is a success, exit 0 and no alert."""
+    import threading
+    from ttp import cli, service
+    p, head = _restart_times_out(env, monkeypatch)
+    disk = cli._runtime_version(p.harness / "runtime")
+    timer = threading.Timer(0.2, _new_daemon_beat, (p, disk))
+    timer.start()
+    res = service.restart(p, wait_s=2, tick_wait_s=2)
+    timer.join()
+    assert res.outcome == "running" and "timed out" in res and "re-check window" in res, res
+    assert not service.unreachable(res), "a timeout is not an unreachable service manager"
+    cli._exit_for_restart(res)                 # no SystemExit: `ttp upgrade` exits 0
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+    _no_rollback(p, head)
+
+
+def test_a_timed_out_restart_still_fails_when_no_daemon_runs_the_new_runtime_by_the_window_end(env, monkeypatch):
+    from ttp import cli, service
+    # Nothing comes up: the daemon is broken, so the runtime is rolled back, with a high alert and exit 1.
+    p, head = _restart_times_out(env, monkeypatch, age=3600)
+    (p.state / "daemon.pid").unlink()
+    t0 = time.time()
+    res = service.restart(p, wait_s=0.3, tick_wait_s=0.3)
+    assert time.time() - t0 < 5
+    assert res.outcome == "rolled_back" and "timed out" in res, res
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+    with pytest.raises(SystemExit) as e:
+        cli._exit_for_restart(res)
+    assert e.value.code == 1
+    # A daemon that comes up on another version than the runtime on disk is no success either.
+    import threading
+    p, head = _restart_times_out(env, monkeypatch)
+    timer = threading.Timer(0.1, _new_daemon_beat, (p, "0.0.1-old"))
+    timer.start()
+    res = service.restart(p, wait_s=2, tick_wait_s=2)
+    timer.join()
+    assert res.outcome == "failed" and "runs 0.0.1-old" in res, res
+    with pytest.raises(SystemExit) as e:
+        cli._exit_for_restart(res)
+    assert e.value.code == 1
+
+
 def test_a_refused_restart_keeps_the_managers_output_and_a_live_old_daemon(env, monkeypatch):
     from ttp import service
     out = "Job for x.service failed because the control process exited with error code.\nSee journalctl -xeu."
