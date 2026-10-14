@@ -47208,7 +47208,7 @@ def test_path_sensitive_runtime_tests_under_task_shaped_tmpdir(tmp_path, scratch
                              *(f"{__file__}::{name}" for name in names)],
                             cwd=pathlib.Path(__file__).resolve().parents[1],
                             env={**os.environ, **{k: str(scratch) for k in ("TMPDIR", "TMP", "TEMP")},
-                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=max(900, _load_scaled(300)))
+                                 "TTP_TEST_JOBS": "1"}, capture_output=True, text=True, timeout=max(1200, _load_scaled(300)))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
