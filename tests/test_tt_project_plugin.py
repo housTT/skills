@@ -1383,3 +1383,185 @@ def test_readme_documents_the_product_defaults():
     jev = " ".join(text.split("## Jev (optional add-on)", 1)[1].split("\n## ", 1)[0].split())
     assert "optional and off until you save a key" in jev
     assert "sends log and alert text" in jev and "outside paid service" in jev
+
+
+def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", res="", queue=""):
+    """A bin dir whose ssh runs the remote command locally, with fake Slurm tools reading files."""
+    fake = tmp_path / "fake"
+    bin_ = tmp_path / "bin"
+    fake.mkdir()
+    bin_.mkdir()
+    (fake / "node.txt").write_text(f"NodeName=node07 Arch=x86_64 CPUTot=1 {node} Reason=a State=IDLE b\n")
+    (fake / "res.txt").write_text(res)
+    (fake / "squeue.txt").write_text(queue)
+    (fake / "sinfo.txt").write_text("node07\n")
+    tools = {
+        "ssh": 'while [ "${1#-}" != "$1" ]; do shift 2; done; shift; exec bash -c "$*"',
+        "scontrol": 'case "$*" in *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
+                    '{ echo "No reservations in the system"; exit 1; };; *) cat "$FAKE/node.txt";; esac',
+        "sinfo": 'cat "$FAKE/sinfo.txt"',
+        "squeue": 'cat "$FAKE/squeue.txt"',
+        "sbatch": 'echo "$*" > "$FAKE/sbatch.args"; for a; do s=$a; done; cp "$s" "$FAKE/job.sbatch"; echo 4242',
+    }
+    for name, body in tools.items():
+        (bin_ / name).write_text(f"#!/bin/bash\n{body}\n")
+        (bin_ / name).chmod(0o755)
+    site = _site_example()
+    site["boxes"]["<box-alias>"]["workdir_root"] = str(tmp_path / "work")
+    site["boxes"]["<box-alias>"]["slurm"]["partitions"][0]["name"] = "p4"
+    site["boxes"]["<box-alias>"]["demo_nodes"] = ["demo1"]
+    site["boxes"]["<box-alias>"]["excluded_nodes"] = ["bad1"]
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    env = {k: v for k, v in os.environ.items() if k != "TTP_BOXES_FILE"}
+    env.update(PATH=f"{bin_}:{env['PATH']}", FAKE=str(fake))
+
+    def run(*a):
+        import subprocess
+        return subprocess.run([sys.executable, str(BOX_PY), "--site", str(tmp_path / "boxes.json"), "slurm", *a],
+                              capture_output=True, text=True, timeout=60, env=env)
+    return run, fake
+
+
+def test_setup_box_slurm_check_takes_only_an_idle_unreserved_node(tmp_path):
+    import datetime
+    run, fake = _fake_slurm(tmp_path)
+    r = run("check", "<box-alias>", "node07", "--partition", "p4")
+    assert r.returncode == 0 and r.stdout.startswith("ok "), r.stdout + r.stderr
+    assert run("check", "<box-alias>", "node07", "--allow", "n1,n2").stdout.startswith("refused: node07 is not in the allowed")
+    assert "demo_nodes" in run("check", "<box-alias>", "demo1").stdout
+    assert "excluded_nodes" in run("check", "<box-alias>", "bad1").stdout
+    for state in ("ALLOCATED", "MIXED", "IDLE+DRAIN", "DOWN+NOT_RESPONDING", "IDLE+RESERVED", "IDLE+MAINT"):
+        (fake / "node.txt").write_text(f"NodeName=node07 State={state} LastBusyTime=2000-01-01T00:00:00\n")
+        r = run("check", "<box-alias>", "node07")
+        assert r.returncode == 1 and f"state is {state}" in r.stdout, (state, r.stdout)
+    (fake / "node.txt").write_text("NodeName=node07 State=IDLE LastBusyTime=2000-01-01T00:00:00\n")
+    (fake / "res.txt").write_text("ReservationName=maint1 Nodes=a[01-03],node07 State=ACTIVE\n")
+    r = run("check", "<box-alias>", "node07")
+    assert r.returncode == 1 and "reservation maint1" in r.stdout
+    (fake / "res.txt").write_text("")
+    recent = (datetime.datetime.now() - datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+    (fake / "node.txt").write_text(f"NodeName=node07 State=IDLE LastBusyTime={recent}\n")
+    assert run("check", "<box-alias>", "node07").returncode == 0  # no idle minimum unless the charter sets one
+    r = run("check", "<box-alias>", "node07", "--min-idle", "120")
+    assert r.returncode == 1 and "LastBusyTime" in r.stdout
+    assert run("check", "<box-alias>", "node07", "--min-idle", "20").returncode == 0
+    (fake / "sinfo.txt").write_text("")
+    assert "not in partition p4" in run("check", "<box-alias>", "node07", "--partition", "p4").stdout
+
+
+def test_setup_box_slurm_hostlist_expansion():
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_slurm
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    assert box_slurm.expand_hostlist("n[01-03,07],m5,x[9-10]y") == ["n01", "n02", "n03", "n07", "m5", "x9y", "x10y"]
+
+
+def test_setup_box_slurm_submit_refuses_unsafe_jobs_and_prints_note_and_probe(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    co = str(tmp_path / "work" / "repo")
+    base = ["submit", "<box-alias>", "--node", "node07", "--partition", "p4", "--name", "t1",
+            "--checkout", co, "--purpose", "smoke test"]
+    r = run(*base, "--command", "make test")
+    assert r.returncode == 1 and "--time is required" in r.stdout
+    assert "not a Slurm time limit" in run(*base, "--time", "UNLIMITED", "--command", "true").stdout
+    for cmd in ("salloc -N1", "sbatch --no-shell x; make"):
+        assert "salloc and --no-shell are not allowed" in run(*base, "--time", "30", "--command", cmd).stdout
+    assert "not under workdir_root" in run(*base[:-4], "--checkout", "/tmp/x", "--purpose", "p",
+                                           "--time", "30", "--command", "true").stdout
+    assert "partition 'nope'" in run(*[("nope" if a == "p4" else a) for a in base], "--time", "30", "--command", "true").stdout
+    (fake / "node.txt").write_text("NodeName=node07 State=ALLOCATED\n")
+    assert "state is ALLOCATED" in run(*base, "--time", "30", "--command", "true").stdout
+    assert not (fake / "sbatch.args").exists()
+
+    (fake / "node.txt").write_text("NodeName=node07 State=IDLE\n")
+    r = run(*base, "--time", "1:10:00", "--devices", "0", "--command", "make test")
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = (fake / "sbatch.args").read_text()
+    assert "--parsable --exclusive -w node07 -p p4 --time=1:10:00" in args
+    script = (fake / "job.sbatch").read_text()
+    assert f"cd {co}" in script and "export TT_VISIBLE_DEVICES=0" in script and "trap cleanup EXIT" in script
+    assert (tmp_path / "work" / "runs" / "t1" / "job.sbatch").is_file()
+    note = next(ln for ln in r.stdout.splitlines() if ln.startswith("note: ttp note "))
+    for part in ("cluster <box-alias>", "job 4242", "node node07", "start ", "purpose: smoke test"):
+        assert part in note, part
+    probe = next(ln for ln in r.stdout.splitlines() if ln.startswith("retry_when: "))[len("retry_when: "):]
+    import subprocess
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "FAKE": str(fake)}
+    (fake / "squeue.txt").write_text("4242\n")
+    assert subprocess.run(probe, shell=True, env=env).returncode == 1
+    (fake / "squeue.txt").write_text("17\n")
+    assert subprocess.run(probe, shell=True, env=env).returncode == 0
+
+
+def test_setup_box_slurm_status_and_verify_clean(tmp_path):
+    run, fake = _fake_slurm(tmp_path, queue="4242|RUNNING|node07|5:00|1:10:00|node07\n")
+    r = run("status", "<box-alias>", "4242")
+    assert r.returncode == 0 and "job 4242 RUNNING node node07" in r.stdout
+    (fake / "squeue.txt").write_text("")
+    rundir = tmp_path / "work" / "runs" / "t1"
+    rundir.mkdir(parents=True)
+    (rundir / "job.log").write_text("line1\nall passed\n")
+    r = run("status", "<box-alias>", "4242", "--name", "t1")
+    assert "no longer in squeue" in r.stdout and "rc missing" in r.stdout and "all passed" in r.stdout
+    (rundir / "job.rc").write_text("0\n")
+    assert "rc 0" in run("status", "<box-alias>", "4242", "--name", "t1").stdout
+    r = run("verify-clean", "<box-alias>", "node07")
+    assert r.returncode == 0 and "clean: no job" in r.stdout and "cannot check processes" in r.stdout
+    (fake / "squeue.txt").write_text("4242 RUNNING\n")
+    r = run("verify-clean", "<box-alias>", "node07")
+    assert r.returncode == 1 and "not clean" in r.stdout
+
+
+def _run_batch_script(tmp_path, command, signal_after=None):
+    import signal
+    import subprocess
+    import time
+    sys.path.insert(0, str(BOX_PY.parent))
+    try:
+        import box_slurm
+    finally:
+        sys.path.remove(str(BOX_PY.parent))
+    co = tmp_path / "co"
+    co.mkdir()
+    rc = tmp_path / "job.rc"
+    script = tmp_path / "job.sbatch"
+    script.write_text(box_slurm.batch_script(str(co), command, str(rc), None))
+    env = {k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"}
+    p = subprocess.Popen(["bash", str(script)], cwd=tmp_path, env=env)  # not a group leader: re-execs via setsid
+    if signal_after is not None:
+        time.sleep(signal_after)
+        p.send_signal(signal.SIGTERM)
+    p.wait(timeout=30)
+    pid = int((co / "child.pid").read_text())
+    for _ in range(50):
+        if not os.path.exists(f"/proc/{pid}") or "Z" in open(f"/proc/{pid}/stat").read().split()[2]:
+            break
+        time.sleep(0.1)
+    alive = os.path.exists(f"/proc/{pid}") and "Z" not in open(f"/proc/{pid}/stat").read().split()[2]
+    return rc.read_text().strip(), alive
+
+
+def test_setup_box_slurm_batch_script_kills_its_process_group(tmp_path):
+    rc, alive = _run_batch_script(tmp_path, "sleep 300 & echo $! > child.pid; exit 3")
+    assert rc == "3" and not alive
+
+
+def test_setup_box_slurm_batch_script_cleans_up_on_term(tmp_path):
+    rc, alive = _run_batch_script(tmp_path, "sleep 300 & echo $! > child.pid; wait", signal_after=1.5)
+    assert rc == "143" and not alive
+
+
+def test_setup_box_exabox_agrees_with_worker_shared_clusters():
+    worker = (PLUGIN / "template/prompts/worker.md").read_text(encoding="utf-8")
+    shared = worker[worker.index("## Shared clusters"):worker.index("<!-- /ttp:if clusters -->")]
+    pages = {name: (SKILLS / "setup-box" / name).read_text(encoding="utf-8")
+             for name in ("exabox.md", "slurm.md")}
+    for text in (shared, *pages.values()):
+        flat = " ".join(text.split())
+        assert "sbatch" in flat
+        assert re.search(r"(Never|No interactive or no-shell allocation \() ?`salloc --no-shell`", flat)
+        assert "allocated, drained, reserved" in flat and "ttp note" in flat
+    for name, text in pages.items():
+        assert "LastBusyTime" in text, name  # what box.py slurm check reads
