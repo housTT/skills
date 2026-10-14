@@ -1159,8 +1159,8 @@ def cmd_spend_today(a) -> None:
             ack = {k: v for k, v in ack.items() if k not in ("tz", "from")}
         print(json.dumps(ack, sort_keys=True))
         raise SystemExit(rc)
+    b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
     if a.since is None:
-        b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
         a.since, a.until, _ = gcap.window(b, now)
     t = gcap.answer(a.since, a.until if a.until is not None else now + gcap.DAY, now=now)
     if a.json:
@@ -1170,7 +1170,7 @@ def cmd_spend_today(a) -> None:
     other = (f", other Claude Code sessions {gcap.money(o['usd'])} (estimated)" if o
              else ", other Claude Code sessions unknown")
     print(f"{t['host']}: {len(t['projects'])} projects, {gcap.money(sum(r['usd'] for r in t['rows']))}{other} since "
-          f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(a.since))}" +
+          f"{timefmt.long(a.since, gcap.zone(b)[0])}" +
           "".join(f"\n  could not read {e}" for e in t["errors"]))
 
 
@@ -1241,7 +1241,7 @@ def cmd_note(a) -> None:
         die("ttp note only works inside a tt-project run")
     if a.to:
         _note_to(a, run_dir)
-    durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {a.text}\n")
+    durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
 
 
 def cmd_notify(a) -> None:
@@ -1258,7 +1258,7 @@ def cmd_notify(a) -> None:
         die("empty notify")
     durable_append(Path(run_dir) / NOTIFY_FILE, json.dumps({"ts": time.time(), "severity": a.severity,
                                                            "text": text}) + "\n")
-    durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} notify: {text[:200]}\n")
+    durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} notify: {text[:200]}\n")
     print("queued for the user: it is sent when this run ends; say so in the hand-off")
 
 
@@ -2503,7 +2503,7 @@ def cmd_lock(a) -> None:
             if run_dir:
                 try:
                     with open(run_dir / "progress.md", "a") as pf:
-                        pf.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+                        pf.write(f"{timefmt.clock()} {line}\n")
                 except OSError:
                     pass
             told = time.time()

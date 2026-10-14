@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, worktree
+from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, timefmt, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
@@ -611,7 +611,7 @@ def run_note(text: str) -> None:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if run_dir:
         try:
-            durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {text}\n")
+            durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {text}\n")
         except OSError:
             pass
 

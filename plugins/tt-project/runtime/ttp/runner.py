@@ -593,18 +593,8 @@ class ProgressWatch:
 
 def _clock(env: dict) -> str:
     """'23:32:05 UTC': now in the home zone of the project in `env` (TTP_PROJECT); UTC without one."""
-    from datetime import datetime
     from . import timefmt
-    where = None
-    try:
-        base = env.get("TTP_PROJECT") or os.environ.get("TTP_PROJECT")
-        if base:
-            from .project import Project
-            where = Project(base)
-            where = timefmt.zone(where)
-    except Exception:
-        where = None
-    return datetime.now(timefmt.tzinfo(where)).strftime("%H:%M:%S %Z")
+    return timefmt.clock(env)
 
 
 def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float, holds: str | None = None,

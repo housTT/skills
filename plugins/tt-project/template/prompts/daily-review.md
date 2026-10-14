@@ -58,4 +58,4 @@ Assess the last day of this project, then hand off.
 `result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the same-day fixes
 from step 5 and the deferrals from step 7 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
 `project:` or `harness:`. Recommend disabling or slowing any recurring job that wastes money.
-`summary`: five lines max, for the user.
+`summary`: five lines max, for the user, with times in the home zone and its abbreviation, never UTC.

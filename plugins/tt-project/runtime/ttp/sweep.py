@@ -34,7 +34,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import credits, failover, holdloops, settinghold, unblock
+from . import credits, failover, holdloops, settinghold, timefmt, unblock
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -105,12 +105,13 @@ def _moved_at(db: DB, tid: int) -> float:
     return max(float((ev or {}).get("ts") or 0), float((run or {}).get("ts") or 0))
 
 
-def items(db: DB, now: float | None = None) -> list[dict]:
+def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
     unknown), since, reason, status, spec_sha}. Kinds: blocked, setting-held, waiting (not a self-wait),
     review, deferred, paused. A task's age comes from its open stuck episode (unblock._task_episodes);
     without that history (a block the coordinator set) from when the sweep first saw it in this status
-    (remember()), first seeded from its last update, so a later update (an addendum) never resets it."""
+    (remember()), first seeded from its last update, so a later update (an addendum) never resets it.
+    Times in reasons are in the home zone of `where` (a Project, its settings or a zone name; None is UTC)."""
     now = time.time() if now is None else now
     out: list[dict] = []
     since_review = db.review_since()
@@ -123,7 +124,7 @@ def items(db: DB, now: float | None = None) -> list[dict]:
                 continue
             kind, start = "deferred", d.get("since")
             reason = _clip(d.get("why") or d.get("when") or "") or (
-                f"starts after {time.strftime('%Y-%m-%d %H:%M', time.gmtime(float(t['not_before'])))} UTC"
+                f"starts after {timefmt.long(float(t['not_before']), where)}"
                 if t["not_before"] else "")
         else:
             last = _last_stuck_events(db, t["id"], 1)
@@ -265,7 +266,7 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     every = _cfg(cfg, "blocker_sweep_h", EVERY_H) * 3600
     if every <= 0:
         return None
-    live = items(db, now)
+    live = items(db, now, cfg)
     remember(db, live)
     if not live or db.one("SELECT id FROM events WHERE kind=? AND status='queued' LIMIT 1", (SWEEP_KIND,)):
         return None
@@ -334,7 +335,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     why dispatch would not start a queued task now, the daemon's own check); returns the event id."""
     now = time.time() if now is None else now
     state = db.kv(STATE_KEY, {}) or {}
-    live = items(db, now)
+    live = items(db, now, cfg)
     if not live:
         return None
     prev = state.get("items") or {}
@@ -466,10 +467,10 @@ def _settled(db: DB, key: str) -> dict:
             "spec_sha": ""}
 
 
-def _covered(db: DB, data: dict, now: float) -> list[dict]:
+def _covered(db: DB, data: dict, now: float, where=None) -> list[dict]:
     # Retain an identity even if an earlier batch unblocked it; the next batch can record closed.
     by_key = {i["key"]: i for i in data.get("snapshot", [])}
-    by_key.update({i["key"]: i for i in items(db, now)})
+    by_key.update({i["key"]: i for i in items(db, now, where)})
     return [by_key.get(k) or _settled(db, k) for k in data.get("items", [])]
 
 
@@ -481,7 +482,7 @@ def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
     if not event:
         return
     data = json.loads(event["data"] or "{}")
-    live = _covered(db, data, now)
+    live = _covered(db, data, now, cfg)
     state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
     budget = min(16000, max(2048, positive((cfg.get("coordinator") or {}).get("sweep_prompt_chars"), 12000)))
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
@@ -520,7 +521,7 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
         return []
     now = time.time() if now is None else now
     state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
-    live = {i["key"]: i for e in events for i in _covered(db, json.loads(e["data"] or "{}"), now)}
+    live = {i["key"]: i for e in events for i in _covered(db, json.loads(e["data"] or "{}"), now, cfg)}
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
     ordered = sorted(live.values(), key=lambda i: (i["key"] not in flagged and i["key"] not in loops,
                                                    -(i["age_s"] or 0)))
@@ -534,13 +535,14 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
     return out
 
 
-def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H) -> list[str]:
-    """For the daily review: every item stuck longer than `hours`, with its reason and sweep outcome."""
+def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H, where=None) -> list[str]:
+    """For the daily review: every item stuck longer than `hours`, with its reason and sweep outcome
+    (times in the home zone of `where`)."""
     now = time.time() if now is None else now
     outs = db.kv(OUTCOMES_KEY, {}) or {}
     state = db.kv(STATE_KEY, {}) or {}
     loops = state.get("loops") or {}
-    rows = [i for i in items(db, now) if i["age_s"] is not None and i["age_s"] >= hours * 3600]
+    rows = [i for i in items(db, now, where) if i["age_s"] is not None and i["age_s"] >= hours * 3600]
     if not rows:
         return [f"nothing stuck longer than {hours:g}h"]
     out = []

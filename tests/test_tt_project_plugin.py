@@ -502,6 +502,22 @@ def test_worker_prompt_quotes_log_tail_before_diagnosing_a_failed_job():
         assert part in text, part
 
 
+def test_prompts_require_home_zone_times_with_abbreviation_never_utc():
+    prompts = PLUGIN / "template" / "prompts"
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("Every time you write for the user (notes, notify, hand-off summary, drafts, reports)",
+                 "home zone from your task header, with its abbreviation (e.g. `09:30 CET`)",
+                 "never the host's, UTC or `Z`", "convert times you copy from UTC logs"):
+        assert part in worker, part
+    coord = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    for part in ("every time you show the user (replies, asks, alerts, notify, reports)",
+                 "with its abbreviation (e.g. `09:30 CET`), never the host's, UTC or `Z`",
+                 "convert times you copy from UTC logs or task output"):
+        assert part in coord, part
+    review = " ".join((prompts / "daily-review.md").read_text(encoding="utf-8").split())
+    assert "times in the home zone and its abbreviation, never UTC" in review
+
+
 def test_worker_prompt_asks_for_narrow_file_reads():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("`grep -n` first", "only the ranges you need", "Do not re-read a range you already read"):

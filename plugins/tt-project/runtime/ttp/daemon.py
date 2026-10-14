@@ -3487,7 +3487,7 @@ class Daemon:
             try:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
                 spec += (f"\n\nStuck longer than {sweep.REVIEW_LONG_H:g}h, with the blocker sweep's outcome:\n"
-                         + "\n".join(f"- {line}" for line in sweep.review_lines(db)))
+                         + "\n".join(f"- {line}" for line in sweep.review_lines(db, where=self.p)))
                 moved = failover.review_lines(db, where=self.p)
                 if moved:
                     spec += ("\n\nProvider failovers (last 24 h; tasks moved off a provider that could not "

@@ -39,8 +39,9 @@
 ## Progress
 
 - `ttp note "<one line>"` at each milestone; humans read these live.
-- Write times for the user in the project's home zone from your task header, with its abbreviation
-  (e.g. `09:30 CET`), never the host's or UTC.
+- Every time you write for the user (notes, notify, hand-off summary, drafts, reports) is in the
+  project's home zone from your task header, with its abbreviation (e.g. `09:30 CET`), never the
+  host's, UTC or `Z`: convert times you copy from UTC logs.
 - `ttp notify "<text>"` (`--severity low|normal`) only when your spec asks you to tell the user
   something; say in your hand-off that you sent it.
 - Make durable progress early (commit, write files): a killed run keeps what is on disk.

@@ -1003,7 +1003,7 @@ class Project:
             end = read_front_matter(head)
             standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
             aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
-            ends = (" (standing)" if standing else "") + (f" ({describe(end)})" if end else "")
+            ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "standing": standing, "audience": aud.group(1) if aud else "",
                         "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})

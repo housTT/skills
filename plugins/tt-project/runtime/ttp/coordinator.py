@@ -3304,10 +3304,18 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
-    """Add an update to a run's steer.md, once per `key` (see apply)."""
+    """Add an update to a run's steer.md, once per `key` (see apply), stamped in the home zone of the
+    project whose run it is (<base>/state/runs/<id>), so a worker that quotes it quotes that zone."""
     if key and _has_line(steer, f"(turn {key})"):
         return
-    durable_append(steer, f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
+    where = None
+    try:
+        if steer.parent.parent.name == "runs" and Project(steer.parent.parent.parent.parent).exists():
+            where = Project(steer.parent.parent.parent.parent)
+    except Exception:
+        where = None
+    durable_append(steer, f"\n## Update {timefmt.long(time.time(), where)}{f' (turn {key})' if key else ''}\n"
+                          f"{text.strip()}\n")
 
 
 # The host-access gate is a high-precision backstop too. It refuses an access ask only when it names,

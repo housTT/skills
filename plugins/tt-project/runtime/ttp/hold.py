@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import locks, poll_s
+from . import locks, poll_s, timefmt
 from .project import durable_write
 
 POLL_S = 2
@@ -145,7 +145,7 @@ def _settle(run_dir: Path, rec: dict, state: str, why: str) -> None:
     _write(run_dir, rec)
     try:
         with open(Path(run_dir) / "progress.md", "a") as pf:
-            pf.write(f"{time.strftime('%H:%M:%S')} {', '.join(r['resource'] for r in rec['resources'])}: {why}\n")
+            pf.write(f"{timefmt.clock()} {', '.join(r['resource'] for r in rec['resources'])}: {why}\n")
     except OSError:
         pass
 

@@ -50828,6 +50828,70 @@ def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(en
         assert re.fullmatch(r"\d\d:\d\d P[DS]T \| \w{3},? \d\d:\d\d P[DS]T\n", r.stdout), r.stdout
 
 
+def test_run_notes_memory_ends_sweep_spend_and_deploy_times_use_the_home_zone_on_a_utc_box(env, utc_box, monkeypatch):
+    """On a UTC box, a Los Angeles project's user-facing times carry PDT/PST, never UTC or 'Z': the run
+    notes people read live (ttp note, notify, push and lock lines), a temporary memory's end in the
+    prompts, the blocker sweep's deferred reason (digest and daily review), the account spend window
+    and the deploy-behind alert after a push."""
+    from datetime import datetime, timezone as dt_timezone
+    from types import SimpleNamespace
+    from ttp import cli, deploy, ends, push, sweep, timefmt
+    from ttp import coordinator as coord
+    pac = re.compile(r"\d\d:\d\d(:\d\d)? P[DS]T")
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    summer = datetime(2026, 7, 1, 12, 0, tzinfo=dt_timezone.utc).timestamp()
+    # The formatter for live lines: the project in the environment, else UTC.
+    assert timefmt.clock({"TTP_PROJECT": str(p.base)}, now=summer) == "05:00:00 PDT"
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    assert timefmt.clock({}, now=summer) == "12:00:00 UTC"
+    # Run notes: ttp note, ttp notify and a push's own note.
+    run = env["home"] / "run-tz"
+    run.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.cmd_note(SimpleNamespace(text="milestone", to=None))
+    cli.cmd_notify(SimpleNamespace(text="please review", severity="low"))
+    push.run_note("pushed")
+    notes = (run / "progress.md").read_text().splitlines()
+    assert len(notes) == 3 and all(re.match(r"\d\d:\d\d:\d\d P[DS]T ", ln) for ln in notes), notes
+    # A temporary memory's end, as the prompts show it; the file keeps its UTC stamp.
+    end = {"expires": summer}
+    assert ends.describe(end) == "ends 2026-07-01T12:00Z"
+    assert ends.describe(end, p) == "ends 2026-07-01 05:00 PDT"
+    (p.memory_dir / "fact-tz.md").write_text("---\nkind: fact\n" + ends.front_matter(end) + "---\nA box is lent out.\n")
+    [line] = [e["line"] for e in p._memory_entries() if e["name"] == "fact-tz"]
+    assert line.endswith("(ends 2026-07-01 05:00 PDT)") and "Z)" not in line, line
+    # The blocker sweep's deferred reason, in the digest's settings and the daily review's project.
+    now = time.time()
+    tid = p.db.add_task("later", "spec", kind="work", not_before=now + 3600)
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(coord.defer_labels(now + 3600, None)), tid))
+    for where in (p, p.config()):
+        [item] = [i for i in sweep.items(p.db, now, where) if i["task"] == tid]
+        assert item["reason"].startswith("starts after ") and pac.search(item["reason"]), item
+        assert " UTC" not in item["reason"]
+    assert "sweep.review_lines(db, where=self.p)" in (RUNTIME / "ttp" / "daemon.py").read_text()
+    # A coordinator update in a run's steer.md (which workers quote) is stamped in the home zone.
+    rd = p.runs / "9999"
+    rd.mkdir(parents=True)
+    coord._append_update(rd / "steer.md", "use the other board", "1.0")
+    assert re.search(r"^## Update \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T \(turn 1\.0\)$",
+                     (rd / "steer.md").read_text(), re.M), (rd / "steer.md").read_text()
+    # The deploy-behind alert an after_push's verdict raises.
+    sent = []
+    deploy._alert(p, {"name": "demo", "target": "9.9.9", "since": summer}, "behind", "files behind", summer + 7200,
+                  alert=lambda key, text, **k: sent.append(text))
+    assert "behind since 2026-07-01 05:00 PDT" in sent[0] and " UTC" not in sent[0], sent
+    # The account spend window: the budget's zone, never the box's.
+    monkeypatch.setattr(cli, "load_account_settings", lambda: {"budget": {"timezone": "America/Los_Angeles"}})
+    import ttp.globalcap as gcap
+    monkeypatch.setattr(gcap, "answer", lambda *a, **k: {"host": "h", "projects": [], "rows": [], "errors": []})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.cmd_spend_today(SimpleNamespace(receive=False, since=summer, until=None, json=False))
+    assert out.getvalue().rstrip().endswith("since 2026-07-01 05:00 PDT"), out.getvalue()
+
+
 def test_mute_heal_and_lock_holder_times_show_the_home_zone_on_a_utc_box(env, utc_box):
     """Mute lines and their end summary, a heal check's self-fix task and lock holders (local and
     shared) are in the project's home zone with its abbreviation, never the box's UTC."""

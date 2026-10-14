@@ -138,6 +138,20 @@ def short(ts: float, where, now: float | None = None) -> str:
     return datetime.fromtimestamp(ts, _tz(where)).strftime(fmt)
 
 
+def clock(env: dict | None = None, now: float | None = None) -> str:
+    """'23:32:05 PDT': now in the home zone of the project in `env` or this process's environment
+    (TTP_PROJECT), for lines people read live (a run's notes); UTC without one."""
+    where = None
+    try:
+        base = (env or {}).get("TTP_PROJECT") or os.environ.get("TTP_PROJECT")
+        if base:
+            from .project import Project
+            where = zone(Project(base))
+    except Exception:
+        where = None
+    return datetime.fromtimestamp(time.time() if now is None else now, _tz(where)).strftime("%H:%M:%S %Z")
+
+
 def abbrev(where, ts: float | None = None) -> str:
     """The zone's abbreviation at `ts` (now by default): 'UTC', or the zone's own ('<zone>')."""
     return datetime.fromtimestamp(ts if ts is not None else time.time(), _tz(where)).strftime("%Z")

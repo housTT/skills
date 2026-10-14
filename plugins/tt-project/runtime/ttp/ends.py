@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import timefmt
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
 CHARTER_HISTORY = "CHARTER.history.md"   # harness file: charter sections retired or replaced
@@ -120,9 +121,12 @@ def from_action(a: dict, now: float | None = None) -> dict:
     return out
 
 
-def describe(end: dict) -> str:
-    """'ends 2026-10-06T12:00Z, or when <until>' for prompts and alerts."""
-    parts = ([stamp(end["expires"])] if end.get("expires") else []) \
+def describe(end: dict, where=None) -> str:
+    """'ends 2026-10-06 05:00 PDT, or when <until>' for prompts and alerts, in the home zone of `where`
+    (a Project, its settings or a zone name); without one the stored UTC stamp."""
+    when = (timefmt.long(end["expires"], where) if where is not None else stamp(end["expires"])) \
+        if end.get("expires") else ""
+    parts = ([when] if when else []) \
         + ([f"when {end['until']}"] if end.get("until") else []) \
         + (["when its probe passes"] if end.get("probe") and not end.get("until") else [])
     return "ends " + ", or ".join(parts) if parts else ""
