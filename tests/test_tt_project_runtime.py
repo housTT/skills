@@ -33473,17 +33473,14 @@ def coord_settable(key, value):
     return USER_SETTABLE[key](value)
 
 
-def test_idle_slot_wake_ignores_forgotten_open_asks(env):
+def test_idle_slot_wake_ignores_open_asks(env):
     from ttp import budget as bud
     from ttp.daemon import starve_state
-    from ttp.db import OPEN_ASK_MAX_AGE_S
     p = make(env)
     gate = bud.Gate(provider="fake", regime="windows", numbers={"plan": [{"headroom": 40.0}]})
-    ask = p.db.post("out", "which option?", kind="ask")
-    now = time.time()
-    assert starve_state(p.db, p.config(), gate.as_dict(), now) is None, "a fresh open ask waits for the user"
-    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - OPEN_ASK_MAX_AGE_S - 60, ask))
-    assert starve_state(p.db, p.config(), gate.as_dict(), now), "a forgotten ask must not hold back idle-slot wakes forever"
+    p.db.post("out", "which option?", kind="ask")
+    st = starve_state(p.db, p.config(), gate.as_dict(), time.time())
+    assert st and st["wait"] > 0, "an open ask must not hold back idle-slot wakes"
 
 
 def _wake_setup(env, monkeypatch, gate=None):

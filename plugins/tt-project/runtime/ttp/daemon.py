@@ -99,7 +99,7 @@ from . import screen as scr
 from . import shared
 from . import shorttmp
 from . import worktree
-from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
+from .db import (CHANGES_NEEDED, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
                  dump_result, load_result, unplanned_abrupt, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
@@ -8198,10 +8198,10 @@ def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
     if running >= int(gate["max_parallel"]):
         return None
     # Queued work, whether ready or waiting on a retry timer, a dependency or a resource, starts by
-    # itself; an open question waits for the user. A deferred task may sit for days: it holds nothing.
+    # itself. An open question waits for the user but does not stop the wake: idle capacity can still
+    # take other work. A deferred task may sit for days: it holds nothing.
     held = [deferral(t) for t in db.q("SELECT labels FROM tasks WHERE status='queued'")]
-    if any("when" not in d and d.get("after", 0) <= now for d in held) or \
-            db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0 AND ts>?", (now - OPEN_ASK_MAX_AGE_S,)):
+    if any("when" not in d and d.get("after", 0) <= now for d in held):
         return None
     if coord.next_task_slot(db, coord.task_cap(cfg)) is not None:
         return None
