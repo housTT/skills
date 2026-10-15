@@ -15,9 +15,16 @@ The cap is the account setting `checks.host_max` (`ttp config --account checks.h
 environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it is one slot per CORES_PER_SLOT cores,
 at least one. Check commands run with HELD_ENV set, so a `ttp checks` nested in them runs at once
 instead of waiting for the slot its parent holds.
+
+Push checks (the push queue's batches and `ttp push` to the push branch) hold the push lock, so every
+approved change waits on them: they never queue behind task checks. Each push branch has one priority
+slot of its own beyond the cap (`acquire_priority`), keyed by the remote and branch so it is one per
+branch host-wide, across projects. Task checks keep their cap and their order: the priority slot never
+takes one of theirs. It is an OS file lock like the others, so a killed push frees it too.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -26,6 +33,7 @@ from typing import Callable
 from . import locks, poll_s, project
 
 RESOURCE = "checks"
+PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16
 HELD_ENV = "TTP_CHECKS_SLOT"
 POLL_S = 5.0
@@ -80,26 +88,42 @@ def paths(n: int | None = None) -> list[Path]:
     return locks.slot_paths(slot_dir(), RESOURCE, limit() if n is None else n)
 
 
+def priority_path(key: str) -> Path:
+    """The priority slot of one push branch; `key` names the branch host-wide (push.priority_key)."""
+    return slot_dir() / f"{PRIORITY}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.lock"
+
+
+def priority_paths() -> list[Path]:
+    try:
+        return sorted(slot_dir().glob(f"{PRIORITY}.*.lock"))
+    except OSError:
+        return []
+
+
 def state() -> dict:
-    """Who runs checks host-wide now and who waits: {"limit", "running": [labels], "queued": [labels]}."""
+    """Who runs checks host-wide now and who waits: {"limit", "running": [labels], "queued": [labels],
+    "priority": [labels of push checks on their priority slots]}."""
     n = limit()
     running = locks.held_labels(paths(n)) if n else []
+    priority = locks.held_labels(priority_paths()) if n else []
     queued = []
     for t in locks.queued(slot_dir(), RESOURCE):
         try:
             queued.append(t.read_text().strip())
         except OSError:
             continue
-    return {"limit": n, "running": running, "queued": queued}
+    return {"limit": n, "running": running, "queued": queued, "priority": priority}
 
 
 def line() -> str:
     """One status line, or "" when nothing runs or waits."""
     s = state()
-    if not s["running"] and not s["queued"]:
+    if not s["running"] and not s["queued"] and not s["priority"]:
         return ""
     cap = f"cap {s['limit']}" if s["limit"] else "no cap"
     out = f"host checks: {len(s['running'])} running ({cap})"
+    if s["priority"]:
+        out += f", push priority slot: {_some(s['priority'])}"
     if s["queued"]:
         out += f", {len(s['queued'])} queued: " + _some(s["queued"])
     if s["running"]:
@@ -181,3 +205,34 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         locks.dequeue(ticket)
         if told and waiting:
             waiting(False)
+
+
+def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None) -> Slot:
+    """Take the priority slot of the push branch `key` (beyond the cap, ahead of every task waiting in
+    the queue), saying so through `tell`. Only another push to the same branch can hold it; then this
+    waits for that one alone. Cap off, nested or an unwritable slot directory: no slot, run at once."""
+    n = limit()
+    if not n or os.environ.get(HELD_ENV):
+        return Slot()
+    path = priority_path(key)
+    started, told = time.time(), 0.0
+    while True:
+        try:
+            f = locks.try_take([path], holder, what)
+        except OSError as e:
+            if tell:
+                tell(f"host-wide checks cap not applied: {slot_dir()} is not writable ({e.strerror or e})")
+            return Slot()
+        if f:
+            if tell:
+                q = len(locks.queued(slot_dir(), RESOURCE))
+                tell(f"push checks took the push priority slot (beyond the host-wide cap of {n}: "
+                     f"{len(locks.held_labels(paths(n)))} task checks running"
+                     + (f", {q} queued behind" if q else "") + ")"
+                     + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
+            return Slot(f)
+        if tell and time.time() - told >= TELL_S:
+            tell(f"waiting for the push priority slot, held by another push to the same branch: "
+                 f"{_some(locks.held_labels([path])) or 'unknown'}")
+            told = time.time()
+        time.sleep(poll_s(POLL_S))

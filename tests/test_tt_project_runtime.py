@@ -24397,6 +24397,33 @@ def _run_batch(p, marker, monkeypatch):
     return batch.run_batch(p, marker), push._read(marker)
 
 
+def test_a_push_batch_runs_its_checks_on_the_priority_slot_while_task_checks_queue(env, monkeypatch, capsys):
+    """Every host-wide checks slot busy and a task waiting for one: the batch does not queue behind it."""
+    import threading
+    from ttp import checkcap
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f'echo "${{{checkcap.HELD_ENV}:-none}}" >> {log}'])
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    holder = _cap_holder("other project task #3 (run 9)")
+    got = []
+    waiter = threading.Thread(target=lambda: got.append(checkcap.acquire("task #4").close()))
+    waiter.start()
+    try:
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == 1)
+        rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+        assert rc == 0 and m["outcome"] == "pushed", m
+        assert log.read_text().split() == ["1"], "the checks ran, holding a slot"
+        assert got == [], "the queued task still waits for its own slot"
+        assert "push checks took the push priority slot (beyond the host-wide cap of 1: 1 task checks running, " \
+               "1 queued behind)" in capsys.readouterr().out
+    finally:
+        holder.kill()
+        holder.wait()
+        waiter.join(10)
+    assert got == [None] and checkcap.line() == ""
+
+
 def _statuses(m):
     return [r["status"] for r in m["results"]]
 
@@ -37591,6 +37618,87 @@ def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, mon
         s.close()
 
 
+_PRIORITY_HOLDER = ("import sys, time; sys.path.insert(0, sys.argv[1]); from ttp import checkcap; "
+                    "s = checkcap.acquire_priority(sys.argv[2], sys.argv[3]); print('held', flush=True); time.sleep(120)")
+
+
+def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    full = [checkcap.acquire("a"), checkcap.acquire("b")]
+    got = []
+
+    def take(label):
+        s = checkcap.acquire(label)
+        got.append(label)
+        s.close()
+
+    waiters = [threading.Thread(target=take, args=(x,)) for x in ("c", "d", "e")]
+    for i, t in enumerate(waiters):
+        t.start()
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+    told = []
+    push = checkcap.acquire_priority("git@example:org/repo#main", "proj push batch 5", "push checks", told.append)
+    assert push.f is not None and push.env() == {checkcap.HELD_ENV: "1"}, "it starts at once with every slot busy"
+    assert got == [], "task checks keep their cap: the priority slot is not theirs"
+    assert "push priority slot" in told[0] and "2 task checks running, 3 queued behind" in told[0]
+    st = checkcap.state()
+    assert st["priority"] == ["proj push batch 5"] and st["running"] == ["a", "b"] and len(st["queued"]) == 3
+    assert "push priority slot: proj push batch 5" in checkcap.line()
+    # One per push branch: another push to the same branch waits for it alone; another branch does not.
+    other = checkcap.acquire_priority("git@example:org/repo#dev", "proj push batch 6")
+    assert other.f is not None
+    second = []
+    t2 = threading.Thread(target=lambda: second.append(checkcap.acquire_priority("git@example:org/repo#main", "p2")))
+    t2.start()
+    time.sleep(0.3)
+    assert second == []
+    push.close()
+    t2.join(10)
+    assert second and second[0].f is not None
+    second[0].close()
+    other.close()
+    # Task checks are not starved: they still run in arrival order as their own slots free.
+    full[0].close()
+    for t in waiters:
+        t.join(10)
+    assert got == ["c", "d", "e"]
+    full[1].close()
+    assert checkcap.line() == ""
+    monkeypatch.setenv(checkcap.HELD_ENV, "1")
+    assert checkcap.acquire_priority("k", "nested").f is None, "nested in a held slot it never waits"
+
+
+def test_push_priority_slot_of_a_killed_push_is_reclaimed(env, monkeypatch):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    proc = subprocess.Popen([sys.executable, "-c", _PRIORITY_HOLDER, str(RUNTIME), "repo#main", "killed push"],
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        assert checkcap.state()["priority"] == ["killed push"]
+    finally:
+        proc.kill()
+        proc.wait()
+    assert checkcap.priority_path("repo#main").exists(), "the label stays behind"
+    assert checkcap.state()["priority"] == [] and checkcap.line() == "", "but a dead holder holds nothing"
+    s = checkcap.acquire_priority("repo#main", "next push")
+    assert s.f is not None and checkcap.state()["priority"] == ["next push"]
+    s.close()
+
+
+def test_push_priority_key_names_the_branch_host_wide(env, tmp_path):
+    from ttp import push
+    a, b = tmp_path / "a", tmp_path / "b"
+    for r, url in ((a, "https://example.com/org/repo.git"), (b, "https://example.com/org/repo/")):
+        subprocess.run(["git", "init", "-q", str(r)], check=True)
+        subprocess.run(["git", "-C", str(r), "remote", "add", "origin", url], check=True)
+    assert push.priority_key(a, "origin", "main") == push.priority_key(b, "origin", "main"), "two clones, one branch"
+    assert push.priority_key(a, "origin", "main") != push.priority_key(a, "origin", "dev")
+    assert push.priority_key(a, "nope", "main") != push.priority_key(b, "nope", "main"), "no URL: the repository"
+
+
 def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_dies(env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli, detach
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -37806,26 +37914,34 @@ def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env
     log = env["tmp"] / "slot"
     p, repo, origin, other = _push_setup(env, monkeypatch, [f'echo "${{{checkcap.HELD_ENV}:-none}}" >> {log}'])
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
-    for push_args in (["push"], ["push", "--own"]):
-        if push_args[-1] == "--own":
-            _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
-            monkeypatch.setenv("TTP_TASK", "30")
-        _commit(repo, f"{len(push_args)}.txt", "x\n")
-        holder = _cap_holder("other")
-        done = []
-        t = threading.Thread(target=lambda: done.append(_ttp(*push_args)))
-        t.start()
-        try:
-            assert _wait_for(lambda: any("ttp push" in q for q in checkcap.state()["queued"])), push_args
-            time.sleep(0.3)
-            assert not log.exists() or len(log.read_text().splitlines()) < len(push_args), "no push check runs over the cap"
-        finally:
-            holder.kill()
-            holder.wait()
-        t.join(60)
-        assert done == [0], push_args
-        assert log.read_text().splitlines()[-1] == "1", "push checks know they hold a slot"
-        assert checkcap.line() == ""
+    # `ttp push` to the push branch holds the push lock: its checks take the priority slot at once.
+    _commit(repo, "1.txt", "x\n")
+    holder = _cap_holder("other")
+    try:
+        assert _ttp("push") == 0
+        assert log.read_text().splitlines() == ["1"], "push checks know they hold a slot"
+    finally:
+        holder.kill()
+        holder.wait()
+    # `ttp push --own` publishes a task's branch: it queues like task checks.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    monkeypatch.setenv("TTP_TASK", "30")
+    _commit(repo, "2.txt", "x\n")
+    holder = _cap_holder("other")
+    done = []
+    t = threading.Thread(target=lambda: done.append(_ttp("push", "--own")))
+    t.start()
+    try:
+        assert _wait_for(lambda: any("ttp push" in q for q in checkcap.state()["queued"]))
+        time.sleep(0.3)
+        assert len(log.read_text().splitlines()) == 1, "no push --own check runs over the cap"
+    finally:
+        holder.kill()
+        holder.wait()
+    t.join(60)
+    assert done == [0]
+    assert log.read_text().splitlines()[-1] == "1"
+    assert checkcap.line() == ""
     # A push nested in a check that holds the slot runs at once instead of waiting for itself.
     holder = _cap_holder("parent")
     try:

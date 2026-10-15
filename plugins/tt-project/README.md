@@ -649,7 +649,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   their `retry_when` and exits 75 (with no project it waits on in the foreground).
   Slots are OS file locks, so a crash or reboot frees them. The default is one slot per 16 cores (at least one); set it with
   `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
-  `ttp checks` or push inside a check command does not wait for its parent's slot.
+  `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
+  gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
+  they never queue behind task checks: each push branch has one priority slot of its own beyond the
+  cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
+  and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  `ttp push --own` publishes a task's branch and queues like task checks.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.

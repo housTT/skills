@@ -1026,7 +1026,8 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
-        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"))
+        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                               priority=push.priority_key(self.repo, self.remote, self.branch))
         started = time.time()   # a wait for the host-wide slot is not check time
         try:
             for cmd in todo:

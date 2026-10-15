@@ -517,14 +517,26 @@ def _in_repo(name: str, top: str | Path) -> bool:
     return False
 
 
-def check_slot(head: str, say: Callable[[str], None], who: str = ""):
-    """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push`, `ttp push
-    --own` and the push queue count toward the same cap as `ttp checks`. Nested in a check that
-    holds one already (checkcap.HELD_ENV), it does not wait."""
+def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = ""):
+    """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
+    toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
+    push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
+    priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
+    one already (checkcap.HELD_ENV), it does not wait."""
     if not who:
         base = os.environ.get("TTP_PROJECT")
         who = checkcap.label(Project(base).name if base else None, "ttp push")
+    if priority:
+        return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say)
     return checkcap.acquire(who, f"push checks on {head[:12]}", say)
+
+
+def priority_key(repo: Path, remote: str, branch: str) -> str:
+    """The push branch as one name host-wide, whichever project or clone pushes to it: the remote's
+    URL (without a trailing .git or /) and the branch; the repository's path when it has no URL."""
+    url = _git(repo, "remote", "get-url", remote).stdout.strip() if remote else ""
+    url = re.sub(r"(\.git)?/*$", "", url) if url else str(Path(repo).resolve() / remote)
+    return f"{url}#{branch}"
 
 
 def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str, str]:
@@ -2698,7 +2710,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        with check_slot(head, say) if todo else checkcap.Slot() as slot:
+        with check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot() as slot:
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
             for cmd in todo:
