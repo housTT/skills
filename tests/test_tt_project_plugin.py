@@ -1325,13 +1325,13 @@ def _bare_env(tmp_path, *, queue="", ssh_down=False, broker=True, svc="active", 
     return env, log
 
 
-def _bare_check(tmp_path, env, *args, site=None):
+def _bare_check(tmp_path, env, *args, site=None, timeout=60):
     import subprocess
     path = tmp_path / "boxes.json"
     path.write_text(json.dumps(site or {"version": 1, "boxes": {"<box-alias>": {
         "route": "bare", "workdir_root": "~/<workdir>"}}}), encoding="utf-8")
     return subprocess.run([sys.executable, str(BOX_PY), "--site", str(path), "bare", "check", "<box-alias>", *args],
-                          capture_output=True, text=True, timeout=60, env=env)
+                          capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def test_setup_box_bare_check_ready_box(tmp_path):
@@ -1425,13 +1425,12 @@ def test_setup_box_bare_check_shows_broker_queue_for_serving_box(tmp_path):
 
 
 def test_setup_box_bare_check_bounds_a_hung_broker_queue_probe(tmp_path):
-    import time
     env, _ = _bare_env(tmp_path, machines={"<box-alias>": {"tags": ["serving"]}})
     shim = tmp_path / "bin" / "tt-device-mcp"
-    shim.write_text("#!/bin/bash\nsleep 40\n")
-    t0 = time.time()
-    r = _bare_check(tmp_path, env)
-    assert time.time() - t0 < 30, r.stdout
+    shim.write_text("#!/bin/bash\nexec sleep 3600\n")  # ends only by the probe's own 10 s bound
+    # No elapsed-time assert: "status timed out" below shows the bound fired; the generous
+    # timeout (over 10x the bound) only stops the test if the check ever waits on the probe.
+    r = _bare_check(tmp_path, env, timeout=300)
     assert "ssh: ok" in r.stdout and "disk:" in r.stdout, r.stdout
     assert "status timed out" in r.stdout, r.stdout
 
@@ -2068,7 +2067,7 @@ def test_setup_box_slurm_page_documents_survey_and_shared_last_busy_time():
         assert part in page, part
 
 
-def _run_batch_script(tmp_path, command, signal_after=None):
+def _run_batch_script(tmp_path, command, signal_on_start=False):
     import signal
     import subprocess
     import time
@@ -2084,12 +2083,15 @@ def _run_batch_script(tmp_path, command, signal_after=None):
     script.write_text(box_slurm.batch_script(str(co), command, str(rc), None))
     env = {k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"}
     p = subprocess.Popen(["bash", str(script)], cwd=tmp_path, env=env)  # not a group leader: re-execs via setsid
-    if signal_after is not None:
-        time.sleep(signal_after)
+    if signal_on_start:  # once the child runs, the script's traps are set: no race with a loaded host
+        deadline = time.monotonic() + 60
+        while not (co / "child.pid").exists() and p.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
         p.send_signal(signal.SIGTERM)
-    p.wait(timeout=30)
+    p.wait(timeout=60)
     pid = int((co / "child.pid").read_text())
-    for _ in range(50):
+    deadline = time.monotonic() + 30  # the cleanup has signalled it already; only reaping is left
+    while time.monotonic() < deadline:
         if not os.path.exists(f"/proc/{pid}") or "Z" in open(f"/proc/{pid}/stat").read().split()[2]:
             break
         time.sleep(0.1)
@@ -2103,7 +2105,7 @@ def test_setup_box_slurm_batch_script_kills_its_process_group(tmp_path):
 
 
 def test_setup_box_slurm_batch_script_cleans_up_on_term(tmp_path):
-    rc, alive = _run_batch_script(tmp_path, "sleep 300 & echo $! > child.pid; wait", signal_after=1.5)
+    rc, alive = _run_batch_script(tmp_path, "sleep 300 & echo $! > child.pid; wait", signal_on_start=True)
     assert rc == "143" and not alive
 
 
@@ -2134,7 +2136,7 @@ exec sh -c "$1"
 FAKE_IRD = r'''#!/usr/bin/env python3
 import json, os, sys, time
 d = os.environ["FAKE_DIR"]
-now = time.time()
+now = float(os.environ.get("FAKE_NOW") or time.time())  # FAKE_NOW: the clock box.py's datetime.now() reads too
 def left(s):  # Slurm's form for time used and time left: [d-][h:]m:ss
     if os.environ.get("FAKE_IRD_NO_LEFT"):
         return "-"
@@ -2156,6 +2158,9 @@ elif cmd == "list":
         open(fails, "w").write(str(n - 1))
         print("ssh: connect to host <ird-mgmt>: Connection timed out", file=sys.stderr); sys.exit(255)
     print("2026-10-14 08:00:00 INFO connected")
+    if st.get("late") and sum(l.split()[:1] == ["list"] for l in open(os.path.join(d, "ird.log"))) > 1:
+        st["reservations"] += st.pop("late")  # late: lands while the client's reserve was cut off,
+        json.dump(st, open(path, "w"))        # seen from the 2nd `ird list` on (the 1st is the snapshot)
     for r in st.get("busy", []) + st["reservations"]:  # busy: other users' reservations
         start, end = r.get("start", now - 60), r.get("end", now + 3600)
         print(f"{r['id']} {r['user']} pool part {r['machine']} a {left(now - start)} {left(end - now)} d e {r['port']}")
@@ -2166,6 +2171,8 @@ elif cmd == "reserve":
             flags["no-shell"] = True; i += 1
         else:
             flags[rest[i][2:]] = rest[i + 1]; i += 2
+    if os.environ.get("FAKE_IRD_SLEEP"):  # hangs past the caller's wait; lands nothing itself
+        time.sleep(float(os.environ["FAKE_IRD_SLEEP"])); sys.exit(0)
     if len(rest) - i != 1 or os.environ.get("FAKE_IRD_NOOP"):
         print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
         sys.exit(int(os.environ.get("FAKE_IRD_RC", "0")))
@@ -2182,8 +2189,6 @@ elif cmd == "reserve":
         other = str(st["next_id"]); st["next_id"] += 1
         st["reservations"].append({"id": other, "user": os.environ["FAKE_IRD_USER"],
                                    "machine": os.environ["FAKE_IRD_ALSO"], "port": "4999"})
-    if os.environ.get("FAKE_IRD_SLEEP"):  # lands only after the caller gave up
-        import time; time.sleep(float(os.environ["FAKE_IRD_SLEEP"]))
     if os.environ.get("FAKE_IRD_NOISE"):
         print(f"chown: changing ownership of '/home/{os.environ['FAKE_IRD_USER']}': Operation not permitted",
               file=sys.stderr)
@@ -2219,15 +2224,32 @@ json.dump(st, open(path, "w"))
 '''
 
 
+# Test-only fake clock: box.py's datetime.now() reads FAKE_NOW, the same instant the fake ird uses,
+# so expiry and extend arithmetic does not depend on how long a loaded host takes between calls.
+FROZEN_NOW = r'''import datetime as _dt, os as _os
+if _os.environ.get("FAKE_NOW"):
+    _real = _dt.datetime
+    class _Frozen(_real):
+        @classmethod
+        def now(cls, tz=None):
+            return _real.fromtimestamp(float(_os.environ["FAKE_NOW"]), tz)
+    _dt.datetime = _Frozen
+'''
+
+
 class FakeIrd:
     def __init__(self, tmp_path, port):
         import stat
+        import time
         self.dir = tmp_path / "fake"
         bin_ = self.dir / "bin"
         bin_.mkdir(parents=True)
         for name, body in (("ssh", FAKE_SSH), ("ird", FAKE_IRD)):
             (bin_ / name).write_text(body)
             (bin_ / name).chmod(0o755)
+        clock = self.dir / "clock"
+        clock.mkdir()
+        (clock / "sitecustomize.py").write_text(FROZEN_NOW)
         self.state = {"next_id": 100, "reservations": [], "busy": [
             {"id": "1", "user": "other", "machine": "m-alloc", "port": "4001"}], "machines": [
             ["m-idle", "p", "arch", "x", "idle"], ["m-mixed", "p", "arch", "x", "mixed"],
@@ -2244,7 +2266,9 @@ class FakeIrd:
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
         self.env.update(PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(self.home), FAKE_DIR=str(self.dir),
                         FAKE_SSH_HOST="127.0.0.1", FAKE_SSH_PORT=str(port), FAKE_IRD_USER="me",
-                        TTP_IRD_DIR=str(tmp_path / "ird"), TTP_PROJECT="proj", TTP_TASK="t1")
+                        TTP_IRD_DIR=str(tmp_path / "ird"), TTP_PROJECT="proj", TTP_TASK="t1",
+                        FAKE_NOW=str(int(time.time()) // 60 * 60 + 30),  # mid-minute: expiries truncate
+                        PYTHONPATH=os.pathsep.join(filter(None, [str(clock), os.environ.get("PYTHONPATH")])))
         self.ird_dir = tmp_path / "ird"
 
     def save(self):
@@ -2372,7 +2396,7 @@ def test_setup_box_ird_reserve_waits_for_a_held_reserve_lock(fake_ird):
 
 def test_setup_box_ird_reserve_timeout_says_it_may_still_land(fake_ird):
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", "--wait", "1",
-                           FAKE_IRD_SLEEP="3")
+                           FAKE_IRD_SLEEP="30")
     assert rc == 1 and "may still land" in out and "box.py ird status <ird-box>" in out, out
     assert "made no reservation" not in out
 
@@ -2455,8 +2479,12 @@ def test_setup_box_ird_same_machine_ignores_site_prefix_and_domain():
 
 
 def test_setup_box_ird_reserve_releases_what_landed_on_timeout(fake_ird, tmp_path):
+    # The reserve hangs past the wait and the reservation lands meanwhile: by ird list count, not by
+    # racing the fake's start against the wait, so a loaded host cannot reorder the two.
+    fake_ird.load()["late"] = [{"id": "100", "user": "me", "machine": "m-idle", "port": "40100"}]
+    fake_ird.save()
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", "--wait", "2",
-                           FAKE_IRD_HANG=str(tmp_path / "landed"))
+                           FAKE_IRD_SLEEP="30")
     assert rc == 1 and "timed out after 2s; reservation 100 on m-idle landed anyway: released it" in out, out
     assert fake_ird.load()["reservations"] == []
     assert [l for l in fake_ird.ird_log() if l.startswith("release")] == ["release 100"]
@@ -2670,16 +2698,16 @@ def test_setup_box_ird_extend_passes_only_when_ird_list_shows_the_time_added(fak
     # ird change-timeout sets the time left, so extend asks for what is left plus the minutes.
     # The claim's expiry has minute resolution, so the time left can read 29 min near a minute edge.
     assert [l for l in fake_ird.ird_log() if l.startswith("change-timeout")] in (["change-timeout 100 45"], ["change-timeout 100 44"])
-    new = re.search(r"^extended 100 by 15 min: expires=(\S+) \(was (\S+), \+1[456] min per ird list\)$", out, re.M)
+    new = re.search(r"^extended 100 by 15 min: expires=(\S+) \(was (\S+), \+15 min per ird list\)$", out, re.M)
     assert new and new.group(2) == old, out
     gained = dt.datetime.fromisoformat(new.group(1)) - dt.datetime.fromisoformat(old)
-    assert dt.timedelta(minutes=14) <= gained <= dt.timedelta(minutes=16), out
+    assert gained == dt.timedelta(minutes=15), out
     claim = json.loads((fake_ird.ird_dir / "claims" / "<ird-box>.100.json").read_text())
     assert claim["expires"] == new.group(1)
 
 
 @pytest.mark.parametrize("how, message", [
-    ("noop", r"exited 0, but ird list shows it expiring \S+ \(was \S+, [+-][01] min, asked \+15\)"),
+    ("noop", r"exited 0, but ird list shows it expiring \S+ \(was \S+, \+0 min, asked \+15\)"),
     ("half", r"exited 0, but ird list shows it expiring \S+ \(was \S+, -[0-9]+ min, asked \+15\)"),
     ("fail", r"ird change-timeout 100 4[45] failed \(rc 3\): change-timeout: permission denied"),
 ])
@@ -2971,14 +2999,14 @@ def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):
     r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
-    # the target is the minutes left (rounded up) plus 15: 44 when the run crosses a minute boundary
+    # the target is the minutes left (rounded up) plus 15; the fixture's frozen clock keeps it 45
     assert re.search(r"result: FAIL at 5 extend: box.py ird extend \(rc 1\): error: ird change-timeout "
-                     r"100 4[45] exited 0, but ird list shows it expiring", out), out
+                     r"100 45 exited 0, but ird list shows it expiring", out), out
     assert "released: yes" in out and fake_ird.load()["reservations"] == [], out
     env["FAKE_IRD_EXTEND"] = "fail"
     r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
     out = r.stdout + r.stderr
-    assert r.returncode == 1 and re.search(r"\(rc 1\): error: ird change-timeout 101 4[45] failed \(rc 3\)", out), out
+    assert r.returncode == 1 and re.search(r"\(rc 1\): error: ird change-timeout 101 45 failed \(rc 3\)", out), out
 
 
 def test_setup_box_ird_e2e_trap_releases_what_an_interrupted_reserve_left(fake_ird, tmp_path):
