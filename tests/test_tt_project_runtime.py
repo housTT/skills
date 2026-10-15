@@ -37233,6 +37233,52 @@ def test_queued_checks_survive_the_launching_process_exit(env, tmp_path, monkeyp
     assert cli._checks_result(run) == 0
 
 
+def _record_checks_argv(monkeypatch):
+    """Record the argv of every `ttp checks` process started in this test, then start it as usual."""
+    real, seen = subprocess.Popen, []
+
+    def popen(args, *a, **kw):
+        if isinstance(args, list) and "checks" in args:
+            seen.append([str(x) for x in args])
+        return real(args, *a, **kw)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return seen
+
+
+def test_queued_checks_keep_full(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--full", "--", "true"])
+    assert "queued" in capsys.readouterr().out
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    assert json.loads(q.read_text())["checks"]["full"] is True
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    seen = _record_checks_argv(monkeypatch)
+    detach.tend(p)
+    assert seen and "--full" in seen[-1], seen
+    assert cli._read_checks_pid(run)["full"] is True
+    assert _wait_precheck(run) == "0"
+
+
+def test_relaunched_checks_keep_full(env, tmp_path, monkeypatch):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    wt, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps({**info, "full": True}))
+    seen = _record_checks_argv(monkeypatch)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    d.wake_after_reboot()
+    assert len(_relaunches(p, tid)) == 1
+    assert seen and "--full" in seen[0], seen
+    assert _wait_precheck(run_dir) == "0"
+    assert cli._read_checks_pid(run_dir)["full"] is True
+
+
 def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, detach, push
     from ttp.runner import proc_start
@@ -62999,13 +63045,17 @@ def _fast_repo(tmp_path, files):
     return base, g("rev-parse", "HEAD")
 
 
+# Globs a project might list in delivery.checks_fast_globs to opt in; the built-in default is none.
+DOCS_GLOBS = ["*.md", "*.rst", "*.txt", "*.csv", "*.tsv"]
+
+
 def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
     from ttp import push
     base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "data/x/y.csv": b"1,2\n"})
-    assert push.fast_path(tmp_path, base, head, push.fast_globs(None))
+    assert push.fast_path(tmp_path, base, head, push.fast_globs({"delivery": {"checks_fast_globs": DOCS_GLOBS}}))
     assert not push.fast_path(tmp_path, base, head, push.fast_globs({"delivery": {"checks_fast_globs": []}}))
     assert not push.fast_path(tmp_path, base, head, [])
-    assert not push.fast_path(tmp_path, "", head, push.FAST_GLOBS)
+    assert not push.fast_path(tmp_path, "", head, DOCS_GLOBS)
     assert push.fast_globs({"delivery": {"checks_fast_globs": ["*.rst"]}}) == ["*.rst"]
 
 
@@ -63019,16 +63069,18 @@ def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
 def test_checks_fast_path_never_takes_code_build_or_installed_content(tmp_path, path):
     from ttp import push
     base, head = _fast_repo(tmp_path, {path: b"x\n"})
-    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+    assert not push.fast_path(tmp_path, base, head, DOCS_GLOBS)
     if not path.startswith(("data/", "docs/build")):   # these are kept out by the extension allowlist alone
-        assert not push.fast_path(tmp_path, base, head, [*push.FAST_GLOBS, "*"])
+        assert not push.fast_path(tmp_path, base, head, [*DOCS_GLOBS, "*"])
     assert push.fast_path(tmp_path, base, head, ["*"], exclude=[])
 
 
-def _fast_cli(env, tmp_path, monkeypatch, files, push_check, extras=()):
+def _fast_cli(env, tmp_path, monkeypatch, files, push_check, extras=(), globs=DOCS_GLOBS):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     p.set_config("delivery.push_branch", "work")
+    if globs is not None:
+        p.set_config("delivery.checks_fast_globs", list(globs))
     base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     subprocess.run([*git, "update-ref", "refs/remotes/origin/work", base], check=True)
     mark = tmp_path / "mark"
@@ -63053,6 +63105,24 @@ def test_ttp_checks_fast_path_on_a_docs_only_commit(env, tmp_path, monkeypatch, 
     from ttp import prguard
     assert not prguard.candidate_record(rec)
     assert "fast-path pass" in prguard._checks_problem(os.getcwd())
+
+
+def test_checks_fast_path_is_off_without_configured_globs(tmp_path):
+    from ttp import push
+    assert push.FAST_GLOBS == [] and push.fast_globs(None) == [] and push.fast_globs({"delivery": {}}) == []
+    base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "plugins/x/README.md": b"hi\n", "docs/n.rst": b"x\n"})
+    assert not push.fast_path(tmp_path, base, head, push.fast_globs(None))
+
+
+@pytest.mark.parametrize("files", [{"README.md": "hi\n"}, {"plugins/x/README.md": "hi\n"},
+                                   {"docs/n.md": "hi\n", "data/t.csv": "1,2\n"}])
+def test_ttp_checks_without_configured_globs_runs_the_full_checks(env, tmp_path, monkeypatch, capsys, files):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, files, True, globs=None)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" not in out and mark.exists(), "a docs-only diff skipped the project's checks by default"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "fast_path" not in rec and "skipped_project_checks" not in rec
 
 
 def test_ttp_checks_fast_path_flags_whitespace(env, tmp_path, monkeypatch, capsys):
@@ -63089,7 +63159,7 @@ def test_ttp_checks_fast_path_still_runs_commands_after_dashes(env, tmp_path, mo
 def test_checks_fast_path_falls_back_for_code_manifest_or_script(tmp_path):
     from ttp import push
     base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "tests/test_a.py": b"x\n"})
-    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+    assert not push.fast_path(tmp_path, base, head, DOCS_GLOBS)
 
 
 def test_checks_fast_checks_flag_crlf_and_trailing_whitespace(tmp_path):

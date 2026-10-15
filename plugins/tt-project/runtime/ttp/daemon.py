@@ -5820,8 +5820,8 @@ class Daemon:
         if why:
             log(self.p, f"task {tid}: the reboot killed its checks, not started again: {why}")
             return False, 0
-        argv = (["--fresh"] if info.get("fresh") else []) + (["--purpose", "harness"] if info.get("purpose") == "harness"
-                                                              else []) + [str(c) for c in cmd]
+        argv = (["--fresh"] if info.get("fresh") else []) + (["--full"] if info.get("full") else []) \
+            + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
         r = self._start_checks(Path(wt), out, f"relaunch-t{tid}", tid, argv)
         if not r:
             return False, 0

@@ -751,13 +751,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   also, when tests failed too): point the check at a venv. Before it runs checks, `ttp checks` warns
   of a venv whose `bin/python -c pass` fails (a dangling `.venv` link, or a venv made on another OS)
   and prints the command that makes it again.
-- Fast path: when a diff changes only docs or data files (`*.md`, `*.rst`, `*.txt`, `*.csv`, `*.tsv`
-  by default; never code, scripts, manifests, tests, templates or skill/prompt files), `ttp checks`
-  runs only the whitespace and CRLF checks and says so. That pass is not a full pass: it never
-  counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks anyway, and a full
-  pass already recorded for the tree is reused. A scoped `push_checks` entry that applies also
-  turns it off. `delivery.checks_fast_globs` (a list; `[]` turns it off) sets the paths and
-  `delivery.checks_fast_exclude` (a list) replaces the paths that never take it.
+- Fast path (opt-in, off by default): with no `delivery.checks_fast_globs`, every diff runs the
+  project's full checks. A project that lists globs there (for example `["docs/*.md"]`) gets the
+  fast path: when every changed path matches one and none matches `delivery.checks_fast_exclude`
+  (by default code, scripts, manifests, tests, templates and skill/prompt files; a list replaces
+  it), `ttp checks` runs only the whitespace and CRLF checks and says so. That pass is not a full
+  pass: it never counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks
+  anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
+  already recorded for the tree is reused. A scoped `push_checks` entry that applies also turns it
+  off. Known gap: a project that opts in owns its globs. A glob that covers installed or
+  test-asserted content (for example a plugin README that tests read) skips the checks those
+  changes need; list only paths nothing installs or tests.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An

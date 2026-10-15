@@ -1028,12 +1028,13 @@ def whitespace_check(base: str) -> str:
     return f"git diff --check {shlex.quote(base)} HEAD -- . {LOG_EXCLUDE}"
 
 
-# `ttp checks` fast path: a diff touching only these paths skips the heavy checks. Override with
-# delivery.checks_fast_globs (a list; an empty list turns the fast path off). Matched with fnmatch
-# against the repo-relative path, so `*` also crosses `/`.
-FAST_GLOBS = ["*.md", "*.rst", "*.txt", "*.csv", "*.tsv"]
-# Paths that never take the fast path, whatever the globs say: code, scripts, manifests, build and
-# dependency files and agent-instruction or installed-content markdown. Override with
+# `ttp checks` fast path: off unless a project lists globs in delivery.checks_fast_globs; a diff
+# touching only paths they match then skips the heavy checks. The project owns its globs: one that
+# covers installed or test-asserted content skips the checks that content needs. Matched with
+# fnmatch against the repo-relative path, so `*` also crosses `/`.
+FAST_GLOBS: list[str] = []
+# Paths that never take the fast path, whatever the configured globs say: code, scripts, manifests,
+# build and dependency files and agent-instruction or installed-content markdown. Override with
 # delivery.checks_fast_exclude (a list; it replaces these).
 FAST_EXCLUDE = ["*.py", "*.sh", "*.c", "*.cc", "*.cpp", "*.h", "*.hpp", "*.js", "*.ts", "*.json", "*.toml",
                 "*.yaml", "*.yml", "*.cfg", "*.ini", "*.cmake", "CMakeLists.txt", "*/CMakeLists.txt", "Makefile",
@@ -1051,7 +1052,7 @@ def fast_exclude(cfg: dict | None) -> list[str]:
 
 def fast_globs(cfg: dict | None) -> list[str]:
     v = ((cfg or {}).get("delivery") or {}).get("checks_fast_globs")
-    return FAST_GLOBS if v is None else [str(g) for g in v] if isinstance(v, list) else FAST_GLOBS
+    return [str(g) for g in v] if isinstance(v, list) else list(FAST_GLOBS)
 
 
 def fast_path(repo: Path, base: str, head: str, globs: list[str], exclude: list[str] | None = None) -> bool:

@@ -2207,7 +2207,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
             die("ttp checks: sandboxed detached checks need a project daemon; set TTP_PROJECT")
         detach.enqueue(p.state, rc, run_dir / CHECKS_OUT, [], top or os.getcwd(), env,
                        checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh),
-                               **_harness_purpose(a)})
+                               "full": bool(getattr(a, "full", False)), **_harness_purpose(a)})
         print("ttp checks: queued; the daemon starts them outside this command's sandbox")
     else:
         detach.withdraw(rc)   # a marker left without a request (no daemon to take it)
@@ -2276,7 +2276,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         try:
             write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
                                               "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
-                                              "fresh": bool(a.fresh), **_harness_purpose(a), "req": req, "pidns": pid_ns(),
+                                              "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
+                                              **_harness_purpose(a), "req": req, "pidns": pid_ns(),
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
             try:
