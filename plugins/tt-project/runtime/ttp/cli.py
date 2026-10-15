@@ -1788,6 +1788,7 @@ def cmd_checks(a) -> None:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
+    fast_skipped, fast_cmds = [], []
     executed, selected = [], []
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -1807,6 +1808,21 @@ def cmd_checks(a) -> None:
             if again:
                 said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
                         f"delivery.push_checks entry runs it on this head")
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
+            fcfg = p.config() if p else None
+            if todo and purpose == "candidate" and not a.full and not a.fresh \
+                    and not any(getattr(c, "if_changed", ()) for c in todo) \
+                    and not _recorded_pass(p, tree, todo, purpose) \
+                    and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
+                own_s = {str(c) for c in own}
+                fast_skipped = [str(c) for c in todo if str(c) in own_s]
+                fast_cmds = push.fast_checks(base)
+                todo = [c for c in todo if str(c) not in own_s] + fast_cmds
+                said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
+                        "only the whitespace and CRLF checks run; `ttp checks --full` runs them all (delivery.checks_fast_globs sets the paths, "
+                        "delivery.checks_fast_exclude the paths that never take it)"
+                        + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             selected = list(todo)
@@ -1910,7 +1926,10 @@ def cmd_checks(a) -> None:
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
                                                         if verified_cmds else {}),
-                                                     "purpose": purpose, **({"not_run": not_run} if not_run else {}),
+                                                     "purpose": purpose,
+                                                     **({"fast_path": True, "skipped_project_checks": fast_skipped}
+                                                        if fast_cmds else {}),
+                                                     **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
     source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
@@ -1928,6 +1947,15 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
+        extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
+        if extras:
+            _record_pass(p, tree, extras, purpose, run_dir)
+        print(f"ttp checks: FAST-PATH pass on {head[:12]} (whitespace and CRLF checks"
+              + (f" and {len(extras)} command(s) after `--`" if extras else "")
+              + f"); the project's checks did NOT run, so this is not a full pass and does not count for a PR "
+              f"(full output: {log})")
+        return
     if purpose == "candidate":
         _mark_verified(p, head, tree, list(todo) + list(verified_cmds))
     if hit:
@@ -2241,7 +2269,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
-                                      *(["--fresh"] if a.fresh else []),
+                                      *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
@@ -5198,6 +5226,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --gap: the push_checks fingerprint the waiter failed under")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
+    s.add_argument("--full", action="store_true",
+                   help="run the project's checks even for a docs/data-only diff (no fast path)")
     s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
                    help="harness: qualify a harness-preparation head with the purpose harness and untagged checks; "
                         "candidate gates are not run and the pass never counts for a PR or a push")

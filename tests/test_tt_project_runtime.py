@@ -24152,15 +24152,15 @@ def test_push_checks_see_the_push_mode_and_the_tip_they_push_onto(env, monkeypat
     _commit(other, "theirs.txt", "theirs\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     tip = _git_out(origin, "rev-parse", "proj")
-    _commit(repo, "mine.txt", "mine\n")
+    _commit(repo, "mine.dat", "mine\n")
     assert _ttp_push() == 0 and seen() == f"target {tip}"
     # --own: a branch the remote does not have yet has no tip; once published, its tip there.
     _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
     monkeypatch.setenv("TTP_TASK", "30")
-    _commit(repo, "own.txt", "1\n")
+    _commit(repo, "own.dat", "1\n")
     assert _ttp("push", "--own") == 0 and seen() == "own none"
     first = _git_out(repo, "rev-parse", "HEAD")
-    _commit(repo, "own.txt", "2\n")
+    _commit(repo, "own.dat", "2\n")
     assert _ttp("push", "--own") == 0 and seen() == f"own {first}"
     # ttp checks pushes nothing: no tip.
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
@@ -36489,7 +36489,7 @@ def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
     monkeypatch.setenv("TTP_TASK", "60")
     _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
-    _commit(repo, "mine.txt", "mine\n")
+    _commit(repo, "mine.dat", "mine\n")
     head = _git_out(repo, "rev-parse", "HEAD")
     # All skipped, nothing recorded: refused, and the message says how to fix it.
     capsys.readouterr()
@@ -36505,7 +36505,7 @@ def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project
     assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
     assert log.read_text().split() == [head, head], "the recorded check must also run on the pushed commit"
     # A record of another head does not count.
-    _commit(repo, "more.txt", "more\n")
+    _commit(repo, "more.dat", "more\n")
     capsys.readouterr()
     assert _ttp("push", "--own") == 4 and "ttp checks -- <cmd>" in capsys.readouterr().err
     assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
@@ -57271,6 +57271,7 @@ def test_checks_record_missing_target_and_probe_config_change(env, tmp_path, mon
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.checks_fast_globs", [])
     base = _git_out(p.root, "rev-parse", "HEAD").strip()
     _git_out(p.root, "update-ref", "refs/remotes/origin/work", base)
     (p.root / "docs").mkdir(exist_ok=True)
@@ -62981,3 +62982,171 @@ def test_task_show_prints_spec_handoff_and_findings(env, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["task", p.name, "show", "99999"])
     assert e.value.code != 0 and "no task #99999" in capsys.readouterr().err
+
+
+def _fast_repo(tmp_path, files):
+    import subprocess as sp
+    g = lambda *a: sp.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    g("init", "-q")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    g("add", "-A"); g("commit", "-qm", "base")
+    base = g("rev-parse", "HEAD")
+    for name, body in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(body)
+    g("add", "-A"); g("commit", "-qm", "change")
+    return base, g("rev-parse", "HEAD")
+
+
+def test_checks_fast_path_only_for_docs_and_data_diffs(tmp_path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "data/x/y.csv": b"1,2\n"})
+    assert push.fast_path(tmp_path, base, head, push.fast_globs(None))
+    assert not push.fast_path(tmp_path, base, head, push.fast_globs({"delivery": {"checks_fast_globs": []}}))
+    assert not push.fast_path(tmp_path, base, head, [])
+    assert not push.fast_path(tmp_path, "", head, push.FAST_GLOBS)
+    assert push.fast_globs({"delivery": {"checks_fast_globs": ["*.rst"]}}) == ["*.rst"]
+
+
+@pytest.mark.parametrize("path", [
+    "CMakeLists.txt", "sub/CMakeLists.txt", "requirements.txt", "requirements-dev.txt", "constraints.txt",
+    "plugins/x/skills/y/SKILL.md", "skills/y/notes.md", "plugins/x/prompts/p.md", "AGENTS.md", "CLAUDE.md",
+    "docs/conf.py", "data/gen.py", "a.sh", "m.cmake", "Makefile", "c.cpp", "h.hpp", "x.js", "x.ts", "p.json",
+    "p.toml", "p.yaml", "p.yml", "p.cfg", "p.ini",
+    "data/gen.rs", "data/main.go", "data/run.pl", "data/x.sql", "data/Dockerfile", "docs/build.bash",
+    "tests/data/golden.txt", "test/fixture.md", "plugins/x/template/CHARTER.md", "plugins/x/templates/a.txt"])
+def test_checks_fast_path_never_takes_code_build_or_installed_content(tmp_path, path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {path: b"x\n"})
+    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+    if not path.startswith(("data/", "docs/build")):   # these are kept out by the extension allowlist alone
+        assert not push.fast_path(tmp_path, base, head, [*push.FAST_GLOBS, "*"])
+    assert push.fast_path(tmp_path, base, head, ["*"], exclude=[])
+
+
+def _fast_cli(env, tmp_path, monkeypatch, files, push_check, extras=()):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_branch", "work")
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/work", base], check=True)
+    mark = tmp_path / "mark"
+    p.set_config("delivery.push_checks", [f"echo project >> {mark}"] if push_check else [])
+    for name, body in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(body)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "change"], check=True)
+    return cli, p, run, mark
+
+
+def test_ttp_checks_fast_path_on_a_docs_only_commit(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and "FAST-PATH pass" in out and "recorded for the draft PR" not in out
+    assert not mark.exists(), "the project's check ran on the fast path"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["fast_path"] is True and rec["skipped_project_checks"]
+    assert len(rec["commands"]) == 2 and all("git diff" in c for c in rec["commands"])
+    from ttp import prguard
+    assert not prguard.candidate_record(rec)
+    assert "fast-path pass" in prguard._checks_problem(os.getcwd())
+
+
+def test_ttp_checks_fast_path_flags_whitespace(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "trail \n"}, True)
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    assert not mark.exists()
+
+
+def test_ttp_checks_runs_the_project_check_for_a_mixed_docs_and_code_commit(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n", "docs/conf.py": "x = 1\n"}, True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" not in out and mark.exists()
+    assert "fast_path" not in json.loads((run / "checks.json").read_text())
+
+
+def test_ttp_checks_fast_globs_empty_turns_the_fast_path_off(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.checks_fast_globs", [])
+    cli.main(["checks"])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists()
+
+
+def test_ttp_checks_fast_path_still_runs_commands_after_dashes(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    extra = tmp_path / "extra"
+    cli.main(["checks", "--", f"echo extra >> {extra}"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and extra.exists() and not mark.exists()
+    assert json.loads((run / "checks.json").read_text())["fast_path"] is True
+
+
+def test_checks_fast_path_falls_back_for_code_manifest_or_script(tmp_path):
+    from ttp import push
+    base, head = _fast_repo(tmp_path, {"README.md": b"hi\n", "tests/test_a.py": b"x\n"})
+    assert not push.fast_path(tmp_path, base, head, push.FAST_GLOBS)
+
+
+def test_checks_fast_checks_flag_crlf_and_trailing_whitespace(tmp_path):
+    import subprocess as sp
+    from ttp import push
+    for body, rc in ((b"ok\n", 0), (b"crlf\r\n", 1), (b"trail \n", 1)):
+        d = tmp_path / str(rc) / str(len(body)); d.mkdir(parents=True)
+        base, head = _fast_repo(d, {"n.md": body})
+        rcs = [sp.run(c, shell=True, cwd=d, executable="/bin/bash", capture_output=True).returncode
+               for c in push.fast_checks(base)]
+        assert (max(rcs) != 0) == bool(rc), (body, rcs)
+
+
+def test_ttp_checks_full_runs_project_checks_and_prguard_accepts(env, tmp_path, monkeypatch, capsys):
+    from ttp import prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks", "--full"])
+    assert mark.exists() and "FAST PATH" not in capsys.readouterr().out
+    rec = json.loads((run / "checks.json").read_text())
+    assert "fast_path" not in rec and prguard.candidate_record(rec)
+    assert prguard._checks_problem(os.getcwd()) is None
+
+
+def test_ttp_checks_reuses_a_recorded_full_pass_over_the_fast_path(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks", "--full"])
+    capsys.readouterr()
+    run2 = tmp_path / "run2"
+    run2.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run2))
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "(recorded)" in out and "FAST PATH" not in out
+    assert "fast_path" not in json.loads((run2 / "checks.json").read_text())
+
+
+def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatch, capsys):
+    from ttp import prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    cli.main(["checks"])
+    msg = prguard._checks_problem(os.getcwd())
+    assert "ttp checks --full" in msg and "unset" not in msg
+
+
+def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, False)
+    p.set_config("delivery.push_checks", [{"run": f"echo scoped >> {mark}", "if_changed": "docs/*"}])
+    cli.main(["checks"])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists()
+
+
+def test_fast_config_keys_are_registered_and_validated(env):
+    from ttp import project
+    p = make(env)
+    for k in ("checks_fast_globs", "checks_fast_exclude"):
+        assert not project.unknown_key_hint(f"delivery.{k}")
+        p.set_config(f"delivery.{k}", [])
+    assert not [x for x in project.config_problems(p.config()) if "checks_fast" in x]
+    assert any("checks_fast_globs" in x for x in project.config_problems({"delivery": {"checks_fast_globs": "*.md"}}))
+    assert any("checks_fast_exclude" in x for x in project.config_problems({"delivery": {"checks_fast_exclude": 3}}))

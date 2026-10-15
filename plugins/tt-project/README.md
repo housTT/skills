@@ -751,6 +751,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   also, when tests failed too): point the check at a venv. Before it runs checks, `ttp checks` warns
   of a venv whose `bin/python -c pass` fails (a dangling `.venv` link, or a venv made on another OS)
   and prints the command that makes it again.
+- Fast path: when a diff changes only docs or data files (`*.md`, `*.rst`, `*.txt`, `*.csv`, `*.tsv`
+  by default; never code, scripts, manifests, tests, templates or skill/prompt files), `ttp checks`
+  runs only the whitespace and CRLF checks and says so. That pass is not a full pass: it never
+  counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks anyway, and a full
+  pass already recorded for the tree is reused. A scoped `push_checks` entry that applies also
+  turns it off. `delivery.checks_fast_globs` (a list; `[]` turns it off) sets the paths and
+  `delivery.checks_fast_exclude` (a list) replaces the paths that never take it.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An

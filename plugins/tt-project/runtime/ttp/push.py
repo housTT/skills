@@ -1028,6 +1028,54 @@ def whitespace_check(base: str) -> str:
     return f"git diff --check {shlex.quote(base)} HEAD -- . {LOG_EXCLUDE}"
 
 
+# `ttp checks` fast path: a diff touching only these paths skips the heavy checks. Override with
+# delivery.checks_fast_globs (a list; an empty list turns the fast path off). Matched with fnmatch
+# against the repo-relative path, so `*` also crosses `/`.
+FAST_GLOBS = ["*.md", "*.rst", "*.txt", "*.csv", "*.tsv"]
+# Paths that never take the fast path, whatever the globs say: code, scripts, manifests, build and
+# dependency files and agent-instruction or installed-content markdown. Override with
+# delivery.checks_fast_exclude (a list; it replaces these).
+FAST_EXCLUDE = ["*.py", "*.sh", "*.c", "*.cc", "*.cpp", "*.h", "*.hpp", "*.js", "*.ts", "*.json", "*.toml",
+                "*.yaml", "*.yml", "*.cfg", "*.ini", "*.cmake", "CMakeLists.txt", "*/CMakeLists.txt", "Makefile",
+                "*/Makefile", "requirements*.txt", "*/requirements*.txt", "constraints*.txt",
+                "*/constraints*.txt", "SKILL.md", "*/SKILL.md", "AGENTS.md", "*/AGENTS.md", "CLAUDE.md",
+                "*/CLAUDE.md", "skills/*", "*/skills/*", "prompts/*", "*/prompts/*",
+                "tests/*", "*/tests/*", "test/*", "*/test/*", "template/*", "*/template/*", "templates/*",
+                "*/templates/*"]
+
+
+def fast_exclude(cfg: dict | None) -> list[str]:
+    v = ((cfg or {}).get("delivery") or {}).get("checks_fast_exclude")
+    return FAST_EXCLUDE if v is None else [str(g) for g in v] if isinstance(v, list) else FAST_EXCLUDE
+
+
+def fast_globs(cfg: dict | None) -> list[str]:
+    v = ((cfg or {}).get("delivery") or {}).get("checks_fast_globs")
+    return FAST_GLOBS if v is None else [str(g) for g in v] if isinstance(v, list) else FAST_GLOBS
+
+
+def fast_path(repo: Path, base: str, head: str, globs: list[str], exclude: list[str] | None = None) -> bool:
+    """True when `base`..`head` changes at least one path and every one matches `globs` and none
+    matches `exclude` (default FAST_EXCLUDE), which always wins."""
+    import fnmatch
+    if not base or not globs:
+        return False
+    r = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", "-z", "--no-renames", base, head],
+                       capture_output=True, text=True)
+    paths = [x for x in r.stdout.split("\0") if x]
+    bad = FAST_EXCLUDE if exclude is None else exclude
+    return r.returncode == 0 and bool(paths) and all(
+        any(fnmatch.fnmatchcase(x, g) for g in globs) and not any(fnmatch.fnmatchcase(x, g) for g in bad)
+        for x in paths)
+
+
+def fast_checks(base: str) -> list[str]:
+    """The checks of the fast path: the whitespace check and a CRLF check on the added lines."""
+    q = shlex.quote(base)
+    return [whitespace_check(base),
+            f"! git diff {q} HEAD -- . {LOG_EXCLUDE} | grep -q \"$(printf '^+.*\\r$')\""]
+
+
 def unexcluded_log_checks(checks: list[str]) -> list[str]:
     """Checks running `git diff --check` that do not leave out `*.log` files: committed run logs
     would fail them. They stay as configured; `ttp doctor` names them."""
