@@ -8,7 +8,8 @@ replays the entries in order onto the target's tip in a worktree of its own (`wo
 settles the conflicts that need no judgment: version lines, both sides adding different lines at
 one spot, and both sides changing different lines that git calls a conflict only because they are
 adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
-pushes it without force. It always runs them itself and never reads the passes `ttp checks` records. When the checks fail, a binary search over prefixes finds the first failing
+pushes it without force. It always runs them itself and never reads the passes `ttp checks` records;
+it skips only a check a batch recorded passing on the same tree, command and environment (pushpass). When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
 

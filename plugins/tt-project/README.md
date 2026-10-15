@@ -861,6 +861,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `ttp push --queue` lists the entries, the last 7 days' conflict counts (conflicted, resolved in
   the batch, sent back) and the last 10 batches. Only a rejected push, a failed
   `after_push` and batches that keep dying reach the top section, and only while they last.
+- A push queue batch records each check that passes, keyed on the checked head's git tree, the
+  exact command and the environment it ran in (the interpreter and venv it uses, the active venv
+  and the target tip). A later batch on the same tree, as after a reboot cut the first, skips a
+  check recorded there as passed and logs `reused pass from <batch> (tree <short>)`. Only passes
+  are recorded: a failed check, and one skipped as not applicable, always run again. A check that
+  is one plain pytest run (no second pytest, and no `PYTHONPATH` or `PYTEST_ADDOPTS` of its own)
+  also resumes: a bundled pytest plugin records each test file whose every selected test passed,
+  and the next run of that check under the same key skips those files and runs the rest; files
+  are skipped whole, never single tests, and pytest-xdist runs never resume. The batch never reads
+  the passes `ttp checks` records. Records live under the project's state
+  (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
   to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A

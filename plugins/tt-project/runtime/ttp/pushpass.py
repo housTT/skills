@@ -6,7 +6,8 @@ reboot) does not run again a check that already passed on the same merged tree.
 A pass is keyed on the tree of the checked head, the exact check command and env_id: the
 interpreters and venv the check would use and the tip it was checked against. Only passes are
 recorded: a failure, a check skipped by if_exists or if_changed and one never run leave nothing. The
-batch reads only what a batch recorded here, never the passes `ttp checks` records. The store keeps
+batch reads only what a batch recorded here, never the passes `ttp checks` records; it trusts the
+project's state as it trusts its own markers there, which name the heads it pushes. The store keeps
 the newest MAX entries younger than MAX_AGE_S.
 
 A check that is one plain pytest run also resumes (resumable): the ttp_pytest_resume plugin appends

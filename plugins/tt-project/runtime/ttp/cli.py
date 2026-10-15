@@ -1714,8 +1714,9 @@ def cmd_checks(a) -> None:
     passed on the same tree (a reviewer checking a worker's commit, a rerun after a rebase that changed
     nothing), that pass is reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
     failure is never served as a pass. `ttp push` and the push queue never read this record and
-    always run their own checks on the exact commit they push: a forged record can at most skip a
-    local re-run, never let a change onto the branch. Where every project check is skipped on a commit,
+    run their own checks on the exact commit they push (the queue skips only a check it recorded
+    passing itself on the same tree, pushpass): a forged record here can at most skip a local re-run,
+    never let a change onto the branch. Where every project check is skipped on a commit,
     `ttp push --own` takes the commands given after `--` that this run recorded passing on exactly that
     commit and runs them itself before it pushes.
 

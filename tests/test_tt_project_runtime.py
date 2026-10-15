@@ -25245,8 +25245,13 @@ def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
     assert marker.read_bytes() == before
 
 
+def _reused(capsys, cmd):
+    """How many times the batch reused a recorded pass of `cmd` instead of running it."""
+    return sum(1 for line in capsys.readouterr().out.splitlines() if "reused pass from" in line and line.endswith(cmd))
+
+
 @pytest.mark.parametrize("bad", [1, 3, 4])
-def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, bad):
+def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, capsys, bad):
     """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
     three more check runs (ceil(log2 4) + 1). The entries before it go, the later ones are requeued."""
     log = env["tmp"] / "checks.log"
@@ -25255,7 +25260,7 @@ def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert _statuses(m) == ["pushed"] * (bad - 1) + ["check_failed"] + ["requeued"] * (4 - bad), m
     assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
-    runs = len(log.read_text().split())
+    runs = len(log.read_text().split()) + _reused(capsys, f"echo run >> {log}")   # a recheck of a tree reuses its passes
     assert runs == m["checks"]["runs"] and runs - 1 <= 3, runs
     if bad == 1:
         assert rc == 0 and m["outcome"] == "nothing" and m["pushed_sha"] is None and _bump_commits(origin) == []
@@ -25311,8 +25316,9 @@ def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_
     write_json(marker, {**push._read(marker), "bad_tip": {"tip": tip, "fresh": fresh, "cmd": "make test"}})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert _statuses(m) == want, m
-    assert m["checks"]["runs"] == runs == len(log.read_text().split()), m
-    assert "checking the tip" not in capsys.readouterr().out and "tip_passed" not in m
+    out = capsys.readouterr().out
+    assert m["checks"]["runs"] == runs == len(log.read_text().split()) + out.count(": echo run"), m
+    assert "checking the tip" not in out and "tip_passed" not in m
     if want[0] == "requeued":
         assert rc == 4 and m["outcome"] == "tip_failed" and _git_out(origin, "rev-parse", "proj") == tip
         assert m["tip_check"]["cmd"] == "make test" and "not checked alone" in m["message"]
