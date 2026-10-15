@@ -271,7 +271,14 @@ STINT_LOOKBACK_S = 14 * 86400
 ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
 ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+# task_add rejections the next turn cannot fix by resending (fixable_rejection): the work is open,
+# tried or reviewed already, or a cap holds it (its own event or wake follows); and a dropped resource
+# name, which still adds the task.
+SETTLED_REJECTIONS = ("duplicate of ", "near duplicate of ", "already tried: ", "cap of ", "the cap on ",
+                      "task_add rejected: head ", "task_add continues #", "resource ")
 MISSING_FIELDS = "task_add needs a"   # start of a rejection the next turn can fix (fixable_rejection)
+UNKNOWN_KIND = "task_add kind"   # start of an unknown-kind rejection, also one the next turn can fix
+TASK_KINDS = ("question", "code", "review", "plan", "harness", "work")   # coordinator.md's `kind` list
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
@@ -927,9 +934,17 @@ def rejection_key(text: str) -> str:
 
 
 def fixable_rejection(problem: str) -> bool:
-    """A rejected task_add the next turn can fix from its own output (a null or empty title or spec):
-    the daemon keeps that turn's user messages for the next one, once (daemon._keep_messages)."""
-    return str(problem).startswith(f"task_add: {MISSING_FIELDS} ")
+    """A rejected task_add the next turn can fix by resending it (a null title or spec, an unknown kind,
+    a bad dependency, start time or spec), so the user's request is not left with no task: the daemon
+    keeps that turn's user messages for the next one, once (daemon._keep_messages). Not a rejection the
+    work itself settles, nor a dropped resource name, which still adds the task (SETTLED_REJECTIONS)."""
+    text = str(problem)
+    return text.startswith("task_add: ") and not text[len("task_add: "):].startswith(SETTLED_REJECTIONS)
+
+
+def task_kinds(p: Project) -> set[str]:
+    """The kinds a task_add may name: TASK_KINDS and any a project's own kind-<name>.md prompt adds."""
+    return set(TASK_KINDS) | {f.name[len("kind-"):-len(".md")] for f in (p.harness / "prompts").glob("kind-*.md")}
 
 
 def digest_size(parts: list[tuple[str, str]]) -> dict:
@@ -1287,6 +1302,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if missing:
                     raise ValueError(f"{MISSING_FIELDS} {' and a '.join(missing)}: title and spec must both be "
                                      f"non-null text; resend it with both")
+                kinds = task_kinds(p)
+                if (a.get("kind") or "work") not in kinds:
+                    raise ValueError(f"{UNKNOWN_KIND} {str(a.get('kind'))[:40]!r} is not one of "
+                                     f"{', '.join(sorted(kinds))}; resend it with one of them")
                 dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')",
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):

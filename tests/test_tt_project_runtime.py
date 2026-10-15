@@ -9922,6 +9922,52 @@ def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid2,))["handled"] == 1
 
 
+def test_a_user_turns_task_add_rejected_for_a_fixable_reason_keeps_its_message(env):
+    """Any task_add rejection the next turn can fix by resending (an unknown kind, a bad dependency) keeps
+    a user turn's messages for that turn, once. One the work itself settles (a duplicate, already tried or
+    reviewed, a cap) or a dropped resource name, which still adds the task, does not."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord, reviewreuse, tried
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    (x,) = coord.apply(p, [{"type": "task_add", "title": "flaky test", "spec": "s", "kind": "investigate"}])
+    assert x.startswith("task_add: task_add kind 'investigate' is not one of") and "question" in x, x
+    assert coord.fixable_rejection(x) and not p.db.q("SELECT id FROM tasks"), "an unknown kind added a task"
+    (own := p.harness / "prompts" / "kind-triage.md").parent.mkdir(parents=True, exist_ok=True)
+    own.write_text("triage rules")
+    assert coord.apply(p, [{"type": "task_add", "title": "triage", "spec": "s", "kind": "triage"}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "plain", "spec": "s", "kind": None}]) == []
+    mid = p.db.post("in", "please look into the flaky test", chat="c1")
+    turn = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": "flaky test", "spec": "s",
+                                                    "kind": "investigate"},
+                                                   {"type": "memory_add", "text": "flaky test reported"}],
+                                       "summary": "added"}, error="", final_text="")
+    d._finish_coordinator({"id": 1, "dir": "x"}, turn, "ok", {"messages": [mid]})
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 0
+    digest = coord.digest(p, {}, [], [])
+    assert "task_add kind 'investigate'" in digest and f"user message #{mid} is shown to you again, once" in digest
+    d._finish_coordinator({"id": 2, "dir": "x"}, turn, "ok", {"messages": [mid]})
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 1
+    # Other rejections a resend fixes.
+    (dead,) = coord.apply(p, [{"type": "task_add", "title": "t2", "spec": "s", "depends_on": [999]}])
+    assert coord.fixable_rejection(dead), dead
+    # Rejections the work settles, and a dropped resource (the task is added), keep nothing.
+    p.db.add_task("busy", "the busy task's own spec", origin="user")
+    (dup,) = coord.apply(p, [{"type": "task_add", "title": "busy", "spec": "s"}])
+    (res,) = coord.apply(p, [{"type": "task_add", "title": "with a resource", "spec": "s", "resources": ["bad name!"]}])
+    p.set_config("coordinator.max_new_tasks_per_day", 0)
+    (cap,) = coord.apply(p, [{"type": "task_add", "title": "capped", "spec": "s"}])
+    entry = {"id": 7, "title": "t", "ts": 0, "date": "2026-01-01", "outcome": "shelved", "result": ""}
+    settled = [dup, res, cap, f"task_add: {tried.rejection(entry)}",
+               f"task_add: task_add rejected: {reviewreuse.rejection({'id': 7}, 'a' * 40)}",
+               "task_add: task_add continues #7 refused: the chain is over its cap; re-plan",
+               "task_update: #7 rejected: depends on #8 which is failed"]
+    for x in settled:
+        assert not coord.fixable_rejection(x), x
+    assert dup.startswith("task_add: duplicate of") and res.startswith("task_add: resource") and "cap" in cap
+
+
 def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
     p = make(env)
     from types import SimpleNamespace
