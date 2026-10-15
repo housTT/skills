@@ -3387,7 +3387,7 @@ class Daemon:
         for prov, g in gates.items():
             if g.numbers.get("account_mismatch"):
                 self.alert(f"account-mismatch:{prov}",
-                           f"{prov}'s current login has no plan readings of its own yet, so its spend counts "
+                           f"{prov}'s current account has no plan readings of its own yet, so its spend counts "
                            f"toward the dollar caps (the stricter gate) for now. This clears by itself once a run "
                            f"reports its plan windows or shows it is billed by use.",
                            severity="low")

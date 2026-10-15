@@ -1664,6 +1664,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "untried host", text)
                     raise ValueError(f"ask_user rejected: {why}")
+                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}")
+                if why:
+                    _count_refusal(db, key, "false login", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
@@ -1695,7 +1699,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
-                why = _owned_fix_question(a["text"])
+                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"])
                 if why:
                     raise ValueError(f"notify rejected: {why}")
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
@@ -3529,6 +3533,40 @@ def _untried_host_ask(p: Project, a: dict, text: str) -> str:
     return (f"the project knows how to reach {where}. Try those routes from a task first (`ssh <alias>` uses the "
             "ssh config's ProxyCommand or ProxyJump; the machines list and resource memory name the others) and "
             "act on what works. Ask only if every route fails, listing each route tried and its result")
+
+
+# Telling the user to log an agent CLI in again: only after a real auth failure, which the daemon
+# records as the provider's open auth breaker (a run refused at the login, or a login check failing
+# while it is open) and announces itself (alert auth:<provider>). Missing, old or another account's
+# plan readings are no login problem: a usage-billed account reports none. Checked in asks and notifies.
+_RELOGIN_RE = re.compile(r"\b(?:log(?:ged)?\s*(?:back\s+)?in\s+again|log\s+back\s+in|re-?log(?:ged)?(?:\s*in)?|"
+                         r"re-?authenticat\w*|logged\s+out|sign(?:ed)?\s+(?:back\s+)?in\s+again|"
+                         r"check\s+(?:the|its|which|their)\s+(?:login|account)|"
+                         r"(?:log|sign)\s+in\s+(?:to|as|with)\s+(?:the|its|another|a|your)\s+(?:plan|subscription|"
+                         r"\w+\s+account|account))\b|(?:^|\s)/login\b", re.I)
+_AGENT_WORDS = ("agent cli", "plan account", "plan readings", "plan windows", "subscription", "usage-billed",
+                "billed by use")
+
+
+def _false_login_ask(db: DB, text: str) -> str:
+    """Why a text telling the user to log an agent CLI in again is not a real login problem, or "":
+    it names a provider (or its plan or account) and no provider has an open auth breaker or auth alert."""
+    from . import alerts
+    from .providers import all_providers
+    said = text.replace("’", "'")
+    if not _RELOGIN_RE.search(said):
+        return ""
+    names = [p.name for p in all_providers()]
+    low = said.lower()
+    if not any(re.search(rf"\b{re.escape(n)}\b", low) for n in names) and not any(w in low for w in _AGENT_WORDS):
+        return ""
+    if any(alerts.breaker(db, n) for n in names) or db.one(
+            "SELECT 1 FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL LIMIT 1"):
+        return ""
+    return ("no agent CLI here is logged out: no run failed with an auth error and no login check failed (no auth "
+            "breaker is open). Missing, old or another account's plan readings are no login problem: an account "
+            "billed by use reports none, and its spend counts toward the dollar caps. Do not tell the user to log "
+            "in. A real logout opens the provider's auth breaker and the harness tells the user itself")
 
 
 # A notify about an override or recovery the project made, handing it back as a question: whether to

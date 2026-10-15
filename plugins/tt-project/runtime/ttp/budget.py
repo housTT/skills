@@ -202,7 +202,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # readings are missing): billed by use is the safe side until its next run reports them. A
         # self-clearing status line (daemon: alert account-mismatch:<provider>), not an instruction.
         g.numbers["account_mismatch"] = True
-        g.reasons.append(f"{provider}'s current login has no plan readings of its own yet"
+        g.reasons.append(f"{provider}'s current account has no plan readings of its own yet"
                          + ("; its spend counts toward the dollar caps until a run reports its plan windows"
                             if dollar_caps(b) else ""))
     elif provider in lapsed and dollar_caps(b):

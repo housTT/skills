@@ -75,7 +75,7 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
-    "account-mismatch": "{arg}'s login has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
+    "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).

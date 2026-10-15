@@ -4821,6 +4821,56 @@ def test_switch_to_usage_billed_account_is_a_neutral_line_not_needs_you(env, mon
     assert line in p.db.kv("gates")["claude"]["reasons"]
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_usage_billed_account_on_day_one_is_never_told_to_log_in(env, monkeypatch, stale):
+    """A usage-billed account before its first run: no plan readings at all (a new project), or only an
+    old plan account's (stale). Neither is a login problem: no gate reason, alert, feed line or
+    'needs you' item says log in or names the login."""
+    p = make(env)
+    from ttp import alerts, budget as bud
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+    now = time.time()
+    if stale:
+        _old_plan(p, now)
+    monkeypatch.setattr(Claude, "account", lambda self: "acct-b | contracted")
+    bud.note_account(p.db, "claude", "acct-b | contracted")
+    p.set_config("core_provider", "claude")
+    Daemon(p.base).update_gates()
+    said = list(p.db.kv("gates")["claude"]["reasons"]) + [m["text"] for m in p.db.q("SELECT text FROM messages")]
+    said += [m["text"] for m in alerts.feed(p.db, time.time())]
+    assert not [t for t in said if re.search(r"\blog(?:ged)?[ -]?(?:in|out)\b|\blogin\b", t, re.I)], said
+    assert not alerts.needs_you(p.db, time.time())
+
+
+@pytest.mark.parametrize("text", [
+    "claude is logged in to another account than its plan readings. Please log in again to the plan account.",
+    "Plan readings for claude are missing since the switch; please check which account claude is logged in as.",
+    "claude may be logged out: no plan windows reported for 2 days. Run claude there and use /login.",
+])
+def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
+    """The coordinator cannot tell the user to log an agent CLI in again from plan metering alone:
+    with no open auth breaker or auth alert the ask and the notify are refused. A real auth failure
+    (a run refused at the login opens the breaker) lets the same ask through, and a login ask about
+    something that is not an agent CLI is not this gate's."""
+    from ttp import alerts, coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    problems, ask = _ask(p, text, blocking="access", recommendation="log in once")
+    assert problems and "no agent CLI here is logged out" in problems[0] and ask is None, problems
+    assert p.db.one("SELECT 1 FROM events WHERE kind=? AND text LIKE 'false login:%'", (coord.ASK_REFUSED_KIND,))
+    problems = coord.apply(p, [{"type": "notify", "text": text, "severity": "normal"}])
+    assert problems and "notify rejected" in problems[0], problems
+    assert not p.db.one("SELECT 1 FROM messages WHERE kind='alert' AND text=?", (text,))
+    other = "The VPN portal session expired; please sign in again to the VPN."
+    assert coord._false_login_ask(p.db, other) == ""
+    Daemon(p.base).open_breaker("claude", "Failed to authenticate: OAuth session expired")
+    assert alerts.breaker(p.db, "claude")
+    assert coord._false_login_ask(p.db, text) == ""
+    problems, ask = _ask(p, text, blocking="access", recommendation="log in once")
+    assert problems == [] and ask is not None, problems
+
+
 def test_recorded_billed_change_from_the_mismatch_gate_is_no_evidence(env, monkeypatch):
     """Review #2298: budgetkind classifies the mismatch gate (dollar caps) as 'billed', so a switch
     to an account of unknown kind records a plan -> billed change after the debounce. That change
