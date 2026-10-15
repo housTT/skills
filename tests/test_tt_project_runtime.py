@@ -61490,6 +61490,33 @@ def test_a_billed_to_plan_switch_wakes_the_coordinator(env, monkeypatch):
     assert "now plan windows (five_hour, seven_day)" in ev[0]["text"]
 
 
+def test_old_plan_readings_never_make_a_billed_account_plan(env, monkeypatch):
+    """A usage-billed account holding only another account's old plan readings is billed on every
+    gate update, never 'plan', so no billed -> plan event fires. A real login switch to a plan account
+    whose run reports windows raises exactly one billed -> plan event."""
+    from ttp import budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    _fake_plan(p, ACCT_PLAN, now - 3600, util=40.0)   # account A's readings, an hour old
+    bud.note_account(p.db, "fake", ACCT_BILLED)
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',2)",
+           (ACCT_BILLED, now - 900, now - 600))
+    d = Daemon(p.base)
+    for _ in range(4):
+        d.update_gates()
+        st = p.db.kv(budgetkind.KV + "fake")
+        assert d.gates["fake"].regime != "windows", d.gates["fake"].reasons
+        assert st["parts"]["kind"] == "billed" and (st.get("pending") or {}).get("parts", {}).get("kind") != "plan", st
+    assert _bk_events(p) == []
+    bud.note_account(p.db, "fake", ACCT_PLAN2)
+    _fake_plan(p, ACCT_PLAN2, time.time(), util=20.0)
+    _bk_tick(d, monkeypatch, 4)
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "budget kind billed -> plan" in ev[0]["text"], ev
+
+
 def test_an_account_flap_on_the_same_billing_kind_wakes_nobody(env, monkeypatch):
     """The flapping case: the account label alternates between two usage-billed accounts with the
     same caps ('was billed by use ... now billed by use'). Each flap raised an event that woke the
