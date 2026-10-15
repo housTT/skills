@@ -5713,8 +5713,11 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--by", help="the project recording it (default: the project you are in)")
     m.add_argument("--covers", action="append",
                    help="what it explains, comma-separated: host, power, network, tray, chip, fabric or "
-                        "a service's name (none: the whole machine); heal checks stay quiet only for "
-                        "results it explains; co-tenant watchers read it from --json")
+                        "a service's name (none: the whole machine). A heal check stays quiet only when "
+                        "its name, resource or unit names one, never because of its output (host, power or "
+                        "network: also while it cannot reach the box), so a check named after a covered "
+                        "part stays quiet even when it fails for another reason; co-tenant watchers read "
+                        "it from --json")
     m.add_argument("--json", action="store_true", help="list the known outages as JSON")
     m.add_argument("--clear", action="store_true", help="the outage is over")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")

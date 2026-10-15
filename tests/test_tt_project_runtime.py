@@ -52862,7 +52862,8 @@ def test_heal_outage_on_another_machine_does_not_quiet_the_check(env, block):
 @pytest.mark.parametrize("finding", ["chip", "unknown"])
 def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, finding):
     """[note f7b7938ee8de232f] An outage recorded for one service (`--covers ltx`) quieted every unhealthy
-    result on the machine, so a chip loss went unnoticed for hours. Only a matching finding stays quiet."""
+    result on the machine, so a chip loss went unnoticed for hours. Only a check whose identity names a
+    covered part stays quiet."""
     from ttp import heal, timefmt
     from ttp import machine_ledger as ml
     from ttp import machines as mm
@@ -52872,8 +52873,8 @@ def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, findi
     rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="LTX")
     assert rec["covers"] == ["ltx"]
     until = timefmt.long(rec["until"], p)
-    # The covered service's finding stays quiet, as under a whole-machine outage.
-    ltx = dict(spec, check="echo 'ltx service inactive'; exit 1")
+    # The covered service's own check stays quiet, as under a whole-machine outage.
+    ltx = dict(spec, unit="ltx.service", check="echo 'ltx service inactive'; exit 1")
     assert heal.outage_explains(rec, "svc", ltx, 1, "ltx service inactive")
     assert heal.run(d, "svc", ltx, now)[0] == f"unhealthy (known outage until {until})"
     assert heal.state(p.db, "svc")["known_outage"] == "box-a"
@@ -52892,11 +52893,84 @@ def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, findi
         assert heal.outage_explains(ml.outages()["box-a"], "svc", dark, 255, "")
         assert heal.run(d, "svc", dark, now + 900) == ("ok (unknown, rc 255)", None)
         assert heal.state(p.db, "svc")["known_outage"] == "box-a"
-    # Covered words match whole words (a plural too), never inside another word.
+    # Covered words match whole words of the identity (a plural too), never inside another word.
     chip = {"covers": ["chip"]}
-    assert heal.outage_explains(chip, "svc", spec, 1, "2 chips lost")
-    assert not heal.outage_explains(chip, "svc", spec, 1, "chipset fan slow")
+    assert heal.outage_explains(chip, "chips", spec, 1, "")
+    assert heal.outage_explains(chip, "svc", dict(spec, resource="box-a-chip"), 1, "")
+    assert not heal.outage_explains(chip, "chipset-fan", spec, 1, "")
     assert heal.outage_explains({}, "svc", spec, 1, "anything at all")
+
+
+def test_heal_outage_covers_match_the_checks_identity_never_its_output(env):
+    """[note f7b7938ee8de232f] Under `--covers ltx`, a health check reporting the held service and a lost
+    chip escalates: its output never makes the outage explain it. A check named after the service stays
+    quiet, even for a chip loss: the accepted gap (heal module doc)."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="ltx")
+    out = "ltx: held (paused by user)\nchip 0 missing"
+    health = dict(spec, check="echo 'ltx: held (paused by user)'; echo 'chip 0 missing'; exit 1")
+    assert not heal.outage_explains(rec, "svc", health, 1, out)
+    assert "self-fix task" in heal.run(d, "svc", health, now)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    # The check's name, resource or unit naming the service: quiet, whatever its output says.
+    assert heal.outage_explains(rec, "ltx", spec, 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, resource="box-a-ltx"), 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, unit="ltx.service"), 1, out)
+    assert heal.run(d, "ltx", health, now)[0].startswith("unhealthy (known outage until ")
+    assert heal.state(p.db, "ltx")["known_outage"] == "box-a"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_outage_covering_the_host_explains_only_unknown_runs_that_are_no_finding(env):
+    """Under `--covers host` (power and network alike) only a run that cannot reach the box, exit 75 or
+    255, is explained: never one carrying the not-outage FINDING line (the box is up), nor another exit."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+    lost = f"chip 0 missing\n{heal.FINDING}"
+    assert heal.outage_explains(rec, "svc", spec, 255, "")
+    assert heal.outage_explains(rec, "svc", spec, 75, "ssh: connect to host timed out")
+    for rc in (75, 255):
+        assert not heal.outage_explains(rec, "svc", spec, rc, lost)
+    for rc in (1, 2, 124):
+        assert not heal.outage_explains(rec, "svc", spec, rc, "")
+    # Run by run: the finding escalates as plain unhealthy, another exit is reported, the dark run is quiet.
+    found = dict(spec, check=f"echo 'chip 0 missing'; echo '{heal.FINDING}'; exit 75")
+    assert "self-fix task" in heal.run(d, "svc", found, now)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+    assert heal.run(d, "two", dict(spec, check="exit 2"), now)[0].startswith("error: heal check exited 2")
+    assert "known_outage" not in heal.state(p.db, "two")
+    assert heal.run(d, "dark", dict(spec, check="exit 255"), now) == ("ok (unknown, rc 255)", None)
+    assert heal.state(p.db, "dark")["known_outage"] == "box-a"
+
+
+def test_heal_outage_that_does_not_explain_a_result_keeps_its_episode(env):
+    """Under `--covers host`, a check alternating between a dark run (explained) and a chip loss (not)
+    escalates once its grace has passed: a result the live outage does not explain never restarts the
+    episode. Only the outage's end does."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+    dark, lost = dict(spec, check="exit 255"), dict(spec, check="echo 'chip 0 missing'; exit 1")
+    first = heal.run(d, "svc", lost, now)[0]
+    assert first.startswith("unhealthy") and "self-fix task" not in first   # within its grace
+    assert heal.run(d, "svc", dark, now + 300) == ("ok (unknown, rc 255)", None)
+    assert "self-fix task" in heal.run(d, "svc", lost, now + 660)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
 
 
 def test_heal_back_from_a_long_unknown_stretch_starts_a_fresh_episode(env):
