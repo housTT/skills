@@ -3526,8 +3526,8 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
                     prev.pop(key, None)
             db.update_task(tid, result=dump_result(prev))
             if probe is not None:
-                from .waitheal import end_marker_only
-                end = end_marker_only(probe)
+                from .waitheal import probe_flag
+                end = probe_flag(probe)
                 said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
                                              else "cleared; it wakes at its retry timer")
                             + (f"; flagged: {end}" if end else ""))

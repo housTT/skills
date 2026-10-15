@@ -12,7 +12,9 @@ records, kept here as plain functions of a probe, its output and the project.
 - A queued task whose start_when keeps saying "not yet" while it names a device or serving resource
   is raised once: a probe waiting on a dead resource hides the outage (watched_resources).
 - A probe that waits over ssh only for an end marker file, with no check that the job's driver still
-  lives, is flagged (end_marker_only): a driver killed by a reboot or power cycle never writes it."""
+  lives, is flagged (end_marker_only): a driver killed by a reboot or power cycle never writes it.
+- A probe that greps a section header a status command always prints (`tt-device-mcp status | grep -q
+  RUNNING`) is flagged (header_grep): it matches whether or not a job is listed under it."""
 from __future__ import annotations
 
 import re
@@ -97,6 +99,30 @@ def end_marker_only(probe: str | None) -> str:
     if not _SSH_RE.search(probe) or _LIVENESS_RE.search(probe):
         return ""
     return END_MARKER_HINT if any(_END_NAME_RE.search(m) for m in _END_TEST_RE.findall(probe)) else ""
+
+
+# A grep whose whole pattern is one section header word a status listing always prints, such as the
+# device broker's RUNNING or QUEUED: the header shows with no job under it too, so the grep always matches.
+HEADER_WORDS = ("RUNNING", "QUEUED", "PENDING")
+_HEADER_GREP_RE = re.compile(r"\b[ef]?grep((?:\s+-[A-Za-z]+)*)\s+(?:-e\s+)?([\"']?)(" + "|".join(HEADER_WORDS)
+                             + r")\2(?=$|[\s;&|)])", re.I)
+HEADER_GREP_HINT = ("it greps `{word}`, a section header the status output prints even when no job is under it, "
+                    "so it always matches: test the job rows instead (a row under the section, or the jobs' "
+                    "status in the broker's JSON job list); never grep a header word that is always printed")
+
+
+def header_grep(probe: str | None) -> str:
+    """HEADER_GREP_HINT when a probe greps only a status section header word (as written, or in any
+    case with -i), else "". A flag only, never a refusal."""
+    for m in _HEADER_GREP_RE.finditer(str(probe or "")):
+        if m[3].isupper() or "i" in m[1].replace("-", ""):
+            return HEADER_GREP_HINT.format(word=m[3])
+    return ""
+
+
+def probe_flag(probe: str | None) -> str:
+    """The first flag for a wait probe that may wait wrongly (end_marker_only, header_grep), else ""."""
+    return end_marker_only(probe) or header_grep(probe)
 
 
 def never_passes(p, probe: str, rc=None, output: str = "") -> str:

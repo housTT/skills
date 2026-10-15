@@ -1,6 +1,7 @@
 # Readiness probes
 
 A `start_when` or `retry_when` that waits for a device or box checks it live and read-only (the broker's status, `tt-box-clean-probe`), never a bare marker file such as `test -f state/ready/<box>.READY`: the file outlives the box going down, so the task starts against a dead box.
+A probe on a status listing tests its job rows, never a section header word the listing always prints: `tt-device-mcp status | grep -q RUNNING` matches with nothing running, because the RUNNING header shows with no job under it, so a `start_when` or `end_when` built that way never waits. Test a row under the section (a job id, owner or command), or the job `status` fields of the broker's JSON job list (`tt-box-clean-probe` reads it). `task_add`/`task_update`, `ttp task add --start-when`, `ttp task set-when` and a waiting task's `retry_when` flag (never refuse) a grep whose whole pattern is such a header word (runtime `waitheal.header_grep`).
 A wait for a broker hold to end checks with `ttp broker-released` (runtime `brokerhold.py`), which counts /health `held` false with a healthy fsm, a `hold released` log line and a `device_released` event alike: a check that only looks for one of them misses a release the broker reported another way.
 A marker that is used is removed by whatever writes it when the resource is paused, shows trouble or fails its probe.
 `task_add`/`task_update`, `ttp task add --start-when` and `ttp task set-when` flag (never refuse) a probe that only tests a readiness marker.

@@ -118,7 +118,8 @@ Each field's rules are in the section named; the table only lists them.
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
   entries it replaces in the same turn.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status),
-  never a marker file a dead box leaves behind.
+  never a marker file a dead box leaves behind. It tests job rows, never a section header the
+  status always prints (`grep -q RUNNING` always matches).
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
 <!-- ttp:if push_branch -->

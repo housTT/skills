@@ -43979,6 +43979,39 @@ def test_a_probe_waiting_over_ssh_only_for_an_end_marker_is_flagged(env, probe, 
     assert "; flagged: it waits over ssh only for an end marker" in cli.set_when(p.db, tid, probe, p)
 
 
+# A device broker's status always prints its section headers, with or without a job under them.
+_STATUS_EMPTY_RUNNING = "device OK\nRUNNING\nQUEUED\n  #12 tenant pytest -k smoke\n"
+_ROWS_UNDER_RUNNING = "awk '/^RUNNING/{f=1;next} /^[A-Z]/{f=0} f&&NF{n++} END{exit !n}'"   # 0: a job runs
+
+
+@pytest.mark.parametrize("busy, flagged", [
+    ("grep -q RUNNING", True),
+    ("grep -qi 'running'", True),
+    ('grep -q -e "QUEUED"', True),
+    (_ROWS_UNDER_RUNNING, False),
+    ("grep -q 'RUNNING.*#[0-9]'", False),
+    ("grep -q running", False),          # case-sensitive: not the header
+])
+def test_a_probe_grepping_an_always_printed_status_header_is_flagged(env, busy, flagged):
+    import subprocess
+    from ttp import cli, coordinator as coord, waitheal
+    probe = f"s=$(ssh -o BatchMode=yes box 'tt-device-mcp status 2>&1') && echo \"$s\" | {busy}"
+    assert bool(waitheal.header_grep(probe)) is flagged
+    assert ("never grep a header word" in (coord.marker_only_probe(probe) or "")) is flagged
+    # Replay a status whose RUNNING section is empty: the row test says not busy, the header grep says busy.
+    rc = subprocess.run(["sh", "-c", busy], input=_STATUS_EMPTY_RUNNING, text=True).returncode
+    if busy == _ROWS_UNDER_RUNNING:
+        assert rc == 1
+        assert subprocess.run(["sh", "-c", busy], input="RUNNING\n  #11 tenant run.sh\nQUEUED\n",
+                              text=True).returncode == 0
+    elif flagged:
+        assert rc == 0
+    if flagged:
+        p = make(env)
+        tid = _due_waiting_task(p, "exit 1")
+        assert "; flagged: it greps `" in cli.set_when(p.db, tid, probe, p)
+
+
 def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, tmp_path):
     """A host without /proc (macOS): the driver's start comes from ps's lstart and the boot from
     kern.boottime, so a pid taken by another process or a restarted host never reads as running.
