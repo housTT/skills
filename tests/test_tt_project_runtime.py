@@ -29624,7 +29624,7 @@ def test_a_requeued_task_is_not_blocked_again_by_one_later_reboot_loss(env, tmp_
     assert p.db.task(tid)["status"] == "queued", "a requeue did not start the reboot count over"
 
 
-def _waiting_from_before_the_boot(p, tid, job=True, boot="an-earlier-boot"):
+def _waiting_from_before_the_boot(p, tid, job=True, boot="an-earlier-boot", retry_when="exit 1"):
     """Task tid waits from before this boot; with job, on a detached job of its own that the reboot
     cut short (no .rc)."""
     if job:
@@ -29636,7 +29636,7 @@ def _waiting_from_before_the_boot(p, tid, job=True, boot="an-earlier-boot"):
                (tid, "worker", "fake", time.time() - 1800, time.time() - 900, "ok", str(run_dir), boot))
     p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
         {**json.loads(p.db.task(tid)["result"] or "{}"), "status": "waiting", "summary": "job running",
-         "retry_after_s": 3600, "retry_when": "exit 1", "waiting_since": time.time() - 900}))
+         "retry_after_s": 3600, "retry_when": retry_when, "waiting_since": time.time() - 900}))
 
 
 def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
@@ -29654,6 +29654,87 @@ def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
     assert "reboot_wakes" not in json.loads(t["result"]), "a block kept the old count"
     ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (tid,))
     assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+
+
+@pytest.mark.parametrize("probe, job, wakes", [
+    ('test "$(date +%s)" -ge 1900000000', False, False),   # a timer
+    (None, False, False),   # no probe: only its retry_after_s
+    ("timeout 30 ssh box 'test -e /tmp/soak.done && kill -0 4242'", False, False),   # another host's state
+    ("ttp detach --check --host box ~/.ttp-detach/r/soak", False, False),
+    ("ttp ack-wait probe --from other --hash 0123abcd", False, False),   # another project's reply
+    ("kill -0 4242", False, True),   # a process of the earlier boot
+    ("test -e /tmp/soak.done", False, True),
+    ("test -s {runs}/r1/soak.out", False, True),   # a file in a run folder
+    ("ttp detach --check {runs}/r1/soak.rc", False, True),
+    ("exit 1", True, True),   # its detached job from the earlier boot wrote no .rc
+])
+def test_a_host_reboot_wakes_only_waits_it_may_have_broken(env, probe, job, wakes):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid, job=job, retry_when=probe and probe.format(runs=p.runs))
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    if wakes:
+        assert not t["not_before"] and res["woke"] == "the host rebooted", dict(t)
+    else:
+        assert t["not_before"] > time.time() + 3000 and "woke" not in res, dict(t)
+
+
+def test_reboot_wait_classifies_probes_by_where_they_run():
+    from ttp import rebootwait as rw
+    assert rw.transient("pgrep -f soak") == "a process"
+    assert rw.transient("ttp devq probe dev 7") == "a device runner job"
+    assert rw.transient("ttp checks --result /x/r1") == "its own checks"
+    assert rw.transient("ssh box test -e /dev/shm/x || test -e /dev/shm/y") == "a path a reboot clears"
+    assert rw.transient('test -e "$TTP_RUN_DIR/done"') == "a file in a run folder"
+    assert rw.transient("ttp ci --repo o/r --branch b") == ""
+    assert rw.transient("/opt/bin/ttp lock --probe dev") == ""
+    assert rw.transient('test -e "/tmp/x') == "a path a reboot clears", "an unparsable probe wakes when in doubt"
+    assert rw.stays_asleep({"retry_when": "kill -0 1", "survives_reboot": True})
+
+
+def _reply_wait_hand_off(p, d, tmp_path, tid, **result):
+    from ttp.providers.base import RunUsage as Usage
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / f"run-{tid}-{len(list(tmp_path.iterdir()))}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "asked the other project",
+                                                     "retry_after_s": 1800, **result}))
+    d._finish_worker({"task": tid, "note": "{}"}, Usage(cost_usd=0.1), "ok", run_dir)
+    return p.db.task(tid)
+
+
+def test_a_wait_on_another_projects_reply_must_use_the_ack_wait_probe(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import project
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setattr(project, "load_registry", lambda: {"projects": {p.name: {}, "fleet-sim": {}}})
+    d = Daemon(p.base)
+    tid = p.db.add_task("needs fleet data", "s", kind="work", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="a reply from fleet-sim to note 0123abcd",
+                             retry_when="exit 1")
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and t["attempts"] == 1 and res["status"] == "failed", dict(t)
+    assert res["summary"].startswith("hand-off refused: it waits on another project's reply"), res["summary"]
+    assert "ttp ack-wait probe --from fleet-sim --hash <note id>" in res["summary"]
+    # With the probe it is a wait, and its wakes run at light whatever it asked for.
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="a reply from fleet-sim to note 0123abcd",
+                             retry_when="ttp ack-wait probe --from fleet-sim --hash 0123abcd", wake_tier="standard",
+                             on_pass_cmd="ttp ack-wait settle --from fleet-sim --hash 0123abcd")
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and res["status"] == "waiting" and t["attempts"] == 1, dict(t)
+    assert bud.wake_tier("standard", res) == "light"
+    assert bud.wake_tier("standard", dict(res, escalated_wake=True)) == "standard"
+    # Waits on anything else, or on the tt-project fix (an upstream note), are not touched.
+    for extra in ({"waiting_for": "CI to respond", "retry_when": "ttp ci --repo o/r --branch b"},
+                  {"waiting_for": "a reply to the upstream note", "retry_when": "ttp upstream --fixed 0123abcd"}):
+        t = _reply_wait_hand_off(p, d, tmp_path, tid, **extra)
+        assert json.loads(t["result"])["status"] == "waiting", extra
 
 
 def _checks_killed_by_reboot(p, tmp_path, tid, boot="an-earlier-boot"):
@@ -30298,7 +30379,8 @@ def test_a_boot_time_wake_counts_only_for_its_own_job_cut_by_an_abrupt_reboot(en
     from ttp.daemon import Daemon
     tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
     for i in range(4):
-        _waiting_from_before_the_boot(p, tid, job=case != "no_job_of_its_own")
+        # A /tmp marker: a wait the reboot may have ended, so it wakes whatever its jobs did.
+        _waiting_from_before_the_boot(p, tid, job=case != "no_job_of_its_own", retry_when="test -e /tmp/soak.done")
         if case == "job_ended":
             last = p.db.one("SELECT dir FROM runs WHERE task=? ORDER BY id DESC", (tid,))["dir"]
             (p.runs / last / "soak.rc").write_text("0\n")   # the job finished before the host went down
@@ -30458,15 +30540,17 @@ def test_waiting_tasks_from_before_the_boot_wake_on_the_first_tick(env, monkeypa
                                                  **extra}))
         return tid
 
-    dead = waiting("local job")
-    remote = waiting("remote job", survives_reboot=True)
+    dead = waiting("local job", retry_when="kill -0 4242")
+    remote = waiting("remote job", retry_when="kill -0 4242", survives_reboot=True)
     d.tick()
     assert dead in started and remote not in started, started
     assert "the host rebooted" in json.loads(p.db.task(dead)["result"]).get("woke", "")
     assert p.db.task(remote)["not_before"] == later
 
 
-def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path):
+@pytest.mark.parametrize("probe", ["test -e /tmp/build.done", "exit 1"])
+def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path, probe):
+    """Only a wait on what the reboot may have ended (a /tmp marker) runs again now: a timer sleeps on."""
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
@@ -30476,13 +30560,18 @@ def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path):
     run_dir.mkdir()
     (run_dir / "output.jsonl").write_text("")
     (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "build started",
-                                                     "retry_after_s": 3600, "retry_when": "exit 1"}))
+                                                     "retry_after_s": 3600, "retry_when": probe}))
     (run_dir / "lease").touch()
     os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
     p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
            (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), "an-earlier-boot"))
     d.reap_runs()
     d.probe_waiting()
+    if probe == "exit 1":
+        t = p.db.task(tid)
+        assert tid not in [x["id"] for x in p.db.ready_tasks()] and t["not_before"] > time.time() + 3000, dict(t)
+        assert "woke" not in json.loads(t["result"])
+        return
     assert tid in [x["id"] for x in p.db.ready_tasks()], "a wait the reboot ended slept on its timer or probe"
     assert json.loads(p.db.task(tid)["result"])["woke"] == "the host rebooted"
 

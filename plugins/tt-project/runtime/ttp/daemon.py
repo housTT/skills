@@ -31,6 +31,7 @@ import traceback
 import uuid
 from pathlib import Path
 
+from . import ackwait
 from . import alerts
 from . import anchors
 from . import audit
@@ -71,6 +72,7 @@ from . import prguard
 from . import projpause
 from . import push
 from . import pushq
+from . import rebootwait
 from . import refwaits
 from . import release
 from . import responsibilities
@@ -2725,6 +2727,13 @@ class Daemon:
                 result, rstatus = gap_wait, "waiting"
                 summary = result["summary"]
         waiting = status == "ok" and rstatus == "waiting"
+        refusal = ackwait.unmanaged_wait(result, self._other_projects()) if waiting else ""
+        if refusal:
+            # A wait on another project's reply without `ttp ack-wait probe` would wake a model run on
+            # every timer to read the inbox: not taken as a wait. Its next run hands off again.
+            waiting, rstatus = False, "failed"
+            summary = f"{refusal} Its summary: {summary}"[:1500]
+            result = {**result, "status": "failed", "summary": summary}
         # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
         # the run the host went down under.
         reboot_lost = status == "lost" and rebooted
@@ -2738,6 +2747,8 @@ class Daemon:
         no_handoff = status == "ok" and rstatus is None
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
+        elif refusal:
+            new, status = "failed", "refused_wait"   # an attempt, but no deep retry (effort.RETRY_FAILED)
         elif no_handoff:
             # A clean exit without a hand-off is not evidence of done work: the worker may have
             # stopped mid-task ("I'll pick up later"). Count an attempt and retry with its last words.
@@ -2752,7 +2763,8 @@ class Daemon:
         attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting or reboot_lost
                                                   or rejects else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
-                                                                                     "stalled", "no_handoff"):
+                                                                                     "stalled", "no_handoff",
+                                                                                     "refused_wait"):
             new = "queued"
         extra: dict = {}
         reason = None
@@ -2809,7 +2821,8 @@ class Daemon:
                     self.cfg["budget"].get("max_reboot_losses", 3)):
                 # This run is already one of the losses: its wait counts once, not again as a wake.
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
-            elif rebooted and result.get("survives_reboot") is not True:
+            elif rebooted and (not rebootwait.stays_asleep(result, (str(self.p.runs),))
+                               or any(not Path(j["rc"]).exists() for j in jobs)):
                 # What it waited on died with the host: its next run finds out now, not at the timer.
                 not_before = time.time()
                 extra["woke"] = "the host rebooted"
@@ -2957,7 +2970,8 @@ class Daemon:
         # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
-        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff") or push_quiet
+        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff",
+                                               "refused_wait") or push_quiet
         # A finished code task's next step is its review. A hand-off with nothing else to decide (no
         # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
         # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
@@ -5844,9 +5858,12 @@ class Daemon:
                        "New runs start again.", kind="info", severity="low", ref=f"pause-lifted:{self.boot}")
 
     def wake_after_reboot(self) -> None:
-        """Once per daemon start: a waiting task that handed off before this host booted waits on
-        something the reboot may have ended (a detached job, a /tmp file, device state). It is due
-        now, past its timer and its probe, unless its hand-off said `survives_reboot`. The wake counts
+        """Once per daemon start: a waiting task that handed off before this host booted is due now,
+        past its timer and its probe, only when what it waits on is something the reboot may have
+        ended (rebootwait.py): its retry_when checks local transient state (a local detached job, its
+        own checks, a process, a /tmp or run-folder file), or a detached job of its own from the earlier
+        boot wrote no .rc. A timer, a probe of another host or another project's reply sleeps on, and
+        `survives_reboot` always does. The wake counts
         toward max_reboot_losses only after an abrupt reboot that cut short a detached job of its own
         (one with no .rc yet): only then may the task be what takes the host down."""
         if self._boot_woken:
@@ -5872,6 +5889,8 @@ class Daemon:
                 asleep, cut = self._relaunch_jobs(t, prev)
             if asleep:
                 continue   # asleep on its retry_when: the same checks or resumable jobs run again
+            if rebootwait.stays_asleep(prev, (str(self.p.runs),)) and not self._job_without_rc(t["id"]):
+                continue   # nothing it waits on died with the host: its timer and probe stand
             self._probe_rc.pop(t["id"], None)
             counts = bool(relaunched) or cut or self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
@@ -6127,21 +6146,44 @@ class Daemon:
                 return {"reason": str(c.get("what") or ""), "path": who, "planner": who}
         return None
 
+    def _other_projects(self) -> list[str]:
+        """The names of this user's other projects (the registry), longest first; [] when unreadable."""
+        from .project import load_registry
+        try:
+            names = (load_registry().get("projects") or {}).keys()
+        except (OSError, ValueError, AttributeError):
+            return []
+        return sorted((n for n in names if isinstance(n, str) and n != self.p.name), key=len, reverse=True)
+
+    def _last_earlier_boot(self, tid: int) -> str | None:
+        """The boot of task tid's latest run on a boot before this one, or None."""
+        last = self.p.db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id NOT IN (?,?) "
+                             "ORDER BY id DESC LIMIT 1", (tid, *self.boots))
+        return last["boot_id"] if last else None
+
+    def _jobs_without_rc(self, tid: int, boot: str) -> bool:
+        """Whether a run of task tid on `boot` detached a job that wrote no .rc."""
+        dirs = self.p.db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, boot))
+        return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
+
+    def _job_without_rc(self, tid: int) -> bool:
+        """Whether a detached job task tid started on the earlier boot never wrote its .rc: the reboot
+        ended it, however the host went down."""
+        boot = self._last_earlier_boot(tid)
+        return bool(boot) and self._jobs_without_rc(tid, boot)
+
     def _job_cut_by_reboot(self, tid: int) -> bool:
         """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
         runs on the earlier boot started that wrote no .rc."""
-        db = self.p.db
-        last = db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id NOT IN (?,?) "
-                      "ORDER BY id DESC LIMIT 1", (tid, *self.boots))
-        if not last or self._shutdown(last["boot_id"]) == "orderly":
+        boot = self._last_earlier_boot(tid)
+        if not boot or self._shutdown(boot) == "orderly":
             return False
-        if cycle := self._planned_cycle(last["boot_id"]):
+        if cycle := self._planned_cycle(boot):
             # A planned host cycle (a recovery owner power cycled the host on purpose) ended it, not the task.
             log(self.p, f"task {tid}: its detached job was cut by a planned host cycle ({cycle['path']}); "
                         "not counted as a reboot loss")
             return False
-        dirs = db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, last["boot_id"]))
-        return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
+        return self._jobs_without_rc(tid, boot)
 
     def _branch_head(self, task: dict) -> str:
         """The commit a task's own branch points at, or "": a new commit there is progress."""

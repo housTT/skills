@@ -145,7 +145,7 @@ def spent_last_hour(db: DB, provider: str, now: float) -> float:
     return max(total, 0.0)
 
 
-WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff", "request_error")
+WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff", "refused_wait", "request_error")
 
 
 def wasted(run: dict) -> bool:
@@ -675,6 +675,8 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     tier = tier if tier in TIER_ORDER else "standard"
     if stale_wakes(prev) and not prev.get("escalated_wake"):
         return TIER_ORDER[0]
+    if re.search(r"\back-wait\s+probe\b", str(prev.get("retry_when") or "")) and not prev.get("escalated_wake"):
+        return TIER_ORDER[0]   # another project's reply: its on_pass_cmd settles it, a wake only reads it
     want = "light" if mechanical_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
         want = "light" if (prev.get("retry_when") or prev.get("waiting_for")) and not next_step(prev) else tier

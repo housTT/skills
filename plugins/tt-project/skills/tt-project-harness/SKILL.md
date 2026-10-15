@@ -133,8 +133,8 @@ do not run while the project is paused. A task that must reboot the host its har
    `budget.max_reboot_losses`, so a job that takes the host down still gets its task blocked.
 2. `ttp pause <name> --until-reboot --reason "host power cycle"`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
-3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no
-   `survives_reboot`: a reboot then wakes the task at once), and start the reboot a little later
+3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back: the daemon
+   probes it after the boot and wakes the task when it passes), and start the reboot a little later
    (for example `shutdown -r +2`), so the run ends cleanly first.
 
 A planned reboot or power cycle (a recovery owner cycling the host on purpose, for any project on it):
