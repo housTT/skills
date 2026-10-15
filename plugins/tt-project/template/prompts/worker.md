@@ -111,7 +111,7 @@ Others share these nodes: hold one only while work runs on it.
 
 ## Updates mid-task
 
-Updates from the coordinator arrive in your context marked "Update for your task"; where one
+Coordinator updates arrive in your context marked "Update for your task"; where one
 differs from the spec, it wins. If your agent cannot receive them, read
 `$TTP_RUN_DIR/steer.md` between major steps. Updates are for you only, not for subagents you
 start: brief them yourself.
@@ -199,11 +199,12 @@ never write to a run folder named in earlier context):
   Keep every device timeout (the `--timeout`, your scripts' broker timeouts, each driver step)
   within the task header's ceiling, which a devq job sees as `TTP_DEVQ_TIMEOUT_S`; split longer runs.
 <!-- /ttp:if devq -->
-  A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours survives it. Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a
-  reboot the daemon restarts it, with no model run, up to 3 times. The
-  next run is a light wake unless you set `wake_tier` standard. After 3 wakes that hand back the
-  same `waiting_for` and `retry_when` with no new commit, the task goes to the coordinator.
-  `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets `wake_tier` standard and no `next_step`.
+  A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours survives it.
+  Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
+  the daemon restarts it, with no model run, up to 3 times. `wake_tier` defaults to light. After 3
+  wakes that hand back the same `waiting_for` and `retry_when` with no new commit, the task goes to
+  the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
+  `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Make judgment calls
