@@ -209,7 +209,7 @@ USER_SETTABLE = {
     "coordinator.ask_timeout_h": float,
     # Days a user's yes to a charter change that failed to apply stays valid for a retry (_charter_approval).
     "coordinator.charter_approval_days": float,
-    # Days of the user's messages and answered asks an ask is checked against (_prior_approval).
+    # Days a pr_approve record refuses a repeated review or merge ask (_prior_approval).
     "coordinator.approval_lookback_days": float,
     # Provider failover (failover.py): hours a provider may be unable to start work before its queued
     # and waiting tasks move (0: off), and the providers they move to first.
@@ -1696,9 +1696,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     prior = _prior_approval(p, text)
                     if prior:
                         _count_refusal(db, key, "prior approval", text)
-                        raise ValueError(f"ask_user rejected: {prior} looks like it already covers this: act on it "
-                                         "and memory_add the decision; if it does not, resend with not_covered "
-                                         f"saying what differs (at least {NOT_COVERED_MIN} characters)")
+                        raise ValueError(f"ask_user rejected: {prior} already covers this: act on it; if it "
+                                         "does not, resend with not_covered saying what differs "
+                                         f"(at least {NOT_COVERED_MIN} characters)")
                 if a["blocking"] in prguard.APPROVING_REASONS:
                     why = prguard.findings_problem(db, text)
                     if why:
@@ -2036,67 +2036,38 @@ def _same_text(a: str, b: str) -> bool:
     return " ".join(a.lower().split()) == " ".join(b.lower().split())
 
 
-# An ask the user already answered (_prior_approval): a source counts when it shares at least
-# APPROVAL_MIN_SHARED subject words with the ask and their Jaccard overlap reaches APPROVAL_MIN_JACCARD,
-# compared sentence by sentence and as a whole. Tuned on the fixtures in tests/test_tt_project_runtime.py.
+# An ask the user already answered (_prior_approval) is refused only on a structured record: an
+# unspent pr_approve record (prguard.APPROVALS_KEY) of the last coordinator.approval_lookback_days, at
+# the current head, for every PR a review or merge ask names. No other ask kind has such a record, so
+# none is refused here; restriction and irreversible asks always go out. Accepted gap: a re-ask after
+# an approval the user gave in free text, or relayed, is stopped only by the prompt's relay and ask
+# rules, not here: matching the user's words counted refusals ("no, do not ...") as approvals.
 APPROVAL_LOOKBACK_DAYS = 30.0
-APPROVAL_MIN_SHARED = 3
-APPROVAL_MIN_JACCARD = 0.3
 NOT_COVERED_MIN = 30   # chars: a resent ask says what differs from the approval on record
-PRIOR_APPROVAL_REASONS = ("restriction", "irreversible", "human")
-# An approval word in a sentence that is not a question, never followed by "not".
-_APPROVAL_WORD = re.compile(r"\b(yes|yeah|yep|approved?|go ahead|ok(ay)? to|you may|do it|proceed|lgtm|ship it)\b"
-                            r"(?!\s+not\b)", re.I)
-_SENTENCES = re.compile(r"[^.!?;\n]+[.!?;]?")
-
-
-def _approves(text: str) -> bool:
-    """Whether `text` holds an approval word outside a question, or a hand-back phrase."""
-    return bool(unblock.handback(text)) or any(
-        _APPROVAL_WORD.search(s) for s in _SENTENCES.findall(text or "") if not s.strip().endswith("?"))
-
-
-def _covers(ask: set[str], text: str) -> bool:
-    """Whether `text`, as a whole or one of its sentences, is about the same subject as `ask`."""
-    for part in [text, *_SENTENCES.findall(text or "")]:
-        words = unblock._subject(part)
-        shared = ask & words
-        if len(shared) >= APPROVAL_MIN_SHARED and len(shared) / len(ask | words) >= APPROVAL_MIN_JACCARD:
-            return True
-    return False
+PRIOR_APPROVAL_REASONS = prguard.APPROVING_REASONS
 
 
 def _prior_approval(p: Project, text: str, now: float | None = None) -> str | None:
-    """Where the user already answered the ask `text`, or None: their own words approving it (the
-    verbatim part of an inbound message of the last coordinator.approval_lookback_days, any
-    provenance but system), an earlier ask on it answered yes or handed back, or a decision or
-    preference in memory."""
-    ask = unblock._subject(text)
-    if len(ask) < APPROVAL_MIN_SHARED:
+    """The pr_approve records that already cover the review or merge ask `text`, or None."""
+    keys = prguard.pr_keys(text)
+    if not keys:
         return None
     now = time.time() if now is None else now
     try:
         days = float(p.config()["coordinator"].get("approval_lookback_days", APPROVAL_LOOKBACK_DAYS))
     except (KeyError, TypeError, ValueError):
         days = APPROVAL_LOOKBACK_DAYS
-    since = now - days * 86400
-    for m in p.db.q("SELECT id, ts, text, context FROM messages WHERE direction='in' AND kind='user' "
-                    "AND COALESCE(provenance,'')!='system' AND ts>=? ORDER BY id DESC", (since,)):
-        said = relay.split(m["text"], m["context"])[0]
-        if _approves(said) and _covers(ask, said):
-            return f"user msg #{m['id']} ({timefmt.long(m['ts'], p)})"
-    for r in reversed(unblock.asks(p.db, since, now)):
-        yes = r["answer"] and _APPROVAL_WORD.search(r["answer"])
-        if not (r["handback"] or yes):
-            continue
-        old = p.db.one("SELECT ts, text FROM messages WHERE id=?", (r["id"],))
-        if old and _covers(ask, _ask_question(old["text"])):
-            how = f'handed back ("{r["handback"]}")' if r["handback"] else f'answered "{r["answer"][:80]}"'
-            return f"ask #{r['id']} ({timefmt.long(old['ts'], p)}), {how},"
-    for e in reversed(p._memory_entries()):
-        if e["kind"] in ("decision", "preference") and _covers(ask, re.sub(r"^\[[^\]]*\]\s*", "", e["line"])):
-            return f"memory [{e['name']}]"
-    return None
+    recs = p.db.kv(prguard.APPROVALS_KEY, {}) or {}
+    heads = p.db.kv(prguard.HEADS_KEY, {}) or {}
+    found = []
+    for key in sorted(keys):
+        r, head = recs.get(key), heads.get(key)
+        if not (isinstance(r, dict) and isinstance(head, dict)) or r.get("spent") or not r.get("head") \
+                or r["head"] != head.get("sha") or float(r.get("ts") or 0) < now - days * 86400:
+            return None
+        found.append(f"the pr_approve record for {key} (ask #{r.get('source')}, user msg #{r.get('answer')}, "
+                     f"{timefmt.long(float(r['ts']), p)})")
+    return "; ".join(found)
 
 
 SIMILAR_DONE_DAYS = 3   # a task done this recently is still compared against a new task_add

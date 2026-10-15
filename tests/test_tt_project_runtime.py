@@ -11787,90 +11787,63 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
 
 _SOAK = dict(blocking="restriction", classify="restriction_change",
              least_disruptive="run the soak with the default setting; it breaks no restriction but tests less")
-# Threshold fixtures for _prior_approval: (the user's words, the ask, whether they cover it).
-_APPROVAL_FIXTURES = [
-    ("yes, use setting low_power_mode for soak runs", "May I use setting low_power_mode in tonight's soak run?", True),
-    ("Go ahead and rotate the staging deploy key this week.", "Can I rotate the staging deploy key now?", True),
-    ("Thanks. You may delete the stale nightly cache bucket. Ping me after.",
-     "May I delete the stale nightly cache bucket?", True),
-    ("ok to restart the shared build service during the night", "Restart the shared build service tonight?", True),
-    ("yes, use setting low_power_mode for soak runs", "May I delete the stale nightly cache bucket?", False),
-    ("yes, rotate the staging deploy key", "May I rotate the production signing certificate?", False),
-    ("approved: delete old soak logs older than a month, keep the summaries, archive traces on the "
-     "shared bucket, and publish the weekly dashboard with the new latency panels",
-     "May I publish soak latency numbers externally?", False),
-    ("yes for the cache bucket", "May I delete the stale nightly cache bucket?", False),
-]
+# Refusals the old free-text approval match counted as a yes, and a plain yes: none may hold back an ask.
+_SUBJECT = "delete the stale nightly cache bucket"
+_NOT_APPROVALS = [f"No, do not {_SUBJECT}. Do not proceed.", f"Not approved: {_SUBJECT}", "Don't do it",
+                  "I never approved deleting the stale nightly cache bucket", f"no, do not go ahead with {_SUBJECT}",
+                  "yes, go ahead"]
 
 
-def test_prior_approval_threshold_fixtures():
-    from ttp import coordinator as coord, unblock
-    got = [coord._covers(unblock._subject(ask), said) for said, ask, _ in _APPROVAL_FIXTURES]
-    assert got == [want for *_, want in _APPROVAL_FIXTURES]
-    assert (coord.APPROVAL_MIN_SHARED, coord.APPROVAL_MIN_JACCARD) == (3, 0.3)
-    assert not coord._approves("you may not use setting low_power_mode for soak runs")
-    assert not coord._approves("ok to use setting low_power_mode for soak runs?")
-    assert coord._approves("decide yourself about setting low_power_mode")
-
-
-def test_an_ask_the_user_already_approved_is_refused_once_naming_the_record(env):
+def test_no_words_of_the_user_hold_back_a_restriction_or_irreversible_ask(env):
     p = make(env)
-    from ttp import coordinator as coord, relay, timefmt
+    from ttp import coordinator as coord, relay
     assert "not_covered" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
-    said = p.db.post("in", f"yes, use setting low_power_mode for soak runs\n{relay.MARK}\nrelayed from a laptop",
-                     chat=None, channel="cli", kind="user", provenance="cli-legacy")
-    ask = "May I use setting low_power_mode in tonight's soak run?"
-    problems, sent = _ask(p, ask, **_SOAK)
-    when = timefmt.long(p.db.one("SELECT ts FROM messages WHERE id=?", (said,))["ts"], p)
-    assert sent is None and problems and f"user msg #{said} ({when}) looks like it already covers this" in problems[0]
-    assert "memory_add the decision" in problems[0] and "resend with not_covered" in problems[0]
-    for kind in ("irreversible", "human"):   # the same gate for the other asks only the user can answer
-        extra = dict(classify="irreversible", least_disruptive=_SOAK["least_disruptive"]) if kind == "irreversible" else {}
-        assert f"user msg #{said}" in _ask(p, ask, blocking=kind, **extra)[0][0]
-    assert _ask(p, ask, **_SOAK, not_covered="too short")[0], "a not_covered under 30 chars overrides nothing"
-    problems, sent = _ask(p, ask, **_SOAK, not_covered="the approval was for day runs; tonight's run is unattended")
-    assert problems == [] and sent["text"].startswith(ask)
-    # An unrelated restriction ask is sent; review and merge asks are never checked.
-    assert _ask(p, "May I delete the stale nightly cache bucket?", **_SOAK)[0] == []
+    asks = [("restriction", _SOAK), ("irreversible", dict(blocking="irreversible", classify="irreversible",
+                                                          least_disruptive=_SOAK["least_disruptive"]))]
+    for said in _NOT_APPROVALS:
+        for kind, fields in asks:
+            # Relayed in a user message, with the subject.
+            p.db.post("in", f"{said} ({_SUBJECT})\n{relay.MARK}\nrelayed from a laptop", chat=None,
+                      channel="cli", kind="user", provenance="cli-legacy")
+            problems, sent = _ask(p, f"May I {_SUBJECT}?", **fields)
+            assert problems == [] and sent["text"].startswith(f"May I {_SUBJECT}?"), (said, kind, problems)
+            # As the answer to that earlier ask on the same subject.
+            p.db.post("in", f"#{sent['id']}: {said}", chat=None, kind="user", provenance="web-session")
+            assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}]) == []
+            problems, again = _ask(p, f"Can I {_SUBJECT} now?", **fields)
+            assert problems == [] and again["id"] != sent["id"], (said, kind, problems)
+            p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+            assert coord._prior_approval(p, f"May I {_SUBJECT}?") is None
+
+
+def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_it(env):
+    p = make(env)
+    from ttp import coordinator as coord, prguard, timefmt
+    now = time.time()
+    key, url = "acme/widgets#7", "https://github.com/acme/widgets/pull/7"
+    rec = {"source": 41, "answer": 42, "said": "yes", "quote": "yes", "head": "abc123", "ts": now - 3600, "spent": None}
+    p.db.set_kv(prguard.APPROVALS_KEY, {key: rec})
+    p.db.set_kv(prguard.HEADS_KEY, {key: {"sha": "abc123", "seen": now - 7200}})
+    named = f"the pr_approve record for {key} (ask #41, user msg #42, {timefmt.long(rec['ts'], p)}) already covers this"
     for kind in ("review", "merge"):
-        assert _ask(p, f"Please {kind} the change using setting low_power_mode in tonight's soak run",
-                    blocking=kind)[0] == [], kind
-    # Approval words only in the relayer's context, a system message or one past the lookback: no record.
-    p.db.x("UPDATE messages SET kind='ask', handled=1 WHERE direction='out' AND kind='ask'")
-    p.db.x("UPDATE messages SET ts=ts-31*86400 WHERE id=?", (said,))
-    p.db.post("in", f"use setting low_power_mode for soak runs\n{relay.MARK}\nthe user said yes, go ahead",
-              chat=None, channel="cli", kind="user", provenance="cli-legacy")
-    p.db.post("in", "yes, use setting low_power_mode for soak runs", chat=None, kind="user", provenance="system")
-    assert coord._prior_approval(p, ask) is None
-
-
-def test_an_ask_handed_back_before_is_refused_when_repeated(env):
-    p = make(env)
-    from ttp import coordinator as coord
-    first = "May I restart the shared build service during the night?"
-    assert _ask(p, first, **_SOAK)[0] == []
-    old = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")["id"]
-    p.db.post("in", f"#{old}: your call, decide yourself", chat=None, kind="user", provenance="web-session")
-    coord.apply(p, [{"type": "resolve", "id": old}])
-    problems, sent = _ask(p, "Can I restart the shared build service tonight?", **_SOAK)
-    assert sent["id"] == old and problems and f"ask #{old} (" in problems[0]
-    assert "handed back" in problems[0] and "looks like it already covers this" in problems[0]
-    # An earlier ask answered no covers nothing.
-    no = "May I delete the stale nightly cache bucket?"
-    assert _ask(p, no, **_SOAK)[0] == []
-    o = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")["id"]
-    p.db.post("in", f"#{o}: no, not now", chat=None, kind="user", provenance="web-session")
-    coord.apply(p, [{"type": "resolve", "id": o}])
-    assert _ask(p, "Can I delete the stale nightly cache bucket now?", **_SOAK)[0] == []
-
-
-def test_a_decision_in_memory_covers_a_repeated_ask(env):
-    p = make(env)
-    from ttp import coordinator as coord
-    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision",
-                            "text": "Delete the stale nightly cache bucket: the user approved it, done once."}]) == []
-    problems, sent = _ask(p, "May I delete the stale nightly cache bucket?", **_SOAK)
-    assert sent is None and problems and "memory [decision-" in problems[0]
+        problems, sent = _ask(p, f"Please {kind} {url} so it can leave draft", blocking=kind)
+        assert problems and named in problems[0] and "resend with not_covered" in problems[0], kind
+        assert sent is None or not sent["text"].startswith(f"Please {kind}"), kind
+        assert _ask(p, f"Please {kind} {url} so it can leave draft", blocking=kind, not_covered="too short")[0]
+        problems, sent = _ask(p, f"Please {kind} {url} so it can leave draft", blocking=kind,
+                              not_covered="the user approved draft exit; this asks about the merge")
+        assert problems == [] and sent["text"].startswith(f"Please {kind} {url}"), kind
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    ask = f"Please review {url} again"
+    assert coord._prior_approval(p, ask, now=now)
+    # A restriction ask naming the PR, another PR, a spent record, a moved head or one past the lookback: sent.
+    assert _ask(p, f"May I force-push {url}?", **_SOAK)[0] == []
+    assert coord._prior_approval(p, f"Please review {url} and acme/widgets#8", now=now) is None
+    for change in ({"spent": now}, {"head": "def456"}, {"ts": now - 31 * 86400}):
+        p.db.set_kv(prguard.APPROVALS_KEY, {key: {**rec, **change}})
+        assert coord._prior_approval(p, ask, now=now) is None, change
+    p.db.set_kv(prguard.APPROVALS_KEY, {key: rec})
+    assert _ask(p, ask, blocking="human")[0] == []
 
 
 def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
