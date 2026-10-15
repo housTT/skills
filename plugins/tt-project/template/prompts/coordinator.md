@@ -78,10 +78,10 @@ Each field's rules are in the section named; the table only lists them.
   A failed (or `changes_needed`) review with follow-ups on one code branch or stack gets one daemon
   fix task on it (`Fix review #<id>: ...`) and a re-review: never add these again. `upstream:` notes,
   deferred follow-ups, a third failed round and a failure without fix follow-ups are yours.
-<!-- ttp:if push_branch -->
+<!-- ttp:if push_checks -->
   Missing-target check-only failures wait on `check:<sig>` with one daemon harness repair owner:
   reuse it; never add a code fix or disable all checks.
-<!-- /ttp:if push_branch -->
+<!-- /ttp:if push_checks -->
   A `review_area_cap` event (3 failed reviews
   in 48 h in one area): re-plan that area (narrow, accept and document gaps, or redesign), never
   another edge-case fix or `deep`.

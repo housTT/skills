@@ -36793,7 +36793,7 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # Rules for features that are off are left out; turning one on brings its rules in.
     assert "With the push queue on" not in role and "came in on Slack" not in role
     assert "`landed:#<id>`" not in role and "Shared clusters" not in role
-    # Push-branch-only settings and check holds show only once a push branch is set.
+    # Push-branch-only settings show only once a push branch is set; check holds once push checks are.
     assert "delivery.mirror_remotes" not in role and "check:<sig>" not in role
     assert "`delivery.push_branch` and `delivery.push_checks`" in role
     assert "A PR leaves draft ONLY on the user's explicit yes" in role
@@ -36810,6 +36810,10 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     closes = _re.findall(r"<!-- /ttp:if (!?)(\w+) -->", src)
     assert opens and sorted(opens) == sorted(closes)
     assert {n for _, n in opens} <= known, {n for _, n in opens} - known
+    # checkgaps.wait opens check:<sig> gaps for push checks with no push branch (PR delivery) too.
+    p.set_config("delivery.push_checks", ["pytest -q"])
+    checks_only = coordinator_role(p)
+    assert "check:<sig>" in checks_only and "delivery.mirror_remotes" not in checks_only
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_queue", True)
     p.set_config("notify.slack", True)

@@ -57,12 +57,15 @@ def feature_blocks(text: str, on: set[str]) -> str:
 
 def coordinator_features(p: Project) -> set[str]:
     """The features whose fenced rules the coordinator's role prompt carries (feature_blocks)."""
-    from . import machines, obligations
+    from . import machines, obligations, push
     cfg = p.config()
     d = cfg.get("delivery") or {}
     on = set()
     if bool(str(d.get("push_branch") or "").strip()) and push_allowed(d):
         on.add("push_branch")
+    # checkgaps.wait opens a check:<sig> gap for any delivery.push_checks, push branch or not.
+    if push.check_list(d.get("push_checks")):
+        on.add("push_checks")
     if push_queue_on(cfg):
         on.add("push_queue")
     if code_tasks_may_push(cfg):
