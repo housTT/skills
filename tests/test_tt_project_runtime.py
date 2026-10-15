@@ -4912,6 +4912,11 @@ def test_a_login_ask_about_another_credential_is_never_refused(env, text):
     "Please log claude back in on the box.",
     "Please check which account claude is logged in as.",
     "The claude CLI's session ended; please log in again.",
+    "Claude has been logged out for two hours; please log in again.",
+    "Claude was logged out at 03:00; please log in again.",
+    "Claude is logged out on this machine; please run /login.",
+    "Claude is logged out on Monday; please log in again.",
+    "Claude has been logged out for an hour; please log in again.",
 ])
 def test_an_agent_cli_login_ask_without_metering_is_still_refused(env, text):
     """The provider (or 'agent CLI') being the thing logged in, next to the login phrase, is the agent's

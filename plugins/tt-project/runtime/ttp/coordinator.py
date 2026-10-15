@@ -3603,8 +3603,12 @@ def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
         rf"\blog\s+{agent}\s+(?:back\s+)?in\b|(?:^|\s)/login\s+in\s+{agent}|"
         rf"\bcheck\s+which\s+account\s+{agent}\s+is\s+logged\s+in\b)"
         # followed by another target (logged out of X, login to X, session on <other host>): fail open
-        r"(?!\s+(?:of|to|into|for)\b)"
-        r"(?!\s+(?:on|at)\s+(?!the\s+box\b|this\s+host\b))", said, re.I)
+        # (a time or duration after for/at/on is no target: "for two hours", "at 03:00", "on Monday")
+        r"(?!\s+(?:of|to|into)\b)"
+        r"(?!\s+(?:for|on|at)\s+(?!(?:the|this)\s+(?:box|host|machine)\b|\d|"
+        r"(?:one|two|three|four|five|six|seven|eight|nine|ten|several|many|hours|days|minutes|weeks|ages|"
+        r"night|morning|evening|noon|midnight|today|tonight|the\s+(?:night|morning|weekend)|"
+        r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|an?\s+(?:hour|minute|day|week|while|night))\b))", said, re.I)
     metered = any(w in low for w in _AGENT_WORDS) and re.search(rf"\b(?:{who})\b", low)
     if not agent_login and not metered:
         return ""
