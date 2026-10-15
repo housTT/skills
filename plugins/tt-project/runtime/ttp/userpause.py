@@ -52,7 +52,8 @@ def is_probe(probe: object, cfg: dict | None = None) -> bool:
 
 def probe_of(task: dict, cfg: dict | None = None) -> str | None:
     """The user-pause probe that is `task`'s only hold, or None. Blocked: its `when:` anchor. Waiting
-    (or queued after a waiting hand-off): its retry_when. Deferred: its start_when."""
+    (or queued after a waiting hand-off, unless only `start_after` defers it now): its retry_when.
+    Deferred: its start_when."""
     if task.get("status") == "blocked":
         a = anchors.anchor(task)
         return a[1] if a and a[0] == "when" and is_probe(a[1], cfg) else None
@@ -61,6 +62,8 @@ def probe_of(task: dict, cfg: dict | None = None) -> str | None:
     when = deferral(task).get("when")
     if when:
         return when if is_probe(when, cfg) else None
+    if time_only(task):   # deferred by start_after alone: an earlier wait's probe no longer holds it
+        return None
     prev = load_result(task.get("result"))
     rw = prev.get("retry_when") if prev.get("status") == "waiting" else None
     return rw if is_probe(rw, cfg) else None

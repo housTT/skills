@@ -371,7 +371,7 @@ prolonged whole-box outage.
   next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
   has not run. A hold no turn can lift needs no outcome and is listed as no action: a user pause (a
   probe that only tests for a marker file named `user-*`; `coordinator.user_pause_marker` sets the
-  pattern) or a deferral only until a time. A waiting task on a user-pause probe is never reported
+  pattern), a resource pause the user set, or a deferral only until a time. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
   Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
   `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped

@@ -111,7 +111,7 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
     unknown), since, reason, status, spec_sha, ends}. Kinds: blocked, setting-held, waiting (not a self-wait),
     review, deferred, paused, user-pause (a task whose only hold is a user-pause probe). `ends` is "user"
-    or "time" for a hold no turn can lift (a user pause, a time-only deferral), else None. A task's age comes from its open stuck episode (unblock._task_episodes);
+    or "time" for a hold no turn can lift (a user pause or user-set resource pause, a time-only deferral), else None. A task's age comes from its open stuck episode (unblock._task_episodes);
     without that history (a block the coordinator set) from when the sweep first saw it in this status
     (remember()), first seeded from its last update, so a later update (an addendum) never resets it.
     Times in reasons are in the home zone of `where` (a Project, its settings or a zone name; None is UTC)."""
@@ -162,7 +162,9 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
         out.append({"key": f"resource:{name}", "kind": "paused", "task": None, "resource": name, "title": name,
                     "age_s": None if since is None else max(0.0, now - float(since)), "since": since,
                     "reason": _clip(f"by {v.get('by') or 'user'}" + (f": {v['reason']}" if v.get("reason") else "")),
-                    "status": "paused", "spec_sha": "", "ends": None})
+                    "status": "paused", "spec_sha": "",
+                    # A pause the user set is lifted on their word only; no turn needs to re-check it.
+                    "ends": "user" if v.get("by") == "user" else None})
     return out
 
 

@@ -64075,6 +64075,50 @@ def test_blocker_sweep_carries_a_time_only_deferral_without_an_outcome(env):
     assert "no action" not in next(ln for ln in text.splitlines() if ln.startswith(f"- #{probed} "))
 
 
+def test_blocker_sweep_carries_a_user_set_resource_pause_and_still_sweeps_a_coordinator_pause(env):
+    """A resource pause the user set is lifted on their word only: listed, carried without an outcome
+    and no reason for a sweep. A pause the coordinator set itself still needs an outcome."""
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    coord.pause_resource(p, "board-a", True, reason="hold for the user", by="user")
+    live = {i["key"]: i for i in sweep.items(db, now, cfg)}
+    assert (live["resource:board-a"]["kind"], live["resource:board-a"]["ends"]) == ("paused", "user")
+    assert sweep.due(db, cfg, now) is None, "only a user-set pause: no sweep turn"
+    assert sweep.loop(db, live["resource:board-a"], None) is None
+    coord.pause_resource(p, "board-b", True, reason="flaky fabric", by="coordinator")
+    live = {i["key"]: i for i in sweep.items(db, now, cfg)}
+    assert live["resource:board-b"]["ends"] is None
+    assert sweep.due(db, cfg, now) == "every 6h"
+    eid = sweep.start(db, cfg, "every 6h", now)
+    assert db.kv(sweep.STATE_KEY)["carried"] == ["resource:board-a"]
+    text = coord.digest(p, {}, [eid], [])
+    assert next(ln for ln in text.splitlines() if ln.startswith("- resource board-a ")).startswith(
+        "- resource board-a | HELD BY USER PAUSE (no action): by user: hold for the user")
+    assert "no action" not in next(ln for ln in text.splitlines() if ln.startswith("- resource board-b "))
+    db.x("UPDATE events SET status='handled'")
+    sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    assert db.kv(sweep.STATE_KEY)["flags"] == {"resource:board-b": "no outcome at the last sweep"}
+    assert "board-a" in db.paused_resources(), "the sweep never lifts the user's pause"
+
+
+def test_a_start_after_deferral_after_a_user_marker_wait_is_time_deferred(env):
+    """A queued task deferred only by `start_after` is time-deferred, even when its previous hand-off
+    was `waiting` on a user-marker probe that has since passed."""
+    p = make(env)
+    from ttp import sweep, userpause
+    db, cfg, now = p.db, p.config(), time.time()
+    t = db.add_task("after the window", labels=[f"start_after:{now + 3600}", f"deferred_since:{now - 600}"])
+    db.update_task(t, not_before=now + 3600, result=json.dumps(
+        {"status": "waiting", "summary": "paused", "retry_when": "test -e state/user-go || exit 1"}))
+    assert userpause.probe_of(db.task(t), cfg) is None
+    [item] = sweep.items(db, now, cfg)
+    assert (item["kind"], item["ends"]) == ("deferred", "time")
+    # Once the window has passed, a queued task after that waiting hand-off is still a user pause.
+    db.update_task(t, labels=[], not_before=0)
+    assert userpause.probe_of(db.task(t), cfg) == "test -e state/user-go || exit 1"
+
+
 def test_past_the_hold_cap_a_user_pause_probe_raises_no_wait_stale(env, monkeypatch):
     """Only the user's word lifts a user pause: a waiting task on one sleeps on past max_hold_s
     without asking the coordinator; another not-yet probe still does."""
