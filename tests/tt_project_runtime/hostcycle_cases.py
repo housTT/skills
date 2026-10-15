@@ -253,6 +253,52 @@ def test_a_drain_that_takes_up_a_due_intent_keeps_holding(env, monkeypatch):
     assert hostcycle.release(p) == [] and ml.changes()[0]["id"] == c["id"]
 
 
+def test_a_dry_run_drain_puts_back_the_time_of_an_intent_it_took_up(env, monkeypatch, capsys):
+    """A drain takes up another project's planned cycle (`ttp machines change ... power-cycle`: no `boot`),
+    pushes it on and brings it to the drain's end; its record then says no reboot. The intent keeps its
+    own time and window again (once, also seen before the daemon writes it), so the co-tenants are not
+    held past that cycle's own window, and it stays open as the planned cycle it is."""
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+
+    def no_reboot():
+        for f in (p.state / hostcycle.FOLDER).glob("*/record.json"):
+            f.write_text(json.dumps({**json.loads(f.read_text()), "rebooted": False}))
+
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", 1200, now=t0)
+    assert not wrote and c2["at"] == t0 + 1200
+    hostcycle.record(p, "kernel update", [], [], intent=c["id"], intent_was=hostcycle.before(c2, p.name, t0))
+    hostcycle.cycle_now(p, c2, now=t0 + 900)          # the drain ended after the intent's own time
+    late = t0 + 900 + ml.POWER_CYCLE_LEAD_S - 1
+    assert hostcycle.hold(q, late)["id"] == c["id"], "a real cycle holds until its recorded time"
+    no_reboot()
+    assert hostcycle.hold(q, late) is None and ml.changes()[0]["at"] == t0 + 900, "read only, already not held"
+    assert hostcycle.hold(q, late, settle=True) is None
+    (c3,) = ml.changes()
+    assert {k: c3.get(k) for k in ml.RETIMED} == orig and "hold_from" not in c3
+    assert hostcycle.hold(q, t0 + 300, settle=True)["id"] == c["id"], "its own window still holds"
+    assert hostcycle.hold(q, t0 + 300 + ml.POWER_CYCLE_LEAD_S) is None
+    assert len(ml.changes()[0]["edits"]) == len(c3["edits"]) == 3, "undone once"
+    assert hostcycle.lapsed(t0 + 300 + ml.POWER_CYCLE_LEAD_S) == ml.changes()
+    # The same through `ttp drain`, whose wait ends at once.
+    ml.close_change(c["id"], "done")
+    for f in (p.state / hostcycle.FOLDER).glob("*/record.json"):
+        f.unlink()
+    t1 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t1)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "1200"])
+    assert "already announced by other" in capsys.readouterr().out and ml.changes()[0]["at"] < t1 + 300
+    no_reboot()
+    assert hostcycle.hold(q, settle=True)["id"] == c["id"]
+    (c4,) = ml.changes()
+    assert {k: c4.get(k) for k in ml.RETIMED} == orig
+
+
 def test_a_drain_intent_quiets_outages_only_around_the_cycle(env, monkeypatch):
     """hold_from holds and steers from the drain's start, but expects_now ('down') starts only
     POWER_CYCLE_LEAD_S before the cycle, so a real outage during the wait is not quieted."""

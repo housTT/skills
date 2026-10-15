@@ -225,6 +225,33 @@ def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None,
         return c
 
 
+# The fields a retime moves (retime_power_cycle) and a restore puts back (restore_power_cycle).
+RETIMED = ("at", "expires", "what", "hold_from")
+
+
+def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | None = None) -> dict:
+    """Put open power-cycle intent #cid's time fields (RETIMED) back to `was` (a None or missing field is
+    removed), with an edit trail entry that carries `mark` as `undo`; once per mark: a second call with the
+    same mark changes nothing."""
+    now = time.time() if now is None else now
+    with _locked():
+        doc = _read(LEDGER, {"next": 1, "changes": []})
+        c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid
+                  and c.get("kind") == POWER_CYCLE and not c.get("closed")), None)
+        if c is None:
+            raise ValueError(f"no open power-cycle intent #{cid}")
+        if any(e.get("undo") == mark for e in c.get("edits") or []):
+            return c
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in RETIMED}, "undo": mark})
+        for k in RETIMED:
+            if was.get(k) is None:
+                c.pop(k, None)
+            else:
+                c[k] = was[k]
+        _write(LEDGER, doc)
+        return c
+
+
 def changes(aliases=None, open_only: bool = True) -> list[dict]:
     doc = _read(LEDGER, {"changes": []})
     return [c for c in doc.get("changes", []) if isinstance(c, dict) and (not open_only or not c.get("closed"))

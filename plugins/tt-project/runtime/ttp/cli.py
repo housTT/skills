@@ -4056,7 +4056,7 @@ def cmd_drain(a) -> None:
                         reason=f"drain before a planned host cycle: {a.reboot}" if a.reboot
                         else "drain: waiting for the runs in flight to end")
         print(f"{p.name} paused: no new model runs start")
-    intent, wrote = None, False
+    intent, wrote, since = None, False, time.time()
     if a.reboot:
         intent, wrote, line = hostcycle.open_intent(p, a.reboot, a.wait)
         print(line, file=sys.stdout if intent else sys.stderr)
@@ -4070,7 +4070,8 @@ def cmd_drain(a) -> None:
         time.sleep(min(poll_s(2.0), max(0.1, end - time.time())))
     if a.reboot:
         try:
-            rec = hostcycle.record(p, a.reboot, left, jobs, intent=intent["id"] if intent else None)
+            rec = hostcycle.record(p, a.reboot, left, jobs, intent=intent["id"] if intent else None,
+                                   intent_was=hostcycle.before(intent, p.name, since) if intent and not wrote else None)
         except OSError as e:
             if wrote:   # no record, no planned cycle: other projects here are not held for it
                 from . import machine_ledger as ml
