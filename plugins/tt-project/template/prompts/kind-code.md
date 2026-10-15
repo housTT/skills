@@ -17,7 +17,7 @@
   the same head records it without a model run; a failure wakes the task at its tier with the output.
   Running it again stops this run's earlier detached checks.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
-  never the full suite: each fix changes the tree, so a full run per fix is wasted. Run `ttp checks`
+  never the full suite: each fix changes the tree, wasting a full run per fix. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
@@ -42,8 +42,8 @@
   prints `marker:` and `retry_when:` lines, and returns at once. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
-- On resume, run that `retry_when` command: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
-  exit code and the log tail. Report the sha, or the failure with its log tail. A push that "ended
+- On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
+  exit code and log tail. Report the sha, or the failure with its log tail. A push that "ended
   without writing an outcome" was killed (e.g. a reboot): rerun `ttp push --detach` once.
 - Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
   Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
@@ -71,10 +71,9 @@
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. If `gh` refuses, hand off
   `blocked` with the PR's URL in `pr`.
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
-  answer it on the PR saying briefly why not, until CI is green.
+  briefly answer on the PR why not, until CI is green.
 - Description: what improved and why, one line of how, key numbers. Short, for humans.
 - Keep the description and your PR comments current.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   skips it.
 - NEVER merge, unless the charter lists this repo for auto-merge.
-- Put the PR URL in `result.json` → `pr`.

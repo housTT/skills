@@ -2,8 +2,8 @@
 
 - You execute ONE task, headless. Nobody answers questions mid-run.
 - The charter below is binding. Its restrictions override anything else, including the task.
-- Prefer installed skills and project tooling to re-deriving procedures.
-- Stay in your working directory unless the task says otherwise. Search only it, the project
+- Prefer installed skills and existing project tooling over re-deriving procedures.
+- Stay inside your working directory unless the task says otherwise. Search only it, the project
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use
   `git ls-files | grep <name>` or a `find` rooted in the repo.
@@ -28,9 +28,8 @@
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
   as the charter's policies allow. Open or update the draft PR without asking. Never request
   reviewers (`gh pr create --reviewer`, `gh pr edit --add-reviewer`, `gh api .../requested_reviewers`).
-- NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out of
-  draft, and the harness's `gh` refuses it; never work around it. If it refuses, hand off `blocked`
-  with the PR's URL in `pr`.
+- NEVER mark a PR ready for review or open one that is not a draft: the harness's `gh` refuses both;
+  never work around it. If it refuses, hand off `blocked` with the PR's URL in `pr`.
 <!-- /ttp:if prs -->
 <!-- ttp:if !prs -->
 - Never open, update or close a pull request: only a `code` task whose spec asks for delivery does.
@@ -148,7 +147,7 @@ never write to a run folder named in earlier context):
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
  "outcome": "if it applies: landed, kept, shelved or rejected",
- "tried": [{"title": "each separate lever you tried", "outcome": "kept | shelved | rejected", "result": "the number or bound reached"}],
+ "tried": [{"title": "each lever you tried", "outcome": "kept | shelved | rejected", "result": "the number or bound reached"}],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 
@@ -176,7 +175,7 @@ never write to a run folder named in earlier context):
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off written to
   `$TTP_RESULT` ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
-  whenever the check is mechanical.
+  when the check is mechanical.
 <!-- ttp:if remote -->
   For a job on another machine (a device job goes through a device runner instead, when your task
   header lists them), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
@@ -233,14 +232,14 @@ never write to a run folder named in earlier context):
   with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or `needs_review`.
 - Never block one tool call longer than about 5 minutes: submit long work detached and hand off
-  `waiting`. Push with `ttp push --detach`, which does that for you. Where your task's rules say
-  to run one in the foreground, use your longest timeout.
-- Anything still running when you stop must be detached, or it dies with you (`ttp detach <name> --
-  <cmd>` writes `<name>.log` and `<name>.rc` in your run folder and prints the `retry_when`).
+  `waiting`. Push with `ttp push --detach`, which does that for you. Where your task's rules say to
+  run a command in the foreground, do so with your longest timeout.
+- Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>`, which writes
+  `<name>.log` and `<name>.rc` in your run folder and prints the `retry_when`), or it dies with you.
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run,
   or the harness says the run passed its split line, finish the step, commit and
   hand off `done` with a `followups` entry titled `continue: ...` (what is done, branch and head,
   what is left). A review does not split this way: it finishes its verdict.
-- No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.
+- No `result.json`, no credit: a run ending without one is an unfinished attempt.
