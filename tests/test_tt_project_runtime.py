@@ -30764,6 +30764,7 @@ def _run_once(d, monkeypatch, crash=False):
         else:
             assert d.run() == 0
     finally:
+        d.stopping = True   # the process ended: its threads with it (a crash left the tick watch spinning)
         if isinstance(getattr(d, "_lock_fd", None), int):
             os.close(d._lock_fd)   # the process ended: its lock with it
 
@@ -49852,8 +49853,9 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     pid = _devq_job_pid(d, "long-1")
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     os.killpg(pid, signal.SIGKILL)
+    from ttp import devq
     deadline = time.time() + 10
-    while time.time() < deadline and _devq("probe", d, "long-1").returncode != 0:
+    while time.time() < deadline and _devq("probe", d, "long-1").returncode != devq.RUNNER_DOWN_RC:
         time.sleep(0.05)
     assert "no runner is alive" in _devq("probe", d, "long-1").stdout
     flag.touch()
