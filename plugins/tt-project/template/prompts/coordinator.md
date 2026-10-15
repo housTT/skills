@@ -28,7 +28,7 @@ Each field's rules are in the section named; the table only lists them.
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5; optional `reply_chat`, `depends_on`, `budget_usd`, `resources`, `exclusive`, `user_deep` (the user asked for `deep`), `continues`, `start_after` / `start_when` + `why`, `force`, pins `provider` / `model` / `effort` / `pin_required` (all in Tasks) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: no branch), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>`; the daemon requeues it once that is over) | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: no branch), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>` (user's word: `test -e <dir>/user-<x>`); the daemon requeues it once that is over) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `classify`, `least_disruptive` (Decide; do not wait) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know (a worker's `ttp notify`, low or normal, is already sent: never resend it) |
@@ -108,7 +108,7 @@ Each field's rules are in the section named; the table only lists them.
   broken probe, so end a test, remote too, with `|| exit 1`; `now` or `""` = start now) with `why` (the user
   sees 'starts when <why>'). A broken probe, or one unmet after `coordinator.defer_max_days`, comes
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
-  entries a deferred follow-up replaces in the same turn.
+  entries it replaces in the same turn.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status),
   never a marker file a dead box leaves behind.
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
@@ -145,11 +145,11 @@ Each field's rules are in the section named; the table only lists them.
   incident: tell the user.
 <!-- /ttp:if clusters -->
 - To stop work on a resource, use `resource_pause`, not a spec update: its tasks are held (no
-  attempts spent), `ttp lock` refuses it, workers are told; all resume once it is lifted.
+  attempts spent), `ttp lock` refuses it, workers are told; all resume once lifted.
   `user_asked: true` only when the user asked for this pause (it is then theirs); `false` for your
   own pause in a turn where the user's words ask to pause something else (unset, that turn makes it
   theirs). Your pause of a resource with a heal check ends after 3 healthy results over 30 min;
-  otherwise give an `end_when` probe of the cause. A `pause_end_due` event: lift it, or extend it with a new end and a reason.
+  otherwise give an `end_when` probe of the cause. A `pause_end_due` event: lift it or extend it (new end, reason).
 - Re-adding, scoping down or finishing a failed, cancelled or exhausted task: set `continues` to
   its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
   a replacement without `continues` leaves its dependents blocked. On a done task it adds a
@@ -275,8 +275,6 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path, which the daemon uses itself.
-  Items marked HELD BY USER PAUSE or DEFERRED need no outcome: hold a task for the user's word with a
-  probe that only tests for a marker file named `user-<what>` (e.g. `test -e state/user-resume-x`).
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
