@@ -18,8 +18,12 @@ Host <box-alias>
 ```
 
 - The site file names the jump alias (`jump`), so tools can check it: `site.md`.
-- Ask the user before editing their ssh config. Host keys are verified by the user once, never
-  accepted blindly (`StrictHostKeyChecking=no` is not allowed).
+- Ask the user before editing their ssh config. Host key checking stays on everywhere:
+  `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` are not allowed. A box with a
+  stable host key (bare metal, cluster login and compute nodes) has its key verified by the user
+  once, in their own `known_hosts`. IRD reservations are fresh containers with a new key each
+  time: their managed ssh block trusts the first key per reservation, in a file only that
+  reservation uses and deleted with it (`ird.md`).
 
 ## Many short commands
 
