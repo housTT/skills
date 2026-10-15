@@ -26268,8 +26268,9 @@ def _pq_plan(s, **plan):
     s.plan.write_text(json.dumps(plan))
 
 
-def _pq_hand_off(env, s, push=None, task=None, **more):
-    """The review's run hands off done with `push` (default: its branch at its head)."""
+def _pq_hand_off(env, s, push=None, task=None, note=None, **more):
+    """The review's run hands off done with `push` (default: its branch at its head). `note`: the
+    run's note, as dispatch recorded it."""
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
     task = task or s.review
@@ -26280,7 +26281,8 @@ def _pq_hand_off(env, s, push=None, task=None, **more):
     if push is not False:
         result["push"] = [{"branch": s.branch, "head": s.head}] if push is None else push
     (run_dir / "result.json").write_text(json.dumps(result))
-    Daemon(s.p.base)._finish_worker({"task": task, "id": 7}, Usage(cost_usd=1.0), "ok", run_dir)
+    Daemon(s.p.base)._finish_worker({"task": task, "id": 7, "note": json.dumps(note or {})}, Usage(cost_usd=1.0),
+                                     "ok", run_dir)
     return s.p.db.task(task)
 
 
@@ -27046,7 +27048,8 @@ def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_lan
 
 
 def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_reaches_the_coordinator(env, monkeypatch):
-    """A review whose approved head conflicts on its last attempt does not fail to the coordinator: the
+    """A review whose approved head keeps conflicting past its conflict fixes (max_attempts of them,
+    apart from its review attempts) does not fail to the coordinator: the
     daemon queues one review that continues it and rebases that head (labelled with it), and the
     rebase may approve a commit it made. Tending again queues no second one. When the rebase's own
     head keeps conflicting, it fails to the coordinator as before, with no third task."""
@@ -27055,6 +27058,12 @@ def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_re
     s.p.db.update_task(s.review, max_attempts=1)
     _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["tests/test_a.py"], "onto": onto})
     _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "queued" and json.loads(t["result"])["conflict_fix"]["n"] == 1, t
+    fixed = _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}})
+    assert fixed["status"] == "pushing" and fixed["attempts"] == 1, "a conflict fix costs no review attempt"
     mark = _pq_mark(s.p)
     _pq_batch(s)
     _pq_tend(s)
@@ -27075,6 +27084,11 @@ def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_re
     fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "rebase onto the tip")
     s.p.db.update_task(rb["id"], max_attempts=1)
     assert _pq_hand_off(env, s, push=[{"branch": s.branch, "head": fix}], task=rb["id"])["status"] == "pushing"
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(rb["id"])["status"] == "queued", "its one conflict fix"
+    assert _pq_hand_off(env, s, push=[{"branch": s.branch, "head": fix}], task=rb["id"],
+                        note={"conflict_fix": {"tier": "light"}})["status"] == "pushing"
     mark = _pq_mark(s.p)
     _pq_batch(s)
     _pq_tend(s)
@@ -27083,6 +27097,155 @@ def test_a_head_that_keeps_conflicting_gets_one_rebase_review_and_its_failure_re
     assert len(s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")) == 1
     [ev] = [e for e in _pq_events(s.p, mark, task=rb["id"]) if e["kind"] == "task_failed"]
     assert ev["status"] == "queued" and "keeps conflicting" in ev["text"], ev
+
+
+def test_a_textual_push_conflict_queues_a_light_conflict_fix_and_a_merged_check_failure_a_standard_one(
+        env, monkeypatch):
+    """The trigger: the queue sends a reviewed head back with a textual conflict, and the review is
+    queued as a conflict fix that dispatch runs at light; a conflict whose merged checks failed, or a
+    rebase that stopped for another reason, runs at standard; deep stays deep."""
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    onto = "ef" * 20
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": onto})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    cf = json.loads(t["result"])["conflict_fix"]
+    assert t["status"] == "queued" and t["attempts"] == 1, t
+    assert (cf["head"], cf["onto"], cf["files"], cf["branch"], cf["n"]) == (s.head, onto, ["feature.txt"], s.branch, 1)
+    assert "escalate" not in cf
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_requeued"]
+    assert ev["status"] == "handled" and "light conflict fix" in ev["text"]
+    d = Daemon(s.p.base)
+    task, pick = d._size_review(t)
+    assert task["tier"] == "light" and pick["conflict_fix"]["tier"] == "light", pick
+    assert s.p.db.task(s.review)["tier"] == "standard", "the light tier is this run's, not the task's"
+    # The batch merged both sides and its checks failed: no plain textual conflict.
+    _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}})
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"},
+             detail={"files": ["feature.txt"], "onto": onto, "cmd": "pytest -q", "tail": "E  assert 1 == 2"})
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    cf = json.loads(t["result"])["conflict_fix"]
+    assert cf["n"] == 2 and "merged checks failed" in cf["escalate"], cf
+    assert d._size_review(t)[0]["tier"] == "standard"
+    s.p.db.update_task(s.review, tier="deep")
+    assert d._size_review(s.p.db.task(s.review))[0]["tier"] == "deep"
+
+
+def test_a_failed_light_conflict_fix_runs_again_at_standard_at_once_with_no_attempt_or_coordinator_turn(
+        env, monkeypatch):
+    """Escalation: a light conflict fix that hands off failed (or ends without a hand-off, or asks for
+    a standard wake) is queued again at once at standard, with no review attempt spent and no event
+    for the coordinator. A standard conflict fix that fails fails as any review does."""
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": "ef" * 20})
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    mark = _pq_mark(s.p)
+    t = _pq_hand_off(env, s, push=False, note={"conflict_fix": {"tier": "light"}}, status="failed",
+                     summary="both sides rewrote the same paragraph")
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and t["attempts"] == 1 and t["not_before"] <= time.time(), t
+    assert res["conflict_fix"]["escalate"].startswith("the light conflict fix ended failed: both sides"), res
+    assert res["woke"].startswith("push conflict"), res
+    evs = _pq_events(s.p, mark, task=s.review)
+    assert evs and all(e["status"] == "handled" for e in evs) and not [e for e in evs if e["kind"] == "task_failed"]
+    task, pick = Daemon(s.p.base)._size_review(t)
+    assert task["tier"] == "standard" and pick["rule"].startswith("the light conflict fix ended"), pick
+    # A light run that waits asking for standard escalates too.
+    s.p.db.update_task(s.review, status="queued", result=json.dumps(
+        {"status": "queued", "conflict_fix": {k: v for k, v in res["conflict_fix"].items() if k != "escalate"}}))
+    t = _pq_hand_off(env, s, push=False, note={"conflict_fix": {"tier": "light"}}, status="waiting",
+                     wake_tier="standard", retry_after_s=0, summary="needs a closer look")
+    assert t["status"] == "queued" and t["attempts"] == 1
+    assert "waiting for a standard run" in json.loads(t["result"])["conflict_fix"]["escalate"]
+    # The standard run fails: an ordinary review failure, with its attempt.
+    mark = _pq_mark(s.p)
+    t = _pq_hand_off(env, s, push=False, note={"conflict_fix": {"tier": "standard"}}, status="failed",
+                     summary="the two changes contradict each other")
+    assert t["status"] == "failed" and t["attempts"] == 2, t
+    assert [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
+
+
+def test_conflict_fix_same_body_escalates_only_when_both_sides_changed_one_python_function(tmp_path):
+    """Both sides changed one function or test since their merge base: standard. Different functions
+    of the same file, an insertion between them, or a non-Python file: light."""
+    from ttp import conflictfix
+    repo = tmp_path / "r"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,  # noqa: E731
+                                  text=True).stdout.strip()
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "t")
+    src = "def f():\n    a = 1\n    return a\n\n\nclass T:\n    def test_g(self):\n        assert 1\n"
+    (repo / "m.py").write_text(src)
+    (repo / "n.md").write_text("one\ntwo\n")
+    g("add", ".")
+    g("commit", "-qm", "base")
+
+    def side(name, text, md=None):
+        g("checkout", "-q", "-b", name, "main")
+        (repo / "m.py").write_text(text)
+        if md:
+            (repo / "n.md").write_text(md)
+        g("commit", "-qam", name)
+        return g("rev-parse", "HEAD")
+    a = side("a", src.replace("a = 1", "a = 2"), "one\nTWO\n")
+    b = side("b", src.replace("a = 1", "a = 3"), "one\nzwei\n")
+    c = side("c", src.replace("assert 1", "assert 2"))
+    d = side("d", src.replace("\n\nclass T", "\ndef h():\n    pass\n\n\nclass T"))
+    e = side("e", src.replace("assert 1", "assert 3"))
+    assert conflictfix.same_body(str(repo), a, b, ["n.md", "m.py"]) == "both sides changed m.py:f"
+    assert conflictfix.same_body(str(repo), a, c, ["m.py"]) == ""
+    assert conflictfix.same_body(str(repo), c, e, ["m.py"]) == "both sides changed m.py:T.test_g"
+    assert conflictfix.same_body(str(repo), a, d, ["m.py"]) == ""
+    assert conflictfix.same_body(str(repo), a, b, ["n.md"]) == ""
+    assert conflictfix.same_body(str(repo), a, "f" * 40, ["m.py"]) == ""
+    assert conflictfix.tier_for(str(repo), {"head": a, "onto": b, "files": ["m.py"]}) == (
+        "standard", "both sides changed m.py:f")
+    assert conflictfix.tier_for(str(repo), {"head": a, "onto": c, "files": ["m.py"]})[0] == "light"
+
+
+def test_a_light_conflict_fix_gets_the_short_prompt_and_an_escalated_one_the_review_rules(env):
+    from ttp.prompts import worker_task
+    from ttp.prompts import restrictions_block
+    p = make(env)
+    cf = {"head": "ab" * 20, "branch": "ttp/t1-x", "target": "origin/main", "onto": "cd" * 20, "files": ["a.py"],
+          "n": 1}
+    rid = p.db.add_task("review x", "the long review spec", kind="review", tier="standard", origin="coordinator")
+    p.db.update_task(rid, result=json.dumps({"status": "queued", "woke": "push conflict: x", "conflict_fix": cf}))
+    short = worker_task(p, p.db.task(rid), str(p.root), None, conflict={"tier": "light", "why": "textual"})
+    assert "git range-diff" in short and '"push": [{"branch": "ttp/t1-x"' in short and "a.py" in short
+    assert "the long review spec" not in short and "## Approving into the push queue" not in short
+    assert short.rstrip().endswith(restrictions_block(p).rstrip())
+    full = worker_task(p, p.db.task(rid), str(p.root), None,
+                       conflict={"tier": "standard", "why": "both sides changed a.py:f"})
+    assert "the long review spec" in full and "settles that push conflict at standard (both sides changed a.py:f)" \
+        in full
+    assert "git range-diff" not in worker_task(p, p.db.task(rid), str(p.root), None)
+
+
+def test_conflict_fix_stats_split_light_runs_from_the_others(env):
+    from ttp import conflictfix
+    p, rid = _pq_rows(env)
+    now = time.time()
+    _pq_row(p, rid, now, status="conflict", age=600)
+    other = p.db.add_task("r2", "r", kind="review", origin="coordinator")
+    _pq_row(p, other, now, status="conflict", age=600, head="ef" * 20)
+    for task, cost, note in ((rid, 0.4, {"conflict_fix": {"tier": "light"}}), (other, 2.5, {})):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (task, "reviewer", "claude", "ok", now + 10, now + 200, cost, json.dumps(note)))
+    st = conflictfix.stats(p.db, now - 86400)
+    assert (st["fixes"], st["light"], st["light_usd"], st["other"], st["other_usd"], st["usd_per_fix"]) == (
+        2, 1, 0.4, 1, 2.5, 1.45), st
 
 
 def test_a_conflicting_head_gets_no_rebase_review_past_the_review_cap_or_after_one_already_ran(env, monkeypatch):

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import settinghold, timefmt
+from . import conflictfix, settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
@@ -493,18 +493,27 @@ def _reboot_note(reboot, tz: str | None = None) -> str:
 RUN_DIR_MARK = "<this run's dir>"
 
 
-def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None) -> str:
+def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None,
+                conflict: dict | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
     task itself, and the restrictions again at the end. `wake` (the daemon's run note) marks a run
-    that wakes a waiting task, at a tier that may be below the task's own."""
+    that wakes a waiting task, at a tier that may be below the task's own. `conflict` (the run
+    note's conflict_fix) marks a push-conflict fix: a light one gets conflict_fix_task's short prompt."""
     cfg = p.config()
     kind = task["kind"] or "work"
     history = ""
     prev = load_result(task["result"])
+    cmark = prev.get(conflictfix.KEY) if isinstance(prev.get(conflictfix.KEY), dict) else None
+    if conflict and cmark and conflict.get("tier") == "light":
+        return conflict_fix_task(p, task, cwd, branch, cmark)
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
             history += f"Woken because: {prev['woke']}.\n"
+        if conflict and cmark:
+            history += (f"This run settles that push conflict at {conflict.get('tier')} ({conflict.get('why')}); it "
+                        "costs no review attempt. Rebase, resolve keeping both sides' intents, run focused tests "
+                        "of what the resolution touched and approve the new head.\n")
         history += _reboot_note(prev.get("reboot"), timefmt.home(p))
     run_tier = (wake or {}).get("tier") or task["tier"]
     step = bud.mechanical_step(prev) if wake else ""
@@ -596,6 +605,39 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
+
+
+def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dict) -> str:
+    """The short prompt of a light push-conflict fix (conflictfix.py): rebase the approved head onto
+    the push branch's tip, test what the resolution touched, and approve the new head again. The
+    review's own rules and spec stay out: the change was already reviewed."""
+    head, onto, target = str(cf.get("head") or "?"), str(cf.get("onto") or "the tip"), str(cf.get("target") or "?")
+    cb = str(cf.get("branch") or "")
+    files = ", ".join(str(f) for f in cf.get("files") or []) or "?"
+    return "\n\n".join([
+        f"# YOUR TASK #{task['id']}: push-conflict fix for {task['title']}\n"
+        f"kind: review · this run: light conflict fix (no review attempt) · budget ${task['budget_usd'] or 0:.2f} "
+        f"(spent ${task['spent_usd'] or 0:.2f})\n"
+        f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
+        f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json\n"
+        f"project root: {p.root}\n" + _zone_line(p),
+        f"This review already approved branch {cb or '(none)'} at {head}, but the push queue could not land it: "
+        f"it conflicts with {target} at {onto} in {files}.\n\n"
+        "Do only this:\n"
+        f"1. Fetch, then rebase {head} onto the current tip of {target} here, resolving each conflict keeping both "
+        "sides' intents. That resolution is the one edit you may make.\n"
+        "2. Run only the focused tests of the files the resolution touched (a file, `-k` or `file::test`; never "
+        "the full suite), plus the validator of the package they belong to where the repository documents one "
+        "(e.g. a plugin validator). The push queue runs the full push checks on the head you hand back.\n"
+        f"3. Show `git range-diff $(git merge-base {head} <new tip>)..{head} <new tip>..HEAD` and say in the "
+        "summary whether each commit matches apart from the resolution.\n"
+        "4. Commit and hand off `done` with "
+        f'"push": [{{"branch": "{cb}", "head": "<the rebased head, full hash>"}}].\n\n'
+        "If both sides changed the same function or test, the resolution needs a decision about either "
+        "change's intent, or the tests fail for a reason you cannot settle in the resolution: stop and hand off "
+        "`failed` saying what it is. The task then runs again at once at standard, at no attempt.\n"
+        "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
+        restrictions_block(p)])
 
 
 def verified_line(p: Project, task: dict, cwd: str) -> str:

@@ -40,6 +40,7 @@ from . import budget as bud
 from . import budgetkind
 from . import cachettl
 from . import chaincap
+from . import conflictfix
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -2891,6 +2892,26 @@ class Daemon:
                 approval, new = check, "pushing"
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
+        # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
+        # light one that ends any other way (a refused account or a lost host aside) runs again at once
+        # at standard, also without an attempt and with no coordinator turn.
+        cfix, cmark = conflictfix.run_note(r.get("note")), conflictfix.of(task)
+        if cfix and cmark:
+            lost_run = status in ("limit", "auth") or reboot_lost
+            asks_up = waiting and isinstance(result, dict) and result.get("wake_tier") in ("standard", "deep")
+            if cfix.get("tier") == "light" and not lost_run and (asks_up or not waiting) \
+                    and new not in ("pushing", "done", "blocked", "review"):
+                why = (f"{conflictfix.LIGHT_FAILED} {'waiting for a standard run' if asks_up else rstatus or status}: "
+                       f"{summary[:300]}")
+                new, not_before, push_quiet, waiting = "queued", time.time(), True, False
+                attempts = int(task["attempts"] or 0)
+                extra[conflictfix.KEY] = {**cmark, "escalate": why}
+                extra["woke"] = str(load_result(task["result"]).get("woke") or "push conflict")[:1500]
+                reason = f"{why[:300]}; its review runs again at standard"
+            elif new == "pushing":
+                attempts = int(task["attempts"] or 0)
+            elif new == "queued":
+                extra[conflictfix.KEY] = cmark   # its next run is the same conflict fix
         if new in ("done", "pushing"):
             self._mark_verified(task, approval, extra)
         if ended:
@@ -4493,12 +4514,15 @@ class Daemon:
                     note["pick"] = picked
                 if review_pick:
                     note["review_tier"] = review_pick
+                    if review_pick.get(conflictfix.KEY):
+                        note[conflictfix.KEY] = review_pick[conflictfix.KEY]
                 if lost and lost["cwd"] == cwd:
                     # The session holds the task and its own work: a short prompt continues it.
                     prompt = worker_resume(self.p, task, lost)
                     note["resumes"] = {"run": lost["run"], "session": lost["session"]}
                 else:
-                    prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake")), None
+                    prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
+                                               conflict=note.get(conflictfix.KEY)), None
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
@@ -6894,7 +6918,16 @@ class Daemon:
         tier, and the rule's pick for the run's note (None when it was not measured). Deep stays the
         coordinator's call. A re-review after a failed review and a retry never run light: the
         failed review shows the change needs the closer look, and the light try may be why it
-        failed. A diff that cannot be measured keeps the tier the task was given."""
+        failed. A diff that cannot be measured keeps the tier the task was given. A push-conflict fix
+        runs at conflictfix.tier_for's tier for this run only, deep reviews too."""
+        cf = conflictfix.of(task)
+        if cf is not None:
+            tier, why = conflictfix.tier_for(str(self.p.root), cf)
+            if tier == "standard" and task["tier"] == "deep":
+                tier = "deep"
+            log(self.p, f"task {task['id']}: push-conflict fix at {tier} ({why})")
+            return dict(task, tier=tier), {"tier": tier, "from": task["tier"], "rule": why,
+                                           conflictfix.KEY: {"tier": tier, "why": why, "head": cf.get("head")}}
         if task["tier"] == "deep":
             return task, None
         prior = self._failed_review_before(task)

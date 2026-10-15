@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, coordinator as coord, locks, push, runner, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, locks, push, runner, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -430,11 +430,12 @@ def queued_text(task: dict, approval: dict) -> str:
 
 
 # edges --------------------------------------------------------------------------------------------
-def _requeue(db, task: dict, woke: str) -> None:
+def _requeue(db, task: dict, woke: str, extra: dict | None = None) -> None:
     """Run the review again at once and tell its run why (prompts.worker_task shows `woke`)."""
     prev = load_result(task["result"])
+    prev.pop(conflictfix.KEY, None)
     db.update_task(task["id"], status="queued", not_before=None, blocked_reason=None,
-                   result=dump_result({**prev, "woke": woke[:1500]}))
+                   result=dump_result({**prev, "woke": woke[:1500], **(extra or {})}))
 
 
 def _cancel(db, ids: list[int]) -> None:
@@ -957,8 +958,12 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         if done:
             woke += "; already landed: " + ", ".join(f"{x['branch'] or '?'} at {_short(x['head'])} ({x['status']} as "
                                                      f"{_short(x['pushed_sha'])})" for x in done)
-        if int(task["attempts"] or 0) >= int(task["max_attempts"] or 3):
-            text = f"{woke}. It keeps conflicting after {task['attempts']} attempts"
+        # Conflict fixes cost no review attempt (conflictfix.py): their own count is the approvals the
+        # queue sent back, this one included.
+        sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'",
+                      (tid,))["n"]
+        if sent > int(task["max_attempts"] or 3):
+            text = f"{woke}. It keeps conflicting after {sent - 1} conflict fixes"
             rebase = auto_rebase(p, task, r, target, woke)
             if rebase:
                 text += f"; the daemon queued #{rebase} to rebase it once more and re-approve it"
@@ -969,9 +974,13 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
             if not rebase:
                 _reply(db, task, "failed", text)
         else:
-            _requeue(db, task, woke)
-            _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it",
-                   queued=False)
+            raw = [str(f) for f in (d.get("files") or [])]
+            textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
+            cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
+                                  str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
+            _requeue(db, task, woke, {conflictfix.KEY: cf})
+            _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it"
+                   + ("" if cf.get("escalate") else " as a light conflict fix"), queued=False)
     elif states <= {"pushed", "landed"}:
         done = [x for x in rows if x["status"] in ("pushed", "landed")]
         last = max(done, key=lambda x: x["id"])
@@ -1617,7 +1626,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
     st = _state(db)
     return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
             "backoff_until": st.get("backoff_until"), "bad_tip": st.get("bad_tip"), "deaths": int(st.get("deaths") or 0),
-            "conflicts": conflict_stats(db, now - STATS_S)}
+            "conflicts": conflict_stats(db, now - STATS_S), "conflict_fixes": conflictfix.stats(db, now - 86400)}
 
 
 # What a live batch is doing, a finished batch's outcome and its after_push, in words for the user.
@@ -1721,6 +1730,11 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
         lines.append(f"last {STATS_S // 86400} days: {c['entries']} entr{'ies' if c['entries'] != 1 else 'y'} done, "
                      f"{c['conflicted']} conflicted ({c['conflict_pct']}%), {c['auto_resolved']} resolved in the batch, "
                      f"{c['sent_back']} sent back ({c['sent_back_pct']}%)")
+    f = sm.get("conflict_fixes") or {}
+    if f.get("fixes"):
+        lines.append(f"last 24 h: {f['fixes']} conflict fix{'es' if f['fixes'] != 1 else ''}, ${f['usd']:.2f} "
+                     f"(${f['usd_per_fix']:.2f} each); {f['light']} light (${f['light_usd']:.2f}), "
+                     f"{f['other']} other (${f['other_usd']:.2f})")
     lv = sm["live"]
     lines.append("batches, newest first:" if sm["last"] or lv else "batches: none yet")
     if lv and lv["id"] not in [b["id"] for b in sm["last"]]:   # still in its push phase
