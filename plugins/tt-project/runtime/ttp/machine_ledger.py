@@ -714,19 +714,23 @@ class Probes:
         self.p, self.log = p, log
         self._procs: dict[int, tuple[subprocess.Popen, float, str]] = {}
         self._probed: dict[int, float] = {}
+        self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
+        self._reported: dict[int, str] = {}   # change id -> the broken-probe reading already logged
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
         passed = []
-        for cid, (proc, started, probe) in list(self._procs.items()):
-            rc = proc.poll()
-            if rc is None and now - started < ends.PROBE_TIMEOUT_S:
-                continue
-            del self._procs[cid]
-            if rc is None:
-                ends._kill(proc)
+        for cid, (rc, probe, err) in ends.reap_probes(self._procs, self._errs, now, self.p).items():
+            if rc == "timeout" or rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names
+                self._reported.pop(cid, None)
             elif rc == 0 or detach.failed_check(probe, rc):   # the jobs it waits on ended, even if one failed
                 passed.append((cid, probe, rc))
+            else:   # a broken probe: say so once, not every round
+                code = rc if isinstance(rc, str) else f"exit {rc}"
+                why = f"{code}: {err}" if err else code
+                if self._reported.get(cid) != why:
+                    self._reported[cid] = why
+                    self.log(f"machine change #{cid}: its until-probe is broken ({why[-500:]})")
         if passed:
             ids = {(cid, probe): rc for cid, probe, rc in passed}
             with _locked():
@@ -748,16 +752,12 @@ class Probes:
                 continue
             self._probed[cid] = now
             try:
-                self._procs[cid] = (subprocess.Popen(c["probe"], shell=True, cwd=str(self.p.root),
-                                                     env=project.command_env(self.p), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                                     stderr=subprocess.DEVNULL, start_new_session=True), now, c["probe"])
+                self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")
 
     def stop(self) -> None:
-        for proc, *_ in self._procs.values():
-            ends._kill(proc)
-        self._procs.clear()
+        ends.stop_probes(self._procs, self._errs)
 
 
 # digest -------------------------------------------------------------------------------------------

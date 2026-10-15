@@ -65316,3 +65316,63 @@ def test_command_watcher_to_pages_a_keyed_lines_new_episode_again(env, monkeypat
     assert len(_notes_to("ops")) == 3
     run("hw", dict(plain, text="box-a: held (since boot 2)", episode="boot 2"))
     assert len(_notes_to("ops")) == 4
+
+
+def test_a_running_end_confirmation_does_not_block_stop_or_exit(env, monkeypatch):
+    import threading
+    from ttp import ends, netwait
+    p = make(env)
+    release = threading.Event()
+    monkeypatch.setattr(netwait, "confirm", lambda *a, **k: release.wait(30) and "")
+    procs = {"c": (ends._Confirming(ends._confirm("exit 255", "", p), ""), time.time(), "exit 255")}
+    t0 = time.time()
+    ends.stop_probes(procs, {})
+    assert time.time() - t0 < 2 and not procs
+    th = [t for t in threading.enumerate() if t.name == "ttp-end-confirm"]
+    assert th and all(t.daemon for t in th)
+    release.set()
+
+
+@pytest.mark.parametrize("code,passed,reported", [(0, True, False), (1, False, False), (2, False, True)])
+def test_machine_change_until_probe_exit_codes(env, code, passed, reported):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=f"exit {code}", now=now)
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    probes.tick(now)
+    probes._procs[c["id"]][0].wait(30)
+    probes.tick(now + 1)
+    [got] = ml.changes()
+    assert bool(got.get("probe_passed")) is passed
+    assert bool(logs) is reported
+    if reported:
+        probes._procs.clear(); probes._probed.clear()
+        probes.tick(now + 1000); probes._procs[c["id"]][0].wait(30); probes.tick(now + 1001)
+        assert len(logs) == 1, "reported once"
+
+
+def test_machine_change_until_probe_255_needs_ssh_confirmation(env, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import netwait
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="exit 255", now=now)
+    seen = []
+    monkeypatch.setattr(netwait, "confirm", lambda *a, **k: seen.append(a) or "ssh reaches h1")
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    probes.tick(now)
+    probes._procs[c["id"]][0].wait(30)
+    probes.tick(now + 1)
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.05)
+    probes.tick(now + 2)
+    assert seen and any("broken" in l and "ssh reaches h1" in l for l in logs), logs

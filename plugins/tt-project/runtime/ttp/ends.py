@@ -19,8 +19,9 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -352,16 +353,25 @@ class _Confirming:
         self.fut, self.err = fut, err
 
 
-_confirm_pool: ThreadPoolExecutor | None = None
+_confirm_slots = threading.BoundedSemaphore(4)   # at most 4 host checks at once, across projects
 
 
 def _confirm(probe: str, err: str, p: Project | None) -> Future:
-    """netwait.confirm off the daemon's thread: in an outage each host check waits out its timeout."""
-    global _confirm_pool
-    if _confirm_pool is None:
-        _confirm_pool = ThreadPoolExecutor(4, thread_name_prefix="ttp-end-confirm")
+    """netwait.confirm off the daemon's thread: in an outage each host check waits out its timeout.
+    Daemon threads, so a check still running never holds up the daemon's exit."""
     env = command_env(p) if p is not None else None
-    return _confirm_pool.submit(netwait.confirm, probe, err, lambda h: netwait.answers(h, env))
+    fut: Future = Future()
+
+    def run() -> None:
+        with _confirm_slots:
+            if not fut.set_running_or_notify_cancel():
+                return
+            try:
+                fut.set_result(netwait.confirm(probe, err, lambda h: netwait.answers(h, env)))
+            except BaseException as e:
+                fut.set_exception(e)
+    threading.Thread(target=run, name="ttp-end-confirm", daemon=True).start()
+    return fut
 
 
 def reap_probes(procs: dict, errs: dict[int, Any], now: float,
