@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, budgetkind, chaincap, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -372,8 +372,9 @@ def _standing_entry(e: dict) -> bool:
 
 def cache_ttl_s(c: dict) -> float:
     """How long the provider keeps the coordinator's prompt cache between turns (coordinator.cache_ttl):
-    "auto" and "1h" write 1h entries; "5m", "off" (the agent's own default) and anything else 5 min."""
-    return 3600.0 if str(c.get("cache_ttl", "auto") or "").lower() in ("auto", "1h") else 300.0
+    "auto" (also unset or "") and "1h" write 1h entries; "5m", "off" (the agent's own default) and anything
+    else 5 min."""
+    return 3600.0 if cachettl.setting(c) in ("auto", "1h") else 300.0
 
 
 def _last_turn(p: Project) -> float:

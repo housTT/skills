@@ -4266,7 +4266,7 @@ class Daemon:
             context = coord.with_cached(context, cached)
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
-                           cache_ttl=str(c.get("cache_ttl", cachettl.AUTO) or ""),
+                           cache_ttl=cachettl.setting(c),
                            budget_usd=budget,
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "budget_usd": budget, **({"sizing": sized["info"]} if sized["info"] else {}),

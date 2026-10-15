@@ -22,6 +22,11 @@ KEEP = 8                 # prefixes remembered
 PARTS = ("prompt", "schema", "model", "effort", "cli")
 
 
+def setting(c: dict) -> str:
+    """coordinator.cache_ttl as set, lower-cased; unset, null or "" (left by an older template) is "auto"."""
+    return str(c.get("cache_ttl") or "").strip().lower() or AUTO
+
+
 def _h(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 

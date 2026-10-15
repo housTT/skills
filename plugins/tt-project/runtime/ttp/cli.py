@@ -4377,6 +4377,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     keep_note = _keep_light_coordinator(p)
     if keep_note:
         print(keep_note)
+    if ttl_note := _auto_cache_ttl(p):
+        print(ttl_note)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     res = service.restart(p)
@@ -4417,6 +4419,19 @@ def _keep_light_coordinator(p: Project) -> str:
     return ("upgrade note: this project overrides the light-tier model, so coordinator.model_tier was set to "
             "\"\" and its coordinator keeps the light-tier model; `ttp config %s coordinator.model_tier "
             "standard` makes it follow the standard tier" % p.name)
+
+
+def _auto_cache_ttl(p: Project) -> str:
+    """An empty coordinator.cache_ttl, left by an older template, is set to "auto" (the runtime already reads
+    it so; an explicit value is the project's own choice). Returns the note."""
+    try:
+        coord = p.raw_config().get("coordinator")
+        if not (isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip()):
+            return ""
+        p.set_config("coordinator.cache_ttl", "auto")
+    except Exception:
+        return ""
+    return 'upgrade note: coordinator.cache_ttl was "" (from an older template) and is now "auto"'
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:

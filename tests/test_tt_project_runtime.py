@@ -7084,10 +7084,10 @@ def test_coordinator_turns_take_the_configured_cache_ttl_and_auto_by_default(env
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     clock = [time.time()]
     monkeypatch.setattr(time, "time", lambda: clock[0])
-    for cfg_ttl, want in ((None, "auto"), ("1h", "1h"), ("5m", "5m"), ("off", "off")):
+    for cfg_ttl, want in ((None, "auto"), ("", "auto"), ("1h", "1h"), ("5m", "5m"), ("off", "off")):
         d = Daemon(p.base)
         d.update_gates()
-        if cfg_ttl:
+        if cfg_ttl is not None:
             d.cfg["coordinator"]["cache_ttl"] = cfg_ttl
         calls = []
         monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append(k) or 1)
@@ -64672,6 +64672,24 @@ def test_upgrade_keeps_a_light_tier_model_coordinator(env):
     p.set_config("coordinator.model_tier", "standard")   # the project's own choice stays
     assert cli._keep_light_coordinator(p) == ""
     assert p.config()["coordinator"]["model_tier"] == "standard"
+
+
+def test_empty_cache_ttl_is_auto_flagged_by_doctor_and_set_to_auto_by_upgrade(env):
+    from ttp import cli, coordinator
+    from ttp.project import config_problems
+    p = make(env)
+    assert coordinator.cache_ttl_s({"cache_ttl": ""}) == coordinator.cache_ttl_s({}) == 3600.0
+    assert coordinator.cache_ttl_s({"cache_ttl": "5m"}) == 300.0
+    assert not any("cache_ttl" in line for line in config_problems(p.raw_config()))
+    assert cli._auto_cache_ttl(p) == ""                  # unset: nothing to change
+    p.set_config("coordinator.cache_ttl", "")
+    assert any('cache_ttl: ""' in line for line in config_problems(p.raw_config()))
+    assert "upgrade note" in cli._auto_cache_ttl(p)
+    assert p.raw_config()["coordinator"]["cache_ttl"] == "auto"
+    assert not any("cache_ttl" in line for line in config_problems(p.raw_config()))
+    p.set_config("coordinator.cache_ttl", "5m")         # the project's own choice stays
+    assert cli._auto_cache_ttl(p) == ""
+    assert p.raw_config()["coordinator"]["cache_ttl"] == "5m"
 
 
 def test_push_result_line_matches_the_documented_format_and_pushed_flag_exit_codes(tmp_path, capsys):

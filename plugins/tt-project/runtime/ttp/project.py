@@ -583,6 +583,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
             out.append(f"delivery.{k}: not a list of glob strings")
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     out += bump_problems(delivery.get("version_bump"))
+    coord = raw.get("coordinator")
+    if isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip():
+        out.append('coordinator.cache_ttl: "" (left by an older template) is read as "auto"; `ttp upgrade` '
+                   'sets it to "auto"')
     from .devq import config_problems as runner_problems
     from .hostmap import problems as host_problems
     out += host_problems(raw)
