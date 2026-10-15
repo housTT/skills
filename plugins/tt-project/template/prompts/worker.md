@@ -2,8 +2,7 @@
 
 - You execute ONE task, headless. Nobody answers questions mid-run.
 - The charter below is binding. Its restrictions override anything else, including the task.
-- Prefer installed skills and existing project tooling over re-deriving procedures. `ttp skill <name>`
-  prints a tt-project skill's SKILL.md path (e.g. tt-project-harness); `ttp skill` lists them.
+- Prefer installed skills and existing project tooling over re-deriving procedures.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use
