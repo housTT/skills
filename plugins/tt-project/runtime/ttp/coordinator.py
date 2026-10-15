@@ -83,6 +83,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"}, "not_covered": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
+            "restriction_quote": {"type": "string"}, "requester": {"type": "string"}, "not_own_call": {"type": "string"},
             "classify": {"type": "string", "enum": list(ASK_CLASSES)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
@@ -332,6 +333,7 @@ _DEFAULT_NOTE = "\n\nIf there is no answer within "
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
+_RESTRICTION_NOTE = "\n\nRestriction: "
 _REVERSIBLE_NOTE = "\n\nReversible alternative considered: "
 LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it and the rule it breaks
 OVER_MIN = 20   # chars: retiring a restriction outside a user turn names the end that passed
@@ -1689,6 +1691,29 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "false login", text)
                     raise ValueError(f"ask_user rejected: {why}")
+                restriction_item = ""
+                if a["blocking"] == "restriction":
+                    restriction_item = _restriction_quoted(p, str(a.get("restriction_quote") or ""))
+                    if not restriction_item:
+                        _count_refusal(db, key, "no restriction item", text)
+                        raise ValueError(
+                            "ask_user rejected: no Restriction item: decide it yourself. A `restriction` ask needs "
+                            "`restriction_quote`: the exact text of one item in the charter's Restrictions "
+                            "sections (the whole item, or a part of it found nowhere else; case, spacing, smart "
+                            "quotes and end punctuation do not count). A quote matching no item, several items or "
+                            "text outside Restrictions is refused")
+                if (a["blocking"] == "human" and not _OTHERS_ASK_RE.search(f"{text} {a.get('recommendation') or ''}")
+                        and not _requester_known(db, str(a.get("requester") or ""))):
+                    _count_refusal(db, key, "no other human", text)
+                    raise ValueError(
+                        "ask_user rejected: the user is not another human: use the real blocking reason or decide "
+                        "it yourself. A `human` ask says who else asked (\"another team asked ...\"), or names them "
+                        "in `requester`: an inbound message id, an upstream note fingerprint, an issue or PR URL "
+                        "this project has seen, or the person's role (a reviewer, a maintainer, the platform team)")
+                why = _own_call_ask(a, text)
+                if why and len(str(a.get("not_own_call") or "").strip()) < LEAST_DISRUPTIVE_MIN:
+                    _count_refusal(db, key, why[0], text)
+                    raise ValueError(f"ask_user rejected: {why[1]}")
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
@@ -1705,7 +1730,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"ask_user rejected: {why}")
                 rec = (a.get("recommendation") or "").strip()
                 if a["blocking"] == "restriction":
-                    text += f"{_LEAST_NOTE}{least}"
+                    text += f"{_LEAST_NOTE}{least}{_RESTRICTION_NOTE}{restriction_item}"
                 elif a["blocking"] == "irreversible" and least:
                     text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
@@ -1713,7 +1738,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
-                flag = _reversible_ask(a, a["text"].strip(), least)
+                own = _own_call_ask(a, a["text"].strip())
+                if own:   # sent on its not_own_call override: counted for the daily audit
+                    _count_refusal(db, key, f"{own[0]} (not_own_call)", a["text"].strip(), kind=ASK_FLAGGED_KIND)
+                flag = None if own else _reversible_ask(a, a["text"].strip(), least)
                 if flag:   # sent anyway: a flag is feedback for the next turn and the daily review, never a refusal
                     _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)
                     notes.append(f"ask_user: ask {turn_asks[-1][1]} was sent; flagged ({flag[0]}): {flag[1]}")
@@ -3878,6 +3906,88 @@ def _reversible_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | No
                 "undone. If this one can, such a call is yours next time: act on it, memory_add the decision and "
                 "notify at severity low. If it cannot, nothing to do")
     return None
+
+
+# Asks the coordinator decides itself whatever `blocking` says: one sentence pairing a rerun verb with
+# what it reruns, or a deadline move with the deadline. Exempt: money, a credential, a step only the user
+# can take, another person's request, a NEEDS_USER setting; overridden by `not_own_call`.
+_OWN_RERUN_RE = re.compile(r"\b(?:re-?run\w*|retr(?:y|ies|ying|ied))\b", re.I)
+_OWN_RERUN_OBJ_RE = re.compile(r"\b(?:tests?|runs?|jobs?|soaks?|benchmarks?|sweeps?)\b", re.I)
+_OWN_DEADLINE_RE = re.compile(r"\b(?:extend\w*|push(?:es|ed|ing)?\s+(?:\S+\s+)?back|mov(?:e|es|ed|ing)|"
+                              r"postpon\w*)\b", re.I)
+_OWN_DEADLINE_OBJ_RE = re.compile(r"\b(?:deadlines?|due\s+dates?|milestones?)\b", re.I)
+
+
+def _own_call_ask(a: dict, text: str) -> tuple[str, str] | None:
+    """(label, hint) when a restriction, irreversible or human ask is the coordinator's own call: one
+    sentence pairs rerun/retry with a test, run, job, soak, benchmark or sweep, or extend, push back,
+    move or postpone with a deadline, due date or milestone. None for other blocking reasons and for
+    asks naming money, a credential, a step only the user can take, another person's request or a
+    NEEDS_USER setting. A `not_own_call` of LEAST_DISRUPTIVE_MIN characters sends it anyway (caller)."""
+    if a.get("blocking") not in ("restriction", "irreversible", "human"):
+        return None
+    said = f"{text} {a.get('recommendation') or ''}".replace("\u2019", "'")
+    if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said)
+            or _USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
+        return None
+    for sentence in re.split(r"[.;:!?\n]+", said):
+        rerun = _OWN_RERUN_RE.search(sentence) and _OWN_RERUN_OBJ_RE.search(_OWN_RERUN_RE.sub(" ", sentence))
+        if rerun or (_OWN_DEADLINE_RE.search(sentence) and _OWN_DEADLINE_OBJ_RE.search(sentence)):
+            return ("own call", "a rerun or a later deadline is your call: decide, memory_add the decision, notify "
+                    "low. If only the user can decide it, say why in `not_own_call` (at least "
+                    f"{LEAST_DISRUPTIVE_MIN} characters)")
+    return None
+
+
+def _restriction_quoted(p, quote: str) -> str:
+    """The one item of the charter's Restrictions sections `quote` names, matched as charter_update
+    matches its `quote` (_quote_hits), as one line; "" when it names none, several or a placeholder."""
+    from .prompts import charter_sections
+    if not quote.strip():
+        return ""
+    try:
+        charter = p.charter_path.read_text()
+    except OSError:
+        return ""
+    found: set[str] = set()
+    hits = 0
+    for head, body in charter_sections(charter):
+        if not " ".join(head[3:].split()).lower().startswith("restriction"):
+            continue
+        whole = "\n".join(body)
+        for s, e in _quote_hits(whole, quote):
+            hits += 1
+            found |= {_ws(whole[i:j]) for i, j, _ in _items(whole) if i < e and s < j}
+    item = found.pop() if hits == 1 and len(found) == 1 else ""
+    return "" if item.startswith("(") and item.endswith(")") else item
+
+
+_REQUESTER_ROLE_RE = re.compile(r"\b(?:team|person|people|colleague|reviewer|reporter|maintainer|owner|lead|"
+                                r"manager|admin(?:istrator)?|operator|customer|developer|contributor|"
+                                r"stakeholder|on[- ]?call)s?\b", re.I)
+_REQUESTER_URL_RE = re.compile(r"https?://\S+/(?:issues|pull|pulls|merge_requests)/\d+", re.I)
+
+
+def _requester_known(db, requester: str) -> bool:
+    """Whether `requester` names someone other than the user who asked, as something this project has:
+    an inbound message id, an upstream note fingerprint, an issue or PR URL in its messages or events,
+    or a person's role."""
+    r = requester.strip()
+    if not r:
+        return False
+    m = re.fullmatch(r"(?:(?:inbound\s+)?(?:message|msg)\s*)?#?(\d+)", r, re.I)
+    if m:
+        return bool(db.one("SELECT 1 FROM messages WHERE id=? AND direction='in'", (int(m.group(1)),)))
+    m = re.fullmatch(r"(?:note\s+)?([0-9a-f]{16})", r, re.I)
+    if m:
+        return bool(db.one("SELECT 1 FROM events WHERE kind='upstream_note' AND text LIKE ?",
+                           (f"%{m.group(1).lower()}%",)))
+    m = _REQUESTER_URL_RE.search(r)
+    if m:
+        url = m.group(0).rstrip(".,;)")
+        return bool(db.one("SELECT 1 FROM messages WHERE text LIKE ?", (f"%{url}%",))
+                    or db.one("SELECT 1 FROM events WHERE text LIKE ?", (f"%{url}%",)))
+    return bool(_REQUESTER_ROLE_RE.search(r))
 
 
 def _count_refusal(db, key: str | None, label: str, text: str, kind: str = ASK_REFUSED_KIND) -> None:
