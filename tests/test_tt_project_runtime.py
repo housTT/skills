@@ -36793,6 +36793,9 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # Rules for features that are off are left out; turning one on brings its rules in.
     assert "With the push queue on" not in role and "came in on Slack" not in role
     assert "`landed:#<id>`" not in role and "Shared clusters" not in role
+    # Push-branch-only settings and check holds show only once a push branch is set.
+    assert "delivery.mirror_remotes" not in role and "check:<sig>" not in role
+    assert "`delivery.push_branch` and `delivery.push_checks`" in role
     assert "A PR leaves draft ONLY on the user's explicit yes" in role
     # The coordinator's own pause in a turn where the user asks to pause something else stays its
     # own: coordinator._users_pause makes an unset `user_asked` the user's in such a turn.
@@ -36812,6 +36815,7 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     p.set_config("notify.slack", True)
     on = coordinator_role(p)
     assert "With the push queue on" in on and "came in on Slack" in on and "`landed:#<id>`" in on
+    assert "delivery.mirror_remotes" in on and "check:<sig>" in on and on.count("| `config_set` |") == 1
     # `ttp:if !X` keeps its block only while X is off; nested blocks follow their outer one.
     text = ("a\n<!-- ttp:if x -->\nb\n<!-- ttp:if y -->\nc\n<!-- /ttp:if y -->\n<!-- /ttp:if x -->\n"
             "<!-- ttp:if !x -->\nd\n<!-- /ttp:if !x -->\n")
