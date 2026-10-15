@@ -297,7 +297,7 @@ MUTE_CHARS = 200
 # resources and memory changes are always shown whole; the machine ledger collapses per line
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "tried")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -452,8 +452,11 @@ def memory_view(p: Project, now: float | None = None) -> dict:
 
 def recent_memory_lines(p: Project) -> list[str]:
     """The newest decisions and facts the coordinator's memory budget leaves room for after the
-    standing entries, shown live after the snapshot (CACHED_SECTIONS) so a new one never changes it."""
-    rest = [e["line"] for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0] if not _standing_entry(e)]
+    standing entries, shown live after the snapshot (CACHED_SECTIONS) so a new one never changes it.
+    Records every entry the turn sees as shown (Project.note_memory_shown)."""
+    shown = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
+    p.note_memory_shown([e["name"] for e in shown])
+    rest = [e["line"] for e in shown if not _standing_entry(e)]
     return [RECENT_MEMORY_HEADER] + rest if rest else []
 
 
@@ -787,6 +790,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")
+    pinned = memory_pinned_line(p)
+    if pinned:
+        section("memory_pinned", [pinned], pinned.split(":")[0], pinned.split(":")[0] + " (as last turn)")
     lines = ["## Open tasks (id | status | tier | priority | age | title | last note)"]
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     in_review = db.review_since()
@@ -2957,10 +2963,27 @@ def memory_budget_line(p: Project) -> str:
             f"entry is only shortened (a standing `memory_add` that supersedes it), never retired for space")
 
 
+MEMORY_PINNED_HALF_KEY = "memory_pinned_half"   # kv: set once pinned memory alone takes over half the coordinator's
+
+
+def memory_pinned_line(p: Project) -> str:
+    """One digest line while pinned entries alone take over half the coordinator's memory budget,
+    leaving little room for the decisions and facts it needs."""
+    _, coord = p.memory_select(COORDINATOR_MEMORY_CHARS)
+    if coord["pinned_chars"] * 2 <= coord["limit"]:
+        return ""
+    return (f"## Pinned memory over half your budget: restrictions, preferences, resources and (standing) "
+            f"entries take {coord['pinned_chars']} of {coord['limit']} chars, leaving "
+            f"{max(0, coord['limit'] - coord['pinned_chars'])} for decisions and facts. Merge overlapping ones "
+            f"(`memory_add` with `supersedes`, same kind, standing kept standing, the user's quoted words "
+            f"kept verbatim); never retire them for space")
+
+
 def memory_budget_check(p: Project) -> None:
     """Tell the coordinator once when the memory workers always get, with their charter digest, no
-    longer fits the workers' budget; it is shown whole anyway, at the cost of every other entry. Re-arms
-    once it fits again."""
+    longer fits the workers' budget; it is shown whole anyway, at the cost of every other entry. Also
+    once when pinned entries alone take over half the coordinator's budget (memory_pinned_line). Each
+    re-arms once it fits again."""
     from .prompts import worker_context
     over = worker_context(p)[2]
     over["pinned_over"] = over["pinned_chars"] + over["charter_chars"] > over["limit"]
@@ -2976,6 +2999,19 @@ def memory_budget_check(p: Project) -> None:
         p.db.set_kv(MEMORY_ALERT_KEY, True)
     elif flagged and not over["pinned_over"]:
         p.db.set_kv(MEMORY_ALERT_KEY, False)
+    _, coord = p.memory_select(COORDINATOR_MEMORY_CHARS)
+    heavy, flagged = coord["pinned_chars"] * 2 > coord["limit"], p.db.kv(MEMORY_PINNED_HALF_KEY)
+    if heavy and not flagged:
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "daemon", "memory_pinned_heavy", "normal",
+                f"Pinned memory ({coord['pinned']} restriction/preference/resource or standing entries, "
+                f"{coord['pinned_chars']} chars) takes over half the coordinator's {coord['limit']}-char memory "
+                f"budget, so fewer decisions and facts reach its prompt. Merge overlapping ones with `memory_add` "
+                f"and `supersedes` (same kind, a standing entry only into a standing one, the user's quoted words "
+                f"kept verbatim); never retire them for space.", "queued"))
+        p.db.set_kv(MEMORY_PINNED_HALF_KEY, True)
+    elif flagged and not heavy:
+        p.db.set_kv(MEMORY_PINNED_HALF_KEY, False)
 
 
 def _hours_or_none(a: dict, key: str) -> float | None:

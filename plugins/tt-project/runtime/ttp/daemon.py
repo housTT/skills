@@ -216,6 +216,7 @@ KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
+MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
@@ -937,7 +938,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -1168,6 +1169,27 @@ class Daemon:
             self._ends.tick()
         except Exception:
             log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
+
+    def archive_hidden_memory(self) -> None:
+        """Once a day, model-free: archive the decisions and facts every prompt has left out for
+        memory.archive_hidden_days (Project.archive_hidden_memory), with one harness commit and one
+        low feed line, then re-check the memory budget."""
+        now = time.time()
+        if now - float(self.p.db.kv(MEMORY_ARCHIVED_KEY, 0) or 0) < 86400:
+            return
+        self.p.db.set_kv(MEMORY_ARCHIVED_KEY, now)
+        days = float((self.cfg.get("memory") or {}).get("archive_hidden_days") or 0)
+        try:
+            names = self.p.archive_hidden_memory(days) if days > 0 else []
+            coord.memory_budget_check(self.p)
+        except Exception:
+            log(self.p, "archiving hidden memory failed\n" + traceback.format_exc())
+            return
+        if names:
+            log(self.p, f"memory: archived {', '.join(names)} (hidden {days:g}+ days)")
+            self.p.db.post("out", f"Archived {len(names)} memory entr{'y' if len(names) == 1 else 'ies'} no prompt had "
+                           f"shown for {days:g}+ days (decisions and facts only); `ttp memory {self.p.name} --search "
+                           f"<words>` still finds them.", chat=None, kind="info", severity="low")
 
     def record_ttr(self) -> None:
         """Machine incidents for time to recover (ttr.observe), model-free, every ttr.OBSERVE_S. It runs

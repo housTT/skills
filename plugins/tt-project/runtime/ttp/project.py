@@ -318,6 +318,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # workstations (a Mac is one); other platforms never.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
+    # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
+    # decision and fact entries, never standing ones, that every prompt has left out for at least
+    # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
+    "memory": {"archive_hidden_days": 7},
 }
 
 
@@ -706,6 +710,9 @@ PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
 # Memory each prompt carries, in characters of whole entries (see Project.memory_select). A worker's
 # charter digest and memory share theirs (see prompts.worker_context); its Restrictions come on top.
 COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
+# Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
+ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
+MEMORY_SHOWN_KEY = "memory_shown"   # kv: when a prompt last carried each entry (see note_memory_shown)
 # Memory audiences an entry's front matter may name (`audience:`); without one, see worker_memory.
 MEMORY_AUDIENCES = ("workers", "coordinator")
 _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
@@ -979,13 +986,15 @@ class Project:
         return self._git_commit(rel, "harness: commit files an earlier failed commit left", gone, sweep=False)
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
-                   end: dict | None = None, standing: bool = False, audience: str | None = None) -> Path:
+                   end: dict | None = None, standing: bool = False, audience: str | None = None,
+                   commit: bool = True) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
         `standing` marks an instruction that applies every time its case comes up (a preference
         unless pinned already): finishing one instance never retires it (see forget_memory).
-        `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory)."""
+        `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory).
+        `commit` False leaves the harness commit to the caller (see supersede_memory)."""
         from .ends import front_matter
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
@@ -1014,7 +1023,8 @@ class Project:
         if f"](memory/{path.name})" not in index:
             durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind}"
                                               f"{', standing' if standing else ''})\n")
-        self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
+        if commit:
+            self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 
     def _memory_entries(self) -> list[dict]:
@@ -1039,9 +1049,10 @@ class Project:
             standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
             aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
             ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
+            created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
-                        "standing": standing, "audience": aud.group(1) if aud else "",
-                        "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})
+                        "standing": standing, "audience": aud.group(1) if aud else "", "created": created,
+                        "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out
 
@@ -1125,11 +1136,11 @@ class Project:
             raise ValueError(errors[0])
         return done[0]
 
-    def forget_memories(self, names: list[str], keep: str | None = None,
-                        why: str | None = None) -> tuple[list[Path], list[str]]:
+    def forget_memories(self, names: list[str], keep: str | None = None, why: str | None = None,
+                        commit: bool = True) -> tuple[list[Path], list[str]]:
         """forget_memory for several entries with one MEMORY.md rewrite and one harness commit:
         (archived paths, one error per name refused). A refused name (unknown, ambiguous, standing
-        without `why`) leaves the others retired."""
+        without `why`) leaves the others retired. `commit` False leaves the commit to the caller."""
         why = " ".join((why or "").split())
         done, errors, moved = [], [], []
         for raw in names:
@@ -1160,10 +1171,113 @@ class Project:
             lines = self.memory_index.read_text().splitlines(keepends=True)
             durable_write(self.memory_index, "".join(x for x in lines
                                                      if not any(f"](memory/{n}.md)" in x for n in moved)))
-        self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in moved), self.memory_index],
-                            f"memory retired: {', '.join(moved)}" + (f" ({why})" if why else ""),
-                            removed=[self.memory_dir / f"{n}.md" for n in moved])
+        if commit:
+                self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in moved), self.memory_index],
+                                f"memory retired: {', '.join(moved)}" + (f" ({why})" if why else ""),
+                                removed=[self.memory_dir / f"{n}.md" for n in moved])
         return done, errors
+
+    def note_memory_shown(self, names: list[str], now: float | None = None) -> None:
+        """Record that a prompt being built carries the entries `names`, and when a prompt was last
+        built, so hidden_memory can tell which entries every prompt leaves out. `since` marks when
+        recording began: no entry counts as hidden from before it."""
+        now = time.time() if now is None else now
+        with self.db.tx():
+            m = self.db.kv(MEMORY_SHOWN_KEY) or {}
+            shown = dict(m.get("entries") or {})
+            shown.update((n, now) for n in names)
+            self.db.set_kv(MEMORY_SHOWN_KEY, {"since": m.get("since") or now, "built": now, "entries": shown})
+
+    def hidden_memory(self, days: float) -> list[str]:
+        """The decisions and facts (never standing) that every prompt built in the last `days` days
+        left out: not shown since `days` before the newest prompt, nor created or recorded since. It
+        counts up to the newest prompt, not now, so a project that built none (paused, idle) hides nothing."""
+        m = self.db.kv(MEMORY_SHOWN_KEY) or {}
+        if days <= 0 or not m.get("built"):
+            return []
+        built, shown = float(m["built"]), m.get("entries") or {}
+        since = float(m.get("since") or built)
+        return [e["name"] for e in self._memory_entries()
+                if e["kind"] in ARCHIVABLE_MEMORY_KINDS and not e["standing"]
+                and built - max(float(shown.get(e["name"]) or 0), since, _stamp_ts(e["created"])) >= days * 86400]
+
+    def archive_hidden_memory(self, days: float) -> list[str]:
+        """Retire hidden_memory(days) to memory/archive/ with one harness commit, and drop retired
+        names from the shown map. Returns the names retired."""
+        names = self.hidden_memory(days)
+        done = self.forget_memories(names, why=f"no prompt showed it for {days:g}+ days")[0] if names else []
+        with self.db.tx():
+            m = self.db.kv(MEMORY_SHOWN_KEY)
+            if m:
+                live = {e["name"] for e in self._memory_entries()}
+                m["entries"] = {n: t for n, t in (m.get("entries") or {}).items() if n in live}
+                self.db.set_kv(MEMORY_SHOWN_KEY, m)
+        return [d.stem for d in done]
+
+    def search_memory(self, words: list[str]) -> list[dict]:
+        """Live and archived entries whose name or text holds every one of `words` (any case), oldest
+        first: `name`, `kind`, `standing`, `archived` and `text` (the body)."""
+        want = [w.lower() for w in " ".join(words).split()]
+        out = []
+        for d, archived in ((self.memory_dir, False), (self.memory_dir / "archive", True)):
+            for f in sorted(d.glob("*.md")) if d.is_dir() else []:
+                head, body = _memory_parts(f.read_text())
+                if not all(w in f"{f.stem}\n{body}".lower() for w in want):
+                    continue
+                m = re.search(r"^kind:\s*(\S+)", head, re.M)
+                c = re.search(r"^created:\s*(\S+)", head, re.M)
+                out.append({"name": f.stem, "kind": m.group(1) if m else f.stem.split("-", 1)[0],
+                            "standing": bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M)),
+                            "archived": archived, "text": body.strip(), "created": c.group(1) if c else ""})
+        return sorted(out, key=lambda e: (e["created"], e["name"]))
+
+    def supersede_memory(self, text: str, names: list[str], kind: str = "fact",
+                         standing: bool = False) -> tuple[Path, list[Path]]:
+        """Add a merged entry and retire the live entries it replaces, with one harness commit:
+        (new entry, archived paths). Refused whole, nothing written, when a name is unknown, ambiguous
+        or already archived, or the merge would lose a user rule: a standing entry is replaced only
+        by a standing one, a restriction only by a restriction, a preference only by a preference or
+        restriction, a resource only by a resource, and the quoted words of a restriction, preference
+        or standing entry (the user's verbatim words) stay word for word in the new text."""
+        if standing and kind not in PINNED_MEMORY_KINDS:
+            kind = "preference"
+        new = " ".join(text.split())
+        errors, olds = [], []
+        for raw in names:
+            try:
+                name, archived = self._resolve_memory_name(Path(raw.strip().strip("[]")).stem)
+            except ValueError as e:
+                errors.append(str(e))
+                continue
+            if archived:
+                errors.append(f"[{name}] is archived already")
+                continue
+            head, body = _memory_parts((self.memory_dir / f"{name}.md").read_text())
+            m = re.search(r"^kind:\s*(\S+)", head, re.M)
+            old = m.group(1) if m else name.split("-", 1)[0]
+            old_standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
+            if old_standing and not standing:
+                errors.append(f"[{name}] is a standing instruction: only a --standing entry replaces it")
+            allowed = {"restriction": ("restriction",), "preference": ("preference", "restriction"),
+                       "resource": ("resource",)}.get(old)
+            if allowed and kind not in allowed:
+                errors.append(f"[{name}] is a {old}: only a {' or '.join(allowed)} entry replaces it (--kind)")
+            if old in ("restriction", "preference") or old_standing:
+                lost = [q for q in _quoted(body) if " ".join(q.split()) not in new]
+                if lost:
+                    errors.append(f"[{name}] holds the user's words; keep them verbatim in the new text: "
+                                  + "; ".join(f'"{q}"' for q in lost))
+            olds.append(name)
+        if errors:
+            raise ValueError("nothing changed: " + "\n".join(errors))
+        added = self.add_memory(text, kind=kind, standing=standing, commit=False)
+        done, errors = self.forget_memories(olds, keep=added.stem, why=f"merged into [{added.stem}]", commit=False)
+        self.commit_harness([added, self.memory_index, *done],
+                            f"memory ({kind}): [{added.stem}] supersedes {', '.join(d.stem for d in done)}",
+                            removed=[self.memory_dir / d.name for d in done])
+        if errors:
+            raise ValueError("\n".join(errors))
+        return added, done
 
 
 OUTPUT_TAIL = 2000   # chars of a failed daemon-run command's output kept for its event or observation
@@ -1230,6 +1344,26 @@ def output_tail(text: str | bytes | None, limit: int = OUTPUT_TAIL) -> str:
     if isinstance(text, bytes):
         text = text[-4 * limit:].decode(errors="replace")
     return (text or "").strip()[-limit:].strip()
+
+
+def _stamp_ts(stamp: str) -> float:
+    """The time a memory entry's `created` (see _stamp, or a bare date) names; 0 when unreadable."""
+    from datetime import datetime, timezone
+    try:
+        d = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def _memory_parts(raw: str) -> tuple[str, str]:
+    """A memory file's (front matter, body)."""
+    return tuple(raw.split("---", 2)[1:]) if raw.startswith("---") and raw.count("---") >= 2 else ("", raw)
+
+
+def _quoted(text: str) -> list[str]:
+    """The quoted spans of a memory entry ("...", “...”): the words it keeps as said."""
+    return [a or b for a, b in re.findall(r'"([^"\n]{3,})"|“([^”\n]{3,})”', text)]
 
 
 def _stamp(ts: float) -> str:

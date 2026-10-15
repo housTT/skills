@@ -3637,8 +3637,28 @@ def cmd_prune(a) -> None:
 def cmd_memory(a) -> None:
     from .coordinator import memory_budget_check
     p = need(a.name, sys.argv[1:])
+    if a.search:
+        found = p.search_memory(a.search)
+        for e in found:
+            tags = ", ".join([e["kind"]] + ["standing"] * e["standing"] + ["archived"] * e["archived"])
+            print(f"[{e['name']}] ({tags}) {' '.join(e['text'].split())[:300]}")
+        print(f"{len(found)} entr{'y' if len(found) == 1 else 'ies'} found")
+        return
     if not a.text and not a.forget:
-        sys.exit("give the memory's text, or --forget <entry>")
+        sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
+    if a.supersedes:
+        if not a.text or a.forget:
+            sys.exit("--supersedes needs the merged entry's text and no --forget: "
+                     f"ttp memory {p.name} \"<text>\" --kind K --supersedes <entry> ...")
+        try:
+            added, done = p.supersede_memory(a.text, a.supersedes, kind=a.kind, standing=a.standing)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(added)
+        for dst in done:
+            print(f"retired to {dst}")
+        memory_budget_check(p)
+        return
     if a.text:
         print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
     done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
@@ -5809,7 +5829,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_obligation)
 
-    s = sub.add_parser("memory", help="add a memory, or retire one with --forget")
+    s = sub.add_parser("memory", help="add a memory, retire one with --forget, merge with --supersedes, or --search")
     s.add_argument("name")
     s.add_argument("text", nargs="?")
     s.add_argument("--kind", default="fact")
@@ -5823,6 +5843,14 @@ def main(argv: list[str] | None = None) -> None:
                         "one finished instance never retires it")
     s.add_argument("--why", help="with --forget: why it ends; required for a standing entry (its end condition "
                                   "or the user's words ending it)")
+    s.add_argument("--search", nargs="+", metavar="WORD",
+                   help="list live and archived entries holding every word (any case); changes nothing")
+    s.add_argument("--supersedes", action="extend", nargs="+", metavar="ENTRY",
+                   help="with the text: add it as a merged entry and archive the entries it replaces, in one "
+                        "harness commit. Refused whole if a name is unknown or archived, a standing entry would "
+                        "be replaced by one not --standing, a restriction, preference or resource by another "
+                        "kind, or the quoted (user's verbatim) words of a restriction, preference or standing "
+                        "entry are missing from the text")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")

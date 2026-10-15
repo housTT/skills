@@ -42,6 +42,11 @@ Assess the last day of this project, then hand off.
    resources that still hold. Name what you retired in the summary. A (standing) entry is a duty
    that recurs: one finished instance does not make it done, and size is no reason to retire it.
    Retire one only with `--why "<its end condition, or the user's words ending it>"`.
+   Then merge overlapping decision and fact entries, at most 10 entries a day: `ttp memory <name>
+   "<merged text>" --kind decision|fact --supersedes <entry> <entry> ...` adds the merged entry and
+   archives the ones it replaces in one commit. Keep every point that still holds; `ttp memory
+   <name> --search <words>` finds related entries, archived ones too. The daemon archives decisions
+   and facts no prompt has shown for `memory.archive_hidden_days` days by itself.
 7. Deferrals held in memory ("deferred", "once X", "N days after Y", "queue it when ..."): turn
    each into a follow-up with `start_after` (a delay such as `3d` or an ISO time in the home zone) and/or
    `start_when` (a read-only shell probe from the project root: exit 0 = start, 1 = not yet,

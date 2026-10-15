@@ -461,6 +461,7 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
     charter, mem, use = worker_context(p)
+    p.note_memory_shown([e["name"] for e in mem])
     head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
     parts.append(head + (charter or "(none)"))
     if mem:
