@@ -528,7 +528,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that
-  host's boot id changed), 1 while it runs and 255 while ssh fails. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
+  host's boot id changed), 1 while it runs and 255 while ssh fails; with `--rows <file> --after <n>` it
+  exits 0 also once that file (on that host) has more than n lines, and 0 once the job ended or its driver
+  is gone, else 1. A retry_when that tests only an end marker over ssh is flagged. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
   and 255 while not (12 with `--classified`), 10 when its host key does not verify and 11 when
   authentication fails (ssh runs with strict host-key checking and no connection sharing);
   `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`

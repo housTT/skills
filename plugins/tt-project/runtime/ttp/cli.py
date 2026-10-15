@@ -2913,7 +2913,10 @@ def cmd_detach(a) -> None:
     ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
     once the job wrote exit code 0, 4 (detach.FAILED_RC) once it wrote another one or its process is
     gone without one (a kill, a reboot: it says why, see detach.state), else 1. On 4 the daemon runs
-    the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. From a command a sandbox would end with everything it started,
+    the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. With
+    `--rows <file> --after <n>` it exits 0 also once that file has more than n lines, and 0 (never 4)
+    once a job ended or is gone, else 1: one probe that wakes on a new result row, the end or a dead
+    driver. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
@@ -2927,15 +2930,22 @@ def cmd_detach(a) -> None:
         a.check = [*a.check, *([a.name] if a.name else []), *(a.command or [])]
         if not a.check:
             die("usage: ttp detach --check <rc path...>  |  ttp detach --check --host <ssh alias> <dir>/<name>...")
+        rows, after = getattr(a, "rows", None), getattr(a, "after", None)
+        if after is not None and rows is None:
+            die("--after goes with --rows <file>: the check wakes once that file has more than --after lines")
+        if (after or 0) < 0:
+            die("--after must be 0 or more")
         if a.host:
-            sys.exit(_detach_check_remote(a.host, a.check))
+            sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0))
+    if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
+        die("--rows and --after go with --check")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
     if a.remote:
         _detach_remote(a, _own_ttp())
         return
     if a.check is not None:
-        ended, failed = True, False
+        ended, failed, one_ended = True, False, False
         for rc in map(Path, a.check):
             st, why = detach.state(rc)
             if st == "ended":
@@ -2947,6 +2957,9 @@ def cmd_detach(a) -> None:
             else:
                 ended = False
                 print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}")
+            one_ended = one_ended or st in ("ended", "lost")
+        if rows is not None:
+            sys.exit(_rows_verdict(_count_rows(Path(rows)), rows, after or 0, one_ended))
         sys.exit(1 if not ended else detach.FAILED_RC if failed else 0)
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
@@ -3048,6 +3061,33 @@ echo "gone"
 '''
 
 
+# Run before _REMOTE_CHECK with `--rows`: the line count of the rows file ($2), "rows none" without one.
+_REMOTE_ROWS = r'''f=$2
+case $f in "~"|"~/"*) f=$HOME${f#\~} ;; esac
+if [ -e "$f" ]; then echo "rows $(awk 'END{print NR}' "$f" 2>/dev/null)"; else echo "rows none"; fi
+'''
+
+
+def _count_rows(path: Path) -> int | None:
+    """The lines in a rows file (a last line without a newline counts), None when it does not exist."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return 0
+    return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+
+
+def _rows_verdict(n: int | None, rows: str, after: int, one_ended: bool, where: str = "") -> int:
+    """`ttp detach --check --rows <file> --after <n>`: 0 once the file has more than `after` lines or a
+    job it checks ended or is gone (its driver dead: killed, the host restarted), else 1."""
+    have = "no file yet" if n is None else f"{n} line{'s' if n != 1 else ''}"
+    print(f"rows: {have} in {rows}{where} (wakes above {after})")
+    return 0 if one_ended or (n or 0) > after else 1
+
+
 def _ssh_sh(host: str, script: str, args: list, timeout: float = 60) -> subprocess.CompletedProcess | None:
     """Run `script` with sh on `host` over ssh, with `args` as its $1...; None when ssh cannot run."""
     remote = "sh -c " + " ".join(shlex.quote(x) for x in (script, "sh", *map(str, args)))
@@ -3088,19 +3128,29 @@ def _detach_remote(a, ttp: str) -> None:
           f"\"{ttp} detach --check --host {shlex.quote(a.remote)} {shlex.quote(prefix)}\"")
 
 
-def _detach_check_remote(host: str, prefixes: list) -> int:
+def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, after: int = 0) -> int:
     """`ttp detach --check --host <alias> <dir>/<name>...`: 0 once every job ended with exit 0, 4
     (detach.FAILED_RC) once every one ended or is gone but one failed or left no exit code, 1 while
-    any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read."""
+    any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read.
+    With `rows` (a file on that host): 0 once it has more than `after` lines or one job ended or is
+    gone, else 1 (_rows_verdict); ssh failing is still 255."""
     from .detach import FAILED_RC
-    ended, failed = True, False
-    for pre in prefixes:
+    ended, failed, one_ended, n = True, False, False, None
+    for i, pre in enumerate(prefixes):
         name = Path(pre[:-3] if pre.endswith(".rc") else pre).name
-        r = _ssh_sh(host, _REMOTE_CHECK, [pre])
+        count = rows is not None and i == 0   # the rows file is read once, in the first job's ssh call
+        r = _ssh_sh(host, _REMOTE_ROWS + _REMOTE_CHECK if count else _REMOTE_CHECK, [pre, rows] if count else [pre])
         if r is None or r.returncode == 255:
             print(f"{name}: ssh to {host} failed{': ' + r.stderr.strip()[-200:] if r and r.stderr.strip() else ''}")
             return 255
-        out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 1)
+        lines = r.stdout.strip().splitlines()
+        if count:
+            got = (lines[0] if lines else "").split(" ", 1)
+            if got[0] != "rows" or len(got) < 2:
+                print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
+                return 2
+            n = None if got[1].strip() == "none" else int(got[1]) if got[1].strip().isdigit() else 0
+        out = (lines or [""])[-1].split(" ", 1)
         if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone"):
             print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
             return 2
@@ -3118,6 +3168,9 @@ def _detach_check_remote(host: str, prefixes: list) -> int:
             failed = True
             why = "the host restarted" if out[0] == "boot" else "killed, or the host restarted"
             print(f"{name}: gone without an exit code ({why}); see {pre}.log on {host}")
+        one_ended = one_ended or out[0] != "running"
+    if rows is not None:
+        return _rows_verdict(n, rows, after, one_ended, f" on {host}")
     return 1 if not ended else FAILED_RC if failed else 0
 
 
@@ -3421,8 +3474,11 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
                     prev.pop(key, None)
             db.update_task(tid, result=dump_result(prev))
             if probe is not None:
+                from .waitheal import end_marker_only
+                end = end_marker_only(probe)
                 said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
-                                             else "cleared; it wakes at its retry timer"))
+                                             else "cleared; it wakes at its retry timer")
+                            + (f"; flagged: {end}" if end else ""))
             if on_pass_cmd is not None:
                 said.append("on_pass_cmd " + (f"set: {on_pass_cmd.strip()}" if on_pass_cmd.strip()
                                               else "cleared; a passed probe wakes it"))
@@ -5584,6 +5640,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
+    s.add_argument("--rows", metavar="FILE",
+                   help="with --check (and --host: a file on that host): also exit 0 once this file has more "
+                   "than --after lines; with it, 0 also once a job ended or its driver is gone (killed, a "
+                   "reboot or power cycle), else 1, so one probe wakes on a new result row, the end or a dead driver")
+    s.add_argument("--after", type=int, metavar="N", help="with --rows: the line count already seen (default 0)")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

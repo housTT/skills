@@ -10,7 +10,9 @@ records, kept here as plain functions of a probe, its output and the project.
   found, it names a run dir or worktree that is gone, its devq job is unknown to the runner, or it
   printed the same output for max_hold_s while a task it names has ended.
 - A queued task whose start_when keeps saying "not yet" while it names a device or serving resource
-  is raised once: a probe waiting on a dead resource hides the outage (watched_resources)."""
+  is raised once: a probe waiting on a dead resource hides the outage (watched_resources).
+- A probe that waits over ssh only for an end marker file, with no check that the job's driver still
+  lives, is flagged (end_marker_only): a driver killed by a reboot or power cycle never writes it."""
 from __future__ import annotations
 
 import re
@@ -73,6 +75,28 @@ def task_refs(db, probe: str, own: int) -> list[int]:
             ids.add(int(r["task"]))
     ids.discard(own)
     return sorted(ids)
+
+
+# An end marker a job writes when it ends (`test -e x.rc`, `[ -f out/done ]`), tested over ssh.
+_SSH_RE = re.compile(r"(?:^|[\s;&|(`'\"])(?:\S*/)?ssh\s")
+_END_TEST_RE = re.compile(r"(?:\btest\s+|\[\[?\s+)-[efs]\s+[\"']?([^\s\"';&|)\]]+)")
+_END_NAME_RE = re.compile(r"(?:\.rc|\.exit\w*|\.status|done|finish\w*|complete\w*|ended|\.end)$", re.I)
+# What tells a dead driver from a slow one: its pid, its boot, its scheduler or ttp's own check.
+_LIVENESS_RE = re.compile(r"kill\s+-0|\bpgrep\b|\bpidof\b|\bps\s|/proc/|boot_id|\.pid\b|\bdetach\s+--check\b"
+                          r"|\bdevq\s+probe\b|\bsystemctl\b|\bsqueue\b|\bsacct\b|\bscontrol\b|\bflock\b")
+END_MARKER_HINT = ("it waits over ssh only for an end marker file, with no check that the job's driver still "
+                   "lives: a driver killed by a reboot or power cycle never writes it, and the wait sleeps on to "
+                   "its timer. Start the job with `ttp detach --remote` and wait with `ttp detach --check --host "
+                   "<alias> <dir>/<name>` (add `--rows <file> --after <n>` to also wake on a new result row)")
+
+
+def end_marker_only(probe: str | None) -> str:
+    """END_MARKER_HINT when a probe tests an end marker over ssh and nothing that tells a dead driver
+    from a running one, else "". A flag only, never a refusal."""
+    probe = str(probe or "")
+    if not _SSH_RE.search(probe) or _LIVENESS_RE.search(probe):
+        return ""
+    return END_MARKER_HINT if any(_END_NAME_RE.search(m) for m in _END_TEST_RE.findall(probe)) else ""
 
 
 def never_passes(p, probe: str, rc=None, output: str = "") -> str:

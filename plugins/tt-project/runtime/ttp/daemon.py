@@ -5921,6 +5921,9 @@ class Daemon:
         probe = str(result.get("retry_when") or "")
         if probe:
             self._flag_never_passes(task, probe, None, "")
+            if waitheal.end_marker_only(probe):
+                log(self.p, f"task {task['id']} retry_when waits over ssh only for an end marker: a dead driver "
+                            f"never writes it (`ttp detach --check --host ... --rows` also sees that)")
 
     def _deferral_event(self, task: dict, since: float, kind: str, what: str) -> None:
         """Once per deferral: the coordinator decides again (fix the probe with task_update
@@ -6606,7 +6609,8 @@ class Daemon:
               f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
               f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}. "
               f"It keeps sleeping and no worker run is spent. "
-              f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
+              + (f"Note: {end}. " if (end := waitheal.end_marker_only(probe)) else "")
+              + f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
               f"at its timer, or cancel the task.", "queued", task["id"]))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
 

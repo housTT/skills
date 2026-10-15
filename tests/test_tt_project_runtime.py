@@ -27392,12 +27392,17 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
 
 
-@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "unreachable"])
+@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "unreachable", "end marker"])
 def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_coordinator_once(env, probe):
     """A model run cannot make a "not yet" probe pass: past max_hold_s the task sleeps on and the
-    coordinator gets one wait_stale event per wait, not one per check."""
+    coordinator gets one wait_stale event per wait, not one per check. A probe waiting over ssh only
+    for an end marker is flagged in it: a dead driver never writes the marker."""
     p = make(env)
+    case = probe
     probe = _ssh_255(p) if probe == "unreachable" else probe
+    if case == "end marker":
+        _ssh_255(p, up=True)
+        probe = "ssh -o BatchMode=yes box-a test -e work/job.rc"
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
@@ -27422,6 +27427,7 @@ def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_co
     ev = p.db.q("SELECT * FROM events WHERE task=? AND kind='wait_stale'", (tid,))
     assert len(ev) == 1 and ev[0]["status"] == "queued" and "keeps sleeping" in ev[0]["text"]
     assert f"set-when {tid}" in ev[0]["text"] and probe in ev[0]["text"]
+    assert ("--rows <file> --after <n>" in ev[0]["text"]) == (case == "end marker"), ev[0]["text"]
     assert coord.EFFORT_EVENT_TRIGGERS["wait_stale"] == "stuck", "deciding on a stale wait needs thought"
     # A new wait (a new hand-off) gets its own event.
     p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "waiting_since": since - 60}),
@@ -43777,6 +43783,106 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
     finally:
         _kill_driver(pid2)
     assert r2.returncode == 0
+
+
+def test_detach_check_rows_wakes_on_a_new_row_the_end_or_a_dead_driver(env):
+    """`--rows <file> --after <n>`: 1 while the job runs and the file has n lines or fewer; 0 on a new
+    row, on the job's end (any exit code, never 4) and on a dead driver (killed, or another boot)."""
+    from ttp import locks
+    from ttp.runner import boot_id
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    rows = run_dir / "rows.csv"
+    jobs = [{"name": n, "rc": str(run_dir / f"{n}.rc"), "log": str(run_dir / f"{n}.log"), "boot": b}
+            for n, b in (("live", boot_id()), ("ended", boot_id()), ("dead", boot_id()), ("reboot", "an-earlier-boot"))]
+    (run_dir / "detached.json").write_text(json.dumps(jobs))
+
+    def check(job, after="3"):
+        return _ttp_run(p, "detach", "--check", str(run_dir / f"{job}.rc"), "--rows", str(rows), "--after", after)
+
+    lock = locks.try_take([locks.job_lock(run_dir / "live.rc")], "test job")   # the job still runs
+    try:
+        r = check("live")
+        assert r.returncode == 1 and "live: running" in r.stdout and "no file yet" in r.stdout, r.stdout
+        rows.write_text("a\nb\nc\n")
+        r = check("live")
+        assert r.returncode == 1 and "rows: 3 lines" in r.stdout, r.stdout
+        rows.write_text("a\nb\nc\nd")   # a new row, its newline not written yet
+        r = check("live")
+        assert r.returncode == 0 and "rows: 4 lines" in r.stdout, r.stdout
+        assert check("live", "4").returncode == 1
+    finally:
+        lock.close()
+    (run_dir / "ended.rc").write_text("3\n")   # ended with a failure: the task wakes to look, not 4
+    r = check("ended", "9")
+    assert r.returncode == 0 and "job finished rc=3" in r.stdout, r.stdout
+    __import__("ttp.detach", fromlist=["x"]).started(run_dir / "dead.rc").write_text("123\n")   # pid gone, no .rc
+    r = check("dead", "9")
+    assert r.returncode == 0 and "killed after it started" in r.stdout, r.stdout
+    r = check("reboot", "9")
+    assert r.returncode == 0 and "host restarted" in r.stdout, r.stdout
+    bad = _ttp_run(p, "detach", "--check", str(run_dir / "live.rc"), "--after", "3")
+    assert bad.returncode != 0 and "--after goes with --rows" in bad.stderr, bad.stderr
+
+
+def test_detach_remote_check_rows_wakes_on_a_new_row_the_end_or_a_dead_driver(env, tmp_path):
+    p = _device_project(env, device=False)
+    e = _ssh_stub(tmp_path)
+    rdir = tmp_path / "remote"
+    r = _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "rowjob", "--", "sleep", "60", env=e)
+    assert r.returncode == 0, r.stderr
+    pid = int((rdir / "rowjob.pid").read_text())
+    rows = rdir / "rows.csv"
+    probe = ["detach", "--check", "--host", "box-b", "--rows", str(rows), "--after", "2", str(rdir / "rowjob")]
+    try:
+        r = _ttp_run(p, *probe, env=e)
+        assert r.returncode == 1 and "running on box-b" in r.stdout and "no file yet" in r.stdout, r.stdout
+        rows.write_text("h\n1\n")
+        assert _ttp_run(p, *probe, env=e).returncode == 1
+        rows.write_text("h\n1\n2\n")   # a new row
+        r = _ttp_run(p, *probe, env=e)
+        assert r.returncode == 0 and "rows: 3 lines" in r.stdout and "on box-b" in r.stdout, r.stdout
+        rows.write_text("h\n1\n")
+        # ssh failing keeps the task asleep (255), never reads as a new row or a dead driver.
+        assert _ttp_run(p, *probe, env={**e, "SSH_STUB_FAIL": "1"}).returncode == 255
+        # The box power-cycled: another boot id, so the driver is dead though no .rc was written.
+        boot = (rdir / "rowjob.boot").read_text()
+        (rdir / "rowjob.boot").write_text("another-boot\n")
+        r = _ttp_run(p, *probe, env=e)
+        assert r.returncode == 0 and "the host restarted" in r.stdout, r.stdout
+        (rdir / "rowjob.boot").write_text(boot)
+        assert _ttp_run(p, *probe, env=e).returncode == 1
+    finally:
+        _kill_driver(pid)
+    deadline = time.time() + 20   # killed: its pid is gone and no .rc is ever written
+    while time.time() < deadline and _ttp_run(p, *probe, env=e).returncode == 1:
+        time.sleep(0.1)
+    r = _ttp_run(p, *probe, env=e)
+    assert r.returncode == 0 and "gone without an exit code" in r.stdout, r.stdout
+    (rdir / "rowjob.rc").write_text("5\n")   # ended with a failure: 0 wakes the task to look, not 4
+    r = _ttp_run(p, *probe, env=e)
+    assert r.returncode == 0 and "job finished rc=5" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("probe, flagged", [
+    ("ssh box 'test $(wc -l < out/rows.csv) -gt 3 || test -e out/job.rc'", True),
+    ("ssh -o BatchMode=yes box '[ -f /scratch/run/done ]'", True),
+    ("ttp detach --check --host box --rows out/rows.csv --after 3 out/job", False),   # sees a dead driver
+    ("ssh box 'test -e out/job.rc || ! kill -0 $(cat out/job.pid)'", False),          # its own liveness check
+    ("test -e out/job.rc", False),                                                    # local, not over ssh
+    ("ssh box test -e /srv/ready", False),                                            # not an end marker
+])
+def test_a_probe_waiting_over_ssh_only_for_an_end_marker_is_flagged(env, probe, flagged):
+    from ttp import coordinator as coord, waitheal
+    assert bool(waitheal.end_marker_only(probe)) is flagged
+    assert ("--rows <file> --after <n>" in (coord.marker_only_probe(probe) or "")) is flagged
+    if not flagged:
+        return
+    from ttp import cli
+    p = make(env)
+    tid = _due_waiting_task(p, "exit 1")
+    assert "; flagged: it waits over ssh only for an end marker" in cli.set_when(p.db, tid, probe, p)
 
 
 def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, tmp_path):

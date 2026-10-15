@@ -1134,7 +1134,12 @@ _MARKER_ONLY = re.compile(rf"\s*{_FILE_TEST}(?:\s*&&\s*{_FILE_TEST})*\s*")
 
 
 def marker_only_probe(probe: str | None) -> str | None:
-    """A hint when a start_when only checks that a readiness marker file exists, else None."""
+    """A hint when a start_when only checks that a readiness marker file exists, or waits over ssh
+    only for an end marker with no dead-driver check (waitheal.end_marker_only), else None."""
+    from .waitheal import end_marker_only
+    end = end_marker_only(probe)
+    if end:
+        return f"start_when {clip(probe, 120)!r} {end}"
     if not probe or not _MARKER_ONLY.fullmatch(probe) or not re.search(r"ready", probe, re.I):
         return None
     return (f"start_when {clip(probe, 120)!r} only checks a readiness marker file, which can outlive the "
