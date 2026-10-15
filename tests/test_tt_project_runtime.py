@@ -27174,6 +27174,35 @@ def test_a_failed_light_conflict_fix_runs_again_at_standard_at_once_with_no_atte
     assert [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
 
 
+
+def test_a_light_conflict_fix_that_ends_done_without_approving_a_new_head_runs_again_at_standard(
+        env, monkeypatch):
+    """A light conflict fix that hands off done with no push list, or one the daemon ignores, approved
+    nothing: it runs again at once at standard with no attempt, instead of closing the review and
+    dropping the approved change."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": "ef" * 20})
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    mark = _pq_mark(s.p)
+    t = _pq_hand_off(env, s, push=False, note={"conflict_fix": {"tier": "light"}}, status="done")
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and t["attempts"] == 1 and t["not_before"] <= time.time(), t
+    assert res["conflict_fix"]["escalate"].startswith(
+        "the light conflict fix ended done without approving a new head"), res
+    evs = _pq_events(s.p, mark, task=s.review)
+    assert all(e["status"] == "handled" for e in evs) and not [e for e in evs if e["kind"] == "task_done"], evs
+    # Its push list is ignored: the same.
+    s.p.db.update_task(s.review, status="queued", result=json.dumps(
+        {"status": "queued", "conflict_fix": {k: v for k, v in res["conflict_fix"].items() if k != "escalate"}}))
+    monkeypatch.setattr(pushq, "check_approval", lambda *a, **k: {"ignored": "a test says so"})
+    t = _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}}, status="done")
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and t["attempts"] == 1, t
+    assert "without approving a new head" in res["conflict_fix"]["escalate"], res
+
 def test_conflict_fix_same_body_escalates_only_when_both_sides_changed_one_python_function(tmp_path):
     """Both sides changed one function or test since their merge base: standard. Different functions
     of the same file, an insertion between them, or a non-Python file: light."""

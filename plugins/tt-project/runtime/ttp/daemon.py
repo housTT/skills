@@ -2893,16 +2893,18 @@ class Daemon:
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
-        # light one that ends any other way (a refused account or a lost host aside) runs again at once
-        # at standard, also without an attempt and with no coordinator turn.
+        # light one that ends any other way (done with nothing approved included; a refused account, a
+        # lost host, a block or a needs_review aside) runs again at once at standard, also without an
+        # attempt and with no coordinator turn.
         cfix, cmark = conflictfix.run_note(r.get("note")), conflictfix.of(task)
         if cfix and cmark:
             lost_run = status in ("limit", "auth") or reboot_lost
             asks_up = waiting and isinstance(result, dict) and result.get("wake_tier") in ("standard", "deep")
             if cfix.get("tier") == "light" and not lost_run and (asks_up or not waiting) \
-                    and new not in ("pushing", "done", "blocked", "review"):
-                why = (f"{conflictfix.LIGHT_FAILED} {'waiting for a standard run' if asks_up else rstatus or status}: "
-                       f"{summary[:300]}")
+                    and new not in ("pushing", "blocked", "review"):
+                ended_as = ("waiting for a standard run" if asks_up
+                            else "done without approving a new head" if new == "done" else rstatus or status)
+                why = f"{conflictfix.LIGHT_FAILED} {ended_as}: {summary[:300]}"
                 new, not_before, push_quiet, waiting = "queued", time.time(), True, False
                 attempts = int(task["attempts"] or 0)
                 extra[conflictfix.KEY] = {**cmark, "escalate": why}
