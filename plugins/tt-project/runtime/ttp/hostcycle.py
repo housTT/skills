@@ -204,7 +204,7 @@ def hold(p: Project | None, now: float | None = None, settle: bool = False) -> d
     if not alias:
         return None
     for c in _intents(alias):
-        if abs(c["at"] - now) > ml.POWER_CYCLE_LEAD_S or _rebooted_since(c):
+        if not c["at"] - ml.POWER_CYCLE_LEAD_S <= now < c["at"] + ml.POWER_CYCLE_LEAD_S or _rebooted_since(c):
             continue
         if _no_reboot(p, c):
             if settle:
