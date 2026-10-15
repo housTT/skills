@@ -271,6 +271,7 @@ STINT_LOOKBACK_S = 14 * 86400
 ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
 ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+MISSING_FIELDS = "task_add needs a"   # start of a rejection the next turn can fix (fixable_rejection)
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
@@ -925,6 +926,12 @@ def rejection_key(text: str) -> str:
     return hashlib.sha256(str(text).encode()).hexdigest()[:16]
 
 
+def fixable_rejection(problem: str) -> bool:
+    """A rejected task_add the next turn can fix from its own output (a null or empty title or spec):
+    the daemon keeps that turn's user messages for the next one, once (daemon._keep_messages)."""
+    return str(problem).startswith(f"task_add: {MISSING_FIELDS} ")
+
+
 def digest_size(parts: list[tuple[str, str]]) -> dict:
     """A digest's size for the run's note: characters per section, in total, and estimated tokens
     (about four characters each), which a turn writes to the provider's cache."""
@@ -1275,9 +1282,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                        severity=_norm_severity(a.get("severity") or "normal")))
             elif t == "task_add":
-                title = (a.get("title") or "").strip()
-                if not title:
-                    raise ValueError("task_add needs a title")
+                title = str(a.get("title") or "").strip()
+                missing = [f for f, v in (("title", title), ("spec", str(a.get("spec") or "").strip())) if not v]
+                if missing:
+                    raise ValueError(f"{MISSING_FIELDS} {' and a '.join(missing)}: title and spec must both be "
+                                     f"non-null text; resend it with both")
                 dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')",
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):

@@ -246,6 +246,12 @@ KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}}: branches 
 BACKUP_TRIES = 3            # a backup push that fails this often (network, auth) is given up with an observation
 BACKUP_RETRY_S = 900        # times the try count: the wait before a failed backup push is tried again
 KV_DIRTY_MAIN = "dirty_main"   # kv: key of the main checkout's dirty tracked paths last reported
+UNQUEUED_TAG = "NOT queued by the daemon"   # on a `continue:` follow-up no hop was queued for
+CONTINUE_UNQUEUED = "continue_unqueued"   # event: a done task's `continue:` follow-up has no continuing task
+CONTINUE_UNQUEUED_AFTER_S = 1800   # how long after task_done before it is raised
+CONTINUE_UNQUEUED_WINDOW_S = 86400   # task_done events older than this are not checked
+CONTINUE_CHECK_EVERY_S = 300
+KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code tasks left in review with no review
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
@@ -541,6 +547,7 @@ class Daemon:
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._review_swept = 0.0     # when sweep_reviews last ran
+        self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
@@ -927,7 +934,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2463,12 +2470,13 @@ class Daemon:
                                high_effort=bool(note.get("unblock")))
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
-        if ids:
+        problems = list(problems)
+        if ids and not self._keep_messages(r, ids, problems):
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
-        problems = refused + list(problems)
+        problems = refused + problems
         decided = len(_decisions(actions))
         self._log_decided(r, note, decided)
         if not decided:
@@ -2480,6 +2488,28 @@ class Daemon:
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+
+    def _keep_messages(self, r: dict, ids: list, problems: list[str]) -> bool:
+        """A user turn whose task_add was rejected for a reason it can fix (coord.fixable_rejection)
+        leaves its messages unhandled, so the next turn sees them again with the rejection, instead of
+        the user getting neither a task nor a reply. Once per message (KV_KEPT_MESSAGES): after that the
+        message is handled and the rejection still reaches the next digest. Marks the rejection, in
+        place in `problems`, so the next turn redoes only that action."""
+        db = self.p.db
+        fix = [i for i, x in enumerate(problems) if coord.fixable_rejection(x)]
+        if not fix:
+            return False
+        kept = [int(x) for x in db.kv(KV_KEPT_MESSAGES, []) or [] if str(x).isdigit()]
+        if set(int(i) for i in ids) & set(kept):
+            return False
+        db.set_kv(KV_KEPT_MESSAGES, (kept + sorted(int(i) for i in ids))[-200:])
+        shown = ", ".join(f"#{i}" for i in ids)
+        for i in fix:
+            problems[i] += (f" [user message {shown} is shown to you again, once: add the task it asked for "
+                            f"(or reply why not); the rest of that turn was applied, do not repeat it]")
+        log(self.p, f"coordinator turn {r.get('id')}: messages {shown} kept for the next turn: a task_add "
+                    f"was rejected for a reason it can fix")
+        return True
 
     def _log_decided(self, r: dict, note: dict, decided: int) -> None:
         """What the turn decided, for the daily review's audit of turns that decided nothing. A turn
@@ -3030,6 +3060,8 @@ class Daemon:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
                 f"; it starts once #{task['id']}'s commits land on the push branch." if wait else ".")
+        elif new == "done" and any(chaincap.CONT_TITLE.match(str(f["title"])) for f in fups):
+            text += f"\nContinue follow-up {UNQUEUED_TAG}: add it with continues #{task['id']} or drop it."
         routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -3056,9 +3088,14 @@ class Daemon:
         for f in fups[:MAX_FOLLOWUPS]:
             # A deferred follow-up names when it may start; the coordinator adds it with those fields.
             start = "; ".join(f"{k}: {str(f[k])[:300]}" for k in ("start_after", "start_when") if f.get(k))
+            # A `continue:` follow-up the daemon did not queue as the next hop says so: only a task_add
+            # with `continues` starts it (else continue_unqueued is raised, check_unqueued_continues).
+            tag = f" ({UNQUEUED_TAG}: add it with continues #{task['id']} or drop it)" \
+                if id(f) not in folded and chaincap.CONT_TITLE.match(str(f["title"])) else ""
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
-                  f"proposed follow-up: {str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
+                  f"proposed follow-up{tag}: "
+                  f"{str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
                   f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}",
                   "handled" if id(f) in folded else "queued", task["id"]))
 
@@ -6918,6 +6955,41 @@ class Daemon:
                              "queued", task["id"]))
         log(self.p, f"task {task['id']}: superseded by {sha[:10]}; no review or fix queued")
         return sha
+
+    def check_unqueued_continues(self) -> None:
+        """Model-free, every CONTINUE_CHECK_EVERY_S: a task done CONTINUE_UNQUEUED_AFTER_S ago (within
+        CONTINUE_UNQUEUED_WINDOW_S) whose hand-off proposed a `continue:` follow-up that no task has
+        taken up yet raises one high CONTINUE_UNQUEUED event, so a hop no turn queued is not lost. A
+        continuing task is any later task that continues it (chaincap.prev_of) or has the follow-up's
+        title. One event per task, ever."""
+        now = time.time()
+        if now - self._continues_checked < CONTINUE_CHECK_EVERY_S:
+            return
+        self._continues_checked = now
+        db = self.p.db
+        done = db.q("SELECT DISTINCT e.task FROM events e JOIN tasks t ON t.id=e.task WHERE e.kind='task_done' "
+                    "AND e.ts BETWEEN ? AND ? AND t.status='done' AND NOT EXISTS (SELECT 1 FROM events x "
+                    "WHERE x.kind=? AND x.task=e.task) ORDER BY e.task",
+                    (now - CONTINUE_UNQUEUED_WINDOW_S, now - CONTINUE_UNQUEUED_AFTER_S, CONTINUE_UNQUEUED))
+        for row in done:
+            task = db.task(row["task"])
+            result = load_result(task["result"]) if task else None
+            fups = result.get("followups") if isinstance(result, dict) else None
+            conts = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
+                     and chaincap.CONT_TITLE.match(str(f["title"]))] if isinstance(fups, list) else []
+            if not conts:
+                continue
+            later = db.q("SELECT id, title, labels, parent FROM tasks WHERE id>? ORDER BY id", (task["id"],))
+            if any(chaincap.prev_of(t) == task["id"] or t["title"].strip().lower() in
+                   {c.lower() for c in conts} for t in later):
+                continue
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, f"task:{task['id']}", CONTINUE_UNQUEUED, "high",
+                  f"#{task['id']} {task['title'][:160]}: its follow-up {conts[0][:200]!r} is {UNQUEUED_TAG} and no "
+                  f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. Add it with "
+                  f"task_add continues #{task['id']}, or drop it on purpose.",
+                  json.dumps({"followups": conts}), "queued", task["id"]))
+            log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")
 
     def sweep_reviews(self) -> None:
         """Model-free retry of reviews left to the coordinator: a code task in 'review' whose last run
