@@ -3,7 +3,8 @@
 Every call is `ssh -n -o BatchMode=yes <ird.mgmt> ird ...`: ird runs only on the management host.
 Acts only on reservations whose user column is the caller. A claim file per reservation (project,
 task, pid, heartbeat) lets `release --stale` free only this project's abandoned reservations.
-State lives under $TTP_IRD_DIR (default ~/.tt-project/ird): claims/ and the ssh include file.
+State lives under $TTP_IRD_DIR (default ~/.tt-project/ird): claims/, the ssh include file and
+known_hosts/, one host key file per reservation (trust on first use, deleted on release).
 Exit codes: 0 ok, 1 refused or failed, 255 the management host is unreachable.
 """
 
@@ -54,11 +55,18 @@ def ssh_include() -> pathlib.Path:
     return state_dir() / "ssh-hosts"
 
 
+def known_hosts(alias: str, rid: str) -> pathlib.Path:
+    """The reservation's own known_hosts file. Each reservation is a fresh container whose host key
+    is new, so a new reservation starts with an empty file and its key is accepted once
+    (`accept-new`); a key that changes within the reservation still fails."""
+    return state_dir() / "known_hosts" / f"{alias}.{rid}"
+
+
 # --- reachability -------------------------------------------------------------------------------
 
 def _ssh_g(alias: str) -> Dict[str, str]:
     try:
-        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=15)
+        r = subprocess.run([*box.ssh_cmd(), "-G", alias], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return {}
     cfg: Dict[str, str] = {}
@@ -242,16 +250,49 @@ def claim_live(c: dict, ttl: float) -> bool:
         return False
 
 
-def write_ssh_block(rid: str, machine: str, port: str, mgmt: str) -> None:
+def write_ssh_block(alias: str, rid: str, machine: str, port: str, mgmt: str) -> None:
+    kh = known_hosts(alias, rid)
+    kh.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(kh.parent, 0o700)
+    kh.write_text("", encoding="utf-8")  # a new reservation trusts no key from an earlier one
+    os.chmod(kh, 0o600)
     lines = [BEGIN.format(id=rid), f"Host {machine}", f"    HostName {machine}"]
     if port:
         lines.append(f"    Port {port}")
-    lines += [f"    ProxyJump {mgmt}", END.format(id=rid)]
+    # Reached only through the authenticated jump host. Never StrictHostKeyChecking no, never
+    # /dev/null: the key is pinned for the reservation's life, and the file goes with it.
+    path = str(kh).replace("%", "%%").replace('"', "")
+    lines += [f"    ProxyJump {mgmt}", f'    UserKnownHostsFile "{path}"',
+              "    StrictHostKeyChecking accept-new", END.format(id=rid)]
     _edit_include(rid, "\n".join(lines) + "\n")
 
 
-def drop_ssh_block(rid: str) -> None:
+def drop_ssh_block(alias: str, rid: str) -> None:
     _edit_include(rid, "")
+    kh = known_hosts(alias, rid)
+    for p in (kh, kh.with_name(kh.name + ".old")):
+        p.unlink(missing_ok=True)
+
+
+def prune_known_hosts(ctx: "Ctx", live: Optional[set] = None, since: Optional[float] = None) -> None:
+    """Drop the known_hosts file and ssh block of every reservation of this box that is gone from
+    `ird list` (a run that crashed before releasing). Asks ird only when such a file exists; a file
+    newer than `since` (when the reservations were read) is left for the next prune."""
+    since = time.time() if since is None else since
+    files = [p for p in (state_dir() / "known_hosts").glob(f"{ctx.alias}.*")
+             if p.name[len(ctx.alias) + 1:].isdigit()]  # not another box whose alias starts so
+    if not files:
+        return
+    if live is None:
+        live = set(ctx.mine())
+    for p in files:
+        rid = p.name[len(ctx.alias) + 1:]
+        try:
+            fresh = p.stat().st_mtime >= since
+        except OSError:
+            continue
+        if rid not in live and not fresh:
+            drop_ssh_block(ctx.alias, rid)
 
 
 def _edit_include(rid: str, block: str) -> None:
@@ -300,6 +341,7 @@ def _gate(ctx: Ctx, rid: str, ttl: float, verb: str) -> Tuple[dict, Optional[dic
 
 
 def cmd_list(ctx: Ctx, args) -> int:
+    prune_known_hosts(ctx)
     for m in ctx.machines():
         if not m["why"]:
             print(f"free {m['machine']} {m['state']}")
@@ -452,7 +494,9 @@ def cmd_reserve(ctx: Ctx, args) -> int:
 def _reserve(ctx: Ctx, args, m, pool: str, name: str) -> int:
     # Never trust ird's exit code alone: it can fail after the reservation completed, or be cut
     # off by a timeout or a signal. The diff of `ird list` against this snapshot decides.
+    since = time.time()
     before = set(ctx.mine())
+    prune_known_hosts(ctx, before, since)
     argv = ["reserve", "--cluster", pool, "--timeout", args.timeout]
     if name:
         argv += ["--machine", name]
@@ -498,8 +542,10 @@ def _reserve(ctx: Ctx, args, m, pool: str, name: str) -> int:
         print(f"warning: {w}")
     if r.returncode:
         print(f"warning: ird reserve exited {r.returncode}, but reservation {rid} is in ird list: claimed it")
-    if args.machine and not same_machine(row["machine"], args.machine):
+    if name and not same_machine(row["machine"], args.machine):
         print(f"warning: asked for {args.machine}, ird reserved {row['machine']}: use {row['machine']}")
+    elif args.machine and not same_machine(row["machine"], args.machine):
+        print(f"note: ird reserved {row['machine']}: use {row['machine']}")  # reserved without --machine
     print(f"reserved {rid} machine={row['machine']} port={row['port'] or '?'} expires={expires}")
     hint = include_hint()
     if hint:
@@ -560,7 +606,7 @@ def _claim(ctx: Ctx, args, rid: str, row: dict, pool: str, m) -> str:
         "task": ctx.task, "run_id": os.environ.get("TTP_RUN_ID", ""), "host": socket.gethostname(),
         "pid": owner_pid(args.pid), "reserved_at": now.isoformat(timespec="seconds"),
         "heartbeat": time.time(), "expires": expires, "reserver": os.getpid()})
-    write_ssh_block(rid, row["machine"], row["port"], ctx.mgmt)
+    write_ssh_block(ctx.alias, rid, row["machine"], row["port"], ctx.mgmt)
     return expires
 
 
@@ -641,7 +687,7 @@ def _release(ctx: Ctx, rid: str) -> None:
     if r.returncode and rid in ctx.mine():
         raise IrdError(f"ird release {rid} failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
     claim_path(ctx.alias, rid).unlink(missing_ok=True)
-    drop_ssh_block(rid)
+    drop_ssh_block(ctx.alias, rid)
 
 
 def cmd_release(ctx: Ctx, args) -> int:
@@ -679,7 +725,7 @@ def cmd_release(ctx: Ctx, args) -> int:
             c = read_claim(ctx.alias, rid) or {}
             if rid not in live_ids and c.get("project") == ctx.project:
                 p.unlink(missing_ok=True)
-                drop_ssh_block(rid)
+                drop_ssh_block(ctx.alias, rid)
     return 0
 
 

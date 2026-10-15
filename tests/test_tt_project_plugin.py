@@ -1081,7 +1081,8 @@ def test_setup_box_site_check_accepts_a_valid_file(tmp_path):
     site = _site_example()
     site["boxes"]["<bare-alias>"] = {"route": "bare", "workdir_root": "/<workdir>"}
     site["boxes"]["<ird-alias>"] = {"route": "ird", "workdir_root": "~/<workdir>",
-                                    "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>"]}}
+                                    "ird": {"mgmt": "<ird-mgmt-alias>", "pools": ["<pool>"],
+                                            "mgmt_ssh": {"HostName": "<mgmt-host>", "Port": 22}}}
     r = _box_check(tmp_path, site)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "ok <box-alias> route=slurm" in r.stdout and "error" not in r.stdout
@@ -1096,6 +1097,8 @@ def test_setup_box_site_check_accepts_a_valid_file(tmp_path):
     (lambda s: s["boxes"]["<box-alias>"]["slurm"].update(partitions=[]), "non-empty list"),
     (lambda s: s["boxes"]["<box-alias>"].update(route="ird"), "route ird needs an ird object"),
     (lambda s: s["boxes"]["<box-alias>"].update(excluded_nodes="<node>"), "excluded_nodes must be a list"),
+    (lambda s: s["boxes"]["<box-alias>"].update(route="ird", ird={"mgmt": "<m>", "pools": ["<p>"], "mgmt_ssh": {
+        "StrictHostKeyChecking": "no"}}), "ird.mgmt_ssh must map ssh options"),
     (lambda s: s.update(boxes={}), "boxes must be a non-empty object"),
     (lambda s: s.pop("version"), "version must be 1"),
 ])
@@ -2113,8 +2116,9 @@ def test_setup_box_exabox_agrees_with_worker_shared_clusters():
 
 FAKE_SSH = r'''#!/bin/sh
 echo "$*" >> "$FAKE_DIR/ssh.log"
+[ "$1" = "-F" ] && shift 2
 if [ "$1" = "-G" ]; then printf 'hostname %s\nport %s\n' "$FAKE_SSH_HOST" "$FAKE_SSH_PORT"; exit 0; fi
-while [ $# -gt 1 ]; do case "$1" in -o) shift 2;; -*) shift;; *) shift; break;; esac; done
+while [ $# -gt 1 ]; do case "$1" in -o|-F) shift 2;; -*) shift;; *) shift; break;; esac; done
 exec sh -c "$1"
 '''
 
@@ -2297,8 +2301,10 @@ def test_setup_box_ird_reserve_puts_every_flag_before_the_arch(fake_ird):
     assert (claim["project"], claim["task"], claim["machine"], claim["port"]) == ("proj", "t1", "m-idle", "4100")
     assert claim["pid"] > 0 and claim["heartbeat"] > 0
     hosts = (fake_ird.ird_dir / "ssh-hosts").read_text()
-    assert "Host m-idle\n    HostName m-idle\n    Port 4100\n    ProxyJump <ird-mgmt-alias>\n" in hosts
-    assert "StrictHostKeyChecking" not in hosts
+    kh = fake_ird.ird_dir / "known_hosts" / "<ird-box>.100"
+    assert ("Host m-idle\n    HostName m-idle\n    Port 4100\n    ProxyJump <ird-mgmt-alias>\n"
+            f'    UserKnownHostsFile "{kh}"\n    StrictHostKeyChecking accept-new\n') in hosts, hosts
+    assert kh.read_text() == "" and kh.stat().st_mode & 0o777 == 0o600  # trusts no earlier key
     assert "Include" in out  # ~/.ssh/config lacks the include: say so, never edit it
     assert not (fake_ird.home / ".ssh" / "config").exists()
 
@@ -2557,6 +2563,74 @@ def test_setup_box_ird_release_follows_claims(fake_ird):
     assert not (fake_ird.ird_dir / "claims" / "<ird-box>.10.json").exists()
 
 
+def test_setup_box_ird_host_keys_are_trusted_per_reservation_and_go_with_it(fake_ird):
+    kh_dir = fake_ird.ird_dir / "known_hosts"
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00")
+    assert rc == 0, out
+    kh = kh_dir / "<ird-box>.100"
+    hosts = (fake_ird.ird_dir / "ssh-hosts").read_text()
+    assert f'UserKnownHostsFile "{kh}"' in hosts and "StrictHostKeyChecking accept-new" in hosts, hosts
+    kh.write_text("[m-idle]:40100 ssh-ed25519 AAAA\n")  # what the first ssh's accept-new records
+    rc, out = fake_ird.run("release", "<ird-box>", "100")
+    assert rc == 0, out
+    assert not kh.exists() and "tt-project ird 100" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
+    # The next reservation, even on the same machine, starts with an empty file of its own.
+    rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00")
+    assert rc == 0 and (kh_dir / "<ird-box>.101").read_text() == "", out
+    rc, out = fake_ird.run("release", "<ird-box>", "101")
+    assert rc == 0 and not (kh_dir / "<ird-box>.101").exists(), out
+
+
+@pytest.mark.parametrize("verb", ["list", "reserve"])
+def test_setup_box_ird_prunes_known_hosts_no_live_reservation_owns(fake_ird, verb):
+    import time
+    kh_dir = fake_ird.ird_dir / "known_hosts"
+    kh_dir.mkdir(parents=True)
+    old = time.time() - 60
+    fake_ird.add("7", machine="m-mixed")  # live: kept
+    for name in ("<ird-box>.6", "<ird-box>.7", "<ird-box>.b.6", "<other-box>.6"):
+        (kh_dir / name).write_text("x\n")
+        os.utime(kh_dir / name, (old, old))
+    (fake_ird.ird_dir / "ssh-hosts").write_text(
+        "# >>> tt-project ird 6\nHost m-gone\n# <<< tt-project ird 6\n"
+        "# >>> tt-project ird 7\nHost m-mixed\n# <<< tt-project ird 7\n")
+    args = ["--arch", "<arch>", "--timeout", "01:00:00"] if verb == "reserve" else []
+    rc, out = fake_ird.run(verb, "<ird-box>", *args)
+    assert rc == 0, out
+    left = sorted(p.name for p in kh_dir.iterdir())
+    assert "<ird-box>.6" not in left, left  # crashed run's file, reservation gone: pruned
+    assert {"<ird-box>.7", "<ird-box>.b.6", "<other-box>.6"} <= set(left), left
+    hosts = (fake_ird.ird_dir / "ssh-hosts").read_text()
+    assert "Host m-gone" not in hosts and "Host m-mixed" in hosts, hosts
+
+
+def test_setup_box_ird_list_asks_ird_list_only_when_a_known_hosts_file_could_be_stale(fake_ird):
+    rc, out = fake_ird.run("list", "<ird-box>")
+    assert rc == 0 and all(l.startswith("list-machines") for l in fake_ird.ird_log()), fake_ird.ird_log()
+    kh = fake_ird.ird_dir / "known_hosts" / "<ird-box>.100"
+    kh.parent.mkdir(parents=True)
+    kh.write_text("")
+    rc, out = fake_ird.run("list", "<ird-box>")
+    assert rc == 0 and not kh.exists(), out
+    assert any(l.startswith("list --noheader") or l == "list" for l in fake_ird.ird_log()), fake_ird.ird_log()
+
+
+def test_setup_box_never_turns_host_key_checking_off():
+    bad = re.compile(r"StrictHostKeyChecking\W{0,3}(no|off|false)\b|UserKnownHostsFile\W{0,3}/dev/null|"
+                     r"GlobalKnownHostsFile\W{0,3}/dev/null", re.I)
+    files = [p for p in (SKILLS / "setup-box").rglob("*") if p.is_file()] + \
+        [p for p in RUNTIME.rglob("*.py")]
+    hits = []
+    for p in files:
+        for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            forbids = line.strip().startswith("#") or (
+                p.suffix == ".md" and ("not allowed" in line or "never" in line.lower()))
+            if bad.search(line) and not forbids:  # a doc line or comment saying not to is fine
+                hits.append(f"{p.relative_to(PLUGIN)}:{n}: {line.strip()}")
+    assert not hits, hits
+    assert "accept-new" in (SKILLS / "setup-box" / "scripts" / "box_ird.py").read_text()
+
+
 def test_setup_box_ird_extend_on_demand_and_reboot_then_re_reserve(fake_ird):
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
                            "--machine", "m-mixed", "--ssh-port", "4300")
@@ -2649,7 +2723,8 @@ def test_setup_box_ird_reserve_passes_ird_lists_name_or_no_machine(fake_ird):
     assert "warning: cannot tell the `ird list` form of site1-m-mixed (no machine in both ird lists); " \
         "reserving without --machine" in out, out
     assert "reserve --cluster <pool> --timeout 01:00:00 --no-shell <arch>" in fake_ird.ird_log()
-    assert "warning: asked for site1-m-mixed, ird reserved m-idle: use m-idle" in out, out
+    # --machine never reached ird, so nothing was asked for: say only where it landed.
+    assert "note: ird reserved m-idle: use m-idle" in out and "asked for" not in out, out
 
 
 def test_setup_box_ird_says_so_when_ird_is_unreachable(fake_ird, tmp_path):
@@ -2671,8 +2746,12 @@ IRD_E2E = BOX_PY.parent / "ird_e2e.sh"
 
 E2E_SSH = r"""#!/bin/sh
 case "$1" in -V) echo "OpenSSH_fake"; exit 0;; esac
-if [ "$1" = "-G" ]; then case "$2" in m-*)
-  echo "$*" >> "$FAKE_DIR/ssh.log"; printf 'hostname %s\nproxyjump <ird-mgmt-alias>\n' "$2"; exit 0;; esac; fi
+[ "$1" = "-F" ] || echo "$*" >> "$FAKE_DIR/no-F.log"
+for a; do last=$a; done
+if [ -n "$FAKE_MGMT_DOWN" ] && [ "$last" = true ]; then echo "ssh: Could not resolve hostname" >&2; exit 255; fi
+# The machine's effective options come from the real ssh -G under the run's own config.
+if [ "$1" = "-F" ] && [ "$3" = "-G" ]; then case "$4" in m-*)
+  echo "$*" >> "$FAKE_DIR/ssh.log"; exec "$REAL_SSH" "$@";; esac; fi
 exec "$FAKE_DIR/bin/ssh" "$@"
 """
 
@@ -2689,7 +2768,11 @@ echo '{"device_info": [{"board_info": {"board_type": "n300 L"}}, {"board_info": 
 
 
 def _e2e(fake_ird, tmp_path, include=True):
+    import shutil
     import subprocess
+    real_ssh = shutil.which("ssh")
+    if not real_ssh:
+        pytest.skip("needs OpenSSH's ssh for `ssh -G`")
     shims = tmp_path / "e2e-bin"
     shims.mkdir()
     for name, body in (("ssh", E2E_SSH), ("cc", E2E_CC), ("tt-smi", E2E_SMI)):
@@ -2709,7 +2792,8 @@ def _e2e(fake_ird, tmp_path, include=True):
         (fake_ird.home / ".ssh" / "config").write_text(f"Include {fake_ird.ird_dir}/ssh-hosts\n")
     work = tmp_path / "work"
     work.mkdir()
-    env = {**fake_ird.env, "PATH": f"{shims}:{fake_ird.env['PATH']}", "TMPDIR": str(tmp_path)}
+    env = {**fake_ird.env, "PATH": f"{shims}:{fake_ird.env['PATH']}", "TMPDIR": str(tmp_path),
+           "REAL_SSH": real_ssh}
     argv = ["bash", str(IRD_E2E), "--site", str(fake_ird.site), "--arch", "<arch>",
             "--workdir", str(work), "--repo", f"file://{repo}"]
     return argv, env, work
@@ -2754,6 +2838,14 @@ def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird
     assert fake_ird.load()["reservations"] == []
     assert "tt-project ird 100" not in (fake_ird.ird_dir / "ssh-hosts").read_text()
     assert list((work / "ird-e2e").iterdir()) == []  # the per-run tree is removed
+    # Every ssh ran under the run's own config, which holds only managed content.
+    assert not (fake_ird.dir / "no-F.log").exists(), (fake_ird.dir / "no-F.log").read_text()
+    cfg = next(tmp_path.glob("ird-e2e.*")) / "ssh_config"
+    assert cfg.read_text() == f'Include "{fake_ird.ird_dir}/ssh-hosts"\n'
+    kh = fake_ird.ird_dir / "known_hosts" / "<ird-box>.100"
+    assert (f"  ssh -G m-idle: hostname=m-idle port=40100 proxyjump=<ird-mgmt-alias> "
+            f"stricthostkeychecking=accept-new userknownhostsfile={kh}") in out, out
+    assert "ssh block and known_hosts file removed" in out and not kh.exists(), out
 
 
 @pytest.mark.parametrize("how", ["fail", "ctrl-c"])
@@ -2822,6 +2914,44 @@ def test_setup_box_ird_e2e_notes_a_different_machine_only_when_it_differs(fake_i
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "PASS id 101 on m-mixed (asked for site1-m-idle; using the machine ird reserved)" in out, out
+
+
+def test_setup_box_ird_e2e_says_asked_for_only_when_machine_reached_ird(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    fake_ird.load().update(busy=[], reservations=[])  # nothing to learn ird list's name form from
+    fake_ird.save()
+    env.update(FAKE_IRD_PREFIX="site1-", FAKE_IRD_LAND="m-mixed")
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "reserve --cluster <pool> --timeout 00:30:00 --no-shell <arch>" in fake_ird.ird_log()
+    assert "  note: ird reserved m-mixed: use m-mixed" in out and "asked for" not in out, out
+    assert "step 2 reserve: PASS id 100 on m-mixed," in out, out
+
+
+def test_setup_box_ird_e2e_reaches_the_management_host_only_through_managed_config(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60,
+                       env={**env, "FAKE_MGMT_DOWN": "1"})
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "the site file has no ird.mgmt_ssh" in out, out
+    assert "never uses personal ssh config" in out and fake_ird.ird_log() == [], out
+    # With ird.mgmt_ssh the run's own config defines the management host from the site file.
+    site = json.loads(fake_ird.site.read_text())
+    site["boxes"]["<ird-box>"]["ird"]["mgmt_ssh"] = {"HostName": "<mgmt-host>", "User": "<user>", "Port": 22}
+    fake_ird.site.write_text(json.dumps(site))
+    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0 and "<ird-mgmt-alias> from ird.mgmt_ssh" in out, out
+    cfg = sorted(tmp_path.glob("ird-e2e.*"), key=lambda p: p.stat().st_mtime)[-1] / "ssh_config"
+    assert cfg.read_text() == (f'Include "{fake_ird.ird_dir}/ssh-hosts"\n\nHost <ird-mgmt-alias>\n'
+                               '    HostName "<mgmt-host>"\n    User "<user>"\n    Port "22"\n')
+    site["boxes"]["<ird-box>"]["ird"]["mgmt_ssh"] = {"StrictHostKeyChecking": "no"}
+    fake_ird.site.write_text(json.dumps(site))
+    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 1 and "ird.mgmt_ssh must map ssh options" in r.stdout, r.stdout
 
 
 def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):

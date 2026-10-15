@@ -31,6 +31,9 @@ ROUTES = ("bare", "ird", "slurm")
 KNOWN_KEYS = {"route", "jump", "workdir_root", "scratch_root", "ird", "slurm",
               "demo_nodes", "excluded_nodes", "mcp", "note"}
 SSH_OPTS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15")
+# ssh options a site may give for the IRD management host (`ird.mgmt_ssh`), so ird_e2e.sh can reach
+# it with no personal ssh config. Host key checking is not among them: it stays on.
+MGMT_SSH_KEYS = ("HostName", "User", "Port", "IdentityFile", "IdentitiesOnly", "CertificateFile", "ProxyJump")
 
 CHECKS: Dict[str, List[Callable[[str, dict], List[str]]]] = {}
 
@@ -120,6 +123,11 @@ def check_box(alias: str, e, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
                 err.append(f"{alias}: ird.mgmt must be the management host's ssh alias")
             if not _str_list(ird.get("pools"), nonempty=True):
                 err.append(f"{alias}: ird.pools must be a non-empty list of pool names")
+            ms = ird.get("mgmt_ssh")
+            if ms is not None and not (isinstance(ms, dict) and all(
+                    k in MGMT_SSH_KEYS and isinstance(v, (str, int)) and not isinstance(v, bool)
+                    and str(v).strip() and "\n" not in str(v) for k, v in ms.items())):
+                err.append(f"{alias}: ird.mgmt_ssh must map ssh options ({', '.join(MGMT_SSH_KEYS)}) to one-line values")
     if route == "slurm":
         sl = e.get("slurm")
         if not isinstance(sl, dict):
@@ -178,6 +186,12 @@ def check_site(site, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
     return err, warn
 
 
+def ssh_cmd() -> List[str]:
+    """`ssh`, with `-F $TTP_SSH_CONFIG` when set: ird_e2e.sh runs every ssh under its own config."""
+    cfg = os.environ.get("TTP_SSH_CONFIG")
+    return ["ssh", "-F", cfg] if cfg else ["ssh"]
+
+
 def ssh_run(alias: str, cmd: Union[str, Sequence[str]], *, timeout: float = 120,
             input: Optional[str] = None, opts: Sequence[str] = ()) -> subprocess.CompletedProcess:
     """Run `cmd` on `alias` over ssh, non-interactively; never raises on a non-zero exit.
@@ -186,7 +200,7 @@ def ssh_run(alias: str, cmd: Union[str, Sequence[str]], *, timeout: float = 120,
     failing (unreachable, auth). A timeout returns code 124 with what was captured.
     """
     remote = cmd if isinstance(cmd, str) else shlex.join(cmd)
-    argv = ["ssh", *SSH_OPTS, *opts, alias, remote]
+    argv = [*ssh_cmd(), *SSH_OPTS, *opts, alias, remote]
     try:
         return subprocess.run(argv, input=input, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as e:

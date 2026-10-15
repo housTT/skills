@@ -10,6 +10,9 @@
 # it, build a trivial target, run `tt-smi -s`; 5 extend once; 6 release and check `ird list`.
 # Before step 2 it snapshots your reservations; on exit, failure, Ctrl-C or TERM the trap diffs
 # them again and releases every new one this run's box.py claimed, never one without that claim.
+# Every ssh (box.py's too) runs with -F <its own config>: an Include of the managed ssh-hosts file
+# and the management host from the site's ird.mgmt_ssh, never the personal ~/.ssh/config, so a
+# personal Host block cannot hide a gap in the managed setup.
 # --dry-run runs step 1 only and prints the rest. Ends with a short report to paste back.
 # Needs bash 3.2+, python3 and ssh. Exit: 0 pass, 1 a step failed, 2 bad usage, 130 interrupted.
 
@@ -49,7 +52,7 @@ REPORT="$RUN_DIR/report.txt"
 export TTP_PROJECT="ird-e2e" TTP_TASK="ird-e2e-$RUN_ID"
 unset TTP_RUN_DIR
 
-RID="" MACHINE="" REMOTE_ROOT="" RESERVING=0 STEP="setup" RESULT="" RELEASED="n/a"
+RID="" KH="" MACHINE="" REMOTE_ROOT="" RESERVING=0 STEP="setup" RESULT="" RELEASED="n/a"
 BEFORE_IDS="" RES_LINE=""
 NOTES=()
 
@@ -58,8 +61,10 @@ note() { NOTES+=("$*"); say "$*"; }
 fail() { RESULT="FAIL at $STEP: $*"; exit 1; }
 box() { python3 "$BOX_PY" --site "$SITE" "$@"; }
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-on_machine() { ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$MACHINE" "$1"; }
-ird_rows() { ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" 'ird list --noheader'; }
+SSH_CFG="$RUN_DIR/ssh_config"
+export TTP_SSH_CONFIG="$SSH_CFG"  # box.py runs its ssh with -F "$TTP_SSH_CONFIG"
+on_machine() { ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MACHINE" "$1"; }
+ird_rows() { ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" 'ird list --noheader'; }
 row_of() { ird_rows | awk -v id="$1" '$1 == id' ; }
 
 report() {
@@ -127,6 +132,7 @@ on_exit() {
     on_machine "rm -rf -- $(q "$REMOTE_ROOT")" >/dev/null 2>&1 || note "cleanup: could not remove $REMOTE_ROOT"
   fi
   [ "$RESERVING" = 1 ] && cleanup_reservations
+  if [ -n "$KH" ] && [ -e "$KH" ]; then note "cleanup: per-reservation known_hosts $KH is still there"; fi
   report
   exit $rc
 }
@@ -141,7 +147,7 @@ command -v ssh >/dev/null || fail "ssh not found"
 # The helper goes to a file first: bash 3.2 (macOS) misparses a heredoc inside $(...).
 cat > "$RUN_DIR/values.py" <<'PY'
 import json, os, sys
-src, alias, mgmt, pool, arch, workdir, out = sys.argv[1:]
+src, alias, mgmt, pool, arch, workdir, out, include, ssh_cfg = sys.argv[1:]
 try:
     data = json.load(open(os.path.expanduser(src)))
 except FileNotFoundError:
@@ -177,21 +183,42 @@ alias = alias or "ird-e2e"
 cfg.update(mgmt=mgmt, pools=[pool] + [p for p in pools if p != pool])
 entry.update(route="ird", workdir_root=workdir, ird=cfg)
 json.dump({"version": 1, "boxes": {alias: entry}}, open(out, "w"), indent=2)
+# The run's own ssh config: managed content only, never the personal ~/.ssh/config.
+keys = ("HostName", "User", "Port", "IdentityFile", "IdentitiesOnly", "CertificateFile", "ProxyJump")
+jump = cfg.get("mgmt_ssh") or {}
+if not isinstance(jump, dict) or any(k not in keys or "\n" in str(v) or not str(v).strip()
+                                     for k, v in jump.items()):
+    sys.exit(f"ird.mgmt_ssh must map ssh options ({', '.join(keys)}) to one-line values (site.md)")
+lines = [f'Include "{include}"']
+if jump:
+    lines += ["", f"Host {mgmt}"] + [f'    {k} "{v}"' for k, v in jump.items()]
+open(ssh_cfg, "w").write("\n".join(lines) + "\n")
+print(f"JUMP\t{'site' if jump else ''}")
 for k, v in (("BOX", alias), ("MGMT", mgmt), ("POOL", pool), ("ARCH", arch), ("WORKDIR", workdir)):
     print(f"{k}\t{v}")
 PY
-VALS=$(python3 "$RUN_DIR/values.py" "$SITE_IN" "$BOX" "$MGMT" "$POOL" "$ARCH" "$WORKDIR" "$SITE" 2>&1) \
-  || fail "$VALS"
+INCLUDE="$IRD_DIR/ssh-hosts"
+VALS=$(python3 "$RUN_DIR/values.py" "$SITE_IN" "$BOX" "$MGMT" "$POOL" "$ARCH" "$WORKDIR" "$SITE" \
+  "$INCLUDE" "$SSH_CFG" 2>&1) || fail "$VALS"
+JUMP_FROM=""
 while IFS=$'\t' read -r k v; do
-  case "$k" in BOX) BOX=$v ;; MGMT) MGMT=$v ;; POOL) POOL=$v ;; ARCH) ARCH=$v ;; WORKDIR) WORKDIR=$v ;; esac
+  case "$k" in BOX) BOX=$v ;; MGMT) MGMT=$v ;; POOL) POOL=$v ;; ARCH) ARCH=$v ;; WORKDIR) WORKDIR=$v ;;
+    JUMP) JUMP_FROM=$v ;; esac
 done <<< "$VALS"
 [[ "$TIMEOUT" =~ ^[0-9]{1,3}:[0-5][0-9]:[0-5][0-9]$ ]] || fail "--timeout must be hh:mm:ss"
 [[ "$EXTEND_MIN" =~ ^[0-9]+$ ]] || fail "--extend-min must be whole minutes"
-INCLUDE="$IRD_DIR/ssh-hosts"
 if ! grep -qsF -e "tt-project/ird/ssh-hosts" -e "$INCLUDE" "$HOME/.ssh/config"; then
   [ "$DRY" = 1 ] || fail "$HOME/.ssh/config lacks 'Include $INCLUDE' at its top (ird.md); add it and rerun"
   note "note: ~/.ssh/config lacks 'Include $INCLUDE' at its top; a live run stops here"
 fi
+# The management host under the run's own config only: no silent fallback to personal ssh config.
+if ! ERR=$(ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" true 2>&1 </dev/null); then
+  if [ -z "$JUMP_FROM" ]; then
+    fail "cannot reach $MGMT with managed ssh config only ($(printf '%s' "$ERR" | tail -n 1)): the site file has no ird.mgmt_ssh, so nothing managed defines $MGMT. If your personal ~/.ssh/config defines it, copy its HostName, User (and IdentityFile, ProxyJump if needed) into ird.mgmt_ssh (site.md); this run never uses personal ssh config"
+  fi
+  fail "cannot reach $MGMT with the site's ird.mgmt_ssh: $(printf '%s' "$ERR" | tail -n 2)"
+fi
+note "ssh: own config $SSH_CFG (Include $INCLUDE${JUMP_FROM:+, $MGMT from ird.mgmt_ssh}), no personal ssh config"
 
 # --- 1 list and pick ------------------------------------------------------------------------------
 STEP="1 list"; T0=$(date +%s)
@@ -204,7 +231,7 @@ note "step 1 list: PASS $(printf '%s\n' "$FREE" | grep -c .) free, picked $MACHI
 RESERVE=(ird reserve "$BOX" --arch "$ARCH" --timeout "$TIMEOUT" --pool "$POOL" --machine "$MACHINE" --wait 120)
 if [ "$DRY" = 1 ]; then
   note "step 2 reserve: DRY box.py ${RESERVE[*]}"
-  note "step 3 ssh: DRY ssh $MACHINE (ProxyJump $MGMT via $INCLUDE)"
+  note "step 3 ssh: DRY ssh -F $SSH_CFG $MACHINE (ProxyJump $MGMT via $INCLUDE, per-reservation known_hosts, accept-new)"
   note "step 4 work: DRY clone $REPO into $WORKDIR/ird-e2e/$RUN_ID, worktree, edit, build, tt-smi -s"
   note "step 5 extend: DRY box.py ird extend $BOX <id> $EXTEND_MIN"
   note "step 6 release: DRY box.py ird release $BOX <id>, then check ird list"
@@ -222,13 +249,14 @@ RESERVING=1
 box "${RESERVE[@]}" > "$RUN_DIR/reserve.out" 2>&1; rc=$?
 OUT=$(cat "$RUN_DIR/reserve.out")
 RID=$(printf '%s\n' "$OUT" | awk '$1 == "reserved" {print $2; exit}')
-while IFS= read -r l; do note "  $l"; done < <(printf '%s\n' "$OUT" | grep '^warning: ')
+while IFS= read -r l; do note "  $l"; done < <(printf '%s\n' "$OUT" | grep -e '^warning: ' -e '^note: ird reserved ')
 [ $rc -eq 0 ] && [ -n "$RID" ] || fail "box.py ird reserve (rc $rc): $(printf '%s' "$OUT" | grep -v '^warning: ' | tail -n 3)"
 EXPIRES=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* expires=\([^ ]*\).*/\1/p')
 MACHINE=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* machine=\([^ ]*\).*/\1/p')
 RES_LINE="$RID on $MACHINE"
+KH="$IRD_DIR/known_hosts/$BOX.$RID"
 ROW1=$(row_of "$RID")
-LANDED=""  # box.py compares the names ignoring a site prefix or domain, and warns when they differ
+LANDED=""  # box.py compares the names ignoring a site prefix or domain; "asked for" only when --machine reached ird
 printf '%s\n' "$OUT" | grep -q '^warning: asked for ' && LANDED=" (asked for $PICKED; using the machine ird reserved)"
 note "step 2 reserve: PASS id $RID on $MACHINE$LANDED, expires $EXPIRES ($(( $(date +%s) - T0 ))s)"
 note "  ird list row: ${ROW1:-<none>}"
@@ -236,14 +264,15 @@ note "  ird list row: ${ROW1:-<none>}"
 # --- 3 ssh in -------------------------------------------------------------------------------------
 STEP="3 ssh"; T0=$(date +%s)
 grep -qs "^# >>> tt-project ird $RID\$" "$INCLUDE" || fail "no ssh block for $RID in $INCLUDE"
-JUMP=$(ssh -G "$MACHINE" 2>/dev/null | awk '$1 == "proxyjump" {print $2}')
-[ "$JUMP" = "$MGMT" ] || fail "ssh -G $MACHINE gives proxyjump '${JUMP:-none}', not $MGMT: is the Include at the top of ~/.ssh/config?"
-if [ -t 0 ]; then
-  say "first ssh to $MACHINE: if asked, check its host key (ssh-workflow.md) before you accept it"
-  ssh -o ConnectTimeout=20 "$MACHINE" true || fail "ssh $MACHINE failed"
-fi
-HOSTNAME_R=$(on_machine 'hostname') || fail "ssh -o BatchMode=yes $MACHINE failed (host key not yet in known_hosts?)"
-note "step 3 ssh: PASS via ProxyJump, remote hostname $HOSTNAME_R ($(( $(date +%s) - T0 ))s)"
+# The options that apply to the machine under the run's own config, for the report.
+EFF=$(ssh -F "$SSH_CFG" -G "$MACHINE" 2>/dev/null)
+opt() { printf '%s\n' "$EFF" | awk -v k="$1" '$1 == k {sub(/^[^ ]+ /, ""); gsub(/"/, ""); print; exit}'; }
+note "  ssh -G $MACHINE: hostname=$(opt hostname) port=$(opt port) proxyjump=$(opt proxyjump) stricthostkeychecking=$(opt stricthostkeychecking) userknownhostsfile=$(opt userknownhostsfile)"
+[ "$(opt proxyjump)" = "$MGMT" ] || fail "ssh -G $MACHINE gives proxyjump '$(opt proxyjump)', not $MGMT: the managed block in $INCLUDE does not apply"
+[ "$(opt stricthostkeychecking)" = "accept-new" ] || fail "ssh -G $MACHINE gives stricthostkeychecking '$(opt stricthostkeychecking)', not accept-new"
+[ "$(opt userknownhostsfile)" = "$KH" ] || fail "ssh -G $MACHINE gives userknownhostsfile '$(opt userknownhostsfile)', not the reservation's own $KH"
+HOSTNAME_R=$(on_machine 'hostname') || fail "ssh -F $SSH_CFG -o BatchMode=yes $MACHINE failed"
+note "step 3 ssh: PASS via ProxyJump, remote hostname $HOSTNAME_R, host key in the reservation's own known_hosts ($(( $(date +%s) - T0 ))s)"
 
 # --- 4 clone, worktree, edit, build, tt-smi -------------------------------------------------------
 STEP="4 work"; T0=$(date +%s)
@@ -302,4 +331,5 @@ RELEASED="yes"
 ROWS=$(ird_rows) || fail "ird list after release failed"
 printf '%s\n' "$ROWS" | awk -v id="$RID" '$1 == id {f=1} END {exit !f}' && fail "$RID still in ird list after release"
 grep -qs "^# >>> tt-project ird $RID\$" "$INCLUDE" && fail "ssh block for $RID still in $INCLUDE"
-note "step 6 release: PASS $RID gone from ird list, ssh block removed ($(( $(date +%s) - T0 ))s)"
+[ -e "$KH" ] && fail "per-reservation known_hosts $KH still there after release"
+note "step 6 release: PASS $RID gone from ird list, ssh block and known_hosts file removed ($(( $(date +%s) - T0 ))s)"
