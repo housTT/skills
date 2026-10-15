@@ -302,6 +302,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
     "upstream": {"ingest": False},
+    # A wait on another project's reply must be model-free (ackwait.py): `ttp ack-wait probe`, the
+    # project's own `<harness>/.../ack_wait.py probe`, or a command listed here (matched on its leading words).
+    "ack_wait": {"probe_commands": []},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the

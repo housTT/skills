@@ -19,7 +19,10 @@ and a progress line in the waiting run.
 from __future__ import annotations
 
 import fcntl
+import os
 import re
+import shlex
+from pathlib import Path
 
 from . import upstream
 
@@ -70,19 +73,59 @@ _REPLY_RE = re.compile(r"\b(?:repl(?:y|ies|ied)|answers?|answered|responses?|res
 _OTHER_PROJECT_RE = re.compile(r"\b(?:an)?other project'?s?\b|\bnote --to\b", re.I)
 
 
-def is_probe(probe) -> bool:
-    """Whether a retry_when is `ttp ack-wait probe ...`."""
-    return isinstance(probe, str) and bool(re.search(r"\back-wait\s+probe\b", probe))
+_WRAPPER_RE = re.compile(r"\s*(?:python3?\s+)?(?P<path>'[^']*'|\"[^\"]*\"|\S+)\s+probe(?:\s|$)")
 
 
-def unmanaged_wait(result: dict, projects, job_in_flight: bool = False) -> str:
+def _words(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def probe_commands(cfg: dict | None) -> list[list[str]]:
+    """ack_wait.probe_commands: more model-free reply-wait commands a retry_when may start with, as words."""
+    raw = ((cfg or {}).get("ack_wait") or {}).get("probe_commands") or []
+    raw = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    return [w for w in (_words(c) for c in raw if isinstance(c, str)) if w]
+
+
+def _own_wrapper(probe: str, harness) -> bool:
+    """Whether `probe` runs the project's own `ack_wait.py probe` from under its harness dir (a relative
+    path is from the project root, where retry_when runs)."""
+    m = _WRAPPER_RE.match(probe)
+    if not m:
+        return False
+    path = Path(m.group("path").strip("'\""))
+    if path.name != "ack_wait.py":
+        return False
+    harness = Path(os.path.normpath(Path(harness).absolute()))
+    full = Path(os.path.normpath(path if path.is_absolute() else harness.parent.parent / path))
+    return full.is_relative_to(harness)
+
+
+def is_probe(probe, cfg: dict | None = None, harness=None) -> bool:
+    """Whether a retry_when is a model-free wait on a reply: `ttp ack-wait probe ...`, a command
+    ack_wait.probe_commands lists (its leading words), or the project's own `ack_wait.py probe` wrapper
+    under its harness dir `harness`."""
+    if not isinstance(probe, str):
+        return False
+    if re.search(r"\back-wait\s+probe\b", probe):
+        return True
+    words = _words(probe)
+    if any(words[:len(c)] == c for c in probe_commands(cfg)):
+        return True
+    return bool(harness) and _own_wrapper(probe, harness)
+
+
+def unmanaged_wait(result: dict, projects, job_in_flight: bool = False, cfg: dict | None = None, harness=None) -> str:
     """Why a waiting hand-off is refused: it waits on another project's reply (its waiting_for asks
     for a reply from one of `projects`, this user's other projects, or from "another project") but
-    its retry_when is not `ttp ack-wait probe`; '' when it is fine. Such a wait would otherwise wake a
+    its retry_when is no ack-wait probe (is_probe); '' when it is fine. Such a wait would otherwise wake a
     model run on every timer to read the inbox, which the probe does for free. A wait with a detached job in
     flight is the job's, not a reply's. A project is named only as `from <name>`, `<name> project` or
     `<name>'s`, so a project with a generic name does not catch an unrelated wait."""
-    if job_in_flight or not isinstance(result, dict) or is_probe(result.get("retry_when")):
+    if job_in_flight or not isinstance(result, dict) or is_probe(result.get("retry_when"), cfg, harness):
         return ""
     what = " ".join(str(result.get("waiting_for") or "").split())
     if not _REPLY_RE.search(what) or re.search(r"\bupstream\s+--fixed\b", str(result.get("retry_when") or "")):
@@ -95,4 +138,4 @@ def unmanaged_wait(result: dict, projects, job_in_flight: bool = False) -> str:
     return (f"hand-off refused: it waits on another project's reply ({what[:200]}) without the ack-wait probe. "
             f"Hand off waiting with retry_when `ttp ack-wait probe --from {frm} --hash <note id>` and on_pass_cmd "
             f"`ttp ack-wait settle --from {frm} --hash <note id>` (the id `ttp note --to` printed), or keep working "
-            f"without the reply.")
+            f"without the reply. A project's own model-free wrapper counts when ack_wait.probe_commands lists it.")

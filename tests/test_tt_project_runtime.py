@@ -30180,6 +30180,44 @@ def test_unmanaged_wait_matches_a_project_only_by_form_and_skips_detached_jobs()
     assert w("a reply from ci to note 0123abcd", job_in_flight=True) == ""
 
 
+def test_ack_wait_accepts_a_projects_own_model_free_wrapper(tmp_path):
+    from ttp import ackwait
+    harness = tmp_path / "tt-project" / "harness"
+    wait = {"status": "waiting", "waiting_for": "a reply from fleet-sim to note 0123abcd"}
+    own = "python3 tt-project/harness/bin/ack_wait.py probe --from fleet-sim --hash 0123abcd"
+    # The project's own `ack_wait.py probe` under its harness dir is a managed probe, relative or absolute.
+    for rw in (own, own.split(" ", 1)[1], f"{harness}/bin/ack_wait.py probe --from fleet-sim --hash 0123abcd"):
+        assert ackwait.is_probe(rw, harness=harness), rw
+        assert ackwait.unmanaged_wait(dict(wait, retry_when=rw), ["fleet-sim"], harness=harness) == "", rw
+    # Not without the harness dir, outside it, or without `probe`.
+    for rw, h in ((own, None), ("python3 other/harness/bin/ack_wait.py probe --hash 0123abcd", harness),
+                  ("python3 tt-project/harness/../../ack_wait.py probe --hash 0123abcd", harness),
+                  ("python3 tt-project/harness/bin/ack_wait.py settle --hash 0123abcd", harness)):
+        assert not ackwait.is_probe(rw, harness=h), rw
+    # ack_wait.probe_commands lists more model-free wrappers: matched on whole leading words.
+    cfg = {"ack_wait": {"probe_commands": ["bin/reply-wait probe", 7, ""]}}
+    assert ackwait.is_probe("bin/reply-wait probe --from fleet-sim --hash 0123abcd", cfg)
+    assert ackwait.is_probe("bin/reply-wait  probe", cfg)
+    assert ackwait.unmanaged_wait(dict(wait, retry_when="bin/reply-wait probe --hash 0123abcd"), ["fleet-sim"], cfg=cfg) == ""
+    for rw in ("bin/reply-wait probes", "bin/reply-wait", "exit 1", "bin/reply-wait-x probe"):
+        assert not ackwait.is_probe(rw, cfg), rw
+    # Any other command is still refused, and the refusal names the setting.
+    msg = ackwait.unmanaged_wait(dict(wait, retry_when="exit 1"), ["fleet-sim"], cfg=cfg, harness=harness)
+    assert msg.startswith("hand-off refused") and "ack_wait.probe_commands" in msg, msg
+
+
+def test_a_reply_wait_on_the_projects_own_wrapper_is_not_refused(env, tmp_path, monkeypatch):
+    from ttp import project
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setattr(project, "load_registry", lambda: {"projects": {p.name: {}, "fleet-sim": {}}})
+    d = Daemon(p.base)
+    tid = p.db.add_task("needs fleet data", "s", kind="work", tier="standard", origin="user")
+    rw = f"python3 {p.base.name}/harness/bin/ack_wait.py probe --from fleet-sim --hash 0123abcd"
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="a reply from fleet-sim to note 0123abcd", retry_when=rw)
+    assert json.loads(t["result"])["status"] == "waiting", dict(t)
+
+
 def _checks_killed_by_reboot(p, tmp_path, tid, boot="an-earlier-boot"):
     """Task tid waits on its own `ttp checks --detach` in a clean git worktree; the reboot behind
     `boot` killed them (checks.pid of that boot, a dead pid, no checks.rc)."""
