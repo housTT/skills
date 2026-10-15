@@ -52859,6 +52859,46 @@ def test_heal_outage_on_another_machine_does_not_quiet_the_check(env, block):
     assert "known_outage" not in heal.state(p.db, "svc")
 
 
+@pytest.mark.parametrize("finding", ["chip", "unknown"])
+def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, finding):
+    """[note f7b7938ee8de232f] An outage recorded for one service (`--covers ltx`) quieted every unhealthy
+    result on the machine, so a chip loss went unnoticed for hours. Only a matching finding stays quiet."""
+    from ttp import heal, timefmt
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="LTX")
+    assert rec["covers"] == ["ltx"]
+    until = timefmt.long(rec["until"], p)
+    # The covered service's finding stays quiet, as under a whole-machine outage.
+    ltx = dict(spec, check="echo 'ltx service inactive'; exit 1")
+    assert heal.outage_explains(rec, "svc", ltx, 1, "ltx service inactive")
+    assert heal.run(d, "svc", ltx, now)[0] == f"unhealthy (known outage until {until})"
+    assert heal.state(p.db, "svc")["known_outage"] == "box-a"
+    if finding == "chip":   # a chip loss is not explained: it escalates as usual
+        lost = dict(spec, check="echo 'chip 0 missing from the device list'; exit 1")
+        assert not heal.outage_explains(rec, "svc", lost, 1, "chip 0 missing from the device list")
+        assert "self-fix task" in heal.run(d, "svc", lost, now + 60)[0]
+        assert "known_outage" not in heal.state(p.db, "svc")
+        assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    else:   # an unreachable box is not explained by one service either: its long stretch is told once
+        dark = dict(spec, check="exit 255")
+        heal.run(d, "svc", dark, now + 60)
+        assert "coordinator told" in heal.run(d, "svc", dark, now + 60 + 601)[0]
+        # An outage covering the host explains it: nothing more is told.
+        ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+        assert heal.outage_explains(ml.outages()["box-a"], "svc", dark, 255, "")
+        assert heal.run(d, "svc", dark, now + 900) == ("ok (unknown, rc 255)", None)
+        assert heal.state(p.db, "svc")["known_outage"] == "box-a"
+    # Covered words match whole words (a plural too), never inside another word.
+    chip = {"covers": ["chip"]}
+    assert heal.outage_explains(chip, "svc", spec, 1, "2 chips lost")
+    assert not heal.outage_explains(chip, "svc", spec, 1, "chipset fan slow")
+    assert heal.outage_explains({}, "svc", spec, 1, "anything at all")
+
+
 def test_heal_back_from_a_long_unknown_stretch_starts_a_fresh_episode(env):
     from ttp import heal
     p, d, up = _heal_setup(env, fix=None, grace_s=600, escalate="coordinator")
@@ -63092,8 +63132,8 @@ def test_an_outage_says_what_it_covers_for_watchers(env, capsys):
     from ttp.cli import main
     alpha, ml, able = _quiet_box(env)
     with pytest.raises(SystemExit):
-        main(["machines", "outage", "box-a", "tray swap", "--covers", "tray,toaster", "--expires", "1d"])
-    assert "toaster" in capsys.readouterr().err and "box-a" not in ml.outages()
+        main(["machines", "outage", "box-a", "tray swap", "--covers", "tray,two words", "--expires", "1d"])
+    assert "two words" in capsys.readouterr().err and "box-a" not in ml.outages()
     main(["machines", "outage", "box-a", "tray swap", "--covers", "Fabric, tray", "--covers", "tray",
           "--expires", "1d"])
     assert "covers: tray, fabric" in capsys.readouterr().out

@@ -22,7 +22,8 @@ A condition no co-tenant reported for CONDITION_GONE_S, or reported cleared, is 
 Quiet outages (quiet_reason). Nobody is paged about a condition the harness already knows: a known outage
 recorded with `ttp machines outage <alias> "<why>" [--owner <who>] [--covers <parts>] --expires <t>` (a
 hardware repair, often owned by a human or an external ticket; `covers`, optional, lists the parts it explains
-from OUTAGE_COVERS for co-tenant watchers, while the harness quiets the whole machine either way), or an open change that expects the condition (`--expect down`).
+from OUTAGE_COVERS, or services on the machine by name, for co-tenant watchers and the harness's own heal checks,
+which it then quiets only for results it explains (heal.outage_explains)), or an open change that expects the condition (`--expect down`).
 The owner's first page still goes, but nothing escalates to the fallback or the user, while: the user paused
 a resource on the machine, a reporting heal check carries a `known_fault`, or no open task of any project on
 this machine uses it (a task's resource on it that its project paused does not count). A reporter this
@@ -85,8 +86,10 @@ PROBE_END_S = 7 * 86400      # an entry with only an until-probe is overdue afte
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
-# what a known outage explains (`ttp machines outage --covers`); none given: the whole machine
+# what a known outage explains (`ttp machines outage --covers`), besides a service's name; none given:
+# the whole machine
 OUTAGE_COVERS = ("host", "power", "network", "tray", "chip", "fabric")
+COVER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # a service a known outage names
 QUIET_KEPT_S = 2 * 86400     # a quiet outage's daily-review record is kept this long after it was last seen
 REVIEW_S = 86400             # the daily review lists the quiet outages seen within this
 GAP_KV = "machine_owner_gap_named"
@@ -356,7 +359,8 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
                covers: Any = None) -> dict:
     """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
     about it meanwhile. `owner`: who has the repair, often a human or an external ticket. `covers`: the
-    parts it explains (OUTAGE_COVERS), stored for co-tenant watchers; none: the whole machine."""
+    parts it explains (OUTAGE_COVERS, or a service by name), stored for co-tenant watchers and heal
+    checks; none: the whole machine."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -378,14 +382,15 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
 
 
 def outage_covers(covers: Any) -> list[str]:
-    """`covers` (a list, or comma-separated words) checked against OUTAGE_COVERS, in that order."""
+    """`covers` (a list, or comma-separated words): the OUTAGE_COVERS in that order, then service names."""
     if isinstance(covers, str):
         covers = [covers]
     words = {w.strip().lower() for c in (covers or []) for w in str(c).split(",") if w.strip()}
-    bad = sorted(words - set(OUTAGE_COVERS))
+    bad = sorted(w for w in words - set(OUTAGE_COVERS) if not COVER_NAME.fullmatch(w))
     if bad:
-        raise ValueError(f"--covers takes {', '.join(OUTAGE_COVERS)}; not {', '.join(bad)}")
-    return [c for c in OUTAGE_COVERS if c in words]
+        raise ValueError(f"--covers takes {', '.join(OUTAGE_COVERS)} or a service's name (one word); "
+                         f"not {', '.join(bad)}")
+    return [c for c in OUTAGE_COVERS if c in words] + sorted(words - set(OUTAGE_COVERS))
 
 
 def clear_outage(alias: str) -> bool:

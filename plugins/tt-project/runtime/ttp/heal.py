@@ -70,8 +70,12 @@ that drops ping stays a route problem. Set them only for a box that answers ping
 Known machine outages: while the check's machine (machine_of) or its `resource` has a known outage in the
 machine ledger (`ttp machines outage`, until its end), an unhealthy result is kept quiet like a known
 fault (no fix, no task, no alert), an outage check's unknown stretch never escalates, and a long unknown
-stretch says nothing (no unknown_cap_s message); the status reads "known outage until <time>". Once the
-outage ends, a check still failing starts a fresh episode.
+stretch says nothing (no unknown_cap_s message); the status reads "known outage until <time>". An outage
+with `covers` (`--covers`) quiets only the results it explains (outage_explains): a covered word in the
+check's name, `resource`, `unit` or output, or, for a run that cannot reach the box (unknown), host, power
+or network among them; any other result (a chip loss under an outage covering one service) is handled
+normally. One without `covers` quiets them all. Once the outage ends, or stops explaining the result, a
+check still failing starts a fresh episode.
 
 Fresh episodes: an unhealthy result after an unknown stretch (ending in 75 or 255, not a broken check)
 longer than its grace (at least FRESH_UNKNOWN_S) whose self-fix task is no longer open starts a new
@@ -629,6 +633,21 @@ def known_outage(spec: dict, now: float) -> tuple[str, dict] | None:
                  if a == alias or res == a or res.startswith((a + "-", a + ":"))), None)
 
 
+OUTAGE_DARK = ("host", "power", "network")   # covers that explain a check unable to reach the box
+
+
+def outage_explains(rec: dict, name: str, spec: dict, rc: int, out: str) -> bool:
+    """Whether a known outage `rec` explains this result: always without `covers`, else a covered word
+    (a plural too) in the check's name, `resource`, `unit` or output, or an unknown run under OUTAGE_DARK."""
+    covers = [str(c).lower() for c in rec.get("covers") or []]
+    if not covers:
+        return True
+    if rc != 0 and rc != 1 and set(covers) & set(OUTAGE_DARK):
+        return True
+    text = " ".join(str(x) for x in (name, spec.get("resource"), spec.get("unit"), out) if x).lower()
+    return any(re.search(rf"(?<![a-z0-9]){re.escape(c)}s?(?![a-z0-9])", text) for c in covers)
+
+
 def _fresh(st: dict, *also: str) -> None:
     """Start a new unhealthy episode: grace again, no task, nothing escalated (module doc). Keeps `fixes`."""
     for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", "paged", "paged_unknown",
@@ -714,6 +733,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     st.update(last_check=now, last_rc=rc, last_out=out[-1000:])
     _untenanted_hold(host, name, spec, st, rc, out, now)
     known = known_outage(spec, now)
+    if known and not outage_explains(known[1], name, spec, rc, out):
+        known = None   # an outage covering other parts: this result is handled normally
     if known:
         st["known_outage"] = known[0]
     elif st.pop("known_outage", None):   # the known outage ended: a check still failing gets its grace,
