@@ -1935,7 +1935,7 @@ class Daemon:
             how = "planned" if cycle else shutdown
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
                     "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"],
-                                "by": cycle.get("planner") or ""} if cycle else None,
+                                "by": cycle.get("planner") or "", "project": cycle.get("project") or ""} if cycle else None,
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
                     "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
                               "usd": round(float(r["cost_usd"] or 0), 2)} for r in lost]}
@@ -6283,7 +6283,7 @@ class Daemon:
             if c.get("kind") == machine_ledger.POWER_CYCLE and isinstance(at, (int, float)) \
                     and -machine_ledger.POWER_CYCLE_LEAD_S <= self.boot_at - at <= hostcycle.WINDOW_S:
                 who = f"machine change #{c.get('id')}" + (f" by {c['by']}" if c.get("by") else "")
-                return {"reason": str(c.get("what") or ""), "path": who, "planner": who}
+                return {"reason": str(c.get("what") or ""), "path": who, "planner": who, "project": self.p.name}
         return None
 
     def _other_projects(self) -> list[str]:

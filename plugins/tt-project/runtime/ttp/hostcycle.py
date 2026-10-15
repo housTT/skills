@@ -29,13 +29,20 @@ WINDOW_S = 7200
 
 def _state_dirs(p: Project | None) -> list[Path]:
     """This project's state folder first, then every other registered project's on this host."""
-    out = [p.state] if p else []
+    return [d for _, d in _named_state_dirs(p)]
+
+
+def _named_state_dirs(p: Project | None) -> list[tuple[str, Path]]:
+    """(project name, state folder) pairs, this project first, then the other registered ones here."""
+    out = [(p.name, p.state)] if p else []
+    seen = {d for _, d in out}
     here = project.hostname()
-    for _, e in sorted((project.load_registry().get("projects") or {}).items()):
+    for name, e in sorted((project.load_registry().get("projects") or {}).items()):
         if isinstance(e, dict) and e.get("host") in (None, here) and e.get("dir"):
             d = Path(e["dir"]) / project.FOLDER / "state"
-            if d not in out:
-                out.append(d)
+            if d not in seen:
+                seen.add(d)
+                out.append((str(name), d))
     return out
 
 
@@ -44,7 +51,7 @@ def planned(p: Project | None, boot: str | None, boot_at: float | None) -> dict 
     dry run, started on that boot, and at most WINDOW_S before `boot_at` (this boot's start)."""
     if not boot:
         return None
-    for d in _state_dirs(p):
+    for owner, d in _named_state_dirs(p):
         try:
             files = sorted((d / FOLDER).glob("*/record.json"), reverse=True)
         except OSError:
@@ -59,7 +66,7 @@ def planned(p: Project | None, boot: str | None, boot_at: float | None) -> dict 
             started = r.get("started")
             if boot_at and (not isinstance(started, (int, float)) or not 0 <= boot_at - started <= WINDOW_S):
                 continue
-            return {**r, "path": str(f)}
+            return {**r, "path": str(f), "project": owner}
     return None
 
 

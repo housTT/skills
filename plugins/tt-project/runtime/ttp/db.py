@@ -774,15 +774,15 @@ def host_line(boots: list[dict], where=None) -> str:
     kept_usd = sum(float(x.get("usd") or 0) for x in kept)
     lost_usd = max(0.0, sum(float(b.get("lost_usd") or 0) for b in boots) - kept_usd)
     planned = [b for b in boots if b.get("planned")]
-    by = sorted({str(b["planned"]["by"]) for b in planned
-                 if isinstance(b["planned"], dict) and re.fullmatch(r"[\w.-]+", str(b["planned"].get("by") or ""))})
+    by = sorted({str(b["planned"]["project"]) for b in planned
+                 if isinstance(b["planned"], dict) and re.fullmatch(r"[\w.-]+", str(b["planned"].get("project") or ""))})
     from .timefmt import short
     last = short(float(boots[-1]["ts"]), where)
     n = len(runs)
     return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h"
             + (f" ({len(planned)} planned" + (f": by {', '.join(by)}" if by else "") + ")" if planned else "")
-            + f" (last {last}), {n} run{'' if n == 1 else 's'} cut short: {len(gone)} lost (${lost_usd:.2f}), "
-              f"{len(kept)} resumed with work kept (${kept_usd:.2f})")
+            + f" (last {last}), {n} run{'' if n == 1 else 's'} cut short"
+            + (f": {len(gone)} lost (${lost_usd:.2f}), {len(kept)} resumed with work kept (${kept_usd:.2f})" if n else ""))
 
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:

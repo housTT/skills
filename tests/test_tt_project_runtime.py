@@ -26148,7 +26148,8 @@ def test_planned_reboots_are_told_as_planned_at_low_severity_and_never_counted_a
     boots = p.db.boots(0)
     assert len(boots) == 4 and not any(dbm.unplanned_abrupt(b) for b in boots)
     assert all(b["planned"]["by"].startswith("host-cycle record rec-") for b in boots), boots
-    assert dbm.host_line(boots).startswith("host: 4 reboots in 24 h (4 planned) (last "), dbm.host_line(boots)
+    assert all(b["planned"]["project"] == p.name for b in boots), boots
+    assert "(4 planned: by " + p.name + ")" in dbm.host_line(boots), dbm.host_line(boots)
     texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE source='host' AND kind='boot'")]
     assert texts and all(t.startswith("the host rebooted (planned);") for t in texts), texts
     mm.add("box-a", tags="device")
@@ -58695,11 +58696,13 @@ def test_host_line_splits_cut_runs_into_lost_and_resumed_and_names_planners(env)
     p.db.x("INSERT INTO runs(id, task, role, status, note) VALUES(?,?,?,?,?)",
            (4, 1, "worker", "ok", json.dumps({"resumes": {"run": 2}})))
     data = {"lost": [{"run": 1, "usd": 1.0}, {"run": 2, "usd": 2.5}, {"run": 3, "usd": 0.5}], "lost_usd": 4.0,
-            "planned": {"reason": "x", "record": "r", "by": "proj-a"}}
+            "planned": {"reason": "x", "record": "r", "project": "proj-a",
+                        "by": "host-cycle record 20261015T100000Z by ttp drain"}}
     p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
            (time.time(), "host", "boot", "boot:b", "normal", "t", json.dumps(data), "record"))
     boots = p.db.boots(0)
     assert [x["kept"] for x in boots[0]["lost"]] == [False, True, False]
     line = dbm.host_line(boots)
     assert "(1 planned: by proj-a)" in line, line
+    assert dbm.host_line([{"ts": time.time(), "lost": []}]).endswith("0 runs cut short")
     assert line.endswith("3 runs cut short: 2 lost ($1.50), 1 resumed with work kept ($2.50)"), line
