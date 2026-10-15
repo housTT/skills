@@ -29859,6 +29859,13 @@ def test_reboot_wait_classifies_probes_by_where_they_run():
     assert rw.transient("/opt/bin/ttp lock --probe dev") == ""
     assert rw.transient('test -e "/tmp/x') == "a path a reboot clears", "an unparsable probe wakes when in doubt"
     assert rw.stays_asleep({"retry_when": "kill -0 1", "survives_reboot": True})
+    # A /tmp path on another host is untouched by a local reboot; a local one is not.
+    assert rw.transient("ttp detach --check --host box1 /tmp/d/j") == ""
+    assert rw.transient("ttp detach --check --host=box1 /tmp/d/j") == ""
+    assert rw.transient("ssh box1 test -e /tmp/d/j") == ""
+    assert rw.transient("test -e /tmp/d/j") == "a path a reboot clears"
+    assert rw.stays_asleep({"retry_when": "ttp detach --check --host box1 /tmp/d/j"})
+    assert rw.stays_asleep({"retry_when": "test -e /tmp/x", "survives_reboot": True})
 
 
 def _reply_wait_hand_off(p, d, tmp_path, tid, **result):

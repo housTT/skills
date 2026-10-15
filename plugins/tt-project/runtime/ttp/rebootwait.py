@@ -5,7 +5,7 @@
 A reboot wakes a waiting task only when what it waits on was local and transient: its probe checks
 a local detached job (`ttp detach --check` without `--host`), its own `ttp checks --result`, a local
 device runner job (`ttp devq probe`), a process (a pid, `pgrep`, `ps`) or a path under /tmp, /run,
-/dev/shm, /proc or a run folder, outside any ssh command; or a detached job of its own from the
+/dev/shm, /proc or a run folder, outside any ssh command or `--host` command (those paths are on the other host); or a detached job of its own from the
 earlier boot never wrote its .rc (the daemon checks that part). A timer, a probe of another host,
 a CI run or another project's reply (`ttp ack-wait probe`) is as it was: the task stays asleep on
 its timer and probe. `survives_reboot` keeps it asleep whatever its probe says.
@@ -66,7 +66,7 @@ def _transient_words(words: list[str], run_dirs: tuple[str, ...]) -> str:
         return "a process"
     if "kill" in base and "-0" in words:
         return "a process"
-    if _VOLATILE_RE.search(joined):
+    if _VOLATILE_RE.search(joined) and not any(w == "--host" or w.startswith("--host=") for w in words):
         return "a path a reboot clears"
     if _RUN_DIR_RE.search(joined) or any(d and d in joined for d in run_dirs):
         return "a file in a run folder"
