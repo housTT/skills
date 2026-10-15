@@ -11,6 +11,10 @@ every project of this account on this host. A run over the cap waits its turn in
 Slots and queue tickets are OS file locks (locks.py), so they end with the process that holds them:
 a crash, a kill or a reboot never leaves a stale holder.
 
+A slot directory that cannot be written (a worker's sandbox without it among its writable roots,
+or file permissions) never runs the checks uncapped: acquire raises Unavailable, which says what to
+fix. Workers get the directory as a writable root (daemon.start_run).
+
 The cap is the account setting `checks.host_max` (`ttp config --account checks.host_max N`), or the
 environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it is one slot per CORES_PER_SLOT cores,
 at least one. Check commands run with HELD_ENV set, so a `ttp checks` nested in them runs at once
@@ -47,6 +51,17 @@ ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
 
 def slot_dir() -> Path:
     return project.HOME_DIR / "check-slots"
+
+
+class Unavailable(RuntimeError):
+    """The slot directory cannot be written here: the checks must not run without the cap."""
+
+
+def _unavailable(e: OSError) -> Unavailable:
+    return Unavailable(f"host-wide checks slots unavailable: {slot_dir()} is not writable here "
+                       f"({e.strerror or e}); not running the checks without the host-wide cap. The run's "
+                       f"sandbox or file permissions must allow writing it; hand the task back as blocked "
+                       f"and name this directory")
 
 
 def cores() -> int:
@@ -163,8 +178,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     """Take a host-wide checks slot, waiting in arrival order while all are held. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
-    it waited that long. `since` is the arrival time to queue at (default now). A slot directory that cannot be written runs the checks uncapped: the cap
-    must never stop them."""
+    it waited that long. `since` is the arrival time to queue at (default now). A slot directory that
+    cannot be written raises Unavailable: the checks never run uncapped."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -175,9 +190,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since)
     except OSError as e:
-        if tell:
-            tell(f"host-wide checks cap not applied: {slot_dir()} is not writable ({e.strerror or e})")
-        return Slot()
+        raise _unavailable(e) from e
     started, told = time.time(), 0.0
     try:
         while True:
@@ -210,7 +223,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None) -> Slot:
     """Take the priority slot of the push branch `key` (beyond the cap, ahead of every task waiting in
     the queue), saying so through `tell`. Only another push to the same branch can hold it; then this
-    waits for that one alone. Cap off, nested or an unwritable slot directory: no slot, run at once."""
+    waits for that one alone. Cap off or nested: no slot, run at once. An unwritable slot directory
+    raises Unavailable."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -220,9 +234,7 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
         try:
             f = locks.try_take([path], holder, what)
         except OSError as e:
-            if tell:
-                tell(f"host-wide checks cap not applied: {slot_dir()} is not writable ({e.strerror or e})")
-            return Slot()
+            raise _unavailable(e) from e
         if f:
             if tell:
                 q = len(locks.queued(slot_dir(), RESOURCE))

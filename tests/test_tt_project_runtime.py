@@ -58039,3 +58039,85 @@ def test_blocker_sweep_flags_not_carries_a_still_blocked_on_a_task_a_long_open_a
     assert coord.apply(p, [{"type": "sweep", "id": t, "outcome": "human_indispensable",
                             "why": "only the user may waive it"}]) == []
     assert sweep.rethink(db, cfg, sweep.items(db, later, cfg), later) == {}
+
+
+def _readonly_check_slots(env):
+    """Make ~/.tt-project/check-slots unwritable, as a worker sandbox without it among its writable
+    roots sees it (a regular file in its place when running as root, which chmod does not stop)."""
+    from ttp import checkcap
+    d = checkcap.slot_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o555)
+    if os.access(d, os.W_OK):
+        d.chmod(0o755)
+        shutil.rmtree(d)
+        d.write_text("")
+    return d
+
+
+def test_checks_host_cap_never_runs_uncapped_when_the_slot_root_is_read_only(env, monkeypatch):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    d = _readonly_check_slots(env)
+    told = []
+    try:
+        for take in (lambda: checkcap.acquire("a", tell=told.append),
+                     lambda: checkcap.acquire_priority("git@example:org/repo#main", "push", tell=told.append)):
+            with pytest.raises(checkcap.Unavailable) as e:
+                take()
+            assert str(d) in str(e.value) and "not running the checks without the host-wide cap" in str(e.value)
+        assert not any("not applied" in t for t in told), told
+        monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")
+        assert checkcap.acquire("off").f is None, "a cap turned off still runs at once"
+        assert checkcap.line() == "", "status still reads the unwritable root"
+    finally:
+        if d.is_dir():
+            d.chmod(0o755)
+
+
+def test_ttp_checks_refuses_to_run_uncapped_when_the_slot_root_is_read_only(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    marker = tmp_path / "ran"
+    d = _readonly_check_slots(env)
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", f"touch {marker}"])
+    finally:
+        if d.is_dir():
+            d.chmod(0o755)
+    assert e.value.code == 2
+    assert not marker.exists(), "the checks did not run without the cap"
+    err = capsys.readouterr().err
+    assert str(d) in err and "not writable" in err and "Traceback" not in err, err
+    rec = run / "checks.json"
+    assert not rec.exists() or json.loads(rec.read_text())["passed"] is not True
+
+
+def test_a_push_batch_does_not_check_uncapped_when_the_slot_root_is_read_only(env, monkeypatch, capsys):
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo ran >> {log}"])
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    d = _readonly_check_slots(env)
+    try:
+        rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    finally:
+        if d.is_dir():
+            d.chmod(0o755)
+    assert m["outcome"] != "pushed", m
+    assert not log.exists(), "no check ran without the cap"
+    assert str(d) in json.dumps(m) + capsys.readouterr().out
+
+
+def test_workers_may_write_the_host_wide_check_slots(env):
+    # A worker's `ttp checks` takes ~/.tt-project/check-slots/checks.N.lock; a sandbox that left it
+    # read-only made the checks run without the host-wide cap.
+    from ttp import checkcap
+    p = make(env)
+    roots = _codex_worker_roots(env, p, p.base)
+    slot = checkcap.paths(1)[0]
+    assert slot.parent == env["home"] / "check-slots", "the slot root must not move"
+    assert any(slot.is_relative_to(r) for r in roots), roots
+    assert checkcap.slot_dir().is_dir() and str(env["home"]) not in roots

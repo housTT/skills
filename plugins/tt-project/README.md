@@ -667,7 +667,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `--result` probe; it never fails the checks. A foreground `ttp checks` (a tool call) waits a
   minute at most: then it starts the same checks detached, in the same place in the queue, prints
   their `retry_when` and exits 75 (with no project it waits on in the foreground).
-  Slots are OS file locks, so a crash or reboot frees them. The default is one slot per 16 cores (at least one); set it with
+  Slots are OS file locks, so a crash or reboot frees them. Workers' sandboxes may write the slot
+  directory; where it cannot be written, the checks stop with an error naming it (exit 2; a push
+  does not go) instead of running uncapped. The default is one slot per 16 cores (at least one); set it with
   `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so

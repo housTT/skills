@@ -522,7 +522,7 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
     push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
     priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
-    one already (checkcap.HELD_ENV), it does not wait."""
+    one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable."""
     if not who:
         base = os.environ.get("TTP_PROJECT")
         who = checkcap.label(Project(base).name if base else None, "ttp push")
@@ -2650,7 +2650,12 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                 say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
                     f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
-        with check_slot(head, say) if todo else checkcap.Slot() as slot:
+        try:
+            slot = check_slot(head, say) if todo else checkcap.Slot()
+        except checkcap.Unavailable as e:
+            say(f"{e}; not pushing")
+            return CHECKS_FAILED
+        with slot:
             started = time.time()
             env = {**check_env("own", tip, check_run_dir), **slot.env()}
             for cmd in todo:
@@ -2839,7 +2844,12 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        with check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot() as slot:
+        try:
+            slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot()
+        except checkcap.Unavailable as e:
+            say(f"{e}; not pushing")
+            return CHECKS_FAILED
+        with slot:
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
             for cmd in todo:

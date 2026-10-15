@@ -2169,7 +2169,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
     clock, and it ends after checkcap.FOREGROUND_WAIT_S: None then means the caller hands over to
     detached checks. With no project there is nobody to start them detached, so it waits on. `arrived`
-    is the place in the queue (default now)."""
+    is the place in the queue (default now). Slots it cannot write end the run (exit 2), never uncapped."""
     from . import checkcap, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -2196,8 +2196,13 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
-    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
-                            checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived)
+    try:
+        return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
+                                checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived)
+    except checkcap.Unavailable as e:
+        out.write(f"ttp checks: {e}\n")
+        out.flush()
+        die(f"ttp checks: {e}")
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:

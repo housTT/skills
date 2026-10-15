@@ -41,6 +41,7 @@ from . import budget as bud
 from . import budgetkind
 from . import cachettl
 from . import chaincap
+from . import checkcap
 from . import conflictfix
 from . import credits
 from . import globalcap as gcap
@@ -1604,6 +1605,12 @@ class Daemon:
                 roots += list(dict.fromkeys([str(shared.root()), str(shared.root().resolve())]))
             except OSError:
                 pass   # `ttp lock` then says plainly that it cannot write the shared lock
+            # Likewise the host-wide checks slots (checkcap): `ttp checks` refuses to run uncapped.
+            try:
+                checkcap.slot_dir().mkdir(parents=True, exist_ok=True)
+                roots += list(dict.fromkeys([str(checkcap.slot_dir()), str(checkcap.slot_dir().resolve())]))
+            except OSError:
+                pass   # `ttp checks` then says plainly that it cannot write the slots
             fence = prov.writable_args(roots)
             sandboxed = bool(fence)
             extra = fence + prov.plugin_args([d for d in dirs if d not in missing])
