@@ -21758,6 +21758,32 @@ def test_an_error_in_the_watch_thread_never_leaves_the_agent_unwatched(env, tmp_
         assert "watch error 1: " in capsys.readouterr().out
 
 
+class _Orphan:
+    """A `sleep` in a session of its own that is not this process's child, like a real run's processes
+    are not the daemon's: a child of ours would linger as a zombie once signalled, and the reaper's
+    TERM-then-KILL would wait out its whole grace for it. Popen's pid/poll/kill/wait."""
+
+    def __init__(self):
+        code = ("import subprocess; print(subprocess.Popen(['sleep', '120'], start_new_session=True, "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)")
+        self.pid = int(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                      check=True).stdout)
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+        except OSError:
+            return -1
+        return None
+
+    def kill(self):
+        with contextlib.suppress(OSError):
+            os.kill(self.pid, signal.SIGKILL)
+
+    def wait(self):
+        _wait(lambda: self.poll() is not None, 15)
+
+
 def _hung_run(p, d, tmp_path, token=None, lease_age=999, spec=None, started=None):
     """A worker run on this boot whose supervisor and agent are live processes (sleeps in sessions of
     their own) and whose lease is lease_age old. token: the supervisor start recorded beside its pid
@@ -21765,8 +21791,7 @@ def _hung_run(p, d, tmp_path, token=None, lease_age=999, spec=None, started=None
     from ttp import runner
     tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
     p.db.update_task(tid, status="running")
-    sup = subprocess.Popen(["sleep", "120"], start_new_session=True)
-    agent = subprocess.Popen(["sleep", "120"], start_new_session=True)
+    sup, agent = _Orphan(), _Orphan()
     run_dir = tmp_path / f"run-{sup.pid}"
     run_dir.mkdir()
     (run_dir / "output.jsonl").write_text("")
@@ -21923,8 +21948,7 @@ def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path
         if ours:
             assert _wait(lambda: _gone(tool), 15), "the agent's tool kept running after its agent and runner"
         else:
-            time.sleep(0.5)
-            assert not _gone(tool), "the reaper ended a group that is not this run's"
+            assert not _gone(tool, 0.5), "the reaper ended a group that is not this run's"
     finally:
         with contextlib.suppress(OSError, TypeError):
             os.kill(tool, signal.SIGKILL)
@@ -60938,15 +60962,19 @@ def test_health_pause_compare_and_swap_rechecks_pause_and_evidence(env, monkeypa
     else:
         owned = pauseends.owned
         calls = [0]
-        def race(*args, **kwargs):
+        def race(project, db=None):
             calls[0] += 1
             if calls[0] == 2:
-                p.db.set_kv(pauseends.HEALTH_KEY, None)
-            return owned(*args, **kwargs)
+                # The evidence changes as the fenced transaction starts: write through its own
+                # connection (another connection would wait out the busy timeout, about 90 s).
+                (db or project.db).set_kv(pauseends.HEALTH_KEY, None)
+            return owned(project, db)
         monkeypatch.setattr(pauseends, "owned", race)
     d.check_pause_ends()
     assert "board" in p.db.paused_resources() and not p.db.kv(sweep.SIGNAL_KEY)
     assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+    daemon_log = p.logs / "daemon.log"
+    assert "pause ends failed" not in (daemon_log.read_text() if daemon_log.exists() else "")
 
 
 @pytest.mark.parametrize("stale", [True, False])
