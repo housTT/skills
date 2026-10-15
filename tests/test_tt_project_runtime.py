@@ -4877,9 +4877,16 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
     "The build server's SSO session expired, so codex runs cannot fetch artifacts; please log in again there.",
     "Claude cannot reach the device box: the host is logged out after the reboot. Please log in again on the console.",
     "The fake data server is logged out; please log in again.",
+    # review #2354: a provider before a clause break, after the phrase, or generic 'subscription'/'metering'
+    "Claude needs the NAS share: please log in again on the file server.",
+    "The license portal session expired, so claude cannot use the subscription seat; please log in again there.",
+    "Please log in again to the dashboard so claude can read the device metering data.",
+    "The license server logged out the claude runs; please log in again on the license portal.",
+    "The claude build server is logged out; please log in again on it.",
 ])
 def test_a_login_ask_about_another_credential_is_never_refused(env, text):
-    """Review #2338: the gate refuses only a login of the agent CLI itself resting on plan metering. An ask
+    """Reviews #2338 and #2354: the gate refuses only a login of the agent CLI itself (the provider is
+    grammatically what is logged in) or one citing a plan-metering cue. An ask
     about another credential or tool (gh, Slurm, kinit, SSO, a host) that only names a provider in
     passing is a real ask, sent with no auth breaker open. The test-only fake provider is no name to
     match unless the project's config uses it."""
@@ -4898,6 +4905,10 @@ def test_a_login_ask_about_another_credential_is_never_refused(env, text):
     "claude's OAuth token is stale; please log in again.",
     "Please run /login in claude again.",
     "The agent CLI is logged out on the box.",
+    "codex was logged out overnight.",
+    "Please log claude back in on the box.",
+    "Please check which account claude is logged in as.",
+    "The claude CLI's session ended; please log in again.",
 ])
 def test_an_agent_cli_login_ask_without_metering_is_still_refused(env, text):
     """The provider (or 'agent CLI') being the thing logged in, next to the login phrase, is the agent's

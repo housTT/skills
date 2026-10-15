@@ -3539,13 +3539,13 @@ def _untried_host_ask(p: Project, a: dict, text: str) -> str:
 # records as the provider's open auth breaker (a run refused at the login, or a login check failing
 # while it is open) and announces itself (alert auth:<provider>). Missing, old or another account's
 # plan readings are no login problem: a usage-billed account reports none. Checked in asks and notifies.
-_RELOGIN_RE = re.compile(r"\b(?:log(?:ged)?\s*(?:back\s+)?in\s+again|log\s+back\s+in|re-?log(?:ged)?(?:\s*in)?|"
+_RELOGIN_RE = re.compile(r"\b(?:log(?:ged)?\s*(?:back\s+)?in\s+again|log\s+(?:[\w-]+\s+(?:cli\s+)?)?back\s+in|re-?log(?:ged)?(?:\s*in)?|"
                          r"re-?authenticat\w*|logged\s+out|sign(?:ed)?\s+(?:back\s+)?in\s+again|"
                          r"check\s+(?:the|its|which|their)\s+(?:login|account)|"
                          r"(?:log|sign)\s+in\s+(?:to|as|with)\s+(?:the|its|another|a|your)\s+(?:plan|subscription|"
                          r"\w+\s+account|account))\b|(?:^|\s)/login\b", re.I)
-_AGENT_WORDS = ("plan account", "plan readings", "plan windows", "plan reading", "plan window", "subscription",
-                "usage-billed", "billed by use", "metering")
+_AGENT_WORDS = ("plan account", "plan readings", "plan windows", "plan reading", "plan window", "usage-billed",
+                "billed by use")
 # Another credential or tool being logged in: gh, git hosting, ssh, Kerberos, a scheduler, a VPN or a
 # token or SSO that is not the provider's own. Such an ask is real and only a human can fix it.
 _OTHER_LOGIN_RE = re.compile(r"\b(?:gh|git|github|gitlab|ssh|kinit|kerberos|krb5|slurm|vpn|ldap|okta|"
@@ -3554,9 +3554,9 @@ _OTHER_LOGIN_RE = re.compile(r"\b(?:gh|git|github|gitlab|ssh|kinit|kerberos|krb5
 
 def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
     """Why a text telling the user to log an agent CLI in again is not a real login problem, or "":
-    the login is the agent CLI's own (a provider named, or 'agent CLI', just before or after the login
-    phrase), or it rests on plan or account metering, nothing names another credential or tool, and no
-    provider has an open auth breaker or auth alert. The test-only fake provider counts only when the
+    the login is the agent CLI's own (the provider, or 'agent CLI', is grammatically what is logged out
+    or logged in), or it cites a plan-metering cue and names a provider, nothing names another credential
+    or tool, and no provider has an open auth breaker or auth alert. The test-only fake provider counts only when the
     project's config uses it."""
     from . import alerts
     from .providers import all_providers
@@ -3573,10 +3573,16 @@ def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
     own = re.compile(rf"\b(?:{who})\b(?:'s)?[^.!?;:]{{0,25}}$", re.I)
     if any(not own.search(said[max(0, m.start() - 40):m.start()]) for m in re.finditer(r"\b(?:token|sso)\b", said, re.I)):
         return ""                                        # a token or SSO that is not the provider's own
-    near = re.compile(rf"\b(?:{who})\b(?:'s)?[^.!?]{{0,40}}$", re.I)       # the provider, then the phrase
-    after = re.compile(rf"^[^.!?;:]{{0,25}}\b(?:{who})\b", re.I)            # the phrase, then the provider
-    agent_login = any(near.search(said[max(0, m.start() - 60):m.start()]) or after.search(said[m.end():])
-                      for m in hits)
+    # The provider (or 'agent CLI') is grammatically the thing logged in, with only a verb or an adverb
+    # between them and no clause punctuation; any other wording fails open (the ask is sent).
+    agent = rf"\b(?:{who})\b(?:\s+cli)?"
+    adv = r"(?:\s+(?:still|now|apparently|probably|also|again|here|there))?"
+    agent_login = re.search(
+        rf"{agent}{adv}(?:\s+(?:is|was|got|has\s+been|may\s+be|might\s+be|seems(?:\s+to\s+be)?|appears(?:\s+to\s+be)?))?"
+        rf"{adv}\s+logged\s+out\b|"
+        rf"\b(?:{who})(?:'s)?(?:\s+cli)?(?:'s)?\s+(?:login|session|oauth\s+token|auth\s+token)\b|"
+        rf"\blog\s+{agent}\s+(?:back\s+)?in\b|(?:^|\s)/login\s+in\s+{agent}|"
+        rf"\bcheck\s+which\s+account\s+{agent}\s+is\s+logged\s+in\b", said, re.I)
     metered = any(w in low for w in _AGENT_WORDS) and re.search(rf"\b(?:{who})\b", low)
     if not agent_login and not metered:
         return ""
