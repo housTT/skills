@@ -307,7 +307,8 @@ RESEND_MARK = "send that text exactly"
 HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
-BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation", "upstream_note")
+# A budget change re-plans on the next turn: the daemon already released its holds model-free.
+BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation", "upstream_note", budgetkind.KIND)
 
 
 def batchable(kind: str, severity: str) -> bool:

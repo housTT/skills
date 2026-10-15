@@ -3341,7 +3341,8 @@ class Daemon:
 
     def _budget_changed(self, prov: str, g: bud.Gate, account: str) -> None:
         """A change of the provider's account or budget kind (budgetkind.py) releases the holds the old
-        limits made and wakes the coordinator, once per change, to re-plan."""
+        limits made and queues the coordinator's re-plan, once per change (none when the kind is the same and
+        nothing is tied to the old limits)."""
         try:
             with self.p.db.tx():
                 change = budgetkind.observe(self.p.db, prov, budgetkind.parts(self.p.db, self.cfg, prov, g, account),
@@ -3352,7 +3353,8 @@ class Daemon:
             return
         if done:
             log(self.p, f"{prov} budget changed: {'; '.join(budgetkind.what_changed(change['old'], change['new']))}; "
-                        f"released {len(done['released'])}, {len(done['tasks'])} tied task(s) for the coordinator")
+                        f"released {len(done['released'])}, {len(done['tasks'])} tied task(s) for the coordinator"
+                        + ("" if done.get("event") else "; same budget kind, nothing to re-plan: no event"))
 
     def _red_episodes(self, prov: str, g: bud.Gate, now: float) -> tuple[bool, dict]:
         """Whether the gate starts a new red episode of one of its reason classes (bud.red_class: the

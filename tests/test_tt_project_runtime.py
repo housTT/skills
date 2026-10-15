@@ -60671,6 +60671,40 @@ def test_a_billed_to_plan_switch_wakes_the_coordinator(env, monkeypatch):
     assert "now plan windows (five_hour, seven_day)" in ev[0]["text"]
 
 
+def test_an_account_flap_on_the_same_billing_kind_wakes_nobody(env, monkeypatch):
+    """The flapping case: the account label alternates between two usage-billed accounts with the
+    same caps ('was billed by use ... now billed by use'). Each flap raised an event that woke the
+    coordinator for a no-op turn. Same kind with nothing to release or re-point: no event, no feed
+    line. A same-kind switch that released a hold still queues one, batched so it never wakes alone."""
+    from ttp import budget as bud, budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    monkeypatch.setattr(budgetkind, "MIN_GAP_S", 0.0)
+    p = make(env)
+    now = time.time()
+    other = "b@example.org | Org | usage-billed"
+    for acct in (ACCT_BILLED, other):
+        p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',1)",
+               (acct, now - 900, now - 600))
+    bud.note_account(p.db, "fake", ACCT_BILLED)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    for acct in (other, ACCT_BILLED, other, ACCT_BILLED):
+        bud.note_account(p.db, "fake", acct)
+        _bk_tick(d, monkeypatch)
+        assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash(acct)
+    assert _bk_events(p) == [], [dict(e) for e in _bk_events(p)]
+    assert not [m for m in p.db.q("SELECT * FROM messages WHERE direction='out'") if "budget changed" in m["text"]]
+    # a real switch that lifts a usage-limit pause still tells the coordinator, batched
+    p.db.set_kv("limited:fake", {"until": time.time() + 86400, "note": "usage limit"})
+    bud.note_account(p.db, "fake", other)
+    _bk_tick(d, monkeypatch)
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "account switched" in ev[0]["text"] and "limit pause" in ev[0]["text"], ev
+    assert float(p.db.kv("limited:fake")["until"]) == 0
+    assert ev[0]["severity"] == "normal" and coord.batchable(ev[0]["kind"], ev[0]["severity"])
+
+
 def test_budget_fingerprint_debounces_flapping_readings():
     """A reading that falls back before the debounce wakes nobody; a lasting one wakes once, and a
     provider raises at most one event per MIN_GAP_S; an unknown part is no change."""

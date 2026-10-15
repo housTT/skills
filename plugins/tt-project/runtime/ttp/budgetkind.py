@@ -28,12 +28,16 @@ On a change (`apply`, in the gate update's transaction):
   plan-window red-alert markers, the schedules its gate held ('waiting for budget', core provider
   only) and task deferrals on it whose reason is a window, reset, limit, cap or budget. Each is
   evaluated against the new gate on the same tick and held again only if that gate holds it;
-- one KIND event (queued) wakes the coordinator at high effort (coordinator.EFFORT_EVENT_TRIGGERS)
-  and brings the blocker sweep forward (sweep.signal). It says old -> new kind and the new limits,
-  lists what was released, and the open tasks still tied to the old limits that are the
+- one KIND event (queued, normal) for the coordinator's next turn, at high effort
+  (coordinator.EFFORT_EVENT_TRIGGERS); it batches (coordinator.BATCH_KINDS), so it never wakes a
+  turn alone. It brings the blocker sweep forward (sweep.signal), says old -> new kind and the new
+  limits, lists what was released, and the open tasks still tied to the old limits that are the
   coordinator's own to re-point: waits and blocks whose reason names them, and tasks failed over off
   this provider;
 - one low `info` line in the feed (never 'needs you').
+A change that keeps the budget kind (another account billed the same way, a reworded account label,
+new caps or windows) with nothing released and no task tied to the old limits raises no event, no
+feed line and no sweep: the coordinator has nothing to re-plan. The holds are released all the same.
 The record is per project (each project's daemon keeps its own), so every project on a machine
 re-plans once per change.
 """
@@ -243,14 +247,17 @@ def release(db: DB, cfg: dict, provider: str, old: dict, new: dict, now: float,
 
 
 def apply(db: DB, cfg: dict, provider: str, change: dict, now: float | None = None) -> dict:
-    """Release what the old budget held, queue the coordinator's event and the feed line. Returns
-    {"released": [...], "tasks": [...], "text": event text}."""
+    """Release what the old budget held, queue the coordinator's event and the feed line (none when
+    the kind is unchanged and nothing was released or is tied to the old limits). Returns
+    {"released": [...], "tasks": [...], "text": event text, "event": whether one was queued}."""
     from . import sweep
     now = time.time() if now is None else now
     old, new = change["old"], change["new"]
     released, kept = release(db, cfg, provider, old, new, now, change.get("resets"))
     tasks = [x["line"] for x in kept]
     changed = "; ".join(what_changed(old, new)) or "budget changed"
+    if old.get("kind") == new.get("kind") and not released and not tasks:
+        return {"released": released, "tasks": tasks, "text": "", "event": False}
     rel = (f"Released at once ({len(released)}; each starts or runs as the new gate allows): "
            + " | ".join(released[:MAX_LISTED]) + (f" | +{len(released) - MAX_LISTED} more" if len(released) > MAX_LISTED else "")
            + ". ") if released else "No hold needed releasing. "
@@ -268,4 +275,4 @@ def apply(db: DB, cfg: dict, provider: str, change: dict, now: float | None = No
                    + "the coordinator re-plans against the new limits.",
             chat=None, kind="info", severity="low")
     sweep.signal(db, f"{provider} budget changed: {changed}")
-    return {"released": released, "tasks": tasks, "text": text}
+    return {"released": released, "tasks": tasks, "text": text, "event": True}
