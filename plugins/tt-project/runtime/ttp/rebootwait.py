@@ -56,7 +56,7 @@ def _transient_words(words: list[str], run_dirs: tuple[str, ...]) -> str:
     for i, b in enumerate(base):
         if b in ("ttp", "ttp.sh"):
             sub, rest = words[i + 1:i + 2], words[i + 2:]
-            if sub == ["detach"] and "--check" in rest and "--host" not in rest:
+            if sub == ["detach"] and "--check" in rest and not any(w == "--host" or w.startswith("--host=") for w in rest):
                 return "a local detached job"
             if sub == ["checks"] and "--result" in rest:
                 return "its own checks"
