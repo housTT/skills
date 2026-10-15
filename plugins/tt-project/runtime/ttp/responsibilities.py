@@ -405,7 +405,7 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
     aliases = [alias] if alias else sorted(known)
     view = {a: {"alias": a, "known": a in known, "projects": [], "owner": (known.get(a) or {}).get("recovery_owner"),
                 "fallback": (known.get(a) or {}).get("recovery_fallback"), "pauses": [], "changes": [],
-                "conditions": [], "checks": [], "problems": [], "unread": []} for a in aliases}
+                "conditions": [], "outage": None, "checks": [], "problems": [], "unread": []} for a in aliases}
     for name, base in _projects(project.hostname()):
         try:
             mine = _resource_aliases((base / "harness" / "CHARTER.md").read_text(), known)
@@ -432,6 +432,7 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
                     view[a]["unread"].append(f"{name} ({type(e).__name__})")
         finally:
             db.close()
+    outs = machine_ledger.outages(now)
     for a, v in view.items():
         for res in sorted({res for res in _shared_resources(a)}):
             pz = shared.read_pause(res)
@@ -443,6 +444,7 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
         v["conditions"] = [f"{c['condition']} since {machine_ledger.ends.shown(c['first'])} (seen by "
                            f"{', '.join(c.get('seen_by', []))}): {c.get('text') or 'no detail'}"
                            for k, c in machine_ledger.conditions().items() if c.get("alias") == a]
+        v["outage"] = outs.get(a)
     return list(view.values())
 
 
@@ -500,6 +502,9 @@ def machine_lines(rec: dict) -> list[str]:
                    + (f"; {pz['end']}" if pz["end"] else "; no end recorded"))
     for c in rec["conditions"]:
         out.append(f"  condition: {c}")
+    if rec.get("outage"):
+        from .machine_ledger import outage_line
+        out.append("  " + outage_line(a, rec["outage"]))
     for c in rec["changes"]:
         out.append(f"  change: {c}")
     for c in rec["checks"]:

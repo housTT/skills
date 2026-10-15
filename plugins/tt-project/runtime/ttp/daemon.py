@@ -65,6 +65,7 @@ from . import locks
 from . import machine_ledger
 from . import netwait
 from . import obligations
+from . import pageto
 from . import machines
 from . import prguard
 from . import projpause
@@ -206,6 +207,7 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
+PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
@@ -2993,11 +2995,19 @@ class Daemon:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
         # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
         # no review stays with the coordinator, or its commits would never be reviewed or delivered.
-        hop = self._auto_continue(dict(task, **upd), fups, ready) \
-            if ready and not fix and (review or task["kind"] != "code" or not self._has_changes(task)) else None
+        # With a review, the next hop starts once they landed: from the tip before that, it would lack
+        # them. Commits already on the push branch (another commit carries them) need no wait, and
+        # none is possible where the review delivers no push (no push branch, or pushing is off).
+        changes = bool(ready) and not fix and task["kind"] == "code" and self._has_changes(task)
+        landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
+        d = self.cfg.get("delivery") or {}
+        wait = changes and not landed_now and bool(d.get("push_branch")) and push_allowed(d)
+        hop = self._auto_continue(dict(task, **upd), fups, ready, wait) \
+            if ready and not fix and (review or not changes or landed_now) else None
         if hop:
             folded.add(id(fups[0]))
-            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})."
+            text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
+                f"; it starts once #{task['id']}'s commits land on the push branch." if wait else ".")
         routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -3302,6 +3312,16 @@ class Daemon:
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
+        # A login on another account than the plan readings: the dollar caps hold it meanwhile (the
+        # stricter side), and the user hears why once; the alert clears itself once they match.
+        for prov, g in gates.items():
+            if g.numbers.get("account_mismatch"):
+                self.alert(f"account-mismatch:{prov}",
+                           f"{prov} is logged in to another account than the one its plan readings come from, so "
+                           f"its spend counts toward the dollar caps (the stricter gate) until they match. Check "
+                           f"which account {prov} is logged in as: if it should be the plan account, log in to it "
+                           f"again; the next run then reports its plan windows and this clears by itself.",
+                           severity="normal")
 
     def _budget_changed(self, prov: str, g: bud.Gate, account: str) -> None:
         """A change of the provider's account or budget kind (budgetkind.py) releases the holds the old
@@ -3482,8 +3502,13 @@ class Daemon:
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
             scr.settle_receipts(self.p.db, source, started, ())   # and its errors are repaired
             scr.settle_mutes(self.p.db, source, started)   # and so are its muted conditions' clocks
+            if self.p.db.kv(PAGED_KEY + s["name"]):   # a line paged again later is a new episode
+                self.p.db.set_kv(PAGED_KEY + s["name"], {})
             return "ok (0 observations)"
         n, subjects = 0, set()
+        paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
+        reported: set[str] = set()
+        filed = 0
         for obs in _observations(text):
             body = obs.get("text", "")
             # Its own failure lines ("error": true) are errors, not reports.
@@ -3493,6 +3518,14 @@ class Daemon:
             whole = obs.get("whole") is True
             if not error and obs.get("machine") and obs.get("condition"):
                 self._machine_condition(obs, body)   # an info line reaches the machine ledger too
+            if not error and obs.get("to") is not None:
+                target = self._page_target(s["name"], obs)
+                if target is not None:   # another project's: a note to it, not an observation here
+                    k = f"{target}\t{_line_key(obs, body)}"
+                    reported.add(k)
+                    filed += self._page_line(s["name"], target, obs, body, paged, k, rewake, filed)
+                    n += 1
+                    continue
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None,
@@ -3501,10 +3534,54 @@ class Daemon:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
             n += 1
+        if ok:   # a line no longer reported is over: its recurrence pages again
+            paged = {k: v for k, v in paged.items() if k in reported}
+        if paged != (self.p.db.kv(PAGED_KEY + s["name"]) or {}):
+            self.p.db.set_kv(PAGED_KEY + s["name"], paged)
         if ok:
             scr.settle_receipts(self.p.db, source, started, subjects)
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         return f"ok ({n} observations)"
+
+    def _page_target(self, name: str, obs: dict) -> str | None:
+        """The other local project a line's `to` names (pageto.resolve), else None: the line is then a
+        normal observation here, and an unknown target is logged."""
+        target, why = pageto.resolve(obs.get("to"), obs.get("machine"))
+        if target is None:
+            log(self.p, f"watcher {name}: line not paged ({why}); observed here instead")
+        return target if target != self.p.name else None
+
+    def _page_line(self, name: str, target: str, obs: dict, body: str, paged: dict, k: str,
+                   rewake: float | None, filed: int) -> int:
+        """File one line to `target` as a daemon note, once per key (`k`) and again after `rewake`
+        seconds (None: never) or on every run with "repeat": true. Returns 1 if it filed a note."""
+        now = time.time()
+        last = paged.get(k)
+        ep = _line_episode(obs)
+        if last and ep and last.get("episode") not in (None, ep):
+            last = None   # another episode of a keyed line: a new note, as a new issue would be (screen)
+        elif last:
+            ep = ep or last.get("episode")   # none changes nothing; one paged without adopts the first it sees
+            if ep:
+                last["episode"] = ep
+        if last and obs.get("repeat") is not True and (rewake is None or now - float(last["at"]) < rewake):
+            return 0
+        if filed >= pageto.PER_RUN:
+            log(self.p, f"watcher {name}: {pageto.PER_RUN} notes this run; the rest go on a later run")
+            return 0
+        sev = obs.get("severity") if obs.get("severity") in upstream.NOTE_SEVERITIES else "normal"
+        # Its first send's time keeps a later episode's note apart from this one's in the inbox (upstream.send).
+        first = float(last["first"]) if last else now
+        again = f" (still reported: note {int(last['n']) + 1})" if last else ""
+        text = f"Watcher {name} of project {self.p.name}, reporting since {timefmt.long(first, self.p)}: {body}{again}"
+        got = upstream.send(self.p.name, None, target, text, sev, now=now, sender="daemon")
+        if got not in ("sent", "duplicate"):
+            log(self.p, f"watcher {name}: note to {target}: {got}; retried on its next run")
+            return 0
+        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1,
+                    **({"episode": ep} if ep else {})}
+        log(self.p, f"watcher {name}: paged {target}: {text[:200]}")
+        return 1
 
     def _machine_condition(self, obs: dict, body: str) -> None:
         """A watcher saw a shared machine down or held (or no longer: `cleared`): tell its recovery owner."""
@@ -4978,7 +5055,8 @@ class Daemon:
     def wake_upstream_fixes(self) -> None:
         """On the first tick and every minute after: a resolved upstream note this project filed, whose fix
         the code this daemon loaded (its identity receipt) has, becomes one coordinator event and an early
-        blocker sweep (upstream.wake_fixed), once per resolution across restarts."""
+        blocker sweep (upstream.wake_fixed), once per resolution across restarts. A note closed as wontfix
+        (no release) wakes the same way and logs as closed."""
         now = time.time()
         if now - self._fixes_checked < upstream.LOCAL_EVERY_S:
             return
@@ -4989,7 +5067,9 @@ class Daemon:
             log(self.p, f"checking upstream fixes failed: {type(e).__name__}: {e}")
             return
         if got:
-            log(self.p, "upstream fix(es) now running: " + ", ".join(f"{r['fp']} in {r['fixed_in']}" for r in got))
+            log(self.p, "upstream note(s) resolved: " + ", ".join(
+                f"{r['fp']} in {r['fixed_in']}" if r.get("fixed_in") else f"{r['fp']} closed ({r.get('kind') or 'resolved'})"
+                for r in got))
 
     def drain_note_outbox(self) -> None:
         """File the notes for other projects that wait in this project's outbox (`ttp note --to` past the
@@ -5373,7 +5453,7 @@ class Daemon:
             if detach.failed_check(probe, got[0]):   # the jobs it waits on ended: over, and the why says one failed
                 self._probe_rc.pop(tid, None)
                 return (f"the detached job its when probe waits on ended but failed or left no exit code "
-                        f"(exit {got[0]}): {probe[:300]}")
+                        f"({detach.failed_why(probe, got[0], self.p.root)}): {probe[:300]}")
             if got[0] not in NOT_YET_RCS:
                 fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
                 if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -5838,8 +5918,10 @@ class Daemon:
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
         before: a job it waits on that did not opt in, one found lost on an earlier boot, one that
-        cannot start, one past budget.max_job_relaunches relaunches, or a relaunch that would reach
-        budget.max_reboot_losses (noted on the task, so its run reads why). cut when an abrupt,
+        cannot start (the ones started before it are stopped again: all or none), one past budget.max_job_relaunches relaunches, or a relaunch that would reach
+        budget.max_reboot_losses (noted on the task, so its run reads why). A job relaunched on this
+        boot before a daemon restart counts as started: stopped when the task wakes, and its
+        job_relaunched event written if the restart came first. cut when an abrupt,
         unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
@@ -5847,17 +5929,29 @@ class Daemon:
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
         if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
             return False, False   # not only its own runs' jobs: not ours to start
-        todo, again, cut = [], False, False
+        todo, done, cut = [], [], False
         cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
+
+        def running():   # jobs relaunched on this boot that still run: a woken task keeps none
+            return [(r, k) for r, k in ((r, detach.running_pid(r, self._this_boot)) for r, _, _ in done) if k]
+
+        def wake(why: str) -> None:
+            for r, k in running():
+                detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})")
         for rc in rcs:
             m = detach.read_resume(rc)
             if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
-                again = True   # relaunched on this boot already
+                # Relaunched on this boot already (a daemon restart, maybe partway through the jobs):
+                # counted as started below, judged by the boot that cut it short.
+                loss = self._abrupt_cut(m.get("cut_boot"))
+                cut = cut or loss
+                done.append((rc, int(m["relaunches"]) - 1, loss))
                 continue
             if rc.exists():
                 continue
             lost = detach.lost(rc)
             if m is None or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
+                wake(f"detached job {rc.stem} is not resumable or was lost before this boot")
                 return False, cut
             loss = self._abrupt_cut(m.get("boot"))
             cut = cut or loss
@@ -5867,31 +5961,48 @@ class Daemon:
                        f"already (cap {cap}), so the task wakes instead")
                 _task_note(rc.parent, why)
                 log(self.p, f"task {tid}: {why}")
+                wake(why)
                 return False, cut
             todo.append((rc, n, loss))
-        if not todo:
-            return again, False   # all ended before the reboot: woken as before
+        if not todo and not done:
+            return False, False   # all ended before the reboot: woken as before
         limit = int(self.cfg["budget"].get("max_reboot_losses", 3))
-        if cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
+        if todo and cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
             # This reboot would reach the cap: wake it, and the wake path blocks it as a reboot loop.
             why = (f"the reboot cut short detached job {todo[0][0].stem}; not relaunched: with {k} earlier "
                    f"reboot losses this one reaches budget.max_reboot_losses ({limit})")
             _task_note(todo[0][0].parent, why)
             log(self.p, f"task {tid}: {why}")
+            wake(why)
             return False, True
+        # All or none: a job that cannot start wakes the task, so the ones started before it (also by
+        # this daemon's earlier life on this boot) are stopped again (no job of a woken task runs on), and
+        # the relaunches are recorded only once all started (a boot that wakes the task is not also
+        # counted as a relaunch boot).
         nice = nice_level(self.cfg.get("runner"))[0]
+        started = running()
         for rc, n, loss in todo:
-            if why := detach.relaunch(rc, self.boot, nice):
-                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+            why, pid = detach.relaunch(rc, self.boot, nice)
+            if why:
+                for r, k in started:
+                    detach.stop(r, k, f"stopped right after its relaunch: detached job {rc.stem}, which the "
+                                      f"task also waits on, could not start ({why}), so the task wakes instead")
+                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}"
+                           + (f"; stopped the jobs relaunched before it ({', '.join(r.stem for r, _ in started)})"
+                              if started else ""))
                 log(self.p, f"task {tid}: detached job {rc.stem} not relaunched: {why}")
                 return False, cut
+            started.append((rc, pid))
+        for rc, n, loss in done + todo:
+            fp = f"job_relaunched:{tid}:{self.boot}:{'loss' if loss else 'free'}:{rc}"
+            if self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue   # recorded before a daemon restart
             text = (f"the host reboot cut short detached job {rc.stem}; relaunched it "
                     f"({n + 1} of {cap}), no model run")
             _task_note(rc.parent, text)
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                         "VALUES(?,?,?,?,?,?,?,?)",
-                        (time.time(), "daemon", "job_relaunched",
-                         f"job_relaunched:{tid}:{self.boot}:{'loss' if loss else 'free'}:{rc}", "low",
+                        (time.time(), "daemon", "job_relaunched", fp, "low",
                          f"#{tid} {t['title']}: {text}", "handled", tid))
             log(self.p, f"task {tid}: {text} ({rc})")
         return True, cut
@@ -7112,10 +7223,11 @@ class Daemon:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
 
-    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
+    def _auto_continue(self, task: dict, fups: list[dict], why: str,
+                       wait_landed: bool = False) -> tuple[int, str] | None:
         """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
         try:
-            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why, wait_landed)
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return None
@@ -7616,7 +7728,7 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith("auth:") or key == netwait.KEY:
+        if key.startswith(("auth:", "account-mismatch:")) or key == netwait.KEY:
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")
@@ -7953,6 +8065,22 @@ def _explicit_clear(payload: str | None) -> bool:
         return (json.loads(payload or "{}") or {}).get("issue_lifecycle") == scr.EXPLICIT_CLEAR
     except (ValueError, AttributeError):
         return False
+
+
+def _line_key(obs: dict, body: str) -> str:
+    """What dedupes a paged line: its `key`, else its whitespace-normalized text."""
+    key = obs.get("key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    return "text:" + hashlib.sha256(" ".join(body.split()).encode()).hexdigest()[:16]
+
+
+def _line_episode(obs: dict) -> str | None:
+    """A keyed line's `episode`, as the screen keeps it (screen.screen), else None."""
+    key, ep = obs.get("key"), obs.get("episode")
+    if not (isinstance(key, str) and key.strip() and isinstance(ep, str)):
+        return None
+    return ep.strip()[:scr.EPISODE_MAX] or None
 
 
 def _observations(text: str) -> list[dict]:

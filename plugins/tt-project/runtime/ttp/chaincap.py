@@ -25,8 +25,10 @@ Model-free hop (`chains.auto`, on by default): a done task whose only proposal i
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
 with `continues` set (an AUTO_EVENT). The next hop starts from the base, not that task's branch, so a
 code task whose branch has changes gets its review queued first; without one the coordinator
-decides. The notice, and a local_only notice for a branch its review still carries, go to the next
-digest (NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
+decides. That hop then waits (start_when `landed:#<task>`) until the reviewed commits are on the push
+branch, unless they already are or nothing pushes there (no push branch, or pushing is off). The
+notice, and a local_only notice for a branch its review still carries, go to the next digest
+(NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
 """
 from __future__ import annotations
 
@@ -215,9 +217,12 @@ def hop_ready(p, cfg: dict, task: dict, fup: dict) -> str:
     return progress(p, ch, len(ch) - 1)
 
 
-def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
+def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
+             wait_landed: bool = False) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
-    progressed), else None."""
+    progressed), else None. With `wait_landed` (a code hop whose commits are not on the push branch
+    yet), the new hop starts only once they landed (start_when `landed:#<task>`): it starts from the
+    branch tip, so before that it would lack them and redo them or conflict with them at push time."""
     from . import coordinator as coord
     db = p.db
     why = hop_ready(p, cfg, task, fup) if why is None else why
@@ -228,6 +233,8 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
     action = {"type": "task_add", "title": title, "spec": str(fup.get("spec") or ""), "kind": task["kind"],
               "tier": task["tier"], "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
+    if wait_landed:
+        action.update(start_when=f"landed:#{task['id']}", why=f"#{task['id']}'s commits land on the push branch")
     saved = db.kv(coord.NOTES_KEY)   # the coordinator's own notes for its next digest stay as they were
     try:
         problems = coord.apply(p, [action])

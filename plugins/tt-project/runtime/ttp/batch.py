@@ -8,7 +8,8 @@ replays the entries in order onto the target's tip in a worktree of its own (`wo
 settles the conflicts that need no judgment: version lines, both sides adding different lines at
 one spot, and both sides changing different lines that git calls a conflict only because they are
 adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
-pushes it without force. It always runs them itself and never reads the passes `ttp checks` records. When the checks fail, a binary search over prefixes finds the first failing
+pushes it without force. It always runs them itself and never reads the passes `ttp checks` records;
+it skips only a check a batch recorded passing on the same tree, command and environment (pushpass). When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
 
@@ -37,7 +38,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, locks, push, runner, worktree
+from . import checkcap, checkdirs, locks, push, pushpass, runner, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1026,16 +1027,35 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
-        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"))
+        env = push.check_env("target", self.tip, self.check_run_dir)
+        tree, run = pushpass.tree_of(self.wt, head), []
+        for cmd in todo:
+            eid = pushpass.env_id(self.wt, str(cmd), env, self.tip or "")
+            if hit := pushpass.passed(self.p, tree, str(cmd), eid):
+                say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
+                self.checks["reused"] = self.checks.get("reused", 0) + 1
+            else:
+                run.append((cmd, eid))
+        if not run:
+            return None
+        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                               priority=push.priority_key(self.repo, self.remote, self.branch))
         started = time.time()   # a wait for the host-wide slot is not check time
         try:
-            for cmd in todo:
+            for cmd, eid in run:
+                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
+                extra = pushpass.resume_env(resume, env) if resume else {}
+                if done := pushpass.resumed(resume) if resume else []:
+                    say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
-                                      env={**push.check_env("target", self.tip, self.check_run_dir), **slot.env()},
-                                      pass_fds=checkdirs.inherited())
+                                      env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited())
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id):
+                    say(f"could not record the pass of {cmd}: {why}")
+                if resume:
+                    resume.unlink(missing_ok=True)
         finally:
             slot.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
@@ -1389,8 +1409,9 @@ def alive(marker: Path) -> bool:
     return False
 
 
-def summary(marker: Path) -> int:
-    """`ttp push --result <marker>` for a batch marker: 0 once it finished (or died), 1 while it runs."""
+def summary(marker: Path, pushed_only: bool = False) -> int:
+    """`ttp push --result <marker>` for a batch marker: 0 once it finished (or died), 1 while it runs.
+    With `pushed_only`: 0 only when it pushed or landed, `push.NOT_PUSHED` when it finished without."""
     m = push._read(marker)
     bid = m.get("id") or Path(marker).stem
     live = alive(Path(marker))
@@ -1403,7 +1424,7 @@ def summary(marker: Path) -> int:
     outcome = m.get("outcome")
     if not outcome:
         print(f"ttp push: batch {bid} ended without an outcome (killed, crashed or rebooted); log: {m.get('log')}")
-        return 0
+        return push.NOT_PUSHED if pushed_only else 0
     sha = m.get("pushed_sha")
     head = f"batch {bid}: {outcome}" + (f", {str(sha)[:10]}" if sha else "") \
         + (f" as {m['version']}" if sha and m.get("version") else "") + f" to {m.get('target')}" \
@@ -1429,4 +1450,4 @@ def summary(marker: Path) -> int:
         tail = push._tail(m.get("log"))
         if tail:
             print(tail)
-    return 0
+    return push.NOT_PUSHED if pushed_only and outcome not in ("pushed", "landed") else 0

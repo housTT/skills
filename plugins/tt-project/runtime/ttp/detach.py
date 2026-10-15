@@ -38,7 +38,9 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -62,6 +64,23 @@ def failed_check(probe: str, rc) -> bool:
     that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
     with the job's exit code, never as a passed probe."""
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def failed_why(probe: str, rc, cwd=None) -> str:
+    """How a failed check reads: "job rc=N" (the first failed job's exit code, read from the rc files the
+    probe's `detach --check` names, relative to `cwd`), else "probe exit 4": 4 is the probe's, not the job's."""
+    try:
+        words = shlex.split(probe or "")
+        for i, w in enumerate(words):
+            if w == "--check":
+                for a in words[i + 1:]:
+                    if a.startswith("-") or a in ("&&", "||", ";", "|"):
+                        break
+                    st, why = state(Path(cwd or ".") / a)
+                    if st == "ended" and why != "0":
+                        return f"job rc={why}"
+                break
+    except (OSError, ValueError):
+        pass
+    return f"probe exit {rc}"
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
@@ -168,19 +187,19 @@ def read_resume(rc: Path) -> dict | None:
     return m if ok else None
 
 
-def relaunch(rc: Path, boot: str, nice: int = 0) -> str:
+def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
     """Start a resumable job a reboot cut short again, with the command, cwd and environment it was
     started with (secrets from the caller's own environment). Its old log is kept as <name>.log.<n>.
-    Returns "" once started, else why not."""
+    Returns ("", pid) once started, else (why not, 0)."""
     rc = Path(rc)
     m = read_resume(rc)
     if m is None:
-        return "it has no resume record"
+        return "it has no resume record", 0
     if rc.exists():
-        return "it already ended"
+        return "it already ended", 0
     lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(map(str, m["command"])))
     if lock is None:
-        return "it is still running"
+        return "it is still running", 0
     try:
         n = int(m.get("relaunches") or 0) + 1
         log = Path(m.get("log") or rc.with_suffix(".log"))
@@ -189,16 +208,37 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> str:
         lost(rc).unlink(missing_ok=True)
         started(rc).unlink(missing_ok=True)
         # Counted before it starts: a crash here never relaunches it past the cap.
-        write_json(resume_file(rc), {**m, "boot": boot, "relaunches": n, "relaunched": time.time()}, mode=0o600)
+        write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
+                                     "relaunched": time.time()}, mode=0o600)
         pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
                     machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
     except (OSError, ValueError, TypeError) as e:
-        return f"it could not start: {e}"
+        return f"it could not start: {e}", 0
     finally:
         lock.close()
     renice(pid, nice)
     _restamp(rc, pid, boot)
-    return ""
+    return "", pid
+
+
+def stop(rc: Path, pid: int, why: str) -> None:
+    """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
+    own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass   # already gone
+    _mark_lost(Path(rc), why)
+
+
+def running_pid(rc: Path, this_boot) -> int:
+    """The pid of a job relaunched on this boot (its registry entry names a boot `this_boot` accepts)
+    that still runs (holds its lock), else 0: the one `stop` may end."""
+    j = _entry(Path(rc))
+    pid = j.get("pid")
+    if not (isinstance(pid, int) and pid > 1 and this_boot(j.get("boot"))):
+        return 0
+    return 0 if locks.any_free([locks.job_lock(Path(rc))]) else pid
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:
@@ -334,6 +374,9 @@ def tend(p: Project) -> None:
             if rid and _read_checks_pid(rc.parent).get("req") == rid:
                 _settle(q, rc, rid)
                 continue
+        elif _superseded(rc, m):
+            _settle(q, rc, rid)
+            continue
         if time.time() - float(m.get("queued") or 0) > QUEUED_S:
             why = (f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
                    f"(was the daemon down?)")
@@ -363,6 +406,15 @@ def tend(p: Project) -> None:
                 finally:
                     lock.close()
         _settle(q, rc, rid, why)
+
+
+def _superseded(rc: Path, m: dict) -> bool:
+    """Whether a queued job already runs, or the daemon relaunched it since it was queued (a
+    --resumable job queued before a reboot): its request is spent, never a lost job, however old."""
+    r = read_resume(rc)
+    if r is not None and float(r.get("relaunched") or 0) >= float(m.get("queued") or 0) > 0:
+        return True
+    return locks.job_lock(rc).exists() and not locks.any_free([locks.job_lock(rc)])
 
 
 def sweep(state: Path) -> None:

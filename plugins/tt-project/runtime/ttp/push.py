@@ -358,6 +358,33 @@ def venv_rebuild_cmd(venv: Path) -> str:
         opt = set(re.findall(r"^\s*\"?([A-Za-z0-9_.-]+)\"?\s*=", table.group(1), re.M)) if table else set()
         extras = ",".join(e for e in ("test", "dev") if e in opt)
         what = f"-e {q(str(src) + (f'[{extras}]' if extras else ''))}"
+        # declared requirements, read only from [project].dependencies, the chosen extras and the
+        # test/dev dependency groups: bounded ones keep their bounds, a group is installed whole
+        arr = r"\[(?:\s*(?:\"[^\"]*\"|'[^']*'|#[^\n]*|,|\{[^}]*\}))*\s*\]"
+
+        def table(name):
+            m = re.search(rf"^\[{re.escape(name)}\][ \t]*(?:#[^\n]*)?$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+            return m.group(1) if m else ""
+
+        def entries(body, key):
+            m = re.search(rf"^\s*[\"']?{re.escape(key)}[\"']?\s*=\s*({arr})", body, re.M)
+            if not m:
+                return []   # one tokenizer: strings first, then comments and inline tables (include-group), which are skipped
+            toks = re.findall(r"\"([^\"]*)\"|'([^']*)'|(#[^\n]*|\{[^}]*\})", m.group(1))
+            return [a or b for a, b, skip in toks if not skip]
+
+        def bounded(r):
+            return "@" not in r and ";" not in r and re.match(r"[A-Za-z0-9_.-]+(\[[^\]]*\])?\s*[<>=!~]", r) \
+                and re.search(r"<|~=", r)
+
+        reqs = {r.strip() for r in entries(table("project"), "dependencies") if bounded(r.strip())}
+        for e in extras.split(","):
+            reqs |= {r.strip() for r in entries(table("project.optional-dependencies"), e) if bounded(r.strip())}
+        for g in ("test", "dev"):
+            reqs |= {r.strip() for r in entries(table("dependency-groups"), g) if r.strip() and "@" not in r}
+        what += "".join(f" {q(b)}" for b in sorted(reqs))
+        if (src / "requirements.txt").is_file():
+            what += f" -r {q(str(src / 'requirements.txt'))}"
     elif (src / "requirements.txt").is_file():
         what = f"-r {q(str(src / 'requirements.txt'))}"
     else:
@@ -403,18 +430,47 @@ def editable_outside(venv: Path, top: str | Path, main: Path) -> str:
     return ""
 
 
+# Files above a worktree that pytest picks up: a conftest.py it loads, or a config file that makes
+# that directory its rootdir (and so its confcutdir).
+PYTEST_FILES = ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "setup.py")
+
+
+def nested_pytest(top: str | Path) -> bool:
+    """A directory above the worktree `top` has a file pytest would pick up (PYTEST_FILES): a worktree
+    nested in a project root that has a conftest.py, say. A plain pytest there may take that directory as
+    its rootdir, load its conftest.py and import its package instead of the worktree's."""
+    try:
+        return any((d / f).is_file() for d in Path(top).resolve().parents for f in PYTEST_FILES)
+    except OSError:
+        return False
+
+
 def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     """`cmd` with each bare pytest run (`pytest`, `py.test`, `python[3] -m pytest`) made
     `<venv>/bin/python -m pytest` when the repository has a venv (venv_python); else `cmd` as it is.
     A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies.
     When the main checkout's venv is skipped for an editable install from outside the worktree, the
-    command stays as written and first prints why to the checks output."""
+    command stays as written and first prints why to the checks output.
+    In a worktree nested below pytest files (nested_pytest), each such run is also kept to the worktree:
+    `--rootdir` and `--confcutdir` set to it (unless the command sets them) and it first on PYTHONPATH
+    (a PYTHONPATH the run itself sets still wins), so it tests the worktree's code, not the outer one's."""
     if not _PYTEST_RUN.search(cmd):
         return cmd
     py, why = _venv(top, env)
-    if not py:
+    nested = nested_pytest(top)
+    if not py and not nested:
         return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{cmd}" if why else cmd
-    return _PYTEST_RUN.sub(lambda m: f"{m.group(1)}{m.group(2)}{shlex.quote(str(py))} -m pytest", cmd)
+    q = shlex.quote(str(top))
+    pre = f" PYTHONPATH={q}${{PYTHONPATH:+:$PYTHONPATH}} " if nested else ""
+    flags = "".join(f" --{f}={q}" for f in ("rootdir", "confcutdir") if nested and f"--{f}" not in cmd)
+
+    def run(m: re.Match) -> str:
+        bare = m.group(0)[len(m.group(1)) + len(m.group(2)):]
+        tail = (f"{shlex.quote(str(py))} -m pytest" if py else bare) + flags
+        return f"{m.group(1)}{pre}{m.group(2).lstrip() if pre else m.group(2)}{tail}"
+
+    out = _PYTEST_RUN.sub(run, cmd)
+    return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
 ENV_FIX = "check command lacks dependencies: point delivery checks at a venv"
@@ -461,14 +517,26 @@ def _in_repo(name: str, top: str | Path) -> bool:
     return False
 
 
-def check_slot(head: str, say: Callable[[str], None], who: str = ""):
-    """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push`, `ttp push
-    --own` and the push queue count toward the same cap as `ttp checks`. Nested in a check that
-    holds one already (checkcap.HELD_ENV), it does not wait."""
+def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = ""):
+    """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
+    toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
+    push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
+    priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
+    one already (checkcap.HELD_ENV), it does not wait."""
     if not who:
         base = os.environ.get("TTP_PROJECT")
         who = checkcap.label(Project(base).name if base else None, "ttp push")
+    if priority:
+        return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say)
     return checkcap.acquire(who, f"push checks on {head[:12]}", say)
+
+
+def priority_key(repo: Path, remote: str, branch: str) -> str:
+    """The push branch as one name host-wide, whichever project or clone pushes to it: the remote's
+    URL (without a trailing .git or /) and the branch; the repository's path when it has no URL."""
+    url = _git(repo, "remote", "get-url", remote).stdout.strip() if remote else ""
+    url = re.sub(r"(\.git)?/*$", "", url) if url else str(Path(repo).resolve() / remote)
+    return f"{url}#{branch}"
 
 
 def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str, str]:
@@ -1691,12 +1759,42 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                 return remote, branch, True
         raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
-    if m and task and m.group(1) == task and not os.environ.get(LAND_ENV) and not _told_to_land(p, task, d):
-        raise ValueError(f"task #{task}'s spec does not ask it to land on {remote}/{push_to}, and a plain "
-                         f"`ttp push` from its own branch {branch} would. Publish {branch} under its own name "
-                         f"with `ttp push --own --detach`; only if the spec does ask to land on the push "
-                         f"branch, say so with `ttp push --land --detach`")
+    if m and task and m.group(1) == task:
+        if os.environ.get(LAND_ENV):
+            say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
+                   f"(explicit override of the landing guard)")
+            print(say, file=sys.stderr)
+            run_note(say)
+        elif not _told_to_land(p, task, d):
+            raise ValueError(f"task #{task}'s spec does not ask it to land on {remote}/{push_to}, and a plain "
+                             f"`ttp push` from its own branch {branch} would. Publish {branch} under its own name "
+                             f"with `ttp push --own --detach`; only if the spec does ask to land on the push "
+                             f"branch, say so with `ttp push --land --detach`")
+        elif why := untested_landing(p, repo, task, d):
+            raise ValueError(why)
     return remote, push_to, False
+
+
+def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
+    """Why a code task's worker must not land its own branch on the push branch yet, or "": plain
+    `ttp push` is delivery, so from a code task's run it needs `ttp checks` passed on exactly HEAD
+    in this worktree (this run's or an earlier run's of the task, prguard.task_pass). A review, the
+    push queue (no task) and other kinds are not gated here; `--land` (LAND_ENV) overrides it."""
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return ""
+    if not t or t.get("kind") != "code":
+        return ""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    if prguard.task_pass(p, task, head, str(repo)):
+        return ""
+    own = (f" To publish the branch under its own name instead, run `ttp push --own --detach`."
+           if own_push({"delivery": d}) != "off" else "")
+    return (f"task #{task} is a code task and `ttp checks` has not passed on this commit ({head[:10]}) in "
+            f"this worktree with no uncommitted changes: plain `ttp push` delivers to the push branch, so "
+            f"it lands only tested work. Run `ttp checks` (committed), then rerun.{own} An explicit "
+            f"`ttp push --land --detach` overrides this and is logged")
 
 
 def _told_to_land(p: Project, task: str, d: dict) -> bool:
@@ -2691,7 +2789,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        with check_slot(head, say) if todo else checkcap.Slot() as slot:
+        with check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot() as slot:
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
             for cmd in todo:
@@ -3289,7 +3387,7 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
     if _read(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
-        return batch.summary(marker)
+        return batch.summary(marker, pushed_only)
     try:
         m = _settle(marker)
         since = {"queued": "queued", "running": "started"}.get(m.get("status"))

@@ -248,13 +248,14 @@ def queue_dir(locks_dir: Path, resource: str) -> Path:
 _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
 
 
-def enqueue(locks_dir: Path, resource: str, holder: str) -> Path:
+def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
-    Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`."""
+    Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
+    is the arrival time to queue at (default now): a waiter that hands over keeps its place."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
-    name = f"{time.time():017.6f}-{os.getpid()}"
+    name = f"{time.time() if since is None else since:017.6f}-{os.getpid()}"
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
     f = open(tmp, "a+")

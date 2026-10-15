@@ -148,7 +148,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import timefmt
+from . import pageto, timefmt
 from .db import DB
 from .project import command_env
 
@@ -185,7 +185,7 @@ _TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "intege
 KNOWN_FAULT_KEYS = ("why", "match", "until")   # known_fault as an object (module doc)
 COMMON_FIELDS: dict[str, dict] = {
     **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate",
-                     "ping_host", "ping_peer"), _TEXT),
+                     "ping_host", "ping_peer", "to"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
     "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
@@ -228,6 +228,8 @@ def validate(block: Any, where: str = "heal") -> dict:
             raise ValueError(f"{where}: `{k}` is text")
     if out.get("known_fault") is not None:
         _validate_known(out["known_fault"], where)
+    if out.get("to") is not None and (not isinstance(out["to"], str) or not out["to"].strip()):
+        raise ValueError(f"{where}: `to` is a project name or {pageto.OWNER}")
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
     for k in ("ping_host", "ping_peer"):
@@ -629,7 +631,8 @@ def known_outage(spec: dict, now: float) -> tuple[str, dict] | None:
 
 def _fresh(st: dict, *also: str) -> None:
     """Start a new unhealthy episode: grace again, no task, nothing escalated (module doc). Keeps `fixes`."""
-    for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", *also):
+    for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", "paged", "paged_unknown",
+                *also):
         st.pop(key, None)
 
 
@@ -640,7 +643,7 @@ def _quiet_outage(host: Any, name: str, st: dict, known: tuple[str, dict], now: 
     alias, rec = known
     until = timefmt.long(float(rec["until"]), host.p)
     alerts.close_key(db, STATE_KEY + name, f"known outage of {alias} until {until}: {rec.get('why') or ''}", now)
-    for key in ("task", "escalated", "alerted", "observed", "phase"):
+    for key in ("task", "escalated", "alerted", "observed", "phase", "paged"):
         st.pop(key, None)
     st["known_outage"] = alias
     _save(db, name, st)
@@ -721,7 +724,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             st["task"] = keep
     owned = known_run(rc, out)
     if owned:   # a known, owned state: ends the unknown stretch; no cap message, fix or task
-        for key in ("unknown_since", "route_only", "unknown_told"):
+        for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown"):
             st.pop(key, None)
         st["known_run"] = f"{owned[0]}: {owned[1]}"[:300]
         _save(db, name, st)
@@ -794,7 +797,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             return f"ok (unknown, rc {rc}{told})", again
         return f"error: heal check exited {rc}{told}: {out[-150:]}", again
     dark = now - float(st.get("unknown_since") or now)
-    for key in ("unknown_since", "route_only", "unknown_told"):
+    for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown"):
         st.pop(key, None)
     if dark > max(_grace(spec), FRESH_UNKNOWN_S) and was_rc in UNKNOWN_RCS:   # not a broken check
         t = db.task(int(st["task"])) if st.get("task") else None
@@ -819,7 +822,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         # A self-fix may identify a known fault while its task is still open.
         from . import alerts
         alerts.close_key(db, STATE_KEY + name, f"known_fault applies to current failure: {kf['why']}", now)
-        for key in ("task", "escalated", "alerted", "observed"):
+        for key in ("task", "escalated", "alerted", "observed", "paged"):
             st.pop(key, None)
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
@@ -929,6 +932,12 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
         return f"unhealthy (self-fix task #{tid} open)", None
     how = f"self-fix task #{tid} {t['status']}" if t else f"self-fix task #{tid} is gone"
     last = (st.get("last_out") or "")[:300]
+    paged = _page(host, name, spec, st, "paged", f"Heal check {name} of project {host.p.name}, unhealthy since "
+                  f"{timefmt.long(float(st.get('since') or now), host.p)}, still fails and its {how}. "
+                  f"Last check: {last}", now)
+    if paged:
+        _save(db, name, st)
+        return f"unhealthy ({how}; {paged} told)", None
     if escalate_to(host, spec) == "coordinator":
         fp = f"{STATE_KEY}{name}:{float(st.get('since') or st.get('escalated') or now):.0f}"
         if not st.get("observed") and not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -948,6 +957,38 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
     return f"unhealthy ({how}; alerted)", None
 
 
+def _page(host: Any, name: str, spec: dict, st: dict, mark: str, text: str, now: float) -> str | None:
+    """The block's `to` (pageto): one high daemon note to that other local project instead of the
+    escalate_to() step, once per episode (`st[mark]`). Returns the project told, or None when there is
+    no `to`, it names this project or cannot be resolved (logged), or the note did not go: then the
+    escalation goes on as without `to`."""
+    if spec.get("to") is None:
+        return None
+    from . import upstream
+    target, why = pageto.resolve(spec["to"], machine_of(spec))
+    if target is None or target == host.p.name:
+        if target is None:
+            _log(host, f"heal check {name}: not paged ({why}); escalated here instead")
+        return None
+    if st.get(mark):
+        return target
+    got = upstream.send(host.p.name, None, target, text, "high", now=now, sender="daemon")
+    if got not in ("sent", "duplicate"):
+        _log(host, f"heal check {name}: note to {target}: {got}; escalated here instead")
+        return None
+    st[mark] = now
+    _log(host, f"heal check {name}: paged {target}")
+    return target
+
+
+def _log(host: Any, msg: str) -> None:
+    try:
+        from .daemon import log
+        log(host.p, msg)
+    except Exception:
+        pass
+
+
 def _observe(db: Any, fp: str, text: str, now: float) -> None:
     """Queue one high observation for the coordinator under `fp`, unless one is already there."""
     if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -963,6 +1004,11 @@ def _tell_unknown(host: Any, name: str, spec: dict, st: dict, rc: int, out: str,
                + (f": {last[:200]}" if last else ""))
     text = (f"Heal check {name} could not tell for {(now - float(st['unknown_since'])) / 60:.0f} min ({blocker}); "
             f"nothing is fixed or escalated on it until it can. Last check: {(out or '(no output)')[-300:]}")
+    paged = _page(host, name, spec, st, "paged_unknown", text.replace(
+        f"Heal check {name} ", f"Heal check {name} of project {host.p.name}, unknown since "
+        f"{timefmt.long(float(st['unknown_since']), host.p)}, ", 1), now)
+    if paged:
+        return f"{paged} told"
     if escalate_to(host, spec) == "coordinator":
         _observe(host.p.db, f"{STATE_KEY}{name}:unknown:{float(st['unknown_since']):.0f}",
                  text + " Repair the check or what blocks it within the charter.", now)

@@ -320,8 +320,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions",
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
-    "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_coordinator_usd",
-               "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
+    "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs", "hourly_coordinator_usd",
+               "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
     # blocker_sweep_h, blocker_sweep_min_gap_h, review_backlog_h: the blocker sweep's timing (sweep.py).
     "coordinator": {"max_review_tasks_per_day", "charter_approval_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "review_backlog_h"},
@@ -337,7 +337,7 @@ EXTRA_KEYS = {
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
-                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude"},   # the last two: `ttp checks` fast path (push.FAST_GLOBS),
@@ -409,11 +409,13 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting,
 # but not before push_min_gap_s passed since the last batch ended unless it is full or priority 1)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
+# push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "push_min_gap_s": 1800,
+                       "push_landing_alert_h": 4,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
-                      "push_min_gap_s": (0, True, False),
+                      "push_min_gap_s": (0, True, False), "push_landing_alert_h": (0, True, False),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
 
 

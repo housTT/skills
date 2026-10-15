@@ -13,6 +13,7 @@ import datetime as _dt
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import secrets as pysecrets
@@ -1383,7 +1384,9 @@ def cmd_upstream(a) -> None:
     machine sends its notes on to, and `--forward-to` sets those targets (`default`: the machines of
     the remote projects; `none`: send nothing). Closing a note: `--resolve <fp> --fixed-in <version>`
     records the maintainers' fix, `--fixed <fp>` is the read-only probe a task waiting on it uses
-    (0 once this project's running daemon is at or above that version, 1 before, 2 unknown), `--ack <fp>
+    (0 once this project's running daemon is at or above that version, 1 before, 2 unknown, 3 when the
+    note was closed as not a plugin bug: no fix ships), `--resolve <fp> --wontfix "<reason>"` closes a
+    not-a-bug note without a release, `--ack <fp>
     "<evidence>"` closes it for this project, `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
     follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
     from . import upstream
@@ -1394,11 +1397,28 @@ def cmd_upstream(a) -> None:
         print(upstream.fingerprint(title.strip()[:upstream.TITLE_CHARS], upstream.cut(
             spec.strip(), f"the hand-off of {me.name if me else '?'} #{task}" if task else "its hand-off")))
         return
-    if a.resolve or a.fixed or a.ack or a.mine or a.resolved:
+    if a.resolve or a.fixed or a.ack or a.mine or a.resolved or a.wontfix is not None:
         try:
+            if a.wontfix is not None and not a.resolve:
+                die("ttp upstream --wontfix needs --resolve <fp>", 2)
+            if a.resolve and a.wontfix is not None:
+                if a.fixed_in:
+                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in", 2)
+                me = here()
+                try:
+                    r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
+                except OSError as e:
+                    if not os.environ.get("TTP_RUN_DIR"):
+                        raise
+                    upstream.queue_wontfix(Path(os.environ["TTP_RUN_DIR"]), a.resolve, a.wontfix)
+                    print(f"wontfix of note {a.resolve.strip().lower()} queued in this run's directory "
+                          f"({e.strerror or e}); this project's daemon records it when the run ends")
+                    return
+                print(f"note {r['fp']} closed without a release (wontfix): {r['note']}")
+                return
             if a.resolve:
                 if not a.fixed_in:
-                    die("ttp upstream --resolve needs --fixed-in <version>")
+                    die("ttp upstream --resolve needs --fixed-in <version> or --wontfix \"<reason>\"")
                 me = here()
                 try:
                     r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
@@ -1529,14 +1549,11 @@ def _command_key(c) -> str:
     return c
 
 
-_PYTEST_PROG = re.compile(r"(?:\S*/)?(?:pytest|py\.test)")
-_PYTHON_PROG = re.compile(r"(?:\S*/)?python(?:3(?:\.\d+)?)?")
-
-
-def _same_run_key(c) -> str:
-    """_command_key, with a pytest run's program made one word: `pytest`, `py.test`,
-    `python3 -m pytest` and `<venv>/bin/python -m pytest` run the same tests, as every bare pytest
-    runs with the venv's python (push.venv_cmd). Only for telling an extra command already run."""
+def _same_run_key(c, py: str = "") -> str:
+    """_command_key, with a pytest run's program made one word where push.venv_cmd runs them alike:
+    bare `pytest`, `py.test` and `python[3] -m pytest`, and `<py> -m pytest` for `py` the venv python
+    venv_cmd puts in their place (venv_python). Any other interpreter (`/usr/bin/python3 -m pytest`,
+    `.venv/bin/pytest`) runs as written, so stays distinct. Only for telling an extra command already run."""
     key = _command_key(c)
     if not isinstance(c, str):
         return key
@@ -1546,9 +1563,10 @@ def _same_run_key(c) -> str:
         return key
     if not words or not all(_PLAIN_WORD.fullmatch(w) for w in words):
         return key   # shell syntax: compared as written
-    if _PYTEST_PROG.fullmatch(words[0]):
+    if words[0] in ("pytest", "py.test"):
         return shlex.join(["pytest", *words[1:]])
-    if len(words) > 2 and _PYTHON_PROG.fullmatch(words[0]) and words[1:3] == ["-m", "pytest"]:
+    if len(words) > 2 and (words[0] in ("python", "python3") or (py and words[0] == py)) \
+            and words[1:3] == ["-m", "pytest"]:
         return shlex.join(["pytest", *words[3:]])
     return key
 
@@ -1639,13 +1657,14 @@ def checks_env_line(p: Project) -> str | None:
             f"{e.get('run') or '?'} at {when} ({what}): {e['problem']}")
 
 
-def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
+def _extra_checks(extra: list[str], own: list, py: str = "") -> tuple[list[str], list[str]]:
     """(the commands given after `--`, the ones dropped). One word is a shell command line as
     written (`ttp checks -- 'FOO=1 pytest -q'`). Several words that each hold whitespace are one
     command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
-    here, is dropped: it would run twice (a pytest run in any spelling, _same_run_key). One that
+    here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike,
+    _same_run_key). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -1654,22 +1673,22 @@ def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
         given = [w for w in extra if w.strip()]
     else:
         given = [shlex.join(extra)]
-    seen = {_same_run_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    seen = {_same_run_key(c, py) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
     mine, dropped = [], []
     for c in given:
-        key = _same_run_key(c)
+        key = _same_run_key(c, py)
         (dropped if key in seen else mine).append(c)
         seen.add(key)
     return mine, dropped
 
 
-def _ran_again(todo: list, own: list) -> tuple[list, list]:
+def _ran_again(todo: list, own: list, py: str = "") -> tuple[list, list]:
     """(the applicable checks to run, the extras dropped): an extra command that a scoped project
     check applicable on this head (in `todo`) also runs is dropped, so it runs once."""
-    keys = {_same_run_key(c) for c in todo if any(c is o for o in own)}
+    keys = {_same_run_key(c, py) for c in todo if any(c is o for o in own)}
     keep, dropped = [], []
     for c in todo:
-        (dropped if not any(c is o for o in own) and _same_run_key(c) in keys else keep).append(c)
+        (dropped if not any(c is o for o in own) and _same_run_key(c, py) in keys else keep).append(c)
     return keep, dropped
 
 
@@ -1695,8 +1714,9 @@ def cmd_checks(a) -> None:
     passed on the same tree (a reviewer checking a worker's commit, a rerun after a rebase that changed
     nothing), that pass is reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
     failure is never served as a pass. `ttp push` and the push queue never read this record and
-    always run their own checks on the exact commit they push: a forged record can at most skip a
-    local re-run, never let a change onto the branch. Where every project check is skipped on a commit,
+    run their own checks on the exact commit they push (the queue skips only a check it recorded
+    passing itself on the same tree, pushpass): a forged record here can at most skip a local re-run,
+    never let a change onto the branch. Where every project check is skipped on a commit,
     `ttp push --own` takes the commands given after `--` that this run recorded passing on exactly that
     commit and runs them itself before it pushes.
 
@@ -1740,14 +1760,6 @@ def cmd_checks(a) -> None:
                 "<full commit ID> (or --definition-at-head) --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
         not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
         own = [c for c in own if c.purpose != "candidate"]
-    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own)
-    if dropped:
-        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
-              f"delivery.push_checks already runs it")
-    cmds = own + mine
-    if not cmds:
-        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
-            "`--`, e.g. ttp checks -- pytest -q")
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
@@ -1764,6 +1776,16 @@ def cmd_checks(a) -> None:
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
         venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
+    # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
+    vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
+    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
+    if dropped:
+        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
+              f"delivery.push_checks already runs it")
+    cmds = own + mine
+    if not cmds:
+        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
+            "`--`, e.g. ttp checks -- pytest -q")
     own_harness = bool(p) and Path(top).resolve() == p.harness.resolve()
     dirty, runtime_written, state = _checks_dirty(git, purpose == "harness", own_harness)
     if dirty:
@@ -1804,7 +1826,7 @@ def cmd_checks(a) -> None:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base, candidate=purpose == "candidate")
-            todo, again = _ran_again(todo, own)
+            todo, again = _ran_again(todo, own, vpy)
             if again:
                 said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
                         f"delivery.push_checks entry runs it on this head")
@@ -1868,10 +1890,16 @@ def cmd_checks(a) -> None:
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
-        slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False))) if todo and not hit else None
+        arrived = _checks_arrived()
+        slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived)
+                if todo and not hit else None)
+        # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
+        handover = bool(todo) and not hit and slot is None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
-        for c in [] if hit else todo:
+        for c in [] if hit or handover else todo:
             executed.append(c)
+            # A progress line per check: the commands' own output goes only to checks.log.
+            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}", flush=True)
             out.write(f"$ {c}\n")
             out.flush()
             check_start = out.tell()
@@ -1892,6 +1920,16 @@ def cmd_checks(a) -> None:
                 break
         if slot:
             slot.close()
+    if handover:
+        try:
+            _checks_detach(a, Path(run_dir), p, top, head, arrived)
+        except OSError as e:
+            die(f"ttp checks: {e}")
+        # Told only once they were started: a failed start says so, never that they run.
+        with open(log, "a") as out:
+            out.write(f"ttp checks: {CHECKS_HANDOVER}\n")
+        print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
+        sys.exit(75)
     env_problem, also, not_executed = None, False, []
     if not passed:
         # The applicable checks a failure or refusal left unrun stay listed as such, never as passed;
@@ -2078,15 +2116,33 @@ def _harness_purpose(a) -> dict:
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
 
 
+CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run in this call; started them "
+                   "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
+                   "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
 
-def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False):
+def _checks_arrived() -> float:
+    """When these checks joined the host-wide queue: the time a foreground run handed over with
+    (checkcap.ARRIVED_ENV, taken out of the environment so no check command inherits it), else now."""
+    from . import checkcap
+    now = time.time()
+    try:
+        t = float(os.environ.pop(checkcap.ARRIVED_ENV, ""))
+    except ValueError:
+        return now
+    return t if math.isfinite(t) and 0 < t <= now else now
+
+
+def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
+                 arrived: float | None = None):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
-    clock."""
+    clock, and it ends after checkcap.FOREGROUND_WAIT_S: None then means the caller hands over to
+    detached checks. With no project there is nobody to start them detached, so it waits on. `arrived`
+    is the place in the queue (default now)."""
     from . import checkcap, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -2113,7 +2169,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
-    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting)
+    return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
+                            checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived)
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
@@ -2189,15 +2246,19 @@ def _read_checks_pid(run_dir: Path) -> dict:
     return info if isinstance(info, dict) else {}
 
 
-def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "") -> None:
+def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
+                   arrived: float | None = None) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`.
     A tool sandbox queues the launch and cancellation through the daemon (detach.tend).
     checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
-    again, model-free, after a reboot killed them (Daemon._relaunch_checks)."""
-    from . import detach, push
+    again, model-free, after a reboot killed them (Daemon._relaunch_checks). `arrived`: a foreground
+    run's place in the host-wide queue, which they keep."""
+    from . import checkcap, detach, push
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    if arrived is not None:
+        env[checkcap.ARRIVED_ENV] = repr(arrived)
     rc = run_dir / CHECKS_RC
     detach.lost(rc).unlink(missing_ok=True)
     # A request the daemon has not finished starting is replaced through the queue too, so the daemon
@@ -3341,6 +3402,11 @@ def cmd_memory(a) -> None:
     for dst in done:
         print(f"retired to {dst}")
     memory_budget_check(p)
+    if spaced := [n for n in a.forget or [] if len(n.split()) > 1]:
+        # --forget takes every word after it, so text written after it was read as an entry name.
+        errors.append(f"{spaced[0]!r} is no entry name (names have no spaces): --forget takes every word "
+                      f"after it as a name, so put the memory's text before it: "
+                      f"ttp memory {p.name} \"<text>\" --forget <entry>")
     if errors:
         sys.exit("\n".join(errors))
 
@@ -3575,6 +3641,9 @@ def _machine_outage(a) -> None:
         return
     if not a.why:
         got = ml.outages()
+        if a.json:
+            print(json.dumps({k: o for k, o in got.items() if not a.alias or k == a.alias}, indent=2, sort_keys=True))
+            return
         for alias, o in sorted(got.items()):
             if not a.alias or alias == a.alias:
                 print(ml.outage_line(alias, o))
@@ -3583,7 +3652,8 @@ def _machine_outage(a) -> None:
         return
     p = here()
     try:
-        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "")
+        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "",
+                            covers=a.covers)
     except ValueError as e:
         die(str(e))
     print(ml.outage_line(a.alias, rec))
@@ -5175,9 +5245,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
     s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in)")
     s.add_argument("--fixed-in", metavar="VERSION", help="with --resolve: the release with the fix")
+    s.add_argument("--wontfix", metavar="REASON", help="with --resolve: close note FP without a release (not a "
+                                                       "plugin bug); the reason is required and recorded")
     s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
     s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
-                                                  "fix, 1 before, 2 when unknown")
+                                                  "fix, 1 before, 2 when unknown, 3 when closed as not a bug (wontfix)")
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
     s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
     s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")
@@ -5465,7 +5537,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
                    help="retire entries (names in [brackets]) to memory/archive/: several names after one "
                         "--forget, or the flag repeated, make one harness commit; an unknown name is "
-                        "reported and the others are still retired")
+                        "reported and the others are still retired. It takes every word after it, so "
+                        "give the text first: ttp memory <name> \"<text>\" --forget <entry>")
     s.add_argument("--standing", action="store_true",
                    help="an instruction that applies every time its case comes up (kept as a preference); "
                         "one finished instance never retires it")
@@ -5535,6 +5608,10 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--owner", help="who has the repair: a person's role or a ticket, not a project")
     m.add_argument("--expires", help="when it ends: a delay (3d) or a time (required to record one)")
     m.add_argument("--by", help="the project recording it (default: the project you are in)")
+    m.add_argument("--covers", action="append",
+                   help="what it explains, comma-separated: host, power, network, tray, chip, fabric "
+                        "(none: the whole machine); co-tenant watchers read it from --json")
+    m.add_argument("--json", action="store_true", help="list the known outages as JSON")
     m.add_argument("--clear", action="store_true", help="the outage is over")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
     cs = m.add_subparsers(dest="change", required=True)

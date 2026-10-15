@@ -339,6 +339,8 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     for n in range(attempts):
         whole, rec = _reusable(p, path, branch)
         if whole:
+            if not carried and task.get("kind") != "code":
+                _refresh(p, path, git_timeout(p, 1))
             break
         try:
             if path.exists() or rec:
@@ -352,6 +354,22 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
                 raise
     prepare(p, path)
     return path, branch
+
+
+def _refresh(p: Project, path: Path, timeout: float) -> None:
+    """A reused worktree of a non-code task (it only reads) catches up to the current base, after a
+    fetch, so a retry never judges what landed from an old tree. Fast-forward only: a worktree with
+    changes or commits of its own stays as it is."""
+    try:
+        _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
+        start = resolve_base(p)
+        if _git(path, "status", "--porcelain", check=False):
+            return
+        if subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", "HEAD", start],
+                          capture_output=True, timeout=timeout).returncode == 0:
+            _git(path, "merge", "--ff-only", "--quiet", start, check=False, timeout=timeout, env=checkout_env(p))
+    except (RuntimeError, subprocess.SubprocessError):
+        pass
 
 
 def checkout_env(p: Project) -> dict | None:

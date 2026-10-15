@@ -57,8 +57,9 @@ $S ird release <box-alias> <id>         # right after the run
   reserved; if still several, it claims and releases none and says so: check `status`, retry with
   `--machine`, and release by hand what is yours and unused.
 - The machine is the one in the new `ird list` row, not the one asked for: `ird` may place the
-  reservation elsewhere. Then `reserve` warns `asked for <A>, ird reserved <B>` and everything
-  after (claim, ssh block, the printed line) uses `<B>`. Names are compared ignoring case and a
+  reservation elsewhere. Everything after (claim, ssh block, the printed line) uses `<B>`. When
+  `--machine <A>` reached `ird`, `reserve` warns `asked for <A>, ird reserved <B>`; when it
+  reserved without `--machine` (below), it only notes `ird reserved <B>: use <B>`. Names are compared ignoring case and a
   site prefix or domain suffix, since `ird list-machines` and `ird list` may print them differently.
 - `--machine` takes either form. `ird reserve --machine` needs the `ird list` form and places the
   reservation anywhere when given another, so `reserve` maps the name, learning the prefix from
@@ -91,12 +92,22 @@ Host <machine>
     HostName <machine>
     Port <port>
     ProxyJump <ird-mgmt-alias>
+    UserKnownHostsFile "~/.tt-project/ird/known_hosts/<box-alias>.<id>"
+    StrictHostKeyChecking accept-new
 ```
 
 - `~/.ssh/config` needs `Include ~/.tt-project/ird/ssh-hosts` at its top. `reserve` says when it
   is missing: ask the user to add it (`ssh-workflow.md`); never edit their ssh config yourself.
-- A machine you never reached has no host key in `known_hosts`, so `BatchMode` refuses it. The
-  user verifies it once (`ssh-workflow.md`); never turn host key checking off.
+- Host keys: each reservation is a fresh container, so the machine's host key changes from one
+  reservation to the next, even on the same machine and port. A key verified once would fail the
+  next reservation, and a shared `known_hosts` would collect stale keys. So each reservation gets
+  its own empty `known_hosts` file under `~/.tt-project/ird/known_hosts/` (keyed by box and
+  reservation id), and the block trusts the first key seen on it (`accept-new`). That first
+  connection runs only through the authenticated jump host, and a changed key within the
+  reservation is still refused: checking stays on. `release` (and the e2e trap, `release --stale`)
+  deletes the file with the block; `reserve` and `list` prune files no live reservation of yours
+  owns. Never write `~/.ssh/known_hosts`.
+- Never use `StrictHostKeyChecking=no` or `UserKnownHostsFile=/dev/null`.
 - Then work as on any box: `ssh <machine>`, checkout or worktree under `workdir_root`
   (`ssh-workflow.md`). Never sync or mirror files to it.
 
@@ -144,21 +155,28 @@ management host is reachable only from the user's laptop: the user runs it there
    `ird.mgmt`, `ird.pools`, `ird.arch` and `workdir_root` (a writable path on the reserved
    machine). Flags override them: `--box <box-alias> --mgmt <ird-mgmt-alias> --pool <pool>
    --arch <arch> --workdir /<workdir>`. There are no built-in defaults for these.
-3. Put `Include ~/.tt-project/ird/ssh-hosts` at the top of `~/.ssh/config`, and check that
-   `ssh <ird-mgmt-alias> true` works without a password prompt.
+3. Put `Include ~/.tt-project/ird/ssh-hosts` at the top of `~/.ssh/config` (agents' later `ssh
+   <machine>` needs it). The test itself runs every ssh with `-F <run-dir>/ssh_config`, a config
+   holding only that Include, so your personal ssh config never shapes the result. When
+   `<ird-mgmt-alias>` is defined only in your personal config, give its options in the site file
+   as `ird.mgmt_ssh` (`site.md`), e.g. `{"HostName": "<mgmt-host>", "User": "<user>"}`: the run's
+   config then defines it. Without it, an unreachable management host fails the run at once and
+   says `ird.mgmt_ssh` is missing; it never falls back to your config.
 4. Run `bash <plugin-root>/skills/setup-box/scripts/ird_e2e.sh --dry-run` first: it only lists
    machines and prints the rest. Then run it without `--dry-run`. Optional: `--timeout hh:mm:ss`
    (default 00:30:00), `--extend-min N` (default 15), `--repo <git-url>` (a small public repo).
-5. The first ssh to the machine may ask you to check its host key (`ssh-workflow.md`).
-6. Paste back the block from `--- ird-e2e report (paste this back) ---` to `--- end ---` (also
+5. Paste back the block from `--- ird-e2e report (paste this back) ---` to `--- end ---` (also
    saved to the `report.txt` path it prints) into your project's chat, not a public place: it
    names machines and pools.
 
 The steps: list and pick a free, non-draining machine; reserve it (every flag before the arch,
-`--wait 120`); check the managed ssh block and ssh in through `ProxyJump`; clone the repo into a
+`--wait 120`); check the managed ssh block, print the machine's effective ssh options
+(`ssh -G <machine>: hostname=... proxyjump=... stricthostkeychecking=accept-new
+userknownhostsfile=.../known_hosts/<box-alias>.<id>`) and ssh in through `ProxyJump`; clone the repo into a
 per-run worktree under `workdir_root`, add a file, build it, run `tt-smi -s`; extend once with
 `extend` and pass only if the expiry moved forward by the minutes asked (absolute times, zone
-included); release and check the id is gone from `ird list`.
+included); release and check the id is gone from `ird list` and its ssh block and `known_hosts` file are
+removed.
 Before reserving it snapshots your reservations. On exit, any failure, Ctrl-C or SIGTERM a trap
 diffs them again and releases every new one this run claimed; a new one without this run's claim
 is left alone and named in the report. The report's `reservation:` line gives the real id and

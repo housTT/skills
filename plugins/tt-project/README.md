@@ -644,10 +644,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   every project on the machine: each takes one of
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap
   waits its turn in arrival order. The wait shows in `ttp status`, the task's notes and the
-  `--result` probe; it never fails the checks. Slots are OS file locks, so a crash or reboot frees
-  them. The default is one slot per 16 cores (at least one); set it with
+  `--result` probe; it never fails the checks. A foreground `ttp checks` (a tool call) waits a
+  minute at most: then it starts the same checks detached, in the same place in the queue, prints
+  their `retry_when` and exits 75 (with no project it waits on in the foreground).
+  Slots are OS file locks, so a crash or reboot frees them. The default is one slot per 16 cores (at least one); set it with
   `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
-  `ttp checks` or push inside a check command does not wait for its parent's slot.
+  `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
+  gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
+  they never queue behind task checks: each push branch has one priority slot of its own beyond the
+  cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
+  and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  `ttp push --own` publishes a task's branch and queues like task checks.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.
@@ -815,9 +822,15 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
   (default 1800: a batch starts only once the last one ended at least this long ago, measured
   from its recorded end so a restart or a failed batch never stretches the wait; a full batch or
-  a priority-1 review's approval starts at once; 0 = off), `after_push`
+  a priority-1 review's approval starts at once; 0 = off), `push_landing_alert_h` (default 4:
+  when approvals have waited this many hours with nothing landed on the push branch and at least
+  two batches tried them, one high alert says so, with the attempt count and how many a host
+  reboot cut short; it clears when a batch lands; 0 = off), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
-  (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
+  (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
+  and three such batches in a row raise a high alert, unless the host rebooted while it ran: then
+  it is reported as cut short by that reboot (its time in the home zone), counts no try and no
+  pause, raises no alert by itself and runs again as soon as the daemon is back. `after_push` runs after each push in a clean worktree at the pushed commit,
   with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION` (the version `version_bump` reads at the pushed
   commit; empty without `version_bump`), `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`, `TTP_PUSH_BATCH` and
   `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never fails the reviews:
@@ -859,6 +872,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `ttp push --queue` lists the entries, the last 7 days' conflict counts (conflicted, resolved in
   the batch, sent back) and the last 10 batches. Only a rejected push, a failed
   `after_push` and batches that keep dying reach the top section, and only while they last.
+- A push queue batch records each check that passes, keyed on the checked head's git tree, the
+  exact command and the environment it ran in (the interpreter and venv it uses, the active venv
+  and the target tip). A later batch on the same tree, as after a reboot cut the first, skips a
+  check recorded there as passed and logs `reused pass from <batch> (tree <short>)`. Only passes
+  are recorded: a failed check, and one skipped as not applicable, always run again. A check that
+  is one plain pytest run (no second pytest, and no `PYTHONPATH` or `PYTEST_ADDOPTS` of its own)
+  also resumes: a bundled pytest plugin records each test file whose every selected test passed,
+  and the next run of that check under the same key skips those files and runs the rest; files
+  are skipped whole, never single tests, and pytest-xdist runs never resume. The batch never reads
+  the passes `ttp checks` records. Records live under the project's state
+  (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
   to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A

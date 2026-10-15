@@ -170,6 +170,7 @@ USER_SETTABLE = {
     "delivery.push_batch_s": lambda v: push_queue_number("push_batch_s", v),
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
     "delivery.push_min_gap_s": lambda v: push_queue_number("push_min_gap_s", v),
+    "delivery.push_landing_alert_h": lambda v: push_queue_number("push_landing_alert_h", v),
     "delivery.after_push": lambda v: push.checks_of(v),
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
     "delivery.deploy_restart_wait_s": lambda v: push_queue_number("deploy_restart_wait_s", v),
@@ -547,17 +548,41 @@ def clip(text: Any, n: int) -> str:
 
 
 def held_at_reboots(boots: list[dict], where=None) -> str:
-    """What each reboot of `boots` interrupted, oldest first. A lock held at several reboots (its
-    name alike but for numbers, such as one push batch after another) is one entry: its count and
-    the latest; so are the reboots that interrupted nothing."""
+    """What each reboot of `boots` interrupted, oldest first. The locks one holder had at a reboot
+    (a push batch holds two) are one entry. Entries alike but for numbers (one push batch after
+    another, each held at its own reboot) are one, with each reboot's time and the latest holder's
+    id; so are the reboots that interrupted nothing."""
     groups: dict[str, list] = {}
     for b in boots:
-        at = timefmt.short(float(b["ts"]), where)
+        ts = float(b["ts"])
+        mine: dict[str, list] = {}
         for item in b.get("held") or ["nothing"]:
-            key = re.sub(r"\d+", "#", str(item).split(": ", 1)[0])
-            g = groups.pop(key, [0, "", ""])   # re-inserted: the order follows each one's latest
-            groups[key] = [g[0] + 1, at, item]
-    return "; ".join(f"{at} {item}" if n == 1 else f"{n}x, latest {at} {item}" for n, at, item in groups.values())
+            lock, _, holder = str(item).partition(": ")
+            mine.setdefault(re.sub(r" since .*$", "", holder or lock), []).append(str(item))
+        for holder, items in mine.items():
+            shown = holder if len(items) > 1 else items[0]
+            key = re.sub(r"\d+", "#", re.sub(r" since .*$", "", shown))
+            g = groups.pop(key, [[], ""])   # re-inserted: the order follows each one's latest
+            groups[key] = [g[0] + [ts], shown]
+    return "; ".join(_held_entry(ts, shown, where) for ts, shown in groups.values())
+
+
+HELD_TIMES_SHOWN = 6   # reboot times listed for one repeated entry, the latest ones
+
+
+def _held_entry(times: list[float], shown: str, where) -> str:
+    """'16:23 PDT board: task #7' for one reboot; 'push batch held at 4 reboots (23:26, 08:20,
+    15:40, 16:23 PDT), latest batch-<id>' for an entry held at several."""
+    if len(times) == 1:
+        return f"{timefmt.short(times[0], where)} {shown}"
+    zone = timefmt.abbrev(where, times[-1])
+    at = [t[:-len(zone) - 1] if t.endswith(" " + zone) else t
+          for t in (timefmt.short(ts, where) for ts in times[-HELD_TIMES_SHOWN:])]
+    label = re.sub(r" since .*$", "", shown)
+    ids = [w for w in label.split(" ") if re.search(r"\d", w)]
+    what = label.rsplit(" " + ids[-1], 1)[0].rstrip(" :") if ids and label.endswith(ids[-1]) else label
+    return (f"{what} held at {len(times)} reboots ({'…, ' if len(times) > HELD_TIMES_SHOWN else ''}"
+            f"{', '.join(at)} {zone})" + (f", latest {ids[-1]}" if what != label else ""))
 
 
 def machine_events(db, event_ids: list[int]) -> bool:

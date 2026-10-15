@@ -64,6 +64,7 @@ CLEARED_TEXT = {
     "push_rejected": "Pushes go through again: a push batch pushed.",
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
+    "push_not_landing": "A push batch landed on the push branch again.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
     "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
@@ -74,11 +75,13 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
+    "account-mismatch": "{arg}'s login no longer disagrees with its plan readings: they match again, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
-USER_BLOCKERS = ("network", "paused", "coord-budget")   # paused: a long project pause (projpause)
-CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low"}
+# account-mismatch: the provider's login is another account than its plan readings (budget.evaluate).
+USER_BLOCKERS = ("network", "paused", "coord-budget", "account-mismatch")   # paused: a long project pause (projpause)
+CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang")
 
@@ -163,6 +166,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":
         return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
+    if kind == "account-mismatch":   # the gate keeps the flag while the login has no plan readings of its own
+        return bool(((db.kv("gates", {}).get(arg) or {}).get("numbers") or {}).get("account_mismatch"))
     if kind == "relayed":   # conditions told to the chat while the coordinator could not run: while one is open
         ids = [int(x) for x in arg.split(",") if x.isdigit()]
         # One reopened after the relay is a new stretch, told by a relay of its own.
@@ -227,9 +232,14 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return turnsize.holds(db)
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
-    if key == "push_queue_dying":
-        return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
-                          "AND finalized>=? LIMIT 1", (since,))
+    if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
+        return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN "
+                          "('died','error','rebooted') AND finalized>=? LIMIT 1", (since,))
+    if key == "push_not_landing":   # pushq.check_landing: until a batch lands
+        if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1"):
+            return False   # every waiting approval was withdrawn or cancelled
+        return not db.one("SELECT id FROM push_batches WHERE outcome IN ('pushed','landed') AND finalized>=? LIMIT 1",
+                          (since,))
     return now - since < DAY
 
 
@@ -249,9 +259,9 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
-                                         "coord-budget")
+                                         "coord-budget", "account-mismatch")
 
 
 def _since(ep: dict) -> float:
