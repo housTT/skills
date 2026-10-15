@@ -9,7 +9,8 @@ the last LEDGER_DAYS, at most LEDGER_ROWS of them. Each entry has the task id, t
 subject key, an outcome (OUTCOMES), the date in the home zone and a one-line result. A hand-off may
 name its outcome (`outcome`) and list each separate thing it tried (`tried`: [{title, outcome,
 result}]); each of those is an entry of its own, so one task that shelved one lever and kept
-another records both.
+another records both. 'landed' needs a push record of the task's work (landed_tasks); a hand-off
+that only says or claims it is 'done', so work that never reached the branch can be queued again.
 
 Matching (`similar`) is wider than the near-duplicate check on open tasks: titles are compared by
 stemmed content words, and numbers in the title and spec that measure something (a decimal, a number
@@ -20,6 +21,7 @@ shared parameters alone never match: a title must name one of them and the title
 subject, leaving out words and numbers the project's ledger uses all the time (`common`)."""
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import Counter
@@ -27,7 +29,7 @@ from datetime import datetime
 from functools import lru_cache
 
 from . import timefmt
-from .db import load_result
+from .db import load_result, review_subject
 
 LEDGER_DAYS = 14           # history task_add checks against
 LEDGER_ROWS = 400          # finished tasks read at most (newest first)
@@ -48,8 +50,7 @@ _GENERIC = set("code work task try retry again rerun redo new next continue foll
 _SAID = (("shelved", re.compile(r"\b(shelv\w*|parked|abandon\w*|not worth\w*|no (?:gain|win|improvement)|"
                                 r"reverted|backed out)\b", re.I)),
          ("rejected", re.compile(r"\b(rejected|ruled out)\b", re.I)),
-         ("kept", re.compile(r"\b(kept|keeping)\b", re.I)),
-         ("landed", re.compile(r"\b(landed|merged|pushed)\b", re.I)))
+         ("kept", re.compile(r"\b(kept|keeping)\b", re.I)))
 _DATES = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?Z?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
 _VERSION = re.compile(r"(?<![\w.])v?\d+(?:\.\d+){2,}\b", re.I)   # 0.2.300: a release, not a parameter
 # A number standing alone: not part of a name (Llama-3.1, fp16, v1.0) or a hash (63e55ab).
@@ -63,6 +64,8 @@ _BOUND_BEFORE = re.compile(r"\b(bound|ceiling|cap|limit|target|threshold|up to|a
 # Spec paragraphs every task repeats (the charter's restrictions, the hand-off asked for): not what the
 # work is, so left out of its words and parameters.
 _BOILERPLATE = re.compile(r"^\W*(restrictions?|binding restrictions|rules|constraints|return|hand-?off)\b", re.I)
+# A task title that redoes another task's change: "rebase #12 onto ...", "rebased #12" (landed._REBASE_TITLE).
+_REBASE_TITLE = re.compile(r"\brebas(?:e|ed|es|ing)\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
 _DIFFERS = re.compile(r"\b(differ\w*|unlike|instead of)\b", re.I)
 _NAME_BEFORE = re.compile(r"\b[A-Za-z]*[A-Z][\w-]*\s$")
 _LIST_DOT = re.compile(r"\.(?:\s|$)")
@@ -165,8 +168,10 @@ def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset =
 
 
 def _outcome(task: dict, result: dict, landed: bool) -> str:
+    """The task's outcome. 'landed' only with a recorded landing (`landed`): a hand-off that says or
+    claims it ('#12's fix landed', outcome: landed) has not shown its own commits on the branch."""
     said = str(result.get("outcome") or "").strip().lower()
-    if said in OUTCOMES:
+    if said in OUTCOMES and (said != "landed" or landed):
         return said
     if task["status"] in ("failed", "cancelled"):
         return task["status"]
@@ -177,6 +182,47 @@ def _outcome(task: dict, result: dict, landed: bool) -> str:
         if rx.search(text):
             return name
     return "landed" if landed else "done"
+
+
+def landed_tasks(db) -> set[int]:
+    """Tasks whose work is on the push branch by a record written only once it was: a push queue
+    landing (pushed, or found on the freshly fetched tip by patch), a detached push to the shared
+    branch, or a recorded supersession; of the task that landed and of each task it carries on (the
+    subject of a review, the task a fix or continuation follows, a rebased or carried branch's owner:
+    landed.carriers read backwards)."""
+    queue = db.q("SELECT task, branch FROM push_queue WHERE status IN ('pushed','landed') "
+                 "AND COALESCE(landed_sha, pushed_sha) IS NOT NULL")
+    owner = {r["branch"]: r["id"] for r in db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL "
+                                                "AND branch != '' ORDER BY id")}
+    done = {r["task"] for r in queue} | {owner[r["branch"]] for r in queue if r["branch"] in owner}
+    done |= {r["task"] for r in db.q("SELECT task FROM task_landings UNION SELECT task FROM task_superseded")}
+    if not done:
+        return set()
+    follows: dict[int, set[int]] = {}
+    for r in db.q("SELECT id, kind, branch, labels, title FROM tasks WHERE kind='review' OR labels LIKE '%continues:%' "
+                  "OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' OR labels LIKE '%pr_branch:%' "
+                  "OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' OR title LIKE '%review%'"):
+        try:
+            labels = json.loads(r["labels"] or "[]")
+        except (ValueError, TypeError):
+            labels = []
+        labels = [lb for lb in labels if isinstance(lb, str)] if isinstance(labels, list) else []
+        ids = {int(lb.partition(":")[2]) for lb in labels if lb.startswith(("continues:", "review_fix:"))
+               and lb.partition(":")[2].isdigit()}
+        if (s := review_subject({"labels": r["labels"], "title": r["title"]})) is not None:
+            ids.add(s)
+        ids |= {int(x) for x in _REBASE_TITLE.findall(r["title"] or "")}
+        ids |= {owner[n] for lb in labels if lb.startswith(("rebases:", "pr_branch:"))
+                and (n := lb.partition(":")[2]) in owner}
+        if ids := {i for i in ids if i < r["id"]}:   # a successor always has a later id
+            follows[r["id"]] = ids
+    todo = list(done)
+    while todo:
+        for i in follows.get(todo.pop(), ()):
+            if i not in done:
+                done.add(i)
+                todo.append(i)
+    return done
 
 
 def _line(text) -> str:
@@ -193,7 +239,7 @@ def entries(db, where=None, now: float | None = None, days: float = LEDGER_DAYS)
                 "COALESCE(updated, created, 0) ts FROM tasks WHERE status IN ('done','failed','cancelled') "
                 "AND kind != 'review' AND COALESCE(updated, created, 0) >= ? ORDER BY ts DESC, id DESC LIMIT ?",
                 (now - days * 86400, LEDGER_ROWS))
-    landed = {r["task"] for r in db.q("SELECT DISTINCT task FROM task_landings")} if rows else set()
+    landed = landed_tasks(db) if rows else set()
     out = []
     for t in rows:
         if t["status"] == "cancelled" and not t["attempts"] and not t["spent_usd"]:

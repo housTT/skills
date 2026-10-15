@@ -10263,6 +10263,51 @@ def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
     assert tried.params(("filler words " * 50) + "at most 600 and Llama 3.1 and 7 items") == {"600"}
 
 
+def test_tried_work_ledger_says_landed_only_for_work_a_push_record_shows_on_the_branch(env):
+    # Replays a false landing: a done code task whose summary said another task's change "landed" (and
+    # one whose hand-off claimed outcome landed) was in the ledger as landed with its commit on no branch,
+    # so task_add refused to redo work that never shipped.
+    p = make(env)
+    from ttp import tried
+    db = p.db
+
+    def finished(title, result, **kw):
+        t = db.add_task(title, "s", kind=kw.pop("kind", "code"), origin="user", **kw)
+        db.update_task(t, status="done", attempts=1, result=json.dumps({"status": "done", **result}))
+        return t
+
+    said = finished("trim the worker prompt under its cap", {"summary": "No trim needed: #12's trim landed in "
+                                                                        "0.2.348. Fixed the test; checks passed."})
+    claimed = finished("fix the cap test", {"summary": "Fixed it.", "outcome": "landed"})
+    db.update_task(said, branch="ttp/t-said")
+    reviewed = finished("shorten the code prompt", {"summary": "Trimmed 600 chars."})
+    db.update_task(reviewed, branch="ttp/t-reviewed")
+    review = finished(f"Review #{reviewed}", {"summary": "approved"}, kind="review",
+                      labels=[f"auto_review:{reviewed}"])
+    fixed = finished("trim the digest", {"summary": "Trimmed."})
+    review1 = finished(f"Review #{fixed}", {"summary": "changes asked"}, kind="review", labels=[f"auto_review:{fixed}"])
+    fix = finished("fix review findings", {"summary": "Fixed."}, labels=[f"review_fix:{review1}"])
+    review2 = finished(f"Review #{fix}", {"summary": "approved"}, kind="review", labels=[f"auto_review:{fix}"])
+    dropped = finished("drop a stale rule", {"summary": "Dropped."})
+    review3 = finished(f"Review #{dropped}", {"summary": "approved"}, kind="review", labels=[f"auto_review:{dropped}"])
+    now = time.time()
+    for task, branch, status, sha in ((review, "ttp/t-reviewed", "landed", "a" * 40),
+                                      (review2, "ttp/t-fix", "pushed", "b" * 40),
+                                      (review3, "ttp/t-dropped", "conflict", None)):   # a batch sent it back
+        db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha, pushed_sha) "
+             "VALUES(?,?,?,?,?,?,?,?,?)", (task, branch, "c" * 40, "origin/work", status, now, now, sha, sha))
+    got = {e["id"]: e["outcome"] for e in tried.entries(db, p)}
+    assert got[said] == "done" and got[claimed] == "done", got
+    assert got[reviewed] == "landed" and got[fixed] == "landed" and got[fix] == "landed", got
+    assert got[dropped] == "done", got
+    assert tried.landed_tasks(db) == {review, reviewed, review2, fix, review1, fixed}
+    # A record of its own (a detached push or a recorded supersession) also lands a claim.
+    db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, ?, 'work')", (claimed, "d" * 40))
+    db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?, ?, ?, ?)", (said, "f" * 40, "e" * 40, now))
+    got = {e["id"]: e["outcome"] for e in tried.entries(db, p)}
+    assert got[claimed] == "landed" and got[said] == "landed", got
+
+
 def test_tried_work_ledger_skips_reviews_and_cancelled_tasks_that_never_ran(env):
     p = make(env)
     from ttp import tried
