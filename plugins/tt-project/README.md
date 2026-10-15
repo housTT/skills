@@ -125,6 +125,15 @@ rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
 history. If you ran `ttp notifier install`, also remove its `tt-project-notifier` user service.
 
+### Known issues
+
+- Cursor install is verified by clone and `ttp setup` only, not end to end.
+- The setup-box IRD route is tested against a fake `ird`; a live run needs a network that reaches the IRD service.
+- Codex and Cursor spend is estimated from a price table (see Limits).
+- Not on Codex: worker plugins. Not yet on Cursor: worker plugins, worker isolation, mid-run coordinator updates (see Limits).
+- Older Cursor builds print nothing until a run ends, so set `stall_s` above their longest run.
+- A laptop pauses while it sleeps; use an always-on machine for round-the-clock work.
+
 ## Using it
 
 | You say | What happens |
