@@ -2916,7 +2916,7 @@ def cmd_detach(a) -> None:
     the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. With
     `--rows <file> --after <n>` it exits 0 also once that file has more than n lines, and 0 (never 4)
     once a job ended or is gone, else 1: one probe that wakes on a new result row, the end or a dead
-    driver. From a command a sandbox would end with everything it started,
+    driver; a path no `ttp detach` recorded is never gone then, only a new row wakes it. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
@@ -2928,6 +2928,7 @@ def cmd_detach(a) -> None:
     from .runner import boot_id
     if a.check is not None:   # `--check --host <alias> <path>` leaves the paths to the positionals
         a.check = [*a.check, *([a.name] if a.name else []), *(a.command or [])]
+        _check_options(a)
         if not a.check:
             die("usage: ttp detach --check <rc path...>  |  ttp detach --check --host <ssh alias> <dir>/<name>...")
         rows, after = getattr(a, "rows", None), getattr(a, "after", None)
@@ -2947,6 +2948,10 @@ def cmd_detach(a) -> None:
     if a.check is not None:
         ended, failed, one_ended = True, False, False
         for rc in map(Path, a.check):
+            if rows is not None and not detach.recorded(rc):   # no driver to read: only a new row wakes it
+                ended = False
+                print(f"{rc.stem}: no detached job recorded at {rc}; waking only on a new row in {rows}")
+                continue
             st, why = detach.state(rc)
             if st == "ended":
                 failed = failed or why != "0"
@@ -3061,6 +3066,31 @@ echo "gone"
 '''
 
 
+def _check_options(a) -> None:
+    """`ttp detach --check`: argparse leaves the options given after the first path (`--rows`,
+    `--after`, `--host`) among the paths; take them back out, so they count wherever they appear."""
+    paths, words = [], list(a.check)
+    while words:
+        w = words.pop(0)
+        key, eq, val = w.partition("=")
+        if key in ("--rows", "--after", "--host"):
+            if not eq:
+                if not words:
+                    die(f"{key} needs a value")
+                val = words.pop(0)
+            if key == "--after":
+                try:
+                    val = int(val)
+                except ValueError:
+                    die(f"--after needs a whole number, not {val!r}")
+            setattr(a, key[2:], val)
+        elif w.startswith("-"):
+            die(f"ttp detach --check: unknown option {w}")
+        else:
+            paths.append(w)
+    a.check = paths
+
+
 # Run before _REMOTE_CHECK with `--rows`: the line count of the rows file ($2), "rows none" without one.
 _REMOTE_ROWS = r'''f=$2
 case $f in "~"|"~/"*) f=$HOME${f#\~} ;; esac
@@ -3133,7 +3163,8 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
     (detach.FAILED_RC) once every one ended or is gone but one failed or left no exit code, 1 while
     any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read.
     With `rows` (a file on that host): 0 once it has more than `after` lines or one job ended or is
-    gone, else 1 (_rows_verdict); ssh failing is still 255."""
+    gone, else 1 (_rows_verdict); a path with no driver recorded (no .rc, no .pid) is never read as
+    gone then, only a new row wakes it; ssh failing is still 255."""
     from .detach import FAILED_RC
     ended, failed, one_ended, n = True, False, False, None
     for i, pre in enumerate(prefixes):
@@ -3161,6 +3192,10 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
         elif out[0] == "running":
             ended = False
             print(f"{name}: running on {host}")
+        elif out[0] == "none" and rows is not None:   # no driver to read: only a new row wakes it
+            ended = False
+            print(f"{name}: no driver recorded at {pre} on {host}; waking only on a new row in {rows}")
+            continue
         elif out[0] == "none":
             failed = True
             print(f"{name}: gone without an exit code: no driver was recorded at {pre} on {host}")

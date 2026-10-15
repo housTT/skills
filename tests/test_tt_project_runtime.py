@@ -43866,6 +43866,59 @@ def test_detach_remote_check_rows_wakes_on_a_new_row_the_end_or_a_dead_driver(en
     assert r.returncode == 0 and "job finished rc=5" in r.stdout, r.stdout
 
 
+def test_detach_check_rows_never_reads_a_path_with_no_driver_recorded_as_gone(env, tmp_path):
+    """A rows file of a run `ttp detach` never started (no .rc, .pid, .boot or entry next to the stem):
+    with `--rows` nothing says it ended, so only a new row wakes it, locally and over ssh, and the
+    local look leaves no .lost behind. Without `--rows` such a path still reads as gone (4)."""
+    p = _device_project(env, device=False)
+    series = tmp_path / "series"
+    series.mkdir()
+    rows = series / "rows.csv"
+    rows.write_text("h\n1\n")
+    stem = series / "run"
+    r = _ttp_run(p, "detach", "--check", f"{stem}.rc", "--rows", str(rows), "--after", "2")
+    assert r.returncode == 1 and "no detached job recorded" in r.stdout and "gone" not in r.stdout, r.stdout
+    assert not list(series.glob("run.*")), "the check marked a path no job wrote as lost"
+    e = _ssh_stub(tmp_path)
+    probe = ["detach", "--check", "--host", "box-b", "--rows", str(rows), "--after", "2", f"{stem}.rc"]
+    r = _ttp_run(p, *probe, env=e)
+    assert r.returncode == 1 and "no driver recorded" in r.stdout and "gone" not in r.stdout, r.stdout
+    rows.write_text("h\n1\n2\n")   # a new row wakes both
+    assert _ttp_run(p, *probe, env=e).returncode == 0
+    assert _ttp_run(p, "detach", "--check", f"{stem}.rc", "--rows", str(rows), "--after", "2").returncode == 0
+    (series / "run.rc").write_text("0\n")   # a real end marker wakes it too
+    r = _ttp_run(p, *probe[:-3], "5", probe[-1], env=e)
+    assert r.returncode == 0 and "job finished rc=0" in r.stdout, r.stdout
+    (series / "run.rc").unlink()
+    r = _ttp_run(p, "detach", "--check", "--host", "box-b", f"{stem}.rc", env=e)
+    assert r.returncode == 4 and "no driver was recorded" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("where", ["local", "host"])
+def test_detach_check_options_after_the_paths_are_options(env, tmp_path, where):
+    """`--rows`, `--after` and `--host` given after the first path (or as --opt=value) count as
+    options, never as more paths to check."""
+    p = _device_project(env, device=False)
+    d = tmp_path / "jobs"
+    d.mkdir()
+    rows = d / "rows.csv"
+    rows.write_text("h\n1\n2\n")
+    (d / "a.rc").write_text("0\n")
+    (d / "b.rc").write_text("0\n")
+    e = _ssh_stub(tmp_path) if where == "host" else None
+    host = ["--host", "box-b"] if where == "host" else []
+    for args in ([*host, str(d / "a.rc"), str(d / "b.rc"), "--rows", str(rows), "--after", "5"],
+                 [str(d / "a.rc"), *host, f"--rows={rows}", str(d / "b.rc"), "--after=5"]):
+        r = _ttp_run(p, "detach", "--check", *args, env=e)
+        assert r.returncode == 0 and "rows: 3 lines" in r.stdout and "wakes above 5" in r.stdout, r.stdout
+        assert "--rows" not in r.stdout and "--after" not in r.stdout, r.stdout
+        assert ("on box-b" in r.stdout) == (where == "host"), r.stdout
+    bad = _ttp_run(p, "detach", "--check", *host, str(d / "a.rc"), "--after", "x", env=e)
+    assert bad.returncode != 0 and re.search(r"--after( needs a whole number|: invalid int)", bad.stderr), bad.stderr
+    bad = _ttp_run(p, "detach", "--check", *host, str(d / "a.rc"), "--rowz", "f", env=e)
+    assert bad.returncode != 0 and re.search(r"(unknown option|unrecognized arguments:) --rowz", bad.stderr), bad.stderr
+
+
 @pytest.mark.parametrize("probe, flagged", [
     ("ssh box 'test $(wc -l < out/rows.csv) -gt 3 || test -e out/job.rc'", True),
     ("ssh -o BatchMode=yes box '[ -f /scratch/run/done ]'", True),

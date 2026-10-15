@@ -460,6 +460,15 @@ def _entry(rc: Path) -> dict:
         if isinstance(jobs, list) else {}
 
 
+def recorded(rc: Path) -> bool:
+    """Whether anything records a detached job at this .rc path: its exit code, its loss, its start,
+    its entry in detached.json, a queued request or its held lock. False for a path no `ttp detach`
+    wrote, which state() would call lost (and mark so)."""
+    rc = Path(rc)
+    return (rc.exists() or lost(rc).exists() or started(rc).exists() or bool(_entry(rc)) or pending(rc)
+            or not locks.any_free([locks.job_lock(rc)]))
+
+
 def state(rc: Path) -> tuple[str, str]:
     """("ended", exit code), ("running" or "queued", ""), or ("lost", why). The first look at a lost
     job records why in <name>.lost."""
