@@ -4058,7 +4058,7 @@ def cmd_drain(a) -> None:
         print(f"{p.name} paused: no new model runs start")
     intent, wrote, since = None, False, time.time()
     if a.reboot:
-        intent, wrote, line = hostcycle.open_intent(p, a.reboot, a.wait)
+        intent, wrote, line = hostcycle.open_intent(p, a.reboot, a.wait, now=since)
         print(line, file=sys.stdout if intent else sys.stderr)
     end = time.time() + max(0.0, a.wait)
     while True:
@@ -4071,14 +4071,15 @@ def cmd_drain(a) -> None:
     if a.reboot:
         try:
             rec = hostcycle.record(p, a.reboot, left, jobs, intent=intent["id"] if intent else None,
-                                   intent_was=hostcycle.before(intent, p.name, since) if intent and not wrote else None)
+                                   intent_was=hostcycle.before(intent, p.name, since) if intent and not wrote else None,
+                                   since=since)
         except OSError as e:
             if wrote:   # no record, no planned cycle: other projects here are not held for it
                 from . import machine_ledger as ml
                 ml.close_change(intent["id"], "ttp drain could not record the planned host cycle", by=p.name)
             die(f"could not record the planned host cycle: {e}")
         if intent:
-            hostcycle.cycle_now(p, intent)
+            hostcycle.cycle_now(p, intent, since=since)
         print(f"planned host cycle recorded: {rec}")
     if others:
         print(f"other projects on this host: {len(others)} run(s) or push(es) in flight, workers told to hand off "

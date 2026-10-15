@@ -20,10 +20,13 @@ drain's intent holds from when it was written), every project's daemon here star
 reviewer run and no push-queue push, and `ttp checks` starts nothing new; the coordinator still
 runs, and runs in flight go on and are told to hand off (daemon.power_cycle_notices). Once the drain
 records the cycle, the intent's time moves to then (cycle_now). The hold lifts once the intent
-closes (a record made with it that says no reboot closes it, or, for one the drain only took up, puts
-back the time and window it had before the drain moved them; and `ttp resume` closes one its own
+closes (a no-reboot record from the drain that wrote it closes it, and `ttp resume` closes one its own
 drain wrote but never recorded: release), once this host booted again, or POWER_CYCLE_LEAD_S after
-its time (lapsed: each daemon posts one low feed line).
+its time (lapsed: each daemon posts one low feed line). A no-reboot record from a drain that only took
+the intent up never closes it: the cycle it was written for is still coming. Instead the intent gets
+back the time and window it had before the take-ups moved it, once every drain that moved it since
+then has said no reboot (while one still waits, or its cycle is coming, its time stands), so it holds
+again only in its own window (_undo_takeups).
 """
 from __future__ import annotations
 
@@ -109,11 +112,12 @@ def running_jobs(p: Project, days: float = 7) -> list[dict]:
 
 
 def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict], intent: int | None = None,
-           intent_was: dict | None = None) -> Path:
+           intent_was: dict | None = None, since: float | None = None) -> Path:
     """Record a planned cycle of this host, about to happen: the next boot matches it (planned).
     `intent`: the machine-ledger power-cycle intent it was announced with (open_intent); `intent_was`: that
     intent's time fields before this drain took it up and moved them (before), so a record that says no
-    reboot can put them back (hold)."""
+    reboot can put them back (hold); `since`: when the drain started, so its edits of the intent are told
+    from others' (_undo_takeups)."""
     from .runner import boot_id
     now = time.time()
     rid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
@@ -126,8 +130,9 @@ def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict], 
     f = d / "record.json"
     write_json(f, {"id": d.name, "started": now, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
                    "boot_id": boot_id(), "dry_run": False, "reason": reason, "by": "ttp drain",
-                   "left_running": left_running, "interrupted": jobs, "intent": intent}
-               | ({"intent_was": intent_was} if intent_was is not None else {}))
+                   "left_running": left_running, "interrupted": jobs, "intent": intent, "project": p.name}
+               | ({"intent_was": intent_was} if intent_was is not None else {})
+               | ({"since": since} if since is not None else {}))
     return f
 
 
@@ -176,7 +181,7 @@ def open_intent(p: Project, reason: str, wait_s: float, now: float | None = None
         if start <= now < end and not _rebooted_since(c):
             if c["at"] < now + wait_s:
                 try:
-                    c = ml.retime_power_cycle(c["id"], now + wait_s, p.name, now=now, hold_from=now)
+                    c = ml.retime_power_cycle(c["id"], now + wait_s, p.name, now=now, hold_from=now, drain=now)
                 except ValueError:
                     continue
             return c, False, f"planned host cycle already announced by {c.get('by')} (machine change #{c['id']})"
@@ -200,12 +205,12 @@ def before(c: dict, by: str, since: float) -> dict:
     return {**cur, **{k: v for k, v in (e or {}).get("was", {}).items() if k in ml.RETIMED}}
 
 
-def cycle_now(p: Project, c: dict, now: float | None = None) -> None:
+def cycle_now(p: Project, c: dict, now: float | None = None, since: float | None = None) -> None:
     """The drain recorded the cycle: intent c's time moves to now, so its hold and lapse count from the
-    cycle itself, not from when the drain thought it might end."""
+    cycle itself, not from when the drain thought it might end. `since`: when that drain started."""
     from . import machine_ledger as ml
     try:
-        ml.retime_power_cycle(c["id"], time.time() if now is None else now, p.name, now=now)
+        ml.retime_power_cycle(c["id"], time.time() if now is None else now, p.name, now=now, drain=since)
     except ValueError:   # closed meanwhile
         pass
 
@@ -239,7 +244,7 @@ def release(p: Project) -> list[int]:
 
 def _no_reboot_records(p: Project | None, c: dict) -> list[tuple[str, dict]]:
     """(project, record) for the host-cycle records made with intent c that say the cycle did not happen
-    (a dry run, or `rebooted` false), newest first."""
+    (a dry run, or `rebooted` false), newest first. Each record carries its file's resolved `path`."""
     out = []
     for owner, d in _named_state_dirs(p):
         try:
@@ -252,35 +257,64 @@ def _no_reboot_records(p: Project | None, c: dict) -> list[tuple[str, dict]]:
             except (OSError, ValueError):
                 continue
             if isinstance(r, dict) and r.get("intent") == c.get("id") and (r.get("dry_run") or r.get("rebooted") is False):
-                out.append((owner, r))
+                out.append((owner, {**r, "path": str(f.resolve())}))
     return sorted(out, key=lambda x: float(x[1].get("started") or 0), reverse=True)
 
 
 def _no_reboot(p: Project | None, c: dict, records: list[tuple[str, dict]] | None = None) -> bool:
-    """Whether a record made on intent c's boot with intent c says the cycle did not happen."""
-    return any(r.get("boot_id") == c.get("boot") for _, r in (_no_reboot_records(p, c) if records is None else records))
+    """Whether a record made on intent c's boot by the drain that wrote intent c says the cycle did not
+    happen. A drain that only took c up (its record has `intent_was`) does not close it: the planned cycle
+    of the one that wrote it is still coming."""
+    return any(r.get("boot_id") == c.get("boot") and not isinstance(r.get("intent_was"), dict)
+               for _, r in (_no_reboot_records(p, c) if records is None else records))
+
+
+def _undone(c: dict, records: list[tuple[str, dict]]) -> tuple[dict, str] | None:
+    """Intent c's time fields (machine_ledger.RETIMED) from before the retimes made since its last undo,
+    newest first back through its edit trail, and the mark of that undo (the newest such record's resolved
+    path), when every one of those retimes was made by a drain that took c up on this boot and then
+    recorded no reboot (the edit's `drain` is that record's `since`); else None: nothing to undo, or a retime
+    stands for a drain still waiting (or for a cycle that is coming), so nothing is put back yet."""
+    from . import machine_ledger as ml
+    from .runner import same_boot
+    takeups = [(str(r.get("project") or owner), r) for owner, r in records
+               if isinstance(r.get("intent_was"), dict) and same_boot(r.get("boot_id"))]
+    edits = list(c.get("edits") or [])
+    last = max((i for i, e in enumerate(edits) if isinstance(e, dict) and e.get("undo")), default=-1)
+    pending = [e for e in edits[last + 1:] if isinstance(e, dict)]
+    if not pending or not takeups:
+        return None
+    newest = None
+    for e in pending:
+        by = next(((n, r) for n, r in takeups if e.get("by") == n and (
+            e["drain"] == r["since"] if e.get("drain") is not None and r.get("since") is not None
+            else float(e.get("at") or 0) >= float(r.get("since") or 0))), None)
+        if by is None:
+            return None
+        newest = by[1] if newest is None or float(by[1].get("started") or 0) > float(newest.get("started") or 0) \
+            else newest
+    was = {k: c.get(k) for k in ml.RETIMED}
+    for e in reversed(pending):
+        was.update({k: v for k, v in (e.get("was") or {}).items() if k in ml.RETIMED})
+    return was, f"{newest.get('path') or newest.get('id')}"
 
 
 def _undo_takeups(p: Project | None, c: dict, records: list[tuple[str, dict]], settle: bool, now: float) -> dict:
-    """Intent c with the retimes of the drains that took it up and then recorded no reboot undone (their
-    record's `intent_was`), newest first, so a planned cycle a drain only took up keeps its own time and
-    window. With `settle` the ledger is written (once per record); else only the returned copy."""
+    """Intent c with the retimes of the drains that took it up and then recorded no reboot undone (_undone),
+    so a planned cycle a drain only took up keeps its own time and window. With `settle` the ledger is
+    written (once per mark, and only if no edit came meanwhile); else only the returned copy."""
     from . import machine_ledger as ml
-    from .runner import same_boot
-    for owner, r in records:
-        mark = f"{owner}/{r.get('id')}"
-        if not isinstance(r.get("intent_was"), dict) or not same_boot(r.get("boot_id")) \
-                or any(e.get("undo") == mark for e in c.get("edits") or []):
-            continue
-        if settle:
-            try:
-                c = ml.restore_power_cycle(c["id"], r["intent_was"], p.name if p else "", mark, now=now)
-            except ValueError:   # closed meanwhile
-                continue
-        else:
-            c = {k: v for k, v in c.items() if k not in ml.RETIMED} | \
-                {k: v for k, v in r["intent_was"].items() if k in ml.RETIMED and v is not None}
-    return c
+    hit = _undone(c, records)
+    if hit is None:
+        return c
+    was, mark = hit
+    if not settle:
+        return {k: v for k, v in c.items() if k not in ml.RETIMED} | {k: v for k, v in was.items() if v is not None}
+    try:
+        return ml.restore_power_cycle(c["id"], was, p.name if p else "", mark, now=now,
+                                      edits=len(c.get("edits") or []))
+    except ValueError:   # closed meanwhile
+        return c
 
 
 def hold(p: Project | None, now: float | None = None, settle: bool = False) -> dict | None:

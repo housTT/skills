@@ -202,11 +202,12 @@ def power_cycles_due(now: float | None = None) -> list[dict]:
 
 
 def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None,
-                       hold_from: float | None = None) -> dict:
+                       hold_from: float | None = None, drain: float | None = None) -> dict:
     """Move open power-cycle intent #cid to epoch time `at` (its end follows), with an edit trail: a drain
     that runs longer pushes it on, and the cycle itself, once recorded, brings it to now. `hold_from`: its
     window also starts no later than that (and no later than it did), in the same write, so a drain that
-    takes up an intent and pushes it on keeps holding from now."""
+    takes up an intent and pushes it on keeps holding from now. `drain`: the start time of the drain that
+    moves it, kept in the edit so its edits are told from another drain's of the same project."""
     now = time.time() if now is None else now
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
@@ -219,7 +220,8 @@ def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None,
                "what": f"power-cycle intent, at {ends.shown(at)}" + (f": {what.split(': ', 1)[1]}" if ": " in what else "")}
         if hold_from is not None:
             new["hold_from"] = min(cycle_window(c)[0], float(hold_from))
-        c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in new}})
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in new}}
+                                         | ({"drain": drain} if drain is not None else {}))
         c.update(new)
         _write(LEDGER, doc)
         return c
@@ -229,10 +231,12 @@ def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None,
 RETIMED = ("at", "expires", "what", "hold_from")
 
 
-def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | None = None) -> dict:
+def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | None = None,
+                        edits: int | None = None) -> dict:
     """Put open power-cycle intent #cid's time fields (RETIMED) back to `was` (a None or missing field is
     removed), with an edit trail entry that carries `mark` as `undo`; once per mark: a second call with the
-    same mark changes nothing."""
+    same mark changes nothing. `edits`: the length of the edit trail `was` was worked out from; when the
+    trail has grown since, nothing changes either (the caller works it out again)."""
     now = time.time() if now is None else now
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
@@ -240,7 +244,8 @@ def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | No
                   and c.get("kind") == POWER_CYCLE and not c.get("closed")), None)
         if c is None:
             raise ValueError(f"no open power-cycle intent #{cid}")
-        if any(e.get("undo") == mark for e in c.get("edits") or []):
+        if any(e.get("undo") == mark for e in c.get("edits") or []) \
+                or edits is not None and len(c.get("edits") or []) != edits:
             return c
         c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in RETIMED}, "undo": mark})
         for k in RETIMED:

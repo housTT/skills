@@ -165,6 +165,13 @@ lost otherwise. Such a helper pauses the project with `ttp pause <name> --until-
 "host power cycle"`, never a plain pause: a plain pause outlives the cycle and nothing lifts it.
 `--until-reboot` without `--reason` records the reason "host power cycle (until reboot)".
 
+`--reboot` also writes a power-cycle intent for the host in `ttp machines`, or takes up one already
+due there, and every project on the host holds new runs until it. The hold lifts when the intent
+closes (the drain that wrote it records no reboot, or `ttp resume` after it recorded nothing), when
+the host boots again, or a while after the intent's time. A drain that only took up another
+project's intent never closes it, since that cycle is still coming: once it and every later drain that
+moved the intent record no reboot, the intent gets back its own time and window.
+
 The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else kern.boottime); where none can be read,
 `--until-reboot` is refused.
 

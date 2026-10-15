@@ -299,6 +299,176 @@ def test_a_dry_run_drain_puts_back_the_time_of_an_intent_it_took_up(env, monkeyp
     assert {k: c4.get(k) for k in ml.RETIMED} == orig
 
 
+def _take_up(p, c, since, wait=1200):
+    """Project p's drain, started at `since`, takes up intent c (open_intent pushes it on): its intent_was
+    and since, as `ttp drain` gives them to record. The record is written later (_record_takeup)."""
+    from ttp import hostcycle
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", wait, now=since)
+    assert not wrote and c2["id"] == c["id"]
+    return {"intent": c["id"], "intent_was": hostcycle.before(c2, p.name, since), "since": since}
+
+
+def _record_takeup(p, took, end, rebooted=None):
+    """The drain of _take_up ends at `end`: it records the cycle and brings the intent to then; with
+    `rebooted` False its record then says no reboot."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    f = hostcycle.record(p, "kernel update", [], [], **took)
+    hostcycle.cycle_now(p, ml.changes()[0], now=end, since=took["since"])
+    if rebooted is False:
+        _no_reboot_record(f)
+    return f
+
+
+def _no_reboot_record(f):
+    f.write_text(json.dumps({**json.loads(f.read_text()), "rebooted": False}))
+
+
+def _undos(c):
+    return [e for e in c.get("edits") or [] if e.get("undo")]
+
+
+def test_take_ups_marked_out_of_order_end_at_the_intents_own_time(env, monkeypatch):
+    """Drains A then B take up one planned cycle. A says no reboot first: nothing is put back while B
+    waits (or has recorded a cycle that is still coming), since that would drop B's time; once B also
+    says no reboot, the intent is back at its own fields, not at A's retime, in one undo."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    a_took = _take_up(p, c, t0)
+    b_took = _take_up(b, c, t0 + 60)
+    b_time = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    assert b_time["at"] == t0 + 60 + 1200
+    fa = _record_takeup(p, a_took, t0 + 120)
+    b_time = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    _no_reboot_record(fa)
+    assert hostcycle.hold(q, t0 + 130, settle=True)["id"] == c["id"], "B still waits: held"
+    assert {k: ml.changes()[0].get(k) for k in ml.RETIMED} == b_time and not _undos(ml.changes()[0])
+    fb = _record_takeup(b, b_took, t0 + 180)
+    hostcycle.hold(q, t0 + 190, settle=True)
+    assert not _undos(ml.changes()[0]), "B's cycle is still coming"
+    _no_reboot_record(fb)
+    assert hostcycle.hold(q, t0 + 400, settle=False)["at"] == orig["at"], "read only: its own time"
+    hostcycle.hold(q, t0 + 400, settle=True)
+    hostcycle.hold(b, t0 + 400, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_take_ups_marked_in_order_are_undone_newest_first(env, monkeypatch):
+    """A and B took up one intent and both say no reboot: the edit trail is walked back newest first, so
+    the read-only view and the settled ledger both show the intent's own fields, written once."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    a_took = _take_up(p, c, t0)
+    b_took = _take_up(b, c, t0 + 60)
+    _record_takeup(p, a_took, t0 + 120, rebooted=False)
+    _record_takeup(b, b_took, t0 + 180, rebooted=False)
+    records = hostcycle._no_reboot_records(q, c)
+    assert [r["project"] for _, r in records] == ["third", "demo"], "newest first"
+    seen = hostcycle._undo_takeups(q, ml.changes()[0], records, False, t0 + 200)
+    assert {k: seen.get(k) for k in ml.RETIMED if seen.get(k) is not None} == {k: v for k, v in orig.items() if v is not None}
+    hostcycle.hold(q, t0 + 200, settle=True)
+    hostcycle.hold(q, t0 + 200, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_a_later_drain_of_the_same_project_keeps_its_retime(env, monkeypatch):
+    """A project's first drain took the intent up and said no reboot; its second drain takes it up again
+    and still waits: that retime is the second drain's (its edit's `drain`), so it stands."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    first = _take_up(p, c, t0)
+    _record_takeup(p, first, t0 + 120, rebooted=False)
+    _take_up(p, c, t0 + 200)
+    waiting = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    assert hostcycle.hold(q, t0 + 210, settle=True)["id"] == c["id"]
+    assert {k: ml.changes()[0].get(k) for k in ml.RETIMED} == waiting and not _undos(ml.changes()[0])
+
+
+def test_a_take_up_by_a_project_listed_under_another_key_is_undone_once(env, monkeypatch):
+    """The drain's project is registered under a key other than its name: its own daemon and a co-tenant's
+    both settle, and the intent is put back once."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    from ttp.project import load_registry, register, unregister
+    p, q = _hold_setup(env, monkeypatch)
+    b = _second_project(env, "third")
+    entry = load_registry()["projects"]["third"]
+    unregister("third")
+    register("third-elsewhere", {"host": entry["host"], "dir": entry["dir"]})
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    _record_takeup(b, _take_up(b, c, t0), t0 + 120, rebooted=False)
+    for proj in (b, q, p, b, q):
+        hostcycle.hold(proj, t0 + 200, settle=True)
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == orig and len(_undos(c2)) == 1
+
+
+def test_a_take_up_that_says_no_reboot_does_not_close_the_owners_intent(env, monkeypatch):
+    """A co-tenant's drain wrote the intent; this project's drain took it up and says no reboot. The
+    intent stays open at its writer's time (that cycle is still coming); the writer's own no-reboot
+    record closes it."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(q, "firmware update", 600, now=t0)
+    assert wrote
+    orig = {k: c.get(k) for k in ml.RETIMED}
+    _record_takeup(p, _take_up(p, c, t0 + 60), t0 + 120, rebooted=False)
+    assert hostcycle.hold(q, t0 + 130, settle=True)["id"] == c["id"], "the writer's own window holds"
+    (c2,) = ml.changes()
+    assert not c2.get("closed") and {k: c2.get(k) for k in ml.RETIMED} == orig
+    own = hostcycle.record(q, "firmware update", [], [], intent=c["id"], since=t0)
+    _no_reboot_record(own)
+    assert hostcycle.hold(q, t0 + 140, settle=True) is None and ml.changes() == []
+
+
+def test_no_take_up_is_undone_after_a_real_reboot(env, monkeypatch):
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    _record_takeup(p, _take_up(p, c, t0), t0 + 120, rebooted=False)
+    moved = {k: ml.changes()[0].get(k) for k in ml.RETIMED}
+    monkeypatch.setattr(hostcycle, "_rebooted_since", lambda c: True)
+    assert hostcycle.hold(q, t0 + 130, settle=True) is None
+    (c2,) = ml.changes()
+    assert {k: c2.get(k) for k in ml.RETIMED} == moved and not _undos(c2)
+
+
+def test_a_take_up_undo_after_the_intent_closed_is_skipped(env, monkeypatch):
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "other", "planned maintenance", now=t0)
+    _record_takeup(p, _take_up(p, c, t0), t0 + 120, rebooted=False)
+    stale = ml.changes()[0]
+    records = hostcycle._no_reboot_records(q, stale)
+    ml.close_change(c["id"], "done")
+    assert hostcycle._undo_takeups(q, stale, records, True, t0 + 130) is stale
+    (closed,) = ml.changes(open_only=False)
+    assert closed["closed"] and not _undos(closed)
+
+
 def test_a_drain_intent_quiets_outages_only_around_the_cycle(env, monkeypatch):
     """hold_from holds and steers from the drain's start, but expects_now ('down') starts only
     POWER_CYCLE_LEAD_S before the cycle, so a real outage during the wait is not quieted."""
