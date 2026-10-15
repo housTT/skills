@@ -3597,11 +3597,14 @@ def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
     agent = rf"\b(?:{who})\b(?:\s+cli)?"
     adv = r"(?:\s+(?:still|now|apparently|probably|also|again|here|there))?"
     agent_login = re.search(
-        rf"{agent}{adv}(?:\s+(?:is|was|got|has\s+been|may\s+be|might\s+be|seems(?:\s+to\s+be)?|appears(?:\s+to\s+be)?))?"
+        rf"(?:{agent}{adv}(?:\s+(?:is|was|got|has\s+been|may\s+be|might\s+be|seems(?:\s+to\s+be)?|appears(?:\s+to\s+be)?))?"
         rf"{adv}\s+logged\s+out\b|"
         rf"\b(?:{who})(?:'s)?(?:\s+cli)?(?:'s)?\s+(?:login|session|oauth\s+token|auth\s+token)\b|"
         rf"\blog\s+{agent}\s+(?:back\s+)?in\b|(?:^|\s)/login\s+in\s+{agent}|"
-        rf"\bcheck\s+which\s+account\s+{agent}\s+is\s+logged\s+in\b", said, re.I)
+        rf"\bcheck\s+which\s+account\s+{agent}\s+is\s+logged\s+in\b)"
+        # followed by another target (logged out of X, login to X, session on <other host>): fail open
+        r"(?!\s+(?:of|to|into|for)\b)"
+        r"(?!\s+(?:on|at)\s+(?!the\s+box\b|this\s+host\b))", said, re.I)
     metered = any(w in low for w in _AGENT_WORDS) and re.search(rf"\b(?:{who})\b", low)
     if not agent_login and not metered:
         return ""

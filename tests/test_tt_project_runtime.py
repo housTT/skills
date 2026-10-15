@@ -4883,6 +4883,9 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
     "Please log in again to the dashboard so claude can read the device metering data.",
     "The license server logged out the claude runs; please log in again on the license portal.",
     "The claude build server is logged out; please log in again on it.",
+    "Claude logged out of the NAS share; please log in again on the file server.",
+    "The claude session on the jump host ended; please log in again on the jump host.",
+    "Codex's login to the artifact store failed; please log in again there.",
 ])
 def test_a_login_ask_about_another_credential_is_never_refused(env, text):
     """Reviews #2338 and #2354: the gate refuses only a login of the agent CLI itself (the provider is
