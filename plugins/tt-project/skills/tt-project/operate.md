@@ -208,9 +208,13 @@
   event) when a worker or reviewer run ends with the root's checkout on another branch than as it
   started, or with tracked paths newly uncommitted. One alert per change, not per run that saw it:
   it blames the runs that worked in the project root (else the run that ended) and lists the rest
-  as also running; it changes nothing and clears once the checkout is back and those paths are clean.
+  as also running; it clears once the checkout is back and those paths are clean. A root left
+  detached or on another branch is first put back on its branch when no other run works there and
+  no rebase or merge is under way: a detached HEAD's commits are kept on `rescue/root-run<id>-<sha>`,
+  nothing is reset or forced, and a coordinator event says so instead of the alert.
   Code tasks always get their own worktree; `worktree.kinds` (default `[]`) gives other kinds one
-  too (say `["work"]`; never review or harness). Off by default because a fresh worktree lacks the
+  too (say `["work"]`; never harness). A review runs in the worktree holding the branch it reviews,
+  else in a detached worktree of its own at the reviewed head (`worktrees/t<id>`), never the root. Off by default because a fresh worktree lacks the
   root's untracked build trees, outputs and submodule checkouts that work tasks often use. Such a
   task's branch gets the local-only, backup and integrity checks of a code task, but no review.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.

@@ -1050,6 +1050,9 @@ class Daemon:
         known = {x for i in seen.values() for x in i.get("new") or []}
         new = (sorted(set(now_at["dirty"]) - set(before["dirty"]) - known)
                if before.get("dirty") is not None and now_at["dirty"] is not None else [])
+        if off and before.get("branch") and self._restore_root(r, before["branch"], now_at):
+            now_at = worktree.checkout_state(self.p.root) or now_at
+            off = (now_at["branch"] or now_at["head"]) != was
         if not off and not new:
             return
         rows = db.q("SELECT id, task, dir FROM runs WHERE role!='coordinator' AND task IS NOT NULL "
@@ -1104,6 +1107,31 @@ class Daemon:
         self.alert(seen[tid]["key"], text, severity="low", every_s=0)
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "observation", "normal", text[:1500], "queued", int(tid)))
+
+    def _restore_root(self, r: dict, branch: str, now_at: dict) -> bool:
+        """check_root_checkout's repair, model-free: a run left the project root detached or on another
+        branch than `branch`, where it started. Put it back (worktree.restore_root: a rescue branch
+        keeps a detached HEAD's commits; no reset, no force) unless another run still works in the
+        root, and record it in the log and as an event for the coordinator. Whether it is back."""
+        root = os.path.realpath(self.p.root)
+        for o in self.p.db.q("SELECT id, dir FROM runs WHERE status='running' AND role!='coordinator' AND id!=?",
+                             (r["id"],)):
+            cwd = (_read_result(self._run_dir(o) / "run.json") or {}).get("cwd")
+            if cwd and os.path.realpath(str(cwd)) == root:
+                log(self.p, f"run {r['id']}: the project root is off {branch}; not restored while run {o['id']} works there")
+                return False
+        ok, info = worktree.restore_root(self.p.root, branch, r["id"])
+        where = f"branch {now_at['branch']}" if now_at["branch"] else f"a detached HEAD at {now_at['head'][:12]}"
+        if not ok:
+            log(self.p, f"run {r['id']}: could not put the project root back on {branch} from {where}: {info}")
+            return False
+        text = (f"The project root's checkout was left on {where} after run {r['id']} of task #{r['task']}; the "
+                f"daemon put it back on {branch}" + (f" and kept the detached commits on branch {info}" if info else "")
+                + ". Nothing was reset or forced.")
+        log(self.p, text)
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), "daemon", "observation", "normal", text, "queued", int(r["task"])))
+        return True
 
     def clear_root_checkout(self, force: bool = False) -> None:
         """Close each open root-checkout alert (check_root_checkout) whose checkout is back on the
@@ -7790,6 +7818,13 @@ class Daemon:
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
             path, branch = worktree.ensure(self.p, task)
             return str(path), branch
+        if task["kind"] == "review" and worktree.is_git(self.p.root):
+            # A review that rebases or checks out a head must not do it in the root, which other
+            # tasks branch from: it works in the change's worktree, or one of its own.
+            prefer = str((conflictfix.of(task) or {}).get("branch") or "")
+            path = worktree.review_workdir(self.p, task, prefer)
+            if path:
+                return str(path), None
         return str(self.p.root), None
 
     # notifications and Slack -------------------------------------------------------------------------

@@ -644,6 +644,66 @@ def reviewed_head(p: Project, review: dict) -> str | None:
     return heads[0] if heads else None
 
 
+def review_workdir(p: Project, review: dict, prefer: str = "") -> Path | None:
+    """Where a review runs, never the project root: a review that rebases or checks out a head there
+    moves the checkout other tasks branch from. The worktree under worktrees/ that holds a branch the
+    review covers (`prefer` first, e.g. a push-conflict fix's branch; reviewed_refs), else one of
+    its own (worktrees/t<id>, detached at reviewed_head) made here. None when it reviews no commit
+    found here: it then runs in the root."""
+    own = p.worktrees / f"t{review['id']}"
+    recs = _records(p)
+    names = [r for r in dict.fromkeys([prefer] + reviewed_refs(p, review)) if r and not _HEX.fullmatch(r)]
+    base = p.worktrees.resolve()
+    for name in names:
+        for rec in recs.values():
+            path = Path(rec["path"])
+            if rec["branch"] == name and not rec["prunable"] and path.parent == base and path.is_dir():
+                return path
+    rec = _record_of(recs, own) if own.is_dir() else None
+    if rec and not rec["prunable"] and is_git(own):
+        return own   # an earlier run's: it may hold that run's rebase
+    head = reviewed_head(p, review)
+    if not head:
+        return None
+    p.worktrees.mkdir(parents=True, exist_ok=True)
+    if own.exists() or rec:
+        _clear_partial(p, own, rec)
+    _git(p.root, "worktree", "add", "--detach", str(own), head, timeout=git_timeout(p), env=checkout_env(p))
+    return own
+
+
+# Git operations whose state files in the git directory mean one is under way in a checkout.
+GIT_BUSY = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
+
+
+def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60) -> tuple[bool, str]:
+    """Put the checkout at `repo` back on `branch` after a run left it detached or on another branch,
+    losing nothing: a detached HEAD with commits `branch` lacks is saved first as rescue/root-run<id>-<sha>,
+    then `git checkout <branch>` (never forced or reset: git refuses to overwrite uncommitted changes,
+    and `branch` itself is not moved). Not while a rebase, merge, cherry-pick, revert or bisect is under
+    way there. (True, the rescue branch or "") or (False, why)."""
+    try:
+        gd = Path(_git(repo, "rev-parse", "--absolute-git-dir", timeout=timeout_s))
+        busy = [x for x in GIT_BUSY if (gd / x).exists()]
+        if busy:
+            return False, f"a git operation is under way there ({busy[0]})"
+        if not _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False, timeout=timeout_s):
+            return False, f"branch {branch} is gone"
+        head = _git(repo, "rev-parse", "HEAD", timeout=timeout_s)
+        detached = not _git(repo, "symbolic-ref", "--quiet", "HEAD", check=False, timeout=timeout_s)
+        rescue = ""
+        if detached and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head,
+                                        f"refs/heads/{branch}"], capture_output=True, timeout=timeout_s).returncode:
+            rescue = f"rescue/root-run{run_id}-{head[:12]}"
+            if _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{rescue}", check=False,
+                    timeout=timeout_s) != head:
+                _git(repo, "branch", rescue, head, timeout=timeout_s)   # no -f: an existing one is kept
+        _git(repo, "checkout", "--quiet", branch, timeout=timeout_s)
+        return True, rescue
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:300]
+
+
 def carried_head(p: Project, task: dict) -> str | None:
     """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto,
     or of the branch it rebases (rebased_branch)."""

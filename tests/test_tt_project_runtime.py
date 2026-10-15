@@ -45865,6 +45865,94 @@ def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts
     assert not alerts(f"root-checkout:{homing}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
 
 
+def test_a_review_run_works_in_the_changes_worktree_or_its_own_never_the_project_root(env):
+    p = make(env)
+    from ttp import daemon as dm
+    repo = env["repo"]
+    root_head = _git_out(repo, "rev-parse", "HEAD")
+    d = dm.Daemon(p.base)
+    code = p.db.add_task("the change", "s", kind="code", tier="light", origin="user")
+    cwd, branch = d._workdir_for(p.db.task(code))
+    p.db.update_task(code, status="done", branch=branch)
+    pathlib.Path(cwd, "change.txt").write_text("x\n")
+    _git_out(cwd, "add", "change.txt")
+    _git_out(cwd, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "the change")
+    head = _git_out(cwd, "rev-parse", "HEAD")
+    review = p.db.add_task("review it", f"Review {branch}.", kind="review", tier="light", origin="user")
+    # The change's worktree, while it is there.
+    assert d._workdir_for(p.db.task(review)) == (cwd, None)
+    # A push-conflict fix prefers the branch it rebases.
+    other = p.db.add_task("another change", "s", kind="code", tier="light", origin="user")
+    ocwd, obranch = d._workdir_for(p.db.task(other))
+    p.db.update_task(other, status="done", branch=obranch)
+    p.db.update_task(review, result=json.dumps({"conflict_fix": {"head": head, "branch": obranch}}))
+    assert d._workdir_for(p.db.task(review)) == (ocwd, None)
+    p.db.update_task(review, result=None)
+    # Once that worktree is gone, a detached one of its own at the reviewed head; reused by its next run.
+    _git_out(repo, "worktree", "remove", cwd)
+    own = str(p.worktrees / f"t{review}")
+    assert d._workdir_for(p.db.task(review)) == (own, None)
+    assert _git_out(own, "rev-parse", "HEAD") == head
+    assert _git_out(own, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD", "detached"
+    _git_out(own, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a rebase's commit")
+    kept = _git_out(own, "rev-parse", "HEAD")
+    assert d._workdir_for(p.db.task(review)) == (own, None) and _git_out(own, "rev-parse", "HEAD") == kept
+    # A review of nothing this repository holds runs in the root, as before.
+    plain = p.db.add_task("review the notes", "s", kind="review", tier="light", origin="user")
+    assert d._workdir_for(p.db.task(plain)) == (str(p.root), None)
+    assert _git_out(repo, "rev-parse", "HEAD") == root_head and _git_out(repo, "symbolic-ref", "-q", "HEAD")
+
+
+def test_the_daemon_puts_a_root_a_run_left_detached_back_on_its_branch_and_keeps_its_commits(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    repo = env["repo"]
+    base = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    d = dm.Daemon(p.base)
+    alerts = lambda key: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref=?", (key,))
+    # A run detaches the root and commits there (a rebase run in the wrong place).
+    t = p.db.add_task("rebases in the root", "s", kind="review", tier="light", origin="user")
+    row = _root_run(p, d, t)
+    _git_out(repo, "checkout", "-q", "--detach", tip)
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "made while detached")
+    made = _git_out(repo, "rev-parse", "HEAD")
+    _end_run(p, d, row)
+    assert _git_out(repo, "symbolic-ref", "--short", "HEAD") == base
+    assert _git_out(repo, "rev-parse", base) == tip, "the branch is not moved"
+    rescue = f"rescue/root-run{row['id']}-{made[:12]}"
+    assert _git_out(repo, "rev-parse", rescue) == made, "the detached commits are kept"
+    ev = p.db.one("SELECT text FROM events WHERE kind='observation' AND task=? AND text LIKE '%put it back%'", (t,))
+    assert ev and rescue in ev["text"] and base in ev["text"]
+    assert not alerts(f"root-checkout:{t}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+    # Another branch: back on its own, no rescue branch needed (the commits are on that branch).
+    t2 = p.db.add_task("switches the root", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, t2)
+    _git_out(repo, "checkout", "-q", "-b", "elsewhere")
+    _end_run(p, d, row)
+    assert _git_out(repo, "symbolic-ref", "--short", "HEAD") == base
+    assert not _git_out(repo, "branch", "--list", f"rescue/root-run{row['id']}-*")
+    # A rebase under way there is left alone: alerted, not touched.
+    t3 = p.db.add_task("mid-rebase", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, t3)
+    _git_out(repo, "checkout", "-q", "--detach", tip)
+    busy = pathlib.Path(_git_out(repo, "rev-parse", "--absolute-git-dir")) / "rebase-merge"
+    busy.mkdir()
+    try:
+        _end_run(p, d, row)
+        assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD", "left as it is"
+        assert len(alerts(f"root-checkout:{t3}")) == 1
+    finally:
+        busy.rmdir()
+        _git_out(repo, "checkout", "-q", base)
+
+
 def test_one_root_change_seen_by_two_runs_raises_one_alert_naming_the_run_in_the_root(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
