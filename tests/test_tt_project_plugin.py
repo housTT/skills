@@ -858,7 +858,8 @@ def test_the_test_runner_summary_line_is_stable_and_greppable():
 
 def test_the_suite_puts_its_temp_files_on_a_free_tmpfs_on_linux_only(tmp_path, pytestconfig):
     """tests/conftest.py moves the session's temp root to a writable tmpfs with enough room, on Linux,
-    unless the user chose a temp root or opted out; and only in this process, never through the env."""
+    unless the caller chose a temp root (TMPDIR included), it runs on CI or opted out; and only in this
+    process, never through the env."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("ttp_conftest_copy", pathlib.Path(__file__).with_name("conftest.py"))
     conf = importlib.util.module_from_spec(spec)
@@ -879,6 +880,13 @@ def test_the_suite_puts_its_temp_files_on_a_free_tmpfs_on_linux_only(tmp_path, p
     assert pick(environ={"TTP_TEST_TMPFS": "1"}) == os.path.realpath(shm)
     assert pick(given=tmp_path / "bt") is None, "--basetemp"
     assert pick(environ={"PYTEST_DEBUG_TEMPROOT": str(tmp_path)}) is None, "a temp root the user set"
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        assert pick(environ={var: str(tmp_path)}) is None, f"{var} the caller set (ttp checks' scratch)"
+    assert pick(environ={"TTP_CHECK_OUTPUT_DIR": str(tmp_path)}) is None, "a ttp checks run"
+    assert pick(environ={"TTP_CHECKS_TMP_FD": "9"}) is None, "a ttp checks run"
+    for var in ("CI", "GITHUB_ACTIONS"):
+        assert pick(environ={var: "true"}) is None, f"{var}: CI keeps pytest's default"
+        assert pick(environ={var: "false"}) == pick(environ={var: "0"}) == os.path.realpath(shm)
     assert pick(platform="darwin") is None, "macOS keeps pytest's default"
     chosen = getattr(pytestconfig, "_ttp_tmpfs", None)
     if chosen:   # this session picked a tmpfs: its temp dirs are there, and nothing was exported

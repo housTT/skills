@@ -45644,7 +45644,6 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", str(nested_tmp))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
-    monkeypatch.setenv("TTP_TEST_TMPFS", "0")   # and its pytest temp root stays under its TMPDIR
     for var in ("TMPDIR", "TMP", "TEMP"):
         monkeypatch.setenv(var, str(nested_tmp))
     cli.main(["checks"])

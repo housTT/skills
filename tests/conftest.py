@@ -449,9 +449,13 @@ TMPFS_MIN_FREE = 2 << 30
 def _tmpfs_root(given_basetemp, environ, platform: str = sys.platform, path: str = TMPFS,
                 min_free: int = TMPFS_MIN_FREE, mounts: str = "/proc/self/mounts") -> str | None:
     """The tmpfs folder to hold this session's temp files, or None to keep pytest's default: not
-    Linux, a --basetemp or PYTEST_DEBUG_TEMPROOT the user chose, TTP_TEST_TMPFS=0, or no writable
-    tmpfs at `path` with `min_free` bytes free."""
-    if (not platform.startswith("linux") or given_basetemp is not None or environ.get("PYTEST_DEBUG_TEMPROOT")
+    Linux, on CI, a temp root the caller chose (--basetemp, PYTEST_DEBUG_TEMPROOT, TMPDIR/TMP/TEMP,
+    or a `ttp checks` run, whose TMPDIR is scratch reclaimed with its allocation), TTP_TEST_TMPFS=0,
+    or no writable tmpfs at `path` with `min_free` bytes free."""
+    if (not platform.startswith("linux") or given_basetemp is not None
+            or any(environ.get(k) for k in ("PYTEST_DEBUG_TEMPROOT", "TMPDIR", "TMP", "TEMP",
+                                            "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD"))
+            or any(environ.get(k, "").strip().lower() not in ("", "0", "false") for k in ("CI", "GITHUB_ACTIONS"))
             or environ.get("TTP_TEST_TMPFS", "").strip() == "0"):
         return None
     try:
