@@ -9790,6 +9790,41 @@ def test_a_blocked_task_can_be_repointed_and_stays_queued(env):
         assert p.db.task(other)["status"] != "blocked", "a cleared dependency was blocked again"
 
 
+def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(env):
+    """A user turn whose task_add came with a null title or spec is rejected with a reason the next
+    turn can fix: its user message stays unhandled for that turn, which sees it with the rejection.
+    Once only: rejected again, the message is handled and the rejection still reaches the digest."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    for a, missing in (({"title": None, "spec": None}, "a title and a spec"), ({"title": "x", "spec": None}, "a spec"),
+                       ({"title": " ", "spec": "s"}, "a title")):
+        (x,) = coord.apply(p, [{"type": "task_add", **a}])
+        assert x.startswith(f"task_add: task_add needs {missing}:") and coord.fixable_rejection(x), x
+    assert not p.db.q("SELECT id FROM tasks"), "a task_add with a null title or spec created a task"
+    mid = p.db.post("in", "please look into the flaky test", chat="c1")
+    turn = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": None, "spec": None, "kind": None},
+                                                   {"type": "memory_add", "text": "flaky test reported"}],
+                                       "summary": "added"}, error="", final_text="")
+    d._finish_coordinator({"id": 1, "dir": "x"}, turn, "ok", {"messages": [mid]})
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 0
+    digest = coord.digest(p, {}, [], [])
+    assert "task_add needs a title and a spec" in digest and f"user message #{mid} is shown to you again, once" in digest
+    # The retry repeats the mistake: the message is handled now, the rejection still goes to the digest.
+    d._finish_coordinator({"id": 2, "dir": "x"}, turn, "ok", {"messages": [mid]})
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 1
+    assert "task_add needs a title and a spec" in coord.digest(p, {}, [], [])
+    # A rejection the next turn cannot fix from its output (a duplicate) handles the message as before.
+    p.db.add_task("busy", "s", origin="user")
+    mid2 = p.db.post("in", "add busy", chat="c1")
+    dup = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": "busy", "spec": "s"}]},
+                          error="", final_text="")
+    d._finish_coordinator({"id": 3, "dir": "x"}, dup, "ok", {"messages": [mid2]})
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid2,))["handled"] == 1
+
+
 def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
     p = make(env)
     from types import SimpleNamespace
@@ -9834,10 +9869,10 @@ def test_task_add_rejects_unknown_or_dead_dependencies(env):
     p.db.update_task(gone, status="cancelled")
     before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
     for deps, why in (([999], "no task #999"), ([ok, gone], f"#{gone} which is cancelled"), ("x", "must be a list")):
-        problems = coord.apply(p, [{"type": "task_add", "title": f"new {why}", "depends_on": deps}])
+        problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": f"new {why}", "depends_on": deps}])
         assert len(problems) == 1 and why in problems[0], (deps, problems)
     assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected task_add created a task"
-    assert not coord.apply(p, [{"type": "task_add", "title": "fine", "depends_on": [ok, ok]}])
+    assert not coord.apply(p, [{"type": "task_add", "spec": "s", "title": "fine", "depends_on": [ok, ok]}])
     assert json.loads(p.db.one("SELECT depends_on FROM tasks WHERE title='fine'")["depends_on"]) == [ok]
 
 def test_task_add_continues_takes_over_the_dead_tasks_dependents(env):
@@ -9878,12 +9913,12 @@ def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status)
     p.db.update_task(old, status=status)
     dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
     before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
-    problems = coord.apply(p, [{"type": "task_add", "title": "redo", "continues": old}])
+    problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": "redo", "continues": old}])
     assert len(problems) == 1 and f"#{old} is {status}" in problems[0], problems
     assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected continue created a task"
     assert json.loads(p.db.task(dep)["depends_on"]) == [old]
     for bad, why in ((999, "no task #999"), ("x", "task id")):
-        problems = coord.apply(p, [{"type": "task_add", "title": f"redo {bad}", "continues": bad}])
+        problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": f"redo {bad}", "continues": bad}])
         assert len(problems) == 1 and why in problems[0], problems
 
 
@@ -9895,7 +9930,7 @@ def test_task_add_continues_rejects_a_dependency_on_its_own_dependents(env):
     child = p.db.add_task("child", "s", origin="user", depends_on=[old])
     grandchild = p.db.add_task("grandchild", "s", origin="user", depends_on=[child])
     for deps in ([child], [grandchild], [old]):
-        problems = coord.apply(p, [{"type": "task_add", "title": f"redo {deps}", "continues": old,
+        problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": f"redo {deps}", "continues": old,
                                     "depends_on": deps}])
         assert len(problems) == 1 and ("cycle" in problems[0] or "it continues" in problems[0]), problems
     assert json.loads(p.db.task(child)["depends_on"]) == [old]
@@ -9908,8 +9943,8 @@ def test_continuing_a_blocked_task_cancels_it_and_may_reuse_its_title(env):
     p.db.update_task(old, status="blocked", blocked_reason="needs a rethink")
     other = p.db.add_task("other", "s", origin="user")
     p.db.update_task(other, status="blocked")
-    assert coord.apply(p, [{"type": "task_add", "title": "other", "continues": old}])[0].startswith("task_add: duplicate")
-    assert coord.apply(p, [{"type": "task_add", "title": "stuck", "continues": old}]) == []
+    assert coord.apply(p, [{"type": "task_add", "spec": "s", "title": "other", "continues": old}])[0].startswith("task_add: duplicate")
+    assert coord.apply(p, [{"type": "task_add", "spec": "s", "title": "stuck", "continues": old}]) == []
     new = p.db.one("SELECT id FROM tasks WHERE title='stuck' AND id!=?", (old,))["id"]
     assert p.db.task(old)["status"] == "cancelled" and f"#{new}" in p.db.task(old)["blocked_reason"]
     assert p.db.task(other)["status"] == "blocked"
@@ -10176,7 +10211,7 @@ def test_a_code_task_continues_from_the_dead_tasks_branch(env):
     head = _git_out(path, "rev-parse", "HEAD")
     p.db.update_task(old, status="failed", branch=branch,
                      result=json.dumps({"status": "failed", "summary": "ran out of budget at step 3"}))
-    assert coord.apply(p, [{"type": "task_add", "title": "finish old", "kind": "code", "continues": old}]) == []
+    assert coord.apply(p, [{"type": "task_add", "spec": "s", "title": "finish old", "kind": "code", "continues": old}]) == []
     new = p.db.one("SELECT * FROM tasks WHERE title='finish old'")
     new_path, new_branch = worktree.ensure(p, new)
     assert new_branch != branch
@@ -10196,7 +10231,7 @@ def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
     old_head = _git_out(path, "rev-parse", "HEAD")
     p.db.update_task(old, status="done", branch=branch)
     dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
-    problems = coord.apply(p, [{"type": "task_add", "title": "more", "kind": "code", "continues": old}])
+    problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": "more", "kind": "code", "continues": old}])
     new = p.db.one("SELECT * FROM tasks WHERE title='more'")
     assert problems == [] and p.db.kv(coord.NOTES_KEY) == [f"task_add: #{old} is done; added #{new['id']} as its follow-up"]
     assert new["parent"] == old and f"continues:{old}" not in json.loads(new["labels"])
@@ -10227,7 +10262,7 @@ def test_follow_up_and_bare_seconds_notes_are_information_not_rejections(env):
     p.db.update_task(old, status="done")
     turn = SimpleNamespace(structured={"actions": [
         {"type": "reply", "text": "Adding the follow-up and the probe.", "chat": "c1"},
-        {"type": "task_add", "title": "more", "continues": old},
+        {"type": "task_add", "spec": "s", "title": "more", "continues": old},
         {"type": "schedule_set", "name": "probe", "kind": "command", "command": "true", "every": 900}],
         "summary": ""}, error="", final_text="")
     d._finish_coordinator({"dir": "x"}, turn, "ok", {})
@@ -10450,7 +10485,7 @@ def test_a_dependency_cycle_is_rejected_at_creation_and_an_existing_one_is_flagg
     problems = coord.apply(p, [{"type": "task_update", "id": a, "depends_on": [r]}])
     assert len(problems) == 1 and "cycle" in problems[0], problems
     # task_add continues=a moves r onto the new task, which may not wait on r.
-    problems = coord.apply(p, [{"type": "task_add", "title": "redo", "continues": a, "depends_on": [r]}])
+    problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": "redo", "continues": a, "depends_on": [r]}])
     assert len(problems) == 1 and "cycle" in problems[0], problems
     # One written past those checks (an older release, a hand edit) is flagged with its members.
     p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([r]), a))
@@ -10585,7 +10620,7 @@ def test_status_json_exposes_each_tasks_dependencies_and_start_and_retry_conditi
     old = p.db.add_task("old try", "s", origin="user")
     p.db.update_task(old, status="failed")
     assert coord.apply(p, [
-        {"type": "task_add", "title": "later", "depends_on": [first], "continues": old,
+        {"type": "task_add", "spec": "s", "title": "later", "depends_on": [first], "continues": old,
          "start_after": "3h", "start_when": "test -e /tmp/ready"}]) == []
     later = p.db.one("SELECT id FROM tasks WHERE title='later'")["id"]
     retry_at = time.time() + 900
@@ -18907,7 +18942,7 @@ def test_the_task_cap_names_its_next_slot_and_wakes_then(env, monkeypatch):
     for tid, ago in zip(old, (3600, 1800)):
         p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - ago, tid))
     problems = coord.apply(p, [{"type": "reply", "text": "Starting the fix now.", "chat": "c1"},
-                               {"type": "task_add", "title": "review the fix", "kind": "review"},
+                               {"type": "task_add", "spec": "s", "title": "review the fix", "kind": "review"},
                                {"type": "task_add", "title": "fix it", "spec": "s"}])
     assert p.db.one("SELECT id FROM tasks WHERE title='review the fix'"), "a review counted toward the task cap"
     assert not p.db.one("SELECT id FROM tasks WHERE title='fix it'")
@@ -18954,7 +18989,7 @@ def test_a_task_cap_of_0_stops_new_tasks_without_a_wake_loop(env, monkeypatch):
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "-3"}]) == []
     assert p.config()["coordinator"]["max_new_tasks_per_day"] == 0
     problems = coord.apply(p, [{"type": "task_add", "title": "fix it", "spec": "s"},
-                               {"type": "task_add", "title": "review it", "kind": "review"}])
+                               {"type": "task_add", "spec": "s", "title": "review it", "kind": "review"}])
     assert len(problems) == 2 and all("is 0" in x for x in problems), problems
     assert not p.db.one("SELECT id FROM tasks WHERE origin='coordinator'")
     d = Daemon(p.base)
@@ -18978,7 +19013,7 @@ def test_review_tasks_have_their_own_higher_cap(env):
     p = make(env)
     from ttp import coordinator as coord
     p.set_config("coordinator.max_new_tasks_per_day", 1)
-    adds = [{"type": "task_add", "title": f"review {i}", "kind": "review"} for i in range(3)]
+    adds = [{"type": "task_add", "spec": "s", "title": f"review {i}", "kind": "review"} for i in range(3)]
     problems = coord.apply(p, adds)
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2, "reviews skipped their cap of 2x"
     assert len(problems) == 1 and "cap of 2 review tasks" in problems[0], problems
@@ -18986,7 +19021,7 @@ def test_review_tasks_have_their_own_higher_cap(env):
     # Reviews and other tasks count apart.
     assert coord.apply(p, [{"type": "task_add", "title": "fix it", "spec": "s"}]) == []
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.max_review_tasks_per_day", "value": "3"}]) == []
-    assert coord.apply(p, [{"type": "task_add", "title": "review 2", "kind": "review"}]) == []
+    assert coord.apply(p, [{"type": "task_add", "spec": "s", "title": "review 2", "kind": "review"}]) == []
     assert coord.task_cap(p.config(), review=True) == 3
 
 
@@ -30758,7 +30793,7 @@ def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
     for bad in SH_BROKEN:
         actions = [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": bad},
                    {"type": "memory_add", "text": "Stay off box A for now.", "until_probe": bad},
-                   {"type": "task_add", "title": "later", "start_when": bad},
+                   {"type": "task_add", "spec": "s", "title": "later", "start_when": bad},
                    {"type": "observation_mute", "source": "watcher:hw", "match": "dropped", "end_when": bad}]
         problems = coord.apply(p, actions)
         assert len(problems) == 4 and all("not valid POSIX sh" in x for x in problems), problems
@@ -30776,8 +30811,8 @@ def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
     first = p.db.add_task("first", "s", kind="work", tier="light", origin="user")
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": good},
                            {"type": "memory_add", "text": "Stay off box A for now.", "until_probe": good},
-                           {"type": "task_add", "title": "later", "start_when": good},
-                           {"type": "task_add", "title": "after", "start_when": f"landed:#{first}"},
+                           {"type": "task_add", "spec": "s", "title": "later", "start_when": good},
+                           {"type": "task_add", "spec": "s", "title": "after", "start_when": f"landed:#{first}"},
                            {"type": "observation_mute", "source": "watcher:hw", "match": "dropped",
                             "end_when": good}]) == []
     assert p.db.paused_resources()["board"]["end_when"] == good and scr.mutes(p.db)
@@ -44583,6 +44618,42 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     other, _, done, reviews = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
     assert not reviews and not p.db.q("SELECT id FROM tasks WHERE parent=?", (other,))
     assert done["status"] == "queued" and "Continue hop" not in done["text"]
+
+
+def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_once(env):
+    """A done code hop with changes and one `continue:` follow-up the daemon could not queue (no review
+    to carry its commits) says NOT queued in its task_done and followup_proposed events. Left alone for
+    30 min, it raises one high continue_unqueued event; a task that continues it raises none."""
+    p = make(env)
+    from ttp import daemon as dm
+    p.set_config("review.auto", False)
+    tid, _, done, _ = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    assert "Continue hop" not in done["text"] and f"Continue follow-up {dm.UNQUEUED_TAG}" in done["text"]
+    fup = p.db.one("SELECT text, status FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+    assert fup["status"] == "queued" and fup["text"].startswith(
+        f"proposed follow-up ({dm.UNQUEUED_TAG}: add it with continues #{tid} or drop it): continue: widget")
+    d = dm.Daemon(p.base)
+
+    def check(age_s):
+        p.db.x("UPDATE events SET ts=? WHERE kind='task_done'", (time.time() - age_s,))
+        d._continues_checked = 0.0
+        d.check_unqueued_continues()
+        return p.db.q("SELECT * FROM events WHERE kind=?", (dm.CONTINUE_UNQUEUED,))
+    assert check(600) == [], "raised before 30 min"
+    (ev,) = check(dm.CONTINUE_UNQUEUED_AFTER_S + 60)
+    assert ev["task"] == tid and ev["severity"] == "high" and ev["status"] == "queued"
+    assert "'continue: widget'" in ev["text"] and dm.UNQUEUED_TAG in ev["text"] and f"continues #{tid}" in ev["text"]
+    assert len(check(dm.CONTINUE_UNQUEUED_AFTER_S + 60)) == 1, "raised twice for one task"
+    # A follow-up a turn did add with continues is taken up: nothing to raise.
+    other, _, _, _ = _finish_code(env, p, "gadget", {"g.py": 10}, result=_cont("gadget"))
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "continue: gadget", "spec": "carry on", "kind": "code",
+                            "continues": other}]) == []
+    assert [e["task"] for e in check(dm.CONTINUE_UNQUEUED_AFTER_S + 60)] == [tid]
+    # Older than the window: not checked at all.
+    third, _, _, _ = _finish_code(env, p, "doohickey", {"d.py": 10}, result=_cont("doohickey"))
+    assert [e["task"] for e in check(dm.CONTINUE_UNQUEUED_WINDOW_S + 60)] == [tid]
 
 
 def _land_on_proj(repo, other, branch):
