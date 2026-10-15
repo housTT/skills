@@ -2192,6 +2192,10 @@ def left(s):  # Slurm's form for time used and time left: [d-][h:]m:ss
         return "-"
     d_, s = divmod(max(0, int(s)), 86400); h, s = divmod(s, 3600); m, s = divmod(s, 60)
     return f"{d_}-{h:02}:{m:02}:{s:02}" if d_ else f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+def hang(s):  # up to s seconds, but only while the caller (its ssh) lives: an orphan never outlives the test
+    parent, end = os.getppid(), time.time() + s
+    while os.getppid() == parent and time.time() < end:
+        time.sleep(0.1)
 path = os.path.join(d, "ird.json")
 st = json.load(open(path))
 a = sys.argv[1:]
@@ -2222,10 +2226,7 @@ elif cmd == "reserve":
         else:
             flags[rest[i][2:]] = rest[i + 1]; i += 2
     if os.environ.get("FAKE_IRD_SLEEP"):  # hangs past the caller's wait, until its ssh is killed; lands nothing
-        parent, end = os.getppid(), time.time() + float(os.environ["FAKE_IRD_SLEEP"])
-        while os.getppid() == parent and time.time() < end:
-            time.sleep(0.1)
-        sys.exit(0)
+        hang(float(os.environ["FAKE_IRD_SLEEP"])); sys.exit(0)
     if len(rest) - i != 1 or os.environ.get("FAKE_IRD_NOOP"):
         print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
         sys.exit(int(os.environ.get("FAKE_IRD_RC", "0")))
@@ -2251,8 +2252,8 @@ elif cmd == "reserve":
     if os.environ.get("FAKE_IRD_LIST_FAIL"):
         open(os.path.join(d, "list-fails"), "w").write(os.environ["FAKE_IRD_LIST_FAIL"])
     if os.environ.get("FAKE_IRD_HANG"):  # landed, then hangs until a timeout or a signal
-        import time; json.dump(st, open(path, "w")); open(os.environ["FAKE_IRD_HANG"], "w").close()
-        time.sleep(60)
+        json.dump(st, open(path, "w")); open(os.environ["FAKE_IRD_HANG"], "w").close()
+        hang(60)
     if os.environ.get("FAKE_IRD_RC"):
         json.dump(st, open(path, "w")); sys.exit(int(os.environ["FAKE_IRD_RC"]))
 elif cmd in ("release", "change-timeout", "reboot"):
@@ -2358,13 +2359,19 @@ class FakeIrd:
 
 
 @pytest.fixture
-def fake_ird(tmp_path):
+def fake_ird(tmp_path, leaked_tmp_processes, reap_tmp_processes):
     import socket
+    import time
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(128)  # every probe connects and is never accepted
     yield FakeIrd(tmp_path, srv.getsockname()[1])
     srv.close()
+    deadline = time.time() + 5  # a hanging stub ends within 0.1 s of its caller
+    while (left := leaked_tmp_processes(tmp_path)) and time.time() < deadline:
+        time.sleep(0.1)
+    reap_tmp_processes(tmp_path)
+    assert not left, f"the fake ird or ssh outlived the test: {left}"
 
 
 def test_setup_box_ird_list_skips_draining_down_and_reboot_pending(fake_ird):
