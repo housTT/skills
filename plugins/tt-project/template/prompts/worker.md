@@ -166,12 +166,10 @@ never write to a run folder named in earlier context):
   final marker, and point `retry_when` at it. The driver runs with `set -eo pipefail`, never pipes a
   step into tail/head, logs each step's exit code and writes the first non-zero one to the marker
   from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`); size each step's timeout to its tool.
-  Retry transient faults (a busy device, a recovering broker, an ssh stall) inside it with
-  bounded backoff; mark failure only for a non-transient fault or once retries run out. A wait
-  for a device or box checks it live (its broker's status), never a readiness marker file. It
-  tests the job rows, never a section header that is always printed (`grep -q RUNNING` matches
-  with no job running). A wait
-  for a broker hold to end uses `ttp broker-released` on its /health answer and log tail: a
+  Retry transient faults (busy device, recovering broker, ssh stall) inside it with bounded
+  backoff; fail only on a non-transient fault or spent retries. A device or box wait reads its
+  broker's job rows live, never a header it always prints (`grep RUNNING`) or a marker file.
+  A wait for a broker hold to end uses `ttp broker-released` on its /health answer and log tail: a
   `device_released` event is not the only sign (also /health `held` false with a healthy fsm, or a
   `hold released` log line).
   When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
