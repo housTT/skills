@@ -806,9 +806,15 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
   (default 1800: a batch starts only once the last one ended at least this long ago, measured
   from its recorded end so a restart or a failed batch never stretches the wait; a full batch or
-  a priority-1 review's approval starts at once; 0 = off), `after_push`
+  a priority-1 review's approval starts at once; 0 = off), `push_landing_alert_h` (default 4:
+  when approvals have waited this many hours with nothing landed on the push branch and at least
+  two batches tried them, one high alert says so, with the attempt count and how many a host
+  reboot cut short; it clears when a batch lands; 0 = off), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
-  (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
+  (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
+  and three such batches in a row raise a high alert, unless the host rebooted while it ran: then
+  it is reported as cut short by that reboot (its time in the home zone), counts no try and no
+  pause, raises no alert by itself and runs again as soon as the daemon is back. `after_push` runs after each push in a clean worktree at the pushed commit,
   with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION` (the version `version_bump` reads at the pushed
   commit; empty without `version_bump`), `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`, `TTP_PUSH_BATCH` and
   `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never fails the reviews:

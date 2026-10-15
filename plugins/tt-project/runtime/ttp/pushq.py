@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, coordinator as coord, locks, push, timefmt, upstream
+from . import checkdirs, batch, coordinator as coord, locks, push, runner, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -37,6 +37,9 @@ BAD_TIP_ALERT = "push_tip_failing"   # the keyed alert while the push branch tip
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
+DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiting this long with no landing alert (high)
+LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
+LANDED_OUTCOMES = ("pushed", "landed")   # batch outcomes that put the approvals on the push branch
 DEPLOY_ALERTED = "deploy_alerted"   # deploy.ALERTED: the last deploy alert, by commit
 MAX_RESUMES = 1                 # respawns of an after_push that died (a reboot killed the deploy)
 RECOVER_S = 1800                # a batch that died mid-push: how long its remote may stay unreadable
@@ -567,6 +570,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
     if len(rows) >= cap:
         why = f"{len(rows)} approvals"
+    elif (last := db.one("SELECT id, outcome FROM push_batches ORDER BY started DESC LIMIT 1")) and \
+            last["outcome"] == "rebooted":
+        why = f"a rerun of {last['id']}, cut short by a reboot"
     elif any(r["priority"] == 1 for r in rows):
         why = "a priority-1 review"
     elif (left := _gap_left(db, now, gap)) > 0:
@@ -767,17 +773,41 @@ def _tail_of(m: dict, detail: dict | None = None, n: int = 20) -> str:
     return "\n".join((tail or push._tail(m.get("log"), n)).splitlines()[-n:])
 
 
-def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, queued: bool = False) -> None:
+def _reboot_in(p: Project, started: float, now: float) -> float | None:
+    """The first host boot after `started` and by `now`: one the daemon recorded (DB.boots), or this
+    boot's own time while the daemon has not recorded it yet. None when the host did not reboot."""
+    times = [float(x.get("boot_time") or x["ts"]) for x in p.db.boots(started)]
+    if (this := runner.boot_time()) is not None:
+        times.append(this)
+    return min((t for t in times if started < t <= now), default=None)
+
+
+def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, queued: bool = False,
+          rebooted: float | None = None) -> None:
     """A batch that ended without a usable outcome: its rows go back to approved, a try counted, and
     the queue backs off. DYING_AFTER of them in a row raise push_queue_dying. `queued`: the event
-    needs the coordinator (something is left that the queue cannot recover)."""
+    needs the coordinator (something is left that the queue cannot recover). `rebooted`: the boot
+    that cut it short; then no try is counted, nothing backs off and the batch runs again at once
+    (due), as the batch itself never failed."""
     db = p.db
+    outcome = "error" if m.get("outcome") == "error" else "rebooted" if rebooted else "died"
     with db.tx():
         if not db.conn.execute("UPDATE push_batches SET outcome=?, ended=?, finalized=?, after_push='skipped', "
                                "after_finalized=? WHERE id=? AND finalized IS NULL",
-                               ("error" if m.get("outcome") == "error" else "died", now, now, now, b["id"])).rowcount:
+                               (outcome, now, now, now, b["id"])).rowcount:
             return
         rows = db.q("SELECT id, tries FROM push_queue WHERE batch=? AND status='batched'", (b["id"],))
+        if rebooted:
+            db.x("UPDATE push_queue SET status='approved', updated=? WHERE batch=? AND status='batched'",
+                 (now, b["id"]))
+            st = _state(db)
+            st.pop("backoff_until", None)
+            db.set_kv(KV, st)
+            _event(db, None, "push_batch_died",
+                   f"push batch {b['id']} was cut short by the {_at(rebooted, now, p)} reboot; {len(rows)} approval"
+                   f"{'s' if len(rows) != 1 else ''} back in the queue, run again at once", queued=False)
+            push._forget_lock(Path(b["marker"]))
+            return
         db.x("UPDATE push_queue SET status='approved', tries=tries+1, updated=? WHERE batch=? AND status='batched'",
              (now, b["id"]))
         tries = max([r["tries"] + 1 for r in rows] or [1])
@@ -1416,7 +1446,11 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
                             f"ran for it" if m.get("unverified")
                        else "ended before writing an outcome (a reboot, a kill or a crash)" if m
                        else "lost its marker")
-                _died(p, b, m, alert, why, now_, queued=bool(m.get("unverified")))
+                # Only a batch that wrote nothing it could not finish: an unverified push still needs
+                # the coordinator, reboot or not, and an error is the batch's own.
+                cut = (_reboot_in(p, float(b["started"]), now_) if m and not m.get("unverified")
+                       and m.get("outcome") != "error" else None)
+                _died(p, b, m, alert, why, now_, queued=bool(m.get("unverified")), rebooted=cut)
                 changed.append(b["id"])
                 continue
             changed.append(b["id"])
@@ -1478,7 +1512,41 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
     cancel_orphans(p)
     if may_requeue:
         queue_off(p, cfg)
-    return finalize(p, cfg, alert)
+    changed = finalize(p, cfg, alert)
+    check_landing(p, cfg, alert)
+    return changed
+
+
+def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
+                  now: float | None = None) -> bool:
+    """Raise LANDING_ALERT (high) once per stall: approvals have waited delivery.push_landing_alert_h
+    (0 = off) since the last landing on the push branch and at least two batches tried them. It
+    counts the batches and how many a reboot cut short; alerts.holds clears it once a batch lands.
+    Returns whether it alerted now."""
+    now = time.time() if now is None else now
+    db = p.db
+    hours = _num(_delivery(p, cfg).get("push_landing_alert_h"), DEFAULT_LANDING_ALERT_H, float, 0)
+    oldest = db.one("SELECT MIN(created) AS t FROM push_queue WHERE status IN ('approved','batched')")
+    if hours <= 0 or not oldest or oldest["t"] is None:
+        return False
+    marks = ",".join("?" * len(LANDED_OUTCOMES))
+    landed = db.one(f"SELECT MAX(finalized) AS t FROM push_batches WHERE outcome IN ({marks})", LANDED_OUTCOMES)
+    since = max(float(oldest["t"]), float(landed["t"] or 0) if landed else 0.0)
+    if now - since < hours * 3600:
+        return False
+    tries = db.q("SELECT outcome FROM push_batches WHERE started>=? AND finalized IS NOT NULL", (since,))
+    st = _state(db)
+    if len(tries) < 2 or float(st.get("landing_told") or 0) >= since:
+        return False
+    st["landing_told"] = now
+    db.set_kv(KV, st)
+    cut = sum(1 for r in tries if r["outcome"] == "rebooted")
+    tgt = target(p)
+    alert(LANDING_ALERT, f"Nothing has landed on {'/'.join(tgt) if tgt else 'the push branch'} for "
+                         f"{(now - since) / 3600:.1f} h although approvals wait: {len(tries)} push batch"
+                         f"{'es' if len(tries) != 1 else ''} tried, {cut} of them cut short by a host reboot. "
+                         f"The queue keeps retrying; this clears once a batch lands.", severity="high")
+    return True
 
 
 # reading ------------------------------------------------------------------------------------------
@@ -1552,7 +1620,7 @@ PHASE_WORDS = {"push": "checking", "after_push": "deploying", "finished": "finis
 OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing": "nothing to push",
                  "conflict": "conflicted", "tip_failed": "the branch tip fails its checks", "moved": "the branch kept moving",
                  "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
-                 "died": "ended before finishing", "error": "failed"}
+                 "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed"}
 AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
                "killed": "deploy cut short", "skipped": "no deploy"}
 

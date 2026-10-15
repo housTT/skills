@@ -26437,6 +26437,102 @@ def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_ale
     assert [ep["key"] for ep in alerts.sweep(s.p.db)] == ["push_queue_dying"], "a finished batch clears the alert"
 
 
+def _pq_boot(p, ts):
+    """Record a host boot at `ts`, as the daemon does once it is back (Daemon._tell_reboot)."""
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
+           (ts, "host", "boot", f"boot:{ts}", "normal", "the host rebooted (abrupt)", json.dumps({"boot_time": ts}),
+            "record"))
+
+
+@pytest.mark.parametrize("boot", ["inside", "before", "none"])
+def test_a_batch_cut_short_by_a_reboot_runs_again_at_once_without_backoff(env, monkeypatch, boot):
+    """A boot inside the batch's run: 'cut short by the HH:MM reboot', no try counted, no backoff, no
+    death toward push_queue_dying, and due() takes it again at once (no gap). A batch that died
+    with no boot inside its run (a kill) keeps the old path."""
+    from ttp import pushq, timefmt
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    if boot == "before":
+        _pq_boot(s.p, time.time() - 60)
+    bid = _pq_batch(s)
+    started = s.p.db.one("SELECT started FROM push_batches WHERE id=?", (bid,))["started"]
+    booted = time.time()   # after the batch started, before the daemon found it dead
+    if boot == "inside":
+        _pq_boot(s.p, booted)
+    _pq_tend(s)
+    st = s.p.db.kv(pushq.KV) or {}
+    [ev] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_batch_died"]
+    outcome = s.p.db.one("SELECT outcome FROM push_batches WHERE id=?", (bid,))["outcome"]
+    if boot == "inside":
+        assert f"cut short by the {timefmt.short(booted, s.p)} reboot" in ev["text"] and "at once" in ev["text"]
+        assert ev["status"] == "handled" and outcome == "rebooted"
+        assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 0}
+        assert not st.get("deaths") and not st.get("backoff_until")
+        rows, why = pushq.due(s.p, time.time())
+        assert rows and why == f"a rerun of {bid}, cut short by a reboot"
+    else:
+        assert "ended before writing an outcome" in ev["text"] and outcome == "died"
+        assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
+        assert st["deaths"] == 1 and st["backoff_until"] > time.time()
+        assert pushq.due(s.p, time.time())[0] == []
+
+
+def test_reboot_cut_batches_alone_raise_no_dying_alert(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    for _ in range(pushq.DYING_AFTER + 1):
+        _pq_batch(s)
+        _pq_boot(s.p, time.time())
+        _pq_tend(s)
+    assert not s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
+    assert s.p.db.one("SELECT tries FROM push_queue")["tries"] == 0
+
+
+def test_nothing_landing_for_hours_alerts_once_with_counts_and_clears_on_landing(env, monkeypatch):
+    from ttp import alerts, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_boot(s.p, time.time())
+    _pq_tend(s)
+    d = Daemon(s.p.base)
+    later = time.time() + 5 * 3600
+    assert not pushq.check_landing(s.p, d.cfg, d.alert, now=later), "one batch is not yet 'despite retries'"
+    _pq_batch(s)          # killed, no reboot
+    _pq_tend(s)
+    assert not pushq.check_landing(s.p, d.cfg, d.alert, now=time.time() + 3 * 3600), "under 4 h"
+    assert pushq.check_landing(s.p, d.cfg, d.alert, now=later)
+    assert not pushq.check_landing(s.p, d.cfg, d.alert, now=later + 3600), "once per stall"
+    [msg] = s.p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref=?", (pushq.LANDING_ALERT,))
+    assert msg["severity"] == "high" and "Nothing has landed on origin/proj" in msg["text"]
+    assert "2 push batches tried, 1 of them cut short by a host reboot" in msg["text"]
+    assert alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
+    _pq_plan(s, outcome="pushed", sha="ab" * 20)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert pushq.LANDING_ALERT in [ep["key"] for ep in alerts.sweep(s.p.db)], "a landing clears it"
+
+
+def test_the_landing_alert_is_off_at_zero(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_landing_alert_h=0)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    for _ in range(3):
+        _pq_batch(s)
+        _pq_tend(s)
+    assert not pushq.check_landing(s.p, now=time.time() + 10 ** 6)
+
+
 def test_a_daemon_restart_mid_batch_finalizes_from_the_marker(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

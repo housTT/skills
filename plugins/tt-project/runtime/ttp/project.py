@@ -337,7 +337,7 @@ EXTRA_KEYS = {
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
-                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard"},
     "jev": {"via", "url", "model"},
@@ -408,11 +408,13 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting,
 # but not before push_min_gap_s passed since the last batch ended unless it is full or priority 1)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
+# push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "push_min_gap_s": 1800,
+                       "push_landing_alert_h": 4,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
-                      "push_min_gap_s": (0, True, False),
+                      "push_min_gap_s": (0, True, False), "push_landing_alert_h": (0, True, False),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
 
 

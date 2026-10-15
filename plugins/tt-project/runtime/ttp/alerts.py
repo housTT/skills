@@ -64,6 +64,7 @@ CLEARED_TEXT = {
     "push_rejected": "Pushes go through again: a push batch pushed.",
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
+    "push_not_landing": "A push batch landed on the push branch again.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
     "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
@@ -231,9 +232,12 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return turnsize.holds(db)
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
-    if key == "push_queue_dying":
-        return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
-                          "AND finalized>=? LIMIT 1", (since,))
+    if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
+        return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN "
+                          "('died','error','rebooted') AND finalized>=? LIMIT 1", (since,))
+    if key == "push_not_landing":   # pushq.check_landing: until a batch lands
+        return not db.one("SELECT id FROM push_batches WHERE outcome IN ('pushed','landed') AND finalized>=? LIMIT 1",
+                          (since,))
     return now - since < DAY
 
 
@@ -253,7 +257,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_tip_failing", "heal",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
                                          "coord-budget", "account-mismatch")
 
