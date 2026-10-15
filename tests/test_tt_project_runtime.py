@@ -62840,17 +62840,65 @@ def test_push_own_skips_harness_checks_but_push_runs_them(env, monkeypatch, tmp_
         _commit(repo, "z.txt", plan)
 
 
+def test_ttp_checks_purpose_harness_falls_back_to_the_default_plan(env, tmp_path, monkeypatch, capsys):
+    """With no purpose harness check configured, `ttp checks --purpose harness` runs the built-in plan:
+    a whitespace check and pytest of the harness's own test folders it has (a missing one is skipped,
+    never passed). A configured purpose harness check replaces it."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / "runtime" / "tests").mkdir(parents=True)
+    (repo / "runtime" / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    subprocess.run([*git, "add", "runtime"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    parent = subprocess.run([*git, "rev-parse", "HEAD^"], capture_output=True, text=True).stdout.strip()
+    cli.main(["checks", "--purpose", "harness"])   # a clean harness repo: exits 0
+    out = capsys.readouterr().out
+    assert "running the default harness plan" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["purpose"] == "harness"
+    assert rec["commands"] == [push.whitespace_check(parent), "python3 -m pytest -q runtime/tests"]
+    assert len(rec["skipped"]) == 1 and "bin/tests" in rec["skipped"][0]
+    # A root commit is compared with the empty tree; with no test folder only the whitespace check runs.
+    assert str(push.default_harness_checks(repo, "")[0]) == push.whitespace_check(parent)
+    subprocess.run([*git, "checkout", "-q", "--orphan", "fresh"], check=True)
+    subprocess.run([*git, "rm", "-rq", "--cached", "runtime"], check=True)
+    (repo / "runtime" / "tests" / "test_ok.py").unlink()
+    subprocess.run([*git, "commit", "-qm", "root"], check=True)
+    cli.main(["checks", "--purpose", "harness", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["commands"] == [push.whitespace_check(push.EMPTY_TREE)]
+    assert len(rec["skipped"]) == 2
+    capsys.readouterr()
+    # A configured purpose harness check wins: the default plan does not run.
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}])
+    cli.main(["checks", "--purpose", "harness", "--fresh"])
+    assert "default harness plan" not in capsys.readouterr().out
+    assert log.read_text().split() == ["plan"]
+    assert json.loads((run / "checks.json").read_text())["commands"] == [HARNESS_PLAN]
+    # The candidate purpose never gets the default plan.
+    p.set_config("delivery.push_checks", [])
+    cli.main(["checks", "--", "true"])
+    assert json.loads((run / "checks.json").read_text())["commands"] == ["true"]
+
+
 def test_ttp_checks_purpose_harness_fails_closed(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     log = tmp_path / "log"
     _fake_check_plan_ttp(tmp_path, monkeypatch, log)
-    # No harness entry: nothing qualifies the head, even with untagged checks and extras.
+    # No harness entry: the default harness plan runs, and its whitespace check fails a bad head.
     p.set_config("delivery.push_checks", ["true", {"run": "true", "purpose": "candidate"}])
+    (repo / "b.txt").write_text("trailing \n")
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
     with pytest.raises(SystemExit) as exc:
         cli.main(["checks", "--purpose", "harness", "--", "true"])
-    assert exc.value.code == 1 and "no purpose harness check" in capsys.readouterr().err
-    assert not (run / "checks.json").exists()
+    assert exc.value.code == 1 and "default harness plan" in capsys.readouterr().out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["purpose"] == "harness"
+    assert json.loads((run / "check_failure.json").read_text())["check"]["run"].startswith("git diff --check ")
     # An unknown purpose fails it too, never skipping the entry.
     p.set_config("delivery.push_checks", [{"run": HARNESS_PLAN, "purpose": "harness"}, {"run": "true", "purpose": "x"}])
     with pytest.raises(SystemExit) as exc:

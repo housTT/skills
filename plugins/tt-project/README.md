@@ -741,6 +741,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   harness's own repo, not to the candidate's. `ttp push` and the push queue run every entry. Started
   outside the repo that has its definition commit (or outside any git repo), `ttp check-plan` exits 66
   and says so, naming the project's own repo when that one has the commit.
+  With no harness entry configured, `ttp checks --purpose harness` runs a default harness plan, all tagged
+  harness: `git diff --check` from the push target (else HEAD's parent) to HEAD, leaving out `*.log`, and
+  `python3 -m pytest -q runtime/tests` and `bin/tests`, each only where that folder exists (`if_exists`:
+  a missing one is reported skipped, never passed). A configured harness entry replaces the whole plan.
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.

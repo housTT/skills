@@ -1755,7 +1755,8 @@ def cmd_checks(a) -> None:
 
     `--purpose harness` qualifies a harness-preparation head: it runs the harness-tagged and untagged
     project checks plus the commands after `--`, lists candidate-tagged ones as not run, and fails
-    unless a harness-tagged check applies to the head and ran or reused a recorded pass. Its pass is recorded as such and never counts for a PR,
+    unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
+    harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
     from . import checkcap, checkdirs, prguard, push
     if getattr(a, "gap", None):
@@ -1779,14 +1780,12 @@ def cmd_checks(a) -> None:
     purpose = getattr(a, "purpose", None) or "candidate"
     own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
     not_run: list[str] = []
+    default_harness = False
     if purpose == "harness":
         if bad := push.check_problems((cfg.get("delivery") or {}).get("push_checks")):
             die("ttp checks --purpose harness: delivery.push_checks is malformed, so nothing is qualified: "
                 + "; ".join(bad), 1)
-        if not any(c.purpose == "harness" for c in own):
-            die("ttp checks --purpose harness: delivery.push_checks has no purpose harness check, so nothing "
-                "qualifies this head; add a reviewed `ttp check-plan --purpose harness --definition-commit "
-                "<full commit ID> (or --definition-at-head) --definition-path <path>` entry tagged \"purpose\": \"harness\"", 1)
+        default_harness = not any(c.purpose == "harness" for c in own)
         not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
         own = [c for c in own if c.purpose != "candidate"]
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
@@ -1797,6 +1796,11 @@ def cmd_checks(a) -> None:
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree")
+    defaults = push.default_harness_checks(Path(top), _checks_base(p, Path(top), own)) if default_harness else []
+    if defaults:   # no configured harness plan: the built-in one qualifies the head
+        own += defaults
+        print("ttp checks: delivery.push_checks has no purpose harness check; running the default harness plan "
+              "(a whitespace check, and pytest of " + " and ".join(push.HARNESS_TEST_DIRS) + " where they exist)")
     if p:
         from . import worktree
         worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
@@ -1999,7 +2003,8 @@ def cmd_checks(a) -> None:
                                                      **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {})})
-    source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
+    source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
+              else "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
     if not passed:
         from . import trim
@@ -5385,7 +5390,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--full", action="store_true",
                    help="run the project's checks even for a docs/data-only diff (no fast path)")
     s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
-                   help="harness: qualify a harness-preparation head with the purpose harness and untagged checks; "
+                   help="harness: qualify a harness-preparation head with the purpose harness (else the default "
+                        "harness plan) and untagged checks; "
                         "candidate gates are not run and the pass never counts for a PR or a push")
     s.add_argument("--detach", action="store_true",
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")

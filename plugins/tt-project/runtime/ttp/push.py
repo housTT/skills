@@ -1096,6 +1096,30 @@ def whitespace_check(base: str) -> str:
     return f"git diff --check {shlex.quote(base)} HEAD -- . {LOG_EXCLUDE}"
 
 
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"   # git's empty tree: a root commit's base
+HARNESS_TEST_DIRS = ("runtime/tests", "bin/tests")   # the harness's own tests, where it has them
+
+
+def default_harness_checks(repo: Path, base: str = "") -> list[Check]:
+    """The plan `ttp checks --purpose harness` runs when delivery.push_checks has no purpose harness
+    check: a whitespace check of `base` (the push target, else HEAD's parent, else the empty tree)
+    to HEAD, and pytest of each of the harness's own test folders it has (`if_exists`: a missing one
+    is skipped, never passed). All are tagged harness, so the whitespace check alone qualifies a
+    head with no tests. A configured purpose harness check replaces the whole plan."""
+    if not base:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", "HEAD^{commit}^"],
+                           capture_output=True, text=True)
+        base = r.stdout.strip() if r.returncode == 0 else EMPTY_TREE
+    out = [Check(whitespace_check(base))]
+    for d in HARNESS_TEST_DIRS:
+        c = Check(f"python3 -m pytest -q {d}")
+        c.if_exists = d
+        out.append(c)
+    for c in out:
+        c.purpose = "harness"
+    return out
+
+
 # `ttp checks` fast path: off unless a project lists globs in delivery.checks_fast_globs; a diff
 # touching only paths they match then skips the heavy checks. The project owns its globs: one that
 # covers installed or test-asserted content skips the checks that content needs. Matched with
