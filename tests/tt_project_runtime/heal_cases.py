@@ -1,0 +1,2399 @@
+# Heal tests of tests/test_tt_project_runtime.py, which runs this file in its own namespace
+# (see _include_cases there): helpers, fixtures and imports come from that file, and pytest collects
+# these tests under its name. Add new heal tests here, not there.
+from __future__ import annotations
+
+
+@pytest.mark.parametrize("outage", ["auth", "network", "disk", "heal"])
+def test_alerts_ack_refuses_a_live_outage_without_mutation(env, outage):
+    from ttp import alerts, cli, heal, netwait
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    if outage == "heal":
+        p, d, up = _heal_setup(env, fix=None, outage=True)
+        spec, now = _heal_spec(p), time.time()
+        heal.run(d, "svc", spec, now)
+        heal.run(d, "svc", spec, now + heal.OUTAGE_S)
+        p.db.update_task(heal.state(p.db, "svc")["task"], status="failed")
+        heal.run(d, "svc", spec, now + heal.OUTAGE_S + 1)
+        key = "heal:svc"
+    else:
+        p = make(env)
+        key = {"auth": "auth:fake", "network": netwait.KEY, "disk": "disk"}[outage]
+        if outage == "auth":
+            p.db.set_kv(alerts.BREAKER + "fake", {"open": True, "ts": time.time()})
+        p.db.set_kv("network_outage" if outage == "network" else "disk_low",
+                    {"alerted": True} if outage == "network" else {"free_gb": 1})
+        Daemon(p.base).alert(key, f"{key} is down", "high")
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert' AND ref=? ORDER BY id DESC", (key,))["id"]
+    before = p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["alerts", "demo", "--ack", str(mid), "--why", "known"])
+    assert exc.value.code != 0
+    assert _episodes(p, key)[-1]["cleared"] is None and not p.db.kv(alerts.ACKS)
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == before
+    assert [m["id"] for m in attention(p.db, time.time())] == [mid], "the outage left the top section"
+
+
+def _no_project_env(monkeypatch):
+    """The daemon's environment as a service manager may start it: no TTP_PROJECT, no ttp on PATH."""
+    for var in ("TTP_PROJECT", "TTP_RUN_DIR", "TTP_LOCKS_HELD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+
+def test_daemon_run_commands_resolve_the_project_without_ttp_project(env, monkeypatch):
+    """`ttp lock <res> -- cmd` exits 2 without a project. A command schedule, a heal check and fix,
+    an until_probe and a pause's end_when all run it in their project's context, so it runs."""
+    p = _device_project(env, device=False)
+    from ttp import coordinator as coord, ends, heal, pauseends
+    from ttp.daemon import Daemon
+    from ttp.project import command_env
+    _no_project_env(monkeypatch)
+    locked = "ttp lock board -- true"
+    d = Daemon(p.base)
+    assert d._run_command_watcher({"name": "w"}, {"command": locked}) == "ok (0 observations)"
+    assert not p.db.q("SELECT text FROM events WHERE source IN ('watcher:w', 'watcher-error:w')")
+    spec = heal.validate({"check": locked})
+    assert heal.run(d, "svc", spec, time.time()) == ("ok (healthy)", None), heal.state(p.db, "svc")
+    flag = p.root / "fixed"
+    st = {}
+    assert heal.run_fix(dict(spec, fix=f"ttp lock board -- touch {flag}"), str(p.root),
+                        command_env(p)) == (0, "") and flag.exists()
+    assert heal.check(spec, st, str(p.root), command_env(p))[0] == 0
+    # A pause whose end_when takes a lock passes; without TTP_PROJECT it would be "broken (exit 2)".
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True,
+                            "end_when": "ttp lock other -- true", "reason": "flaky"}]) == []
+    pe, now = pauseends.PauseEnds(p), time.time()
+    pe.tick(now)
+    for proc, _, _ in list(pe._procs.values()):
+        proc.wait(30)
+    assert pe.tick(now + 1) == ["rig"]
+    due = p.db.one("SELECT text FROM events WHERE kind='pause_end_due'")["text"]
+    assert "probe `ttp lock other -- true` passed" in due, due
+
+
+def test_failed_daemon_run_commands_keep_a_bounded_stderr_tail(env, monkeypatch):
+    p = _device_project(env, device=False)
+    from ttp import coordinator as coord, ends, heal, pauseends
+    from ttp.daemon import Daemon
+    from ttp.project import OUTPUT_TAIL
+    _no_project_env(monkeypatch)
+    noisy = "printf 'x%.0s' $(seq 5000) >&2; echo >&2; echo the-real-cause >&2; exit 3"
+    d = Daemon(p.base)
+    d._run_command_watcher({"name": "w"}, {"command": noisy})
+    text = p.db.one("SELECT text FROM events WHERE source='watcher-error:w'")["text"]
+    assert text.startswith("watcher command failed rc=3: ") and text.endswith("the-real-cause"), text[-80:]
+    assert len(text) <= OUTPUT_TAIL + 40
+    # A watcher that printed reports and then failed keeps both: its reports, and its failure with why.
+    report = shlex.quote(json.dumps({"text": "box-a is down", "severity": "high"}))
+    d._run_command_watcher({"name": "v"}, {"command": f"echo {report}; echo why-it-broke >&2; exit 2"})
+    got = [r["text"] for r in p.db.q("SELECT text FROM events WHERE source IN ('watcher:v', 'watcher-error:v') "
+                                     "ORDER BY id")]
+    assert sorted(got) == ["box-a is down", "watcher command exited rc=2: why-it-broke"], got
+    # An until_probe that neither passes nor says "not yet" is broken: its stderr tail says why.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Hands off the rig.",
+                            "until": "the rig is fixed", "until_probe": noisy}]) == []
+    e, now = ends.Ends(p), time.time()
+    e.tick(now)
+    e._procs[next(iter(e._procs))][0].wait(30)
+    e.tick(now + 1)
+    (why,) = (p.db.kv(ends.BROKEN_KEY) or {}).values()
+    assert why.startswith("exit 3: ") and why.endswith("the-real-cause") and len(why) <= OUTPUT_TAIL + 10, why[-80:]
+    assert not e._errs, "each probe's stderr file is closed once read"
+    # So does a pause's broken end_when, and it still wakes the coordinator.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True,
+                            "end_when": "echo no-such-box >&2; exit 4", "reason": "flaky"}]) == []
+    pe = pauseends.PauseEnds(p)
+    pe.tick(now)
+    for proc, _, _ in list(pe._procs.values()):
+        proc.wait(30)
+    assert pe.tick(now + 1) == ["rig"]
+    due = p.db.one("SELECT text FROM events WHERE kind='pause_end_due'")["text"]
+    assert "is broken (exit 4): it would never end. Its stderr: no-such-box" in due, due
+    # A heal check's output, stderr included, is kept bounded in its state for the self-fix task.
+    assert heal.run(d, "svc", heal.validate({"check": noisy}), now)[0].startswith("error: heal check exited 3")
+    st = heal.state(p.db, "svc")
+    assert st["last_out"].endswith("the-real-cause") and len(st["last_out"]) <= 1000
+
+
+def test_heal_block_is_validated_in_the_file_and_schedule_set(env):
+    from ttp import heal
+    from ttp import schedule as sched
+    with pytest.raises(ValueError, match="needs `check`"):
+        heal.validate({"fix": "x"})
+    with pytest.raises(ValueError, match="unknown key"):
+        heal.validate({"check": "true", "unit": "x"})
+    with pytest.raises(ValueError, match="needs `unit`"):
+        heal.validate({"preset": "systemd"})
+    s = heal.validate({"preset": "systemd", "unit": "w.service", "user": True, "host": "box-a"})
+    assert s["fix"] == "ssh -o BatchMode=yes box-a 'systemctl --user restart w.service'" and s["max_fixes"] == 3
+    ok = [{"name": "svc", "kind": "command", "every": "5m", "payload": {"heal": {"check": "true"}}}]
+    assert sched.parse_file(json.dumps(ok))
+    with pytest.raises(ValueError, match="only a command schedule"):
+        sched.parse_file(json.dumps([dict(ok[0], kind="llm")]))
+    with pytest.raises(ValueError, match="grace_s"):
+        sched.parse_file(json.dumps([dict(ok[0], payload={"heal": {"check": "true", "grace_s": -1}})]))
+    p = make(env)
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "schedule_set", "name": "svc", "kind": "command", "every": "5m",
+                             "heal": {"check": "true", "fix": "true"}}])
+    assert json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])["heal"]["fix"] == "true"
+
+
+def test_heal_dead_service_is_fixed_without_coordinator_turns_or_asks(env):
+    from ttp import daemon as dm
+    from ttp import heal
+    p, d, up = _heal_setup(env)
+    p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+    fp, events = dm.wake_fingerprint(p, {}), p.db.one("SELECT COUNT(*) n FROM events")["n"]
+    tasks, msgs = p.db.q("SELECT id, status FROM tasks"), p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    d.run_schedules()
+    assert up.exists() and heal.state(p.db, "svc")["phase"] == "settling"
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] <= time.time()
+    d.run_schedules()   # the settle recheck
+    row = p.db.one("SELECT last_status FROM schedules WHERE name='svc'")
+    assert row["last_status"] == "fixed (1 today)"
+    assert heal.state(p.db, "svc")["status"] == "healthy"
+    assert p.db.q("SELECT id, status FROM tasks") == tasks, p.db.q("SELECT id, title, origin FROM tasks")
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == msgs + 1   # the info line only
+    assert not p.db.q("SELECT id FROM messages WHERE kind IN ('ask','alert')")
+    assert p.db.one("SELECT COUNT(*) n FROM events")["n"] == events
+    assert not p.db.q("SELECT id FROM runs WHERE role='coordinator'")
+    assert dm.wake_fingerprint(p, {}) == fp
+    info = p.db.q("SELECT text, severity FROM messages WHERE kind='info'")
+    assert len(info) == 1 and info[0]["severity"] == "low" and "Self-healed svc" in info[0]["text"]
+    assert heal.digest_lines(p.db, 0) == ["## Self-healed (nothing to do): fixed svc, 1 today"]
+    assert heal.line(p.db) == "health: 1 ok, 1 fixed today, 0 failing"
+
+
+def test_heal_grace_unknown_and_broken_check_never_fix(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now) == ("unhealthy (0 s, grace 300 s)", now + 300)
+    assert heal.run(d, "svc", spec, now + 100)[0] == "unhealthy (100 s, grace 300 s)" and not up.exists()
+    for rc, status in ((75, "ok (unknown, rc 75)"), (255, "ok (unknown, rc 255)")):
+        assert heal.run(d, "svc", dict(spec, check=f"exit {rc}"), now + 400) == (status, None)
+    assert heal.run(d, "svc", dict(spec, check="exit 2"), now + 400)[0].startswith("error: heal check exited 2")
+    assert not up.exists() and heal.summary(p.db)["unknown"] == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 500) == ("ok (healthy)", None)   # healthy clears, no fix recorded
+    st = heal.state(p.db, "svc")
+    assert st["status"] == "healthy" and "since" not in st and "unknown_since" not in st
+    assert heal.fixed_today(p.db) == 0
+    up.unlink()
+    assert heal.run(d, "svc", spec, now + 600)[0] == "unhealthy (0 s, grace 300 s)"   # a new stint
+
+
+def test_heal_cap_then_one_self_fix_task_then_outage_alert_that_clears(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, max_fixes=2, window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    for i in range(2):   # it dies again after each fix
+        assert heal.run(d, "svc", spec, now + i * 10)[0] == "unhealthy (fixed; rechecking)"
+        assert heal.run(d, "svc", spec, now + i * 10 + 1)[0] == "fixed (%d today)" % (i + 1)
+        up.unlink()
+    status, _ = heal.run(d, "svc", spec, now + 30)
+    assert "cap" in status and not up.exists()
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert t["priority"] == 1 and json.loads(t["labels"]) == ["heal:svc"] and "test -e" in t["spec"]
+    assert heal.run(d, "svc", spec, now + 40)[0] == f"unhealthy (self-fix task #{t['id']} open)"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", spec, now + 50)[0]
+    heal.run(d, "svc", spec, now + 60)
+    al = p.db.q("SELECT * FROM messages WHERE kind='alert'")
+    assert len(al) == 1 and al[0]["severity"] == "high" and al[0]["ref"] == "heal:svc"
+    assert alerts.holds(p.db, "heal:svc", now, now + 60)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 70)[0] == "ok (healthy)"
+    assert [e["key"] for e in alerts.sweep(p.db)] == ["heal:svc"]
+    assert "passes again" in p.db.one("SELECT text FROM messages WHERE kind='resolved'")["text"]
+
+
+def _heal_to_self_fix_failed(p, d, up, spec, now):
+    """Drive the check (no fix) to its self-fix task, then fail that task."""
+    from ttp import heal
+    assert "it has no fix" in heal.run(d, "svc", spec, now)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    return tid
+
+
+def test_heal_escalate_user_alerts_and_coordinator_observes_once_per_episode(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.escalate_to(d, spec) == "user"
+    tid = _heal_to_self_fix_failed(p, d, up, spec, now)
+    assert "alerted" in heal.run(d, "svc", spec, now + 10)[0]
+    assert [a["ref"] for a in p.db.q("SELECT ref FROM messages WHERE kind='alert'")] == ["heal:svc"]
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")
+    up.touch()
+    heal.run(d, "svc", spec, now + 20)
+    up.unlink()
+    p.db.x("DELETE FROM messages WHERE kind='alert'")
+
+    co = dict(spec, escalate="coordinator")
+    t0 = now + 100
+    tid2 = _heal_to_self_fix_failed(p, d, up, co, t0)
+    assert tid2 != tid
+    for i in range(3):   # repeated runs in one episode add nothing
+        assert "coordinator told" in heal.run(d, "svc", co, t0 + 10 + i)[0]
+    ev = p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'heal:%'")
+    assert len(ev) == 1 and ev[0]["kind"] == "observation" and ev[0]["severity"] == "high"
+    assert ev[0]["status"] == "queued" and ev[0]["fingerprint"] == f"heal:svc:{t0:.0f}" and "svc" in ev[0]["text"]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'"), "coordinator mode alerted the user"
+    st = heal.state(p.db, "svc")
+    st.pop("observed")   # a lost state flag still finds the episode's event
+    heal._save(p.db, "svc", st)
+    heal.run(d, "svc", co, t0 + 20)
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")) == 1
+
+    up.touch()   # healthy ends the episode; the next one is told again
+    heal.run(d, "svc", co, t0 + 30)
+    up.unlink()
+    t1 = t0 + 200
+    _heal_to_self_fix_failed(p, d, up, co, t1)
+    heal.run(d, "svc", co, t1 + 10)
+    fps = [e["fingerprint"] for e in p.db.q("SELECT fingerprint FROM events WHERE fingerprint LIKE 'heal:%' ORDER BY id")]
+    assert fps == [f"heal:svc:{t0:.0f}", f"heal:svc:{t1:.0f}"]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+
+
+@pytest.mark.parametrize("change", ["coordinator", "project_default", "known_fault", "finding_known_fault"])
+@pytest.mark.parametrize("run_check", [False, True])
+def test_heal_config_change_closes_an_existing_user_alert(env, change, run_check):
+    from ttp import alerts, heal
+    from ttp.web import attention
+    finding = change == "finding_known_fault"
+    p, d, up = _heal_setup(env, fix=None, outage=finding,
+                          check="echo 'ttp-heal: not-outage'; exit 1" if finding else "exit 1")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    heal.run(d, "svc", spec, now + 1)
+    assert len(attention(p.db, now + 1)) == 1
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    if change == "project_default":
+        p.set_config("heal.escalate", "coordinator")
+        d.cfg = p.config()
+    else:
+        payload["heal"]["escalate" if change == "coordinator" else "known_fault"] = (
+            "coordinator" if change == "coordinator" else "vendor bug")
+        p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    # Readers hide it immediately, even before the next scheduled check or daemon sweep.
+    assert attention(p.db, now + 2) == []
+    if run_check:
+        heal.run(d, "svc", _heal_spec(p), now + 2)
+    alerts.sweep(p.db, now + 3)
+    ep = _episodes(p, "heal:svc")[0]
+    assert ep["cleared"] and ("coordinator" if change in ("coordinator", "project_default") else "known_fault") in ep["cleared_why"]
+    assert heal.state(p.db, "svc")["status"] == "unhealthy", "closing a user alert does not repair the check"
+    resolved = p.db.q("SELECT text FROM messages WHERE kind='resolved'")
+    assert len(resolved) == 1 and "passes again" not in resolved[0]["text"]
+    for dt in (4, 5):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        alerts.sweep(p.db, now + dt)
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved'")) == 1
+    assert len(_episodes(p, "heal:svc")) == 1
+    if change in ("coordinator", "project_default"):
+        assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")) == 1
+    else:
+        assert not {"task", "escalated", "alerted", "observed"} & set(heal.state(p.db, "svc"))
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_heal_known_fault_does_not_close_a_real_outage_alert(env, unknown):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, fix=None, outage=True, check="exit 255" if unknown else "exit 1")
+    spec, now = _heal_spec(p), time.time()
+    heal.run(d, "svc", spec, now)
+    heal.run(d, "svc", spec, now + heal.OUTAGE_S)
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    heal.run(d, "svc", spec, now + heal.OUTAGE_S + 1)
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["known_fault"] = "vendor bug"
+    p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    assert alerts.holds(p.db, "heal:svc", now, now + heal.OUTAGE_S + 2)
+    assert alerts.sweep(p.db, now + heal.OUTAGE_S + 2) == []
+    assert _episodes(p, "heal:svc")[0]["cleared"] is None
+
+
+def test_heal_user_override_keeps_its_alert_when_the_project_default_changes(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, fix=None, escalate="user")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    heal.run(d, "svc", spec, now + 1)
+    p.set_config("heal.escalate", "coordinator")
+    d.cfg = p.config()
+    heal.run(d, "svc", spec, now + 2)
+    assert alerts.sweep(p.db, now + 3) == []
+    assert _episodes(p, "heal:svc")[0]["cleared"] is None
+
+
+def test_heal_escalate_project_default_and_validation(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="escalate"):
+        heal.validate({"check": "true", "escalate": "chat"})
+    p, d, up = _heal_setup(env, fix=None)
+    spec = _heal_spec(p)
+    d.cfg["heal"] = {"escalate": "coordinator"}
+    assert heal.escalate_to(d, spec) == "coordinator"
+    assert heal.escalate_to(d, dict(spec, escalate="user")) == "user", "the block's own setting wins"
+    now = time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 10)[0]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    from ttp import project
+    assert project.unknown_key_hint("heal.escalate") is None
+
+
+def test_heal_fix_that_fails_or_does_not_help_queues_the_task(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix="echo boom; exit 3")
+    spec, now = _heal_spec(p), time.time()
+    assert "the fix exited 3" in heal.run(d, "svc", spec, now)[0]
+    assert "boom" in p.db.one("SELECT spec FROM tasks WHERE origin='daemon'")["spec"]
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    assert heal.run(d, "svc", dict(spec, fix="true"), now)[0] == "unhealthy (fixed; rechecking)"
+    assert "still fails" in heal.run(d, "svc", dict(spec, fix="true"), now + 1)[0]
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    assert "it has no fix" in heal.run(d, "svc", dict(spec, fix=None), now)[0]
+
+
+def test_heal_restart_mid_fix_counts_the_fix_and_rechecks(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, max_fixes=1)
+    spec, now = _heal_spec(p), time.time()
+    # The daemon died while the fix ran: the state says so, the database kept it.
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 60, "phase": "fixing",
+                                         "fix_started": now - 5, "fixes": [now - 5]})
+    up.touch()
+    assert heal.run(d, "svc", spec, now) == ("fixed (1 today)", None)
+    up.unlink()
+    assert "cap" in heal.run(d, "svc", spec, now + 1)[0]   # the interrupted fix used the cap
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 60, "phase": "fixing",
+                                         "fixes": [now - 5]})
+    assert "still fails" in heal.run(d, "svc", spec, now)[0]
+
+
+def test_heal_fix_runs_under_its_lock_and_waits_out_a_pause(env):
+    from ttp import heal
+    from ttp.db import PAUSED_RESOURCES_KEY
+    held, up = env["repo"] / "held", env["repo"] / "demo-up"
+    p, d, _ = _heal_setup(env, resource="dev-x", check=f"test -e {up}",
+                          fix=f'echo "$TTP_LOCKS_HELD" > {held}; touch {up}')
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"dev-x": {"reason": "user hold", "since": now}})
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert heal.run(d, "svc", spec, now + 1800)[0] == "unhealthy (fix deferred: dev-x paused)"   # waits out the pause
+    assert not up.exists() and heal.state(p.db, "svc")["fixes"] == []
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    assert heal.run(d, "svc", spec, now + 7210)[0] == "unhealthy (fixed; rechecking)", heal.state(p.db, "svc")
+    assert up.exists() and "dev-x" in held.read_text()
+
+
+def test_heal_fix_that_itself_exits_75_under_a_lock_is_counted(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", fix="echo own; exit 75", max_fixes=2)
+    spec, now = _heal_spec(p), time.time()
+    status = heal.run(d, "svc", spec, now)[0]
+    assert "the fix exited 75" in status and "self-fix task" in status, status
+    st = heal.state(p.db, "svc")
+    assert st["fixes"] == [now] and st["fix_rc"] == 75 and "own" in st["fix_out"]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_lock_busy_past_window_escalates(env, monkeypatch):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x stayed busy for 30 s. Hand the task back"))
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.run(d, "svc", spec, now + 1800)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.state(p.db, "svc")["fixes"] == [] and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", spec, now + 3600)[0]
+    assert "could not get the lock dev-x for 1.0 h" in status, status
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def _heal_told(p):
+    """What a heal check has told anyone: user alerts and lines, asks, and coordinator observations."""
+    return (p.db.q("SELECT kind, severity, ref, text FROM messages WHERE kind IN ('alert','info','ask') ORDER BY id"),
+            p.db.q("SELECT fingerprint, severity, text FROM events WHERE kind='observation' ORDER BY id"))
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_unknown_check_without_outage_escalates_once_per_stretch_past_its_cap(env, escalate):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300, escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    assert spec["unknown_cap_s"] == 3600
+    dark = dict(spec, check="echo probing; echo 'dev-x is paused (bench work)'; exit 75")
+    for t in (0, 30 * 60, 59 * 60):
+        assert heal.run(d, "svc", dark, now + t) == ("ok (unknown, rc 75)", None)
+    assert _heal_told(p) == ([], [])
+
+    def stretch(start, n):
+        status = heal.run(d, "svc", dark, start + 61 * 60)[0]
+        assert status == f"ok (unknown, rc 75; {escalate} told)", status
+        heal.run(d, "svc", dark, start + 180 * 60)   # the same stretch: nothing more
+        msgs, events = _heal_told(p)
+        if escalate == "user":
+            assert events == [] and [(m["kind"], m["severity"], m["ref"]) for m in msgs] == \
+                [("alert", "normal", "heal-unknown:svc")] * n
+            text = msgs[-1]["text"]
+        else:
+            assert msgs == [] and [(e["fingerprint"], e["severity"]) for e in events][-1] == \
+                (f"heal:svc:unknown:{start:.0f}", "high") and len(events) == n
+            text = events[-1]["text"]
+        assert "could not tell for 61 min (exit 75: dev-x is paused (bench work))" in text and "probing" in text
+        assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+
+    stretch(now, 1)
+    # A healthy result ends the stretch; a new one can escalate again.
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 200 * 60) == ("ok (healthy)", None)
+    up.unlink()
+    assert heal.run(d, "svc", dark, now + 201 * 60)[0] == "ok (unknown, rc 75)"
+    stretch(now + 201 * 60, 2)
+    # So does an unhealthy one (here within its grace).
+    assert heal.run(d, "svc", spec, now + 400 * 60)[0] == "unhealthy (0 s, grace 300 s)"
+    assert "unknown_told" not in heal.state(p.db, "svc")
+    assert heal.run(d, "svc", dark, now + 401 * 60)[0] == "ok (unknown, rc 75)"
+    stretch(now + 401 * 60, 3)
+
+
+def test_heal_check_marks_a_known_owned_state_with_one_output_line():
+    from ttp import heal
+    assert heal.known_run(75, "probing\nttp-heal: known recovery: power work on the box\n") == \
+        ("recovery", "power work on the box")
+    assert heal.known_run(1, "  ttp-heal: known the user: resource paused (bench)  ") == \
+        ("the user", "resource paused (bench)")
+    assert heal.known_run(255, "ttp-heal: known recovery: x") is None, "only on exit 75 or 1"
+    assert heal.known_run(0, "ttp-heal: known recovery: x") is None
+    assert heal.known_run(75, "ttp-heal: known recovery:") is None, "it needs a reason"
+    assert heal.known_run(75, "ttp-heal: known : why") is None, "and an owner"
+    assert heal.known_run(75, "it says ttp-heal: known recovery: x inline") is None, "only a line of its own counts"
+
+
+def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_line_is_unknown_again(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=3600, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    owned = dict(spec, check="echo 'ttp-heal: known recovery: power work on the box'; exit 75")
+    for t in (0, 61 * 60, 300 * 60):
+        assert heal.run(d, "svc", owned, now + t) == ("ok (known, recovery: power work on the box)", None)
+    assert heal.describe({"name": "svc"}, spec, p.db, now + 300 * 60).startswith(
+        "svc: known (recovery: power work on the box);")
+    assert heal.summary(p.db, now + 300 * 60)["unknown"] == 1
+    # Exit 1 with the line: past its grace, still no fix and no task.
+    bad = dict(spec, check="echo 'ttp-heal: known the user: resource paused'; exit 1")
+    assert heal.run(d, "svc", bad, now + 310 * 60)[0] == "ok (known, the user: resource paused)"
+    assert heal.run(d, "svc", bad, now + 320 * 60)[0] == "ok (known, the user: resource paused)"
+    assert _heal_told(p) == ([], []) and not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    # A run without the line starts the ordinary unknown stretch; a known run in it ends that stretch.
+    dark = dict(spec, check="exit 75")
+    t0 = now + 400 * 60
+    assert heal.run(d, "svc", dark, t0) == ("ok (unknown, rc 75)", None)
+    assert "known_run" not in heal.state(p.db, "svc")
+    assert heal.run(d, "svc", owned, t0 + 50 * 60)[0].startswith("ok (known")
+    assert heal.run(d, "svc", dark, t0 + 61 * 60) == ("ok (unknown, rc 75)", None)
+    assert _heal_told(p) == ([], [])
+    status = heal.run(d, "svc", dark, t0 + 122 * 60)[0]
+    assert status == "ok (unknown, rc 75; coordinator told)", status
+    assert [e["fingerprint"] for e in _heal_told(p)[1]] == [f"heal:svc:unknown:{t0 + 61 * 60:.0f}"]
+
+
+def test_heal_outage_check_known_owned_runs_never_escalate_as_an_outage(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    spec, now = _heal_spec(p), time.time()
+    owned = dict(spec, check="echo 'ttp-heal: known recovery: handed to the recovery owner'; exit 75")
+    for t in (0, 30 * 60, 120 * 60):
+        assert heal.run(d, "svc", owned, now + t)[0] == "ok (known, recovery: handed to the recovery owner)"
+    assert _heal_told(p) == ([], []) and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    # Without the line the outage window counts from the first unknown run.
+    dark = dict(spec, check="exit 75")
+    assert heal.run(d, "svc", dark, now + 130 * 60) == ("ok (unknown, rc 75)", now + 130 * 60 + 600)
+    assert "could not tell for 10 min" in heal.run(d, "svc", dark, now + 140 * 60)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_unknown_cap_is_validated_and_zero_turns_it_off(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="unknown_cap_s"):
+        heal.validate({"check": "true", "unknown_cap_s": -1})
+    p, d, up = _heal_setup(env, unknown_cap_s=0)
+    spec, now = _heal_spec(p), time.time()
+    for t in (0, 3600, 10 * 3600):
+        assert heal.run(d, "svc", dict(spec, check="exit 255"), now + t) == ("ok (unknown, rc 255)", None)
+    assert _heal_told(p) == ([], [])
+
+
+def test_heal_outage_check_unknown_keeps_its_outage_escalation_not_the_unknown_cap(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=3000, unknown_cap_s=600)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 75)", now + 3000)
+    assert heal.run(d, "svc", dark, now + 11 * 60) == ("ok (unknown, rc 75)", now + 3000)
+    assert _heal_told(p) == ([], [])
+    assert "could not tell for 50 min" in heal.run(d, "svc", dark, now + 3000)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert _heal_told(p) == ([], []) and "unknown_told" not in heal.state(p.db, "svc")
+
+
+@pytest.mark.parametrize("by", ["user", "coordinator"])
+def test_heal_fix_deferred_on_a_pause_past_the_cap_tells_once_by_who_set_it(env, monkeypatch, by):
+    from ttp import heal
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p, d, up = _heal_setup(env, resource="dev-x")
+    spec, now = _heal_spec(p), time.time()
+    pause = {"dev-x": {"reason": "bench work", "since": now - 600, "by": by}}
+    p.db.set_kv(PAUSED_RESOURCES_KEY, pause)
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused (bench work); hand the task back"))
+    for t in (0, 30 * 60, 59 * 60):
+        assert heal.run(d, "svc", spec, now + t)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert _heal_told(p) == ([], [])
+    who = "user's pause: told" if by == "user" else "coordinator told"
+    assert heal.run(d, "svc", spec, now + 61 * 60)[0] == f"unhealthy (fix deferred: dev-x paused; {who})"
+    for t in (120, 600):   # the same pause: nothing more
+        assert heal.run(d, "svc", spec, now + t * 60)[0] == "unhealthy (fix deferred: dev-x paused)"
+    msgs, events = _heal_told(p)
+    if by == "user":
+        assert events == [] and [(m["kind"], m["severity"], m["ref"]) for m in msgs] == [("info", "low", "heal:svc")]
+        text = msgs[0]["text"]
+        assert "paused by the user (bench work)" in text
+    else:
+        assert msgs == [] and [(e["fingerprint"], e["severity"]) for e in events] == [(f"heal:svc:paused:{now:.0f}", "high")]
+        text = events[0]["text"]
+        assert "paused by coordinator (bench work)" in text
+    assert "waited 1.0 h on dev-x" in text and f"Lifting the pause lets its fix run: touch {up}" in text
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'") and heal.state(p.db, "svc")["fixes"] == []
+    assert p.db.kv(PAUSED_RESOURCES_KEY) == pause   # never lifted here
+    # The fix running ends the stretch; a later pause stretch can tell again.
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (0, "fixed"))
+    assert heal.run(d, "svc", spec, now + 700 * 60)[0] == "unhealthy (fixed; rechecking)"
+    assert not {"deferred_since", "deferred_on", "deferred_told"} & set(heal.state(p.db, "svc"))
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused (bench work); hand the task back"))
+    st = heal.state(p.db, "svc")
+    p.db.set_kv(heal.STATE_KEY + "svc", {k: v for k, v in st.items() if k not in ("phase", "fixes")})
+    assert heal.run(d, "svc", spec, now + 701 * 60)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert heal.run(d, "svc", spec, now + 762 * 60)[0].endswith(f"; {who})")
+    assert sum(map(len, _heal_told(p))) == 2
+
+
+def test_heal_paused_then_busy_lock_restarts_the_deferral_clock(env, monkeypatch):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x is paused; hand the task back"))
+    heal.run(d, "svc", spec, now)
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x stayed busy for 30 s. Hand the task back"))
+    assert heal.run(d, "svc", spec, now + 3000)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.run(d, "svc", spec, now + 3700)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert "could not get the lock" in heal.run(d, "svc", spec, now + 3000 + 3600)[0]
+
+
+def test_heal_timeout_is_capped_below_the_daemon_watchdog(env):
+    from ttp import daemon as dm
+    from ttp import heal
+    assert heal.validate({"check": "true", "timeout_s": 100000})["timeout_s"] == heal.MAX_TIMEOUT_S
+    assert heal.validate({"check": "true", "timeout_s": 30})["timeout_s"] == 30
+    assert heal.MAX_TIMEOUT_S == dm.WATCHER_MAX_S
+    assert heal.MAX_TIMEOUT_S + heal.LOCK_WAIT_S + 10 < dm.WATCHDOG_S   # the longest single segment
+
+
+def test_heal_timeout_kills_the_whole_process_group(env, tmp_path):
+    from ttp import heal
+    pidf = tmp_path / "group.pid"
+    # the check's shell records its pid, its process group's id (a session of its own); on a busy machine the
+    # timeout can fire before the shell wrote it, so retry with a longer one
+    for timeout in (1, 5, 15):
+        pidf.unlink(missing_ok=True)
+        t0 = time.time()
+        rc, out = heal._exec(f"sleep 60 & echo $$ > {pidf}.tmp; mv {pidf}.tmp {pidf}; wait", str(tmp_path), timeout)
+        assert rc == 124 and "timed out" in out and time.time() - t0 < timeout + 10
+        if pidf.exists():
+            break
+    group = int(pidf.read_text())
+
+    def gone() -> bool:
+        """No process is left in the group but zombies (killed, not yet reaped). Portable: no /proc."""
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return True
+        ps = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True, timeout=30).stdout
+        return all(st.startswith("Z") for g, st in (line.split(None, 1) for line in ps.splitlines() if line.strip())
+                   if int(g) == group)
+    deadline = time.time() + 30   # generous: reaping an orphan can lag on a busy machine
+    while not gone() and time.time() < deadline:
+        time.sleep(0.1)
+    assert gone(), "the check's child outlived its timeout"
+
+
+def test_heal_step_pings_the_watchdog_between_check_and_fix_and_skips_own_command_after_a_fix(env):
+    from ttp import heal
+    trail, ran = env["repo"] / "trail", env["repo"] / "own-ran"
+    p, d, up = _heal_setup(env, check=f"echo check >> {trail}; test -e {env['repo'] / 'never'}",
+                           fix=f"echo fix >> {trail}")
+    pings = []
+    d._progress = lambda: pings.append(trail.read_text())
+    payload = {"command": f"touch {ran}", "heal": json.loads(
+        p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])["heal"]}
+    status, again = d._run_heal(dict(p.db.one("SELECT * FROM schedules WHERE name='svc'")), payload)
+    assert status == "unhealthy (fixed; rechecking)" and again is not None
+    assert pings[0] == "check\n" and pings[-1] == "check\nfix\n", pings
+    assert not ran.exists()   # the own command waits for the recheck
+    d._run_heal(dict(p.db.one("SELECT * FROM schedules WHERE name='svc'")), payload)
+    assert ran.exists()   # the recheck failed and escalated: no fix this step, so the own command ran
+
+
+def test_heal_restart_mid_fix_still_waits_settle(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, settle_s=60)
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 120, "phase": "fixing",
+                                         "fix_started": now - 5, "fixes": [now - 5]})
+    up.touch()
+    assert heal.run(d, "svc", spec, now) == ("unhealthy (fix interrupted; rechecking)", now + 55)
+    assert "last_check" not in heal.state(p.db, "svc")   # no check ran early
+    assert heal.run(d, "svc", spec, now + 56) == ("fixed (1 today)", None)
+
+
+def test_heal_outage_check_that_stays_unknown_escalates_without_fixing(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")   # unknown, but not only its route (255: its own test)
+    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 75)", now + 600)
+    assert heal.run(d, "svc", dark, now + 300)[0] == "ok (unknown, rc 75)"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", dark, now + 600)[0]
+    assert "could not tell for 10 min (exit 75)" in status and not up.exists(), status
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert json.loads(t["labels"]) == ["heal:svc"] and heal.summary(p.db)["failing"] == 1
+    assert heal.run(d, "svc", dark, now + 900)[0] == f"unhealthy (self-fix task #{t['id']} open)"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", dark, now + 1200)[0] and not up.exists()
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='heal:svc'")) == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 1500) == ("ok (healthy)", None)
+    assert [e["key"] for e in alerts.sweep(p.db)] == ["heal:svc"]
+    st = heal.state(p.db, "svc")
+    assert st["status"] == "healthy" and not {"unknown_since", "task", "escalated", "alerted"} & set(st)
+    # Without outage, a check that stays unknown never fixes; past unknown_cap_s it only says so once.
+    plain = dict(spec, outage=False, check="exit 255")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    up.unlink()
+    assert heal.run(d, "svc", plain, now + 2000) == ("ok (unknown, rc 255)", None)
+    for dt in (3600, 10 * 3600):
+        assert heal.run(d, "svc", plain, now + 2000 + dt)[0].startswith("ok (unknown, rc 255")
+    assert not up.exists() and p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, known_fault="repair is the user's call", grace_s=7200)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.run(d, "svc", spec, now + 3 * 3600)[0] == "unhealthy (known fault: kept quiet)"
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    box = dict(spec, outage=True)
+    assert heal.run(d, "svc", box, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
+
+
+def test_heal_known_fault_object_is_validated_and_strings_still_load(env):
+    from datetime import datetime, timezone
+    from ttp import heal
+    from ttp import schedule as sched
+    iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    assert heal.validate({"check": "true", "known_fault": "vendor bug"})["known_fault"] == "vendor bug"
+    ok = [{"name": "svc", "kind": "command", "every": "5m",
+           "payload": {"heal": {"check": "true", "known_fault": "vendor bug"}}}]
+    assert sched.parse_file(json.dumps(ok))
+    kf = {"why": "vendor bug", "match": "err [0-9]+", "until": iso(time.time() + 6 * 86400)}
+    assert heal.validate({"check": "true", "known_fault": kf})["known_fault"] == kf
+    assert heal.validate({"check": "true", "known_fault": {"why": "vendor bug"}})
+    for bad, msg in [({"why": "x", "owner": "y"}, "unknown key"), ({"match": "x"}, "needs `why`"),
+                     ({"why": " "}, "needs `why`"), ({"why": "x", "match": "("}, "not a valid regex"),
+                     ({"why": "x", "match": 3}, "is text"), ({"why": "x", "until": "soon"}, "ISO time"),
+                     ({"why": "x", "until": iso(time.time() + 8 * 86400)}, "at most 7 d"), (["x"], "text or an object")]:
+        with pytest.raises(ValueError, match=msg):
+            heal.validate({"check": "true", "known_fault": bad})
+
+
+@pytest.mark.parametrize("fix", [True, False])
+def test_heal_known_fault_match_keeps_only_matching_failures_quiet(env, fix):
+    from ttp import heal
+    p, d, up = _heal_setup(env, known_fault={"why": "vendor bug", "match": "err [0-9]+: vendor"},
+                          **({} if fix else {"fix": None}))
+    spec, now = dict(_heal_spec(p), check=f"test -e {up} || {{ echo 'err 42: vendor fault'; exit 1; }}"), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    other = dict(spec, known_fault={"why": "vendor bug", "match": "power lost"})
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    out = heal.run(d, "svc", other, now)[0]
+    if fix:
+        assert out == "unhealthy (fixed; rechecking)" and up.exists()
+    else:
+        assert "self-fix task" in out and len(p.db.q("SELECT id FROM tasks WHERE origin='daemon'")) == 1
+
+
+@pytest.mark.parametrize("form", ["string", "until"])
+def test_heal_known_fault_ends_escalates_and_asks_renewal_once(env, form):
+    from datetime import datetime, timezone
+    from ttp import heal
+    now = time.time()
+    end = now + 3600 if form == "until" else now + heal.KNOWN_FAULT_S
+    kf = ("vendor bug" if form == "string"
+          else {"why": "vendor bug", "until": datetime.fromtimestamp(end, timezone.utc).isoformat()})
+    p, d, up = _heal_setup(env, fix=None, known_fault=kf)
+    spec = _heal_spec(p)
+    renewals = lambda: p.db.q("SELECT * FROM messages WHERE direction='out' AND text LIKE '%known_fault (vendor bug) ended%'")
+    observed = lambda: p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'heal:svc:known_fault:%'")
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.state(p.db, "svc")["known_since"] == now
+    # A healthy spell keeps its end: a flapping fault never renews itself.
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 60)[0] == "ok (healthy)"
+    up.unlink()
+    assert heal.run(d, "svc", spec, end - 60)[0] == "unhealthy (known fault: kept quiet)"
+    assert not renewals() and heal.holds(p.db, "svc", end - 60) is False
+    out = heal.run(d, "svc", spec, end + 1)[0]
+    assert "self-fix task" in out, out
+    assert len(renewals()) == 1 and renewals()[0]["severity"] == "low"
+    assert len(observed()) == 1 and observed()[0]["severity"] == "low"
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    assert heal.run(d, "svc", spec, end + 120)[0] == f"unhealthy (self-fix task #{tid} failed; alerted)"
+    assert len(renewals()) == 1 and len(observed()) == 1
+    # Renewing (a changed entry) keeps it quiet again.
+    renewed = dict(spec, known_fault={"why": "vendor bug, renewed"})
+    assert heal.run(d, "svc", renewed, end + 180)[0] == "unhealthy (known fault: kept quiet)"
+
+
+@pytest.mark.parametrize("via", ["machine", "resource", "outage_unknown"])
+def test_heal_known_machine_outage_keeps_the_check_quiet_then_grace_after_it(env, via):
+    """Replay: a check on a box with a known `ttp machines outage` opened a self-fix task; once the outage
+    ended a check still failing went straight to escalation with no grace."""
+    from ttp import heal, timefmt
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    block = {"machine": "box-a"} if via == "machine" else {"resource": "box-a-device"}
+    if via == "outage_unknown":
+        block = {"resource": "box-a-device", "outage": True, "check": "exit 75"}
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, **block)
+    spec, now = _heal_spec(p), time.time()
+    tid = _heal_to_self_fix_failed(p, d, up, dict(spec, check=f"test -e {up}", grace_s=0), now)   # an earlier episode
+    rec = ml.set_outage("box-a", "hardware repair", "user", "2h", now=now)
+    until = timefmt.long(rec["until"], p)
+    if via == "outage_unknown":   # unknown within its window, then quiet past it instead of escalating
+        assert heal.run(d, "svc", spec, now + 30)[0] == "ok (unknown, rc 75)"
+    for dt in (660, 3600, 7000):
+        assert heal.run(d, "svc", spec, now + dt)[0] == f"unhealthy (known outage until {until})"
+    st = heal.state(p.db, "svc")
+    assert st["known_outage"] == "box-a" and not {"task", "escalated", "alerted", "observed"} & set(st)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'") and not up.exists()
+    assert p.db.task(tid)["status"] == "failed"
+    # The outage ends and the box still fails: a fresh episode with its grace, not an escalation.
+    ml.clear_outage("box-a")
+    t1 = now + 7300
+    first = heal.run(d, "svc", spec, t1)[0]
+    if via == "outage_unknown":
+        assert first == "ok (unknown, rc 75)"
+    else:
+        assert first == "unhealthy (0 s, grace 600 s)"
+    assert "self-fix task" in heal.run(d, "svc", spec, t1 + 600)[0]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
+
+
+def test_heal_known_outage_end_keeps_a_still_open_self_fix_task(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, grace_s=0, machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "2h", now=now)
+    heal.run(d, "svc", spec, now + 10)
+    tid = p.db.add_task("open self-fix", kind="code") if hasattr(p.db, "add_task") else None
+    assert tid
+    st = heal.state(p.db, "svc")
+    st["task"] = tid
+    heal._save(p.db, "svc", st)
+    ml.clear_outage("box-a")
+    heal.run(d, "svc", spec, now + 60)
+    heal.run(d, "svc", spec, now + 120)
+    assert heal.state(p.db, "svc")["task"] == tid
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] <= 1
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_unknown_check_under_a_known_machine_outage_tells_no_one(env, escalate):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, machine="box-a", unknown_cap_s=600, escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 255")
+    ml.set_outage("box-a", "hardware repair", "user", "4h", now=now)
+    for t in (0, 11 * 60, 3600, 3 * 3600):
+        assert heal.run(d, "svc", dark, now + t) == ("ok (unknown, rc 255)", None)
+    assert _heal_told(p) == ([], []) and "unknown_told" not in heal.state(p.db, "svc")
+    # The outage over, the same stretch says so once past its cap again.
+    ml.clear_outage("box-a")
+    assert heal.run(d, "svc", dark, now + 4 * 3600 + 60) == ("ok (unknown, rc 255)", None)
+    assert "told" in heal.run(d, "svc", dark, now + 4 * 3600 + 60 + 601)[0]
+    assert sum(map(len, _heal_told(p))) == 1
+
+
+@pytest.mark.parametrize("block", [{"machine": "box-b"}, {"resource": "box-ab-device"}, {"resource": "box-a2"}])
+def test_heal_outage_on_another_machine_does_not_quiet_the_check(env, block):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, escalate="coordinator", **block)
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "4h", now=now)
+    assert heal.known_outage(spec, now) is None
+    heal.run(d, "svc", dict(spec, check="exit 255"), now)
+    assert "coordinator told" in heal.run(d, "svc", dict(spec, check="exit 255"), now + 601)[0]
+    assert "it has no fix" in heal.run(d, "svc", spec, now + 700)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+
+
+@pytest.mark.parametrize("finding", ["chip", "unknown"])
+def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, finding):
+    """[note f7b7938ee8de232f] An outage recorded for one service (`--covers ltx`) quieted every unhealthy
+    result on the machine, so a chip loss went unnoticed for hours. Only a check whose identity names a
+    covered part stays quiet."""
+    from ttp import heal, timefmt
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="LTX")
+    assert rec["covers"] == ["ltx"]
+    until = timefmt.long(rec["until"], p)
+    # The covered service's own check stays quiet, as under a whole-machine outage.
+    ltx = dict(spec, unit="ltx.service", check="echo 'ltx service inactive'; exit 1")
+    assert heal.outage_explains(rec, "svc", ltx, 1, "ltx service inactive")
+    assert heal.run(d, "svc", ltx, now)[0] == f"unhealthy (known outage until {until})"
+    assert heal.state(p.db, "svc")["known_outage"] == "box-a"
+    if finding == "chip":   # a chip loss is not explained: it escalates as usual
+        lost = dict(spec, check="echo 'chip 0 missing from the device list'; exit 1")
+        assert not heal.outage_explains(rec, "svc", lost, 1, "chip 0 missing from the device list")
+        assert "self-fix task" in heal.run(d, "svc", lost, now + 60)[0]
+        assert "known_outage" not in heal.state(p.db, "svc")
+        assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    else:   # an unreachable box is not explained by one service either: its long stretch is told once
+        dark = dict(spec, check="exit 255")
+        heal.run(d, "svc", dark, now + 60)
+        assert "coordinator told" in heal.run(d, "svc", dark, now + 60 + 601)[0]
+        # An outage covering the host explains it: nothing more is told.
+        ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+        assert heal.outage_explains(ml.outages()["box-a"], "svc", dark, 255, "")
+        assert heal.run(d, "svc", dark, now + 900) == ("ok (unknown, rc 255)", None)
+        assert heal.state(p.db, "svc")["known_outage"] == "box-a"
+    # Covered words match whole words of the identity (a plural too), never inside another word.
+    chip = {"covers": ["chip"]}
+    assert heal.outage_explains(chip, "chips", spec, 1, "")
+    assert heal.outage_explains(chip, "svc", dict(spec, resource="box-a-chip"), 1, "")
+    assert not heal.outage_explains(chip, "chipset-fan", spec, 1, "")
+    assert heal.outage_explains({}, "svc", spec, 1, "anything at all")
+
+
+def test_heal_outage_covers_match_the_checks_identity_never_its_output(env):
+    """[note f7b7938ee8de232f] Under `--covers ltx`, a health check reporting the held service and a lost
+    chip escalates: its output never makes the outage explain it. A check named after the service stays
+    quiet, even for a chip loss: the accepted gap (heal module doc)."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="ltx")
+    out = "ltx: held (paused by user)\nchip 0 missing"
+    health = dict(spec, check="echo 'ltx: held (paused by user)'; echo 'chip 0 missing'; exit 1")
+    assert not heal.outage_explains(rec, "svc", health, 1, out)
+    assert "self-fix task" in heal.run(d, "svc", health, now)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    # The check's name, resource or unit naming the service: quiet, whatever its output says.
+    assert heal.outage_explains(rec, "ltx", spec, 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, resource="box-a-ltx"), 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, unit="ltx.service"), 1, out)
+    assert heal.run(d, "ltx", health, now)[0].startswith("unhealthy (known outage until ")
+    assert heal.state(p.db, "ltx")["known_outage"] == "box-a"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_outage_covering_the_host_explains_only_unknown_runs_that_are_no_finding(env):
+    """Under `--covers host` (power and network alike) only a run that cannot reach the box, exit 75 or
+    255, is explained: never one carrying the not-outage FINDING line (the box is up), nor another exit."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    rec = ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+    lost = f"chip 0 missing\n{heal.FINDING}"
+    assert heal.outage_explains(rec, "svc", spec, 255, "")
+    assert heal.outage_explains(rec, "svc", spec, 75, "ssh: connect to host timed out")
+    for rc in (75, 255):
+        assert not heal.outage_explains(rec, "svc", spec, rc, lost)
+    for rc in (1, 2, 124):
+        assert not heal.outage_explains(rec, "svc", spec, rc, "")
+    # Run by run: the finding escalates as plain unhealthy, another exit is reported, the dark run is quiet.
+    found = dict(spec, check=f"echo 'chip 0 missing'; echo '{heal.FINDING}'; exit 75")
+    assert "self-fix task" in heal.run(d, "svc", found, now)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+    assert heal.run(d, "two", dict(spec, check="exit 2"), now)[0].startswith("error: heal check exited 2")
+    assert "known_outage" not in heal.state(p.db, "two")
+    assert heal.run(d, "dark", dict(spec, check="exit 255"), now) == ("ok (unknown, rc 255)", None)
+    assert heal.state(p.db, "dark")["known_outage"] == "box-a"
+
+
+def test_heal_outage_that_does_not_explain_a_result_keeps_its_episode(env):
+    """Under `--covers host`, a check alternating between a dark run (explained) and a chip loss (not)
+    escalates once its grace has passed: a result the live outage does not explain never restarts the
+    episode. Only the outage's end does."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, escalate="coordinator", machine="box-a")
+    spec, now = _heal_spec(p), time.time()
+    ml.set_outage("box-a", "host repair", "user", "4h", now=now, covers="host")
+    dark, lost = dict(spec, check="exit 255"), dict(spec, check="echo 'chip 0 missing'; exit 1")
+    first = heal.run(d, "svc", lost, now)[0]
+    assert first.startswith("unhealthy") and "self-fix task" not in first   # within its grace
+    assert heal.run(d, "svc", dark, now + 300) == ("ok (unknown, rc 255)", None)
+    assert "self-fix task" in heal.run(d, "svc", lost, now + 660)[0]
+    assert "known_outage" not in heal.state(p.db, "svc")
+
+
+def test_heal_back_from_a_long_unknown_stretch_starts_a_fresh_episode(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, grace_s=600, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    tid = _heal_to_self_fix_failed(p, d, up, dict(spec, grace_s=0), now)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 10)[0]
+    # A short unknown blip keeps the episode.
+    heal.run(d, "svc", dark, now + 20)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 30)[0]
+    # A long one (past grace and FRESH_UNKNOWN_S) with the task closed: grace again, then a new task.
+    heal.run(d, "svc", dark, now + 40)
+    t1 = now + 40 + heal.FRESH_UNKNOWN_S + 1
+    assert heal.run(d, "svc", spec, t1)[0] == "unhealthy (0 s, grace 600 s)"
+    st = heal.state(p.db, "svc")
+    assert st["since"] == t1 and not {"task", "escalated", "observed"} & set(st)
+    assert "it has no fix" in heal.run(d, "svc", spec, t1 + 600)[0]
+    assert heal.state(p.db, "svc")["task"] != tid
+    # An open task survives a long unknown stretch: the episode goes on.
+    heal.run(d, "svc", dark, t1 + 700)
+    assert "open" in heal.run(d, "svc", spec, t1 + 700 + 10 * heal.FRESH_UNKNOWN_S)[0]
+
+
+def test_heal_fresh_episode_after_a_long_unknown_stretch_keeps_the_fix_cap(env, tmp_path):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=f"echo fixed >> {tmp_path}/fixes", grace_s=0, max_fixes=1, window_h=2,
+                           escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fixed; rechecking)"
+    assert "the fix ran but" in heal.run(d, "svc", spec, now + 10)[0]
+    p.db.update_task(heal.state(p.db, "svc")["task"], status="failed")
+    heal.run(d, "svc", dict(spec, check="exit 75"), now + 20)
+    assert "used up its cap (1)" in heal.run(d, "svc", spec, now + 20 + heal.FRESH_UNKNOWN_S + 1)[0]
+    assert (tmp_path / "fixes").read_text().count("fixed") == 1
+
+
+def test_heal_reboots_keep_the_fix_cap_and_an_open_self_fix_task(env, tmp_path):
+    """Known gap (module doc): a reboot starts no fresh episode, so a crash-looping box gets no fix per boot."""
+    from ttp import heal
+    boot = tmp_path / "boot"
+    boot.write_text("aaaaaaaa-1111")
+    p, d, up = _heal_setup(env, grace_s=300, max_fixes=1, escalate="coordinator")
+    spec, now = _heal_spec(p), time.time()
+    spec = dict(spec, check=f'echo "boot_id: $(cat {boot})"; test -e {up}', fix=f"echo fixed >> {tmp_path}/fixes")
+    assert "grace" in heal.run(d, "svc", spec, now)[0]
+    assert heal.run(d, "svc", spec, now + 300)[0] == "unhealthy (fixed; rechecking)"
+    assert "the fix ran but" in heal.run(d, "svc", spec, now + 310)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    for i, t in enumerate((400, 900, 1500)):
+        boot.write_text(f"bbbbbbbb-{i}")   # the host rebooted and still fails
+        assert heal.run(d, "svc", spec, now + t)[0] == f"unhealthy (self-fix task #{tid} open)"
+    p.db.update_task(tid, status="failed")
+    for i, t in enumerate((2000, 2600, 3500)):
+        boot.write_text(f"cccccccc-{i}")
+        assert "coordinator told" in heal.run(d, "svc", spec, now + t)[0]
+    assert (tmp_path / "fixes").read_text().count("fixed") == 1
+    assert len(heal.state(p.db, "svc")["fixes"]) == 1
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+@pytest.mark.parametrize("task_status", ["running", "done", "failed", "blocked", "gone", "escalated-only"])
+def test_heal_known_fault_added_after_self_fix_stays_quiet(env, escalate, task_status):
+    from ttp import heal
+    p, d, up = _heal_setup(env, outage=True, fix=None, escalate=escalate,
+                          check="echo 'ttp-heal: not-outage'; exit 1")
+    spec, now = _heal_spec(p), time.time()
+    assert "self-fix task" in heal.run(d, "svc", spec, now)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="running")
+    assert heal.run(d, "svc", spec, now + 1)[0] == f"unhealthy (self-fix task #{tid} open)"
+
+    # The self-fix identifies a known fault instead of repairing the hardware.
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["known_fault"] = "vendor bug"
+    p.db.x("UPDATE schedules SET payload=? WHERE name='svc'", (json.dumps(payload),))
+    quiet = _heal_spec(p)
+    if task_status == "gone":
+        p.db.x("DELETE FROM tasks WHERE id=?", (tid,))
+    elif task_status == "escalated-only":
+        st = heal.state(p.db, "svc")
+        st.pop("task")
+        heal._save(p.db, "svc", st)
+    else:
+        p.db.update_task(tid, status=task_status)
+    for dt in (2, heal.OUTAGE_S, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", quiet, now + dt) == ("unhealthy (known fault: kept quiet)", None)
+        st = heal.state(p.db, "svc")
+        assert st["finding"] and st["status"] == "unhealthy"
+        assert not {"task", "escalated", "alerted", "observed"} & set(st)
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == (0 if task_status == "gone" else 1)
+    if task_status not in ("gone", "escalated-only"):
+        assert p.db.task(tid)["status"] == task_status
+
+    # A real outage must still escalate even though the same fault is known.
+    outage = dict(quiet, check="exit 1")
+    assert "self-fix task" in heal.run(d, "svc", outage, now + 4 * heal.OUTAGE_S)[0]
+    outage_tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(outage_tid, status="failed")
+    assert ("alerted" if escalate == "user" else "coordinator told") in heal.run(
+        d, "svc", outage, now + 4 * heal.OUTAGE_S + 1)[0]
+
+
+def test_heal_check_marks_a_non_outage_finding_with_one_output_line():
+    from ttp import heal
+    assert heal.finding(1, "keeper stale\nttp-heal: not-outage\n")
+    assert heal.finding(2, "  ttp-heal: not-outage  ")
+    assert not heal.finding(0, "ttp-heal: not-outage"), "a healthy check is healthy"
+    assert not heal.finding(1, "box down"), "no line: the default classification"
+    assert not heal.finding(1, "it says ttp-heal: not-outage inline"), "only a line of its own counts"
+
+
+def test_heal_outage_check_with_a_non_outage_finding_queues_an_ordinary_self_fix_task(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, outage=True, machine="box-a", fix=None, grace_s=7200)
+    spec, now = _heal_spec(p), time.time()
+    # Default (no line): an outage check exiting 1 escalates as an outage within OUTAGE_S, reported down.
+    assert heal.run(d, "svc", spec, now)[0].startswith("unhealthy (")
+    assert list(ml.conditions()) == ["box-a:down"]
+    # The same check now says the box is up: the down report clears and its own grace_s applies.
+    found = dict(spec, check=f"test -e {up} || {{ echo 'keeper stale'; echo 'ttp-heal: not-outage'; exit 2; }}")
+    status = heal.run(d, "svc", found, now + 60)
+    assert status == ("unhealthy (60 s, grace 7200 s)", now + 7200), status
+    assert ml.conditions() == {} and heal.state(p.db, "svc")["finding"] is True
+    assert heal.run(d, "svc", found, now + heal.OUTAGE_S)[0] == f"unhealthy ({heal.OUTAGE_S} s, grace 7200 s)"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", found, now + 7200)[0]
+    assert "self-fix task" in status and not status.startswith("error"), status
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert json.loads(t["labels"]) == ["heal:svc"] and "non-outage finding" in t["spec"]
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", found, now + 7500)[0]
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='heal:svc'")["text"]
+    assert alert.startswith("Heal check svc still fails") and "Outage" not in alert, alert
+    up.touch()
+    assert heal.run(d, "svc", found, now + 7800) == ("ok (healthy)", None)
+    assert "finding" not in heal.state(p.db, "svc")
+    # A known fault stays quiet past the outage window when the check reports a finding.
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    up.unlink()
+    quiet = dict(found, known_fault="vendor bug", grace_s=0)
+    for dt in (0, heal.OUTAGE_S, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", quiet, now + 9000 + dt)[0] == "unhealthy (known fault: kept quiet)"
+    # Without the line the same exit 2 stays today's unknown-and-error result.
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    plain = dict(spec, check="echo 'keeper stale'; exit 2", grace_s=600)
+    assert heal.run(d, "svc", plain, now + 20000)[0].startswith("error: heal check exited 2")
+
+
+def test_heal_presets_read_systemd_and_broker_status(env, monkeypatch):
+    from ttp import heal
+    out = {}
+    monkeypatch.setattr(heal, "_shell", lambda cmd, cwd, timeout: out[cmd.split()[0]])
+    sd = heal.validate({"preset": "systemd", "unit": "w.service"})
+    st: dict = {}
+    out["systemctl"] = (0, "ActiveState=active\nNRestarts=2")
+    assert heal.check(sd, st, ".")[0] == 0 and st["nrestarts"] == 2
+    out["systemctl"] = (0, "ActiveState=active\nNRestarts=5")
+    assert heal.check(sd, st, ".") == (1, "w.service is crash-looping: NRestarts 2 -> 5")
+    out["systemctl"] = (0, "ActiveState=failed\nNRestarts=5")
+    assert heal.check(sd, st, ".")[0] == 1
+    bk = heal.validate({"preset": "broker", "status_command": "status --json"})
+    out["status"] = (0, json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
+    assert heal.check(bk, {}, ".") == (0, "no hold; automatic recovery on")
+    out["status"] = (0, json.dumps({"held": True, "auto_power_cycle": False, "auto_reboot": True}))
+    assert heal.check(bk, {}, ".") == (1, "held is set; auto_power_cycle is off")
+    out["status"] = (0, json.dumps({"held": False}))
+    assert heal.check(bk, {}, ".")[0] == 75
+    out["status"] = (255, "ssh: connect failed")
+    assert heal.check(bk, {}, ".")[0] == 255
+    with pytest.raises(ValueError, match="needs `url`"):
+        heal.validate({"preset": "http", "url": "ftp://x"})
+
+
+def _hold_check(p, holder):
+    """A check that, like one standing down for a known outage, exits 75: it prints the untenanted-hold line
+    while `holder` is missing."""
+    from ttp import heal
+    return heal.validate({"check": f"test -e {holder} || echo '{heal.UNTENANTED}'; exit 75", "machine": "box-a",
+                          "outage": True, "grace_s": 0})
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outage(env, escalate):
+    from ttp import alerts, heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env)
+    holder = p.root / "holder"
+    spec = {**_hold_check(p, holder), "escalate": escalate}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": spec})
+    now = time.time()
+    ml.set_outage("box-a", "unrelated repair", "user", "1d", now=now)
+    ceiling = heal.UNTENANTED_HOLD_S
+
+    def pages():
+        return (p.db.q("SELECT ref FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'"),
+                p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'heal-hold:%'"))
+
+    for t in (now, now + ceiling / 2, now + ceiling - 60):
+        heal.run(d, "svc", spec, t)
+    assert pages() == ([], [])
+    for t in (now + ceiling, now + ceiling + 900):   # past the ceiling: once
+        heal.run(d, "svc", spec, t)
+    alerts_, events = pages()
+    if escalate == "user":
+        assert [a["ref"] for a in alerts_] == ["heal-hold:svc"] and events == []
+        text = p.db.one("SELECT text FROM messages WHERE ref='heal-hold:svc'")["text"]
+    else:
+        assert alerts_ == [] and len(events) == 1 and events[0]["severity"] == "high"
+        text = events[0]["text"]
+    assert "held with no holder" in text and "unrelated repair" in text and "box-a" in text
+    # Unknown runs without the line keep the page; a run that answers without it clears it.
+    heal.run(d, "svc", {**spec, "check": "exit 75"}, now + ceiling + 1000)
+    assert alerts.sweep(p.db, now + ceiling + 1001) == [] and "hold_since" in heal.state(p.db, "svc")
+    holder.touch()
+    heal.run(d, "svc", {**spec, "check": "exit 1"}, now + ceiling + 1200)
+    assert "hold_since" not in heal.state(p.db, "svc")
+    if escalate == "user":
+        assert [e["key"] for e in alerts.sweep(p.db, now + ceiling + 1201)] == ["heal-hold:svc"]
+        assert p.db.one("SELECT cleared_why FROM alerts WHERE key='heal-hold:svc'")["cleared_why"] == \
+            "condition cleared"
+    # The project's heal.untenanted_hold_s sets the ceiling.
+    d.cfg.setdefault("heal", {})["untenanted_hold_s"] = 600
+    holder.unlink()
+    t1 = now + 2 * ceiling
+    heal.run(d, "svc", spec, t1)
+    heal.run(d, "svc", spec, t1 + 600)
+    assert len(pages()[0 if escalate == "user" else 1]) == 2
+
+
+def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):
+    from ttp import coordinator as coord
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env)
+    now = time.time()
+    ml.set_outage("box-a", "hardware repair", "user", "1d", now=now)
+    # A check standing down for the outage without the line: no hold page, however long.
+    plain = heal.validate({"check": "echo 'known outage: standing down'; exit 75", "machine": "box-a", "grace_s": 0})
+    for t in (now, now + 3600, now + 5 * heal.UNTENANTED_HOLD_S):
+        heal.run(d, "svc", plain, t)
+    assert "hold_since" not in heal.state(p.db, "svc")
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")
+    # An untenanted hold on a resource the user paused is known: quiet too.
+    spec = {**_hold_check(p, p.root / "holder"), "resource": "box-a-device"}
+    coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    t0 = now + 6 * heal.UNTENANTED_HOLD_S
+    for t in (t0, t0 + heal.UNTENANTED_HOLD_S + 60):
+        heal.run(d, "svc", spec, t)
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")
+
+
+@pytest.mark.parametrize("ender", ["schedule disabled", "schedule deleted", "escalate coordinator", "user pause"])
+def test_heal_hold_page_ends_like_the_heal_alert(env, ender):
+    """The untenanted-hold page shares the heal alert's lifecycle (cleared_why): the sweep ends it once the
+    check has no enabled schedule with a heal block, escalation moves to the coordinator or the user pauses
+    its resource, and the next run does not page the user again."""
+    from ttp import alerts, heal
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    p, d, up = _heal_setup(env)
+    spec = {**_hold_check(p, p.root / "holder"), "resource": "box-a-device"}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": spec})
+    now, ceiling = time.time(), heal.UNTENANTED_HOLD_S
+    for t in (now, now + ceiling):
+        heal.run(d, "svc", spec, t)
+
+    def page():
+        return p.db.one("SELECT * FROM alerts WHERE key='heal-hold:svc' ORDER BY id DESC LIMIT 1")
+
+    assert page()["cleared"] is None
+    assert alerts.sweep(p.db, now + ceiling + 1) == [] and page()["cleared"] is None   # still held: kept
+    if ender == "schedule disabled":
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    elif ender == "schedule deleted":
+        p.db.x("DELETE FROM schedules WHERE name='svc'")
+    elif ender == "escalate coordinator":
+        p.set_config("heal.escalate", "coordinator")
+        d.cfg = p.config()
+    else:
+        coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    assert [e["key"] for e in alerts.sweep(p.db, now + ceiling + 2)] == ["heal-hold:svc"]
+    why = {"schedule disabled": "the check has no enabled schedule with a heal block",
+           "schedule deleted": "the check has no enabled schedule with a heal block",
+           "escalate coordinator": "escalation moved to coordinator",
+           "user pause": "box-a-device is paused (by the user)"}[ender]
+    assert page()["cleared_why"] == why
+    if ender in ("escalate coordinator", "user pause"):   # the hold goes on: no second user page
+        heal.run(d, "svc", spec, now + ceiling + 300)
+        assert len(p.db.q("SELECT id FROM alerts WHERE key='heal-hold:svc'")) == 1
+
+
+def test_heal_broker_preset_reports_a_hold_with_no_holder(env, tmp_path):
+    from ttp import heal
+    status = tmp_path / "status.json"
+    spec = heal.validate({"preset": "broker", "status_command": f"cat {status}", "holder_field": "holder"})
+    status.write_text(json.dumps({"held": True, "holder": "", "auto_power_cycle": True, "auto_reboot": True}))
+    rc, out = heal.check(spec, {}, str(tmp_path))
+    assert rc == 1 and heal.untenanted(out) and "holder is empty" in out
+    status.write_text(json.dumps({"held": True, "holder": "job 12", "auto_power_cycle": True, "auto_reboot": True}))
+    rc, out = heal.check(spec, {}, str(tmp_path))
+    assert rc == 1 and not heal.untenanted(out)
+    rc, out = heal.check(heal.validate({"preset": "broker", "status_command": f"cat {status}"}), {}, str(tmp_path))
+    assert not heal.untenanted(out)   # no holder_field: a hold alone is not called untenanted
+
+
+def test_heal_open_task_matches_labels_exactly_not_as_like_wildcards(env):
+    from ttp import heal
+    p = make(env)
+    ids = {n: p.db.add_task(f"t {n}", "s", origin="daemon", labels=[heal.LABEL + n]) for n in ("axb", "a%c")}
+    assert heal.open_task(p.db, "a_b") is None and heal.open_task(p.db, "a%") is None
+    assert heal.open_task(p.db, "%") is None and heal.open_task(p.db, "a_c") is None
+    assert heal.open_task(p.db, "axb")["id"] == ids["axb"] and heal.open_task(p.db, "a%c")["id"] == ids["a%c"]
+
+
+def test_heal_queued_self_fix_task_is_cancelled_when_the_check_recovers_a_running_one_is_not(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env)
+    spec, now = _heal_spec(p), time.time()
+    nofix = dict(spec, fix="")
+    for status in ("queued", "running"):
+        assert "self-fix task" in heal.run(d, "svc", nofix, now)[0]
+        t = heal.open_task(p.db, "svc")
+        p.db.update_task(t["id"], status=status)
+        up.touch()
+        assert heal.run(d, "svc", nofix, now + 10)[0] == "ok (healthy)"
+        t = p.db.task(t["id"])
+        if status == "queued":
+            assert t["status"] == "cancelled" and "recovered" in t["blocked_reason"]
+        else:
+            assert t["status"] == "running"
+            p.db.update_task(t["id"], status="done")
+        up.unlink()
+
+
+def test_heal_outage_check_exiting_an_error_code_gets_one_task(env):
+    import unittest.mock
+    from ttp import alerts, heal
+    from ttp import schedule as sched
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["check"] = "exit 124"
+    sched.upsert(p.db, "svc", "command", "5m", payload=payload)
+    spec, now = _heal_spec(p), time.time()
+
+    def tick(at):   # one daemon run of the schedule, due now
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        with unittest.mock.patch("time.time", return_value=at):
+            d.run_schedules()
+        return p.db.one("SELECT last_status FROM schedules WHERE name='svc'")["last_status"]
+
+    assert tick(now).startswith("error: heal check exited 124")
+    tick(now + 300)   # second failure: the daemon queues its schedule_fix task
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    status = tick(now + 700)   # past the outage window: heal adopts that task
+    tasks = p.db.q("SELECT * FROM tasks WHERE origin='daemon'")
+    assert len(tasks) == 1 and f"self-fix task #{tasks[0]['id']}" in status, status
+    assert heal.has_open_task(p.db, "svc")
+    for dt in (1000, 1300):
+        tick(now + dt)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    p.db.update_task(tasks[0]["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", spec, now + 1600)[0]
+    assert p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='heal:svc'")
+    up.touch()
+    assert heal.run(d, "svc", dict(spec, check=f"test -e {up}"), now + 1900)[0] == "ok (healthy)"
+    assert "heal:svc" in [e["key"] for e in alerts.sweep(p.db)]
+
+
+def test_responsibility_inventory_credits_a_cotenants_fresh_healthy_heal_check_without_an_owner(env):
+    from ttp import heal
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    mm.add("box-a", tags="device")
+    me, gamma = make(env), _second_project(env, "gamma")
+    _resources(me, "Machines: box-a")
+    n = len(rs.inventory(me))
+    # A co-tenant's heal check that never ran, ran unhealthy, or ran healthy too long ago does not cover it.
+    sched.upsert(gamma.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    assert rs.refresh(me, now=10_000.0)["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "unhealthy", "last_check": 9_900.0, "last_rc": 1})
+    assert rs.inventory(me, now=10_000.0)[0]["covered_by"] == []
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 10_000.0 - 3 * 300, "last_rc": 0})
+    assert rs.inventory(me, now=10_000.0)[0]["covered_by"] == [], "stale: not covered"
+    # Healthy within its interval: covered by the co-tenant, with no recovery owner set, and gamma is only read.
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 9_800.0, "last_rc": 0})
+    mtime = (gamma.base / "state" / "project.db").stat().st_mtime_ns
+    rec = rs.refresh(me, now=10_000.0)
+    assert rec["items"][0] == {"kind": "machine", "name": "box-a", "covered_by": ["gamma/box-a-up"],
+                               "via": "gamma heal check"}
+    assert rec["line"] == f"health coverage: {n}/{n} (machine box-a covered by gamma heal check)"
+    assert (gamma.base / "state" / "project.db").stat().st_mtime_ns == mtime
+    advice = rs.review_advice(me.db)
+    assert "Give each missing one" not in advice and "no duplicate check" in advice
+    # Its check going stale makes the machine missing again, and the review advises a check.
+    rec = rs.refresh(me, now=9_800.0 + 3 * 300)
+    assert rec["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    assert "Give each missing one a heal check" in rs.review_advice(me.db)
+    # A recovery owner's heal check still covers it whatever its state, and wins over the co-tenant's.
+    mm.set_recovery("box-a", "alpha", None)
+    alpha = _second_project(env, "alpha")
+    sched.upsert(alpha.db, "box-a-own", "command", "5m", payload={"heal": {"check": "ssh box-a true"}})
+    gamma.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": 20_000.0, "last_rc": 0})
+    assert rs.refresh(me, now=20_000.0)["line"] == f"health coverage: {n}/{n} (machine box-a covered by owner alpha)"
+    # The owner set but without a check of its own: the co-tenant's healthy check covers it.
+    alpha.db.x("DELETE FROM schedules WHERE name='box-a-own'")
+    assert rs.refresh(me, now=20_000.0)["line"] == f"health coverage: {n}/{n} (machine box-a covered by gamma heal check)"
+    # The daily review spec carries the coverage line and no advice to add a duplicate check.
+    from ttp import daemon as dm
+    sched.upsert(me.db, "daily-review", "llm", "1d", payload={})
+    me.db.x("UPDATE schedules SET next_run=0 WHERE name='daily-review'")
+    dm.Daemon(me.base).run_schedules()
+    t = me.db.one("SELECT spec FROM tasks WHERE labels LIKE '%daily-review%'")
+    assert t and "covered by gamma heal check" in t["spec"] and "Give each missing one" not in t["spec"]
+
+
+def test_heal_check_reports_its_machine_down_or_held_to_the_ledger_and_clears_it(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, machine="box-a", fix=None, grace_s=600)
+    spec = _heal_spec(p)
+    assert heal.machine_of(spec) == "box-a"
+    now = time.time()
+    heal.run(d, "svc", spec, now)
+    c = ml.conditions()["box-a:down"]
+    assert c["seen_by"] == ["demo"] and c["grace_s"] == 600 and "heal check svc" in c["text"]
+    up.touch()
+    heal.run(d, "svc", spec, now + 60)
+    assert ml.conditions() == {} and "machine_reported" not in heal.state(p.db, "svc")
+    # A known fault on a non-outage check is not reported; an unknown result only past the outage window.
+    with pytest.raises(ValueError, match="condition"):
+        heal.validate({"check": "true", "condition": "gone"})
+    assert heal.machine_of(heal.validate({"check": "x", "resource": "box-a-device"})) is None
+    assert heal.machine_of(heal.validate({"check": "x", "resource": "box-a-device", "outage": True})) == "box-a"
+    up.unlink()
+    quiet = heal.validate({"check": f"test -e {up}", "machine": "box-a", "known_fault": "vendor bug"})
+    heal.run(d, "svc", quiet, now + 120)
+    assert ml.conditions() == {}
+    dark = heal.validate({"check": "exit 75", "machine": "box-a", "outage": True, "grace_s": 600})
+    heal.run(d, "svc", dark, now + 180)
+    assert ml.conditions() == {}
+    heal.run(d, "svc", dark, now + 180 + 600)
+    assert ml.conditions()["box-a:down"]["grace_s"] == 0
+
+
+def test_an_outage_check_whose_only_route_failed_for_an_hour_reports_no_machine_down(env):
+    """Replay: an outage check unknown for over 60 min only because its ssh route failed paged the
+    machine's recovery owner for nothing. Now it escalates as its own route problem and reports nothing."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    assert heal.route_failed(255, "") and heal.route_failed(75, "ssh: connect to host x port 22: Connection refused")
+    assert heal.route_failed(124, "No route to host") and heal.route_failed(75, "Network is unreachable")
+    assert not heal.route_failed(75, "broker status: no answer") and not heal.route_failed(1, "Connection refused")
+    assert not heal.route_failed(0, "Connection timed out")
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha")
+    p, d, _ = _heal_setup(env)
+    dark = heal.validate({"check": "echo 'ssh: connect to host box-a port 22: Connection timed out' >&2; exit 255",
+                          "machine": "box-a", "outage": True, "grace_s": 0})
+    t0 = time.time()
+    for dt in (0, 1800, 3700, 7200):
+        heal.run(d, "svc", dark, t0 + dt)
+        assert ml.conditions() == {}, dt
+    assert ml.route(t0 + 7200, able=lambda n: (True, ""), healthy=lambda *a: []) == []
+    st = heal.state(p.db, "svc")
+    assert st["route_only"] and st["status"] == "unhealthy" and "machine_reported" not in st
+    task = p.db.one("SELECT * FROM tasks WHERE labels LIKE '%heal:svc%'")
+    assert "own route problem" in st["why"] and "route (ssh, a tunnel) failed" in task["spec"]
+    # One unknown run that is not a route failure ends route_only: past the window the machine is down.
+    other = heal.validate({"check": "echo 'status: no answer'; exit 75", "machine": "box-a", "outage": True,
+                           "grace_s": 0})
+    heal.run(d, "svc", other, t0 + 7300)
+    assert not heal.state(p.db, "svc")["route_only"] and list(ml.conditions()) == ["box-a:down"]
+    # A run that is a route failure again does not make the stretch route-only, so the report stays.
+    heal.run(d, "svc", dark, t0 + 7400)
+    assert list(ml.conditions()) == ["box-a:down"]
+    # A route-only stretch after a down report clears it.
+    p.root.joinpath("svc-up").touch()
+    heal.run(d, "svc", heal.validate({"check": f"test -e {p.root / 'svc-up'}", "machine": "box-a"}), t0 + 7500)
+    assert ml.conditions() == {}
+    for dt in (7600, 7600 + 3700):
+        heal.run(d, "svc", dark, t0 + dt)
+    assert ml.conditions() == {} and heal.state(p.db, "svc")["route_only"]
+
+
+def test_an_outage_check_with_ping_host_tells_a_box_that_is_off_from_its_own_route(env, monkeypatch):
+    """Upstream note: every ssh 255 counted as this project's route problem, so a box that was powered off
+    or rebooting got a self-fix task instead of an outage report. `ping_host` (and a `ping_peer`) tell them apart."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha")
+    p, d, _ = _heal_setup(env)
+    answers: dict = {}
+    pinged: list = []
+    monkeypatch.setattr(heal, "_pings", lambda h, cwd: pinged.append(h) or answers.get(h))
+    block = {"check": "echo 'ssh: connect to host box-a port 22: No route to host' >&2; exit 255",
+             "machine": "box-a", "outage": True, "grace_s": 0, "ping_host": "box-a", "ping_peer": "box-b"}
+    spec = heal.validate(block)
+    t0 = time.time()
+    # Both silent, the box answering, or ping unable to tell: still our own route, nothing reported.
+    for i, (box, peer) in enumerate(((False, False), (True, True), (None, True), (False, None))):
+        answers.update({"box-a": box, "box-b": peer})
+        heal.run(d, f"r{i}", spec, t0)
+        heal.run(d, f"r{i}", spec, t0 + 3700)
+        st = heal.state(p.db, f"r{i}")
+        assert st["route_only"] and "own route problem" in st["why"] and ml.conditions() == {}, (box, peer)
+    # The box silent while its peer answers: it is off or rebooting, an outage reported down.
+    answers.update({"box-a": False, "box-b": True})
+    heal.run(d, "off", spec, t0)
+    heal.run(d, "off", spec, t0 + 3700)
+    st = heal.state(p.db, "off")
+    assert not st["route_only"] and list(ml.conditions()) == ["box-a:down"]
+    assert "box-a does not answer ping while box-b does" in st["why"] and "ping: box-a" in st["last_out"]
+    # Only ssh's own exit 255 pings: a route failure with another exit code stays our route, as do runs
+    # without a route failure or without the ping options.
+    pinged.clear()
+    heal.run(d, "other", heal.validate({**block, "check": block["check"].replace("255", "2")}), t0)
+    heal.run(d, "other", heal.validate({**block, "check": block["check"].replace("255", "2")}), t0 + 3700)
+    assert heal.state(p.db, "other")["route_only"] and list(ml.conditions()) == ["box-a:down"]
+    heal.run(d, "plain", heal.validate({**block, "check": "echo 'status: no answer'; exit 75"}), t0)
+    heal.run(d, "noping", heal.validate({**block, "ping_host": None, "ping_peer": None}), t0)
+    assert pinged == []
+    # A silent box with no peer to compare is never called down: the two options are set together.
+    for bad in ({"ping_host": "-f", "ping_peer": "b"}, {"ping_host": "a b", "ping_peer": "b"},
+                {"ping_host": 3, "ping_peer": "b"}, {"ping_peer": "box-b"}, {"ping_host": "box-a"}):
+        with pytest.raises(ValueError):
+            heal.validate({"check": "true", **bad})
+
+
+def test_heal_pings_reads_only_no_reply_as_silent(monkeypatch):
+    from ttp import heal
+    for platform, silent in (("linux", 1), ("darwin", 2)):
+        monkeypatch.setattr(heal.sys, "platform", platform)
+        for rc, want in ((0, True), (silent, False), (127, None), (68, None)):
+            monkeypatch.setattr(heal, "_exec", lambda argv, cwd, t, rc=rc: (rc, ""))
+            assert heal._pings("box-a", ".") is want, (platform, rc)
+
+
+def test_a_route_only_outage_check_is_not_an_outage_alert(env):
+    from ttp import heal
+    from ttp import schedule as sched
+    p, d, _ = _heal_setup(env)
+    block = {"check": "exit 255", "machine": "box-a", "outage": True, "grace_s": 0}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": block})
+    spec = _heal_spec(p)
+    t0 = time.time()
+    heal.run(d, "svc", spec, t0)
+    heal.run(d, "svc", spec, t0 + 3700)
+    assert heal.state(p.db, "svc")["route_only"] and not heal.is_outage(p.db, "svc")
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": {**block, "check": "exit 75"}})
+    heal.run(d, "svc", _heal_spec(p), t0 + 3800)
+    assert heal.is_outage(p.db, "svc")
+
+
+def test_the_owners_own_healthy_heal_check_holds_a_machine_page_and_sends_one_low_note(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha", fallback="beta")
+    me, alpha = make(env), _second_project(env, "alpha")
+    sched.upsert(alpha.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    t0 = time.time()
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": t0 - 60, "last_rc": 0})
+    mtime = (alpha.base / "state" / "project.db").stat().st_mtime_ns
+    able = lambda n: (True, "")
+    ml.report("gamma", "box-a", "down", "heal check up: unknown", grace_s=0, now=t0)
+    pages = ml.route(t0 + 1, able=able)
+    assert [(x["target"], x["kind"], x["severity"]) for x in pages] == [("alpha", "machine_condition_held", "low")]
+    assert "by gamma" in pages[0]["text"] and "alpha/box-a-up" not in pages[0]["text"]
+    assert "box-a-up" in pages[0]["text"] and "No recovery page" in pages[0]["text"]
+    assert (alpha.base / "state" / "project.db").stat().st_mtime_ns == mtime, "the owner is only read"
+    assert ml.delivered(pages[0])
+    assert ml.route(t0 + 300, able=able) == [], "one note per episode, and no recovery page while held"
+    assert ml.conditions()["box-a:down"]["page"]["held"]["by"] == "alpha"
+    _resources(me, "Machines: box-a")
+    assert "page held: alpha's heal check sees it healthy" in "\n".join(ml.digest_lines(me, t0 + 300))
+    # The owner's check going stale (or unhealthy) lifts the hold: the usual recovery page goes out.
+    ml.report("gamma", "box-a", "down", now=t0 + 1000)
+    pages = ml.route(t0 + 1000, able=able)
+    assert [(x["target"], x["kind"]) for x in pages] == [("alpha", "machine_condition")]
+    assert "severity" not in pages[0] and "held" not in ml.conditions()["box-a:down"]["page"]
+    # The owner reporting the condition itself is never held by its own other check.
+    ml.report("gamma", "box-a", "down", cleared=True)
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-up", {"status": "healthy", "last_check": t0 + 1990, "last_rc": 0})
+    ml.report("alpha", "box-a", "down", grace_s=0, now=t0 + 2000)
+    assert [x["kind"] for x in ml.route(t0 + 2000, able=able)] == ["machine_condition"]
+    # A broker hold comes from a check that reached the box: a healthy reachability check never holds its page.
+    ml.report("alpha", "box-a", "down", cleared=True)
+    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2010)
+    got = ml.route(t0 + 2010, able=able)
+    assert [(x["target"], x["kind"]) for x in got] == [("alpha", "machine_condition")]
+    assert "held" not in ml.conditions()["box-a:held"]["page"]
+    # Only the owner's own healthy broker check of the machine (no hold there) holds it, with no route wording.
+    ml.report("gamma", "box-a", "held", cleared=True)
+    sched.upsert(alpha.db, "box-a-broker", "command", "5m", payload={"heal": {
+        "preset": "broker", "status_command": "true", "resource": "box-a-device"}})
+    alpha.db.set_kv(heal.STATE_KEY + "box-a-broker", {"status": "healthy", "last_check": t0 + 2020, "last_rc": 0})
+    ml.report("gamma", "box-a", "held", grace_s=0, now=t0 + 2030)
+    got = ml.route(t0 + 2030, able=able)
+    assert [(x["target"], x["kind"]) for x in got] == [("alpha", "machine_condition_held")]
+    assert "box-a-broker" in got[0]["text"] and "route problem" not in got[0]["text"]
+    assert ml.conditions()["box-a:held"]["page"]["held"]["checks"] == ["box-a-broker"]
+    ml.report("gamma", "box-a", "held", cleared=True)
+    # A recovery page recorded before the hold began is not delivered while the hold is on.
+    ml.report("gamma", "box-a", "down", grace_s=0, now=t0 + 2040)
+    nobody = lambda who, alias, now, cond: []
+    first = ml.route(t0 + 2040, able=able, healthy=nobody)
+    assert [x["kind"] for x in first] == ["machine_condition"]
+    assert ml.route(t0 + 2040 + ml.CLAIM_S, able=able) == [], "unclaimed while held"
+    assert ml.route(t0 + 2040 + ml.CLAIM_S, able=able, healthy=nobody)[0]["id"] == first[0]["id"]
+    ml.report("gamma", "box-a", "down", cleared=True)
+    # The fallback's healthy check holds it when the owner has none.
+    ml.report("gamma", "box-a", "down", grace_s=0, now=t0 + 2100)
+    got = ml.route(t0 + 2100, able=able, healthy=lambda who, alias, now, cond: ["up"] if who == "beta" else [])
+    assert [(x["target"], x["kind"]) for x in got] == [("beta", "machine_condition_held")]
+    # Delivery: a low inbox note to another project; a low feed line, no coordinator event, at home.
+    d = Daemon(me.base)
+    assert d._machine_page({**got[0], "target": "alpha"}, t0)
+    note = [json.loads(ln) for ln in upstream.path().read_text().splitlines()][-1]
+    assert (note["to"], note["severity"]) == ("alpha", "low")
+    home = {**got[0], "target": me.name}
+    assert d._machine_page(home, t0) and d._machine_page(home, t0)
+    assert me.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (home["id"],))["n"] == 1
+    assert me.db.one("SELECT id FROM events WHERE kind='machine_condition_held'") is None
+
+
+def test_heal_broker_check_reports_held_and_not_a_missing_auto_recovery(env, tmp_path):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    out = tmp_path / "status.json"
+    p, d, _ = _heal_setup(env)
+    spec = heal.validate({"preset": "broker", "status_command": f"cat {out}", "resource": "box-a-device",
+                          "grace_s": 0})
+    out.write_text(json.dumps({"held": False, "auto_power_cycle": False, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert ml.conditions() == {}, "automatic recovery off is not a held or down machine"
+    out.write_text(json.dumps({"held": True, "auto_power_cycle": True, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert list(ml.conditions()) == ["box-a:held"]
+    out.write_text(json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert ml.conditions() == {}
+
+
+def test_mute_heal_and_lock_holder_times_show_the_home_zone_on_a_utc_box(env, utc_box):
+    """Mute lines and their end summary, a heal check's self-fix task and lock holders (local and
+    shared) are in the project's home zone with its abbreviation, never the box's UTC."""
+    from types import SimpleNamespace
+    from ttp import heal, locks, shared
+    from ttp import screen as scr
+    pac = re.compile(r"\d\d:\d\d P[DS]T")
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    now = time.time()
+    scr.mute(p.db, "watcher:hw", "held", 1, now=now - 3600)
+    with p.db.tx():
+        [m] = p.db.kv(scr.MUTES_KEY)
+        m.update(count=2, last_at=now - 600)
+        p.db.set_kv(scr.MUTES_KEY, [m])
+    line = scr.mute_line(m, now, p)
+    assert pac.search(line.split("last at", 1)[1]) and " UTC" not in line, line
+    assert scr.expire_mutes(p.db, now + 60, where=p)
+    ended = p.db.one("SELECT text FROM events WHERE text LIKE 'mute ended:%'")["text"]
+    assert pac.search(ended.split("last at", 1)[1]) and " UTC" not in ended, ended
+    heal._escalate(SimpleNamespace(p=p), "svc", {"check": "false", "fix": "true"},
+                   {"since": now - 7200, "last_rc": 1}, now, "the fix exited 1")
+    spec = p.db.one("SELECT spec FROM tasks WHERE title LIKE 'Self-fix: heal check svc%'")["spec"]
+    assert re.search(r"Unhealthy since \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T\.", spec), spec
+    assert "exit 75 (known outage, unknown) is the expected end state" in spec, spec
+    assert "do not try to force a pass" in spec, spec
+    p.set_config("shared_resources", ["board"])
+    slots = {"own": p.state / "locks" / "dev.0.lock", "shared": shared.root() / "board" / "board.0.lock"}
+    held = []
+    try:
+        for path in slots.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            held.append(locks.try_take([path], "task #3 (run 9)", "x"))
+        assert all(held)
+        assert re.fullmatch(r"task #3 \(run 9\) since \d\d:\d\d P[DS]T", locks.holders([slots["own"]], p)[0])
+        for who in shared.held(p) + locks.held(p.state / "locks", p):
+            assert pac.search(who) and " UTC" not in who, who
+        assert len(shared.held(p)) == 2, shared.held(p)
+    finally:
+        for f in held:
+            if f:
+                f.close()
+
+
+@pytest.mark.parametrize('provider', ['codex', 'claude'])
+def test_coordinator_wire_schema_closes_nullable_heal_and_covers_prompt(env, tmp_path, provider):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    argv, _ = get_provider(provider).build(role='coordinator', model='', effort='low', cwd=str(tmp_path),
+                                           budget_usd=1, read_only=True, schema=coord.ACTIONS_SCHEMA,
+                                           restrictions={})
+    flag = '--output-schema' if provider == 'codex' else '--json-schema'
+    raw = argv[argv.index(flag) + 1]
+    wire = json.loads(pathlib.Path(raw).read_text() if provider == 'codex' else raw)
+    _assert_openai_strict_schema(wire)
+    item = wire['properties']['actions']['items']['properties']
+    prompt = (RUNTIME.parent / 'template/prompts/coordinator.md').read_text()
+    documented = set(re.findall(r'^\| `([a-z_]+)` \|', prompt, re.M))
+    assert set(item['type']['enum']) == documented == set(coord.ACTION_TYPES)
+    from ttp import heal
+    block = item['heal']
+    assert set(block['properties']) == heal._COMMON | set().union(*heal.PRESETS.values())
+    for sub in block['properties'].values():
+        assert 'null' in sub.get('type', []) or {'type': 'null'} in sub.get('anyOf', [])
+
+
+@pytest.mark.parametrize('preset, fields', [(None, {'check': 'true'}),
+                                           ('systemd', {'unit': 'example.service'}),
+                                           ('http', {'url': 'http://example.invalid'}),
+                                           ('broker', {'status_command': 'true'}),
+                                           ('broker', {'status_command': 'true', 'expected_count': 4,
+                                                       'max_recent_failures': 0})])
+def test_strict_heal_padding_uses_defaults_and_preset_keys(env, preset, fields):
+    from ttp import coordinator as coord, heal
+    p = make(env)
+    assert set(fields) <= set(coord.HEAL_SCHEMA['properties'])   # strict output sends only schema keys
+    block = dict.fromkeys(coord.HEAL_SCHEMA['properties'])
+    block.update(preset=preset, **fields)
+    action = dict.fromkeys(coord.ACTIONS_SCHEMA['properties']['actions']['items']['properties'])
+    action.update(type='schedule_set', name='probe', kind='command', heal=block)
+    assert coord.apply(p, [action]) == []
+    stored = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")['payload'])['heal']
+    assert all(v is not None for v in stored.values()) and {k: stored[k] for k in fields} == fields
+    assert heal.validate(stored)['timeout_s'] == heal.DEFAULTS['timeout_s']
+
+
+def test_heal_field_types_are_what_validate_takes():
+    """heal.py types each key once for the coordinator's wire schema: a value of every declared type
+    passes validate() for its preset, and no key has two types."""
+    from ttp import heal
+    sample = {'string': 'x', 'integer': 2, 'number': 1.5, 'boolean': True}
+    fixed = {'escalate': 'coordinator', 'condition': 'down', 'url': 'http://example.invalid'}
+    seen = {}
+    for preset, fields in [(None, {}), *heal.PRESET_FIELDS.items()]:
+        for k, t in [*heal.COMMON_FIELDS.items(), *fields.items()]:
+            assert seen.setdefault(k, t) == t, k
+        typed = {**heal.COMMON_FIELDS, **fields}
+        typed = {k: t.get('anyOf', [t])[0] for k, t in typed.items()}   # known_fault: text, or an object
+        block = {k: fixed.get(k, [sample[t['items']['type']]] if t['type'] == 'array' else sample[t['type']])
+                 for k, t in typed.items() if k != 'preset'}
+        out = heal.validate({**block, **({'preset': preset} if preset else {})})
+        assert all(out[k] == v for k, v in block.items()), preset
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_health_pause_lifts_once_and_wakes_waiters_and_sweep(env, shared):
+    from ttp import heal, sweep
+    p, d, _ = _health_pause(env, shared=shared)
+    now = time.time()
+    tid = p.db.add_task("use board", "s", labels=["resource:board"])
+    p.db.update_task(tid, status="queued", not_before=now + 9000,
+                     result=json.dumps({"status": "waiting", "waiting_for": "board",
+                                        "retry_when": "ttp lock --probe board"}))
+    for dt in (0, 900):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+        assert "board" in p.db.paused_resources()
+    heal.run(d, "svc", _heal_spec(p), now + 1800)
+    d.check_pause_ends()
+    d.check_pause_ends()
+    assert "board" not in p.db.paused_resources()
+    assert p.db.task(tid)["not_before"] is None
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+    events = p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+    assert len(events) == 1 and events[0]["source"] == "daemon"
+    assert "svc" in events[0]["text"] and "3" in events[0]["text"]
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")
+
+
+@pytest.mark.parametrize("rc", [1, 75, 255])
+def test_health_pause_failure_or_unknown_resets_clean_window(env, monkeypatch, rc):
+    from ttp import heal
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    verdict = [0]
+    monkeypatch.setattr(heal, "check", lambda *a: (verdict[0], "result"))
+    for dt, code in [(0, 0), (900, 0), (1200, rc), (1800, 0), (2700, 0), (3600, 0)]:
+        verdict[0] = code
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+        assert ("board" in p.db.paused_resources()) == (dt < 3600)
+
+
+def test_health_pause_restart_keeps_count_and_ticks_do_not_replay_results(env):
+    from ttp import heal
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env)
+    assert p.db.paused_resources()["board"]["end_when"] == HEALTH_END
+    now = time.time()
+    heal.run(d, "svc", _heal_spec(p), now)
+    for _ in range(4):
+        d.check_pause_ends()
+    assert "board" in p.db.paused_resources()
+    heal.run(d, "svc", _heal_spec(p), now + 900)
+    restarted = Daemon(p.base)
+    heal.run(restarted, "svc", _heal_spec(p), now + 1800)
+    restarted.check_pause_ends()
+    assert "board" not in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("replacement", ["coordinator", "user"])
+def test_health_pause_changed_after_evidence_is_not_lifted(env, replacement):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env)
+    before = p.db.paused_resources()["board"]["generation"]
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    coord.pause_resource(p, "board", True, reason="new cause", by=replacement,
+                         end={"end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    assert p.db.paused_resources()["board"]["generation"] != before
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources() and not p.db.kv(sweep.SIGNAL_KEY)
+
+
+def test_health_pause_user_end_only_reports_once_and_never_lifts(env):
+    from ttp import heal, sweep
+    p, d, _ = _health_pause(env, by="user")
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d.check_pause_ends()
+    assert p.db.paused_resources()["board"]["by"] == "user"
+    assert not p.db.kv(sweep.SIGNAL_KEY)
+    (event,) = p.db.q("SELECT * FROM events WHERE kind='observation'")
+    assert event["severity"] == "low" and "Only the user lifts it" in event["text"]
+
+
+@pytest.mark.parametrize("field,value", [("expected_count", 4), ("max_recent_failures", 0)])
+def test_broker_heal_checks_optional_count_and_recent_failures(env, monkeypatch, field, value):
+    from ttp import heal
+    spec = heal.validate({"preset": "broker", "status_command": "status", field: value})
+    data = {"held": False, "auto_power_cycle": True, "auto_reboot": True,
+            "count": 4, "recent_failures": 0}
+    monkeypatch.setattr(heal, "_shell", lambda *args: (0, json.dumps(data)))
+    assert heal.check(spec, {}, ".")[0] == 0
+    data["count" if field == "expected_count" else "recent_failures"] = 3 if field == "expected_count" else 1
+    assert heal.check(spec, {}, ".")[0] == 1
+    data.pop("count" if field == "expected_count" else "recent_failures")
+    assert heal.check(spec, {}, ".")[0] == 75
+
+
+def test_health_pause_check_started_before_replacement_cannot_count(env, monkeypatch):
+    from ttp import coordinator as coord, heal, pauseends
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    original = heal.check
+    def replace_during_check(*args):
+        coord.pause_resource(p, "board", True, by="coordinator", reason="changed during check",
+                             end={"end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 0}})
+        return 0, "healthy old generation"
+    monkeypatch.setattr(heal, "check", replace_during_check)
+    heal.run(d, "svc", _heal_spec(p), now)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    monkeypatch.setattr(heal, "check", original)
+    for dt in (900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("change", ["shared_pause", "health_failure"])
+def test_health_pause_compare_and_swap_rechecks_pause_and_evidence(env, monkeypatch, change):
+    from ttp import coordinator as coord, heal, pauseends, shared, sweep
+    p, d, _ = _health_pause(env, shared=change == "shared_pause")
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    if change == "shared_pause":
+        update = shared.update_pause
+        def race(name, fn):
+            update(name, lambda w: {**w, "by": "user", "generation": "replacement"})
+            return update(name, fn)
+        monkeypatch.setattr(shared, "update_pause", race)
+    else:
+        owned = pauseends.owned
+        calls = [0]
+        def race(project, db=None):
+            calls[0] += 1
+            if calls[0] == 2:
+                # The evidence changes as the fenced transaction starts: write through its own
+                # connection (another connection would wait out the busy timeout, about 90 s).
+                (db or project.db).set_kv(pauseends.HEALTH_KEY, None)
+            return owned(project, db)
+        monkeypatch.setattr(pauseends, "owned", race)
+    d.check_pause_ends()
+    assert "board" in p.db.paused_resources() and not p.db.kv(sweep.SIGNAL_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+    daemon_log = p.logs / "daemon.log"
+    assert "pause ends failed" not in (daemon_log.read_text() if daemon_log.exists() else "")
+
+
+@pytest.mark.parametrize("stale", [True, False])
+def test_health_pause_old_or_disabled_check_cannot_lift(env, stale):
+    from ttp import heal
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    if not stale:
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now + 3700 if stale else now + 1800)   # past the 1800 s freshness bound
+    assert "board" in p.db.paused_resources()
+
+
+@pytest.mark.parametrize("probe", [None, "false"])
+def test_coordinator_pause_with_until_still_ends_on_health(env, probe):
+    # `until` is the deadline the coordinator is told about, not a reason to drop the health end; a
+    # probe of another cause replaces it.
+    from ttp import heal
+    p, d, _ = _health_pause(env, end={"until": "1d", **({"end_when": probe} if probe else {})})
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "coordinator" and held["end_when"] == (probe or HEALTH_END)
+    assert 86400 - 60 < held["until"] - time.time() <= 86400
+    now = time.time()
+    try:
+        for dt in (0, 900, 1800):
+            heal.run(d, "svc", _heal_spec(p), now + dt)
+            d._pause_ends.tick(now + dt)
+    finally:
+        d._pause_ends.stop()
+    assert ("board" in p.db.paused_resources()) == bool(probe)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == (0 if probe else 1)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")
+
+
+@pytest.mark.parametrize("how", ["chat", "repause"])
+def test_users_pause_with_until_reports_once_and_is_never_lifted(env, how):
+    # Only the coordinator's own pause gets the health end beside its `until`. The user's (asked in
+    # chat, or already theirs when the coordinator re-pauses it) reports its deadline once and stays.
+    from ttp import coordinator as coord, heal, pauseends
+    p, d, _ = _health_pause(env, by="user" if how == "repause" else "coordinator")
+    action = {"type": "resource_pause", "resource": "board", "paused": True, "until": "1d"}
+    if how == "chat":
+        msg = p.db.post("in", "Pause board until I say so.")
+        assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
+    else:
+        assert coord.apply(p, [action]) == []
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "user" and "end_when" not in held
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due','observation')")
+    for dt in (86400 + 60, 86400 + 120):
+        d._pause_ends.tick(now + dt)
+    (event,) = p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due','observation')")
+    assert event["kind"] == "observation" and "Only the user lifts it" in event["text"]
+    assert p.db.paused_resources()["board"]["by"] == "user"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("until", [True, False])
+def test_health_pause_users_chat_pause_is_theirs_and_never_lifted(env, shared, until):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env, shared=shared)
+    # The user's words replace the coordinator's own health pause, with an end given or defaulted:
+    # only the defaulted one gets the health end, and that only reports.
+    msg = p.db.post("in", "Pause board until I explicitly allow it again.")
+    end = {"until": "1d"} if until else {}
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "reason": "the user asked", **end}], user_turn=True, messages=[msg]) == []
+    held = p.db.paused_resources()["board"]
+    assert held["by"] == "user" and held.get("end_when") == (None if until else HEALTH_END)
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert p.db.paused_resources()["board"]["by"] == "user" and not p.db.kv(sweep.SIGNAL_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due')")
+    assert len(p.db.q("SELECT * FROM events WHERE kind='observation'")) == (0 if until else 1)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("until", [True, False])
+@pytest.mark.parametrize("words", ["Pause box until I say so.", "Please stop using box for now."])
+def test_users_chat_pause_naming_the_host_is_theirs_and_never_lifted(env, shared, until, words):
+    from ttp import coordinator as coord, heal
+    # Users name the host (`box`), not the resource (`box-device`); the pause must still be theirs.
+    p, d, up = _heal_setup(env, resource="box-device")
+    up.touch()
+    if shared:
+        p.set_config("shared_resources", ["box-device"])
+    msg = p.db.post("in", words)
+    end = {"until": "1d"} if until else {}
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "box-device", "paused": True,
+                            "reason": "the user asked", **end}], user_turn=True, messages=[msg]) == []
+    assert p.db.paused_resources()["box-device"]["by"] == "user"
+    now = time.time()
+    for dt in (0, 900, 1800, 2700):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert p.db.paused_resources()["box-device"]["by"] == "user"
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'")
+
+
+@pytest.mark.parametrize("gap,lifts", [(600, True), (900, False)])
+def test_health_pause_gap_past_freshness_restarts_the_window(env, gap, lifts):
+    from ttp import heal
+    p, d, _ = _health_pause(env, every_s=300)   # results stay fresh 600 s
+    now = time.time()
+    times = [0, 300] + [300 + gap + 300 * k for k in range(5)]
+    for t in times:
+        heal.run(d, "svc", _heal_spec(p), now + t)
+        d._pause_ends.tick(now + t)
+    # 1800 s of clean results exist only if the gap did not break them.
+    assert ("board" not in p.db.paused_resources()) == lifts
+
+
+def test_health_pause_stale_gap_resets_with_or_without_a_tick(env):
+    from ttp import heal, pauseends
+    for tick in (True, False):
+        p, d, _ = _health_pause(env, every_s=300)
+        now = time.time()
+        for dt in (0, 300):
+            heal.run(d, "svc", _heal_spec(p), now + dt)
+        if tick:   # the daemon saw the gap: the stale window is dropped
+            d._pause_ends.tick(now + 3600)
+            assert not p.db.kv(pauseends.HEALTH_KEY)
+        heal.run(d, "svc", _heal_spec(p), now + 3600)   # after downtime: one fresh result only
+        d._pause_ends.tick(now + 3600)
+        assert "board" in p.db.paused_resources()
+        assert p.db.kv(pauseends.HEALTH_KEY)["board"]["n"] == 1
+        p.db.x("DELETE FROM kv")
+
+
+def test_health_pause_disabled_then_reenabled_check_starts_over(env):
+    from ttp import heal, pauseends
+    p, d, _ = _health_pause(env, every_s=300)
+    now = time.time()
+    for dt in (0, 300, 600):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now + 700)
+    assert not p.db.kv(pauseends.HEALTH_KEY)
+    p.db.x("UPDATE schedules SET enabled=1 WHERE name='svc'")
+    for dt in (900, 1200, 1500, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt)
+    assert "board" in p.db.paused_resources() and p.db.kv(pauseends.HEALTH_KEY)["board"]["n"] == 4
+
+
+@pytest.mark.parametrize("by", ["coordinator", "user"])
+@pytest.mark.parametrize("evidence", ["none", "stale", "disabled"])
+def test_health_pause_until_is_reported_once_without_health(env, by, evidence):
+    from ttp import coordinator as coord, heal
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    coord.pause_resource(p, "board", True, by=by,
+                         end={"until": now + 60, "end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    if evidence == "stale":
+        heal.run(d, "svc", _heal_spec(p), now - 7200)
+    elif evidence == "disabled":
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='svc'")
+    d._pause_ends.tick(now)
+    assert not p.db.q("SELECT * FROM events WHERE kind IN ('pause_end_due','observation')")
+    d._pause_ends.tick(now + 120)
+    Daemon(p.base)._pause_ends.tick(now + 240)   # a restart does not report it again
+    kind = "pause_end_due" if by == "coordinator" else "observation"
+    (event,) = p.db.q("SELECT * FROM events WHERE kind IN ('pause_end_due','observation')")
+    assert event["kind"] == kind and "end time" in event["text"]
+    assert p.db.paused_resources()["board"]["by"] == by   # a deadline never lifts it by itself
+
+
+def test_health_pause_until_then_health_release_each_once(env):
+    from ttp import coordinator as coord, heal, sweep
+    p, d, _ = _health_pause(env)
+    now = time.time()
+    coord.pause_resource(p, "board", True, by="coordinator",
+                         end={"until": now + 60, "end_when": {"heal": "svc", "healthy_n": 3, "clean_s": 1800}})
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+        d._pause_ends.tick(now + dt + 120)
+    assert "board" not in p.db.paused_resources()
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_end_due'")) == 1
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == 1
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+
+
+def _released_once(p):
+    from ttp import pauseends, sweep
+    assert len(p.db.q("SELECT * FROM events WHERE kind='pause_ended'")) == 1
+    assert [s["why"] for s in p.db.kv(sweep.SIGNAL_KEY)] == ["pause ended: board"]
+    assert not p.db.kv(pauseends.RELEASE_KEY)
+
+
+@pytest.mark.parametrize("cut", ["before_removal", "after_removal", "after_commit"])
+def test_health_pause_shared_release_survives_interruption(env, monkeypatch, cut):
+    from ttp import heal, pauseends, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    signal, update = sweep.signal, shared.update_pause
+    if cut == "before_removal":   # the receipt is saved, then the file write is cut off
+        def cut_short(name, fn):
+            fn(shared.read_pause(name))
+            raise RuntimeError("interrupted before removal")
+        monkeypatch.setattr(shared, "update_pause", cut_short)
+    elif cut == "after_removal":   # the file is gone, the database commit is cut off
+        monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    if cut == "after_commit":
+        d._pause_ends.tick(now + 1800)
+    else:
+        with pytest.raises(RuntimeError):
+            d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(sweep, "signal", signal)
+    monkeypatch.setattr(shared, "update_pause", update)
+    assert (shared.read_pause("board") is None) == (cut != "before_removal")
+    for _ in range(2):   # recovery runs once, however often the restarted daemon ticks
+        restarted = Daemon(p.base)
+        restarted.sync_shared_pauses()
+        restarted._pause_ends.tick(now + 1800)
+    assert shared.read_pause("board") is None
+    _released_once(p)
+
+
+def test_health_pause_shared_recovery_keeps_a_replacement_users_pause(env, monkeypatch):
+    from ttp import coordinator as coord, heal, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    signal = sweep.signal
+    monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    with pytest.raises(RuntimeError):
+        d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(sweep, "signal", signal)
+    coord.pause_resource(p, "board", True, reason="mine now", by="user", end={"until": now + 86400})
+    restarted = Daemon(p.base)
+    restarted._pause_ends.tick(now + 1800)
+    restarted._pause_ends.tick(now + 1900)
+    assert shared.read_pause("board")["by"] == "user"
+    _released_once(p)
+
+
+def test_health_pause_shared_replaced_in_place_before_removal_is_not_a_release(env, monkeypatch):
+    from ttp import coordinator as coord, heal, pauseends, shared, sweep
+    from ttp.daemon import Daemon
+    p, d, _ = _health_pause(env, shared=True)
+    now = time.time()
+    for dt in (0, 900, 1800):
+        heal.run(d, "svc", _heal_spec(p), now + dt)
+    update = shared.update_pause
+    def cut_short(name, fn):
+        fn(shared.read_pause(name))
+        raise RuntimeError("interrupted before removal")
+    monkeypatch.setattr(shared, "update_pause", cut_short)
+    with pytest.raises(RuntimeError):
+        d._pause_ends.tick(now + 1800)
+    monkeypatch.setattr(shared, "update_pause", update)
+    coord.pause_resource(p, "board", True, reason="still mine", by="user", end={"until": now + 86400})
+    Daemon(p.base)._pause_ends.tick(now + 1800)
+    assert shared.read_pause("board")["by"] == "user" and not p.db.kv(pauseends.RELEASE_KEY)
+    assert not p.db.q("SELECT * FROM events WHERE kind='pause_ended'") and not p.db.kv(sweep.SIGNAL_KEY)
+
+
+def test_an_outage_check_whose_resource_is_paused_neither_escalates_nor_reports_the_machine(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, resource="box-a-device", outage=True, fix=None, grace_s=0)
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv("paused_resources", {"box-a-device": {"reason": "box out", "since": now, "by": "coordinator"}})
+    for dt in (0, 3600, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", spec, now + dt) == ("unhealthy (box-a-device paused: not escalated)", None)
+    dark = dict(spec, check="exit 255")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    for dt in (0, 2 * heal.OUTAGE_S):
+        heal.run(d, "svc", dark, now + dt)
+    assert ml.conditions() == {}
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    # The pause lifted: the same outage escalates and reports the machine down.
+    p.db.set_kv("paused_resources", {})
+    assert "paused" not in heal.run(d, "svc", spec, now + 3 * heal.OUTAGE_S + 60)[0]
+    assert "box-a:down" in ml.conditions()
+
+def test_ttr_records_one_incident_per_machine_from_conditions_outages_and_heal_checks(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    p = make(env, "alpha")
+    for a in ("box-a", "box-b", "box-c", "box-d"):
+        mm.add(a)
+    _resources(p, "Machines: box-a, box-c")
+    t0 = 1_800_000_000.0
+    # A co-tenant's down condition on a watched machine opens one incident, from its first report.
+    ml.report("other", "box-a", "down", "no ping", now=t0)
+    assert ttr.observe(p, t0 + 30) == (["box-a"], [])
+    assert ttr.observe(p, t0 + 90) == ([], []), "still down: no second incident"
+    # A machine its own heal check reports is watched too (box-b is not in Resources); box-d is watched by nobody.
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0 + 60,
+                                               "machine_reported": ["box-b", "down"]})
+    ml.report("other", "box-d", "down", now=t0)
+    # A known outage opens one as well.
+    ml.set_outage("box-c", "fan repair", "other", expires="1d", now=t0 + 100)
+    assert ttr.observe(p, t0 + 120) == (["box-b", "box-c"], [])
+    rows = {r["alias"]: r for r in p.db.q("SELECT * FROM ttr_incidents")}
+    assert set(rows) == {"box-a", "box-b", "box-c"}
+    assert (rows["box-a"]["kind"], rows["box-a"]["started"]) == ("down", t0)
+    assert "no ping" in rows["box-a"]["cause"] and "other" in rows["box-a"]["cause"]
+    assert (rows["box-b"]["kind"], rows["box-b"]["cause"], rows["box-b"]["started"]) == ("down", "heal check box-b-up", t0 + 60)
+    assert (rows["box-c"]["kind"], rows["box-c"]["started"]) == ("outage", t0 + 100)
+    # Healthy again: each ends once, at the tick that sees it.
+    ml.report("other", "box-a", "down", cleared=True, now=t0 + 600)
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "healthy"})
+    ml.clear_outage("box-c")
+    assert ttr.observe(p, t0 + 660) == ([], ["box-a", "box-b", "box-c"])
+    assert ttr.observe(p, t0 + 720) == ([], [])
+    assert [r["ended"] for r in p.db.q("SELECT ended FROM ttr_incidents ORDER BY alias")] == [t0 + 660] * 3
+    # Down again with an old first report: a new incident that starts no earlier than the last one ended.
+    ml.report("other", "box-a", "held", now=t0 + 800)
+    p.db.x("UPDATE ttr_incidents SET ended=? WHERE alias='box-a'", (t0 + 900,))   # (a late end, for the bound)
+    assert ttr.observe(p, t0 + 950) == (["box-a"], [])
+    r = p.db.one("SELECT * FROM ttr_incidents WHERE alias='box-a' AND ended IS NULL")
+    assert (r["kind"], r["started"]) == ("held", t0 + 900)
+    # A condition nobody reported for CONDITION_GONE_S is over.
+    assert ttr.observe(p, t0 + 800 + ml.CONDITION_GONE_S) == ([], ["box-a"])
+
+
+def test_ttr_ignores_a_frozen_heal_report_while_the_project_is_paused(env):
+    from ttp import heal
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    p = make(env, "alpha")
+    mm.add("box-b")
+    t0 = 1_800_000_000.0
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0, "last_check": t0,
+                                               "machine_reported": ["box-b", "down"]})
+    assert ttr.observe(p, t0 + 60) == (["box-b"], [])
+    # Paused: heal checks stop, so the report freezes. Within its period plus the margin it still counts.
+    p.db.set_kv("paused", True)
+    assert ttr.observe(p, t0 + 600 + ttr.HEAL_STALE_MARGIN_S - 1) == ([], [])
+    # Past that the frozen report is ignored, so the pause does not stretch the incident.
+    late = t0 + 600 + ttr.HEAL_STALE_MARGIN_S + 1
+    assert ttr.observe(p, late) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE alias='box-b'")["ended"] == late
+    # Not paused: the same stale report counts again (the check runs and keeps it current).
+    p.db.set_kv("paused", False)
+    assert ttr.observe(p, late + 60) == (["box-b"], [])
+
+
+def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, monkeypatch):
+    import http.server
+    from ttp import goalchecks as gc, heal
+    replies = {"/ok": (200, b"ready: yes"), "/down": (503, b"no")}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            code, body = replies.get(self.path, (404, b""))
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        [up] = gc.service_up(url=f"{base}/ok", body_contains="ready")
+        assert up["ok"] and up["status"] == 200 and up["key"] == f"service_up:{base}/ok" and "error" not in up, up
+        assert gc.service_up(url=f"{base}/down", expect=[503])[0]["ok"]
+        # a non-2xx status's body is read too
+        assert gc.service_up(url=f"{base}/down", expect=[503], body_contains="no")[0]["ok"]
+        assert not gc.service_up(url=f"{base}/down", expect=[503], body_contains="ready")[0]["ok"]
+        for kwargs in ({"url": f"{base}/down"}, {"url": f"{base}/ok", "body_contains": "never"},
+                       {"url": f"{base}/ok", "expect": [204]}):
+            [down] = gc.service_up(**kwargs)
+            assert not down["ok"] and "error" not in down, (kwargs, down)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    [gone] = gc.service_up(url=base)
+    assert not gone["ok"] and "error" not in gone and "does not answer" in gone["text"], gone
+    [bad] = gc.service_up(url="not a url")
+    assert bad["error"] is True
+    page = tmp_path / "page.html"
+    page.write_text("x")
+    [local] = gc.service_up(url=page.as_uri())
+    assert local["error"] is True and local["ok"] is False and gc.exit_code([local]) == gc.UNKNOWN, local
+    # the unit: systemctl's answer decides; systemctl itself failing is could-not-run
+    shown = {}
+
+    def fake_shell(cmd, cwd, timeout, env=None):
+        shown["cmd"] = cmd
+        return shown["reply"]
+    monkeypatch.setattr(heal, "_shell", fake_shell)
+    for reply, ok in (((0, "ActiveState=active\nNRestarts=0"), True), ((0, "ActiveState=failed\nNRestarts=2"), False),
+                      ((1, "Failed to connect to bus"), None)):
+        shown["reply"] = reply
+        [o] = gc.service_up(unit="demo.service", user=True)
+        assert o["key"] == "service_up:demo.service" and "--user" in shown["cmd"], (o, shown)
+        assert (o["ok"], o.get("error")) == ((True, None) if ok else (False, None) if ok is False else (False, True)), o
+    shown["reply"] = (0, "ActiveState=active\nNRestarts=0")
+    both = gc.service_up(unit="demo.service", url=base)
+    assert [o["ok"] for o in both] == [True, False] and gc.exit_code(both) == 1
+    [none] = gc.service_up()
+    assert none["error"] is True and gc.exit_code([none]) == 75
+
+
+def test_heal_to_pages_another_project_once_per_episode_instead_of_escalating(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="`to`"):
+        heal.validate({"check": "true", "to": 5})
+    p, d, up = _heal_setup(env, fix=None, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    for i in range(3):
+        assert "ops told" in heal.run(d, "svc", spec, now + 10 + i)[0]
+    notes = _notes_to("ops")
+    assert len(notes) == 1 and notes[0]["severity"] == "high" and "Heal check svc of project demo, unhealthy since" in notes[0]["spec"]
+    assert _heal_told(p) == ([], [])
+    up.touch()   # healthy ends the episode; the next one pages again
+    heal.run(d, "svc", spec, now + 30)
+    up.unlink()
+    _heal_to_self_fix_failed(p, d, up, spec, now + 200)
+    heal.run(d, "svc", spec, now + 210)
+    assert len(_notes_to("ops")) == 2
+    # An unknown target escalates as without `to`.
+    lost = dict(spec, to="nope")
+    up.touch()
+    heal.run(d, "svc", lost, now + 300)
+    up.unlink()
+    _heal_to_self_fix_failed(p, d, up, lost, now + 400)
+    assert "alerted" in heal.run(d, "svc", lost, now + 410)[0]
+
+
+def test_heal_to_gets_the_unknown_stretch_message_too(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, unknown_cap_s=600, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    heal.run(d, "svc", dark, now)
+    assert "ops told" in heal.run(d, "svc", dark, now + 700)[0]
+    heal.run(d, "svc", dark, now + 800)
+    notes = _notes_to("ops")
+    assert len(notes) == 1 and "could not tell" in notes[0]["spec"] and _heal_told(p) == ([], [])
+
+
+def test_heal_to_pages_again_once_a_known_run_or_a_fresh_episode_ends_the_last_one(env):
+    """Its page marks clear wherever the unknown stretch or the episode they belong to ends: a known,
+    owned run (`ttp-heal: known`) and a fresh episode after a long unknown stretch."""
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, to="ops")
+    _peer(env, "ops")
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 75")
+    owned = dict(spec, check="echo 'ttp-heal: known repair: board swap'; exit 75")
+    heal.run(d, "svc", dark, now)
+    assert "ops told" in heal.run(d, "svc", dark, now + 700)[0]
+    assert "known" in heal.run(d, "svc", owned, now + 800)[0]   # ends that stretch
+    heal.run(d, "svc", dark, now + 900)
+    assert "ops told" in heal.run(d, "svc", dark, now + 1600)[0]
+    assert len([n for n in _notes_to("ops") if "could not tell" in n["spec"]]) == 2
+    _heal_to_self_fix_failed(p, d, up, spec, now + 1700)
+    assert "ops told" in heal.run(d, "svc", spec, now + 1710)[0]
+    heal.run(d, "svc", dict(dark, unknown_cap_s=0), now + 1800)   # a long unknown stretch, its task over
+    _heal_to_self_fix_failed(p, d, up, spec, now + 3000)   # back unhealthy: a fresh episode
+    assert "ops told" in heal.run(d, "svc", spec, now + 3010)[0]
+    assert len([n for n in _notes_to("ops") if "still fails" in n["spec"]]) == 2

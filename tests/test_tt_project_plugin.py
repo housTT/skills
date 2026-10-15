@@ -189,9 +189,12 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
 
 def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
-    # The plugin's tests ship in the same open-source repository. This file names the patterns
-    # themselves (as regex source), so it is checked with that list cut out.
-    assert_no_leaks([re.compile(p) for p in FORBIDDEN], [TESTS / "test_tt_project_runtime.py"])
+    # The plugin's tests ship in the same open-source repository, the runtime tests' area case files
+    # too. This file names the patterns themselves (as regex source), so it is checked with that
+    # list cut out.
+    runtime_tests = [TESTS / "test_tt_project_runtime.py", *sorted((TESTS / "tt_project_runtime").glob("*.py"))]
+    assert len(runtime_tests) > 1
+    assert_no_leaks([re.compile(p) for p in FORBIDDEN], runtime_tests)
     own = (TESTS / "test_tt_project_plugin.py").read_text(encoding="utf-8")
     own = own[:own.index("FORBIDDEN = [")] + own[own.index("]\n", own.index("FORBIDDEN = [")):]
     for pattern in map(re.compile, FORBIDDEN):
