@@ -2302,6 +2302,14 @@ def _checks_elsewhere(info: dict) -> bool:
     return push._boxed() or bool(info.get("pidns") and ns and ns != info["pidns"])
 
 
+def _checks_old_boot(info: dict) -> bool:
+    """The recorded checks were started in an earlier boot of this host. A missing or unknown boot
+    id, recorded or current, never says so."""
+    from .runner import boot_id, same_boot
+    b = info.get("boot")
+    return isinstance(b, str) and b not in ("", "unknown") and boot_id() != "unknown" and not same_boot(b)
+
+
 def _read_checks_pid(run_dir: Path) -> dict:
     try:
         info = json.loads((run_dir / CHECKS_PID).read_text())
@@ -2491,6 +2499,12 @@ def _checks_result(run_dir: Path) -> int:
         print(f"ttp checks: not started: {detach.lost(rc_file).read_text().strip()}")
         return 0
     info = _read_checks_pid(run_dir)
+    if info and not rc_file.exists() and _checks_old_boot(info):
+        # Checked before the namespace fallback: no process of an earlier boot still runs.
+        durable_write(rc_file, "killed\n")
+        print(f"ttp checks: the detached checks (pid {info.get('pid')}) were started before this host last "
+              "rebooted and ended without an exit code: the reboot interrupted them; run `ttp checks --detach` again")
+        return 0
     if info and not rc_file.exists() and _checks_elsewhere(info):
         # Its pid means nothing in this PID namespace: never call it dead (nor write `killed`) from
         # here. The daemon's own probe of retry_when sees the host's processes and settles it.

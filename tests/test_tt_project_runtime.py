@@ -36197,6 +36197,65 @@ def test_an_orphan_queued_marker_is_cleared_by_the_probe_and_after_a_restart_or_
     assert _wait_precheck(run) == "0"
 
 
+def test_checks_of_an_earlier_boot_are_interrupted_before_the_namespace_fallback(env, tmp_path, monkeypatch, capsys):
+    """A checks.pid recorded in another boot reads as interrupted, even from another PID namespace;
+    same-boot live checks still run, an unknown boot id keeps the conservative answer, an exit code
+    stands and the daemon's reboot relaunch stays bounded."""
+    from ttp import cli, push, runner
+    from ttp.daemon import Daemon
+    run = tmp_path / "run"
+    run.mkdir()
+    rc = run / cli.CHECKS_RC
+    monkeypatch.setattr(runner, "boot_id", lambda: "this-boot")
+    monkeypatch.setattr(runner, "BOOT_ID_FILE", tmp_path / "boot_id")   # only boot_id() names this boot
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    monkeypatch.setattr(push, "pid_ns", lambda: "pid:[this]")
+    live = {"pid": os.getpid(), "started": runner.proc_start(os.getpid()), "ts": time.time()}
+
+    def probe(info, rc_text=None):
+        rc.unlink(missing_ok=True)
+        if rc_text is not None:
+            rc.write_text(rc_text)
+        (run / cli.CHECKS_PID).write_text(json.dumps(info))
+        capsys.readouterr()
+        return cli._checks_result(run), capsys.readouterr().out
+
+    # An earlier boot's queued pid with no exit code, recorded in another PID namespace: interrupted.
+    code, out = probe({"pid": 4242, "started": "1", "boot": "an-earlier-boot", "pidns": "pid:[other]"})
+    assert code == 0 and rc.read_text() == "killed\n" and "reboot interrupted" in out
+    # Same boot, another namespace: still running unless the daemon's probe finds otherwise.
+    code, out = probe({**live, "boot": "this-boot", "pidns": "pid:[other]"})
+    assert code == 1 and not rc.exists() and "outside this sandbox" in out
+    # Same boot, live here: running.
+    code, out = probe({**live, "boot": "this-boot", "pidns": "pid:[this]"})
+    assert code == 1 and not rc.exists() and "running (pid" in out
+    # A missing or unknown boot id, recorded or current: today's conservative answer.
+    for boot in (None, "", "unknown"):
+        code, out = probe({"pid": 4242, "started": "1", "pidns": "pid:[other]",
+                           **({} if boot is None else {"boot": boot})})
+        assert code == 1 and not rc.exists() and "outside this sandbox" in out, boot
+    with monkeypatch.context() as m:
+        m.setattr(runner, "boot_id", lambda: "unknown")
+        code, out = probe({"pid": 4242, "started": "1", "boot": "an-earlier-boot", "pidns": "pid:[other]"})
+        assert code == 1 and not rc.exists() and "outside this sandbox" in out
+    # A completed outcome is unchanged.
+    for done in ("0\n", "7\n"):
+        code, out = probe({"pid": 4242, "started": "1", "boot": "an-earlier-boot", "pidns": "pid:[other]"}, done)
+        assert code == 0 and rc.read_text() == done and "finished with exit code" in out
+    # The daemon's reboot relaunch stays bounded: checks the probe already called interrupted are not
+    # started again on top of it.
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps({**info, "pidns": "pid:[other]"}))
+    assert cli._checks_result(run_dir) == 0 and (run_dir / cli.CHECKS_RC).read_text() == "killed\n"
+    d = Daemon(p.base)
+    d.boot, d.boot_at = "this-boot", time.time() - 300
+    assert d._relaunch_checks(p.db.task(tid), json.loads(p.db.task(tid)["result"])) == (False, 0)
+    assert not _relaunches(p, tid)
+
+
 _CRASHING_LAUNCHER = """
 import argparse, os, sys
 from pathlib import Path
