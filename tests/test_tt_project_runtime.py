@@ -453,7 +453,11 @@ def _git_session(tmp_path_factory):
         [str(f) for f in (xdg / "git" / "config", home / ".gitconfig") if f.is_file()]
     config.write_text("".join(f"[include]\n\tpath = {f}\n" for f in own)
                       + "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n")
-    return {"objects": objects / "objects", "repo": repo, "config": config, "base": base}
+    # An empty bare repository, as `git init --bare` makes it under the tests' git settings: tests copy it.
+    bare = base / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True,
+                   env={**os.environ, "GIT_CONFIG_GLOBAL": str(config)})
+    return {"objects": objects / "objects", "repo": repo, "config": config, "base": base, "bare": bare}
 
 
 @pytest.fixture()
@@ -18061,13 +18065,32 @@ def _check_local_only(d):
     _finish_local_only(d)
 
 
+def _bare_init(env, path):
+    """`git init -q --bare <path>` without a git process: a copy of the session's empty bare repository."""
+    shutil.copytree(env["_make"][0]["bare"], path, symlinks=True)
+    return path
+
+
+def _remote_add(repo, url, name="origin"):
+    """`git remote add <name> <url>` in `repo` without a git process: the section git writes for it,
+    appended to the repository's config. A url git would quote, or a linked worktree, uses git itself."""
+    config, url = pathlib.Path(repo) / ".git" / "config", str(url)
+    if not config.is_file() or any(c in url + name for c in '"\\;#\n\t ') or url.startswith("-"):
+        subprocess.run(["git", "-C", str(repo), "remote", "add", name, url], check=True)
+        return
+    text = config.read_text()
+    assert f'[remote "{name}"]' not in text, f"remote {name} already exists in {repo}"
+    config.write_text(text + ("" if text.endswith("\n") else "\n")
+                      + f'[remote "{name}"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/{name}/*\n')
+
+
 def _with_origin(env, clone=True):
     remote = env["tmp"] / "remote.git"
     if clone:
         subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
     else:
-        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+        _bare_init(env, remote)
+    _remote_add(env["repo"], remote)
     return remote
 
 
@@ -23053,8 +23076,8 @@ def _push_setup(env, monkeypatch, checks):
     p = make(env)
     repo, tmp = env["repo"], env["tmp"]
     origin, other = tmp / "origin.git", tmp / "other"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
-    _git_out(repo, "remote", "add", "origin", str(origin))
+    _bare_init(env, origin)
+    _remote_add(repo, origin)
     _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
     subprocess.run(["git", "clone", "-q", "-b", "proj", str(origin), str(other)], check=True)
     p.set_config("delivery.push_branch", "origin/proj")

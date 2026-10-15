@@ -4462,6 +4462,34 @@ def test_a_task_carrying_a_branch_works_on_it_in_a_worktree_and_publishes_onto_i
     assert d._workdir_for(review) == (str(p.root), None)
 
 
+# Wordings of the usual delivery rules (the review pushes, not the worker): none is a ban on pushing.
+USUAL_PUSH_RULES = ("Do not push.", "Never push to the push branch yourself.",
+    "Do not push to work directly; the review pushes it.", "Never push to main.",
+    "Never push to the push branches of other projects.",
+    "Only a change whose whole diff is kept off the push branch by "
+    "delivery.push_exclude_paths is review only.",
+    "With the push queue on, workers never push to the push branch; the daemon does.",
+    "Do not push to the push branch: the review pushes it.",
+    "Workers must not push to the push branch themselves.",
+    "Fix: a notes commit cannot reach the push branch, so drop it.",
+    "Never push it to the push branch yourself.",
+    # Prose is never a ban, not even one naming the change: only the marker line.
+    "Write the notes. They must not be pushed to the push branch.",
+    "Never push this to work.", "This change must not reach the push branch.",
+    "These notes must not be pushed to work.", "Keep this change off origin/work.",
+    "or (b) the code task's spec or hand-off says the change must not be pushed "
+    "to the push branch",
+    "A review of a change whose spec says it must not reach the push branch is "
+    "review only.",
+    "Detect when the hand-off says this change must not be pushed to the push branch.",
+    "If it must not reach the push branch, the review is review only.",
+    'Such a spec names the change as what is banned ("this change must not be '
+    'pushed to the push branch")',
+    "Rely on one explicit spec marker on its own line, e.g. a line starting "
+    "`no_push:` (the reason follows).",
+    "no_push: false", "Set no_push: true in the hand-off.")
+
+
 def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_step(env, monkeypatch):
     # A notes-only change (every file push-excluded), or one its spec or hand-off keeps off the push
     # branch, gets a review-only spec: no `ttp push` and no push-queue approval, with the reason.
@@ -4495,33 +4523,15 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
             assert review_only(review(f"ban {on} {i}", {f"d{i}.py": 3}, spec=ban)), (on, ban)
         rev = review(f"flag {on}", {"e.py": 3}, result={"status": "done", "summary": "ok", "no_push": "a local tool"})
         assert review_only(rev) and "a local tool" in rev["spec"], on
-        # The usual rule that the review pushes, not the worker, is not a prohibition.
-        for i, usual in enumerate(("Do not push.", "Never push to the push branch yourself.",
-                                   "Do not push to work directly; the review pushes it.", "Never push to main.",
-                                   "Never push to the push branches of other projects.",
-                                   "Only a change whose whole diff is kept off the push branch by "
-                                   "delivery.push_exclude_paths is review only.",
-                                   "With the push queue on, workers never push to the push branch; the daemon does.",
-                                   "Do not push to the push branch: the review pushes it.",
-                                   "Workers must not push to the push branch themselves.",
-                                   "Fix: a notes commit cannot reach the push branch, so drop it.",
-                                   "Never push it to the push branch yourself.",
-                                   # Prose is never a ban, not even one naming the change: only the marker line.
-                                   "Write the notes. They must not be pushed to the push branch.",
-                                   "Never push this to work.", "This change must not reach the push branch.",
-                                   "These notes must not be pushed to work.", "Keep this change off origin/work.",
-                                   "or (b) the code task's spec or hand-off says the change must not be pushed "
-                                   "to the push branch",
-                                   "A review of a change whose spec says it must not reach the push branch is "
-                                   "review only.",
-                                   "Detect when the hand-off says this change must not be pushed to the push branch.",
-                                   "If it must not reach the push branch, the review is review only.",
-                                   'Such a spec names the change as what is banned ("this change must not be '
-                                   'pushed to the push branch")',
-                                   "Rely on one explicit spec marker on its own line, e.g. a line starting "
-                                   "`no_push:` (the reason follows).",
-                                   "no_push: false", "Set no_push: true in the hand-off.")):
-            assert pushes(review(f"usual {on} {i}", {f"g{i}.py": 3}, spec=usual)), (on, usual)
+        # The usual rule that the review pushes, not the worker, is not a prohibition. The review's
+        # push step follows push.kept_off of the code task alone (the daemon passes it the task and its
+        # diff), so each wording is checked there and two of them go through a whole review.
+        d = p.config()["delivery"]
+        for i, usual in enumerate(USUAL_PUSH_RULES):
+            task = p.db.task(p.db.add_task(f"usual {on} {i}", usual, kind="code", origin="coordinator"))
+            assert push.kept_off(task, {f"g{i}.py": 3}, d, p) == "", (on, usual)
+        for i in (0, USUAL_PUSH_RULES.index("This change must not reach the push branch.")):
+            assert pushes(review(f"usual {on} {i}", {f"g{i}.py": 3}, spec=USUAL_PUSH_RULES[i])), (on, i)
         rev = review(f"summary {on}", {"f.py": 3},
                      result={"status": "done", "summary": "Done; keep it off the push branch."})
         assert pushes(rev), on
