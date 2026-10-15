@@ -10939,7 +10939,7 @@ def test_a_host_that_restarts_under_a_listener_is_named_as_restarting_once_past_
     assert len(calls) == 7 and set(calls) == {True}
     assert err.count("ttp: box dropped the connection (probably restarting;") == 1, err
     assert "Retrying; messages are delivered once it is back." in err, err
-    assert "back on that network" not in err and "10.1.2.3" not in err, err
+    assert "can reach box again" not in err and "10.1.2.3" not in err, err
 
 
 def test_a_rebooting_host_keeps_its_restart_wording_while_its_retries_time_out(env, monkeypatch, capsys):
@@ -10952,7 +10952,7 @@ def test_a_rebooting_host_keeps_its_restart_wording_while_its_retries_time_out(e
     assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     err = capsys.readouterr().err
     assert err.count("ttp: box dropped the connection (probably restarting") == 1, err
-    assert "back on that network" not in err and "10.1.2.3" not in err, err
+    assert "can reach box again" not in err and "10.1.2.3" not in err, err
 
 
 @pytest.mark.parametrize("later", [
@@ -10964,7 +10964,7 @@ def test_a_drop_followed_by_this_machine_going_offline_gets_the_network_advice(e
     _listener_on_a_clock(cli, monkeypatch, [(600, 255, gone)] + [(20, 255, later)] * 6 + [(1, 0, "")])
     assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     err = capsys.readouterr().err
-    assert err.count("once this machine is back on that network.") == 1, err
+    assert err.count("once this machine can reach box again.") == 1, err
     assert "restarting" not in err and "10.1.2.3" not in err, err
 
 
@@ -10975,7 +10975,7 @@ def test_a_listener_that_never_connected_and_times_out_gets_the_network_advice(e
     assert cli.forward_listen({"host": "box-host", "ssh": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     err = capsys.readouterr().err
     assert err.count("ttp: cannot reach box right now (ssh: connect to host box port 22: Connection timed out)") == 1, err
-    assert "once this machine is back on that network." in err, err
+    assert "once this machine can reach box again." in err, err
     assert "restarting" not in err and "10.1.2.3" not in err, err
 
 
@@ -10995,14 +10995,14 @@ def test_a_listener_whose_name_does_not_resolve_keeps_the_network_advice(env, mo
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"]) == 0
     err = capsys.readouterr().err
     assert err.count("ttp: cannot reach box right now (ssh: Could not resolve hostname box") == 1, err
-    assert "retrying; messages are delivered once this machine is back on that network." in err, err
+    assert "retrying; messages are delivered once this machine can reach box again." in err, err
     assert "restarting" not in err
 
 
 @pytest.mark.parametrize("stderr,says,not_says", [
     ("ssh: connect to host 10.1.2.3 port 22: Connection refused\n", "box is not accepting connections (probably restarting",
-     "back on that network"),
-    ("ssh: Could not resolve hostname box: Name or service not known\n", "try again once this machine is back on that network",
+     "can reach box again"),
+    ("ssh: Could not resolve hostname box: Name or service not known\n", "try again once this machine can reach box again",
      "restarting"),
 ])
 def test_a_forwarded_command_explains_an_ssh_failure_from_the_right_side(env, monkeypatch, capsys, stderr, says, not_says):
@@ -55573,6 +55573,7 @@ def test_network_outage_on_a_tunnel_route_is_a_low_feed_line_raised_once_after_a
     assert "box-a" in m["text"] and "tunnel from the user's workstation" in m["text"], m["text"]
     assert "reconnects by itself" in m["text"] and "VPN" not in m["text"] and "sign-in" not in m["text"], m["text"]
     assert not re.search(r"127\.\d+\.\d+\.\d+|::1|localhost", m["text"]), m["text"]
+    assert "nothing else can start" not in m["text"] and "the project keeps running" in m["text"], m["text"]
     assert not alerts.needs_you(p.db, now + 900) and "needs you" not in status_text(p)
     assert [x["state"] for x in alerts.feed(p.db, now + 900) if x["id"] == m["id"]] == ["status"]
     assert p.db.one("SELECT severity FROM alerts WHERE key='network:unreachable'")["severity"] == "low"
@@ -55625,6 +55626,9 @@ def test_network_outage_on_a_remote_route_keeps_the_vpn_wording_and_names_the_al
     assert len(sent) == 1 and sent[0]["severity"] == "normal"
     assert "box-r (box-r.example) cannot be reached" in sent[0]["text"], sent[0]["text"]
     assert "VPN or network sign-in" in sent[0]["text"] and "tunnel" not in sent[0]["text"]
+    assert "Check that machine's network, and its VPN or network sign-in if it needs one" in sent[0]["text"]
+    assert "nothing else can start" not in sent[0]["text"], "says what is held and what still runs"
+    assert "2 queued task(s) that need it are held" in sent[0]["text"] and "the project keeps running" in sent[0]["text"]
     assert len(check(now + 6 * 3600)) == 1, "a network route is never raised again"
 
 

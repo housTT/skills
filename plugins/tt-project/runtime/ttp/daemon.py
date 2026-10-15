@@ -3972,8 +3972,8 @@ class Daemon:
 
     def check_unreachable(self, every_s: float = 60) -> None:
         """One alert per network outage (netwait): every task that could start waits on a probe saying
-        this machine cannot reach its host (exit 255), no worker runs and nothing else can start, for
-        `waiting.unreachable_alert_s`. Only the user can sign back in to a VPN or network; the alert
+        this machine cannot reach its host (exit 255), no worker runs and no other task is ready to start,
+        for `waiting.unreachable_alert_s`. Only the user can restore the network (or sign back in); the alert
         says so once, stays in the top section and clears itself once the hosts answer again. Hosts
         reached through a tunnel from the user's workstation get a low feed line instead, raised once to
         normal after `waiting.tunnel_outage_page_after_s` (netwait.py)."""

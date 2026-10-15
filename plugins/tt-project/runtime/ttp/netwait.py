@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """One alert per network outage, model-free (Daemon.check_unreachable).
 
-When this machine loses its VPN or network sign-in, every probe that reaches another host over ssh
+When this machine loses its network (or the VPN or network sign-in its hosts need), every probe that reaches another host over ssh
 exits 255 and the tasks behind them sleep on. Only the user can sign back in, so once every task that
 could otherwise start has waited on such a probe for `waiting.unreachable_alert_s` (900 s; 0: off),
 with no worker running and nothing else startable, one keyed normal alert (KEY) says so. It is
@@ -253,13 +253,14 @@ def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = Fal
     `now` (the raise to normal) adds how long it has been down."""
     shown_ = ", ".join(names[:HOSTS_MAX]) + (f" (+{len(names) - HOSTS_MAX} more)" if len(names) > HOSTS_MAX else "")
     what = f"{shown_} cannot" if names else "The hosts this project's work needs cannot"
-    waiting = f"{n_tasks} queued task(s) wait on it and nothing else can start."
+    them, need = ("it", "it needs") if len(names) == 1 else ("them", "they need")
+    held = f"{n_tasks} queued task(s) that need {them} are held; the rest of the project keeps running."
     if tunnel:
         down = f", down {(now - since) / 3600:.1f} h" if now is not None else ""
         return (f"Tunnel: {what} be reached since {timefmt.long(since, where)}{down}: the tunnel from the "
-                f"user's workstation that reaches {'it' if len(names) == 1 else 'them'} is down. {waiting} "
-                f"It reconnects by itself once the workstation is back; the waiting work then resumes.")
+                f"user's workstation that reaches {them} is down. It reconnects by itself once the "
+                f"workstation is back; the held work then resumes. {held}")
     return (f"Network: {what} be reached from the machine running this project since "
-            f"{timefmt.long(since, where)}; {waiting} "
-            f"Reconnect the VPN or network sign-in on that machine; the waiting work resumes by itself "
-            f"once the hosts answer.")
+            f"{timefmt.long(since, where)}. Check that machine's network, and its VPN or network sign-in "
+            f"if {need} one; the held work resumes by itself once {them} answer{'s' if len(names) == 1 else ''}. "
+            f"{held}")

@@ -225,8 +225,8 @@ def _unreachable(entry: dict, stderr: str | None, rc: int = 255, connected: bool
                 else " Try again in a minute or two.")
     elif kind == "network":
         line = f"ttp: cannot reach {host} right now ({why}). The project keeps running there;"
-        tail = (f" retrying{retrying}; messages are delivered once this machine is back on that network."
-                if retrying is not None else " try again once this machine is back on that network.")
+        tail = (f" retrying{retrying}; messages are delivered once this machine can reach {host} again."
+                if retrying is not None else f" try again once this machine can reach {host} again.")
     else:
         line = f"ttp: cannot reach {host} right now ({why})."
         tail = (f" Retrying{retrying}; messages are delivered once the connection is back." if retrying is not None

@@ -421,10 +421,11 @@ prolonged whole-box outage.
   until a task names the device again.
 - Network outage (model-free): when every task that could start waits on a probe saying this
   machine cannot reach its host (ssh exit 255, confirmed by `ssh <alias> true` failing too; a 255
-  that names no host, or whose host answers, is a broken probe for its task), no worker runs and nothing else can start, for
-  `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to reconnect
-  the VPN or network sign-in on the machine running the project. It names the hosts, when the outage
-  began (home time zone) and how many tasks wait, stays in the top section, is sent once per outage
+  that names no host, or whose host answers, is a broken probe for its task), no worker runs and no other task is ready to start, for
+  `waiting.unreachable_alert_s` (900; 0 turns it off), one normal alert asks the user to check the
+  network connection of the machine running the project, and its VPN or network sign-in if the hosts
+  need one. It names the hosts, when the outage began (home time zone), how many tasks are held and
+  that the project keeps running and starts other work once it is ready, stays in the top section, is sent once per outage
   (also across projects on the same machine) and wakes no coordinator. A heal check still trying its
   fix delays it by one more grace. It clears with one low feed line once no probe has said
   unreachable for `waiting.unreachable_debounce_s` (600), so a brief reconnect stays one outage.
