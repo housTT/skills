@@ -275,6 +275,8 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path, which the daemon uses itself.
+  Items marked HELD BY USER PAUSE or DEFERRED need no outcome: hold a task for the user's word with a
+  probe that only tests for a marker file named `user-<what>` (e.g. `test -e state/user-resume-x`).
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the

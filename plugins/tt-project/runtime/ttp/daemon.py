@@ -87,6 +87,7 @@ from . import turngate
 from . import turnsize
 from . import unblock
 from . import upstream
+from . import userpause
 from . import verified
 from . import waitheal
 from . import watchdup
@@ -6336,7 +6337,9 @@ class Daemon:
             held = now >= since + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
-            if held and (gate is None or gate <= now):
+            # Nor is a user pause (userpause): only the user's word lifts it.
+            if held and (gate is None or gate <= now) \
+                    and not userpause.is_probe(prev.get("retry_when"), self.cfg):
                 self._stale_wait_event(task, prev, since, max_hold)
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)

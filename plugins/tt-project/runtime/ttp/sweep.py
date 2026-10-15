@@ -13,7 +13,9 @@ needs a `why`. An item the next sweep finds without an outcome since the last on
 `still_blocked` had no re-checkable condition or passed its next check, is carried and flagged. A
 valid `still_blocked` whose next check is still ahead, on an item that has not changed since (status,
 spec, reason) and is no loop, is carried forward as one collapsed CARRIED line that needs no action; a
-sweep due only to its interval is skipped while every item is carried.
+sweep due only to its interval is skipped while every item is carried. A hold no turn can lift (`ends`:
+a user pause or a time-only deferral, userpause) is carried without an outcome, listed as HELD BY USER
+PAUSE or DEFERRED (no action), and left out of signals and loop detection.
 
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
@@ -34,7 +36,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import credits, failover, holdloops, settinghold, timefmt, unblock
+from . import credits, failover, holdloops, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -107,8 +109,9 @@ def _moved_at(db: DB, tid: int) -> float:
 
 def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
-    unknown), since, reason, status, spec_sha}. Kinds: blocked, setting-held, waiting (not a self-wait),
-    review, deferred, paused. A task's age comes from its open stuck episode (unblock._task_episodes);
+    unknown), since, reason, status, spec_sha, ends}. Kinds: blocked, setting-held, waiting (not a self-wait),
+    review, deferred, paused, user-pause (a task whose only hold is a user-pause probe). `ends` is "user"
+    or "time" for a hold no turn can lift (a user pause, a time-only deferral), else None. A task's age comes from its open stuck episode (unblock._task_episodes);
     without that history (a block the coordinator set) from when the sweep first saw it in this status
     (remember()), first seeded from its last update, so a later update (an addendum) never resets it.
     Times in reasons are in the home zone of `where` (a Project, its settings or a zone name; None is UTC)."""
@@ -116,8 +119,9 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     out: list[dict] = []
     since_review = db.review_since()
     seen = (db.kv(STATE_KEY, {}) or {}).get("seen") or {}
+    cfg = userpause.settings(where)
     for t in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','review','queued') ORDER BY id"):
-        kind, start, reason = t["status"], None, _reason(t)
+        kind, start, reason, ends = t["status"], None, _reason(t), None
         if kind == "queued":
             d = deferral(t)
             if not d or (not d.get("when") and float(t["not_before"] or 0) <= now):
@@ -126,6 +130,8 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
             reason = _clip(d.get("why") or d.get("when") or "") or (
                 f"starts after {timefmt.long(float(t['not_before']), where)}"
                 if t["not_before"] else "")
+            if userpause.time_only(t, now):
+                ends = "time"
         else:
             last = _last_stuck_events(db, t["id"], 1)
             if kind == "waiting" and last and last[0]["kind"] == "task_waiting" and unblock.is_self_wait(last[0]["data"]):
@@ -140,6 +146,8 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                 reason = _clip(unblock.wait_reason(last[0])) or reason
             if kind == "blocked" and settinghold.held_key(t):
                 kind = "setting-held"
+        if kind != "review" and (pause := userpause.probe_of(t, cfg)):
+            kind, ends, reason = "user-pause", "user", f"held by user pause until `{_clip(pause, 160)}` passes"
         if not isinstance(start, (int, float)):
             prev = seen.get(f"task:{t['id']}") or {}
             start = prev.get("since") if prev.get("status") == t["status"] else None
@@ -147,13 +155,14 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                 start = float(t["updated"]) if t["updated"] else None
         out.append({"key": f"task:{t['id']}", "kind": kind, "task": t["id"], "resource": None,
                     "title": t["title"], "age_s": None if start is None else max(0.0, now - float(start)),
-                    "since": start, "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t)})
+                    "since": start, "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t),
+                    "ends": ends})
     for name, v in sorted(db.paused_resources().items()):
         since = v.get("since") if isinstance(v.get("since"), (int, float)) else None
         out.append({"key": f"resource:{name}", "kind": "paused", "task": None, "resource": name, "title": name,
                     "age_s": None if since is None else max(0.0, now - float(since)), "since": since,
                     "reason": _clip(f"by {v.get('by') or 'user'}" + (f": {v['reason']}" if v.get("reason") else "")),
-                    "status": "paused", "spec_sha": ""})
+                    "status": "paused", "spec_sha": "", "ends": None})
     return out
 
 
@@ -180,7 +189,7 @@ def remember(db: DB, live: list[dict]) -> None:
 def loop(db: DB, item: dict, prev: dict | None) -> str | None:
     """Why this item looks like a re-block loop, or None: the same normalized stuck reason handed off
     twice in a row, or its spec changed since the last sweep while it stayed in the same stuck state."""
-    if item["task"] is None or item["kind"] == "deferred":
+    if item["task"] is None or item["kind"] == "deferred" or item.get("ends"):
         return None
     last = _last_stuck_events(db, item["task"], 2)
     if len(last) == 2 and last[0]["kind"] == last[1]["kind"]:
@@ -238,7 +247,7 @@ def _signals(db: DB, state: dict, live: list[dict], now: float) -> list[str]:
         if isinstance(r, dict) and float(r.get("ts") or 0) > last:
             out.append(f"ask #{aid} resolved")
             break
-    deps = {d for i in live if i["task"] for d in dependency_ids(db.task(i["task"]) or {"depends_on": "[]"})
+    deps = {d for i in live if i["task"] and not i.get("ends") for d in dependency_ids(db.task(i["task"]) or {"depends_on": "[]"})
             if isinstance(d, int)}
     if deps:
         done = db.q(f"SELECT DISTINCT task FROM events WHERE kind='task_done' AND ts>? AND task IN "
@@ -252,7 +261,7 @@ def _signals(db: DB, state: dict, live: list[dict], now: float) -> list[str]:
             continue
         if last < until <= now:
             out.append(f"provider pause over: {r['key'].split(':', 1)[1]}")
-    keys = {i["key"] for i in live}
+    keys = {i["key"] for i in live if not i.get("ends")}
     for key, o in (db.kv(OUTCOMES_KEY, {}) or {}).items():
         if key in keys and o.get("outcome") == "still_blocked" and o.get("next") and last < float(o["next"]) <= now:
             out.append(f"next check due: {key}")
@@ -294,7 +303,10 @@ def _snap(i: dict) -> dict:
 
 def carried(o: dict | None, i: dict, now: float) -> bool:
     """A still_blocked outcome that still holds for item `i`: re-checkable, its next check ahead, and
-    recorded against the item as it is now. Such an item needs no new outcome at this sweep."""
+    recorded against the item as it is now. Such an item needs no new outcome at this sweep. Nor does
+    a hold that ends without a turn (`ends`): a user pause or a time-only deferral."""
+    if i.get("ends"):
+        return True
     return bool(o and o.get("outcome") == "still_blocked" and recheckable(o) and o.get("next")
                 and float(o["next"]) > now and o.get("item") == _snap(i))
 
@@ -440,6 +452,9 @@ def _carries(i: dict, state: dict, outs: dict, now: float) -> bool:
 
 def _line(i: dict, state: dict, outs: dict, now: float) -> str:
     who = f"#{i['task']} {_clip(i['title'], 70)}" if i["task"] else f"resource {i['resource']}"
+    if i.get("ends") and _carries(i, state, outs, now):
+        what = "HELD BY USER PAUSE" if i["ends"] == "user" else "DEFERRED"
+        return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
     if _carries(i, state, outs, now):
         return f"- {who} | CARRIED (no action): {_last_check(outs.get(i['key']), now)}"
     line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {_clip(i['reason']) or 'no reason given'} | " \
@@ -461,10 +476,10 @@ def _settled(db: DB, key: str) -> dict:
         return {"key": key, "kind": "resolved", "task": int(ident), "resource": None,
                 "title": t["title"] if t else "(no longer exists)", "age_s": None, "since": None,
                 "reason": f"no longer stuck (now {status}): record closed or unblocked", "status": status,
-                "spec_sha": _spec_sha(t) if t else ""}
+                "spec_sha": _spec_sha(t) if t else "", "ends": None}
     return {"key": key, "kind": "resumed", "task": None, "resource": ident, "title": ident, "age_s": None,
             "since": None, "reason": "no longer paused: record closed or unblocked", "status": "resumed",
-            "spec_sha": ""}
+            "spec_sha": "", "ends": None}
 
 
 def _covered(db: DB, data: dict, now: float, where=None) -> list[dict]:
@@ -550,6 +565,7 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
         who = f"#{i['task']} {_clip(i['title'], 60)}" if i["task"] else f"resource {i['resource']}"
         o = outs.get(i["key"])
         out.append(f"{who}: {i['kind']} {_dur(i['age_s'])}: {i['reason'] or 'no reason given'}; sweep: "
-                   + (f"{o['outcome']} {_dur(now - float(o['ts']))} ago" if o else "no outcome yet")
+                   + (f"{o['outcome']} {_dur(now - float(o['ts']))} ago" if o
+                      else f"none needed (ends by {i['ends']})" if i.get("ends") else "no outcome yet")
                    + (" (LOOP)" if i["key"] in loops else ""))
     return out

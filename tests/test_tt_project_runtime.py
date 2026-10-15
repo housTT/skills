@@ -63834,6 +63834,118 @@ def test_blocker_sweep_interval_with_every_item_carried_still_starts_on_a_pendin
     assert "for each item not marked CARRIED" in db.one("SELECT text FROM events WHERE id=?", (eid,))["text"]
 
 
+
+def test_blocker_sweep_carries_user_pause_holds_without_an_outcome_and_starts_no_sweep_for_them(env):
+    """A hold only the user's word lifts (a probe that only tests for a `user-*` marker) needs no sweep
+    outcome, starts no sweep, raises no flag or loop, and stays listed for the user."""
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    probe = "test -e state/user-resume-tuning || exit 1"
+    blocked = db.add_task("blocked on the user")
+    db.update_task(blocked, status="blocked", blocked_reason="paused by the user", labels=[f"waits:when:{probe}"])
+    for ts in (now - 7200, now - 3600):     # the same stuck reason twice: a loop for any other hold
+        _sweep_ev(db, blocked, "task_blocked", f"#{blocked} blocked on the user: paused by the user", ts)
+    waiting = db.add_task("waits on the user")
+    db.update_task(waiting, status="waiting", result=json.dumps(
+        {"status": "waiting", "summary": "paused", "retry_when": "test -f state/user-go"}))
+    deferred = db.add_task("starts on the user's word", labels=[f"start_when:[ -e state/user-start ]",
+                                                                 f"deferred_since:{now - 600}"])
+    live = {i["key"]: i for i in sweep.items(db, now, cfg)}
+    assert {k: (i["kind"], i["ends"]) for k, i in live.items()} == {
+        f"task:{t}": ("user-pause", "user") for t in (blocked, waiting, deferred)}
+    assert "held by user pause until `test -e state/user-resume-tuning || exit 1`" in live[f"task:{blocked}"]["reason"]
+    assert sweep.due(db, cfg, now) is None, "only user pauses are stuck: no sweep turn"
+    assert all(sweep.loop(db, i, None) is None for i in live.values())
+    # Another stuck item starts a sweep: the user pauses are carried and listed, with no action asked.
+    other = db.add_task("needs a key")
+    db.update_task(other, status="blocked", blocked_reason="needs the vendor's key")
+    assert sweep.due(db, cfg, now) == "every 6h"
+    eid = sweep.start(db, cfg, "every 6h", now)
+    state = db.kv(sweep.STATE_KEY)
+    assert sorted(state["carried"]) == sorted(f"task:{t}" for t in (blocked, waiting, deferred))
+    assert not state["loops"] and not state["flags"]
+    text = coord.digest(p, {}, [eid], [])
+    for t in (blocked, waiting, deferred):
+        line = next(ln for ln in text.splitlines() if ln.startswith(f"- #{t} "))
+        assert "HELD BY USER PAUSE (no action)" in line, line
+    assert "3 CARRIED" in text
+    # The next sweep flags only the item left without an outcome.
+    db.x("UPDATE events SET status='handled'")
+    sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    assert db.kv(sweep.STATE_KEY)["flags"] == {f"task:{other}": "no outcome at the last sweep"}
+    # Once the other item is resolved, an interval sweep is skipped again.
+    db.update_task(other, status="done")
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.due(db, cfg, now + 14 * 3600) is None
+    # The daily review still lists the user's pauses.
+    rows = sweep.review_lines(db, now + 14 * 3600, where=p)
+    assert any(f"#{blocked} " in r and "user-pause" in r and "none needed (ends by user)" in r for r in rows), rows
+
+
+def test_user_pause_marker_pattern_is_configurable_and_only_a_bare_marker_test_counts():
+    from ttp import userpause
+    from ttp.project import unknown_key_hint
+    assert userpause.is_probe("test -e state/user-resume-x || exit 1")
+    assert userpause.is_probe("[ -f /abs/path/user-ok ]")
+    assert not userpause.is_probe("test -e state/build-done")
+    assert not userpause.is_probe("test -e state/user-x && ssh box true"), "a probe that does more is no user pause"
+    assert not userpause.is_probe(None)
+    cfg = {"coordinator": {"user_pause_marker": r"(?:^|/)owner-hold-[\w.-]+$"}}
+    assert userpause.is_probe("test -e state/owner-hold-a", cfg)
+    assert not userpause.is_probe("test -e state/user-resume-x", cfg)
+    bad = {"coordinator": {"user_pause_marker": "("}}
+    assert userpause.is_probe("test -e state/user-resume-x", bad), "an invalid pattern falls back to the default"
+    assert unknown_key_hint("coordinator.user_pause_marker") is None
+
+
+def test_blocker_sweep_carries_a_time_only_deferral_without_an_outcome(env):
+    """A queued task held only by `start_after` ends on its own: carried and listed as DEFERRED, never
+    a reason for a sweep, a due-check signal or a loop. A deferral on a probe still needs an outcome."""
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    later = db.add_task("after the window", labels=[f"start_after:{now + 86400}", f"deferred_since:{now - 600}",
+                                                    "start_why:after the window"])
+    db.update_task(later, not_before=now + 86400)
+    [item] = sweep.items(db, now, cfg)
+    assert (item["kind"], item["ends"]) == ("deferred", "time")
+    assert sweep.due(db, cfg, now) is None, "only a time deferral: no sweep turn"
+    # A still_blocked recorded on it earlier whose next check passed is no signal.
+    db.set_kv(sweep.OUTCOMES_KEY, {f"task:{later}": {"outcome": "still_blocked", "ts": now - 7200,
+                                                      "probe": "true", "next": now - 60}})
+    db.set_kv(sweep.STATE_KEY, {"last": now - 3600})
+    assert sweep.due(db, cfg, now) is None
+    probed = db.add_task("after the build", labels=["start_when:test -e out/build-done",
+                                                    f"deferred_since:{now - 600}"])
+    kinds = {i["key"]: i["ends"] for i in sweep.items(db, now, cfg)}
+    assert kinds == {f"task:{later}": "time", f"task:{probed}": None}
+    assert sweep.due(db, cfg, now + 7 * 3600) == "every 6h"
+    eid = sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    assert db.kv(sweep.STATE_KEY)["carried"] == [f"task:{later}"]
+    text = coord.digest(p, {}, [eid], [])
+    assert next(ln for ln in text.splitlines() if ln.startswith(f"- #{later} ")).startswith(
+        f"- #{later} after the window | DEFERRED (no action): after the window")
+    assert "no action" not in next(ln for ln in text.splitlines() if ln.startswith(f"- #{probed} "))
+
+
+def test_past_the_hold_cap_a_user_pause_probe_raises_no_wait_stale(env, monkeypatch):
+    """Only the user's word lifts a user pause: a waiting task on one sleeps on past max_hold_s
+    without asking the coordinator; another not-yet probe still does."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    paused = _due_waiting_task(p, f"test -e {env['tmp']}/state/user-resume-x", since_ago=6 * 3600 + 1)
+    other = _due_waiting_task(p, f"test -e {env['tmp']}/state/build-done", since_ago=6 * 3600 + 1)
+    for tid in (paused, other):
+        _settle_probe(d, tid)
+        p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    for tid in (paused, other):
+        assert not _ready(p, tid) and p.db.task(tid)["not_before"] > time.time() + 800
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (paused,))
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (other,))) == 1
+
 def test_ttr_records_one_incident_per_machine_from_conditions_outages_and_heal_checks(env):
     from ttp import heal
     from ttp import machine_ledger as ml

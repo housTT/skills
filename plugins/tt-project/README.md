@@ -369,7 +369,10 @@ prolonged whole-box outage.
   outcome for each; items without one, `still_blocked` ones with no re-checkable condition, and
   re-block loops (the same reason twice, or a spec addendum while still blocked) are flagged in the
   next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
-  has not run. The daily review lists everything stuck over 6 h with its sweep outcome.
+  has not run. A hold no turn can lift needs no outcome and is listed as no action: a user pause (a
+  probe that only tests for a marker file named `user-*`; `coordinator.user_pause_marker` sets the
+  pattern) or a deferral only until a time. A waiting task on a user-pause probe is never reported
+  as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
   Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
   `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped
   to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep
