@@ -51,7 +51,8 @@ POWER_CYCLE_LEAD_S before T until it ends (expects_now), so it never hides an ou
 daemon tells its running workers on that machine (the daemon's own host, or a task resource on it) once,
 through their steer.md, to commit and hand off now (daemon.power_cycle_notices). An intent `ttp drain
 --reboot` writes carries `hold_from`, when it was written: its window starts there when that is earlier
-(cycle_window), so the drain is held and steered from its start (hostcycle).
+(cycle_window), so the drain is held and steered from its start (hostcycle); its expects still start
+POWER_CYCLE_LEAD_S before T, which the drain moves to the cycle once it records it.
 
 Both files live next to machines.json, written whole under one lock, so co-tenant daemons and CLIs never
 lose each other's writes. Other projects' state is only read (their database, read-only), never written.
@@ -200,9 +201,12 @@ def power_cycles_due(now: float | None = None) -> list[dict]:
             and cycle_window(c)[0] <= now <= cycle_window(c)[1]]
 
 
-def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None) -> dict:
+def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None,
+                       hold_from: float | None = None) -> dict:
     """Move open power-cycle intent #cid to epoch time `at` (its end follows), with an edit trail: a drain
-    that runs longer pushes it on, and the cycle itself, once recorded, brings it to now."""
+    that runs longer pushes it on, and the cycle itself, once recorded, brings it to now. `hold_from`: its
+    window also starts no later than that (and no later than it did), in the same write, so a drain that
+    takes up an intent and pushes it on keeps holding from now."""
     now = time.time() if now is None else now
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
@@ -213,6 +217,8 @@ def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None) -
         what = str(c.get("what") or "")
         new = {"at": at, "expires": at + POWER_CYCLE_AFTER_S,
                "what": f"power-cycle intent, at {ends.shown(at)}" + (f": {what.split(': ', 1)[1]}" if ": " in what else "")}
+        if hold_from is not None:
+            new["hold_from"] = min(cycle_window(c)[0], float(hold_from))
         c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in new}})
         c.update(new)
         _write(LEDGER, doc)
@@ -307,14 +313,15 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
 
 def expects_now(c: dict, now: float | None = None) -> list[str]:
     """What entry `c` expects at `now`: nothing once it is closed or overdue, and for a power-cycle intent
-    nothing outside its window (cycle_window's start until its end), so it never quiets an outage
-    days before the cycle, or after it when nobody closed it."""
+    nothing outside POWER_CYCLE_LEAD_S before its time until its end, so it never quiets an outage
+    days before the cycle, or after it when nobody closed it. A drain's `hold_from` does not widen this:
+    the drain moves the time to the cycle once it records it (hostcycle.cycle_now)."""
     now = time.time() if now is None else now
     if c.get("closed") or overdue(c, now):
         return []
     if c.get("kind") == POWER_CYCLE:
         at = float(c.get("at") or 0)
-        if not cycle_window(c)[0] <= now < float(c.get("expires") or at + POWER_CYCLE_AFTER_S):
+        if not at - POWER_CYCLE_LEAD_S <= now < float(c.get("expires") or at + POWER_CYCLE_AFTER_S):
             return []
     return [str(x) for x in c.get("expects") or []]
 

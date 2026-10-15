@@ -230,3 +230,43 @@ def test_drain_reboot_waits_for_other_projects_pushes_but_not_their_coordinators
     t0 = time.time()
     cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.3"])
     assert time.time() - t0 >= 0.3 and f"other push of task #{tid}" in capsys.readouterr().out
+
+
+def test_a_drain_that_takes_up_a_due_intent_keeps_holding(env, monkeypatch):
+    """A drain reuses an intent `ttp machines change ... power-cycle` wrote (no hold_from) and pushes it on
+    past POWER_CYCLE_LEAD_S: the co-tenant stays held before, during and after the reuse, until the cycle;
+    a resume does not withdraw the intent the drain only took up."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c = ml.add_power_cycle("testhost", "5m", "demo", "planned maintenance", now=t0)
+    assert hostcycle.hold(q, t0)["id"] == c["id"]
+    c2, wrote, _ = hostcycle.open_intent(p, "kernel update", 1200, now=t0)
+    assert not wrote and c2["id"] == c["id"] and c2["at"] == t0 + 1200
+    assert c2["hold_from"] == t0 - ml.POWER_CYCLE_LEAD_S + 300, "no later than its window began"
+    for t in (t0, t0 + 1, t0 + 600, t0 + 1199):
+        assert hostcycle.hold(q, t)["id"] == c["id"], t
+    hostcycle.cycle_now(p, c2, now=t0 + 900)
+    assert hostcycle.hold(q, t0 + 900 + ml.POWER_CYCLE_LEAD_S - 1)["id"] == c["id"]
+    assert hostcycle.hold(q, t0 + 900 + ml.POWER_CYCLE_LEAD_S + 1) is None
+    assert hostcycle.release(p) == [] and ml.changes()[0]["id"] == c["id"]
+
+
+def test_a_drain_intent_quiets_outages_only_around_the_cycle(env, monkeypatch):
+    """hold_from holds and steers from the drain's start, but expects_now ('down') starts only
+    POWER_CYCLE_LEAD_S before the cycle, so a real outage during the wait is not quieted."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1800, now=t0)
+    assert wrote and hostcycle.hold(q, t0)["id"] == c["id"]
+    for t in (t0, t0 + 600, t0 + 1800 - ml.POWER_CYCLE_LEAD_S - 1):
+        assert ml.expects_now(c, t) == [], t
+    assert ml.expects_now(c, t0 + 1800 - ml.POWER_CYCLE_LEAD_S) == ["down"]
+    hostcycle.cycle_now(p, c, now=t0 + 300)
+    (c,) = ml.changes()
+    assert ml.expects_now(c, t0 + 300 - ml.POWER_CYCLE_LEAD_S - 1) == []
+    for t in (t0 + 300 - ml.POWER_CYCLE_LEAD_S, t0 + 300, t0 + 600):
+        assert ml.expects_now(c, t) == ["down"], t

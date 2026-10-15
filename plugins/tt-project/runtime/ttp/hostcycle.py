@@ -156,7 +156,7 @@ def _rebooted_since(c: dict) -> bool:
 def open_intent(p: Project, reason: str, wait_s: float, now: float | None = None) -> tuple[dict | None, bool, str]:
     """`ttp drain --reboot` as it starts: the open power-cycle intent for this host (at now + wait_s,
     holding from now), whether this call wrote it, and a line to print. An open one made on this boot
-    and due now is reused, pushed on to now + wait_s when it was due sooner; one planned for later
+    and due now is reused, pushed on to now + wait_s when it was due sooner and held from now on; one planned for later
     holds nothing now, so a new one is written. (None, False, why) when this host has no
     `ttp machines list` entry or the ledger refused."""
     from . import machine_ledger as ml
@@ -171,7 +171,7 @@ def open_intent(p: Project, reason: str, wait_s: float, now: float | None = None
         if start <= now < end and not _rebooted_since(c):
             if c["at"] < now + wait_s:
                 try:
-                    c = ml.retime_power_cycle(c["id"], now + wait_s, p.name, now=now)
+                    c = ml.retime_power_cycle(c["id"], now + wait_s, p.name, now=now, hold_from=now)
                 except ValueError:
                     continue
             return c, False, f"planned host cycle already announced by {c.get('by')} (machine change #{c['id']})"
@@ -213,7 +213,7 @@ def release(p: Project) -> list[int]:
                 continue
     out = []
     for c in _intents(alias):
-        if c.get("by") == p.name and "hold_from" in c and c["id"] not in recorded and not _rebooted_since(c) \
+        if c.get("by") == p.name and "boot" in c and c["id"] not in recorded and not _rebooted_since(c) \
                 and all(e.get("by") == p.name for e in c.get("edits") or []):
             try:
                 ml.close_change(c["id"], f"{p.name} resumed: its drain recorded no host cycle", by=p.name)
