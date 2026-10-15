@@ -69,7 +69,8 @@ def coordinator_features(p: Project) -> set[str]:
         on.add("land")
     mode = own_push(cfg)
     on |= {"own_push"} if mode != "off" else set()
-    on |= {"own_push_limited"} if mode != "on" else set()
+    # Unset reads as existing_only, but its section costs every coordinator turn: the own_push one names it.
+    on |= {"own_push_limited"} if mode != "on" and d.get("own_push") is not None else set()
     if d.get("draft_prs", True) is not False:
         on.add("draft_prs")
     if d.get("drafts_during_freeze", True) is not False:
@@ -601,7 +602,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + (f", own pushes={own_push(cfg)} (delivery.own_push: "
            + ("refused; never push any branch but the push branch)" if own_off else
               "`ttp push --own` publishes only onto a branch the remote already has)")
-           if own_push(cfg) != "on" else "") + "\n"
+           if own_push(cfg) != "on" and delivery.get("own_push") is not None else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())

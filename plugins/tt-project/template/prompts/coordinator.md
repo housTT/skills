@@ -396,8 +396,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   plain `ttp push` or a push-queue approval (both rebase onto the push branch).
 <!-- /ttp:if own_push -->
 <!-- ttp:if own_push_limited -->
-- `delivery.own_push` says which other branches may be pushed: `on` (default), `existing_only`
-  (`ttp push --own` never creates a remote branch) or `off` (the push branch is the only one).
+- `delivery.own_push` says which other branches may be pushed: `on`, `existing_only` (the default:
+  `ttp push --own` never creates a remote branch) or `off` (the push branch is the only one).
   While it is `off`, never write `--own` or "publish it with `ttp push --own`" into any spec: a
   `pr_branch:` or rebase task still builds on its branch, but lands on the push branch, so its
   review approves it for the push queue (or pushes with plain `ttp push`).

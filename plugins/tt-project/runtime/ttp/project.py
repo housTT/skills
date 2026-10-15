@@ -447,8 +447,9 @@ def push_allowed(d: dict) -> bool:
 
 # delivery.own_push: which remote branches other than delivery.push_branch `ttp push --own` (and any
 # push that publishes as with --own: a notes branch, a pr_branch or rebases: task) may push to.
-# "on" (default): the task's own or carried branch, created on the remote when new (draft PRs).
-# "existing_only": only onto a branch the remote already has; never creates one. "off": none; the
+# "on" (set explicitly): the task's own or carried branch, created on the remote when new.
+# "existing_only" (the default when unset): only onto a branch the remote already has; never creates
+# one, except a code task's own draft-PR branch while unset (own_creates_pr_branch). "off": none; the
 # push branch, through `ttp push` or the push queue, is the only branch the project pushes, and a
 # pr_branch or rebases: task lands there too. A project whose charter allows only one push branch
 # sets "off". An unknown value reads as "off": a typo never widens what may be pushed.
@@ -456,9 +457,12 @@ OWN_PUSH_MODES = ("on", "existing_only", "off")
 
 
 def own_push_mode(v: Any) -> str:
-    """A delivery.own_push value as one of OWN_PUSH_MODES: unset is "on", true/false are on/off,
-    "existing"/"existing-only" are existing_only, anything else is "off"."""
-    if v is None or v is True:
+    """A delivery.own_push value as one of OWN_PUSH_MODES: unset is "existing_only" (a review once
+    created remote branches a project's charter never allowed: creating one takes an explicit "on"),
+    true/false are on/off, "existing"/"existing-only" are existing_only, anything else is "off"."""
+    if v is None:
+        return "existing_only"
+    if v is True:
         return "on"
     if v is False:
         return "off"
@@ -471,6 +475,15 @@ def own_push_mode(v: Any) -> str:
 def own_push(cfg: dict) -> str:
     """The project's delivery.own_push mode (own_push_mode)."""
     return own_push_mode((cfg.get("delivery") or {}).get("own_push"))
+
+
+def own_creates_pr_branch(cfg: dict) -> bool:
+    """Whether a code task's `ttp push --own` may still create its own ttp/t<id>-... branch on the remote
+    under the unset default (existing_only): that push is how a draft PR's branch is first published
+    (kind-code.md), and nothing else could publish it. Only while delivery.own_push is unset and
+    delivery.draft_prs is on; an explicit own_push value, or draft PRs off, keeps the mode strict."""
+    d = cfg.get("delivery") or {}
+    return d.get("own_push") is None and d.get("draft_prs", True) is not False
 
 
 OWN_FLAG = re.compile(r"(?<![\w-])--own\b")

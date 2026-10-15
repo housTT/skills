@@ -4975,6 +4975,7 @@ def test_the_review_of_a_task_with_another_pr_branch_publishes_with_own_and_neve
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.own_push", "on")   # creating its branch takes own pushes set on
     monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
     for on in (False, True):
         p.set_config("delivery.push_queue", on)
@@ -5005,6 +5006,7 @@ def test_the_review_prompt_keeps_the_own_publish_step_when_the_push_queue_is_on(
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.own_push", "on")   # creating its branch takes own pushes set on
     p.set_config("delivery.push_queue", True)
     monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
     _, _, _, (rev,) = _finish_code(env, p, "other", {"o.py": 3}, labels=["pr_branch:feature/x"])
@@ -5031,8 +5033,8 @@ def test_the_review_of_a_task_whose_pr_branch_is_absent_from_the_remote_delivers
         env, monkeypatch):
     """With the push queue on, a pr_branch the push remote has no branch of is ignored, as the queue's
     check_approval ignores it: the review gets the usual push step and the label is named as ignored.
-    A task whose spec asks for `ttp push --own` (it creates that branch) keeps the --own step, and so
-    does a pr_branch the remote has."""
+    A task whose spec asks for `ttp push --own` (it creates that branch) keeps the --own step only with
+    delivery.own_push on, and a pr_branch the remote has keeps it too."""
     from ttp import push, pushq, settinghold
     from ttp.daemon import Daemon
     p = make(env)
@@ -5048,6 +5050,12 @@ def test_the_review_of_a_task_whose_pr_branch_is_absent_from_the_remote_delivers
 
     def own(tid, head):
         p.db.update_task(tid, spec="Create feature/x: publish it with `ttp push --own --detach`.")
+    # delivery.own_push unset (existing_only) creates no branch, whatever the spec asks: the push queue
+    # takes it. A reported case: reviews created such branches with --own in a one-branch project.
+    _, _, _, (unset,) = _finish_code(env, p, "unset", {"u.py": 3}, labels=["pr_branch:feature/x"], before=own)
+    assert "was ignored" in unset["spec"] and "publish it with" not in unset["spec"].split("Its hand-off")[1]
+    assert "ttp push` from" in unset["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(unset["labels"])
+    p.set_config("delivery.own_push", "on")
     _, _, _, (mine,) = _finish_code(env, p, "own", {"m.py": 3}, labels=["pr_branch:feature/x"], before=own)
     assert "`ttp push --own --detach`" in mine["spec"] and "was ignored" not in mine["spec"], mine["spec"]
     assert push.REVIEW_ONLY_LABEL in json.loads(mine["labels"])
@@ -5671,6 +5679,7 @@ def test_push_own_with_a_git_remote_still_pushes_to_it_and_never_falls_back_to_t
     from ttp import push
     p, repo = _local_push_setup(env, monkeypatch, ["true"])
     _git_out(repo, "remote", "add", "origin", str(env["tmp"] / "gone.git"))
+    p.set_config("delivery.own_push", "on")   # unset (existing_only) would refuse before reaching the remote
     t = p.db.add_task("Speed it up", "s", kind="code", labels=["pr_branch:feature/x"])
     monkeypatch.setenv("TTP_TASK", str(t))
     _git_out(repo, "branch", "feature/x")
@@ -5692,6 +5701,7 @@ def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.own_push", "on")   # creating its branch takes own pushes set on
     monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
     _git_out(p.root, "branch", "feature/x")
     assert coord.apply(p, [{"type": "task_add", "title": "Rebase feature/x onto work", "kind": "code",

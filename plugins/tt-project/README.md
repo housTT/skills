@@ -914,16 +914,21 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
-- `delivery.own_push` (`on` by default) says which remote branches besides the push branch
+- `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
-  `pr_branch:` or `rebases:` task). `on`: the task's own or carried branch, created on the remote
-  when new (what draft PRs need). `existing_only`: only onto a branch the remote already has; it
-  never creates one. `off`: none; `ttp push --own` refuses and names the push queue, a
+  `pr_branch:` or `rebases:` task). `on`, set explicitly: the task's own or carried branch, created
+  on the remote when new. `existing_only`: only onto a branch the remote already has; it never
+  creates one. Unset reads as `existing_only` with one exception: a code task's `ttp push --own`
+  still creates its own `ttp/t<id>-...` branch while `delivery.draft_prs` is on, the documented
+  way a draft PR's branch is first published; a review, another task's branch, a notes branch or
+  a push outside a run never creates one. So a review of a `pr_branch:` or `rebases:` task whose
+  branch the remote lacks is review only, or approves into the push queue when it is on. The
+  refusal names the setting. `off`: none; `ttp push --own` refuses and names the push queue, a
   `pr_branch:` or `rebases:` task lands on the push branch like any other change, and no spec the
   daemon writes (reviews, fixes, PR fixes, `review.auto_notes`) mentions `--own`. Set it `off`
   when the project may push to one branch only. An unknown value reads as `off`. The coordinator
-  may turn it `off` itself; `on` and `existing_only` need the user's word. The default stays `on`
-  so projects that publish draft PRs keep working without a change.
+  may turn it `off` itself; `on` and `existing_only` need the user's word. The default was `on`
+  until reviews created remote branches in a project allowed one push branch only.
 - `delivery.drafts_during_freeze` (on by default): opening and updating draft PRs needs no one's
   word, even under a project's code freeze. Off, for teams whose freeze also covers drafts: the
   coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask

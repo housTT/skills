@@ -34,8 +34,8 @@ from urllib.parse import quote, unquote
 from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, settinghold, timefmt, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
-from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_push, push_queue_on,
-                      renice, write_json)
+from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_creates_pr_branch,
+                      own_push, push_queue_on, renice, write_json)
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1718,21 +1718,37 @@ def own_landing(cfg: dict) -> str:
 
 def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
     """Refuse (ValueError) a push that publishes `branch` on `remote` as with --own when
-    delivery.own_push forbids it: "off" refuses every one, "existing_only" one the remote does not
-    have yet (or cannot be asked about). A code repo with no git remote (LOCAL) moves only a local
-    branch, which pushes nothing, so it is never refused here."""
+    delivery.own_push forbids it: "off" refuses every one, "existing_only" (also unset) one the remote
+    does not have yet (or cannot be asked about). Unset still lets a code task create its own branch
+    (own_pr_branch): draft PRs are published that way. A code repo with no git remote (LOCAL) moves
+    only a local branch, which pushes nothing, so it is never refused here."""
     if remote == LOCAL:
         return
     cfg = p.config()
     mode = own_push(cfg)
+    unset = (cfg.get("delivery") or {}).get("own_push") is None
     if mode == "off":
         raise ValueError(f"own pushes are off in this project (delivery.own_push = off): it pushes to no "
                          f"remote branch but delivery.push_branch, so {remote}/{branch} is not pushed. Never "
                          f"publish it another way (no `git push`): {own_landing(cfg)}")
-    if mode == "existing_only" and not _on_remote(repo, remote, branch):
+    if mode == "existing_only" and not own_pr_branch(p, cfg, branch) and not _on_remote(repo, remote, branch):
+        setting = ("delivery.own_push is unset, which reads as existing_only; only the user sets it to on"
+                   if unset else "delivery.own_push = existing_only")
         raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
-                         f"only onto a branch the remote already has (delivery.own_push = existing_only): not "
+                         f"only onto a branch the remote already has ({setting}): not "
                          f"creating it. Never create it another way (no `git push`): {own_landing(cfg)}")
+
+
+def own_pr_branch(p: Project, cfg: dict, branch: str) -> bool:
+    """Whether `branch` is the running code task's own ttp/t<id>-... branch (no notes branch) that it may
+    create on the remote with delivery.own_push unset (own_creates_pr_branch): the documented way a
+    draft PR's branch is first published. Never another task's branch, never from a review (reviews
+    once created the branches of the code tasks they covered this way), and never outside a run."""
+    task = os.environ.get("TTP_TASK")
+    m = OWN_BRANCH.fullmatch(branch)
+    if not (task and m and m.group(1) == task and own_creates_pr_branch(cfg)) or is_notes_branch(p, branch):
+        return False
+    return str((_task_row(p, task) or {}).get("kind") or "") == "code"
 
 
 def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:

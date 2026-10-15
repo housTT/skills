@@ -23059,6 +23059,8 @@ def _push_setup(env, monkeypatch, checks):
     subprocess.run(["git", "clone", "-q", "-b", "proj", str(origin), str(other)], check=True)
     p.set_config("delivery.push_branch", "origin/proj")
     p.set_config("delivery.push_checks", checks)
+    # Own pushes on explicitly (unset reads as existing_only): these tests exercise how --own publishes.
+    p.set_config("delivery.own_push", "on")
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.chdir(repo)
     return p, repo, origin, other
@@ -49045,7 +49047,7 @@ def test_push_own_without_a_git_remote_fast_forwards_a_pr_branch_checked_out_in_
 
 def test_own_push_off_refuses_every_own_push_and_names_the_push_queue(env, monkeypatch, capsys):
     """delivery.own_push off: `ttp push --own` and `--own --detach` push nothing, start no detached
-    push and say how the work lands instead; on (the default) still publishes."""
+    push and say how the work lands instead; on (set explicitly) still publishes."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
     _commit(repo, "mine.txt", "mine\n")
@@ -49084,6 +49086,63 @@ def test_own_push_existing_only_never_creates_a_remote_branch_but_updates_one(en
     _commit(repo, "more.txt", "more\n")
     assert _ttp("push", "--own") == 0
     assert _git_out(origin, "rev-parse", "ttp/t30-exp") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_own_push_unset_never_lets_a_review_create_a_remote_branch_but_updates_one(env, monkeypatch, capsys):
+    """A reported case, replayed: with delivery.own_push unset, reviews ran `ttp push --own` for code
+    tasks whose pr_branch: line named their own ttp/t<id>-... branch, and created those branches on a
+    remote whose project allowed one push branch only. Unset reads as existing_only: the review is
+    refused, naming the setting, and nothing reaches the remote; a branch the remote has still moves."""
+    from ttp.project import own_push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", None)
+    p.set_config("delivery.push_queue", True)
+    assert own_push(p.config()) == "existing_only"
+    code = p.db.add_task("Fix it", "s", kind="code", labels=["pr_branch:ttp/t1-fix-it"])
+    assert code == 1
+    review = p.db.add_task(f"Review #{code}: Fix it", "r", kind="review", labels=[f"auto_review:{code}"])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t1-fix-it")
+    _commit(repo, "fix.txt", "fix\n")
+    monkeypatch.setenv("TTP_TASK", str(review))
+    capsys.readouterr()
+    for args in (["push", "--own"], ["push", "--own", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "delivery.own_push is unset, which reads as existing_only" in err and "not creating it" in err, err
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj"
+    # The branch already on the remote (its PR's): the review's --own moves it on, fast-forward.
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t1-fix-it")
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t1-fix-it") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_own_push_unset_still_lets_a_code_task_create_its_own_draft_pr_branch(env, monkeypatch, capsys):
+    """Unset keeps the documented draft-PR path: a code task's `ttp push --own` creates its own
+    ttp/t<id>-... branch, while delivery.draft_prs is on. Draft PRs off, an explicit existing_only, a
+    review or no run at all creates nothing."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", None)
+    t = p.db.add_task("Speed it up", "s", kind="code")
+    branch = f"ttp/t{t}-speed-it-up"
+    _git_out(repo, "checkout", "-q", "-b", branch)
+    _commit(repo, "a.txt", "a\n")
+    heads = lambda: _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2 and "delivery.own_push" in capsys.readouterr().err   # outside a run
+    monkeypatch.setenv("TTP_TASK", str(t))
+    for key, value in (("delivery.draft_prs", False), ("delivery.own_push", "existing_only")):
+        p.set_config(key, value)
+        assert _ttp("push", "--own") == 2, key
+        assert "not creating it" in capsys.readouterr().err
+        p.set_config(key, None if key == "delivery.own_push" else True)
+    assert heads() == ["proj"]
+    review = p.db.add_task(f"Review #{t}: Speed it up", "r", kind="review", labels=[f"auto_review:{t}"])
+    monkeypatch.setenv("TTP_TASK", str(review))   # the task's own branch only: never a review's push
+    assert _ttp("push", "--own") == 2 and heads() == ["proj"]
+    monkeypatch.setenv("TTP_TASK", str(t))
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", branch) == _git_out(repo, "rev-parse", "HEAD")
 
 
 def test_the_coordinator_may_turn_own_pushes_off_but_only_the_user_turns_them_on(env):
