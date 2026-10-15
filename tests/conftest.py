@@ -10,6 +10,12 @@ collected tests form one unit that a single worker runs in order, as before.
 
 Every collected test still runs exactly once. A worker that dies fails the tests it took and did not
 finish. TTP_TEST_JOBS=1 (or -x, --maxfail, --pdb, -s, --stepwise, xdist) runs everything in-process.
+
+A session that runs tt-project tests also fails if, at its end, a process whose command line names
+the session's own temp root (basetemp) is still alive: those are processes a test detached and never
+reaped. The guard lists them and stops them first, so a failure leaves nothing behind. Only this
+session's basetemp counts, so concurrent sessions on the host never trip it. `reap_tmp_processes`
+gives a test the same reaping for its own tmp_path.
 """
 
 from __future__ import annotations
@@ -17,11 +23,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import selectors
 import signal
 import struct
+import subprocess
 import sys
+import time
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +57,129 @@ def _jobs(config, items) -> int:
     except AttributeError:
         cpus = os.cpu_count() or 1
     return max(1, min(MAX_AUTO_JOBS, cpus))
+
+
+_STARTED = time.time()   # this session's start (reset at sessionstart): older processes are never its leaks
+
+
+def _seconds(etime: str) -> int | None:
+    """`ps` etime ([[dd-]hh:]mm:ss) in seconds, or None."""
+    days, _, rest = etime.rpartition("-")
+    try:
+        total = 0
+        for part in rest.split(":"):
+            total = total * 60 + int(part)
+        return total + int(days or 0) * 86400
+    except ValueError:
+        return None
+
+
+def _ps() -> list[tuple[int, int, int, float, str]]:
+    """(pid, ppid, pgid, start time, command line) of every process on the host; `ps` as on Linux and
+    macOS. The start time is to the second (etime)."""
+    # -ww: whole command lines, never cut to the terminal width (COLUMNS) as without a terminal
+    r = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,pgid=,etime=,command="], capture_output=True,
+                       text=True, timeout=60)
+    now, rows = time.time(), []
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 4)
+        age = _seconds(parts[3]) if len(parts) == 5 else None
+        if age is not None and all(x.isdigit() for x in parts[:3]):
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), now - age, parts[4]))
+    return rows
+
+
+def _ancestors(rows) -> set[int]:
+    """This process and its ancestors."""
+    parent = {row[0]: row[1] for row in rows}
+    mine, pid = set(), os.getpid()
+    while pid > 0 and pid not in mine:
+        mine.add(pid)
+        pid = parent.get(pid, 0)
+    return mine
+
+
+def leaked_processes(root: str | Path, since: float | None = None) -> list[tuple[int, int, str]]:
+    """(pid, pgid, command line) of live processes whose command line names `root` (the path itself or
+    anything below it) and that started after `since` (default: this session's start), other than
+    this process and its ancestors. Processes from before the session (the shell that started pytest
+    with --basetemp=root, say) are never counted: etime has whole seconds, so a process counts only from
+    a second after `since`."""
+    rows = _ps()
+    mine = _ancestors(rows)
+    since = _STARTED if since is None else since
+    names = re.compile(re.escape(str(root).rstrip(os.sep)) + r"(?=[/\s'\"]|$)")
+    return [(pid, pgid, cmd) for pid, _, pgid, start, cmd in rows
+            if pid not in mine and start >= since + 1 and names.search(cmd)]
+
+
+def reap(found: list[tuple[int, int, str]], root: str | Path, grace: float = 3.0) -> list[tuple[int, int, str]]:
+    """Stop the processes in `found` and their process groups: TERM, up to `grace` s, then KILL. A group
+    this process or an ancestor belongs to is never signalled, only the process. Returns those of
+    `found` still alive afterwards."""
+    rows = _ps()
+    mine = _ancestors(rows)
+    ours = {row[2] for row in rows if row[0] in mine} | {os.getpgrp()}
+    left = found
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid, pgid, _ in left:
+            try:
+                if pgid > 1 and pgid not in ours:
+                    os.killpg(pgid, sig)
+                else:
+                    os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.time() + grace
+        while True:
+            left = [proc for proc in leaked_processes(root) if proc[0] in {f[0] for f in found}]
+            if not left or time.time() >= deadline:
+                break
+            time.sleep(0.1)
+        if not left:
+            break
+    return left
+
+
+@pytest.fixture
+def reap_tmp_processes():
+    """Returns reap(root): stops every process whose command line names `root` (and its group), and
+    returns those still alive after TERM and KILL, normally []. For a test that detaches processes:
+    call it from a finalizer that also runs when the test fails."""
+    return lambda root: reap(leaked_processes(root), root)
+
+
+@pytest.fixture
+def leaked_tmp_processes():
+    """The session guard's finder (leaked_processes), for tests of the guard itself."""
+    return leaked_processes
+
+
+def pytest_sessionstart(session):
+    global _STARTED
+    _STARTED = time.time()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not any(i.path.name.startswith(_SHARDED) for i in session.items):
+        return
+    root = getattr(getattr(session.config, "_tmp_path_factory", None), "_basetemp", None)
+    if root is None:   # no test used a temp path
+        return
+    found = leaked_processes(root)
+    if not found:
+        return
+    left = reap(found, root)
+    lines = [f"tests left {len(found)} process(es) running that name this session's temp root {root} "
+             f"(stopped now{'' if not left else f'; {len(left)} still alive'}):"]
+    lines += [f"  pid {pid} (group {pgid}): {cmd[:300]}" for pid, pgid, cmd in found]
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    for line in lines:
+        if tr:
+            tr.write_line(line, red=True)
+        else:
+            print(line, file=sys.stderr)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _units(items) -> list[list]:

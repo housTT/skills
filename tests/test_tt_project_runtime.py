@@ -60989,8 +60989,15 @@ def test_budget_change_never_shows_the_account_in_clear(env, monkeypatch):
 @pytest.mark.parametrize("queued", [False, pytest.param(True, marks=pytest.mark.skipif(
     sys.platform != "linux", reason="a launcher finds itself boxed only by its Linux PID namespace or cgroup "
     "(/proc); other hosts are never boxed and take the direct path"))], ids=["direct", "daemon-queued"])
-def test_detached_checks_temp_survives_worker_cleanup(env, tmp_path, monkeypatch, queued):
+def test_detached_checks_temp_survives_worker_cleanup(env, tmp_path, monkeypatch, queued, request,
+                                                    reap_tmp_processes):
     from ttp import cli, detach, push, runner
+
+    def reap():
+        # The checks and their command (a session of its own) block on `release` until the test
+        # writes it: however the test ends, nothing they started may outlive it.
+        assert reap_tmp_processes(tmp_path) == [], "the detached checks outlived the test"
+    request.addfinalizer(reap)
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     worker_tmp = run / "tmp"
     worker_tmp.mkdir()
@@ -61017,25 +61024,43 @@ def test_detached_checks_temp_survives_worker_cleanup(env, tmp_path, monkeypatch
         assert "queued" in launch.stdout and not (run / cli.CHECKS_PID).exists()
         detach.tend(p)
     info = cli._read_checks_pid(run)
+    assert _wait_for(ready.exists), (run / cli.CHECKS_OUT).read_text()
+    scratch = pathlib.Path(ready.read_text()).parent.parent
+    runner.remove_private(run)
+    assert not worker_tmp.exists()
+    assert pathlib.Path(ready.read_text()).exists(), "worker cleanup deleted live checks temp files"
+    monkeypatch.setattr(p, "runs", tmp_path)
+    detach.tend(p)   # recovery must leave live checks' storage alone
+    assert pathlib.Path(ready.read_text()).exists()
+    release.write_text("go")
+    assert _wait_precheck(run) == "0"
+    assert _wait_for(lambda: not scratch.exists()), "completed checks left scratch behind"
+    assert cli._checks_result(run) == 0
+    assert info["pidns"] == push.pid_ns()
+
+
+def test_leak_guard_finds_and_reaps_processes_naming_the_temp_root(tmp_path, leaked_tmp_processes,
+                                                                    reap_tmp_processes):
+    """The session guard (tests/conftest.py) reports a process left running that names the temp root,
+    whether detached or in pytest's own process group, never one naming a sibling path, and stops
+    them without touching pytest."""
+    sleep = "import sys, time; time.sleep(120)"
+    detached = subprocess.Popen([sys.executable, "-c", sleep, str(tmp_path / "a")], start_new_session=True)
+    same_group = subprocess.Popen([sys.executable, "-c", sleep, str(tmp_path)])
+    sibling = subprocess.Popen([sys.executable, "-c", sleep, f"{tmp_path}1/b"], start_new_session=True)
     try:
-        assert _wait_for(ready.exists), (run / cli.CHECKS_OUT).read_text()
-        scratch = pathlib.Path(ready.read_text()).parent.parent
-        runner.remove_private(run)
-        assert not worker_tmp.exists()
-        assert pathlib.Path(ready.read_text()).exists(), "worker cleanup deleted live checks temp files"
-        monkeypatch.setattr(p, "runs", tmp_path)
-        detach.tend(p)   # recovery must leave live checks' storage alone
-        assert pathlib.Path(ready.read_text()).exists()
-        release.write_text("go")
-        assert _wait_precheck(run) == "0"
-        assert _wait_for(lambda: not scratch.exists()), "completed checks left scratch behind"
-        assert cli._checks_result(run) == 0
-        assert info["pidns"] == push.pid_ns()
+        want = {detached.pid, same_group.pid}
+        assert _wait_for(lambda: {pid for pid, _, _ in leaked_tmp_processes(tmp_path)} == want), \
+            leaked_tmp_processes(tmp_path)
+        assert {pid: pgid for pid, pgid, _ in leaked_tmp_processes(tmp_path)}[detached.pid] == detached.pid
+        assert reap_tmp_processes(tmp_path) == []
+        assert detached.wait(timeout=10) == -signal.SIGTERM and same_group.wait(timeout=10) == -signal.SIGTERM
+        assert sibling.poll() is None, "a process naming a sibling path was stopped"
+        assert [pid for pid, _, _ in leaked_tmp_processes(f"{tmp_path}1")] == [sibling.pid]
     finally:
-        try:
-            os.killpg(info["pid"], signal.SIGTERM)
-        except OSError:
-            pass
+        for proc in (detached, same_group, sibling):
+            proc.kill()
+            proc.wait()
 
 
 @pytest.mark.parametrize("command, expected", [("true", "0"), ("false", "1"), ("sleep 60", "143")])
