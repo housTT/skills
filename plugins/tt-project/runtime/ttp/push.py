@@ -1386,7 +1386,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     too. Both only as a fast-forward (publish, ff_only: own_ff_only). A task labelled
     `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
     worktree) publishes its head onto that branch instead, and so does a review covering that task,
-    from that task's branch or from the pr_branch itself checked out (_reviewed finds the task).
+    from that task's branch or from the pr_branch itself checked out (_reviewed finds the task); a
+    review whose own spec has one `pr_branch:` line publishes the covered task's branch onto it.
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
@@ -1413,8 +1414,17 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would:
         # from that task's own branch, or from the pr_branch itself checked out (a task's ttp/t<id>-...
         # branch another task carries as its pr_branch, e.g. one publishing a finished task's work).
-        onto = next((b for t in _reviewed(p, task)
+        reviewed = _reviewed(p, task)
+        onto = next((b for t in reviewed
                      if (b := pr_branch_of(p, t)) and (str(t["id"]) == m.group(1) or b == branch)), "")
+        # Or, from the reviewed task's own branch, onto the one branch a `pr_branch:` line of the
+        # review's own spec names (the code task carried no label; the review delivers it there).
+        # Accepted gap: a branch still checked out in a done task's kept worktree is not freed here
+        # or in worktree.py; the error names the holding worktree, and worktree retention clears it.
+        if not onto and any(str(t["id"]) == m.group(1) for t in reviewed):
+            named = {g.group("branch") for g in worktree.SPEC_PR_BRANCH.finditer(
+                str((_task_row(p, task) or {}).get("spec") or ""))}
+            onto = named.pop() if len(named) == 1 else ""
         carried = bool(onto)
     if carried:
         if not worktree.valid_branch(onto):

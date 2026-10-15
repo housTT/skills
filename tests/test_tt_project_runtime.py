@@ -21338,6 +21338,41 @@ def test_a_workspace_locked_initializing_with_an_index_and_edits_is_kept_and_reu
         "the kept worktree stayed locked"
 
 
+def test_a_review_publishes_an_unlabelled_code_tasks_head_onto_the_branch_its_spec_names(env, monkeypatch):
+    """A code task with no pr_branch label, reviewed by a task whose spec has a `pr_branch:` line:
+    `ttp push --own` in the code task's worktree publishes its head onto that branch, fast-forward
+    only. A review with no such line, lines naming two branches or a protected branch is refused."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
+    cid = p.db.add_task("work", "s", kind="code")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{cid}-work")
+    _commit(repo, "work.txt", "work\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+
+    def review(spec):
+        return str(p.db.add_task(f"Review #{cid}", spec, kind="review", depends_on=[cid]))
+    for spec, why in (("check it", "only this task's own branch"),
+                      ("pr_branch: feature/x\npr_branch: feature/y", "only this task's own branch"),
+                      ("pr_branch: main", "not one valid branch name")):
+        monkeypatch.setenv("TTP_TASK", review(spec))
+        with pytest.raises(ValueError, match=why):
+            push.own_target(p, repo)
+    monkeypatch.setenv("TTP_TASK", review("Deliver it.\npr_branch: feature/x\n"))
+    assert push.own_target(p, repo) == ("origin", "feature/x")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "feature/x") == head
+    # Never a force: once the branch moved elsewhere, a head that does not contain it is not pushed.
+    _git_out(other, "fetch", "-q", "origin")
+    _git_out(other, "checkout", "-q", "-b", "fx", "origin/feature/x")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:feature/x")
+    theirs = _git_out(origin, "rev-parse", "feature/x")
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp("push", "--own") != 0
+    assert _git_out(origin, "rev-parse", "feature/x") == theirs
+
+
 def test_a_workspace_on_another_branch_without_commits_keeps_its_files_and_is_made_again(env):
     p = make(env)
     from ttp import worktree

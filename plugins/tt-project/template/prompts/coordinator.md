@@ -392,9 +392,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   setting (a `setting hold` line) are released together once it is settled: leave them.
 <!-- /ttp:if push_branch -->
 <!-- ttp:if own_push -->
-- A code task labelled `pr_branch:<branch>` for a branch other than `delivery.push_branch` delivers
-  to that PR: its review spec says "if it passes, publish it with `ttp push --own --detach`", never
-  plain `ttp push` or a push-queue approval (both would rebase it onto the push branch).
+- A code task labelled `pr_branch:<branch>` (not `delivery.push_branch`), or whose review spec has
+  it, delivers there: the review says "if it passes, publish it with `ttp push --own --detach`", never
+  plain `ttp push` or a push-queue approval (both rebase onto the push branch).
 <!-- /ttp:if own_push -->
 <!-- ttp:if own_push_limited -->
 - `delivery.own_push` says which other branches may be pushed: `on` (default), `existing_only`
