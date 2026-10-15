@@ -289,8 +289,10 @@ DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "tried")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
-# whole ledger again after a machine event or a snapshot refresh (ledger_section).
-LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"snapshot": its time, "lines": {key: hash}}
+# whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
+# alone: a prompt-snapshot refresh changes nothing in it, so it still shows only the diff.
+LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"lines": {key: hash}}
+LEDGER_WHOLE_CHANGES = 10   # change lines in a whole view (overdue, then the project's own); the rest counted
 LEDGER_HEAD = "## Shared machines in your Resources"
 # Sections that change only when memory, the charter or the release does: they end the cached
 # context block (with_cached) instead of the digest, which a timestamp leads and so misses the cache
@@ -600,20 +602,18 @@ def machine_events(db, event_ids: list[int]) -> bool:
 def ledger_section(p: Project, db, seen: dict | None, machine_event: bool,
                    now: float) -> tuple[list[str], dict] | None:
     """The machine ledger's digest lines and what to store for the next turn under LEDGER_SEEN_KEY;
-    None when there is nothing to show. Whole on a turn with a machine event, without `seen` or
-    after a snapshot refresh; else only the lines new or reworded since the previous turn, and a
-    count of the ones gone. The line naming machines without a recovery owner is shown once anyway."""
+    None when there is nothing to show. Whole (ledger_whole) on a turn with a machine event or without
+    `seen`; else only the lines new or reworded since the previous turn, and a count of the ones gone.
+    The line naming machines without a recovery owner is shown once anyway."""
     items = machine_ledger.digest_items(p, now)
     kept = [(k, ln) for k, ln in items if k != machine_ledger.GAP_ITEM]
-    snap = prompt_state(p, now)[0].get("at")
-    store = {"snapshot": snap, "lines": {k: _sha(ln) for k, ln in kept}}
+    store = {"lines": {k: _sha(ln) for k, ln in kept}}
     before = (seen or {}).get(LEDGER_SEEN_KEY)
-    if machine_event or not isinstance(before, dict) or before.get("snapshot") != snap:
+    if machine_event or not isinstance(before, dict) or not isinstance(before.get("lines"), dict):
         if not items:
             return None
-        return ([f"{LEDGER_HEAD}: open changes (`ttp machines change`), conditions, owners"]
-                + [f"- {ln}" for _, ln in items]), store
-    old = before.get("lines") or {}
+        return ledger_whole(p, items, now), store
+    old = before["lines"]
     fresh = [(k, ln) for k, ln in items if k == machine_ledger.GAP_ITEM or old.get(k) != store["lines"].get(k)]
     gone = len(set(old) - set(store["lines"]))
     if not items and not gone:
@@ -624,6 +624,26 @@ def ledger_section(p: Project, db, seen: dict | None, machine_event: bool,
     return ([f"{LEDGER_HEAD}: {len(kept)} open; new or changed since last turn below"
              + (f", {same} as last turn" if same else "") + (f", {gone} gone" if gone else "")]
             + [f"- {ln}" for _, ln in fresh]), store
+
+
+def ledger_whole(p: Project, items: list[tuple[str, str]], now: float) -> list[str]:
+    """The whole ledger view, capped: conditions, outages and the owner gap in full, then at most
+    LEDGER_WHOLE_CHANGES open change lines (overdue first, then `p`'s own, then other projects'), and
+    one line counting the open changes not shown."""
+    byid = {f"change:{c.get('id')}": c for c in machine_ledger.changes(set(machine_ledger.resource_machines(p)))}
+
+    def rank(c: dict) -> int:
+        return 0 if machine_ledger.overdue(c, now) else 1 if c.get("by") == p.name else 2
+
+    other = [ln for k, ln in items if k not in byid and not k.startswith("others:")]
+    picked = sorted((k for k, _ in items if k in byid), key=lambda k: rank(byid[k]))[:LEDGER_WHOLE_CHANGES]
+    line = dict(items)
+    shown = [line[k] for k in picked]
+    rest = len(byid) - len(shown)
+    return ([f"{LEDGER_HEAD}: open changes (`ttp machines change`), conditions, owners"]
+            + [f"- {ln}" for ln in other + shown]
+            + ([f"- {rest} more open change{'s' if rest > 1 else ''} not shown (`ttp machines change list`)"]
+               if rest > 0 else []))
 
 
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:

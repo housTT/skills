@@ -6889,12 +6889,44 @@ def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworde
     # A machine event shows it whole.
     text, seen = ledger(seen, (ev, mev))
     assert "known outage" in text and "a second change" in text and "(as last turn" not in text
-    # So does the turn after a snapshot refresh.
+    # A prompt-snapshot refresh leaves the ledger as it was: still one line, or only the diff.
     assert ledger(seen)[0].endswith("(as last turn)")
     p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
     text, seen = ledger(seen)
-    assert "known outage" in text and "a second change" in text and "(as last turn" not in text
-    assert ledger(seen)[0].endswith("(as last turn)")
+    assert text == "## Shared machines in your Resources: 2 open (as last turn)"
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    ml.add_change("box-d", "a third change", "undo it", "demo", expires="6h")
+    text, seen = ledger(seen)
+    assert "a third change" in text and "a second change" not in text and "2 as last turn" in text
+    # A seen entry from before (keyed on the snapshot) still diffs on its lines.
+    old = dict(seen, **{coord.LEDGER_SEEN_KEY: {"snapshot": 1.0, **seen[coord.LEDGER_SEEN_KEY]}})
+    assert ledger(old)[0].endswith("(as last turn)")
+
+
+def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-c", tags="device")
+    _resources(p, "- box-c")
+    n = coord.LEDGER_WHOLE_CHANGES
+    for i in range(n + 5):
+        ml.add_change("box-c", f"theirs {i} " + "y" * 250, "undo it", "proj-a", expires="6h", until_probe="true")
+    ml.add_change("box-c", "my own change", "undo it", p.name, expires="6h")
+    for i in range(3):
+        ml.add_change("box-c", f"quiet {i}", "undo it", "proj-b", expires="6h")
+    ml.report("proj-a", "box-c", "held", "a hold")
+    text = "\n".join(coord.ledger_section(p, p.db, None, False, time.time())[0])
+    assert "my own change" in text and "box-c held" in text
+    assert text.count("theirs ") == n - 1 and "quiet" not in text
+    assert f"- {5 + 1 + 3} more open changes not shown (`ttp machines change list`)" in text
+    assert text.index("my own change") < text.index("theirs ")
+    assert len(text) < (n + 4) * 400
+    # The next turn diffs against every line, shown or counted: nothing repeats.
+    seen = {coord.LEDGER_SEEN_KEY: coord.ledger_section(p, p.db, None, True, time.time())[1]}
+    assert coord.ledger_section(p, p.db, seen, False, time.time())[0] == [
+        f"## Shared machines in your Resources: {n + 5 + 1 + 1 + 1} open (as last turn)"]
 
 
 def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
