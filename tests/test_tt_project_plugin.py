@@ -461,6 +461,15 @@ def test_review_lists_every_blocking_finding_and_fixes_test_each_bug_class():
     assert "test each class of bug found, not only the reported case" in code
 
 
+
+def test_new_tests_for_an_area_go_in_its_case_file():
+    """Area case files keep changes to different areas in different files, so pushes conflict less."""
+    code = " ".join((PLUGIN / "template" / "prompts" / "kind-code.md").read_text(encoding="utf-8").split())
+    assert "a test that fails without the fix (in its area's case file, if any)" in code
+    agents = " ".join((TESTS.parent / "AGENTS.md").read_text(encoding="utf-8").split())
+    assert "`tests/tt_project_runtime/<area>_cases.py`): new tests for an area go in its case file" in agents
+
+
 def test_worker_prompt_limits_search_scope():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Never search / or the home folder" in text

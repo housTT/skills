@@ -4,7 +4,7 @@
   is removed if all is committed (the branch stays); uncommitted work keeps it.
   Git-ignored files (tmp/, logs, outputs) are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
-- Reproduce first, then fix. Add or update a test that fails without the fix.
+- Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
   Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run, each
@@ -36,14 +36,14 @@
 - Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
   `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
   words, add `--land`.
-- It refuses uncommitted changes, rebases onto the target branch, runs the project's checks on
+- It refuses uncommitted changes, rebases onto the target, runs the project's checks on
   the final head, starts over if the branch moved, and pushes without force.
 - Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
   exit code and log tail. Report the sha or the failure. A push that "ended
-  without writing an outcome" was killed (e.g. a reboot): rerun `ttp push --detach` once.
+  without writing an outcome" was killed: rerun `ttp push --detach` once.
 - Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
   Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
   4: a check failed; hand off `failed` with the output. If instead it says the change keeps the
@@ -72,7 +72,7 @@
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
   briefly answer on the PR why not, until CI is green.
 - Description: what improved and why, one line of how, key numbers. Short, for humans.
-- Keep the description and your PR comments current.
+  Keep it and your PR comments current.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   skips it.
 - NEVER merge, unless the charter lists this repo for auto-merge.
