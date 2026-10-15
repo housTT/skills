@@ -4733,7 +4733,7 @@ def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, m
 
 def _billed_switch(p, account="acct-b | contracted"):
     """The login moved off the plan account to `account`, and the budget fingerprint recorded the
-    plan -> billed change for it (budgetkind.apply's event)."""
+    plan -> billed change for it (budgetkind.apply's event; it reflects the gate, so it is no evidence)."""
     from ttp import budget as bud, budgetkind
     bud.note_account(p.db, "claude", account)
     ts = time.time() - 300
@@ -4746,7 +4746,7 @@ def _billed_switch(p, account="acct-b | contracted"):
 
 def test_switch_to_usage_billed_account_is_a_neutral_line_not_needs_you(env, monkeypatch):
     """The reported case: plan readings of account A, claude deliberately switched to a usage-billed
-    account B, and the plan -> billed change recorded. The old readings are history: no 'another
+    account B, whose paid runs since report no plan windows (the lapse rule). The old readings are history: no 'another
     account' reason and no alert or 'needs you', a neutral 'billed by use since' line in the gate's
     reasons (status, web app, coordinator digest), and the dollar caps still gate it. An alert raised
     for the condition before clears itself."""
@@ -4760,7 +4760,10 @@ def test_switch_to_usage_billed_account_is_a_neutral_line_not_needs_you(env, mon
     # an alert raised for the condition by an earlier version (normal, 'needs you' then)
     p.db.post("out", "claude is logged in to another account than its plan readings", chat=None, kind="alert",
               severity="normal", ref="account-mismatch:claude")
-    since = _billed_switch(p)
+    bud.note_account(p.db, "claude", "acct-b | contracted")
+    since = now - 500
+    _run(p, "acct-b | contracted", since, now - 400, 0.3)
+    _run(p, "acct-b | contracted", now - 300, now - 200, 0.3)
     p.set_config("budget.daily_usd", 5)
     p.db.spend("claude", 9.0, "task:2", account="acct-b | contracted", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
@@ -4777,6 +4780,42 @@ def test_switch_to_usage_billed_account_is_a_neutral_line_not_needs_you(env, mon
     assert p.db.one("SELECT cleared FROM alerts WHERE key='account-mismatch:claude'")["cleared"]
     assert not [m for m in alerts.needs_you(p.db, time.time()) if "account" in (m.get("ref") or "")]
     assert line in p.db.kv("gates")["claude"]["reasons"]
+
+
+def test_recorded_billed_change_from_the_mismatch_gate_is_no_evidence(env, monkeypatch):
+    """Review #2298: budgetkind classifies the mismatch gate (dollar caps) as 'billed', so a switch
+    to an account of unknown kind records a plan -> billed change after the debounce. That change
+    reflects the gate itself: the warning stays a low status line until the account's own runs say
+    which it is."""
+    p = make(env)
+    from ttp import alerts, budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+    now = time.time()
+    _old_plan(p, now)
+    p.set_config("core_provider", "claude")
+    monkeypatch.setattr(Claude, "account", lambda self: "acct-a | plan")
+    bud.note_account(p.db, "claude", "acct-a | plan")
+    d = Daemon(p.base)
+    d.update_gates()                                       # the baseline
+    monkeypatch.setattr(Claude, "account", lambda self: "acct-b | plan")
+    bud.note_account(p.db, "claude", "acct-b | plan")
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    for _ in range(3):
+        d.update_gates()
+    ev = p.db.q("SELECT data FROM events WHERE kind=?", (budgetkind.KIND,))
+    assert ev and json.loads(ev[-1]["data"])["new"]["kind"] == "billed", "the circular event is recorded"
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db), time.time())
+    assert g.numbers.get("account_mismatch") and "billed_by_use_since" not in g.numbers, g.reasons
+    assert not any("billed by use since" in r for r in g.reasons), g.reasons
+    sent = p.db.q("SELECT * FROM messages WHERE ref='account-mismatch:claude'")
+    assert len(sent) == 1 and sent[0]["severity"] == "low", [dict(m) for m in sent]
+    assert not alerts.needs_you(p.db, time.time())
+    # real evidence: two paid runs of its own that reported no plan windows
+    _run(p, "acct-b | plan", now - 500, now - 400, 0.3)
+    _run(p, "acct-b | plan", now - 300, now - 200, 0.3)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db), time.time())
+    assert not g.numbers.get("account_mismatch") and g.numbers["billed_by_use_since"] == now - 500, g.reasons
 
 
 def test_usage_billed_known_from_its_own_runs_without_a_recorded_change(env):

@@ -783,22 +783,14 @@ def account_billed_since(db: DB, provider: str, last_reading: float) -> float | 
     """Since when the account `provider` is on now is known to be billed by use, or None while its
     kind is unknown or it is a plan account whose own readings are missing. Known billed: at least
     PLAN_LAPSE_RUNS of its own paid runs ended after the provider's last plan reading without one of
-    their own (billing.py's lapse rule, per account), or a plan -> billed budget change was recorded
-    for it (budgetkind) and it never reported a plan reading."""
-    from .budgetkind import KIND, account_hash
+    their own (billing.py's lapse rule, per account). A recorded plan -> billed budget change is no
+    evidence: budgetkind derives that kind from this very gate (its dollar-caps treatment)."""
     account = current_accounts(db).get(provider)
     if not account:
         return None
     runs = db.one("SELECT COUNT(*) n, MIN(started) first FROM runs WHERE provider=? AND account=? AND status='ok' "
                   "AND ended>? AND cost_usd>0", (provider, account, last_reading))
-    if runs["n"] >= PLAN_LAPSE_RUNS:
-        return float(runs["first"] or last_reading)
-    if db.one("SELECT 1 FROM snapshots WHERE provider=? AND account=? LIMIT 1", (provider, account)):
-        return None   # a plan account whose readings are missing: its next run reports them
-    row = db.one("SELECT MAX(ts) ts FROM events WHERE kind=? AND json_extract(data,'$.provider')=? "
-                 "AND json_extract(data,'$.new.account')=? AND json_extract(data,'$.new.kind')='billed' "
-                 "AND json_extract(data,'$.old.kind')='plan'", (KIND, provider, account_hash(account)))
-    return float(row["ts"]) if row and row["ts"] is not None else None
+    return float(runs["first"] or last_reading) if runs["n"] >= PLAN_LAPSE_RUNS else None
 
 
 def plan_lapsed(db: DB, provider: str, last_reading: float) -> bool:
