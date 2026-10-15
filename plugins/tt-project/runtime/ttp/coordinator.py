@@ -1664,7 +1664,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "untried host", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}")
+                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}", cfg)
                 if why:
                     _count_refusal(db, key, "false login", text)
                     raise ValueError(f"ask_user rejected: {why}")
@@ -1699,7 +1699,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
-                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"])
+                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg)
                 if why:
                     raise ValueError(f"notify rejected: {why}")
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
@@ -3544,21 +3544,41 @@ _RELOGIN_RE = re.compile(r"\b(?:log(?:ged)?\s*(?:back\s+)?in\s+again|log\s+back\
                          r"check\s+(?:the|its|which|their)\s+(?:login|account)|"
                          r"(?:log|sign)\s+in\s+(?:to|as|with)\s+(?:the|its|another|a|your)\s+(?:plan|subscription|"
                          r"\w+\s+account|account))\b|(?:^|\s)/login\b", re.I)
-_AGENT_WORDS = ("agent cli", "plan account", "plan readings", "plan windows", "subscription", "usage-billed",
-                "billed by use")
+_AGENT_WORDS = ("plan account", "plan readings", "plan windows", "plan reading", "plan window", "subscription",
+                "usage-billed", "billed by use", "metering")
+# Another credential or tool being logged in: gh, git hosting, ssh, Kerberos, a scheduler, a VPN or a
+# token or SSO that is not the provider's own. Such an ask is real and only a human can fix it.
+_OTHER_LOGIN_RE = re.compile(r"\b(?:gh|git|github|gitlab|ssh|kinit|kerberos|krb5|slurm|vpn|ldap|okta|"
+                             r"docker|huggingface|hf|aws|gcloud|azure|keychain|keyring)\b", re.I)
 
 
-def _false_login_ask(db: DB, text: str) -> str:
+def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
     """Why a text telling the user to log an agent CLI in again is not a real login problem, or "":
-    it names a provider (or its plan or account) and no provider has an open auth breaker or auth alert."""
+    the login is the agent CLI's own (a provider named, or 'agent CLI', just before or after the login
+    phrase), or it rests on plan or account metering, nothing names another credential or tool, and no
+    provider has an open auth breaker or auth alert. The test-only fake provider counts only when the
+    project's config uses it."""
     from . import alerts
     from .providers import all_providers
-    said = text.replace("’", "'")
-    if not _RELOGIN_RE.search(said):
+    said = text.replace("\u2019", "'")
+    hits = list(_RELOGIN_RE.finditer(said))
+    if not hits or _OTHER_LOGIN_RE.search(said):
         return ""
     names = [p.name for p in all_providers()]
+    cfg = cfg or {}
+    fake_used = cfg.get("core_provider") == "fake" or "fake" in (cfg.get("providers") or {})
+    agents = [n for n in names if n != "fake" or fake_used] + ["agent cli", "agent clis"]
+    who = "|".join(re.escape(n) for n in agents)
     low = said.lower()
-    if not any(re.search(rf"\b{re.escape(n)}\b", low) for n in names) and not any(w in low for w in _AGENT_WORDS):
+    own = re.compile(rf"\b(?:{who})\b(?:'s)?[^.!?;:]{{0,25}}$", re.I)
+    if any(not own.search(said[max(0, m.start() - 40):m.start()]) for m in re.finditer(r"\b(?:token|sso)\b", said, re.I)):
+        return ""                                        # a token or SSO that is not the provider's own
+    near = re.compile(rf"\b(?:{who})\b(?:'s)?[^.!?]{{0,40}}$", re.I)       # the provider, then the phrase
+    after = re.compile(rf"^[^.!?;:]{{0,25}}\b(?:{who})\b", re.I)            # the phrase, then the provider
+    agent_login = any(near.search(said[max(0, m.start() - 60):m.start()]) or after.search(said[m.end():])
+                      for m in hits)
+    metered = any(w in low for w in _AGENT_WORDS) and re.search(rf"\b(?:{who})\b", low)
+    if not agent_login and not metered:
         return ""
     if any(alerts.breaker(db, n) for n in names) or db.one(
             "SELECT 1 FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL LIMIT 1"):

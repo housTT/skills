@@ -4871,6 +4871,42 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
     assert problems == [] and ask is not None, problems
 
 
+@pytest.mark.parametrize("text", [
+    "gh on the device box is logged out, so Claude cannot push. Please run gh auth login again there.",
+    "The Slurm account token expired; please re-authenticate with kinit so the claude workers can submit jobs.",
+    "The build server's SSO session expired, so codex runs cannot fetch artifacts; please log in again there.",
+    "Claude cannot reach the device box: the host is logged out after the reboot. Please log in again on the console.",
+    "The fake data server is logged out; please log in again.",
+])
+def test_a_login_ask_about_another_credential_is_never_refused(env, text):
+    """Review #2338: the gate refuses only a login of the agent CLI itself resting on plan metering. An ask
+    about another credential or tool (gh, Slurm, kinit, SSO, a host) that only names a provider in
+    passing is a real ask, sent with no auth breaker open. The test-only fake provider is no name to
+    match unless the project's config uses it."""
+    from ttp import alerts, coordinator as coord
+    p = make(env)
+    p.set_config("core_provider", "claude")
+    assert not any(alerts.breaker(p.db, n) for n in ("claude", "codex", "cursor", "fake"))
+    assert coord._false_login_ask(p.db, text, p.config()) == ""
+    problems, ask = _ask(p, text, blocking="access", recommendation="log in once")
+    assert problems == [] and ask is not None, problems
+    problems = coord.apply(p, [{"type": "notify", "text": text, "severity": "normal"}])
+    assert problems == [], problems
+
+
+@pytest.mark.parametrize("text", [
+    "claude's OAuth token is stale; please log in again.",
+    "Please run /login in claude again.",
+    "The agent CLI is logged out on the box.",
+])
+def test_an_agent_cli_login_ask_without_metering_is_still_refused(env, text):
+    """The provider (or 'agent CLI') being the thing logged in, next to the login phrase, is the agent's
+    own login: with no auth breaker or alert it is refused like the metering asks."""
+    from ttp import coordinator as coord
+    p = make(env)
+    assert "no agent CLI here is logged out" in coord._false_login_ask(p.db, text, p.config())
+
+
 def test_recorded_billed_change_from_the_mismatch_gate_is_no_evidence(env, monkeypatch):
     """Review #2298: budgetkind classifies the mismatch gate (dollar caps) as 'billed', so a switch
     to an account of unknown kind records a plan -> billed change after the debounce. That change
