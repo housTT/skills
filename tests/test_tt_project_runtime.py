@@ -39581,7 +39581,7 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     assert feature_blocks(text, {"x", "y"}) == "a\nb\nc\n"
 
 
-def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small(env, monkeypatch):
+def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small(env, monkeypatch, tmp_path):
     import inspect, json as _json, re as _re
     from ttp import machines, prompts
     from ttp.prompts import feature_blocks, worker_features, worker_system
@@ -39599,7 +39599,10 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
-        assert len(system) <= 16_000, len(system)
+        # The prompt names charter and memory files under the temp folder: measure it with a fixed
+        # 64-char stand-in so the size does not depend on the temp path's length.
+        size = len(system.replace(str(tmp_path), "T" * 64))
+        assert size <= 16_000, size
     # Every fence names a feature worker_features can turn on, and each opens and closes once.
     known = set(_re.findall(r'on\.add\("(\w+)"\)', inspect.getsource(worker_features))) | {"harness"}
     opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
