@@ -21893,11 +21893,16 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     """A large charter and memory still give a worker prompt (system plus per-task rules, not the
     spec) of at most 28k chars for a code task and 24k for a question, every restriction verbatim.
     The prompt names the test's temp folder several times; it is measured with a fixed 64-char stand-in
-    for it (a typical pytest temp path), so the size does not depend on the host, user or run number."""
-    from ttp import machines
+    for it (a typical pytest temp path), so the size does not depend on the host, user or run number.
+    The charter and memory digest's headers name it too and count toward the digest's budget: they get
+    the stand-in as well, so how many memory entries fit does not depend on the temp path's length."""
+    from ttp import machines, prompts
     from ttp.prompts import charter_restrictions, worker_prompt
     p = make(env)
     monkeypatch.setattr(machines, "load", lambda: {})
+    heads = prompts._worker_heads
+    monkeypatch.setattr(prompts, "_worker_heads",
+                        lambda *a: tuple(h.replace(str(tmp_path), "T" * 64) for h in heads(*a)))
     charter = _BIG_CHARTER + "".join(f"- Resource {i}: a shared store for run outputs. " + "r" * 200 + "\n"
                                      for i in range(20))
     p.charter_path.write_text(charter)
