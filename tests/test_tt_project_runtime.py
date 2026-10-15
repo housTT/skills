@@ -38570,7 +38570,8 @@ def test_detached_ttp_checks_write_their_exit_code_when_another_worker_pkills_th
                 pass
 
 
-def test_the_detached_checks_probe_wakes_the_task_when_they_were_killed_outright(env, tmp_path, monkeypatch, capsys):
+def test_the_detached_checks_probe_wakes_the_task_when_they_were_killed_outright(env, tmp_path, monkeypatch, capsys,
+                                                                               reap_tmp_processes):
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     started = tmp_path / "started"
     pid = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
@@ -38587,6 +38588,7 @@ def test_the_detached_checks_probe_wakes_the_task_when_they_were_killed_outright
             os.killpg(pid, signal.SIGKILL)
         except OSError:
             pass
+        reap_tmp_processes(tmp_path)   # the check, a session of its own, outlives its killed supervisor
 
 
 def test_detached_ttp_checks_finish_record_the_pass_and_a_rerun_stops_the_earlier_one(env, tmp_path, monkeypatch, capsys):
@@ -38717,7 +38719,7 @@ def test_relaunched_checks_keep_full(env, tmp_path, monkeypatch):
     assert cli._read_checks_pid(run_dir)["full"] is True
 
 
-def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkeypatch, capsys):
+def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkeypatch, capsys, reap_tmp_processes):
     from ttp import cli, detach, push
     from ttp.runner import proc_start
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -38745,6 +38747,7 @@ def test_queued_checks_death_is_not_hidden_by_a_reused_pid(env, tmp_path, monkey
                 os.killpg(info["pid"], signal.SIGKILL)
             except OSError:
                 pass
+        reap_tmp_processes(tmp_path)   # the check, a session of its own, outlives its killed supervisor
 
 
 _CAP_HOLDER = ("import sys, time; sys.path.insert(0, sys.argv[1]); from ttp import checkcap; "
