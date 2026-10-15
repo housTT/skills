@@ -453,7 +453,7 @@ def _git_session(tmp_path_factory):
         [str(f) for f in (xdg / "git" / "config", home / ".gitconfig") if f.is_file()]
     config.write_text("".join(f"[include]\n\tpath = {f}\n" for f in own)
                       + "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n")
-    return {"objects": objects / "objects", "repo": repo, "config": config}
+    return {"objects": objects / "objects", "repo": repo, "config": config, "base": base}
 
 
 @pytest.fixture()
@@ -539,7 +539,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
     real_agents = _no_real_providers(tmp_path, monkeypatch)
-    yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents}
+    # make() clones a bootstrapped project unless the test first patches what bootstrap uses.
+    yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents,
+           "_make": (_git_session, monkeypatch, len(getattr(monkeypatch, "_setattr", ())))}
     sys.path.remove(str(RUNTIME))
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
 
@@ -561,12 +563,256 @@ def host_tz(monkeypatch):
     time.tzset()
 
 
+MAKE_BRIEF = "Keep the README friendly."
+
+
 def make(env, name="demo"):
-    from ttp.cli import bootstrap
     from ttp.project import register
-    p = bootstrap(env["repo"], name, "Keep the README friendly.", "fake")
+    p = _clone_project(env, name)
     register(name, {"host": "testhost", "dir": str(p.root)})
     return p
+
+
+# make() bootstraps each project once per test process and clones it after that: a bootstrap is about
+# 15 git processes and 3 MB of copies, and most tests start with one. The clone gets the project's own
+# root, creation time and id, the git history a bootstrap at that root writes (commits rewritten in
+# process), and a database filled anew at the current time. test_make_clone_matches_a_real_bootstrap
+# compares the two.
+
+def _bootstrap_patched(mp, since: int) -> bool:
+    """Whether the test patched anything bootstrap's outcome depends on (the clock, processes, files,
+    the runtime) before calling make(): it then bootstraps for real."""
+    entries = getattr(mp, "_setattr", None)
+    if entries is None:
+        return True
+    for obj, _name, _old in entries[since:]:
+        mod = obj.__name__ if isinstance(obj, types.ModuleType) else getattr(obj, "__module__", None) or ""
+        if mod in ("time", "subprocess", "os", "shutil", "secrets", "json", "sqlite3", "datetime") \
+                or mod == "ttp" or mod.startswith("ttp."):
+            return True
+    return False
+
+
+def _make_key(name: str) -> tuple:
+    """Everything outside the test folder that a bootstrap's result depends on."""
+    from ttp import cli, timefmt
+    from ttp.project import load_secrets
+    return (name, cli.__version__, cli.PLUGIN_ROOT, cli.RUNTIME, cli.source_commit(), time.strftime("%Y-%m-%d"),
+            os.environ.get("TZ"), cli.hostname(), timefmt.in_ssh_login(), timefmt.detect_local(),
+            bool((load_secrets().get("slack") or {}).get("bot_token")),
+            tuple(sorted((k, v) for k, v in os.environ.items() if k.startswith("GIT_"))))
+
+
+def _git_object(git: pathlib.Path, sha: str) -> bytes | None:
+    import zlib
+    try:
+        raw = zlib.decompress((git / "objects" / sha[:2] / sha[2:]).read_bytes())
+    except OSError:
+        return None
+    return raw[raw.index(b"\0") + 1:]
+
+
+def _put_git_object(git: pathlib.Path, kind: bytes, body: bytes) -> str:
+    import hashlib
+    import zlib
+    raw = kind + b" %d\0" % len(body) + body
+    sha = hashlib.sha1(raw).hexdigest()
+    path = git / "objects" / sha[:2] / sha[2:]
+    if not path.exists():
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(zlib.compress(raw))
+        path.chmod(0o444)
+    return sha
+
+
+def _index_layout(data: bytes) -> tuple[list, int] | None:
+    """(path, offset) of each entry of a version 2 index, and the offset of its cache-tree root id;
+    None for any other layout (the clone then bootstraps for real)."""
+    import struct
+    if data[:4] != b"DIRC" or struct.unpack(">I", data[4:8])[0] != 2 or not any(data[-20:]):
+        return None
+    count, off, entries = struct.unpack(">I", data[8:12])[0], 12, []
+    for _ in range(count):
+        end = data.index(b"\0", off + 62)
+        entries.append((data[off + 62:end].decode(), off))
+        off += (62 + end - (off + 62) + 8) // 8 * 8
+    root = None
+    while off < len(data) - 20:
+        sig, size = data[off:off + 4], struct.unpack(">I", data[off + 4:off + 8])[0]
+        if sig != b"TREE":
+            return None
+        nl = data.index(b"\n", off + 8)
+        if not data[off + 9:nl].startswith(b"-"):   # "" NUL "<entries> <subtrees>\n" <root id>
+            root = nl + 1
+        off += 8 + size
+    return entries, root
+
+
+def _project_snapshot(gs: dict, name: str) -> dict | None:
+    """The bootstrapped project make() clones for `name`, made on first use; None when its git layout
+    is one the clone cannot rewrite."""
+    key = _make_key(name)
+    cache = gs.setdefault("make", {})
+    if key in cache:
+        return cache[key]
+    from ttp import cli
+    root = gs["base"] / f"make{len(cache)}"
+    shutil.copytree(gs["repo"], root, symlinks=True)
+    p = cli.bootstrap(root, name, MAKE_BRIEF, "fake")
+    welcome = p.db.one("SELECT text FROM messages")["text"]
+    p.db.close()
+    for f in p.state.glob("project.db*"):
+        f.unlink()
+    git = p.harness / ".git"
+    snap = None
+    head = (git / "refs" / "heads" / "main").read_text().strip() if (git / "refs" / "heads" / "main").is_file() else ""
+    chain, sha = [], head
+    for _ in range(2):   # the charter-and-config commit, then the schedules commit
+        body = _git_object(git, sha) if sha else None
+        if not body:
+            break
+        tree, parent = re.match(rb"tree ([0-9a-f]{40})\nparent ([0-9a-f]{40})\n", body).groups()
+        chain.insert(0, (sha, body, tree.decode(), _git_object(git, tree.decode())))
+        sha = parent.decode()
+    blob = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD:project.json"],
+                          capture_output=True, text=True).stdout.strip()
+    index = (git / "index").read_bytes()
+    layout = _index_layout(index)
+    if (len(chain) == 2 and all(t for *_, t in chain) and blob and layout and layout[1]
+            and (git / "HEAD").read_text() == "ref: refs/heads/main\n"
+            and index[layout[1]:layout[1] + 20].hex() == chain[1][2]
+            and all(bytes.fromhex(blob) in t for *_, t in chain)):
+        snap = {"base": p.base, "first": sha, "chain": chain, "blob": blob, "index": index,
+                "entries": layout[0], "root": layout[1], "welcome": welcome}
+    cache[key] = snap
+    return snap
+
+
+def _clone_file(src, dst):
+    """shutil.copy2 that shares the data blocks where the filesystem can (copy_file_range)."""
+    try:
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            left = os.fstat(fi.fileno()).st_size
+            while left > 0:
+                n = os.copy_file_range(fi.fileno(), fo.fileno(), left)
+                if not n:
+                    break
+                left -= n
+    except (AttributeError, OSError):
+        shutil.copyfile(src, dst)
+    shutil.copystat(src, dst)
+    return dst
+
+
+def _rewrite_history(harness: pathlib.Path, snap: dict) -> None:
+    """Gives the clone's harness the commits a bootstrap at its root writes: the charter-and-config
+    and schedules commits again, with this project.json and the current time, and an index to match."""
+    import hashlib
+    import struct
+    git = harness / ".git"
+    now = b"> %d " % int(time.time())
+    blob = _put_git_object(git, b"blob", (harness / "project.json").read_bytes())
+    old_raw, new_raw = bytes.fromhex(snap["blob"]), bytes.fromhex(blob)
+    parent, renamed, stale = snap["first"], {}, [snap["blob"]]
+    for sha, body, tree, tree_body in snap["chain"]:
+        new_tree = _put_git_object(git, b"tree", tree_body.replace(old_raw, new_raw))
+        body = body.replace(b"tree " + tree.encode(), b"tree " + new_tree.encode(), 1)
+        body = re.sub(rb"^parent [0-9a-f]{40}", b"parent " + parent.encode(), body, count=1, flags=re.M)
+        body = re.sub(rb"> \d+ (?=[+-]\d{4}\n)", now, body)
+        renamed[sha] = parent = _put_git_object(git, b"commit", body)
+        stale += [sha, tree]
+    for sha in stale:
+        (git / "objects" / sha[:2] / sha[2:]).unlink(missing_ok=True)
+    (git / "refs" / "heads" / "main").write_text(parent + "\n")
+    for log in (git / "logs" / "HEAD", git / "logs" / "refs" / "heads" / "main"):
+        if log.is_file():
+            log.write_text(re.sub("[0-9a-f]{40}", lambda m: renamed.get(m[0], m[0]), log.read_text()))
+    index = bytearray(snap["index"][:-20])
+    for path, off in snap["entries"]:
+        st = os.lstat(harness / path)
+        struct.pack_into(">6I", index, off, int(st.st_ctime) & 0xffffffff, st.st_ctime_ns % 10**9,
+                         int(st.st_mtime) & 0xffffffff, st.st_mtime_ns % 10**9, st.st_dev & 0xffffffff,
+                         st.st_ino & 0xffffffff)
+        struct.pack_into(">3I", index, off + 28, st.st_uid, st.st_gid, st.st_size & 0xffffffff)
+        if path == "project.json":
+            index[off + 40:off + 60] = new_raw
+    index[snap["root"]:snap["root"] + 20] = bytes.fromhex(new_tree)
+    tmp = git / "index.clone"
+    tmp.write_bytes(bytes(index) + hashlib.sha1(index).digest())
+    os.replace(tmp, git / "index")
+
+
+def _clone_project(env, name):
+    from ttp import cli
+    from ttp import schedule as sched
+    from ttp import timefmt
+    from ttp.project import Project, write_json
+    gs, mp, since = env.get("_make") or (None, None, 0)
+    if gs is None or Project(env["repo"]).exists() or _bootstrap_patched(mp, since):
+        return cli.bootstrap(env["repo"], name, MAKE_BRIEF, "fake")
+    snap = _project_snapshot(gs, name)
+    if not snap:
+        return cli.bootstrap(env["repo"], name, MAKE_BRIEF, "fake")
+    p = Project(env["repo"])
+    shutil.copytree(snap["base"], p.base, symlinks=True, copy_function=_clone_file)
+    cfg = json.loads(p.config_path.read_text())
+    cfg.update(root=str(p.root), created=time.time(), id=secrets.token_hex(4))
+    write_json(p.config_path, cfg)
+    _rewrite_history(p.harness, snap)
+    # The database as bootstrap fills it, at this time.
+    db = p.db
+    for s in json.loads((cli.PLUGIN_ROOT / "template" / "recurring.json").read_text()):
+        sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
+                     s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), cfg[timefmt.KEY])
+    db.set_kv(sched._APPLIED, sched._sha(sched.file_path(p).read_text()))
+    db.set_meta("name", name)
+    db.post("in", snap["welcome"], chat=None, channel="system", kind="user", provenance="system")
+    return p
+
+
+def _project_picture(p) -> dict:
+    """What a project holds, minus what differs per bootstrap (its root, creation time, id and times)."""
+    def git(*args):
+        out = subprocess.run(["git", "-C", str(p.harness), *args], capture_output=True, text=True)
+        return out.returncode, out.stdout.replace(blob, "<config>"), out.stderr
+    blob = subprocess.run(["git", "-C", str(p.harness), "hash-object", "project.json"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    files = {}
+    for f in sorted(p.base.rglob("*")):
+        rel = str(f.relative_to(p.base))
+        if rel.startswith(("harness/.git/objects/", "harness/.git/logs/", "harness/.git/refs/heads/",
+                           "state/project.db")) or rel in ("harness/project.json", "harness/.git/index"):
+            continue   # object and commit ids differ by the commits' times; compared through git below
+        else:
+            files[rel] = "dir" if f.is_dir() else (f.read_bytes(), stat.S_IMODE(f.lstat().st_mode))
+    cfg = json.loads(p.config_path.read_text())
+    assert cfg.pop("root") == str(p.root)
+    cfg.pop("created"), cfg.pop("id")
+    def when(v):
+        return "<time>" if isinstance(v, (float, str)) and re.fullmatch(r"1[0-9]{9}(\.[0-9]*)?", str(v)) else v
+    tables = {r["name"]: [{k: when(v) for k, v in row.items()} for row in p.db.q(f"SELECT * FROM [{r['name']}]")]
+              for r in p.db.q("SELECT name FROM sqlite_master WHERE type='table'")}
+    return {"files": files, "config": cfg, "db": tables,
+            "log": git("log", "--graph", "--format=%s|%an|%ae|%cn|%ce", "--all", "--topo-order"),
+            "reflogs": [len(git("reflog", "show", ref)[1].splitlines()) for ref in ("HEAD", "main", "upstream")],
+            "tree": git("ls-tree", "-r", "HEAD"), "head_config": git("rev-parse", "HEAD:project.json"),
+            "refs": git("for-each-ref", "--format=%(refname)"), "status": git("status", "--porcelain"),
+            "staged": git("diff", "--cached", "--stat"), "fsck": git("fsck", "--strict", "--unreachable"),
+            "local": git("config", "--local", "-l")}
+
+
+def test_make_clone_matches_a_real_bootstrap(env):
+    from ttp.cli import bootstrap
+    p = make(env)
+    gs = env["_make"][0]
+    assert any(gs["make"].values()), "make() bootstrapped for real instead of cloning"
+    real = env["tmp"] / "real"
+    shutil.copytree(env["repo"], real, symlinks=True, ignore=shutil.ignore_patterns("tt-project"))
+    q = bootstrap(real, "demo", MAKE_BRIEF, "fake")
+    got, want = _project_picture(p), _project_picture(q)
+    assert got["head_config"] == (0, "<config>\n", "")
+    for k in want:
+        assert got[k] == want[k], k
 
 
 def test_project_folder_is_invisible_to_the_enclosing_repo(env):
