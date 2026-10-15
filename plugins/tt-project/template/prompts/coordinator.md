@@ -153,10 +153,8 @@ Each field's rules are in the section named; the table only lists them.
 - Re-adding, scoping down or finishing a failed, cancelled or exhausted task: set `continues` to
   its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
   a replacement without `continues` leaves its dependents blocked. On a done task it adds a
-  follow-up (no dependents move; code starts from the base branch). The daemon queues a
-  progressing hop's sole `continue:` follow-up only when its `task_done` says "Continue hop #N
-  queued by the daemon"; one marked "NOT queued by the daemon" is yours to add (with `continues`)
-  or drop. A `continue_cap` event refuses more hops:
+  follow-up (no dependents move; code starts from the base branch). A `continue:` follow-up
+  "NOT queued by the daemon" is yours to add. A `continue_cap` event refuses more hops:
   re-plan, or give a `reason` naming what changed.
 - A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
   `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
