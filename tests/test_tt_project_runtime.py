@@ -539,9 +539,22 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
     real_agents = _no_real_providers(tmp_path, monkeypatch)
-    # make() clones a bootstrapped project unless the test first patches what bootstrap uses.
+    # make() clones a bootstrapped project unless the test first patches what bootstrap uses: through
+    # any MonkeyPatch (this one, monkeypatch.context(), pytest.MonkeyPatch()), or by replacing a
+    # function of a standard module bootstrap calls (unittest.mock.patch("time.time")).
+    patched = []
+    real_setattr, real_delattr = pytest.MonkeyPatch.setattr, pytest.MonkeyPatch.delattr
+
+    def recording(real):
+        def patch(self, *args, **kwargs):
+            real(self, *args, **kwargs)
+            patched.extend(self._setattr[-1:])
+        return patch
+    monkeypatch.setattr(pytest.MonkeyPatch, "setattr", recording(real_setattr))
+    monkeypatch.setattr(pytest.MonkeyPatch, "delattr", recording(real_delattr))
+    stdlib = {m: dict(vars(m)) for m in _MAKE_STDLIB}
     yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents,
-           "_make": (_git_session, monkeypatch, len(getattr(monkeypatch, "_setattr", ())))}
+           "_make": (_git_session, patched, stdlib)}
     sys.path.remove(str(RUNTIME))
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
 
@@ -579,18 +592,18 @@ def make(env, name="demo"):
 # process), and a database filled anew at the current time. test_make_clone_matches_a_real_bootstrap
 # compares the two.
 
-def _bootstrap_patched(mp, since: int) -> bool:
+_MAKE_STDLIB = (time, subprocess, os, shutil, secrets, json, sqlite3)
+
+
+def _bootstrap_patched(patched: list, stdlib: dict) -> bool:
     """Whether the test patched anything bootstrap's outcome depends on (the clock, processes, files,
     the runtime) before calling make(): it then bootstraps for real."""
-    entries = getattr(mp, "_setattr", None)
-    if entries is None:
-        return True
-    for obj, _name, _old in entries[since:]:
+    for obj, _name, _old in patched:
         mod = obj.__name__ if isinstance(obj, types.ModuleType) else getattr(obj, "__module__", None) or ""
         if mod in ("time", "subprocess", "os", "shutil", "secrets", "json", "sqlite3", "datetime") \
                 or mod == "ttp" or mod.startswith("ttp."):
             return True
-    return False
+    return any(vars(m).get(k) is not v for m, attrs in stdlib.items() for k, v in attrs.items())
 
 
 def _make_key(name: str) -> tuple:
@@ -747,8 +760,8 @@ def _clone_project(env, name):
     from ttp import schedule as sched
     from ttp import timefmt
     from ttp.project import Project, write_json
-    gs, mp, since = env.get("_make") or (None, None, 0)
-    if gs is None or Project(env["repo"]).exists() or _bootstrap_patched(mp, since):
+    gs, patched, stdlib = env.get("_make") or (None, [], {})
+    if gs is None or Project(env["repo"]).exists() or _bootstrap_patched(patched, stdlib):
         return cli.bootstrap(env["repo"], name, MAKE_BRIEF, "fake")
     snap = _project_snapshot(gs, name)
     if not snap:
@@ -813,6 +826,21 @@ def test_make_clone_matches_a_real_bootstrap(env):
     assert got["head_config"] == (0, "<config>\n", "")
     for k in want:
         assert got[k] == want[k], k
+
+
+def test_make_bootstraps_for_real_after_any_patch_of_what_bootstrap_uses(env):
+    import unittest.mock
+    from ttp import cli
+    def patched():
+        return _bootstrap_patched(*env["_make"][1:])
+    assert not patched()
+    with unittest.mock.patch("time.time", return_value=1.0):
+        assert patched()
+    assert not patched()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cli, "HARNESS_ROOT_FILES", ())
+        assert patched()
+        assert not (make(env).harness / "pytest.ini").exists()
 
 
 def test_project_folder_is_invisible_to_the_enclosing_repo(env):
