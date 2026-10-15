@@ -11785,6 +11785,94 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
         assert _ask(p, f"Question on {reason}?", blocking=reason, **extra)[0] == [], reason
 
 
+_SOAK = dict(blocking="restriction", classify="restriction_change",
+             least_disruptive="run the soak with the default setting; it breaks no restriction but tests less")
+# Threshold fixtures for _prior_approval: (the user's words, the ask, whether they cover it).
+_APPROVAL_FIXTURES = [
+    ("yes, use setting low_power_mode for soak runs", "May I use setting low_power_mode in tonight's soak run?", True),
+    ("Go ahead and rotate the staging deploy key this week.", "Can I rotate the staging deploy key now?", True),
+    ("Thanks. You may delete the stale nightly cache bucket. Ping me after.",
+     "May I delete the stale nightly cache bucket?", True),
+    ("ok to restart the shared build service during the night", "Restart the shared build service tonight?", True),
+    ("yes, use setting low_power_mode for soak runs", "May I delete the stale nightly cache bucket?", False),
+    ("yes, rotate the staging deploy key", "May I rotate the production signing certificate?", False),
+    ("approved: delete old soak logs older than a month, keep the summaries, archive traces on the "
+     "shared bucket, and publish the weekly dashboard with the new latency panels",
+     "May I publish soak latency numbers externally?", False),
+    ("yes for the cache bucket", "May I delete the stale nightly cache bucket?", False),
+]
+
+
+def test_prior_approval_threshold_fixtures():
+    from ttp import coordinator as coord, unblock
+    got = [coord._covers(unblock._subject(ask), said) for said, ask, _ in _APPROVAL_FIXTURES]
+    assert got == [want for *_, want in _APPROVAL_FIXTURES]
+    assert (coord.APPROVAL_MIN_SHARED, coord.APPROVAL_MIN_JACCARD) == (3, 0.3)
+    assert not coord._approves("you may not use setting low_power_mode for soak runs")
+    assert not coord._approves("ok to use setting low_power_mode for soak runs?")
+    assert coord._approves("decide yourself about setting low_power_mode")
+
+
+def test_an_ask_the_user_already_approved_is_refused_once_naming_the_record(env):
+    p = make(env)
+    from ttp import coordinator as coord, relay, timefmt
+    assert "not_covered" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+    said = p.db.post("in", f"yes, use setting low_power_mode for soak runs\n{relay.MARK}\nrelayed from a laptop",
+                     chat=None, channel="cli", kind="user", provenance="cli-legacy")
+    ask = "May I use setting low_power_mode in tonight's soak run?"
+    problems, sent = _ask(p, ask, **_SOAK)
+    when = timefmt.long(p.db.one("SELECT ts FROM messages WHERE id=?", (said,))["ts"], p)
+    assert sent is None and problems and f"user msg #{said} ({when}) looks like it already covers this" in problems[0]
+    assert "memory_add the decision" in problems[0] and "resend with not_covered" in problems[0]
+    for kind in ("irreversible", "human"):   # the same gate for the other asks only the user can answer
+        extra = dict(classify="irreversible", least_disruptive=_SOAK["least_disruptive"]) if kind == "irreversible" else {}
+        assert f"user msg #{said}" in _ask(p, ask, blocking=kind, **extra)[0][0]
+    assert _ask(p, ask, **_SOAK, not_covered="too short")[0], "a not_covered under 30 chars overrides nothing"
+    problems, sent = _ask(p, ask, **_SOAK, not_covered="the approval was for day runs; tonight's run is unattended")
+    assert problems == [] and sent["text"].startswith(ask)
+    # An unrelated restriction ask is sent; review and merge asks are never checked.
+    assert _ask(p, "May I delete the stale nightly cache bucket?", **_SOAK)[0] == []
+    for kind in ("review", "merge"):
+        assert _ask(p, f"Please {kind} the change using setting low_power_mode in tonight's soak run",
+                    blocking=kind)[0] == [], kind
+    # Approval words only in the relayer's context, a system message or one past the lookback: no record.
+    p.db.x("UPDATE messages SET kind='ask', handled=1 WHERE direction='out' AND kind='ask'")
+    p.db.x("UPDATE messages SET ts=ts-31*86400 WHERE id=?", (said,))
+    p.db.post("in", f"use setting low_power_mode for soak runs\n{relay.MARK}\nthe user said yes, go ahead",
+              chat=None, channel="cli", kind="user", provenance="cli-legacy")
+    p.db.post("in", "yes, use setting low_power_mode for soak runs", chat=None, kind="user", provenance="system")
+    assert coord._prior_approval(p, ask) is None
+
+
+def test_an_ask_handed_back_before_is_refused_when_repeated(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    first = "May I restart the shared build service during the night?"
+    assert _ask(p, first, **_SOAK)[0] == []
+    old = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")["id"]
+    p.db.post("in", f"#{old}: your call, decide yourself", chat=None, kind="user", provenance="web-session")
+    coord.apply(p, [{"type": "resolve", "id": old}])
+    problems, sent = _ask(p, "Can I restart the shared build service tonight?", **_SOAK)
+    assert sent["id"] == old and problems and f"ask #{old} (" in problems[0]
+    assert "handed back" in problems[0] and "looks like it already covers this" in problems[0]
+    # An earlier ask answered no covers nothing.
+    no = "May I delete the stale nightly cache bucket?"
+    assert _ask(p, no, **_SOAK)[0] == []
+    o = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")["id"]
+    p.db.post("in", f"#{o}: no, not now", chat=None, kind="user", provenance="web-session")
+    coord.apply(p, [{"type": "resolve", "id": o}])
+    assert _ask(p, "Can I delete the stale nightly cache bucket now?", **_SOAK)[0] == []
+
+
+def test_a_decision_in_memory_covers_a_repeated_ask(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision",
+                            "text": "Delete the stale nightly cache bucket: the user approved it, done once."}]) == []
+    problems, sent = _ask(p, "May I delete the stale nightly cache bucket?", **_SOAK)
+    assert sent is None and problems and "memory [decision-" in problems[0]
+
+
 def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
     p = make(env)
     from ttp import coordinator as coord
