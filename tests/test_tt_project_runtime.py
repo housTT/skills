@@ -13329,7 +13329,7 @@ def test_harness_skill_documents_until_reboot_pauses_and_fsync():
 
 
 def test_operate_doc_names_ttp_skill():
-    assert "`ttp skill <name>`" in (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
+    assert "`ttp skill [<name>]`" in (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
 
 
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
