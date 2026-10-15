@@ -82,8 +82,10 @@ def _suite_line(wall: float, cpu: float, workers: int) -> str:
     return f"ttp-suite: wall {wall:.1f}s cpu {cpu:.1f}s workers {workers}"
 
 
+@pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
     config._ttp_started = time.monotonic()
+    _use_tmpfs(config)
 
 
 @pytest.hookimpl(trylast=True)
@@ -470,8 +472,7 @@ def _tmpfs_root(given_basetemp, environ, platform: str = sys.platform, path: str
     return real
 
 
-@pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory
-def pytest_configure(config):
+def _use_tmpfs(config) -> None:
     """Puts the session's base temp under the tmpfs _tmpfs_root picks, in this process only: an
     exported PYTEST_DEBUG_TEMPROOT would also move the temp root of a nested pytest that a test
     starts. pytest still numbers, retains and removes the folders as usual. config._ttp_tmpfs tells
