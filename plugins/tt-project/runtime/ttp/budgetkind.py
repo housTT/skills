@@ -70,7 +70,8 @@ def parts(db: DB, cfg: dict, provider: str, gate: Any, account: str) -> dict:
     """The fingerprint's parts for `provider`, from its freshly evaluated gate (before any pause)."""
     if gate.regime == "windows":
         kind = "plan"
-    elif any("plan readings" in r or "stopped reporting plan windows" in r for r in gate.reasons) or db.one(
+    elif any("plan readings" in r or "stopped reporting plan windows" in r or "billed by use since" in r
+                                         for r in gate.reasons) or db.one(
             "SELECT 1 FROM runs WHERE provider=? AND status='ok' LIMIT 1", (provider,)):
         kind = "billed"
     else:

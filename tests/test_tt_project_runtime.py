@@ -895,7 +895,7 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     _run(p, "acct-b | plan", now - 60)                  # the next run starts under another account
     assert bud.plan_windows(p.db, now) == [] and bud.windows_from_snapshots(p.db, now) == []
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
-    assert g.regime == "caps" and any("another account" in r for r in g.reasons), g.reasons
+    assert g.regime == "caps" and any("no plan readings of its own" in r for r in g.reasons), g.reasons
     assert g.numbers["spent_24h"] == 0 and g.level == "green", "the old plan's spend stays plan-billed"
     line = budget_line(p.db, now, "claude", g.as_dict())
     assert "86%" not in line and "avg" not in line and "this project" in line, line
@@ -4694,9 +4694,10 @@ def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
 
 
 def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, monkeypatch):
-    """A login on another account than the plan readings: the dollar caps hold it (the stricter side),
-    one user-facing alert says so, and once a run of the logged-in account reports its windows, the
-    plan windows gate it again with no manual step and the alert clears itself."""
+    """A login on another account than the plan readings, its kind unknown: the dollar caps hold it
+    (the stricter side), one self-clearing status line says so (never 'needs you'), and once a run of
+    the logged-in account reports its windows, the plan windows gate it again with no manual step and
+    the line clears itself."""
     p = make(env)
     from ttp import alerts, budget as bud
     from ttp.daemon import Daemon
@@ -4706,14 +4707,19 @@ def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, m
     monkeypatch.setattr(Claude, "account", lambda self: "acct-b | plan")
     bud.note_account(p.db, "claude", "acct-b | plan")     # the login switched
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
-    assert g.regime == "caps" and g.numbers.get("account_mismatch") and any("check the login" in r for r in g.reasons)
+    assert g.regime == "caps" and g.numbers.get("account_mismatch") and any(
+        "no plan readings of its own yet" in r for r in g.reasons), g.reasons
+    assert not any("check the login" in r or "another account" in r for r in g.reasons), g.reasons
     p.set_config("core_provider", "claude")
     d = Daemon(p.base)
     d.update_gates()
     d.update_gates()                                      # a repeat does not post again
     sent = p.db.q("SELECT * FROM messages WHERE ref='account-mismatch:claude'")
-    assert len(sent) == 1 and sent[0]["severity"] == "normal", [dict(m) for m in sent]
+    assert len(sent) == 1 and sent[0]["severity"] == "low", [dict(m) for m in sent]
+    assert "log in" not in sent[0]["text"] and "clears by itself" in sent[0]["text"]
     assert alerts.holds(p.db, "account-mismatch:claude", now, now)
+    assert not alerts.needs_you(p.db, time.time()), "a status line, never 'needs you'"
+    assert any(m["state"] == "status" and "no plan readings" in m["text"] for m in alerts.feed(p.db, time.time()))
     # the next run on the logged-in account reports its windows
     _run(p, "acct-b | plan", now - 120, now - 30, 0.5)
     _reading(p, time.time(), "acct-b | plan", "five_hour", 7.0, now + 3600)
@@ -4723,6 +4729,90 @@ def test_account_mismatch_then_match_keeps_caps_meanwhile_and_alerts_once(env, m
     assert not alerts.holds(p.db, "account-mismatch:claude", now, time.time())
     alerts.sweep(p.db)
     assert p.db.one("SELECT cleared FROM alerts WHERE key='account-mismatch:claude'")["cleared"]
+
+
+def _billed_switch(p, account="acct-b | contracted"):
+    """The login moved off the plan account to `account`, and the budget fingerprint recorded the
+    plan -> billed change for it (budgetkind.apply's event)."""
+    from ttp import budget as bud, budgetkind
+    bud.note_account(p.db, "claude", account)
+    ts = time.time() - 300
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+           (ts, "daemon", budgetkind.KIND, "normal", "claude budget changed", "handled",
+            json.dumps({"provider": "claude", "old": {"account": budgetkind.account_hash("acct-a | plan"), "kind": "plan"},
+                        "new": {"account": budgetkind.account_hash(account), "kind": "billed"}})))
+    return ts
+
+
+def test_switch_to_usage_billed_account_is_a_neutral_line_not_needs_you(env, monkeypatch):
+    """The reported case: plan readings of account A, claude deliberately switched to a usage-billed
+    account B, and the plan -> billed change recorded. The old readings are history: no 'another
+    account' reason and no alert or 'needs you', a neutral 'billed by use since' line in the gate's
+    reasons (status, web app, coordinator digest), and the dollar caps still gate it. An alert raised
+    for the condition before clears itself."""
+    p = make(env)
+    from ttp import alerts, budget as bud, timefmt
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+    now = time.time()
+    _old_plan(p, now)
+    monkeypatch.setattr(Claude, "account", lambda self: "acct-b | contracted")
+    # an alert raised for the condition by an earlier version (normal, 'needs you' then)
+    p.db.post("out", "claude is logged in to another account than its plan readings", chat=None, kind="alert",
+              severity="normal", ref="account-mismatch:claude")
+    since = _billed_switch(p)
+    p.set_config("budget.daily_usd", 5)
+    p.db.spend("claude", 9.0, "task:2", account="acct-b | contracted", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and not g.numbers.get("account_mismatch"), g.reasons
+    assert not any("another account" in r or "plan readings" in r or "login" in r for r in g.reasons), g.reasons
+    line = f"claude billed by use since {timefmt.short(since, p.config(), now)}"
+    assert line in g.reasons and g.numbers["billed_by_use_since"] == since, g.reasons
+    assert g.level == "red" and any("cap reached" in r for r in g.reasons), g.reasons   # the dollar cap still applies
+    p.set_config("core_provider", "claude")
+    Daemon(p.base).update_gates()
+    assert len(p.db.q("SELECT * FROM messages WHERE ref='account-mismatch:claude'")) == 1, "no new alert"
+    assert not alerts.holds(p.db, "account-mismatch:claude", now, time.time())
+    alerts.sweep(p.db)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='account-mismatch:claude'")["cleared"]
+    assert not [m for m in alerts.needs_you(p.db, time.time()) if "account" in (m.get("ref") or "")]
+    assert line in p.db.kv("gates")["claude"]["reasons"]
+
+
+def test_usage_billed_known_from_its_own_runs_without_a_recorded_change(env):
+    """The account's own paid runs that ended after the last plan reading without one of their own
+    show it is billed by use, before any budget change is recorded (billing.py's lapse rule)."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    _old_plan(p, now)
+    bud.note_account(p.db, "claude", "acct-b | contracted")
+    _run(p, "acct-b | contracted", now - 500, now - 400, 0.3)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.numbers.get("account_mismatch"), "one run is not yet evidence"
+    _run(p, "acct-b | contracted", now - 300, now - 200, 0.3)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert not g.numbers.get("account_mismatch") and g.numbers["billed_by_use_since"] == now - 500, g.reasons
+
+
+def test_plan_account_missing_its_readings_still_warns_as_status_line(env):
+    """A plan account (it reported plan windows before) whose own readings are missing still warns,
+    as a self-clearing status line, even with a plan -> billed change recorded for it."""
+    p = make(env)
+    from ttp import alerts, budget as bud
+    from ttp.daemon import Daemon
+    now = time.time()
+    _old_plan(p, now)
+    _reading(p, now - 10 * 86400, "acct-b | plan", "seven_day", 40.0, now - 9 * 86400)
+    _billed_switch(p, "acct-b | plan")
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.numbers.get("account_mismatch") and "billed_by_use_since" not in g.numbers, g.reasons
+    p.set_config("core_provider", "claude")
+    Daemon(p.base).update_gates()
+    sent = p.db.q("SELECT * FROM messages WHERE ref='account-mismatch:claude'")
+    assert len(sent) == 1 and sent[0]["severity"] == "low"
+    assert alerts.tracked("alert", "low", "account-mismatch:claude") and not alerts._top("low", "account-mismatch:claude")
+    assert not alerts.needs_you(p.db, time.time())
 
 
 def test_plan_billed_work_with_high_virtual_dollars_is_not_held(env):
@@ -4900,9 +4990,11 @@ def test_budget_text_treats_zero_dollar_caps_as_unset(env):
     # the login on another account than the readings: told, but without the caps it does not change
     _run(p, "acct-b | plan", now - 100, now - 50, 1.0)
     bud.note_account(p.db, "claude", "acct-b | plan")
-    assert any(r.endswith("check the login") for r in reasons()) and not any("dollar cap" in r for r in reasons())
+    assert any(r.endswith("has no plan readings of its own yet") for r in reasons()) \
+        and not any("dollar cap" in r for r in reasons()), reasons()
     p.set_config("budget.daily_usd", 100.0)
-    assert any("check the login. Until they match, its spend counts toward the dollar caps" in r for r in reasons())
+    assert any("has no plan readings of its own yet; its spend counts toward the dollar caps" in r
+               for r in reasons()), reasons()
 
 
 def test_one_listener_per_chat(env):

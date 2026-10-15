@@ -3328,16 +3328,16 @@ class Daemon:
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
-        # A login on another account than the plan readings: the dollar caps hold it meanwhile (the
-        # stricter side), and the user hears why once; the alert clears itself once they match.
+        # A login with no plan readings of its own yet, its kind unknown: the dollar caps hold it
+        # meanwhile (the stricter side). A self-clearing status line, never "needs you": its next run
+        # reports its windows, or shows it is billed by use (then budget.evaluate drops the flag).
         for prov, g in gates.items():
             if g.numbers.get("account_mismatch"):
                 self.alert(f"account-mismatch:{prov}",
-                           f"{prov} is logged in to another account than the one its plan readings come from, so "
-                           f"its spend counts toward the dollar caps (the stricter gate) until they match. Check "
-                           f"which account {prov} is logged in as: if it should be the plan account, log in to it "
-                           f"again; the next run then reports its plan windows and this clears by itself.",
-                           severity="normal")
+                           f"{prov}'s current login has no plan readings of its own yet, so its spend counts "
+                           f"toward the dollar caps (the stricter gate) for now. This clears by itself once a run "
+                           f"reports its plan windows or shows it is billed by use.",
+                           severity="low")
 
     def _budget_changed(self, prov: str, g: bud.Gate, account: str) -> None:
         """A change of the provider's account or budget kind (budgetkind.py) releases the holds the old

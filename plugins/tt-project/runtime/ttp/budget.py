@@ -191,13 +191,20 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     moved = set(last) - {w.provider for w in plan_windows(db, now)}
     lapsed = moved | {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
     plan = [w for w in windows if w.provider == provider and provider not in lapsed]
-    if provider in moved:
-        # The login and the readings disagree: billed by use is the safe side until they match (the
-        # next run of a plan account brings its own readings), but the user hears of it (daemon:
-        # alert account-mismatch:<provider>) instead of the caps taking over silently.
+    billed_since = account_billed_since(db, provider, last.get(provider, 0.0)) if provider in moved else None
+    if billed_since is not None:
+        # The current account is billed by use: the old account's plan readings are history, and
+        # the switch was made on purpose. A neutral line, never an alert.
+        g.numbers["billed_by_use_since"] = billed_since
+        g.reasons.append(f"{provider} billed by use since {timefmt.short(billed_since, cfg, now)}")
+    elif provider in moved:
+        # The login has no plan readings of its own yet (its kind is unknown, or a plan account's
+        # readings are missing): billed by use is the safe side until its next run reports them. A
+        # self-clearing status line (daemon: alert account-mismatch:<provider>), not an instruction.
         g.numbers["account_mismatch"] = True
-        g.reasons.append(f"{provider} is logged in to another account than its plan readings; check the login"
-                         + (". Until they match, its spend counts toward the dollar caps" if dollar_caps(b) else ""))
+        g.reasons.append(f"{provider}'s current login has no plan readings of its own yet"
+                         + ("; its spend counts toward the dollar caps until a run reports its plan windows"
+                            if dollar_caps(b) else ""))
     elif provider in lapsed and dollar_caps(b):
         # With no dollar cap set (0 = unset) nothing changes for the user: no reason to tell.
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
@@ -770,6 +777,28 @@ def plan_providers(db: DB, now: float | None = None) -> dict[str, float]:
     now = now or time.time()
     return {r["provider"]: float(r["ts"]) for r in
             db.q("SELECT provider, MAX(ts) ts FROM snapshots WHERE ts>=? GROUP BY provider", (now - WEEK,))}
+
+
+def account_billed_since(db: DB, provider: str, last_reading: float) -> float | None:
+    """Since when the account `provider` is on now is known to be billed by use, or None while its
+    kind is unknown or it is a plan account whose own readings are missing. Known billed: at least
+    PLAN_LAPSE_RUNS of its own paid runs ended after the provider's last plan reading without one of
+    their own (billing.py's lapse rule, per account), or a plan -> billed budget change was recorded
+    for it (budgetkind) and it never reported a plan reading."""
+    from .budgetkind import KIND, account_hash
+    account = current_accounts(db).get(provider)
+    if not account:
+        return None
+    runs = db.one("SELECT COUNT(*) n, MIN(started) first FROM runs WHERE provider=? AND account=? AND status='ok' "
+                  "AND ended>? AND cost_usd>0", (provider, account, last_reading))
+    if runs["n"] >= PLAN_LAPSE_RUNS:
+        return float(runs["first"] or last_reading)
+    if db.one("SELECT 1 FROM snapshots WHERE provider=? AND account=? LIMIT 1", (provider, account)):
+        return None   # a plan account whose readings are missing: its next run reports them
+    row = db.one("SELECT MAX(ts) ts FROM events WHERE kind=? AND json_extract(data,'$.provider')=? "
+                 "AND json_extract(data,'$.new.account')=? AND json_extract(data,'$.new.kind')='billed' "
+                 "AND json_extract(data,'$.old.kind')='plan'", (KIND, provider, account_hash(account)))
+    return float(row["ts"]) if row and row["ts"] is not None else None
 
 
 def plan_lapsed(db: DB, provider: str, last_reading: float) -> bool:

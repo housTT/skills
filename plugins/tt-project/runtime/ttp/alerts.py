@@ -75,15 +75,16 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
-    "account-mismatch": "{arg}'s login no longer disagrees with its plan readings: they match again, or the old readings aged out.",
+    "account-mismatch": "{arg}'s login has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
-# account-mismatch: the provider's login is another account than its plan readings (budget.evaluate).
-USER_BLOCKERS = ("network", "paused", "coord-budget", "account-mismatch")   # paused: a long project pause (projpause)
+USER_BLOCKERS = ("network", "paused", "coord-budget")   # paused: a long project pause (projpause)
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
-STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang")
+# account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
+# run reports them, or it turns out billed by use.
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch")
 
 
 def _urgent(severity: str | None) -> bool:
