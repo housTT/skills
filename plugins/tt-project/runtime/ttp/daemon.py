@@ -2821,8 +2821,9 @@ class Daemon:
                     self.cfg["budget"].get("max_reboot_losses", 3)):
                 # This run is already one of the losses: its wait counts once, not again as a wake.
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
-            elif rebooted and (not rebootwait.stays_asleep(result, (str(self.p.runs),))
-                               or any(not Path(j["rc"]).exists() for j in jobs)):
+            elif rebooted and result.get("survives_reboot") is not True and (
+                    not rebootwait.stays_asleep(result, (str(self.p.runs),))
+                    or any(not Path(j["rc"]).exists() for j in jobs)):
                 # What it waited on died with the host: its next run finds out now, not at the timer.
                 not_before = time.time()
                 extra["woke"] = "the host rebooted"

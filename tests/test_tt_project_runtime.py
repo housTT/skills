@@ -30548,7 +30548,7 @@ def test_waiting_tasks_from_before_the_boot_wake_on_the_first_tick(env, monkeypa
     assert p.db.task(remote)["not_before"] == later
 
 
-@pytest.mark.parametrize("probe", ["test -e /tmp/build.done", "exit 1"])
+@pytest.mark.parametrize("probe", ["test -e /tmp/build.done", "exit 1", "survives"])
 def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path, probe):
     """Only a wait on what the reboot may have ended (a /tmp marker) runs again now: a timer sleeps on."""
     p = make(env)
@@ -30560,7 +30560,12 @@ def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path, 
     run_dir.mkdir()
     (run_dir / "output.jsonl").write_text("")
     (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "build started",
-                                                     "retry_after_s": 3600, "retry_when": probe}))
+                                                     "retry_after_s": 3600, "retry_when": probe,
+                                                     **({"survives_reboot": True} if probe == "survives" else {})}))
+    if probe == "survives":   # its own job wrote no .rc, but the hand-off says the wait outlives a reboot
+        (run_dir / "detached.json").write_text(json.dumps([{"name": "b", "rc": str(run_dir / "b.rc"),
+                                                            "log": str(run_dir / "b.log")}]))
+        probe = "exit 1"
     (run_dir / "lease").touch()
     os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
     p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
