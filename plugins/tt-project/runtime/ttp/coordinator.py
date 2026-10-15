@@ -83,7 +83,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"}, "not_covered": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
-            "restriction_quote": {"type": "string"}, "requester": {"type": "string"}, "not_own_call": {"type": "string"},
+            "requester": {"type": "string"}, "not_own_call": {"type": "string"},
             "classify": {"type": "string", "enum": list(ASK_CLASSES)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
@@ -333,7 +333,6 @@ _DEFAULT_NOTE = "\n\nIf there is no answer within "
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
-_RESTRICTION_NOTE = "\n\nRestriction: "
 _REVERSIBLE_NOTE = "\n\nReversible alternative considered: "
 LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it and the rule it breaks
 OVER_MIN = 20   # chars: retiring a restriction outside a user turn names the end that passed
@@ -1691,17 +1690,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "false login", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                restriction_item = ""
-                if a["blocking"] == "restriction":
-                    restriction_item = _restriction_quoted(p, str(a.get("restriction_quote") or ""))
-                    if not restriction_item:
-                        _count_refusal(db, key, "no restriction item", text)
-                        raise ValueError(
-                            "ask_user rejected: no Restriction item: decide it yourself. A `restriction` ask needs "
-                            "`restriction_quote`: the exact text of one item in the charter's Restrictions "
-                            "sections (the whole item, or a part of it found nowhere else; case, spacing, smart "
-                            "quotes and end punctuation do not count). A quote matching no item, several items or "
-                            "text outside Restrictions is refused")
                 if (a["blocking"] == "human" and not _OTHERS_ASK_RE.search(f"{text} {a.get('recommendation') or ''}")
                         and not _requester_known(db, str(a.get("requester") or ""))):
                     _count_refusal(db, key, "no other human", text)
@@ -1730,7 +1718,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"ask_user rejected: {why}")
                 rec = (a.get("recommendation") or "").strip()
                 if a["blocking"] == "restriction":
-                    text += f"{_LEAST_NOTE}{least}{_RESTRICTION_NOTE}{restriction_item}"
+                    text += f"{_LEAST_NOTE}{least}"
                 elif a["blocking"] == "irreversible" and least:
                     text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
@@ -3937,29 +3925,6 @@ def _own_call_ask(a: dict, text: str) -> tuple[str, str] | None:
                     "low. If only the user can decide it, say why in `not_own_call` (at least "
                     f"{LEAST_DISRUPTIVE_MIN} characters)")
     return None
-
-
-def _restriction_quoted(p, quote: str) -> str:
-    """The one item of the charter's Restrictions sections `quote` names, matched as charter_update
-    matches its `quote` (_quote_hits), as one line; "" when it names none, several or a placeholder."""
-    from .prompts import charter_sections
-    if not quote.strip():
-        return ""
-    try:
-        charter = p.charter_path.read_text()
-    except OSError:
-        return ""
-    found: set[str] = set()
-    hits = 0
-    for head, body in charter_sections(charter):
-        if not " ".join(head[3:].split()).lower().startswith("restriction"):
-            continue
-        whole = "\n".join(body)
-        for s, e in _quote_hits(whole, quote):
-            hits += 1
-            found |= {_ws(whole[i:j]) for i, j, _ in _items(whole) if i < e and s < j}
-    item = found.pop() if hits == 1 and len(found) == 1 else ""
-    return "" if item.startswith("(") and item.endswith(")") else item
 
 
 _REQUESTER_ROLE_RE = re.compile(r"\b(?:team|person|people|colleague|reviewer|reporter|maintainer|owner|lead|"

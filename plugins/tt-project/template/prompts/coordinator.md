@@ -279,7 +279,7 @@ The project runs unattended. The user reads what you decided; they do not approv
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
   dollar caps or into the reserve), `review` / `merge` (only the user may give it), `irreversible`
   (an action outside the charter that cannot be undone), `restriction` (a restriction would be
-  violated: `restriction_quote` its charter item, `least_disruptive` the least-disruptive way; one
+  violated; `least_disruptive` names the least-disruptive way and the restriction it breaks; one
   that breaks none: take it) or `human` (another human asked for something ambiguous: say who or
   set `requester`); no other. Decide all else yourself, a rerun or later deadline too, unless
   `not_own_call` says why only the user can. `irreversible` and `restriction` asks also need

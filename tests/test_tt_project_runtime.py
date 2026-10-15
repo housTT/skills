@@ -9307,9 +9307,8 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
         problems, ask = _ask(p, f"Pause nightly job {k}?", blocking="irreversible", recommendation=say, **ir)
         assert problems and "you call reversible" in problems[0] and ask is None, say
     # Truly unclear (no yes), a step that cannot be undone, and review asks still go out.
-    _restricted(p)
     assert _ask(p, stale, blocking="restriction", recommendation="keep it until you confirm",
-                least_disruptive=least, restriction_quote=_RQ, **rc)[0] == []
+                least_disruptive=least, **rc)[0] == []
     assert _ask(p, "Publish the package?", blocking="irreversible", recommendation="yes, it is not reversible",
                 **ir)[0] == []
     # Any negation or hedge before "reversible" / "be undone", or "irreversible" anywhere, lets it go out.
@@ -9322,7 +9321,7 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
         for blocking in ("irreversible", "restriction"):
             cls = "irreversible" if blocking == "irreversible" else "restriction_change"
             assert _ask(p, f"Publish package {k} ({blocking})?", blocking=blocking, recommendation=say,
-                        least_disruptive=least, classify=cls, restriction_quote=_RQ)[0] == [], (blocking, say)
+                        least_disruptive=least, classify=cls)[0] == [], (blocking, say)
     assert _ask(p, "Publish the package? It isn\u2019t reversible.", blocking="irreversible",
                 recommendation="yes, publish", **ir)[0] == []
     assert _ask(p, "Grant the bot read access?", blocking="access", recommendation="yes, it can be undone")[0] == []
@@ -11754,11 +11753,11 @@ def test_say_to_an_older_remote_runtime_resends_without_the_client_id(env, monke
     assert sent == [["say", "--client-id=c-1", "demo", "--", "hi"], ["say", "demo", "--", "hi"]]
 
 
-_RQ = "Never restart a shared service without the user's yes."   # the Restrictions item _restricted adds
+_RQ = "Never restart a shared service without the user's yes."
 
 
 def _restricted(p, item=_RQ):
-    """Give the project's charter one Restrictions item, for restriction asks to quote."""
+    """Give the project's charter one Restrictions item."""
     text = p.charter_path.read_text()
     if f"- {item}" in text:
         return
@@ -11799,11 +11798,10 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
     least = {"least_disruptive": "a canary on one box breaks the no-shared-machines restriction"}
-    _restricted(p)
     for reason in coord.BLOCKING_REASONS:
         extra = {**least, "classify": "irreversible" if reason == "irreversible" else "restriction_change"} \
             if reason in ("restriction", "irreversible") else {}
-        extra.update({"restriction": {"restriction_quote": _RQ}, "human": {"requester": "a reviewer"}}.get(reason, {}))
+        extra.update({"human": {"requester": "a reviewer"}}.get(reason, {}))
         assert _ask(p, f"Question on {reason}?", blocking=reason, **extra)[0] == [], reason
 
 
@@ -11879,14 +11877,12 @@ def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
         assert "put it in least_disruptive with the restriction it breaks" in problems[0]
         assert ask is None, "a restriction ask without the way it considered reached the user"
     way = "restart it during the nightly lull; still breaks 'never restart a shared service'"
-    _restricted(p)
-    problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction", restriction_quote=_RQ,
+    problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction",
                          least_disruptive=way, recommendation="yes, at night", classify="restriction_change")
     assert problems == []
     assert f"Least-disruptive way considered: {way}" in ask["text"] and "My recommendation: yes" in ask["text"]
-    assert f"Restriction: {_RQ}" in ask["text"]
     problems, _ = _ask(p, "may i restart the shared service?", blocking="restriction", least_disruptive=way,
-                       classify="restriction_change", restriction_quote=_RQ)
+                       classify="restriction_change")
     assert problems and "already asked" in problems[0], "the note hid a repeated ask"
     # Asks for any other reason need no such field and carry no such line.
     problems, ask = _ask(p, "Grant repo access?", blocking="access", least_disruptive=way)
@@ -12110,8 +12106,7 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
                          classify="restriction_change", least_disruptive=vague)
     assert problems and "keeping the project running is yours" in problems[0] and ask is None
     way = "restart it at night; it still breaks the 'never restart a shared service' restriction"
-    _restricted(p)
-    assert _ask(p, "The serving runner crashed; restart it?", blocking="restriction", restriction_quote=_RQ,
+    assert _ask(p, "The serving runner crashed; restart it?", blocking="restriction",
                 classify="restriction_change", least_disruptive=way)[0] == []
     # Review, merge, funds and spend asks always pass; the user-only and other-person exemptions
     # hold only under access or human.
@@ -12130,7 +12125,7 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
 
 _QUO = "leave the config as it is for now; that breaks nothing and nobody waits on it"
 _COSTLY_QUO = "leave the config as it is; but then the nightly job keeps failing until it changes"
-_R = {"blocking": "restriction", "classify": "restriction_change", "restriction_quote": _RQ}
+_R = {"blocking": "restriction", "classify": "restriction_change"}
 _I = {"blocking": "irreversible", "classify": "irreversible"}
 # (fields, flag label, or None for no flag, or "sent" when only sending matters). Every case is sent:
 # these checks never refuse. Flags first, then exemptions, near misses and the asks a review found
@@ -12188,7 +12183,6 @@ _REVERSIBLE_CASES = [
 def test_the_ask_gate_flags_status_quo_and_reversible_step_asks_but_sends_them(env, fields, label):
     p = make(env)
     from ttp import coordinator as coord, unblock
-    _restricted(p)
     problems, ask = _ask(p, **({"requester": "a reviewer"} if fields["blocking"] == "human" else {}), **fields)
     assert problems == [] and ask is not None and ask["text"].startswith(fields["text"]), problems
     lines = unblock.lines(p.db)
@@ -12212,33 +12206,21 @@ _OWN_CALL_ASKS = ("Use an already-approved setting for the next build?",
 _WAY = "keep the current plan; it waits on the restriction quoted here and stalls the work"
 
 
-def test_a_restriction_ask_must_quote_one_restriction_item(env):
+def test_a_restriction_ask_about_a_memory_or_charter_restriction_is_sent(env):
+    # A restriction recorded with memory_add binds as a charter one does: an ask about either, including
+    # whether it is over, is sent (a gate that took only charter quotes refused the memory one outright).
     p = make(env)
-    from ttp import coordinator as coord, unblock
+    from ttp import coordinator as coord
     _restricted(p)
+    rule = "Never retire the old build cache until the platform team confirms the new one."
+    assert coord.apply(p, [{"type": "memory_add", "text": rule, "memory_kind": "restriction"}], turn=1) == []
     cls = {"blocking": "restriction", "classify": "restriction_change", "least_disruptive": _WAY}
-    outside = ("Keep the README friendly.",                    # the brief, not a Restriction
-               "Never push to main.",                          # in no section
-               "Pull requests: opening and updating draft PRs is always allowed")   # a Policy
-    for text in _OWN_CALL_ASKS:
-        for quote in ({}, {"restriction_quote": "  "}, *({"restriction_quote": q} for q in outside)):
-            problems, ask = _ask(p, text, **cls, **quote)
-            assert problems and "no Restriction item: decide it yourself" in problems[0] and ask is None, (text, quote)
-            assert "`restriction_quote`" in problems[0]
-    # An exact item, or one compared ignoring case, spacing, smart quotes and end punctuation, is sent
-    # with the charter's own item.
-    problems, ask = _ask(p, _OWN_CALL_ASKS[0], **cls, restriction_quote=_RQ)
-    assert problems == [] and ask["text"].endswith(f"Restriction: {_RQ}"), problems
-    problems, ask = _ask(p, "Restart the shared service tonight?", **cls,
-                         restriction_quote="never restart a  shared service without the user\u2019s yes")
-    assert problems == [] and ask["text"].endswith(f"Restriction: {_RQ}"), problems
-    # A quote naming several items names none.
-    _restricted(p, "Never restart a shared service on a release day.")
-    problems, ask = _ask(p, "Restart the shared service on Monday?", **cls, restriction_quote="Never restart a shared service")
-    assert problems and "no Restriction item" in problems[0] and "Monday" not in ask["text"]
-    assert coord._restriction_quoted(p, "(none stated yet)") == ""
-    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
-    assert "no restriction item 16" in line, line
+    for text in ("The platform team confirmed the new build cache; is the restriction on retiring the old one over?",
+                 "Restart the shared service tonight to apply the fix, or wait for your yes?"):
+        problems, ask = _ask(p, text, **cls)
+        assert problems == [] and ask is not None and ask["text"].startswith(text), (text, problems)
+        assert "Restriction: " not in ask["text"]
+    assert "restriction_quote" not in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
 
 
 def test_a_human_ask_needs_another_human(env):
@@ -12273,8 +12255,7 @@ def test_a_human_ask_needs_another_human(env):
 def test_a_rerun_or_a_later_deadline_is_the_coordinators_call(env):
     p = make(env)
     from ttp import coordinator as coord, unblock
-    _restricted(p)
-    by = {"restriction": {"classify": "restriction_change", "least_disruptive": _WAY, "restriction_quote": _RQ},
+    by = {"restriction": {"classify": "restriction_change", "least_disruptive": _WAY},
           "irreversible": {"classify": "irreversible", "least_disruptive": _WAY},
           "human": {"requester": "a reviewer"}}
     hint = "a rerun or a later deadline is your call: decide, memory_add the decision, notify low"
@@ -12341,9 +12322,8 @@ def test_an_irreversible_or_restriction_ask_must_be_classified(env):
     problems, ask = _ask(p, "Publish the package?", blocking="irreversible", classify="irreversible",
                          least_disruptive=least)
     assert problems == [] and f"Reversible alternative considered: {least}" in ask["text"]
-    _restricted(p)
     assert _ask(p, "Lift the freeze?", blocking="restriction", classify="restriction_change",
-                least_disruptive=least, restriction_quote=_RQ)[0] == []
+                least_disruptive=least)[0] == []
     # Other reasons need no class.
     for blocking in ("access", "funds", "spend", "review", "merge", "human"):
         assert _ask(p, f"Question on {blocking}?", blocking=blocking, requester="a reviewer")[0] == [], blocking
@@ -37560,9 +37540,7 @@ def test_an_ask_that_only_seeks_leave_to_open_a_draft_pr_is_rejected(env):
             ("Could you take a look at the update to draft PR acme/widgets#7?", "human")]
     for text, blocking in sent:
         p = make(env)
-        _restricted(p)
-        problems, ask = _ask(p, text, blocking=blocking, least_disruptive="x" * 80, restriction_quote=_RQ,
-                             requester="a reviewer")
+        problems, ask = _ask(p, text, blocking=blocking, least_disruptive="x" * 80, requester="a reviewer")
         assert not any("draft PRs need no permission" in x for x in problems) and ask is not None, (text, problems)
 
 
