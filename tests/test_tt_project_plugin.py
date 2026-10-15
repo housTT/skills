@@ -794,6 +794,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
         "@pytest.mark.parametrize('i', range(60))\n"
         "def test_ok(i, tmp_path):\n"
         "    pathlib.Path(os.environ['OUT'], f'ok-{i}').write_text(str(os.getpid()))\n"
+        "    pathlib.Path(os.environ['OUT'], f'nice-{i}').write_text(str(os.nice(0)))\n"
         "def test_fail(): assert 1 == 2, 'boom'\n"
         "def test_skip(): pytest.skip('not here')\n"
         "def test_warn(): warnings.warn('careful', UserWarning)\n"
@@ -807,6 +808,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
         out = tmp_path / f"out-{jobs}"
         out.mkdir()
         env = {**os.environ, "TTP_TEST_JOBS": str(jobs), "OUT": str(out)}
+        env.pop("CI", None)
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-W",
                             "default", str(tmp_path)], cwd=str(tmp_path), env=env, capture_output=True,
                            text=True, timeout=120)
@@ -820,9 +822,35 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     assert "SKIPPED [1] test_tt_project_sample.py:" in forked.stdout and "UserWarning: careful" in forked.stdout
     pids = {(out / f"ok-{i}").read_text() for i in range(60)}
     assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
+    # Off CI the workers run at a lower priority, and the run ends with its wall and CPU time.
+    nice = os.nice(0)
+    assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(19, nice + 10)}
+    assert re.search(r"^ttp-suite: wall \d+\.\ds cpu \d+\.\ds workers 3$", forked.stdout, re.M), forked.stdout
     # One process runs the same tests the same way, but for the test that ends its process.
     single, _ = run(1)
     assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
+
+
+def _test_conftest():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ttp_tests_conftest", pathlib.Path(__file__).with_name("conftest.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("cpus,env,jobs", [
+    (1, {}, 1), (2, {}, 1), (3, {}, 1), (6, {}, 3), (8, {}, 4), (14, {}, 4), (64, {}, 4),
+    (14, {"CI": "false"}, 4), (14, {"CI": ""}, 4),
+    (1, {"CI": "true"}, 1), (6, {"CI": "true"}, 6), (14, {"CI": "1"}, 8), (64, {"CI": "true"}, 8),
+])
+def test_the_test_runner_uses_half_the_cpus_up_to_4_off_ci_and_up_to_8_on_ci(cpus, env, jobs):
+    assert _test_conftest()._auto_jobs(cpus, env) == jobs
+
+
+def test_the_test_runner_summary_line_is_stable_and_greppable():
+    line = _test_conftest()._suite_line(312.44, 1840.16, 4)
+    assert line == "ttp-suite: wall 312.4s cpu 1840.2s workers 4"
 
 
 BOX_PROBE = PLUGIN / "template" / "bin" / "tt-box-clean-probe"

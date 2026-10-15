@@ -2,8 +2,9 @@
 
 Those files hold well over a thousand tests that mostly wait on subprocesses (git, the CLI, the
 runner), so one process spends most of its time idle. When a session collects at least
-MIN_ITEMS of them, the main process forks TTP_TEST_JOBS workers (default: up to 8, one per CPU)
-after collection. Each worker takes the next test from a shared queue and runs it with pytest's own
+MIN_ITEMS of them, the main process forks TTP_TEST_JOBS workers after collection. The default is
+half the CPUs, at most 4, so a laptop stays usable; on CI (the CI variable set) it is one per CPU, at
+most 8. Off CI the workers run at a lower priority (nice +10, where the system has it). Each worker takes the next test from a shared queue and runs it with pytest's own
 runtest protocol; the main process replays every report through pytest's hooks, so the terminal
 output, --durations, the summary and the exit status are those of an ordinary run. All other
 collected tests form one unit that a single worker runs in order, as before.
@@ -16,6 +17,10 @@ the session's own temp root (basetemp) is still alive: those are processes a tes
 reaped. The guard lists them and stops them first, so a failure leaves nothing behind. Only this
 session's basetemp counts, so concurrent sessions on the host never trip it. `reap_tmp_processes`
 gives a test the same reaping for its own tmp_path.
+
+Every run ends its summary with one line of wall time and CPU time (user + system, of the main
+process and every child it waited for: workers and the processes the tests started), e.g.
+`ttp-suite: wall 312.4s cpu 1840.2s workers 4`, so a slower or costlier suite shows in push logs.
 """
 
 from __future__ import annotations
@@ -36,7 +41,9 @@ from pathlib import Path
 import pytest
 
 MIN_ITEMS = 50
-MAX_AUTO_JOBS = 8
+MAX_AUTO_JOBS = 8      # on CI
+MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this
+WORKER_NICE = 10
 _SHARDED = "test_tt_project_"
 
 
@@ -56,7 +63,41 @@ def _jobs(config, items) -> int:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 1
-    return max(1, min(MAX_AUTO_JOBS, cpus))
+    return _auto_jobs(cpus, os.environ)
+
+
+def _on_ci(env) -> bool:
+    return env.get("CI", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _auto_jobs(cpus: int, env) -> int:
+    """The default worker count: one per CPU up to MAX_AUTO_JOBS on CI, else half the CPUs up to
+    MAX_LOCAL_JOBS, so a run on a laptop or a shared host leaves room for everything else."""
+    if _on_ci(env):
+        return max(1, min(MAX_AUTO_JOBS, cpus))
+    return max(1, min(MAX_LOCAL_JOBS, cpus // 2))
+
+
+def _suite_line(wall: float, cpu: float, workers: int) -> str:
+    return f"ttp-suite: wall {wall:.1f}s cpu {cpu:.1f}s workers {workers}"
+
+
+def pytest_configure(config):
+    config._ttp_started = time.monotonic()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_terminal_summary(terminalreporter, config):
+    started = getattr(config, "_ttp_started", None)
+    if started is None or os.environ.get("PYTEST_XDIST_WORKER"):
+        return
+    try:
+        import resource
+        cpu = sum(r.ru_utime + r.ru_stime for r in (resource.getrusage(resource.RUSAGE_SELF),
+                                                     resource.getrusage(resource.RUSAGE_CHILDREN)))
+    except ImportError:   # no resource module (Windows): this process's own CPU time only
+        cpu = time.process_time()
+    terminalreporter.write_line(_suite_line(time.monotonic() - started, cpu, getattr(config, "_ttp_workers", 1)))
 
 
 _STARTED = time.time()   # this session's start (reset at sessionstart): older processes are never its leaks
@@ -196,6 +237,7 @@ def pytest_runtestloop(session):
     jobs = min(_jobs(session.config, session.items), len(units))
     if jobs < 2 or len(units) * 4 > 60000:   # the queue must fit in a pipe's buffer
         return None
+    session.config._ttp_workers = jobs
     _run_forked(session, units, jobs)
     return True
 
@@ -289,6 +331,11 @@ def _run_forked(session, units, jobs: int) -> None:
                 os.close(r)
                 for other in workers.values():
                     os.close(other["fd"])
+                if not _on_ci(os.environ):
+                    try:
+                        os.nice(WORKER_NICE)   # the tests and what they start yield to other work
+                    except (AttributeError, OSError):
+                        pass
                 _worker(session, units, work_r, w)
             except BaseException:   # noqa: BLE001 - the main process reports what this worker left
                 code = 1
