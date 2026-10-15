@@ -39,7 +39,8 @@ entry also expires after PROBE_END_S. An overdue entry pages the project that ma
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
 then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
-from its root, as end probes do. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe]`
+from its root, as end probes do; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
+timeout) queues one low `change_probe_broken` event per kind of breakage. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe]`
 corrects an open entry in place (same id), with an edit trail in the entry.
 
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
@@ -61,6 +62,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -707,6 +709,9 @@ def change_overdue(cid: int, now: float | None = None) -> bool:
 
 # probes -------------------------------------------------------------------------------------------
 
+PROBE_BROKEN_KIND = "change_probe_broken"   # the event a broken until-probe queues for the coordinator
+
+
 class Probes:
     """Runs the until-probes of the entries project `p` made, in the background, from its root."""
 
@@ -715,22 +720,18 @@ class Probes:
         self._procs: dict[int, tuple[subprocess.Popen, float, str]] = {}
         self._probed: dict[int, float] = {}
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
-        self._reported: dict[int, str] = {}   # change id -> the broken-probe reading already logged
+        self._reported: dict[int, str] = {}   # change id -> the broken kind ("exit 2", "timeout") already reported
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
         passed = []
         for cid, (rc, probe, err) in ends.reap_probes(self._procs, self._errs, now, self.p).items():
-            if rc == "timeout" or rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names
+            if rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names
                 self._reported.pop(cid, None)
             elif rc == 0 or detach.failed_check(probe, rc):   # the jobs it waits on ended, even if one failed
                 passed.append((cid, probe, rc))
-            else:   # a broken probe: say so once, not every round
-                code = rc if isinstance(rc, str) else f"exit {rc}"
-                why = f"{code}: {err}" if err else code
-                if self._reported.get(cid) != why:
-                    self._reported[cid] = why
-                    self.log(f"machine change #{cid}: its until-probe is broken ({why[-500:]})")
+            else:   # broken, a timeout too (as ends.EndProbes reads it): said once per kind, not every round
+                self._broken(cid, probe, rc, err, now)
         if passed:
             ids = {(cid, probe): rc for cid, probe, rc in passed}
             with _locked():
@@ -755,6 +756,28 @@ class Probes:
                 self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")
+
+    def _broken(self, cid: int, probe: str, rc, err: str, now: float) -> None:
+        """Log a broken until-probe and queue one low event for the coordinator, keyed on the change, the
+        probe and how it broke (its exit code or "timeout"), never its stderr: once across restarts too."""
+        code = rc if isinstance(rc, str) else f"exit {rc}"
+        if self._reported.get(cid) == code:
+            return
+        self._reported[cid] = code
+        why = f"{code}: {err}" if err else code
+        self.log(f"machine change #{cid}: its until-probe is broken ({why[-500:]})")
+        fp = f"{PROBE_BROKEN_KIND}:{cid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}:{code}"
+        db = self.p.db
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        c = next((x for x in changes() if x.get("id") == cid), {})
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now, "daemon", PROBE_BROKEN_KIND, fp, "low",
+              f"Machine change #{cid} on {c.get('alias', '?')} ({str(c.get('what', ''))[:200]}) ends when its "
+              f"until-probe passes, but the probe is broken ({why[-300:]}; only 0 = over and 1, 75 or 255 = not "
+              f"yet are valid, and it must finish within {ends.PROBE_TIMEOUT_S}s): {probe[:300]}. Unfixed, it is "
+              f"flagged only once overdue ({ends.shown(float(c.get('expires') or now), self.p)}). Fix it: `ttp machines change edit {cid} --until-probe <command>`, or close "
+              f"the change once it is undone.", "queued", c.get("task")))
 
     def stop(self) -> None:
         ends.stop_probes(self._procs, self._errs)

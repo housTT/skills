@@ -65376,3 +65376,63 @@ def test_machine_change_until_probe_255_needs_ssh_confirmation(env, monkeypatch)
         time.sleep(0.05)
     probes.tick(now + 2)
     assert seen and any("broken" in l and "ssh reaches h1" in l for l in logs), logs
+
+
+def _change_probe_round(probes, cid, at):
+    probes._probed.clear()
+    probes.tick(at)
+    probes._procs[cid][0].wait(30)
+    probes.tick(at + 1)
+
+
+def test_machine_change_until_probe_timeout_is_broken_and_queued_once(env):
+    from ttp import ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="sleep 30", now=now)
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    for at in (now, now + 1000):   # two rounds: each runs past the timeout and is killed
+        probes._probed.clear()
+        probes.tick(at)
+        probes.tick(at + ends.PROBE_TIMEOUT_S + 1)
+        assert c["id"] not in probes._procs
+    [got] = ml.changes()
+    assert not got.get("probe_passed")
+    assert len(logs) == 1 and "timeout" in logs[0], logs
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=?", (ml.PROBE_BROKEN_KIND,))
+    assert ev["severity"] == "low" and ev["status"] == "queued" and f"#{c['id']} on box-a" in ev["text"]
+    assert "timeout" in ev["text"] and f"ttp machines change edit {c['id']} --until-probe" in ev["text"]
+
+
+def test_machine_change_broken_probe_reported_once_per_kind_not_per_stderr(env, tmp_path):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    code = tmp_path / "code"
+    code.write_text("2")
+    now = time.time()
+    probe = f"date +%N >&2; exit $(cat {code})"   # a new stderr tail every round
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=probe, now=now)
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    _change_probe_round(probes, c["id"], now)
+    _change_probe_round(probes, c["id"], now + 1000)
+    assert len(logs) == 1, logs
+    _change_probe_round(ml.Probes(p, log=logs.append), c["id"], now + 2000)   # a daemon restart
+    events = lambda: p.db.q("SELECT fingerprint FROM events WHERE kind=?", (ml.PROBE_BROKEN_KIND,))
+    assert len(events()) == 1, "one event across restarts"
+    code.write_text("3")   # broken another way: said again
+    _change_probe_round(probes, c["id"], now + 3000)
+    assert len(events()) == 2 and "exit 3" in logs[-1]
+    code.write_text("1")   # not yet clears it; broken again later is the same kind: no new event
+    _change_probe_round(probes, c["id"], now + 4000)
+    code.write_text("3")
+    _change_probe_round(probes, c["id"], now + 5000)
+    assert len(events()) == 2
+    from ttp import coordinator
+    assert coordinator.EFFORT_EVENT_TRIGGERS[ml.PROBE_BROKEN_KIND] == "resource"

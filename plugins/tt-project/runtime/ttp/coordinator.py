@@ -242,7 +242,7 @@ EFFORT_EVENT_TRIGGERS = {
     "review_stall": "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
-    "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource",
+    "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "change_probe_broken": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
