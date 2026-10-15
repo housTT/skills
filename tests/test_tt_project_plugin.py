@@ -2830,13 +2830,14 @@ def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):
     r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
+    # the target is the minutes left (rounded up) plus 15: 44 when the run crosses a minute boundary
     assert re.search(r"result: FAIL at 5 extend: box.py ird extend \(rc 1\): error: ird change-timeout "
-                     r"100 45 exited 0, but ird list shows it expiring", out), out
+                     r"100 4[45] exited 0, but ird list shows it expiring", out), out
     assert "released: yes" in out and fake_ird.load()["reservations"] == [], out
     env["FAKE_IRD_EXTEND"] = "fail"
     r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
     out = r.stdout + r.stderr
-    assert r.returncode == 1 and "(rc 1): error: ird change-timeout 101 45 failed (rc 3)" in out, out
+    assert r.returncode == 1 and re.search(r"\(rc 1\): error: ird change-timeout 101 4[45] failed \(rc 3\)", out), out
 
 
 def test_setup_box_ird_e2e_trap_releases_what_an_interrupted_reserve_left(fake_ird, tmp_path):
