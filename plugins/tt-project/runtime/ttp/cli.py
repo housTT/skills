@@ -1384,7 +1384,9 @@ def cmd_upstream(a) -> None:
     machine sends its notes on to, and `--forward-to` sets those targets (`default`: the machines of
     the remote projects; `none`: send nothing). Closing a note: `--resolve <fp> --fixed-in <version>`
     records the maintainers' fix, `--fixed <fp>` is the read-only probe a task waiting on it uses
-    (0 once this project's running daemon is at or above that version, 1 before, 2 unknown), `--ack <fp>
+    (0 once this project's running daemon is at or above that version, 1 before, 2 unknown, 3 when the
+    note was closed as not a plugin bug: no fix ships), `--resolve <fp> --wontfix "<reason>"` closes a
+    not-a-bug note without a release, `--ack <fp>
     "<evidence>"` closes it for this project, `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
     follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
     from . import upstream
@@ -1395,11 +1397,23 @@ def cmd_upstream(a) -> None:
         print(upstream.fingerprint(title.strip()[:upstream.TITLE_CHARS], upstream.cut(
             spec.strip(), f"the hand-off of {me.name if me else '?'} #{task}" if task else "its hand-off")))
         return
-    if a.resolve or a.fixed or a.ack or a.mine or a.resolved:
+    if a.resolve or a.fixed or a.ack or a.mine or a.resolved or a.wontfix is not None:
         try:
+            if a.wontfix is not None and not a.resolve:
+                die("ttp upstream --wontfix needs --resolve <fp>", 2)
             if a.resolve and a.wontfix is not None:
+                if a.fixed_in:
+                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in", 2)
                 me = here()
-                r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
+                try:
+                    r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
+                except OSError as e:
+                    if not os.environ.get("TTP_RUN_DIR"):
+                        raise
+                    upstream.queue_wontfix(Path(os.environ["TTP_RUN_DIR"]), a.resolve, a.wontfix)
+                    print(f"wontfix of note {a.resolve.strip().lower()} queued in this run's directory "
+                          f"({e.strerror or e}); this project's daemon records it when the run ends")
+                    return
                 print(f"note {r['fp']} closed without a release (wontfix): {r['note']}")
                 return
             if a.resolve:
@@ -5205,7 +5219,7 @@ def main(argv: list[str] | None = None) -> None:
                                                        "plugin bug); the reason is required and recorded")
     s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
     s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
-                                                  "fix, 1 before, 2 when unknown")
+                                                  "fix, 1 before, 2 when unknown, 3 when closed as not a bug (wontfix)")
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
     s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
     s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")

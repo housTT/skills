@@ -63755,3 +63755,46 @@ def test_upstream_ack_still_works_for_a_release_resolved_note_and_wontfix_needs_
     upstream.resolve(fp, "0.2.10")
     assert _upstream_cli(cli, "--ack", fp, "works") == 0
     assert upstream.state(fp) == "closed"
+
+
+def test_upstream_wontfix_queues_in_a_sandbox_is_refused_without_resolve_or_with_fixed_in(env, monkeypatch, tmp_path):
+    from ttp import cli, upstream
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: sb", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: sb", "y")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _upstream_cli(cli, "--wontfix", "why") != 0
+    assert _upstream_cli(cli, "--resolve", fp, "--fixed-in", "1.0", "--wontfix", "why") != 0
+    assert upstream.state(fp) == "open"
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+
+    def boom(*a, **k):
+        raise PermissionError(13, "read-only")
+    monkeypatch.setattr(upstream, "wontfix", boom)
+    assert _upstream_cli(cli, "--resolve", fp, "--wontfix", "not a bug") == 0
+    monkeypatch.undo()
+    assert upstream.state(fp) == "open"
+    assert upstream.file_queued_acks(tmp_path, "demo") == 1
+    assert upstream.wontfixed(fp)["note"] == "not a bug"
+
+
+def test_upstream_wontfix_ends_the_fixed_wait_wakes_the_filer_once_and_round_trips(env, monkeypatch):
+    from ttp import upstream
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: wf", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: wf", "y")
+    monkeypatch.setattr(upstream, "running_version", lambda p: "0.1.0")
+    assert upstream.fixed(p, fp) == 1
+    upstream.resolve(fp, "9.9.9")
+    upstream.wontfix(fp, "not a plugin bug", "m")
+    assert upstream.fixed(p, fp) == upstream.WONTFIX_RC
+    assert len(upstream.wake_fixed(p, "10.0.0")) == 1 and upstream.wake_fixed(p, "10.0.0") == []
+    ev = p.db.q("SELECT text FROM events WHERE source='upstream'")
+    assert len(ev) == 1 and "not a plugin bug" in ev[0]["text"] and "closed as not a plugin bug" in ev[0]["text"]
+    sent = upstream._resolved_for("")  # no forwarded notes here: nothing to send
+    assert sent == []
+    recs = upstream._records()
+    assert upstream.wontfixed(fp, recs)
+    got = [{"kind": "wontfix", "fp": fp, "note": "not a plugin bug", "by": "m", "ts": 5.0}]
+    n = upstream._take_resolved("peer", got)
+    assert n == 0 or upstream._take_resolved("peer", got) == 0

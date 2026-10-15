@@ -258,7 +258,7 @@ Each field's rules are in the section named; the table only lists them.
 - `upstream_note` events: handle them like follow-ups. Each ends with `[note <fp>]`: name it in the
   spec of the code task that fixes it, whose hand-off lists it in `resolves`; the push queue then
   records it fixed in the release it pushes. A fix shipped another way gets `ttp upstream --resolve
-  <fp> --fixed-in <version>`.
+  <fp> --fixed-in <version>`; a note that is not a plugin bug gets `--wontfix "<reason>"` instead of `--fixed-in`.
 <!-- /ttp:if upstream_ingest -->
 
 # Decide; do not wait

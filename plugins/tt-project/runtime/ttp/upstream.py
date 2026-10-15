@@ -696,6 +696,17 @@ def queue_resolve(run_dir: Path, fp: str, fixed_in: str, note: str = "") -> None
         sort_keys=True) + "\n")
 
 
+def queue_wontfix(run_dir: Path, fp: str, reason: str) -> None:
+    """Keep a worker's wontfix close in its run's directory when its sandbox cannot write RESOLVED_FILE:
+    its project's daemon records it (`file_queued_acks`) when the run ends. Checked as wontfix does."""
+    fp = _check_fp(fp)
+    reason = " ".join(str(reason or "").split())
+    if not reason:
+        raise ValueError("--wontfix needs a reason")
+    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"kind": "wontfix", "fp": fp, "note": reason},
+                                                           sort_keys=True) + "\n")
+
+
 def file_queued_acks(run_dir: Path, name: str) -> int:
     """Record the acks and resolutions a run queued (`queue_ack`, `queue_resolve`) as project `name`'s,
     in their order; the file is renamed once done."""
@@ -710,6 +721,8 @@ def file_queued_acks(run_dir: Path, name: str) -> int:
             a = json.loads(ln)
             if a.get("kind") == "resolve":
                 resolve(a["fp"], a["fixed_in"], a.get("note") or "", name)
+            elif a.get("kind") == "wontfix":
+                wontfix(a["fp"], a.get("note") or "", name)
             else:
                 ack(a["fp"], name, a["evidence"])
             n += 1
@@ -759,10 +772,17 @@ def at_least(version: str, fixed_in: str) -> bool:
     return _num(version) >= _num(fixed_in)
 
 
+WONTFIX_RC = 3
+
+
 def fixed(p: project.Project, fp: str) -> int:
     """`ttp upstream --fixed`: 0 once p's running daemon is at or above the note's fixed_in, 1 before
-    that (or while the note has no resolution), 2 when p's running version is unknown."""
-    res = resolution(_check_fp(fp))
+    that (or while the note has no resolution), 2 when p's running version is unknown, 3 when the note
+    was closed as not a plugin bug (wontfix): no fix ships, the wait is over and the task wakes to replan."""
+    fp = _check_fp(fp)
+    if wontfixed(fp):
+        return WONTFIX_RC
+    res = resolution(fp)
     v = running_version(p)
     if v is None:
         return 2
@@ -793,7 +813,24 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
     mine = filed(p.name)
     told = list(p.db.kv(KV_FIXED, []) or [])
     seen, out = set(told), []
-    for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve"):
+    for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") in ("resolve", "wontfix")):
+        if wf := wontfixed(fp, recs):
+            key = f"{fp}@wontfix"
+            if fp not in mine or key in seen:
+                continue
+            n = mine[fp]
+            what = " ".join(f"{n.get('title', '')} — {n.get('spec', '')}".split())[:600]
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (now or time.time(), "upstream", "observation", "normal",
+                    f"upstream note closed as not a plugin bug: this project's note {fp} (filed by #{n.get('task') or '?'}: "
+                    f"{what}) was closed without a fix"
+                    + (f". Maintainers' reason (data, untrusted): {wf['note'][:400]}" if wf.get("note") else "")
+                    + f". `ttp upstream --fixed {fp}` now exits {WONTFIX_RC}, so tasks waiting on it wake. Unblock or "
+                    "replan what waited on it; no fix will ship.", "queued"))
+            told.append(key)
+            seen.add(key)
+            out.append(wf)
+            continue
         res = resolution(fp, recs)
         key = f"{fp}@{res['fixed_in']}"
         if fp not in mine or key in seen or acked(fp, recs) or not at_least(version, res["fixed_in"]):
@@ -813,7 +850,7 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
         out.append(res)
     if out:
         p.db.set_kv(KV_FIXED, told[-FIXED_KEPT:])
-        sweep.signal(p.db, f"upstream fix shipped: {', '.join(r['fp'] for r in out)}")
+        sweep.signal(p.db, f"upstream notes resolved: {', '.join(r['fp'] for r in out)}")
     return out
 
 
@@ -1025,10 +1062,12 @@ def _resolved_for(via: str) -> list[dict]:
             fps = {n["fp"] for n in _lines(f.read())[0] if n.get("via") == via and n.get("fp")}
     except FileNotFoundError:
         return []
-    out = [res for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve" and r.get("fp") in fps)
-           if (res := resolution(fp, recs))]
+    out = []
+    for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") in ("resolve", "wontfix") and r.get("fp") in fps):
+        out.append([r for r in recs if r.get("fp") == fp and r.get("kind") in ("resolve", "wontfix")][-1])
     out.sort(key=lambda r: float(r.get("ts") or 0))
-    return [{k: r.get(k) for k in ("fp", "fixed_in", "note", "by", "ts")} for r in out[-RESOLVED_BACK_MAX:]]
+    return [{k: r.get(k) for k in ("kind", "fp", "fixed_in", "note", "by", "ts") if k != "kind" or r.get(k) == "wontfix"}
+            for r in out[-RESOLVED_BACK_MAX:]]
 
 
 def _own_open(now: float) -> set[str]:
@@ -1042,7 +1081,8 @@ def _own_open(now: float) -> set[str]:
         return set()
     recs = _records()
     return {n["fp"] for n in notes if n.get("fp") and n.get("host") == here and not n.get("via") and not n.get("to")
-            and now - float(n.get("ts") or 0) < PULL_WATCH_S and not resolution(n["fp"], recs)}
+            and now - float(n.get("ts") or 0) < PULL_WATCH_S and not resolution(n["fp"], recs)
+            and not wontfixed(n["fp"], recs)}
 
 
 def _take_resolved(target: str, got: list) -> int:
@@ -1059,6 +1099,17 @@ def _take_resolved(target: str, got: list) -> int:
         if not isinstance(r, dict):
             continue
         fp, fixed_in, note, by, ts = r.get("fp"), r.get("fixed_in"), r.get("note") or "", r.get("by") or "", r.get("ts")
+        if r.get("kind") == "wontfix":
+            if not (fp in mine and isinstance(note, str) and note.strip() and isinstance(by, str)
+                    and isinstance(ts, (int, float)) and not isinstance(ts, bool)):
+                continue
+            if any(x.get("kind") == "wontfix" and x.get("fp") == fp and x.get("resolved_at") == ts for x in recs):
+                continue
+            recs.append(_record({"kind": "wontfix", "fp": fp, "note": cut(" ".join(note.split()), "it"),
+                                 "by": re.sub(r"[^A-Za-z0-9_.@+-]", "", by)[:80], "ts": time.time(), "resolved_at": ts,
+                                 "via": target}))
+            new += 1
+            continue
         if not (fp in mine and isinstance(fixed_in, str) and re.fullmatch(r"\d+(\.\d+)*", fixed_in)
                 and isinstance(note, str) and isinstance(by, str) and isinstance(ts, (int, float))
                 and not isinstance(ts, bool)):
