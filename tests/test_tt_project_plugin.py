@@ -477,6 +477,20 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_unreadable_inputs_block_once_and_are_collected_up_front():
+    # A worker that meets an OS-guarded or password-protected input blocks once with the cause;
+    # the coordinator gathers such inputs (or passwords) in one ask instead of one per task.
+    prompts = PLUGIN / "template" / "prompts"
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    for phrase in ("privacy-protected folders", "password-protected or encrypted",
+                   "Hand off `blocked` once, naming the file and the cause", "the project's inputs folder"):
+        assert phrase in worker, phrase
+    coord = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    for phrase in ("collect them once, up front, in one `access` ask", "never in memory, notes or specs",
+                   "an inputs folder the project owns and workers can read", "Never ask again per task"):
+        assert phrase in coord, phrase
+
+
 def test_shipped_prompts_and_templates_hold_no_one_users_cluster_policy():
     # One user's rules (a node list, an idle threshold, a machine list) belong in their own charter;
     # the shipped prompts, templates and skills state only company-wide scheduler etiquette.

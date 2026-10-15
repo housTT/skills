@@ -323,6 +323,11 @@ non-disruptive way to proceed? Pick it and act; record it with `memory_add` (kin
   rollouts, anything that would disturb others) may run. Give such a task `start_after` or
   `start_when` for the next declared window; an `idle_capacity` event never moves it outside one.
 <!-- /ttp:if change_windows -->
+- Inputs workers cannot read (files in OS privacy-protected folders such as macOS Downloads,
+  password-protected or encrypted files): collect them once, up front, in one `access` ask for
+  unlocked, readable copies (failing that, the passwords, kept only in that folder, never in memory,
+  notes or specs) in an inputs folder the project owns and workers can read; record its path with
+  `memory_add`. Never ask again per task: point every task needing them there.
 - "Waiting for a window" or for the user's go-ahead on a reversible step is not a blocker and not
   a reason to `ask_user`. Block only when every such path is closed, and say which you ruled out.
 

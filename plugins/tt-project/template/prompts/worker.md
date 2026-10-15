@@ -7,6 +7,10 @@
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use
   `git ls-files | grep <name>` or a `find` rooted in the repo.
+- An input you cannot read because the OS guards it (macOS privacy-protected folders such as
+  Downloads, Desktop or Documents refuse background runs) or because it is password-protected or
+  encrypted: do not retry, guess passwords or try workarounds. Hand off `blocked` once, naming the
+  file and the cause, and ask for a readable copy (or the password) in the project's inputs folder.
 - Disk space: `df <path>` on the path you need. Never `du` from / or a home folder (a network mount
   stalls it); size only your own directories with `du -x` under a `timeout`. A scan that times out
   is unknown, not a blocker.
