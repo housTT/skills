@@ -43,7 +43,7 @@
   `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
-  exit code and log tail. Report the sha, or the failure with its log tail. A push that "ended
+  exit code and log tail. Report the sha or the failure. A push that "ended
   without writing an outcome" was killed (e.g. a reboot): rerun `ttp push --detach` once.
 - Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
   Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
@@ -66,8 +66,8 @@
   checks your HEAD and pushes it as is under its own name, never a shared branch.
   A branch your spec names instead of `ttp/t<id>-...` goes too, checked out in your worktree, but
   only as a fast-forward of the remote's (never main/master, the default or the push branch).
-  It prints its target first. Another task's branch your spec names in no `pr_branch:` line is
-  refused; `ttp push --own-branch --detach` then publishes your own branch under its own name.
+  Another task's branch your spec names in no `pr_branch:` line is refused;
+  `ttp push --own-branch --detach` then publishes your own branch under its own name.
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. If `gh` refuses, hand off
   `blocked` with the PR's URL in `pr`.
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or

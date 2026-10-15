@@ -12,8 +12,7 @@
   is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
   saying what and why.
-- `tt-project/` at the project root is this harness's own state. Ignore it unless the task is about
-  the harness.
+- `tt-project/` at the project root is this harness's state: ignore it unless the task is about it.
 <!-- ttp:if harness -->
 - A harness task changes only this project's own harness. It never edits, or makes a worktree
   or branch in, the tt-project plugin's source repo or another project's harness. Upgrading
@@ -56,7 +55,7 @@
 
 ## Working in parallel
 
-Other workers run at the same time, on other tasks of this project.
+Other workers run other tasks of this project at the same time.
 
 - Edit only in your own working directory. Another repository: make your own `git worktree` of it.
   Never edit a checkout another task may use, and never switch the project root's checkout to
@@ -132,12 +131,12 @@ never write to a run folder named in earlier context):
  "question": "if blocked: the one decision you need",
  "waiting_for": "if waiting: the busy resource or event",
  "retry_after_s": 1800,
- "retry_when": "if waiting: a quick shell check that exits 0 once the wait is over",
+ "retry_when": "if waiting: a quick shell check (below)",
 <!-- ttp:if wait -->
  "wake_tier": "if waiting: light (the next run only checks) or standard (real work follows)",
  "next_step": "if waiting: one short mechanical command a light wake runs",
  "on_pass": {"status": "done", "summary": "if waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
- "on_pass_cmd": "if waiting: a command that checks the finished job and writes the final hand-off to $TTP_RESULT",
+ "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
  "wait_kind": "if waiting: self (your own detached checks or jobs, a window you planned) or external",
 <!-- /ttp:if wait -->
 <!-- ttp:if device -->
@@ -152,7 +151,7 @@ never write to a run folder named in earlier context):
 ```
 
 - `done` only with evidence: tests run, numbers measured, files produced.
-- `waiting` when a resource is busy (a reservation, a queue, a review). The task comes back after
+- `waiting` when a resource is busy (a reservation, a queue, a review). The task returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a
   `retry_when`: the harness runs it model-free every few minutes in the project root. Keep it
   read-only and under a minute. It must exit 0 once the wait is over whatever the outcome (the job
@@ -202,15 +201,14 @@ never write to a run folder named in earlier context):
 <!-- /ttp:if devq -->
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours survives it. Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a
   reboot the daemon restarts it, with no model run, up to 3 times. The
-  next run is a light wake unless you set `wake_tier` standard (only for real work). Handing back
-  the same `waiting_for` and `retry_when` with no new commit is no progress; after 3 such wakes the
-  task goes to the coordinator. `next_step` is one short mechanical command, never a plan or an
-  "if ... then"; a wake that needs judgment sets `wake_tier` standard and no `next_step`.
+  next run is a light wake unless you set `wake_tier` standard. After 3 wakes that hand back the
+  same `waiting_for` and `retry_when` with no new commit, the task goes to the coordinator.
+  `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
-  next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
-  yours: make them, and state each and why in the summary.
-- Read another task's record (spec, hand-off, review findings) with `ttp task <project> show <id>`;
+  next step cannot be undone and is outside the charter. Say exactly what. Make judgment calls
+  yourself; state each and why in the summary.
+- Read another task's record (spec, hand-off, findings) with `ttp task <project> show <id>`;
   never open project.db.
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
   `retry_when` `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or
