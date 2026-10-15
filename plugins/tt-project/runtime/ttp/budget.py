@@ -89,6 +89,28 @@ class Gate:
         return asdict(self)
 
 
+def red_class(reason: str) -> str | None:
+    """The class of a red reason other than a plan window's line (daemon: one alert per episode of a
+    class), or None."""
+    for prefix, cls in (("runaway guard", "runaway guard"), ("cap reached", "cap"),
+                        ("global daily cap reached", "global cap")):
+        if reason.startswith(prefix):
+            return cls
+    return "spend limit" if "reports its spend limit reached" in reason else None
+
+
+def red_share(g: Gate, cls: str) -> float | None:
+    """How far a red class's measured value is toward its limit (1 = at it), None when not measured."""
+    n = g.numbers or {}
+    if cls == "runaway guard":
+        return n.get("guard_ratio")
+    if cls == "cap":
+        return n.get("cap_ratio")
+    if cls == "global cap" and float(n.get("global_cap") or 0) > 0:
+        return float(n.get("global_today") or 0) / float(n["global_cap"])
+    return None
+
+
 def _raise(g: Gate, level: str, reason: str) -> None:
     if LEVELS.index(level) > LEVELS.index(g.level):
         g.level = level
@@ -174,9 +196,10 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # next run of a plan account brings its own readings), but the user hears of it (daemon:
         # alert account-mismatch:<provider>) instead of the caps taking over silently.
         g.numbers["account_mismatch"] = True
-        g.reasons.append(f"{provider} is logged in to another account than its plan readings; check the login. "
-                         f"Until they match, its spend counts toward the dollar caps")
-    elif provider in lapsed:
+        g.reasons.append(f"{provider} is logged in to another account than its plan readings; check the login"
+                         + (". Until they match, its spend counts toward the dollar caps" if dollar_caps(b) else ""))
+    elif provider in lapsed and dollar_caps(b):
+        # With no dollar cap set (0 = unset) nothing changes for the user: no reason to tell.
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     reading = credits.latest(db, provider, now) if plan else None
     paid = credits.paid_open(reading)
@@ -232,6 +255,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     workers = min(max(_peak_tasks(spans, now), 1), max(int(b.get("max_parallel_workers", 6)), 1))
     waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
+    # Each signal's share of its limit: red past 1, and a red alert's episode ends only well below it
+    # (daemon: RED_CLEAR_RATIO), so a value hovering at a limit is one alert, not one per crossing.
+    shares: list[float] = []
     g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
                       "waste_1h": round(waste, 2), "waste_limit": round(waste_cap, 2),
                       "coordinator_1h": round(thrash, 2), "coordinator_user_1h": round(asked, 2)})
@@ -240,30 +266,39 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         lost = sum(1 for r in runs_h if wasted(r))
         lost_cap = int(b.get("hourly_waste_runs", 4)) * workers
         g.numbers.update({"waste_runs_1h": lost, "waste_runs_limit": lost_cap})
+        shares.append(_share(lost, lost_cap))
         if lost > lost_cap:
             _raise(g, "red", f"runaway guard: {lost} failed or stalled runs in the last hour "
                              f"(limit {lost_cap}); resumes automatically as the hour rolls over")
-    elif waste > waste_cap:
+    else:
+        shares.append(_share(waste, waste_cap))
+    if not virtual and waste > waste_cap:
         _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
     selfs = [r for r in coord_h if not user_turn(r)]
     same = repeated_turns(selfs)
     g.numbers.update({"coordinator_turns_1h": len(selfs), "coordinator_repeats_1h": same})
     if virtual:
-        turn_cap = int(b.get("hourly_coordinator_turns", 40))
+        # Below coordinator.max_turns_per_hour, which stops self-started turns by itself: a guard at
+        # or above it could never fire.
+        turn_cap = int(b.get("hourly_coordinator_turns") or default_turn_cap(cfg))
         repeat_cap = int(b.get("hourly_coordinator_repeats", 4))
+        shares += [_share(len(selfs), turn_cap), _share(same, repeat_cap)]
         if len(selfs) > turn_cap:
             _raise(g, "red", f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
                              f"(limit {turn_cap}; turns for user messages not counted)")
         if same >= repeat_cap:
             _raise(g, "red", f"runaway guard: {same} self-started coordinator turns in the last hour met the "
                              f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
-    elif thrash > thrash_cap:
+    else:
+        shares += [_share(thrash, thrash_cap), _share(last_h, ceiling)]
+    if not virtual and thrash > thrash_cap:
         _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
                          f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
     if last_h > ceiling and not virtual:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
+    g.numbers["guard_ratio"] = round(max(shares, default=0.0), 3)
 
     if g.level == "yellow":
         # On a plan the headroom to the line already sets the workers; a deep run burns it fastest.
@@ -276,6 +311,22 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
+
+
+def _share(value: float, limit: float) -> float:
+    """`value` as a share of `limit`; a limit of 0 or less trips on any value (capped for JSON)."""
+    return min(value / limit, 99.0) if limit > 0 else (99.0 if value > 0 else 0.0)
+
+
+def default_turn_cap(cfg: dict) -> int:
+    """The plan turn guard's default: 80% of coordinator.max_turns_per_hour, so it can fire before
+    that limit holds the turns back."""
+    return max(int(int((cfg.get("coordinator") or {}).get("max_turns_per_hour", 30)) * 0.8), 1)
+
+
+def dollar_caps(b: dict) -> bool:
+    """Whether any dollar cap is set (budget.daily_usd, weekly_usd, global_daily_usd; 0 = unset)."""
+    return any(float(b.get(k) or 0) > 0 for k in ("daily_usd", "weekly_usd", "global_daily_usd"))
 
 
 def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: dict, now: float,
@@ -308,7 +359,10 @@ def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: 
     ratio = max(today / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
     g.numbers["cap_ratio"] = round(ratio, 3)
     if ratio >= 1.0:
-        _raise(g, "red", f"cap reached: ${today:.2f}/{label} of ${day_cap:.0f}, ${w7:.2f}/7d of ${week_cap:.0f}")
+        # A cap of 0 is unset: only the caps set are named.
+        set_caps = ([f"${today:.2f}/{label} of ${day_cap:.0f}"] if day_cap else []) + \
+                   ([f"${w7:.2f}/7d of ${week_cap:.0f}"] if week_cap else [])
+        _raise(g, "red", "cap reached: " + ", ".join(set_caps))
     elif ratio >= 0.85:
         _raise(g, "orange", f"{ratio:.0%} of cap used")
     elif ratio >= 0.6:

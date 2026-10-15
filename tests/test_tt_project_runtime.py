@@ -4800,6 +4800,111 @@ def test_runaway_guard_on_a_plan_trips_on_repeated_turns_not_virtual_dollars(env
     assert g.level == "red" and any("41 self-started coordinator turns" in r for r in g.reasons), g.reasons
 
 
+def test_the_default_plan_turn_guard_fires_below_the_coordinators_own_turn_limit(env):
+    """coordinator.max_turns_per_hour stops self-started turns by itself, so the plan turn guard's
+    default sits below it (80%) or it could never fire; an explicit setting still wins."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    wins = [bud.Window("claude", "five_hour", 7.0, now + 3600)]
+    limit = int(p.config()["coordinator"]["max_turns_per_hour"])
+    assert bud.default_turn_cap(p.config()) < limit
+
+    def turns(n):
+        p.db.x("DELETE FROM runs")
+        for i in range(n):
+            p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
+                   "VALUES('coordinator','claude','ok',?,?,0.01,?)",
+                   (now - 100 - i * 60, now - 70 - i * 60, json.dumps({"messages": [], "gate": {"bg": f"bg{i}"}})))
+        return bud.evaluate(p.db, p.config(), "claude", wins, now)
+
+    cap = bud.default_turn_cap(p.config())
+    g = turns(cap + 1)
+    assert cap + 1 < limit and g.level == "red", "the default turn guard cannot fire under max_turns_per_hour"
+    assert any(f"{cap + 1} self-started coordinator turns in the last hour (limit {cap};" in r for r in g.reasons)
+    assert g.numbers["guard_ratio"] > 1
+    g = turns(cap)
+    assert g.level != "red" and g.numbers["guard_ratio"] == 1.0, g.reasons
+    p.set_config("budget.hourly_coordinator_turns", 50)
+    assert turns(cap + 1).level != "red", "an explicit hourly_coordinator_turns still sets the guard"
+
+
+def test_a_runaway_guard_hovering_at_its_limit_alerts_once_per_episode(env, monkeypatch):
+    """Replays a flap: the coordinator guard crosses its $4 limit, drops just under it and crosses
+    again. One alert per episode: it ends only below 80% of the limit, and a repeat within an hour
+    of that end is no new alert. Gating is unchanged: every crossing stops new work."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon, RED_REPEAT_S
+    d = Daemon(p.base)
+    alerts = lambda: [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")]  # noqa: E731
+
+    def settle(spent: float) -> bud.Gate:
+        gate = bud.Gate(provider="fake", regime="caps", numbers={"guard_ratio": round(spent / 4.0, 3)})
+        if spent > 4.0:
+            bud._raise(gate, "red", f"runaway guard: coordinator spent ${spent:.2f} on self-started turns in the "
+                                    f"last hour (limit $4; turns for user messages not counted)")
+            gate.allow_new_work, gate.max_parallel = False, 0
+        monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
+        d.update_gates()
+        return d.gates["fake"]
+
+    settle(2.0)
+    for spent in (4.07, 3.9, 4.33, 3.5, 4.12, 3.95, 4.2):   # clears briefly, but stays above 80% ($3.20)
+        g = settle(spent)
+        assert (g.level == "red") == (spent > 4.0) and g.allow_new_work == (spent <= 4.0), "gating changed"
+    assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red: runaway guard"), alerts()
+    settle(2.5)                                             # below 80%: the episode ends
+    assert settle(4.1).level == "red"                       # red again within the hour: the same episode
+    assert len(alerts()) == 1, alerts()
+    settle(2.0)
+    eps = p.db.kv("budget_red_episodes")
+    assert not eps["fake"]["runaway guard"]["open"], eps
+    eps["fake"]["runaway guard"]["cleared"] -= RED_REPEAT_S + 60   # clear for over an hour
+    p.db.set_kv("budget_red_episodes", eps)
+    settle(2.0)
+    assert "runaway guard" not in p.db.kv("budget_red_episodes")["fake"], "an episode long over is forgotten"
+    settle(4.4)
+    assert len(alerts()) == 2 and alerts()[1].startswith("Budget for fake is now red: runaway guard"), alerts()
+
+
+def test_budget_text_treats_zero_dollar_caps_as_unset(env):
+    """A cap of 0 is unset: a reached cap names only the caps set, and a plan that stopped reporting
+    its windows says nothing about dollar caps when none is set."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 7200, "claude", "task:1", 60.0))
+    for daily, weekly, words, absent in ((50.0, 0, "$60.00/24h of $50", "7d"), (0, 50.0, "$60.00/7d of $50", "24h")):
+        p.set_config("budget.daily_usd", daily)
+        p.set_config("budget.weekly_usd", weekly)
+        g = bud.evaluate(p.db, p.config(), "claude", [], now)
+        cap = [r for r in g.reasons if r.startswith("cap reached")]
+        assert cap == [f"cap reached: {words}"] and absent not in cap[0] and "of $0" not in cap[0], g.reasons
+    p.db.x("DELETE FROM ledger")
+    p.set_config("budget.weekly_usd", 200.0)
+    # a plan whose paid runs report no windows any more: billed by use from its last reading on
+    _reading(p, now - 5 * 3600, "acct-a | plan", "five_hour", 20.0, now + 3600)
+    for h in (4.9, 4.5, 3):
+        _run(p, "acct-a | plan", now - h * 3600 - 60, now - h * 3600, 1.0)
+
+    def reasons():
+        g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+        assert g.regime == "caps", g.reasons
+        return g.reasons
+    assert any("stopped reporting plan windows; its spend counts toward the dollar caps" in r
+               for r in reasons()), reasons()
+    for key in ("daily_usd", "weekly_usd", "global_daily_usd"):
+        p.set_config(f"budget.{key}", 0)
+    assert not any("plan windows" in r or "dollar cap" in r for r in reasons()), reasons()
+    # the login on another account than the readings: told, but without the caps it does not change
+    _run(p, "acct-b | plan", now - 100, now - 50, 1.0)
+    bud.note_account(p.db, "claude", "acct-b | plan")
+    assert any(r.endswith("check the login") for r in reasons()) and not any("dollar cap" in r for r in reasons())
+    p.set_config("budget.daily_usd", 100.0)
+    assert any("check the login. Until they match, its spend counts toward the dollar caps" in r for r in reasons())
+
+
 def test_one_listener_per_chat(env):
     """The newest listener wins, and a listener whose starter is gone exits by itself. The replaced
     one says so and exits LISTEN_REPLACED; any other SIGTERM still ends a listener as before."""
