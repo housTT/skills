@@ -2171,8 +2171,11 @@ elif cmd == "reserve":
             flags["no-shell"] = True; i += 1
         else:
             flags[rest[i][2:]] = rest[i + 1]; i += 2
-    if os.environ.get("FAKE_IRD_SLEEP"):  # hangs past the caller's wait; lands nothing itself
-        time.sleep(float(os.environ["FAKE_IRD_SLEEP"])); sys.exit(0)
+    if os.environ.get("FAKE_IRD_SLEEP"):  # hangs past the caller's wait, until its ssh is killed; lands nothing
+        parent, end = os.getppid(), time.time() + float(os.environ["FAKE_IRD_SLEEP"])
+        while os.getppid() == parent and time.time() < end:
+            time.sleep(0.1)
+        sys.exit(0)
     if len(rest) - i != 1 or os.environ.get("FAKE_IRD_NOOP"):
         print("usage: ird reserve [options] <arch>")  # a flag after the arch: silently no reservation
         sys.exit(int(os.environ.get("FAKE_IRD_RC", "0")))
