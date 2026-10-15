@@ -382,6 +382,11 @@ prolonged whole-box outage.
   probe that only tests for a marker file named `user-*`; `coordinator.user_pause_marker` sets the
   pattern), a resource pause the user set, or a deferral only until a time. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
+- Ask rethink: an open `restriction`, `irreversible` or `human` ask that holds a blocked task
+  longer than `coordinator.ask_rethink_h` (2; 0 turns it off) raises one `ask_rethink` event, a
+  high-effort turn that decides the ask itself unless only the user can (then `human_indispensable`
+  with a why). Each ask is raised once, across restarts; review, merge, access, funds and spend asks
+  never are. A `still_blocked` on a task such an ask holds is flagged, not carried.
   Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
   `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped
   to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep

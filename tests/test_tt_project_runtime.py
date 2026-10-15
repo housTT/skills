@@ -57322,3 +57322,96 @@ def test_wake_tier_own_ack_wait_wrapper_is_light(tmp_path):
     assert bud.wake_tier("standard", prev, {}, harness) == "light"
     other = {**prev, "retry_when": "mycheck probe"}
     assert bud.wake_tier("standard", other, {"ack_wait": {"probe_commands": ["mycheck probe"]}}) == "light"
+
+
+def _rethink_setup(p, blocking="restriction", hours_ago=3.0, anchored=True):
+    db = p.db
+    aid = db.post("out", "Take the slower path that keeps the restriction?", chat=None, kind="ask",
+                  severity="high", ref=f"blocking:{blocking}")
+    db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - hours_ago * 3600, aid))
+    t = db.add_task("held by the ask")
+    db.update_task(t, status="blocked", blocked_reason=f"waits for the answer to ask {aid}",
+                   labels=json.dumps([f"waits:ask:{aid}"] if anchored else []))
+    return aid, t
+
+
+def test_ask_rethink_fires_once_past_the_threshold_and_not_before(env):
+    p = make(env)
+    from ttp import askrethink
+    db, cfg = p.db, p.config()
+    assert askrethink.hours(cfg) == 2
+    aid, t = _rethink_setup(p, hours_ago=1.5, anchored=False)    # cited in the reason only
+    now = time.time()
+    assert askrethink.raise_due(db, cfg, now) == []
+    assert askrethink.raise_due(db, cfg, now + 0.6 * 3600) == [aid]
+    (ev,) = db.q("SELECT * FROM events WHERE kind=?", (askrethink.KIND,))
+    assert ev["text"].startswith(f"Ask {aid} has blocked tasks #{t} for 2h. Decide it yourself")
+    assert "human_indispensable" in ev["text"] and "notify low" in ev["text"]
+    assert askrethink.raise_due(db, cfg, now + 5 * 3600) == []
+    assert db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (askrethink.KIND,))["n"] == 1
+    # 0 turns it off.
+    aid2, _ = _rethink_setup(p, hours_ago=30)
+    assert askrethink.raise_due(db, {"coordinator": {"ask_rethink_h": 0}}, now) == []
+    assert askrethink.raise_due(db, cfg, now) == [aid2]
+
+
+def test_ask_rethink_never_for_user_only_asks_or_a_resolved_ask_or_one_holding_nothing(env):
+    p = make(env)
+    from ttp import askrethink, coordinator as coord
+    db, cfg = p.db, p.config()
+    for b in ("review", "merge", "access", "funds", "spend"):
+        _rethink_setup(p, blocking=b)
+    assert askrethink.raise_due(db, cfg) == []
+    aid, t = _rethink_setup(p, blocking="irreversible")
+    assert coord.apply(p, [{"type": "resolve", "id": aid}]) == []
+    assert askrethink.raise_due(db, cfg) == []
+    from ttp import settinghold
+    aid, t = _rethink_setup(p)    # a user-only setting's hold
+    db.update_task(t, blocked_reason=f"{settinghold.NOTE} delivery.allow_protected_push_branch is off (ask {aid})")
+    assert settinghold.held_key(db.task(t)) and askrethink.raise_due(db, cfg) == []
+    free = db.post("out", "A human question that holds nothing?", chat=None, kind="ask", ref="blocking:human")
+    db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 10 * 3600, free))
+    assert askrethink.raise_due(db, cfg) == []
+    assert not db.q("SELECT id FROM events WHERE kind=?", (askrethink.KIND,))
+
+
+def test_ask_rethink_raises_once_across_a_daemon_restart_at_high_effort(env):
+    p = make(env)
+    from ttp import askrethink, coordinator as coord
+    from ttp.daemon import Daemon
+    aid, t = _rethink_setup(p, blocking="human")
+    Daemon(p.base).rethink_asks()
+    Daemon(p.base).rethink_asks()
+    evs = p.db.q("SELECT id FROM events WHERE kind=?", (askrethink.KIND,))
+    assert len(evs) == 1 and str(aid) in p.db.kv(askrethink.RAISED_KEY)
+    assert coord.EFFORT_EVENT_TRIGGERS[askrethink.KIND] == "stuck"
+    assert askrethink.KIND in coord.effort_triggers(p.db, p.config(), [evs[0]["id"]], None)[0]
+
+
+def test_blocker_sweep_flags_not_carries_a_still_blocked_on_a_task_a_long_open_ask_holds(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, cfg, now = p.db, p.config(), time.time()
+    aid, t = _rethink_setup(p, hours_ago=1)
+    other = db.add_task("blocked on a board")
+    db.update_task(other, status="blocked", blocked_reason="board down")
+    sweep.start(db, cfg, "every 6h", now - 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": i, "outcome": "still_blocked", "until_probe": "test -e /x",
+                            "start_after": "1d"} for i in (t, other)]) == []
+    # Before the threshold both carry; past it the ask's task is flagged and the interval sweep runs.
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    assert set(db.kv(sweep.STATE_KEY)["carried"]) == {f"task:{t}", f"task:{other}"}
+    later = now + 2 * 3600
+    assert sweep.due(db, cfg, later + 7 * 3600)
+    eid = sweep.start(db, cfg, "every 6h", later)
+    state = db.kv(sweep.STATE_KEY)
+    assert state["carried"] == [f"task:{other}"] and f"held by open ask {aid}" in state["flags"][f"task:{t}"]
+    assert "CARRIED" not in next(ln for ln in coord.digest(p, {}, [eid], []).splitlines()
+                                 if ln.startswith(f"- #{t} "))
+    # human_indispensable clears the flag.
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": t, "outcome": "human_indispensable",
+                            "why": "only the user may waive it"}]) == []
+    assert sweep.rethink(db, cfg, sweep.items(db, later, cfg), later) == {}

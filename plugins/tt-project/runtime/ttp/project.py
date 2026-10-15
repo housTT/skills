@@ -192,6 +192,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "turn_timeout_s": 0, "turn_timeouts_s": {},
                     "turn_timeout_ceiling_s": 3600, "sweep_prompt_chars": 12000,
                     "ask_timeout_h": 1,
+                    # An open restriction, irreversible or human ask that holds a blocked task longer
+                    # than this goes back to a high-effort turn once to decide it (askrethink.py); 0 off.
+                    "ask_rethink_h": 2,
                     # A task deferred with `start_when` that has not started after this long is raised
                     # to the coordinator once.
                     "defer_max_days": 14,

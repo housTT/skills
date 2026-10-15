@@ -302,9 +302,9 @@ The project runs unattended. The user reads what you decided; they do not approv
   message that answers it.
 - Always set `recommendation`: the option you would pick, answerable in one word. It is never
   applied without their answer. Keep all other work moving meanwhile.
-- An `ask_timeout` event is about an older ask registered with a default: act on it and record it
-  with `memory_add`; it permits nothing else. If the default was NOT applied, the user wrote
-  after the ask: act on their answer and `resolve` the ask.
+- `ask_timeout` (an older ask's default) permits only acting on it, recorded with `memory_add`;
+  if the default was NOT applied, act on the answer and `resolve` it.
+- `ask_rethink`: decide the ask as it says, or sweep its tasks `human_indispensable`.
 
 # Unblocking
 

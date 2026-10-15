@@ -10,7 +10,8 @@ its reason and its last re-check. The coordinator records exactly one outcome pe
 `sweep` action (OUTCOMES). `still_blocked` needs a re-checkable condition (`until_probe`, or an
 `until` that is not only "keep it blocked") and a next check (`start_after`); `human_indispensable`
 needs a `why`. An item the next sweep finds without an outcome since the last one, or whose
-`still_blocked` had no re-checkable condition or passed its next check, is carried and flagged. A
+`still_blocked` had no re-checkable condition or passed its next check, or that an ask has held past
+coordinator.ask_rethink_h (askrethink.py), is carried and flagged. A
 valid `still_blocked` whose next check is still ahead, on an item that has not changed since (status,
 spec, reason) and is no loop, is carried forward as one collapsed CARRIED line that needs no action; a
 sweep due only to its interval is skipped while every item is carried. A hold no turn can lift (`ends`:
@@ -36,7 +37,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import credits, failover, holdloops, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -286,8 +287,9 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     if since >= every:
         outs = db.kv(OUTCOMES_KEY, {}) or {}
         prev = state.get("items") or {}
+        rethought = rethink(db, cfg, live, now)
         if not holdloops.flagged(db) and all(_carries(i, state, outs, now) and not loop(db, i, prev.get(i["key"]))
-                                             for i in live):
+                                             and i["key"] not in rethought for i in live):
             # Every item keeps a valid, not-yet-due outcome: only a pending signal calls for a sweep.
             sigs = _signals(db, state, live, now)
             return "; ".join(sigs)[:300] if sigs else None
@@ -334,6 +336,18 @@ def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
     return out
 
 
+def rethink(db: DB, cfg: dict, live: list[dict], now: float) -> dict[str, str]:
+    """Blocked tasks an open ask has held past coordinator.ask_rethink_h (askrethink.py): a
+    `still_blocked` on one is flagged, never carried. The coordinator decides the ask itself, or
+    records `human_indispensable` with why only the user can answer it."""
+    held = askrethink.held_tasks(db, cfg, now)
+    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    return {i["key"]: f"held by open ask {held[i['task']]} past {askrethink.hours(cfg):g}h: decide the ask "
+                      f"yourself, or record human_indispensable with why only the user can"
+            for i in live if i["task"] in held
+            and (outs.get(i["key"]) or {}).get("outcome") != "human_indispensable"}
+
+
 def recheckable(o: dict) -> bool:
     """A still_blocked outcome names something anyone can re-check: a probe, or an `until` that is
     not only 'keep it blocked'."""
@@ -354,6 +368,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
         return None
     prev = state.get("items") or {}
     flagged = flags(db, state, live, now)
+    flagged.update(rethink(db, cfg, live, now))
     loops = {i["key"]: x for i in live if (x := loop(db, i, prev.get(i["key"])))}
     stuck = holdloops.flagged(db)
     for i in live:
@@ -364,7 +379,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
                if i["kind"] == "review" and backlog > 0 and (i["age_s"] or 0) >= backlog}
     outs = db.kv(OUTCOMES_KEY, {}) or {}
     carry = [i["key"] for i in live if i["key"] not in loops and i["key"] not in reviews
-             and carried(outs.get(i["key"]), i, now)]
+             and i["key"] not in flagged and carried(outs.get(i["key"]), i, now)]
     n = int(state.get("n") or 0) + 1
     with db.tx():
         db.set_kv(STATE_KEY, {"last": now, "n": n, "why": why, "flags": flagged, "loops": loops, "reviews": reviews,

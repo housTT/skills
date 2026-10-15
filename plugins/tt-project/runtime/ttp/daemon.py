@@ -34,6 +34,7 @@ from pathlib import Path
 from . import ackwait
 from . import alerts
 from . import anchors
+from . import askrethink
 from . import audit
 from . import awake
 from . import budget as bud
@@ -935,7 +936,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4188,6 +4189,19 @@ class Daemon:
             olds = sorted({m["old"] for m in moves} | {r["provider"] for r in running})
             self.alert(f"failover:{','.join(olds)}", "Provider failover: " + "; ".join(lines)[:1500],
                        severity="low", every_s=0)
+
+    def rethink_asks(self) -> None:
+        """Hand an open ask that has held work past coordinator.ask_rethink_h back to a high-effort
+        turn to decide (askrethink.py), once per ask. Checked once a minute."""
+        now = time.time()
+        if now - getattr(self, "_rethink_checked", 0.0) < 60:
+            return
+        self._rethink_checked = now
+        try:
+            for aid in askrethink.raise_due(self.p.db, self.cfg, now):
+                log(self.p, f"ask {aid} has held work past coordinator.ask_rethink_h: raised to the coordinator")
+        except Exception:   # a failed check must not stop the tick
+            log(self.p, "ask rethink failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def blocker_sweep(self) -> None:
         """Queue a blocker sweep (sweep.py) when one is due: a high-effort turn that re-checks every
