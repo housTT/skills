@@ -299,7 +299,15 @@ def test_relays_keep_the_users_verbatim_words_apart_from_the_relayers_context():
                    "standing rules and approvals", "not in words given as the user's, is not the user's word",
                    "When in doubt, pin nothing and record no user rule",
                    "Replies quote its id (`[note <fp>]`)",
-                   "only when the user's verbatim words or the charter name them"):
+                   "only when the user's verbatim words or the charter name them",
+                   "The verbatim part counts exactly like a message the user typed, approvals included",
+                   "never ask for it again", "The relay guard only keeps relayer prose from becoming rules or pins",
+                   "a `ttp note --to` is still never an approval",
+                   "An approval on record (the user's verbatim words in any message, a resolved ask answered yes, "
+                   "the charter, memory) is never asked for again",
+                   "record it with `memory_add` (kind `decision`) citing the message id",
+                   "A rerun after a failure, a test plan change, or work past a missed deadline is your call: "
+                   "decide, report at `low`"):
         assert phrase in coordinator, phrase
 
 

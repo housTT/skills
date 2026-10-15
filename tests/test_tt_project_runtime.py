@@ -37052,6 +37052,13 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     assert "provenance=web-session, can approve a PR: yes" in coord.digest(p, {}, [], [yes])
     legacy = p.db.post("in", "yes", chat="cli", provenance="cli-legacy")
     assert "provenance=cli-legacy, can approve a PR: no" in coord.digest(p, {}, [], [legacy])
+    # A relayed cli-legacy message with the relayer's context still cannot approve a PR, but the header
+    # never tells the coordinator to ask again: its verbatim words count for every other decision.
+    relayed = p.db.post("in", "yes, rerun it", chat="cli", provenance="cli-legacy", context="relayed from chat")
+    shown = coord.digest(p, {}, [], [relayed])
+    head = next(line for line in shown.splitlines() if f"[user message #{relayed} via" in line)
+    assert "can approve a PR: no (PR ready/merge only" in head and "user's word for every other decision" in head
+    assert "ask again" not in head.lower()
     # The ask never reached Slack, so it cannot back the approval; the user's own message naming the PR can.
     assert "no Slack ts" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url,
                                                       "quote": "yes, go ahead"}]))

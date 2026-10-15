@@ -899,7 +899,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if msg_ids:
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
             prov = m["provenance"] or "unknown"
-            ok = "yes" if prov in prguard.APPROVING else "no, ask again on an approving channel"
+            # Only PR approvals need an approving channel; the verbatim words decide everything else.
+            ok = "yes" if prov in prguard.APPROVING else ("no (PR ready/merge only; its verbatim words are the "
+                                                         "user's word for every other decision)")
             head = (f"- [user message #{m['id']} via {m['channel']}, provenance={prov}, can approve a PR: {ok}, "
                     f"chat={m['chat'] or '-'}]")
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
