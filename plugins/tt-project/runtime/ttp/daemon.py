@@ -2727,7 +2727,7 @@ class Daemon:
                 result, rstatus = gap_wait, "waiting"
                 summary = result["summary"]
         waiting = status == "ok" and rstatus == "waiting"
-        refusal = ackwait.unmanaged_wait(result, self._other_projects()) if waiting else ""
+        refusal = ackwait.unmanaged_wait(result, self._other_projects(), bool(jobs)) if waiting else ""
         if refusal:
             # A wait on another project's reply without `ttp ack-wait probe` would wake a model run on
             # every timer to read the inbox: not taken as a wait. Its next run hands off again.

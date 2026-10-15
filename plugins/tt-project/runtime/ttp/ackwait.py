@@ -75,18 +75,20 @@ def is_probe(probe) -> bool:
     return isinstance(probe, str) and bool(re.search(r"\back-wait\s+probe\b", probe))
 
 
-def unmanaged_wait(result: dict, projects) -> str:
+def unmanaged_wait(result: dict, projects, job_in_flight: bool = False) -> str:
     """Why a waiting hand-off is refused: it waits on another project's reply (its waiting_for asks
     for a reply from one of `projects`, this user's other projects, or from "another project") but
     its retry_when is not `ttp ack-wait probe`; '' when it is fine. Such a wait would otherwise wake a
-    model run on every timer to read the inbox, which the probe does for free."""
-    if not isinstance(result, dict) or is_probe(result.get("retry_when")):
+    model run on every timer to read the inbox, which the probe does for free. A wait with a detached job in
+    flight is the job's, not a reply's. A project is named only as `from <name>`, `<name> project` or
+    `<name>'s`, so a project with a generic name does not catch an unrelated wait."""
+    if job_in_flight or not isinstance(result, dict) or is_probe(result.get("retry_when")):
         return ""
     what = " ".join(str(result.get("waiting_for") or "").split())
     if not _REPLY_RE.search(what) or re.search(r"\bupstream\s+--fixed\b", str(result.get("retry_when") or "")):
         return ""
     names = [n for n in projects if isinstance(n, str) and n]
-    named = next((n for n in names if re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", what, re.I)), None)
+    named = next((n for n in names if re.search(rf"(?<![\w-])(?:from\s+{re.escape(n)}(?![\w-])|{re.escape(n)}(?:'s\b|\s+project\b))", what, re.I)), None)
     if not named and not _OTHER_PROJECT_RE.search(what):
         return ""
     frm = named or "<project>"

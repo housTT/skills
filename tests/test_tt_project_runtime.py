@@ -29769,6 +29769,16 @@ def test_a_wait_on_another_projects_reply_must_use_the_ack_wait_probe(env, tmp_p
         assert json.loads(t["result"])["status"] == "waiting", extra
 
 
+def test_unmanaged_wait_matches_a_project_only_by_form_and_skips_detached_jobs():
+    from ttp import ackwait
+    w = lambda text, **kw: ackwait.unmanaged_wait({"waiting_for": text, "retry_when": "exit 1"}, ["ci", "review"], **kw)
+    assert w("CI to respond") == "" and w("the review answer from the bot") == ""
+    assert w("a reply from ci to note 0123abcd").startswith("hand-off refused")
+    assert w("an answer from the review project").startswith("hand-off refused")
+    assert w("ci's reply").startswith("hand-off refused")
+    assert w("a reply from ci to note 0123abcd", job_in_flight=True) == ""
+
+
 def _checks_killed_by_reboot(p, tmp_path, tid, boot="an-earlier-boot"):
     """Task tid waits on its own `ttp checks --detach` in a clean git worktree; the reboot behind
     `boot` killed them (checks.pid of that boot, a dead pid, no checks.rc)."""
