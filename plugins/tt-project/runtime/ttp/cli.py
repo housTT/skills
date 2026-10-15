@@ -800,6 +800,22 @@ def cmd_say(a) -> None:
     if entry:
         sys.exit(say_remote(a.name, entry, text, a.chat, context))
     p = p or need(a.name, sys.argv[1:])
+    import sqlite3
+    from .db import is_busy
+    try:
+        seen, mid = _say_local(p, a, text, context)
+    except sqlite3.OperationalError as e:   # db.tx already waited and retried
+        if not is_busy(e):
+            raise
+        die(f"the database stayed busy ({e}); the message was not saved. Send it again"
+            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), 75)
+    if seen:
+        print(f"already received (#{mid})")
+    else:
+        print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+
+
+def _say_local(p: Project, a, text: str, context: str) -> tuple[dict | None, int]:
     seen = None
     with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
         if a.client_id:
@@ -809,19 +825,17 @@ def cmd_say(a) -> None:
                                                  provenance="cli-legacy", context=context)
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
-    if seen:
-        print(f"already received (#{mid})")
-    else:
-        print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+    return seen, mid
 
 
 def cmd_listen(a) -> None:
     p = need(a.name, sys.argv[1:])
     db = p.db
     if a.ack is not None:
-        # Acknowledged ids only move forward and never past the newest message.
-        db.x("UPDATE chats SET last_read=MAX(COALESCE(last_read,0), MIN(?, (SELECT COALESCE(MAX(id),0) "
-             "FROM messages))) WHERE id=?", (a.ack, a.chat))
+        # Acknowledged ids only move forward and never past the newest message. Best effort: the
+        # next acknowledgement catches up, so a busy database never ends the listener.
+        _listen_write(db, "UPDATE chats SET last_read=MAX(COALESCE(last_read,0), MIN(?, (SELECT COALESCE(MAX(id),0) "
+                      "FROM messages))) WHERE id=?", (a.ack, a.chat), f"acknowledging #{a.ack}")
     row = db.one("SELECT last_read, min_severity FROM chats WHERE id=?", (a.chat,))
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
@@ -923,14 +937,28 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
             # With --ack, only an acknowledgement marks messages read, so what was printed to a
             # reader that is gone comes back on the next listen.
             if a.ack is None:
-                db.x("UPDATE chats SET last_read=? WHERE id=?", (after, a.chat))
+                _listen_write(db, "UPDATE chats SET last_read=? WHERE id=?", (after, a.chat), f"marking #{after} read")
         if msgs:
-            db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
+            _listen_write(db, "UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat), "noting activity")
             if a.once:
                 return
         if deadline and time.time() > deadline:
             return
         time.sleep(poll_s(2))
+
+
+def _listen_write(db, sql: str, args: tuple, what: str) -> None:
+    """A listener's own bookkeeping write (db.x retries a busy database). Still busy after that: say so
+    on stderr and go on listening. Each of these writes is idempotent and the next one catches up."""
+    import sqlite3
+    from .db import is_busy
+    try:
+        db.x(sql, args)
+    except sqlite3.OperationalError as e:
+        if not is_busy(e):
+            raise
+        print(f"ttp: {what} skipped, the database stayed busy ({e}); the next update catches up",
+              file=sys.stderr, flush=True)
 
 
 def status_text(p: Project) -> str:

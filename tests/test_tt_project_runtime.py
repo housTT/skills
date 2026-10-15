@@ -5094,6 +5094,166 @@ def test_listen_ack_is_clamped_to_known_messages(env):
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == top
 
 
+def _hold_write_lock(path, release_after: float | None = None):
+    """A second connection holding the database's write lock (BEGIN IMMEDIATE), as a slow daemon
+    transaction does; released after `release_after` seconds, or by the caller."""
+    import sqlite3
+    import threading
+    other = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
+    other.execute("BEGIN IMMEDIATE")
+    release = lambda: (other.execute("ROLLBACK"), other.close())
+    if release_after is not None:
+        threading.Timer(release_after, release).start()
+    return release
+
+
+def _short_busy_waits(monkeypatch, timeout_s=0.1, pauses=(0.2, 0.4)):
+    from ttp import db as dbm
+    monkeypatch.setattr(dbm, "BUSY_TIMEOUT_S", timeout_s)
+    monkeypatch.setattr(dbm, "BUSY_RETRY_PAUSES_S", pauses)
+
+
+def _listen_once(p, chat, ack):
+    import signal
+    from types import SimpleNamespace
+    from ttp.cli import cmd_listen
+    was = signal.getsignal(signal.SIGTERM)   # cmd_listen installs its own; keep the test process's
+    try:
+        cmd_listen(SimpleNamespace(name=p.name, chat=chat, ack=ack, once=True, timeout=0.3))
+    finally:
+        signal.signal(signal.SIGTERM, was)
+
+
+def test_listen_ack_waits_out_a_write_lock_held_past_the_busy_timeout(env, monkeypatch, capsys):
+    """The relay's crash: `ttp listen --once --ack` while another process held the write lock longer
+    than the busy timeout raised "database is locked". A write is retried, so the ack lands."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    first = p.db.post("out", "first", chat="c1", kind="reply")
+    p.db.post("out", "second", chat="c1", kind="reply")
+    _short_busy_waits(monkeypatch)
+    _hold_write_lock(p.state / "project.db", release_after=0.3)   # longer than the 0.1 s busy timeout
+    _listen_once(p, "c1", first)
+    out = capsys.readouterr()
+    assert "second" in out.out and "first" not in out.out, out
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == first
+
+
+def test_listen_keeps_listening_when_its_ack_stays_locked(env, monkeypatch, capsys):
+    """Still locked after every retry: the acknowledgement is skipped with a line on stderr, never
+    raised, and the listener delivers as usual. The next acknowledgement catches up."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    first = p.db.post("out", "first", chat="c1", kind="reply")
+    p.db.post("out", "second", chat="c1", kind="reply")
+    _short_busy_waits(monkeypatch, pauses=(0.05,))
+    release = _hold_write_lock(p.state / "project.db")
+    try:
+        _listen_once(p, "c1", first)
+    finally:
+        release()
+    out = capsys.readouterr()
+    assert "first" in out.out and "second" in out.out, out   # nothing acknowledged yet: both again
+    assert "skipped, the database stayed busy" in out.err, out.err
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == 0
+    _listen_once(p, "c1", first)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == first
+
+
+def test_say_on_a_database_locked_past_its_retries_exits_75_without_a_traceback(env, monkeypatch, capsys):
+    import sqlite3
+    from types import SimpleNamespace
+    from ttp.cli import cmd_say
+    p = make(env)
+    _short_busy_waits(monkeypatch, pauses=(0.05,))
+    release = _hold_write_lock(p.state / "project.db")
+    try:
+        with pytest.raises(SystemExit) as ex:
+            cmd_say(SimpleNamespace(name=p.name, text="hello", context=None, chat=None, client_id="k1"))
+    finally:
+        release()
+    assert ex.value.code == 75
+    assert "message was not saved" in capsys.readouterr().err
+    _short_busy_waits(monkeypatch)
+    _hold_write_lock(p.state / "project.db", release_after=0.3)
+    cmd_say(SimpleNamespace(name=p.name, text="hello", context=None, chat=None, client_id="k1"))
+    assert "sent (#" in capsys.readouterr().out
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='client:k1'")) == 1
+
+
+def test_every_db_connection_waits_for_a_busy_database(env, tmp_path):
+    """No code path opens the project database without a busy timeout, and it runs in WAL mode."""
+    import ast
+    from ttp import db as dbm
+    d = dbm.DB(tmp_path / "x.db")
+    assert d.conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 1000
+    assert d.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    src = pathlib.Path(dbm.__file__).read_text()
+    connects = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "connect"]
+    assert len(connects) == 1, "db.py opens a connection outside DB.__init__"
+    assert any(k.arg == "timeout" for k in connects[0].keywords)
+
+
+def test_db_write_retries_a_lock_held_past_the_busy_timeout(env, tmp_path, monkeypatch):
+    import sqlite3
+    from ttp import db as dbm
+    _short_busy_waits(monkeypatch, timeout_s=0.05, pauses=(0.2, 0.4))
+    d = dbm.DB(tmp_path / "x.db")
+    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    d.set_kv("a", 1)                        # a write on its own
+    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    with d.tx():                            # a transaction's BEGIN IMMEDIATE
+        d.set_kv("b", 2)
+    assert (d.kv("a"), d.kv("b")) == (1, 2)
+    release = _hold_write_lock(tmp_path / "x.db")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):   # bounded: it gives up
+            d.set_kv("c", 3)
+    finally:
+        release()
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):   # not busy: never retried
+        d.x("UPDATE nope SET a=1")
+
+
+def test_a_slow_write_transaction_is_logged_with_its_caller(tmp_path, monkeypatch):
+    from ttp import db as dbm
+    monkeypatch.setattr(dbm, "SLOW_TX_S", 0.0)
+    d = dbm.DB(tmp_path / "x.db")
+
+    def slow_writer():
+        with d.tx():
+            d.set_kv("a", 1)
+    slow_writer()
+    line = (tmp_path / "logs" / "slow-tx.log").read_text()
+    assert "write lock held" in line and "slow_writer" in line, line
+
+
+def test_run_end_reads_the_root_checkout_after_its_transaction_commits(env, monkeypatch):
+    """git status of the project root (_note_dirty_main) can take long in a large repository; it runs
+    after the run-end transaction commits, never while every other process waits for its lock."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    d = Daemon(p.base)
+    seen, real = [], worktree.dirty_tracked
+    monkeypatch.setattr(worktree, "dirty_tracked", lambda repo: seen.append(d.p.db.conn.in_transaction) or real(repo))
+    tid = p.db.add_task("hand-off", "spec", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok"}))
+    (env["repo"] / "README.md").write_text("edited\n")
+    with d.p.db.tx():   # as _finish_run calls it
+        d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+        assert seen == [], "git status ran inside the write transaction"
+    assert seen == [False]
+    assert p.db.q("SELECT id FROM events WHERE kind='observation' AND text LIKE '%README.md%'")
+
+
 def test_listen_honours_the_project_chat_floor(env):
     """notify.chat_min_severity filters broadcasts on every listener; a per-chat floor can only raise it."""
     p = make(env)

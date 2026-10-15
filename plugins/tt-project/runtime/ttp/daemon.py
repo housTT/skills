@@ -2893,7 +2893,9 @@ class Daemon:
         if new == "done" and worktree.own_worktree(task):
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
-        self._note_dirty_main(task)
+        # git status of the project root can take long in a large repository: after the run-end
+        # transaction commits, so it never holds the write lock every other process waits on.
+        db.after_commit(lambda: self._note_dirty_main(task))
         if waiting and new == "queued" and extra.get("escalated_wake") and gate_probe:
             self._start_probe(task["id"], gate_probe, time.time())
         if waiting and new == "queued":

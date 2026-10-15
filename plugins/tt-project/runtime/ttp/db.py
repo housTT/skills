@@ -172,19 +172,50 @@ CREATE TABLE IF NOT EXISTS push_batches(
 OPEN_ASK_MAX_AGE_S = 14 * 86400
 
 
+# Every connection waits this long for another's write lock before SQLITE_BUSY ("database is locked").
+BUSY_TIMEOUT_S = 30
+# Then a write is tried again this many more times, after these pauses, before the error is raised.
+BUSY_RETRY_PAUSES_S = (0.5, 2.0)
+# A write transaction held longer than this is logged with its caller (logs/slow-tx.log next to the
+# database): it makes every other process wait, and past BUSY_TIMEOUT_S their writes fail.
+SLOW_TX_S = 5.0
+
+
+def is_busy(e: BaseException) -> bool:
+    """True for SQLite's busy or locked error: another connection holds the lock (transient)."""
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    code = getattr(e, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (5, 6)   # SQLITE_BUSY, SQLITE_LOCKED and their extended codes
+    msg = str(e).lower()
+    return "database is locked" in msg or "database table is locked" in msg or "database is busy" in msg
+
+
+def retry_busy(fn: Callable[[], Any], pauses: Iterable[float] | None = None) -> Any:
+    """fn(), tried again after each pause while it fails only because the database is busy."""
+    for pause in (*(BUSY_RETRY_PAUSES_S if pauses is None else pauses), None):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if pause is None or not is_busy(e):
+                raise
+            time.sleep(pause)
+
+
 class DB:
     """Thin wrapper: short transactions, WAL, rows as dicts. Safe to open from many processes."""
 
     def __init__(self, path: str | Path):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        self.conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, isolation_level=None)
         self._after_commit: list[Callable[[], Any]] = []
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=30000")
+        self.conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
+        retry_busy(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(SCHEMA)
+        retry_busy(lambda: self.conn.executescript(SCHEMA))
         if self.meta("schema_version") is None:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
         self._migrate()
@@ -378,7 +409,11 @@ class DB:
         return dict(r) if r else None
 
     def x(self, sql: str, args: Iterable[Any] = ()) -> int:
-        cur = self.conn.execute(sql, tuple(args))
+        args = tuple(args)
+        if self.conn.in_transaction:   # the transaction holds the write lock (BEGIN IMMEDIATE)
+            cur = self.conn.execute(sql, args)
+        else:                          # a write on its own: it commits or fails whole, so it is safe to retry
+            cur = retry_busy(lambda: self.conn.execute(sql, args))
         return cur.lastrowid or cur.rowcount
 
     @contextmanager
@@ -387,7 +422,8 @@ class DB:
         if self.conn.in_transaction:
             yield
             return
-        self.conn.execute("BEGIN IMMEDIATE")
+        retry_busy(lambda: self.conn.execute("BEGIN IMMEDIATE"))
+        began = time.monotonic()
         try:
             yield
         except BaseException:
@@ -395,9 +431,26 @@ class DB:
             self.conn.execute("ROLLBACK")
             raise
         self.conn.execute("COMMIT")
+        held = time.monotonic() - began
+        if held > SLOW_TX_S:
+            self._log_slow_tx(held)
         pending, self._after_commit = self._after_commit, []
         for fn in pending:
             fn()
+
+    def _log_slow_tx(self, held: float) -> None:
+        """One line per slow write transaction, with the code that held it: slow work (git, a subprocess,
+        the network) belongs before the transaction or in after_commit. A report only: never raises."""
+        try:
+            import traceback
+            where = " <- ".join(f"{Path(f.filename).name}:{f.lineno} {f.name}"
+                                for f in reversed(traceback.extract_stack()[:-3][-8:]))
+            log = Path(self.path).parent / "logs" / "slow-tx.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} write lock held {held:.1f} s: {where}\n")
+        except Exception:
+            pass
 
     def after_commit(self, fn: Callable[[], Any]) -> None:
         """Run fn once the open transaction commits, or now outside one. Slow side effects go here,
