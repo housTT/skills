@@ -1,0 +1,33 @@
+# Watchers
+
+`kind: command` schedules; scripts under `watchers/` in the harness.
+One JSON line per observation: `{"text", "severity", "repeat", "whole", "key", "episode"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet.
+Write a line as `<subject>: <item>; <item>`: each item is one issue (counts masked), an item may start with `now`, `still:`, `changed:` or `cleared:`, and `cleared: <item>` closes it.
+A JSON line with `"whole": true` is one observation instead: one issue for all the text after its subject, never split at `; ` (a long title is truncated); a leading `cleared:` closes it.
+An optional `"key"` (a short stable string) is the issue's identity instead of its text, so a changed text under the same key updates that issue and opens no new one.
+An optional `"episode"` on a keyed line names one occurrence of that condition (say its start time or a job id): a different non-empty episode closes the key's open or closed issue as `superseded by a new episode` and opens a new one, which wakes like any new issue (severity floor and mutes apply, the reraise window does not).
+The same episode, or none, changes nothing; an issue opened without one adopts the first it sees.
+On a keyed line, text after the subject that starts with the word `cleared` (any case, colon optional: `cleared: X`, `cleared X`, `Cleared by ops`) is a clear: it closes the open issue under that key, if there is one, and never opens one, so `fleet gate: cleared: X` with key `X:cleared` raises nothing.
+Put the state after the item instead (`fleet gate: X cleared`).
+A leading `now`, `still` or `changed` is stripped and the keyed issue opens or updates as usual.
+Give every line whose text changes from run to run a key naming the condition (`"key": "box-a down"`): a varying reason, a duration (`down for 0.7h`), a count or a long line with `; ` in it otherwise opens a new issue per variant or fragment.
+A watcher that opens more than `screen.same_subject_warn` (3; 0 off) issues of one kind on one subject within 24 h gets a daemon log line, listing the keys it counted, and a note in the digest and the daily review, with no wake of its own: fix its output.
+Keyless issues are one kind; a key's kind is its condition class: its `:`, `/` or `#` segments without the subject's and without trailing segments that hold a number, digits counted as one number (`hold:3` and `hold:4` are one kind; `outage ended`, `drop-in` and `<watcher>:<box>:reboot` next to `<watcher>:<box>:fsm` are distinct conditions).
+A keyed issue counts each time it opens or reopens, so one key that keeps closing and coming back warns too.
+A multi-line observation without a key is keyed by its first line: make it a stable heading and list the changing items below it.
+An info line (`"severity": "info"`) takes the same path as any other: its `cleared:` items close issues and it replaces older receipts of the same subject.
+Known gap: info lines are not suppressed, so an item first seen at info is still recorded as a quiet issue (it wakes once a line rates it higher).
+A run that prints nothing closes the watcher's open issues, and an issue not seen for 24 h (or 3 periods of a slower watcher) closes; a closed one seen again reopens and wakes at its severity.
+Exception: a keyed issue that a run printing nothing closed, sent again under its key within `screen.reraise_window_h` (6; 0 or null off) of that close at the same or a lower severity, only counts: it stays closed and wakes nobody; a higher severity reopens and wakes, and a `"repeat": true` line always wakes.
+An event that must stay until its owner acknowledges it (a receipt): print it every run, with its identity as a prefixed token (`evidence_<hash>`: bare hashes and numbers are masked), until the owner acknowledges it, and set `rewake_after_h` null so an unchanged one never wakes again; a changed token wakes.
+A receipt source that may miss runs or report several subjects also sets `issue_lifecycle` `explicit_clear`: its items then never close by time (downtime included); one closes when the owner acknowledges it (`cleared: <item>`, or a run that prints nothing) or when a run reports a different item for the same subject (the changed outcome wakes; a later return to the old one wakes too).
+Exit codes and errors: exit 0 or 1 is a normal run (1 is how a checker says it found something), so every line it prints is a report under `watcher:<name>`, also a line whose text says error or failed.
+When the watcher itself could not check (a source it reads is missing, a call failed), print that as a JSON line with `"error": true` (the JSON boolean; the string `"true"` is a report), at any exit code.
+Any other exit code is a failed run: with no output it is one error; lines it printed still count (reports, or errors where marked) and the exit code is one error more.
+A watcher's own failures (timeout, failed exit code, or a line with `"error": true`) are errors under `watcher-error:<name>`, never receipts: they close after the usual quiet time or at the next run at exit 0 or 1 that no longer reports them, so the same failure later wakes again.
+Mark them: an unmarked failure line is a report, which stays open while the watcher prints other lines, so the same failure coming back after a good run wakes nobody.
+Paging another project: a JSON line with `"to": "<project>"` (a project on this machine, `ttp list`) is filed by the daemon as a note to that project's coordinator instead of an observation here, no run needed.
+`"to": "@machine-owner"` with `"machine": "<alias>"` names that machine's owner from `ttp machines`: a known outage's owner when that is a project here, else its `recovery_owner`, else its `recovery_fallback`.
+One note per `key` (else per text; a keyed line's new `episode` is a new note) until the watcher stops reporting it; it is sent again after `rewake_after_h`, or on every run with `"repeat": true`; at most 10 notes a run, the rest on later runs.
+A `to` naming this project, an unknown project or a machine without an owner here is logged and the line is an ordinary observation.
+With a Jev key, Jev rates each new observation; each call is logged with its cost and the coordinator wake it skipped, and a Jev use that saves nothing over `jev.window_days` (at least `jev.min_calls` calls) switches itself off once, reported, as does one whose last `jev.idle_calls` (20) calls changed none of the rules' decisions; `jev.uses.<use>` = `on`/`off` forces it (uses: `screen`; `effort`, which may start a short-lookup task the coordinator queued at standard at light)

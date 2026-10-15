@@ -2900,7 +2900,7 @@ def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_
     assert watchdup.check(p.db, {"screen": {"same_subject_warn": 0}}, ["watcher:quiet"]) == []
     assert len(watchdup.check(p.db, {}, ["watcher:quiet"])) == 1
     # Watcher authors are told to key changing text, in the skill and the coordinator's schedule_set notes.
-    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
+    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "watchers.md").read_text().split())
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert '"whole", "key", "episode"}' in skill and "Give every line whose text changes from run to run a key" in skill
     assert "`screen.same_subject_warn`" in skill
@@ -12809,7 +12809,7 @@ def test_command_watcher_exit_1_is_a_normal_run_and_only_error_true_lines_are_er
                for x in issues(err))
     assert fix_tasks() == 0
     # The skill and the coordinator's schedule_set entry say so.
-    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
+    skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "watchers.md").read_text().split())
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "exit 0 or 1 is a normal run" in skill and '`"error": true` (the JSON boolean' in skill
     assert "any other exit code is a failed run" in skill.lower()
@@ -13844,6 +13844,8 @@ def test_setup_installs_the_skills_and_ttp_skill_finds_them_from_any_project(env
     assert r.returncode == 0, r.stderr
     skill = env["home"] / "lib" / __version__ / "skills" / "tt-project-harness" / "SKILL.md"
     assert skill.read_text() == (TTP.parents[1] / "skills" / "tt-project-harness" / "SKILL.md").read_text()
+    refs = sorted((TTP.parents[1] / "skills" / "tt-project-harness" / "references").glob("*.md"))
+    assert refs and all((skill.parent / "references" / f.name).read_text() == f.read_text() for f in refs)
     installed = env["home"] / "lib" / "current" / "bin" / "ttp"
     r = subprocess.run([sys.executable, str(installed), "skill", "tt-project-harness"],
                        capture_output=True, text=True, timeout=300)

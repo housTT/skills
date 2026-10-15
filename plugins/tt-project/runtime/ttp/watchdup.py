@@ -34,10 +34,10 @@ from . import screen   # a module, not its names: screen imports this module too
 WINDOW_S = 86400.0
 DEFAULT = 3
 KEY = "watcher_same_subject"   # kv: "<source>\n<subject>" -> {source, subject, n, at, kind, keys}
-FIX = 'give its JSON lines a stable "key" (or "whole": true), see the tt-project-harness skill'
-KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see the tt-project-harness skill'
-CHURN_FIX = ('it keeps closing and reopening: report the condition on every run while it holds, see the '
-             'tt-project-harness skill')
+FIX = 'give its JSON lines a stable "key" (or "whole": true), see references/watchers.md in the tt-project-harness skill'
+KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see references/watchers.md in the tt-project-harness skill'
+CHURN_FIX = ('it keeps closing and reopening: report the condition on every run while it holds, see '
+             'references/watchers.md in the tt-project-harness skill')
 NO_KEY = ""                    # the kind of every issue opened under no key
 SHOWN_KEYS = 6
 STORED_KEYS = 20             # keys kept per warning; n counts them all

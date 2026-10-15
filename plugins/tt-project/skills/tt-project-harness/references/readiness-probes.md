@@ -1,0 +1,9 @@
+# Readiness probes
+
+A `start_when` or `retry_when` that waits for a device or box checks it live and read-only (the broker's status, `tt-box-clean-probe`), never a bare marker file such as `test -f state/ready/<box>.READY`: the file outlives the box going down, so the task starts against a dead box.
+A wait for a broker hold to end checks with `ttp broker-released` (runtime `brokerhold.py`), which counts /health `held` false with a healthy fsm, a `hold released` log line and a `device_released` event alike: a check that only looks for one of them misses a release the broker reported another way.
+A marker that is used is removed by whatever writes it when the resource is paused, shows trouble or fails its probe.
+`task_add`/`task_update`, `ttp task add --start-when` and `ttp task set-when` flag (never refuse) a probe that only tests a readiness marker.
+Exit 255 is ssh's own only (the host does not answer): quote the remote command as one string (`ssh <box> 'test -e <path>' || exit 1`) and let a failing remote command exit 1 or another code, never `|| exit 255`.
+Before a probe's 255 counts as unreachable (and toward the network outage alert), the daemon checks each host it names with `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> true`; one that names no host, or whose host answers, is a broken probe for its task (a start_when's comes to the coordinator as an event, a retry_when's wakes its task).
+Write a pause's `end_when` the same way: an `end_when` or `until_probe` 255 gets the same check (in the background), and one whose host answers is reported as a broken probe.

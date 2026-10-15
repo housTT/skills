@@ -885,6 +885,17 @@ def test_box_clean_probe_ships_executable_and_documented():
     assert "tt-box-clean-probe" in (SKILLS / "tt-project-harness" / "SKILL.md").read_text()
 
 
+def test_skill_lines_stay_short_and_long_rows_live_in_linked_references():
+    """A giant table row is read whole by every worker and conflicts on every concurrent edit: no
+    SKILL.md line passes 1,000 characters, and each references/ file is linked from its SKILL.md."""
+    for path in SKILLS.glob("*/SKILL.md"):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            assert len(line) <= 1000, f"{path.relative_to(PLUGIN)}:{n} is {len(line)} characters: move it to references/"
+        text = path.read_text(encoding="utf-8")
+        for ref in (path.parent / "references").glob("*.md"):
+            assert f"](references/{ref.name})" in text, f"{ref.relative_to(PLUGIN)} is not linked from its SKILL.md"
+
+
 @pytest.mark.parametrize("job", [
     _job(3, owner="[broker]power-cycle"), _job(3, owner="[broker]bridge-reset"), _job(3, owner="[broker]reboot"),
     _job(3, owner="[broker]pci-rescan"), _job(3, owner="[broker]health-gate"),
