@@ -65702,6 +65702,18 @@ def test_broker_released_counts_health_held_false_and_hold_released_log_lines(en
     assert rel('{"held": false}\n' + log)[0]
     assert not rel(log + "22:10:00 hold set by recovery\n")[0]
     assert not rel("")[0] and not rel("12:00 no hold today\n")[0]
+    # The broker's real /health shape reports fsm_state, not fsm.
+    real = '{"status": "ok", "version": "1", "running": 0, "queued": 0, "held": %s, "fsm_state": "%s", "fsm_why": ""}\n'
+    assert rel(real % ("false", "healthy"))[0]
+    assert rel(log + "22:10:00 hold set by recovery\n" + real % ("false", "healthy"))[0]
+    assert not rel(real % ("true", "healthy"))[0]
+    assert not rel(real % ("false", "recovering"))[0]
+    no_fsm = rel('{"status": "ok", "held": false}\n')
+    assert not no_fsm[0] and "no /health answer" not in no_fsm[1] and "fsm not reported" in no_fsm[1]
+    # A device_held event after device_released is held again; a device_held_since field is not a hold.
+    assert not rel('{"kind": "device_released"}\n{"kind": "device_held", "reason": "x"}\n')[0]
+    assert rel('{"kind": "device_held", "reason": "x"}\n{"kind": "device_released"}\n')[0]
+    assert rel('{"kind": "device_released"}\n12:00 device_held_since=0\n')[0]
     # The CLI probe: 0 released, 1 not, from files or stdin.
     f = tmp_path / "server.log"
     f.write_text(log)

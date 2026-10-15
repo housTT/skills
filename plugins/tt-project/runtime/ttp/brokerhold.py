@@ -9,10 +9,11 @@ others: a `device_released` event, a log line such as `STARTUP hold released aft
 counts. The input is any mix of /health JSON and log text (e.g. `curl -s .../health; tail -n 500
 <log>` over ssh), read line by line:
 - /health JSON (an object with a `held` field; the last one counts) is live, so it decides: `held`
-  false with `fsm` healthy (a string, or an object's `state`) is released; `held` true, or an fsm
-  that is not healthy, is not, whatever the log says.
+  false with a healthy fsm (the broker's `fsm_state`; else `fsm`, a string or an object's `state`)
+  is released; `held` true, or an fsm that is not healthy, is not, whatever the log says.
 - Otherwise (no /health, or one with no fsm) the last hold line in the log decides: a release line
-  (above) is released, a later line that sets a hold again (`hold set`, `hold engaged`, ...) is not.
+  (above) is released, a later line that sets a hold again (a `device_held` event, `hold set`,
+  `hold engaged`, ...) is not.
 """
 from __future__ import annotations
 
@@ -20,7 +21,8 @@ import json
 import re
 
 RELEASE_RE = re.compile(r"\bhold\s+released\b|\bdevice_released\b", re.I)
-HOLD_RE = re.compile(r"\bhold\s+(?:set|placed|engaged|started|acquired|applied)\b", re.I)
+# `device_held(?!_)`: the event, not a field such as `device_held_since`.
+HOLD_RE = re.compile(r"\bhold\s+(?:set|placed|engaged|started|acquired|applied)\b|\bdevice_held\b(?!_)", re.I)
 HEALTHY = "healthy"
 
 
@@ -37,7 +39,9 @@ def _health(line: str) -> dict | None:
 
 
 def _fsm(health: dict) -> str:
-    fsm = health.get("fsm")
+    fsm = health.get("fsm_state")
+    if fsm is None:
+        fsm = health.get("fsm")
     if isinstance(fsm, dict):
         fsm = fsm.get("state")
     return str(fsm).strip().lower() if fsm is not None else ""
@@ -59,5 +63,7 @@ def released(text: str) -> tuple[bool, str]:
         if held is not False or fsm:
             return False, f"/health: held {json.dumps(held)}, fsm {fsm or 'not reported'}"
     if last is None:
+        if health is not None:
+            return False, "/health: held false, fsm not reported, and no hold line in the log"
         return False, "no /health answer and no hold line in the log"
     return last[0], ("released: " if last[0] else "held again: ") + last[1][-200:]
