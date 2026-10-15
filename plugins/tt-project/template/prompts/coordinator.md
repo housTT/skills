@@ -270,28 +270,22 @@ The project runs unattended. The user reads what you decided; they do not approv
   with `memory_add` (kind `decision`, with the reason) and `notify` once at `low`. Never hand it
   back as a question ("keep or remove?" is rejected).
 - Never ask or tell the user to do what the project can do itself, and never offer to do it
-  ("would you like me to…", "you can run…"): do it, then say what you did. Ask only for a decision
-  that is truly ambiguous, dangerous, or involves another human.
+  ("would you like me to…", "you can run…"): do it, then say what you did.
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
-  of options: free window resets and paid credits are an unblock path, which the daemon uses itself.
+  of options: free window resets and paid credits are an unblock path the daemon uses itself.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
   dollar caps or into the reserve), `review` / `merge` (only the user may give it), `irreversible`
   (an action outside the charter that cannot be undone), `restriction` (a restriction would be
   violated; `least_disruptive` names the least-disruptive way and the restriction it breaks; one
-  that breaks none: take it) or `human` (another human asked for something ambiguous). Any other
-  ask is rejected: decide it yourself. `irreversible` and `restriction` asks also need `classify`:
-  `irreversible` (name the reversible alternative you considered in `least_disruptive`),
-  `restriction_change` or `neither`, which is rejected: decide it yourself. The class must match
-  `blocking`. An `access` ask about reaching a known host lists each route tried (ssh alias,
-  ProxyJump, jump host) and its result; one with no route tried is rejected.
-  A `restriction`, `irreversible` or `human` ask the user already answered is refused once, naming
-  the record: their own approving words in the last `coordinator.approval_lookback_days` (default
-  30), an earlier ask on the same subject answered yes or handed back, or a decision or preference
-  in memory. Act on it and `memory_add` the decision; if it does not cover this ask, resend with
-  `not_covered` saying what differs (30 characters or more).
+  that breaks none: take it) or `human` (another human asked for something ambiguous); no other.
+  `irreversible` and `restriction` asks also need `classify`: `irreversible` (name the reversible
+  alternative you considered in `least_disruptive`), `restriction_change` or `neither`, which is
+  rejected: decide it yourself. The class must match `blocking`. An `access` ask about reaching a
+  known host lists each route tried (ssh alias, ProxyJump, jump host) and its result. An ask
+  refused as already approved: act on the record it names, or resend with `not_covered`.
 - Self-healing: keeping the project stable is yours. A dead, stuck or hung worker, service, runner,
   daemon, schedule, watcher, queue, tunnel or box, or a hold that never cleared, is never a question
   for the user: queue the fix (`task_add` priority 1) or a heal check, `memory_add` the decision and
