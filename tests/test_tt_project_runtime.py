@@ -411,11 +411,13 @@ def _no_real_providers(tmp_path, monkeypatch) -> list:
 
 
 @pytest.fixture(scope="session")
-def _short_tmp():
-    """A short folder for the short temp dirs (ttp.shorttmp) tests make, removed at the end.
-    TTP_TEST_SHORT_TMP_ROOT puts it elsewhere (a nested suite that must write nothing else to /tmp)."""
+def _short_tmp(pytestconfig):
+    """A short folder for the short temp dirs (ttp.shorttmp) tests make, removed at the end: on the
+    session's tmpfs when conftest.py picked one, else /tmp. TTP_TEST_SHORT_TMP_ROOT puts it elsewhere
+    (a nested suite that must write nothing else to /tmp)."""
+    root = os.environ.get("TTP_TEST_SHORT_TMP_ROOT") or getattr(pytestconfig, "_ttp_tmpfs", None) or "/tmp"
     try:
-        base = tempfile.mkdtemp(prefix="ts", dir=os.environ.get("TTP_TEST_SHORT_TMP_ROOT") or "/tmp")
+        base = tempfile.mkdtemp(prefix="ts", dir=root)
     except OSError:   # a sandbox that refuses /tmp: the default temp root
         base = tempfile.mkdtemp(prefix="ts")
     # Named without links, as shorttmp.root() names it: macOS /tmp is a link to /private/tmp, and tests
@@ -45642,6 +45644,7 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", str(nested_tmp))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
+    monkeypatch.setenv("TTP_TEST_TMPFS", "0")   # and its pytest temp root stays under its TMPDIR
     for var in ("TMPDIR", "TMP", "TEMP"):
         monkeypatch.setenv(var, str(nested_tmp))
     cli.main(["checks"])

@@ -438,3 +438,54 @@ def _run_forked(session, units, jobs: int) -> None:
         raise session.Failed(session.shouldfail)
     if session.shouldstop:
         raise session.Interrupted(session.shouldstop)
+
+
+# On Linux the session's temp files go to a RAM disk when one is free: the suite writes gigabytes of
+# short-lived git repositories, and on disk that costs about a third of its CPU and wall time.
+TMPFS = "/dev/shm"
+TMPFS_MIN_FREE = 2 << 30
+
+
+def _tmpfs_root(given_basetemp, environ, platform: str = sys.platform, path: str = TMPFS,
+                min_free: int = TMPFS_MIN_FREE, mounts: str = "/proc/self/mounts") -> str | None:
+    """The tmpfs folder to hold this session's temp files, or None to keep pytest's default: not
+    Linux, a --basetemp or PYTEST_DEBUG_TEMPROOT the user chose, TTP_TEST_TMPFS=0, or no writable
+    tmpfs at `path` with `min_free` bytes free."""
+    if (not platform.startswith("linux") or given_basetemp is not None or environ.get("PYTEST_DEBUG_TEMPROOT")
+            or environ.get("TTP_TEST_TMPFS", "").strip() == "0"):
+        return None
+    try:
+        real = os.path.realpath(path)
+        with open(mounts, encoding="utf-8") as f:
+            fstype = {p[1]: p[2] for p in (line.split() for line in f) if len(p) > 2}.get(real)
+        st = os.statvfs(real)
+    except OSError:
+        return None
+    if fstype != "tmpfs" or not os.access(real, os.W_OK | os.X_OK) or st.f_bavail * st.f_frsize < min_free:
+        return None
+    return real
+
+
+@pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory
+def pytest_configure(config):
+    """Puts the session's base temp under the tmpfs _tmpfs_root picks, in this process only: an
+    exported PYTEST_DEBUG_TEMPROOT would also move the temp root of a nested pytest that a test
+    starts. pytest still numbers, retains and removes the folders as usual. config._ttp_tmpfs tells
+    the _short_tmp fixture the same root."""
+    factory = getattr(config, "_tmp_path_factory", None)
+    root = _tmpfs_root(getattr(factory, "_given_basetemp", None), os.environ) if factory is not None else None
+    config._ttp_tmpfs = root
+    if root is None:
+        return
+    import tempfile
+    default = factory.getbasetemp
+
+    def getbasetemp():
+        if factory._basetemp is not None:
+            return factory._basetemp
+        saved, tempfile.tempdir = tempfile.tempdir, root   # pytest's temp root is tempfile.gettempdir()
+        try:
+            return default()
+        finally:
+            tempfile.tempdir = saved
+    factory.getbasetemp = getbasetemp

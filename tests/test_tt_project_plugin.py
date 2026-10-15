@@ -856,6 +856,36 @@ def test_the_test_runner_summary_line_is_stable_and_greppable():
     assert line == "ttp-suite: wall 312.4s cpu 1840.2s workers 4"
 
 
+def test_the_suite_puts_its_temp_files_on_a_free_tmpfs_on_linux_only(tmp_path, pytestconfig):
+    """tests/conftest.py moves the session's temp root to a writable tmpfs with enough room, on Linux,
+    unless the user chose a temp root or opted out; and only in this process, never through the env."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ttp_conftest_copy", pathlib.Path(__file__).with_name("conftest.py"))
+    conf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(conf)
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    mounts = tmp_path / "mounts"
+
+    def pick(fstype="tmpfs", given=None, environ=None, platform="linux", min_free=0, path=shm):
+        mounts.write_text(f"tmpfs {shm} {fstype} rw,nosuid,nodev 0 0\n")
+        return conf._tmpfs_root(given, environ or {}, platform=platform, path=str(path), min_free=min_free,
+                                mounts=str(mounts))
+
+    assert pick() == os.path.realpath(shm), "a writable tmpfs with room"
+    assert pick(fstype="ext4") is None and pick(path=tmp_path / "missing") is None, "no tmpfs there"
+    assert pick(min_free=1 << 62) is None, "too small"
+    assert pick(environ={"TTP_TEST_TMPFS": "0"}) is None, "opted out"
+    assert pick(environ={"TTP_TEST_TMPFS": "1"}) == os.path.realpath(shm)
+    assert pick(given=tmp_path / "bt") is None, "--basetemp"
+    assert pick(environ={"PYTEST_DEBUG_TEMPROOT": str(tmp_path)}) is None, "a temp root the user set"
+    assert pick(platform="darwin") is None, "macOS keeps pytest's default"
+    chosen = getattr(pytestconfig, "_ttp_tmpfs", None)
+    if chosen:   # this session picked a tmpfs: its temp dirs are there, and nothing was exported
+        assert str(tmp_path.resolve()).startswith(chosen + os.sep)
+        assert "PYTEST_DEBUG_TEMPROOT" not in os.environ
+
+
 BOX_PROBE = PLUGIN / "template" / "bin" / "tt-box-clean-probe"
 PROBE_NOW = "2026-01-10T12:00:00"
 
