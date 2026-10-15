@@ -1242,7 +1242,7 @@ class Project:
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         new = " ".join(text.split())
-        errors, olds = [], []
+        errors, olds, auds = [], [], set()
         for raw in names:
             try:
                 name, archived = self._resolve_memory_name(Path(raw.strip().strip("[]")).stem)
@@ -1256,6 +1256,8 @@ class Project:
             m = re.search(r"^kind:\s*(\S+)", head, re.M)
             old = m.group(1) if m else name.split("-", 1)[0]
             old_standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
+            am = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
+            auds.add(am.group(1) if am else "")
             if old_standing and not standing:
                 errors.append(f"[{name}] is a standing instruction: only a --standing entry replaces it")
             allowed = {"restriction": ("restriction",), "preference": ("preference", "restriction"),
@@ -1270,7 +1272,9 @@ class Project:
             olds.append(name)
         if errors:
             raise ValueError("nothing changed: " + "\n".join(errors))
-        added = self.add_memory(text, kind=kind, standing=standing, commit=False)
+        # Merged entries that all share one audience keep it.
+        added = self.add_memory(text, kind=kind, standing=standing, commit=False,
+                                audience=next(iter(auds)) if len(auds) == 1 else None)
         done, errors = self.forget_memories(olds, keep=added.stem, why=f"merged into [{added.stem}]", commit=False)
         self.commit_harness([added, self.memory_index, *done],
                             f"memory ({kind}): [{added.stem}] supersedes {', '.join(d.stem for d in done)}",

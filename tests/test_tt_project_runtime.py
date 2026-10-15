@@ -58706,3 +58706,15 @@ def test_host_line_splits_cut_runs_into_lost_and_resumed_and_names_planners(env)
     assert "(1 planned: by proj-a)" in line, line
     assert dbm.host_line([{"ts": time.time(), "lost": []}]).endswith("0 runs cut short")
     assert line.endswith("3 runs cut short: 2 lost ($1.50), 1 resumed with work kept ($2.50)"), line
+
+
+def test_memory_supersedes_keeps_a_shared_audience(env):
+    p = make(env)
+    a = p.add_memory("Alpha fact.", title="aud a", audience="coordinator")
+    b = p.add_memory("Beta fact.", title="aud b", audience="coordinator")
+    new, _ = p.supersede_memory("Alpha and beta facts.", [a.stem, b.stem])
+    assert re.search(r"^audience:\s*coordinator\s*$", new.read_text(), re.M)
+    c = p.add_memory("Gamma fact.", title="aud c", audience="coordinator")
+    d = p.add_memory("Delta fact.", title="aud d", audience="workers")
+    new, _ = p.supersede_memory("Gamma and delta facts.", [c.stem, d.stem])
+    assert not re.search(r"^audience:", new.read_text(), re.M)
