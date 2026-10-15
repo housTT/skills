@@ -15203,6 +15203,181 @@ def test_memory_cli_says_to_put_the_text_before_forget_when_a_name_has_spaces(en
     assert "before it" not in str(e.value)
 
 
+def test_memory_every_prompt_leaves_out_is_archived_daily_after_the_set_days(env):
+    """Prompts record which entries they carried; once a day the daemon archives the decisions and
+    facts every prompt left out for memory.archive_hidden_days, with one commit and one low feed line.
+    Pinned kinds and standing entries never go, and a project that built no prompts hides nothing."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_system
+    day = 86400
+    old = [p.add_memory(f"Old decision {i}: " + "z" * 3000, kind="decision", title=f"Old decision {i}")
+           for i in range(6)]
+    pinned = [p.add_memory("Use the shared queue for jobs.", kind="preference"),
+              p.add_memory("Box pool: the lab machines.", kind="resource"),
+              p.add_memory("Whenever a job fails, file a note.", kind="decision", standing=True)]
+    for f in old + pinned:   # written long ago
+        f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
+    t0 = time.time()
+    p.note_memory_shown([], now=t0 - 30 * day)   # recording began a month ago
+    coord.recent_memory_lines(p)
+    worker_system(p)
+    shown = p.db.kv("memory_shown")["entries"]
+    assert old[-1].stem in shown and old[0].stem not in shown, "the coordinator's budget cut the oldest"
+    assert all(f.stem in shown for f in pinned)
+    # Nothing has been hidden for 7 days yet: the newest prompt is now, the oldest entries last shown never,
+    # but recording began 30 days ago, so they count as hidden since then.
+    hidden = p.hidden_memory(7)
+    assert old[0].stem in hidden and old[-1].stem not in hidden
+    assert not set(hidden) & {f.stem for f in pinned}, "pinned and standing entries never archive"
+    assert p.hidden_memory(0) == [] and p.hidden_memory(40) == []
+    # A shown entry counts from when it was last shown.
+    p.note_memory_shown([old[0].stem], now=time.time() - 3 * day)
+    assert old[0].stem not in p.hidden_memory(7)
+    d = Daemon(p.base)
+    git = ["git", "-C", str(p.harness)]
+    count = lambda: int(subprocess.run([*git, "rev-list", "--count", "HEAD"], capture_output=True,
+                                       text=True).stdout)
+    before = count()
+    d.archive_hidden_memory()
+    gone = [f for f in old if not f.exists()]
+    assert gone and old[0].exists() and old[-1].exists() and all(f.exists() for f in pinned)
+    assert all((p.memory_dir / "archive" / f.name).exists() for f in gone)
+    assert count() == before + 1, "one harness commit"
+    feed = p.db.q("SELECT text,severity,kind FROM messages WHERE direction='out' AND text LIKE 'Archived %'")
+    assert len(feed) == 1 and feed[0]["severity"] == "low" and f"Archived {len(gone)} memory entries" in feed[0]["text"]
+    assert not set(p.db.kv("memory_shown")["entries"]) & {f.stem for f in gone}, "archived names leave the map"
+    # Once a day: a second tick the same day does nothing.
+    p.note_memory_shown([], now=time.time() + 30 * day)
+    d.archive_hidden_memory()
+    assert old[0].exists() and count() == before + 1
+    # 0 turns it off.
+    p.db.set_kv("memory_archived_at", 0)
+    d.cfg["memory"] = {"archive_hidden_days": 0}
+    d.archive_hidden_memory()
+    assert old[0].exists()
+
+
+def test_memory_shown_counts_hidden_time_only_up_to_the_newest_prompt(env):
+    """A project that built no prompt for weeks (paused) hides nothing: hidden time ends at the newest prompt."""
+    p = make(env)
+    f = p.add_memory("A dated fact.", kind="fact")
+    f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
+    t0 = time.time() - 60 * 86400
+    p.note_memory_shown([f.stem], now=t0)
+    p.note_memory_shown([], now=t0 + 3 * 86400)
+    assert p.hidden_memory(7) == []
+    p.note_memory_shown([], now=t0 + 8 * 86400)
+    assert p.hidden_memory(7) == [f.stem]
+    # A new entry counts from its creation, not from when recording began.
+    p.add_memory("A brand new fact.", kind="fact")
+    assert p.hidden_memory(7) == [f.stem]
+
+
+def test_memory_cli_search_finds_live_and_archived_entries(env):
+    p = make(env)
+    live = p.add_memory("The widget build needs the large runner.", kind="fact")
+    gone = p.add_memory("The widget used to build on the small runner.", kind="decision")
+    p.add_memory("Unrelated note.", kind="fact")
+    p.forget_memory(gone.stem)
+    from ttp import cli
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--search", "WIDGET", "runner"])
+    text = out.getvalue()
+    assert f"[{live.stem}] (fact) The widget build" in text
+    assert f"[{gone.stem}] (decision, archived) The widget used" in text
+    assert "Unrelated" not in text and "2 entries found" in text
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--search", "nothing-matches"])
+    assert "0 entries found" in out.getvalue()
+
+
+def test_memory_cli_supersedes_merges_in_one_commit(env):
+    p = make(env)
+    a = p.add_memory("Builds run on the large runner.", kind="fact", title="runner a")
+    b = p.add_memory("Builds take about ten minutes.", kind="decision", title="runner b")
+    git = ["git", "-C", str(p.harness)]
+    count = lambda: int(subprocess.run([*git, "rev-list", "--count", "HEAD"], capture_output=True,
+                                       text=True).stdout)
+    before = count()
+    from ttp import cli
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "Builds run on the large runner and take about ten minutes.",
+                  "--kind", "decision", "--supersedes", a.stem, f"[{b.stem}]"])
+    assert count() == before + 1, "the merged entry and the retirements make one commit"
+    assert out.getvalue().count("retired to") == 2
+    assert not a.exists() and not b.exists() and (p.memory_dir / "archive" / a.name).exists()
+    assert "large runner and take about ten minutes" in p.memory_text() and a.stem not in p.memory_index.read_text()
+    assert subprocess.run([*git, "status", "--porcelain", "--", "memory", "MEMORY.md"], capture_output=True,
+                          text=True).stdout.strip() == ""
+
+
+def test_memory_supersedes_keeps_user_rules_or_changes_nothing(env):
+    """Each class of lost user rule refuses the whole merge with nothing written: a standing entry
+    into a non-standing one, a restriction, preference or resource into another kind, the user's
+    quoted words dropped, an unknown or archived name."""
+    p = make(env)
+    from ttp import cli
+    stand = p.add_memory('Whenever a run fails twice, "file a note for the owner".', kind="decision", standing=True)
+    rule = p.add_memory('User: "never push to the main branch".', kind="restriction")
+    pref = p.add_memory("Prefer short summaries.", kind="preference")
+    res = p.add_memory("Runner pool: the build machines.", kind="resource")
+    fact = p.add_memory("Old fact.", kind="fact")
+    gone = p.add_memory("Retired fact.", kind="fact", title="retired fact")
+    p.forget_memory(gone.stem)
+    git = ["git", "-C", str(p.harness)]
+    head = lambda: subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout
+    entries = lambda: sorted(f.name for f in p.memory_dir.glob("*.md"))
+    cases = [
+        (['Whenever a run fails twice, "file a note for the owner".', "--kind", "preference", "--supersedes", stand.stem],
+         "only a --standing entry"),
+        (["Never push to the main branch.", "--kind", "fact", "--supersedes", rule.stem], "only a restriction"),
+        (['"never push to the main branch".', "--kind", "preference", "--supersedes", rule.stem], "only a restriction"),
+        (["Short summaries.", "--kind", "fact", "--supersedes", pref.stem], "only a preference or restriction"),
+        (["Pool.", "--kind", "fact", "--supersedes", res.stem], "only a resource"),
+        (["Never push to main.", "--kind", "restriction", "--supersedes", rule.stem], "keep them verbatim"),
+        (["Whenever a run fails, tell someone.", "--standing", "--supersedes", stand.stem], "keep them verbatim"),
+        (["New fact.", "--supersedes", fact.stem, "no-such-entry"], "no memory entry 'no-such-entry'"),
+        (["New fact.", "--supersedes", gone.stem], "archived already"),
+    ]
+    for args, why in cases:
+        before, files = head(), entries()
+        with pytest.raises(SystemExit, match=re.escape(why)), contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["memory", "demo", *args])
+        assert head() == before and entries() == files, f"{args}: something was written"
+    # Allowed: the same kind, standing kept standing, the quoted words kept verbatim; a preference may
+    # become a restriction.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", 'Whenever a run fails twice or more, "file a note  for the owner".', "--standing",
+                  "--supersedes", stand.stem])
+        cli.main(["memory", "demo", 'Restriction (user): "never push to the main branch"; short summaries.',
+                  "--kind", "restriction", "--supersedes", rule.stem, pref.stem])
+    assert not stand.exists() and not rule.exists() and not pref.exists() and fact.exists() and res.exists()
+    text = p.memory_text()
+    assert "fails twice or more" in text and "(standing)" in text and "never push to the main branch" in text
+
+
+def test_pinned_memory_over_half_the_coordinator_budget_is_flagged_once(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    _memories(p, [("preference", f"PREF-{i} " + "q" * 1100) for i in range(5)])
+    coord.memory_budget_check(p)
+    events = lambda: p.db.q("SELECT text,severity FROM events WHERE kind='memory_pinned_heavy'")
+    assert events() == [], "under half: no event"
+    assert "Pinned memory over half" not in coord.digest(p, {}, [], [])
+    p.add_memory("PREF-X " + "q" * 1100, kind="preference")
+    coord.memory_budget_check(p)
+    coord.memory_budget_check(p)
+    assert len(events()) == 1 and events()[0]["severity"] == "normal"
+    assert "takes over half the coordinator's 12000-char" in events()[0]["text"]
+    assert "## Pinned memory over half your budget" in coord.digest(p, {}, [], [])
+    # It re-arms once pinned memory fits again.
+    p.forget_memories([f.stem for f in p.memory_dir.glob("preference-*.md")][:3])
+    coord.memory_budget_check(p)
+    assert p.db.kv("memory_pinned_half") is False
+
+
 def test_a_cancel_cut_off_before_its_stop_still_ends_the_run(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
