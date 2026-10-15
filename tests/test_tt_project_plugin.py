@@ -1456,6 +1456,12 @@ def test_setup_box_bare_check_bounds_a_hung_broker_queue_probe(tmp_path):
     env, _ = _bare_env(tmp_path, machines={"<box-alias>": {"tags": ["serving"]}})
     shim = tmp_path / "bin" / "tt-device-mcp"
     shim.write_text("#!/bin/bash\nexec sleep 3600\n")  # ends only by the probe's own 10 s bound
+    import shutil
+    real = shutil.which("timeout", path="/usr/bin:/bin")
+    if real:   # the box's coreutils timeout, its 10 s bound shortened to 0.5 s: the bound still fires, sooner
+        (tmp_path / "bin" / "timeout").write_text(f'#!/bin/bash\n[ "$1" = 10 ] && shift && set -- 0.5 "$@"\n'
+                                                  f'exec {real} "$@"\n')
+        (tmp_path / "bin" / "timeout").chmod(0o755)
     # No elapsed-time assert: "status timed out" below shows the bound fired; the generous
     # timeout (over 10x the bound) only stops the test if the check ever waits on the probe.
     r = _bare_check(tmp_path, env, timeout=300)
@@ -2110,6 +2116,8 @@ def _run_batch_script(tmp_path, command, signal_on_start=False):
     script = tmp_path / "job.sbatch"
     script.write_text(box_slurm.batch_script(str(co), command, str(rc), None))
     env = {k: v for k, v in os.environ.items() if k != "TTP_JOB_PGRP"}
+    # The script's cleanup waits up to 5 s for its group to empty; its own ps | awk check counts as a
+    # member, so each run here takes that whole 5 s.
     p = subprocess.Popen(["bash", str(script)], cwd=tmp_path, env=env)  # not a group leader: re-execs via setsid
     if signal_on_start:  # once the child runs, the script's traps are set: no race with a loaded host
         deadline = time.monotonic() + 60
@@ -2265,6 +2273,10 @@ if _os.environ.get("FAKE_NOW"):
         def now(cls, tz=None):
             return _real.fromtimestamp(float(_os.environ["FAKE_NOW"]), tz)
     _dt.datetime = _Frozen
+if _os.environ.get("FAKE_SLEEP_SCALE"):   # retry backoffs pass at this fraction of their real length
+    import time as _time
+    _sleep, _scale = _time.sleep, float(_os.environ["FAKE_SLEEP_SCALE"])
+    _time.sleep = lambda s: _sleep(s * _scale)
 '''
 
 
@@ -2470,6 +2482,7 @@ def test_setup_box_ird_reserve_takes_the_machine_ird_reserved(fake_ird):
 
 def test_setup_box_ird_reserve_claims_what_landed_when_ssh_drops_mid_reserve(fake_ird):
     # rc 255 (ssh dropped) after the reservation landed: the ird list diff still claims it.
+    fake_ird.env["FAKE_SLEEP_SCALE"] = "0.01"   # the `ird list` retry backoffs (2 s, 5 s) in 20 and 50 ms
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
                            "--machine", "m-idle", FAKE_IRD_RC="255")
     assert rc == 0, out
@@ -2959,7 +2972,7 @@ def test_setup_box_ird_e2e_ssh_drop_mid_reserve_still_claims_and_releases(fake_i
     import subprocess
     fake_ird.add("99")
     argv, env, _ = _e2e(fake_ird, tmp_path)
-    env.update(FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="1")
+    env.update(FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="1", FAKE_SLEEP_SCALE="0.01")   # the list retry in 20 ms
     r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
