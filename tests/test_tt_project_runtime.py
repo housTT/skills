@@ -24816,6 +24816,30 @@ def test_the_resume_plugin_skips_only_test_files_that_passed(env, tmp_path):
     assert r.returncode == 0 and log.read_text() == "", r.stdout
 
 
+def test_the_resume_plugin_forgets_files_when_the_session_fails_though_every_test_passed(env, tmp_path):
+    from ttp import pushpass
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_a.py").write_text("def test_a(): pass\n")
+    (suite / "conftest.py").write_text(
+        "import os\ndef pytest_sessionfinish(session, exitstatus):\n"
+        "    if os.path.exists(os.environ['FLAG']): session.exitstatus = 1\n")
+    flag, record = tmp_path / "flag", tmp_path / "k.txt"
+    flag.write_text("")
+    base = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+    base["FLAG"] = str(flag)
+
+    def run():
+        e = {**base, **pushpass.resume_env(record, base)}
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "."], cwd=suite,
+                              env=e, capture_output=True, text=True)
+
+    assert run().returncode == 1
+    assert pushpass.resumed(record) == [], "a failed session leaves nothing to resume"
+    r = run()
+    assert r.returncode == 1 and "resuming" not in r.stdout, "the next run reruns and does not pass"
+
+
 def test_the_resume_plugin_keeps_itself_out_of_a_pytest_a_test_starts(env, tmp_path):
     from ttp import pushpass
     suite = tmp_path / "suite"

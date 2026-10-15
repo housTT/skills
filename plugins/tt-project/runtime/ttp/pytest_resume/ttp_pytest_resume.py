@@ -16,6 +16,7 @@ import pytest
 
 ENV = "TTP_PYTEST_RESUME"
 NAME = "ttp_pytest_resume"
+TESTS_FAILED = 1
 NO_TESTS = 5   # pytest's exit status when nothing was selected
 
 
@@ -82,8 +83,17 @@ class Resume:
                 out.flush()
                 os.fsync(out.fileno())
 
+    @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
-        if self.skipped and exitstatus == NO_TESTS and not self.left:
+        status = int(session.exitstatus)   # after other plugins (a coverage floor) set theirs
+        if status == TESTS_FAILED and not self.bad:
+            # The session failed though no test did: its record would let a later run skip the failure.
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+            return
+        if self.skipped and status == NO_TESTS and not self.left:
             session.exitstatus = 0   # every file passed before: nothing left to run is a pass
 
 
