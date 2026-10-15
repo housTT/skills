@@ -57311,3 +57311,14 @@ def test_case_files_run_once_under_this_file_with_rewritten_asserts():
     assert sorted(from_cases) == files
     if "@pytest_ar" in globals():   # asserts in the case files are rewritten like this file's
         assert all(any("@pytest_ar" in f.__code__.co_names for f in fs) for fs in from_cases.values())
+
+
+def test_wake_tier_own_ack_wait_wrapper_is_light(tmp_path):
+    from ttp import budget as bud
+    harness = tmp_path / "proj" / "tt-project" / "harness"
+    prev = {"status": "waiting", "wake_tier": "standard",
+            "retry_when": f"python3 {harness}/ack_wait.py probe --from x"}
+    assert bud.wake_tier("standard", prev) == "standard"
+    assert bud.wake_tier("standard", prev, {}, harness) == "light"
+    other = {**prev, "retry_when": "mycheck probe"}
+    assert bud.wake_tier("standard", other, {"ack_wait": {"probe_commands": ["mycheck probe"]}}) == "light"

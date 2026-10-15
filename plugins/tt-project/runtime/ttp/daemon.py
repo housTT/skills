@@ -4495,7 +4495,7 @@ class Daemon:
             picked = self._pick_effort(task, provider)
             if picked:
                 task = dict(task, tier=picked["tier"])
-            wake = bud.wake_tier(task["tier"], load_result(task["result"]))
+            wake = bud.wake_tier(task["tier"], load_result(task["result"]), self.cfg, self.p.harness)
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # Before _workdir_for, which would make a missing worktree afresh.
             lost = self._resumable(task, provider)

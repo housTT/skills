@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import credits
+from . import ackwait, credits
 from . import globalcap as gcap
 from . import timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
@@ -660,7 +660,7 @@ def clamp_tier(tier: str, gate: Gate) -> str:
     return tier if TIER_ORDER.index(tier) <= TIER_ORDER.index(gate.max_tier) else gate.max_tier
 
 
-def wake_tier(tier: str, prev: dict) -> str | None:
+def wake_tier(tier: str, prev: dict, cfg: dict | None = None, harness=None) -> str | None:
     """The tier of the run that wakes a task whose last hand-off (`prev`) was `waiting`, or None
     when the run is no wake. Most wakes only check whether the wait is over, so a hand-off that
     names what it waits on wakes at light unless it asks for a `wake_tier`; never above the task's
@@ -675,7 +675,7 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     tier = tier if tier in TIER_ORDER else "standard"
     if stale_wakes(prev) and not prev.get("escalated_wake"):
         return TIER_ORDER[0]
-    if re.search(r"\back-wait\s+probe\b", str(prev.get("retry_when") or "")) and not prev.get("escalated_wake"):
+    if ackwait.is_probe(prev.get("retry_when"), cfg, harness) and not prev.get("escalated_wake"):
         return TIER_ORDER[0]   # another project's reply: its on_pass_cmd settles it, a wake only reads it
     want = "light" if mechanical_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
