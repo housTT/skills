@@ -4996,7 +4996,8 @@ class Daemon:
     def wake_upstream_fixes(self) -> None:
         """On the first tick and every minute after: a resolved upstream note this project filed, whose fix
         the code this daemon loaded (its identity receipt) has, becomes one coordinator event and an early
-        blocker sweep (upstream.wake_fixed), once per resolution across restarts."""
+        blocker sweep (upstream.wake_fixed), once per resolution across restarts. A note closed as wontfix
+        (no release) wakes the same way and logs as closed."""
         now = time.time()
         if now - self._fixes_checked < upstream.LOCAL_EVERY_S:
             return
@@ -5007,7 +5008,9 @@ class Daemon:
             log(self.p, f"checking upstream fixes failed: {type(e).__name__}: {e}")
             return
         if got:
-            log(self.p, "upstream fix(es) now running: " + ", ".join(f"{r['fp']} in {r['fixed_in']}" for r in got))
+            log(self.p, "upstream note(s) resolved: " + ", ".join(
+                f"{r['fp']} in {r['fixed_in']}" if r.get("fixed_in") else f"{r['fp']} closed ({r.get('kind') or 'resolved'})"
+                for r in got))
 
     def drain_note_outbox(self) -> None:
         """File the notes for other projects that wait in this project's outbox (`ttp note --to` past the

@@ -63770,9 +63770,9 @@ def test_upstream_wontfix_queues_in_a_sandbox_is_refused_without_resolve_or_with
 
     def boom(*a, **k):
         raise PermissionError(13, "read-only")
-    monkeypatch.setattr(upstream, "wontfix", boom)
-    assert _upstream_cli(cli, "--resolve", fp, "--wontfix", "not a bug") == 0
-    monkeypatch.undo()
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "wontfix", boom)
+        assert _upstream_cli(cli, "--resolve", fp, "--wontfix", "not a bug") == 0
     assert upstream.state(fp) == "open"
     assert upstream.file_queued_acks(tmp_path, "demo") == 1
     assert upstream.wontfixed(fp)["note"] == "not a bug"
@@ -63791,10 +63791,36 @@ def test_upstream_wontfix_ends_the_fixed_wait_wakes_the_filer_once_and_round_tri
     assert len(upstream.wake_fixed(p, "10.0.0")) == 1 and upstream.wake_fixed(p, "10.0.0") == []
     ev = p.db.q("SELECT text FROM events WHERE source='upstream'")
     assert len(ev) == 1 and "not a plugin bug" in ev[0]["text"] and "closed as not a plugin bug" in ev[0]["text"]
-    sent = upstream._resolved_for("")  # no forwarded notes here: nothing to send
-    assert sent == []
-    recs = upstream._records()
-    assert upstream.wontfixed(fp, recs)
+    assert upstream._resolved_for("") == []
+    assert upstream.wontfixed(fp, upstream._records())
+    upstream.append("demo", 4, [{"title": "upstream: wf3", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: wf3", "y")
+    assert fp in upstream._own_open(time.time())
     got = [{"kind": "wontfix", "fp": fp, "note": "not a plugin bug", "by": "m", "ts": 5.0}]
-    n = upstream._take_resolved("peer", got)
-    assert n == 0 or upstream._take_resolved("peer", got) == 0
+    assert upstream._take_resolved("peer", got) == 1 and upstream._take_resolved("peer", got) == 0
+    assert fp not in upstream._own_open(time.time())
+    assert upstream.fixed(p, fp) == upstream.WONTFIX_RC
+    rec = {"title": "upstream: rx", "spec": "z", "fp": upstream.fingerprint("upstream: rx", "z"), "via": "peer",
+           "host": "other", "ts": time.time(), "project": "x"}
+    with open(upstream.path(), "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    upstream.resolve(rec["fp"], "1.2.3")
+    upstream.wontfix(rec["fp"], "reason", "m")
+    last = upstream._resolved_for("peer")[-1]
+    assert last["kind"] == "wontfix" and last["note"] == "reason"
+
+
+def test_daemon_wake_upstream_fixes_survives_a_wontfix_record(env):
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    p = make(env)
+    upstream.append("demo", 4, [{"title": "upstream: dw", "spec": "y"}])
+    fp = upstream.fingerprint("upstream: dw", "y")
+    upstream.wontfix(fp, "reason", "m")
+    d = Daemon(p.base)
+    d.identity["version"] = "0.2.10"
+    d.wake_upstream_fixes()
+    assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == 1
+    d._fixes_checked = 0
+    d.wake_upstream_fixes()
+    assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == 1
