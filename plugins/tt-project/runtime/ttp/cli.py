@@ -2269,7 +2269,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
-                                      *(["--fresh"] if a.fresh else []), *(["--full"] if a.full else []),
+                                      *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
