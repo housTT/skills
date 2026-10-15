@@ -26060,7 +26060,7 @@ def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_p
     assert len(note) == 1 and note[0]["severity"] == "normal", note
     assert "1st reboot in 24 h" in note[0]["text"] and "board: task #7" in note[0]["text"], note
     from ttp import timefmt
-    line = f"host: 1 reboot in 24 h (last {timefmt.short(booted, p)}), 2 runs lost ($53.00)"
+    line = f"host: 1 reboot in 24 h (last {timefmt.short(booted, p)}), 2 runs cut short: 2 lost ($53.00), 0 resumed with work kept ($0.00)"
     assert health(p, p.db)["host"] == line
     assert line in status_text(p).splitlines()
     digest = coord.digest(p, {}, [], [])
@@ -58685,3 +58685,21 @@ def test_task_show_and_list_json_print_start_when_and_retry_when_only_when_set(e
     rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
     assert rows[waiting]["start_when"] == "exit 0" and rows[waiting]["retry_when"] == "test -e /tmp/x"
     assert "start_when" not in rows[plain] and "retry_when" not in rows[plain]
+
+
+def test_host_line_splits_cut_runs_into_lost_and_resumed_and_names_planners(env):
+    p = make(env)
+    from ttp import db as dbm
+    for i in (1, 2, 3):
+        p.db.x("INSERT INTO runs(id, task, role, status, note) VALUES(?,?,?,?,?)", (i, 1, "worker", "lost", "{}"))
+    p.db.x("INSERT INTO runs(id, task, role, status, note) VALUES(?,?,?,?,?)",
+           (4, 1, "worker", "ok", json.dumps({"resumes": {"run": 2}})))
+    data = {"lost": [{"run": 1, "usd": 1.0}, {"run": 2, "usd": 2.5}, {"run": 3, "usd": 0.5}], "lost_usd": 4.0,
+            "planned": {"reason": "x", "record": "r", "by": "proj-a"}}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
+           (time.time(), "host", "boot", "boot:b", "normal", "t", json.dumps(data), "record"))
+    boots = p.db.boots(0)
+    assert [x["kept"] for x in boots[0]["lost"]] == [False, True, False]
+    line = dbm.host_line(boots)
+    assert "(1 planned: by proj-a)" in line, line
+    assert line.endswith("3 runs cut short: 2 lost ($1.50), 1 resumed with work kept ($2.50)"), line

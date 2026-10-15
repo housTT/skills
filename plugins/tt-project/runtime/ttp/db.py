@@ -522,7 +522,30 @@ class DB:
         plus the boot event's data (runs lost, resources held at the last heartbeat before it)."""
         rows = self.q("SELECT ts, data FROM events WHERE source='host' AND kind='boot' AND ts>? ORDER BY ts, id",
                       (since,))
-        return [{**json.loads(r["data"] or "{}"), "ts": r["ts"]} for r in rows]
+        out = [{**json.loads(r["data"] or "{}"), "ts": r["ts"]} for r in rows]
+        ids = [int(x["run"]) for b in out for x in b.get("lost") or [] if isinstance(x, dict) and "run" in x]
+        kept = self.resumed_run_ids(min(ids) - 1) if ids else set()
+        for b in out:
+            for x in b.get("lost") or []:
+                if isinstance(x, dict) and "run" in x:
+                    x["kept"] = int(x["run"]) in kept
+        return out
+
+    def resumed_run_ids(self, after_id: int) -> set[int]:
+        """Ids of earlier runs that a later run (id > after_id) resumed with their session, so their work
+        was kept. A resume that never started kept nothing."""
+        kept: set[int] = set()
+        for r in self.q("SELECT note FROM runs WHERE id>? AND role!='coordinator' AND note LIKE '%\"resumes\"%'",
+                        (after_id,)):
+            try:
+                note = json.loads(r["note"] or "{}")
+            except ValueError:
+                continue
+            res = note.get("resumes") if isinstance(note, dict) else None
+            back = res.get("run") if isinstance(res, dict) else None
+            if back is not None and note.get("not_waste") != "resume":
+                kept.add(int(back))
+        return kept
 
     # messages ------------------------------------------------------------------------------
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
@@ -740,18 +763,26 @@ def unplanned_abrupt(boot: dict) -> bool:
 
 
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (K planned) (last HH:MM <zone>), M runs lost ($X)' for the boots of the
-    last day, as DB.boots returns them, in the home zone `where`; '' when there were none."""
+    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>), M runs cut short: L lost
+    ($A), K resumed with work kept ($B)' for the boots of the last day, as DB.boots returns them, in
+    the home zone `where`; '' when there were none. A run a later run resumed kept its work."""
     if not boots:
         return ""
-    lost = sum(len(b.get("lost") or []) for b in boots)
-    usd = sum(float(b.get("lost_usd") or 0) for b in boots)
-    planned = sum(1 for b in boots if b.get("planned"))
+    runs = [x for b in boots for x in b.get("lost") or [] if isinstance(x, dict)]
+    kept = [x for x in runs if x.get("kept")]
+    gone = [x for x in runs if not x.get("kept")]
+    kept_usd = sum(float(x.get("usd") or 0) for x in kept)
+    lost_usd = max(0.0, sum(float(b.get("lost_usd") or 0) for b in boots) - kept_usd)
+    planned = [b for b in boots if b.get("planned")]
+    by = sorted({str(b["planned"]["by"]) for b in planned
+                 if isinstance(b["planned"], dict) and re.fullmatch(r"[\w.-]+", str(b["planned"].get("by") or ""))})
     from .timefmt import short
     last = short(float(boots[-1]["ts"]), where)
+    n = len(runs)
     return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h"
-            + (f" ({planned} planned)" if planned else "")
-            + f" (last {last}), {lost} run{'' if lost == 1 else 's'} lost (${usd:.2f})")
+            + (f" ({len(planned)} planned" + (f": by {', '.join(by)}" if by else "") + ")" if planned else "")
+            + f" (last {last}), {n} run{'' if n == 1 else 's'} cut short: {len(gone)} lost (${lost_usd:.2f}), "
+              f"{len(kept)} resumed with work kept (${kept_usd:.2f})")
 
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:

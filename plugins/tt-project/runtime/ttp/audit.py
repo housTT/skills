@@ -113,14 +113,7 @@ def lost_runs(db: DB, since: float) -> dict[str, dict]:
     out: dict[str, dict] = {}
     rows = db.q("SELECT id, status, note, cost_usd FROM runs WHERE role!='coordinator' AND ended>=? AND status IN "
                 f"({','.join('?' * len(budget.WASTED))})", (since, *budget.WASTED))
-    kept: set[int] = set()
-    if rows:
-        for r in db.q("SELECT note FROM runs WHERE id>? AND role!='coordinator' AND note LIKE '%\"resumes\"%'",
-                      (min(int(r["id"]) for r in rows),)):
-            note = _note(r["note"])
-            back = (note.get("resumes") or {}).get("run") if isinstance(note.get("resumes"), dict) else None
-            if back is not None and note.get("not_waste") != "resume":   # a resume that never started kept nothing
-                kept.add(int(back))
+    kept = db.resumed_run_ids(min(int(r["id"]) for r in rows)) if rows else set()
     for r in rows:
         cause = _note(r["note"]).get("not_waste")
         if cause and cause != "handoff":   # a hand-off that stood is an outcome
