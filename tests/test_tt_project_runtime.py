@@ -11863,7 +11863,7 @@ def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_i
         p.db.set_kv(prguard.APPROVALS_KEY, {key: {**rec, **change}})
         assert coord._prior_approval(p, ask, now=now) is None, change
     p.db.set_kv(prguard.APPROVALS_KEY, {key: rec})
-    assert _ask(p, ask, blocking="human")[0] == []
+    assert _ask(p, ask, blocking="human", requester="a maintainer")[0] == []
 
 
 def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
