@@ -70,7 +70,9 @@ Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
 - Codex: hook-source detection reads `config.toml` with simple patterns, so it errs towards
   seeing a source and leaving the hook off.
 - Cursor: not measured, because the CLI is not installed on the test machine. From its docs: no
-  chat store, so `session_saved` stays false and no run is resumed; no budget, effort,
+  documented chat store or chat listing, so `session_saved` stays false and a Cursor run cut short
+  by a reboot is not resumed (the daemon starts it fresh; resuming blind could open an empty chat).
+  Revisit when the CLI docs name a store location or a `ls` command; no budget, effort,
   auto-compact or system-prompt switch; and no usage in the documented output.
 
 [cc-cli]: https://code.claude.com/docs/en/cli-reference
