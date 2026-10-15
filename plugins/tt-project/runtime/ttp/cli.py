@@ -1939,15 +1939,8 @@ def cmd_checks(a) -> None:
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
             env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
-            proc = subprocess.Popen(push.check_argv(c, top, env), cwd=top, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=group, env=env,
-                                    pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
-            try:
-                rc = proc.wait()
-            except BaseException:
-                if group:
-                    _end_check(proc)
-                raise
+            rc = _run_check(push.check_argv(c, top, env), group, cwd=top, stdout=out, stderr=subprocess.STDOUT,
+                            env=env, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             if rc != 0:
                 passed, failed = False, c
                 break
@@ -2243,6 +2236,43 @@ def _checks_tmp_cleanup(run_dir: Path) -> None:
         pass
 
 
+# A stop signal that lands while a check command starts or is being ended waits for that to finish.
+_CHECK_STOP: dict = {"defer": False, "pending": None}
+
+
+def _checks_stop(sig, _frame):
+    """The detached checks' stop handler: exit 128+sig, deferred while a check starts or is ended."""
+    if _CHECK_STOP["defer"]:
+        _CHECK_STOP["pending"] = 128 + sig
+        return
+    raise SystemExit(128 + sig)
+
+
+def _run_check(argv: list, group: bool, **kw) -> int:
+    """Run one check command to its exit code. In its own group (`group`) a stop always ends it:
+    a stop during Popen would otherwise leave the started command running."""
+    proc = None
+    _CHECK_STOP.update(defer=True, pending=None)
+    try:
+        proc = subprocess.Popen(argv, start_new_session=group, **kw)
+        _CHECK_STOP["defer"] = False
+        if _CHECK_STOP["pending"]:
+            raise SystemExit(_CHECK_STOP["pending"])
+        return proc.wait()
+    except BaseException:
+        _CHECK_STOP["defer"] = True
+        try:
+            if group and proc is not None:
+                _end_check(proc)
+        finally:
+            _CHECK_STOP["defer"] = False
+        if _CHECK_STOP["pending"]:
+            raise SystemExit(_CHECK_STOP["pending"])
+        raise
+    finally:
+        _CHECK_STOP["defer"] = False
+
+
 def _end_check(proc: subprocess.Popen) -> None:
     """End a check run in its own group: TERM, then KILL if it is still there after 5 s."""
     for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
@@ -2413,11 +2443,8 @@ def _checks_child(a) -> int:
     released = False
     code: int | str = 1
 
-    def stop(sig, _frame):
-        raise SystemExit(128 + sig)
-
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(sig, stop)
+        signal.signal(sig, _checks_stop)
     try:
         released = _checks_released(sys.stdin.buffer.read(), rc_file.parent)
         if not released:

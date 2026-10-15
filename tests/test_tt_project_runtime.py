@@ -61679,6 +61679,33 @@ def test_detached_checks_clean_scratch_on_exit(env, tmp_path, monkeypatch, capsy
     assert not scratch.parent.exists(), 'completed checks left their check-runs folder behind'
 
 
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_detached_check_stop_during_start_still_ends_the_command(monkeypatch, when):
+    """SIGTERM inside Popen (before or after the fork) never leaves the started check running."""
+    from ttp import cli
+    real, started = subprocess.Popen, []
+
+    def popen(*args, **kw):
+        if when == "before":
+            os.kill(os.getpid(), signal.SIGTERM)
+        proc = real(*args, **kw)
+        started.append(proc)
+        if when == "after":
+            os.kill(os.getpid(), signal.SIGTERM)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    old = signal.signal(signal.SIGTERM, cli._checks_stop)
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli._run_check([sys.executable, "-c", "import time; time.sleep(60)"], True)
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    assert e.value.code == 143
+    assert len(started) == 1 and started[0].returncode is not None, "the started check kept running"
+    assert cli._CHECK_STOP["defer"] is False
+
+
 def test_detached_checks_recovery_leaves_legacy_scratch(env, tmp_path, monkeypatch):
     from ttp import cli, detach
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
