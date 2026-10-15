@@ -170,14 +170,15 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
 
 
 def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | None = None,
-                    now: float | None = None) -> dict:
-    """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes)."""
+                    now: float | None = None, extra: dict | None = None) -> dict:
+    """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes).
+    `extra`: more fields (`ttp drain --reboot` adds the boot it was made on and its reason)."""
     now = time.time() if now is None else now
     when = ends.parse_expires(at, now, what="--power-cycle-at")
     what = f"power-cycle intent, at {ends.shown(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
     return add_change(alias, what, "none: a planned power cycle; the entry closes itself after it", by,
                       expires=when + POWER_CYCLE_AFTER_S, task=task, now=now, expects=["down"],
-                      extra={"kind": POWER_CYCLE, "at": when})
+                      extra={**(extra or {}), "kind": POWER_CYCLE, "at": when})
 
 
 def power_cycles_due(now: float | None = None) -> list[dict]:

@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, hostcycle, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -756,6 +756,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     if pause := projpause.current(db, now):
         lines.append(f"## Project {projpause.describe(pause, p, now)}: no new runs start until it resumes")
+    if cyc := hostcycle.hold(p, now):
+        lines.append(f"## {hostcycle.hold_line(cyc, p, now)}: no worker or reviewer runs, checks or pushes start "
+                     "until it is over; runs in flight are told to hand off")
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")

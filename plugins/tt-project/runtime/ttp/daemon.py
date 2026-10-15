@@ -217,6 +217,7 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
+HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
@@ -937,6 +938,7 @@ class Daemon:
         settling = self.settling()
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
+        cycle = self.host_cycle_held(now)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
                      self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
@@ -945,6 +947,8 @@ class Daemon:
             # So while the core provider's API host does not resolve; dispatch holds each provider itself.
             if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
+                continue
+            if cycle and step in (self.dispatch, self.start_pushes):   # the coordinator still runs
                 continue
             self._step_name = step.__name__
             step()
@@ -1237,6 +1241,34 @@ class Daemon:
                 (machine_ledger.delivered if ok else machine_ledger.release)(page)
             except Exception:
                 log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
+
+    def host_cycle_held(self, now: float) -> dict | None:
+        """The planned cycle of this host (hostcycle.hold) that holds this tick's new worker and reviewer
+        runs and push-queue pushes, or None; runs in flight go on (power_cycle_notices). Logged once per
+        cycle; one whose hold ran out with no new boot gets one low feed line."""
+        from . import hostcycle
+        try:
+            c = hostcycle.hold(self.p, now, settle=True)
+            gone = hostcycle.lapsed(now)
+        except Exception:
+            log(self.p, "planned host cycle check failed\n" + traceback.format_exc())
+            return None
+        seen = dict(self.p.db.kv(HOST_CYCLE_SEEN_KEY, {}) or {})
+        told = dict(seen)
+        if c and str(c["id"]) not in seen:
+            log(self.p, f"{hostcycle.hold_line(c, self.p, now)}: no new worker or reviewer runs or pushes start "
+                        f"(machine change #{c['id']})")
+            told[str(c["id"])] = "held"
+        for g in gone:
+            if told.get(str(g["id"])) != "lapsed":
+                at = timefmt.short(float(g["at"]) + machine_ledger.POWER_CYCLE_LEAD_S, self.p, now)
+                self.p.db.post("out", f"The planned host cycle by {g.get('by') or 'unknown'} (machine change "
+                                      f"#{g['id']}) did not come by {at}: new runs, checks and pushes start again.",
+                               chat=None, kind="info", severity="low")
+                told[str(g["id"])] = "lapsed"
+        if told != seen:
+            self.p.db.set_kv(HOST_CYCLE_SEEN_KEY, dict(list(told.items())[-50:]))
+        return c
 
     def power_cycle_notices(self, now: float) -> None:
         """A planned power cycle (machine_ledger.add_power_cycle) close at hand: tell each running worker

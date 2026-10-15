@@ -11,10 +11,22 @@ loss does not count toward max_reboot_losses.
 
 `ttp drain` also lists the project's `ttp detach` jobs still running here, which a reboot would
 end, and the record names them as interrupted so the woken tasks and the user can see why.
+
+Holding the host. As it starts, `ttp drain --reboot` also writes a power-cycle intent for this host
+into the shared machine ledger (machine_ledger.add_power_cycle, at now + its wait), unless one is
+open already (open_intent). While an intent for this host is due (hold: from POWER_CYCLE_LEAD_S
+before its time), every project's daemon here starts no worker or reviewer run and no push-queue
+push, and `ttp checks` starts nothing new; the coordinator still runs, and runs in flight go on and
+are told to hand off (daemon.power_cycle_notices). The hold lifts once the intent closes (a record
+made with it that says no reboot closes it), once this host booted again, or POWER_CYCLE_LEAD_S
+after its time (lapsed: each daemon posts one low feed line).
 """
 from __future__ import annotations
 
 import json
+import math
+import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -92,8 +104,9 @@ def running_jobs(p: Project, days: float = 7) -> list[dict]:
     return out
 
 
-def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict]) -> Path:
-    """Record a planned cycle of this host, about to happen: the next boot matches it (planned)."""
+def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict], intent: int | None = None) -> Path:
+    """Record a planned cycle of this host, about to happen: the next boot matches it (planned).
+    `intent`: the machine-ledger power-cycle intent it was announced with (open_intent)."""
     from .runner import boot_id
     now = time.time()
     rid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
@@ -106,10 +119,142 @@ def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict]) 
     f = d / "record.json"
     write_json(f, {"id": d.name, "started": now, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
                    "boot_id": boot_id(), "dry_run": False, "reason": reason, "by": "ttp drain",
-                   "left_running": left_running, "interrupted": jobs})
+                   "left_running": left_running, "interrupted": jobs, "intent": intent})
     return f
 
 
 def describe(jobs: list[dict]) -> str:
     return ", ".join(f"{j['name']} (task #{j['task']}, log {j['log']})" if j.get("task") else
                      f"{j['name']} (run {j['run']}, log {j['log']})" for j in jobs)
+
+
+# Holding new runs before a planned cycle (see the module docstring) ------------------------------
+def this_host() -> str | None:
+    """This host's alias in `ttp machines list`, or None when it has no entry there."""
+    from . import machines
+    hit = machines.here()
+    return hit[0] if hit else None
+
+
+def _intents(alias: str) -> list[dict]:
+    from . import machine_ledger as ml
+    return [c for c in ml.changes([alias]) if c.get("kind") == ml.POWER_CYCLE and isinstance(c.get("at"), (int, float))]
+
+
+def _rebooted_since(c: dict) -> bool:
+    """Whether this host booted again since intent c was made."""
+    from .runner import boot_time, same_boot
+    if c.get("boot"):
+        return not same_boot(c["boot"])
+    bt = boot_time()
+    return bool(bt) and bt > float(c.get("added") or 0)
+
+
+def open_intent(p: Project, reason: str, wait_s: float, now: float | None = None) -> tuple[dict | None, bool, str]:
+    """`ttp drain --reboot` as it starts: the open power-cycle intent for this host (at now + wait_s),
+    whether this call wrote it, and a line to print. An open one not yet past its hold is reused.
+    (None, False, why) when this host has no `ttp machines list` entry or the ledger refused."""
+    from . import machine_ledger as ml
+    from .runner import boot_id
+    now = time.time() if now is None else now
+    alias = this_host()
+    if not alias:
+        return None, False, ("this host has no entry in `ttp machines list`, so other projects here are not held "
+                             "(`ttp machines add` it)")
+    for c in _intents(alias):
+        if now < c["at"] + ml.POWER_CYCLE_LEAD_S and not _rebooted_since(c):
+            return c, False, f"planned host cycle already announced by {c.get('by')} (machine change #{c['id']})"
+    task = os.environ.get("TTP_TASK")
+    try:
+        c = ml.add_power_cycle(alias, f"{max(1, math.ceil(wait_s))}s", p.name, reason,
+                               int(task) if task and task.isdigit() else None, now=now,
+                               extra={"boot": boot_id(), "reason": reason})
+    except ValueError as e:
+        return None, False, f"could not announce the planned host cycle: {e}"
+    return c, True, (f"planned host cycle announced (machine change #{c['id']}): every project on this host "
+                     "starts no new worker or reviewer runs, checks or pushes until it")
+
+
+def _no_reboot(p: Project | None, c: dict) -> bool:
+    """Whether a host-cycle record made with intent c says the cycle did not happen (a dry run, or
+    `rebooted` false)."""
+    for d in _state_dirs(p):
+        try:
+            files = list((d / FOLDER).glob("*/record.json"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                r = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(r, dict) and r.get("intent") == c.get("id") and r.get("boot_id") == c.get("boot") \
+                    and (r.get("dry_run") or r.get("rebooted") is False):
+                return True
+    return False
+
+
+def hold(p: Project | None, now: float | None = None, settle: bool = False) -> dict | None:
+    """The power-cycle intent that holds new runs on this host now, or None: open, due (from
+    POWER_CYCLE_LEAD_S before its time until as long after it) and made on this boot. With `settle`
+    (the daemon), an intent whose record says the cycle did not happen is closed."""
+    from . import machine_ledger as ml
+    now = time.time() if now is None else now
+    alias = this_host()
+    if not alias:
+        return None
+    for c in _intents(alias):
+        if abs(c["at"] - now) > ml.POWER_CYCLE_LEAD_S or _rebooted_since(c):
+            continue
+        if _no_reboot(p, c):
+            if settle:
+                try:
+                    ml.close_change(c["id"], "the planned host cycle did not happen: its record says no reboot",
+                                    by=p.name if p else "", now=now)
+                except ValueError:
+                    pass
+            continue
+        return c
+    return None
+
+
+def lapsed(now: float | None = None) -> list[dict]:
+    """Open intents for this host whose hold ran out (POWER_CYCLE_LEAD_S past their time) with no
+    new boot: the cycle did not come in time."""
+    from . import machine_ledger as ml
+    now = time.time() if now is None else now
+    alias = this_host()
+    return [c for c in _intents(alias) if c["at"] + ml.POWER_CYCLE_LEAD_S <= now and not _rebooted_since(c)] \
+        if alias else []
+
+
+def reason(c: dict) -> str:
+    what = str(c.get("what") or "")
+    return str(c.get("reason") or (what.split(": ", 1)[1] if ": " in what else ""))
+
+
+def hold_line(c: dict, where, now: float | None = None) -> str:
+    """'holding new runs: planned host cycle by <project> at HH:MM <zone> (<reason>)'."""
+    from . import timefmt
+    why = reason(c)
+    return (f"holding new runs: planned host cycle by {c.get('by') or 'unknown'} at "
+            f"{timefmt.short(float(c['at']), where, now)}" + (f" ({why})" if why else ""))
+
+
+def host_runs(p: Project) -> list[tuple[str, dict]]:
+    """(project, run) for the runs in flight in the other projects on this host, read only; a
+    project whose database cannot be read is skipped."""
+    from .globalcap import connect_ro, local_projects
+    out = []
+    for name, db in local_projects(skip=str((p.state / "project.db").resolve())):
+        try:
+            conn = connect_ro(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute("SELECT id,task,role FROM runs WHERE status='running' ORDER BY id").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        out += [(name, dict(r)) for r in rows]
+    return out

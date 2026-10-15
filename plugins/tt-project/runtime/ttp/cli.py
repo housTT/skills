@@ -979,6 +979,9 @@ def status_text(p: Project) -> str:
     lines = [head]
     if h["runtime"]["line"]:
         lines.append(h["runtime"]["line"])
+    from . import hostcycle
+    if cyc := hostcycle.hold(p, now):
+        lines.append(hostcycle.hold_line(cyc, p, now))
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
@@ -1777,6 +1780,11 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
+    from . import hostcycle
+    if cyc := hostcycle.hold(p):   # a planned cycle of this host would cut them short
+        print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
+              "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
+        sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
     own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
     not_run: list[str] = []
@@ -4030,7 +4038,10 @@ def cmd_drain(a) -> None:
     """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept.
     Its `ttp detach` jobs still running here are listed (a reboot ends them); with --jobs it waits for
     them too. With --reboot it records the planned host cycle (hostcycle), so the next boot does not
-    count the jobs it cuts as the tasks' reboot losses."""
+    count the jobs it cuts as the tasks' reboot losses. --reboot also announces the cycle in the machine
+    ledger as it starts (hostcycle.open_intent): every project on this host then starts no new worker
+    or reviewer run, checks or push, and their running workers are told to hand off. Its wait also lasts
+    while other projects' runs here are in flight, and lists them; only this project's decide the exit."""
     from . import hostcycle
     p = need(a.name, sys.argv[1:])
     if not p.db.kv("paused", False):
@@ -4039,14 +4050,30 @@ def cmd_drain(a) -> None:
                         reason=f"drain before a planned host cycle: {a.reboot}" if a.reboot
                         else "drain: waiting for the runs in flight to end")
         print(f"{p.name} paused: no new model runs start")
+    intent, wrote = None, False
+    if a.reboot:
+        intent, wrote, line = hostcycle.open_intent(p, a.reboot, a.wait)
+        print(line, file=sys.stdout if intent else sys.stderr)
     end = time.time() + max(0.0, a.wait)
     while True:
         left, jobs = _draining_runs(p), hostcycle.running_jobs(p)
-        if not left and not (a.jobs and jobs) or time.time() >= end:
+        others = hostcycle.host_runs(p) if a.reboot else []
+        if not left and not (a.jobs and jobs) and not others or time.time() >= end:
             break
         time.sleep(min(poll_s(2.0), max(0.1, end - time.time())))
     if a.reboot:
-        print(f"planned host cycle recorded: {hostcycle.record(p, a.reboot, left, jobs)}")
+        try:
+            rec = hostcycle.record(p, a.reboot, left, jobs, intent=intent["id"] if intent else None)
+        except OSError as e:
+            if wrote:   # no record, no planned cycle: other projects here are not held for it
+                from . import machine_ledger as ml
+                ml.close_change(intent["id"], "ttp drain could not record the planned host cycle", by=p.name)
+            die(f"could not record the planned host cycle: {e}")
+        print(f"planned host cycle recorded: {rec}")
+    if others:
+        print(f"other projects on this host: {len(others)} run(s) in flight, told to hand off before the cycle; "
+              "a reboot ends them: " + ", ".join(f"{n} run {r['id']} ({r['role']}"
+                                                 + (f", task #{r['task']})" if r["task"] else ")") for n, r in others))
     if jobs:
         print(f"{p.name}: {len(jobs)} detached job(s) still running on this host; a reboot ends them"
               + (" (recorded as interrupted by the planned cycle)" if a.reboot else "") + f": {hostcycle.describe(jobs)}",
@@ -5986,7 +6013,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="also wait for the project's `ttp detach` jobs running on this host (listed either way)")
     s.add_argument("--reboot", metavar="REASON",
                    help="record a planned reboot or power cycle of this host, about to happen: on the next boot "
-                        "the detached jobs it ends do not count as the tasks' reboot losses")
+                        "the detached jobs it ends do not count as the tasks' reboot losses. It also holds every "
+                        "project on this host (no new worker runs, checks or pushes) and waits for their runs too")
     s.set_defaults(fn=cmd_drain)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")
