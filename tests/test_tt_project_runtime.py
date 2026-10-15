@@ -63411,7 +63411,8 @@ def test_ssh_preflight_forces_strict_host_keys_and_classifies_ssh_failures(env, 
     r = run("up")
     assert r.returncode == 0 and "up reachable" in r.stdout, r.stderr
     args = log.read_text().splitlines()[0].split()
-    for opt in ("BatchMode=yes", "StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
+    for opt in ("BatchMode=yes", "StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none",
+                "UpdateHostKeys=no", "LogLevel=ERROR"):
         assert opt in args and args[args.index(opt) - 1] == "-o", (opt, args)
     assert args[-2:] == ["up", "true"]
     for host, rc, says in (("changed", 10, "host key not verified"), ("unknown", 10, "host key not verified"),

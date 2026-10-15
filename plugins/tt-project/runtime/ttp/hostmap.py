@@ -29,6 +29,7 @@ HOST_KEY_RC = 10       # the host key did not verify: wakes a waiting task, wait
 AUTH_RC = 11           # authentication failed: likewise
 CLASSIFIED_UNREACHABLE_RC = 12
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes",
+       "-o", "UpdateHostKeys=no", "-o", "LogLevel=ERROR",
        "-o", "ControlMaster=no", "-o", "ControlPath=none"]
 _HOST_KEY = re.compile(r"Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|"
                        r"host key for .* has changed|No \S+ host key is known for", re.I)
