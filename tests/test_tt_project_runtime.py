@@ -40188,6 +40188,32 @@ def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_onc
     assert [e["task"] for e in check(dm.CONTINUE_UNQUEUED_WINDOW_S + 60)] == [tid]
 
 
+def _fetch_origin(repo, tries=20):
+    """`git fetch origin` that waits out a concurrent fetch (the daemon's) holding the same ref lock."""
+    for i in range(tries):
+        r = subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin"], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        if "cannot lock ref" not in r.stderr or i == tries - 1:
+            raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+        time.sleep(0.1)
+
+
+def test_fetch_origin_helper_retries_only_a_ref_lock_race(monkeypatch):
+    calls = []
+    def fake(cmd, **kw):
+        calls.append(1)
+        err = "cannot lock ref 'refs/remotes/origin/proj'" if len(calls) < 3 else ""
+        return subprocess.CompletedProcess(cmd, 1 if err else 0, "", err)
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _fetch_origin("x")
+    assert len(calls) == 3
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "fatal: other"))
+    with pytest.raises(subprocess.CalledProcessError):
+        _fetch_origin("x")
+
+
 def _land_on_proj(repo, other, branch):
     """Another clone lands `branch`'s commits on origin/proj as rebased copies (new shas, after a commit
     of its own), as the push queue does."""
@@ -40195,7 +40221,7 @@ def _land_on_proj(repo, other, branch):
     _git_out(other, "fetch", "-q", str(repo), branch)
     _git_out(other, "cherry-pick", "HEAD..FETCH_HEAD")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
-    _git_out(repo, "fetch", "-q", "origin")
+    _fetch_origin(repo)
 
 
 def test_a_daemon_queued_code_hop_starts_only_once_its_predecessors_reviewed_commits_landed(env, monkeypatch):
