@@ -1531,6 +1531,10 @@ def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda 
     oldest = db.one("SELECT MIN(created) AS t FROM push_queue WHERE status IN ('approved','batched')")
     if hours <= 0 or not oldest or oldest["t"] is None:
         return False
+    paused = db.paused_resources()
+    tgt = target(p)
+    if "push" in paused or (tgt and push.lock_name(*tgt) in paused):
+        return False   # paused: the queue is not retrying
     marks = ",".join("?" * len(LANDED_OUTCOMES))
     landed = db.one(f"SELECT MAX(finalized) AS t FROM push_batches WHERE outcome IN ({marks})", LANDED_OUTCOMES)
     since = max(float(oldest["t"]), float(landed["t"] or 0) if landed else 0.0)
@@ -1543,7 +1547,6 @@ def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda 
     st["landing_told"] = now
     db.set_kv(KV, st)
     cut = sum(1 for r in tries if r["outcome"] == "rebooted")
-    tgt = target(p)
     alert(LANDING_ALERT, f"Nothing has landed on {'/'.join(tgt) if tgt else 'the push branch'} for "
                          f"{(now - since) / 3600:.1f} h although approvals wait: {len(tries)} push batch"
                          f"{'es' if len(tries) != 1 else ''} tried, {cut} of them cut short by a host reboot. "

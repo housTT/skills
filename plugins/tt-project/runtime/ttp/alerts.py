@@ -236,6 +236,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN "
                           "('died','error','rebooted') AND finalized>=? LIMIT 1", (since,))
     if key == "push_not_landing":   # pushq.check_landing: until a batch lands
+        if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1"):
+            return False   # every waiting approval was withdrawn or cancelled
         return not db.one("SELECT id FROM push_batches WHERE outcome IN ('pushed','landed') AND finalized>=? LIMIT 1",
                           (since,))
     return now - since < DAY

@@ -63824,3 +63824,25 @@ def test_daemon_wake_upstream_fixes_survives_a_wontfix_record(env):
     d._fixes_checked = 0
     d.wake_upstream_fixes()
     assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == 1
+
+
+def test_landing_alert_clears_without_approvals_and_is_not_raised_while_paused(env, monkeypatch):
+    from ttp import alerts, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    _pq_batch(s)
+    _pq_tend(s)
+    d = Daemon(s.p.base)
+    later = time.time() + 5 * 3600
+    s.p.db.set_kv("paused_resources", {"push": {"reason": "maintenance", "since": time.time()}})
+    assert not pushq.check_landing(s.p, d.cfg, d.alert, now=later), "paused: the queue is not retrying"
+    s.p.db.set_kv("paused_resources", {})
+    assert pushq.check_landing(s.p, d.cfg, d.alert, now=later)
+    assert alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
+    s.p.db.x("UPDATE push_queue SET status='withdrawn' WHERE status IN ('approved','batched')")
+    assert not alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
