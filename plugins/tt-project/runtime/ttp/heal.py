@@ -502,6 +502,17 @@ def known_run(rc: int, out: str) -> tuple[str, str] | None:
     return None
 
 
+def classify(rc: int, out: str) -> str:
+    """The word for a check result, as the daemon reads it: known (owner: why), healthy, unhealthy (not an
+    outage when a finding), else unknown. `ttp heal test` prints it."""
+    owned = known_run(rc, out)
+    if owned:
+        return f"known ({owned[0]}: {owned[1]})"
+    if finding(rc, out):
+        return "unhealthy, not an outage"
+    return {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
+
+
 def untenanted(out: str) -> bool:
     """A check result that reports a device held with no tenant: an UNTENANTED line in its output."""
     return any(line.strip() == UNTENANTED for line in (out or "").splitlines())

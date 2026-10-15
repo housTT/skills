@@ -66465,3 +66465,15 @@ def test_broker_released_counts_health_held_false_and_hold_released_log_lines(en
     with pytest.raises(SystemExit) as e:
         cli.main(["broker-released"])
     assert e.value.code == 1 and "not released (/health: held true" in capsys.readouterr().out
+
+
+def test_heal_classify_known_exit_75_and_unknown_agree_with_the_daemon():
+    from ttp import heal
+    out = "noise\nttp-heal: known owner-x: waiting on a part\n"
+    assert heal.classify(75, out) == "known (owner-x: waiting on a part)"
+    assert heal.classify(75, "no marker") == "unknown"
+    assert heal.classify(0, "") == "healthy"
+    assert heal.classify(1, "ttp-heal: not-outage") == "unhealthy, not an outage"
+    # the daemon's reading of the same result uses the same known_run
+    assert heal.known_run(75, out) == ("owner-x", "waiting on a part")
+    assert heal.known_run(75, "no marker") is None
