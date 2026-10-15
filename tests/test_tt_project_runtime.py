@@ -6768,7 +6768,7 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     from ttp import machines as mm
     mm.add("box-c", tags="device")
     _resources(p, "- box-c")
-    ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "other", expires="6h")
+    ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "demo", expires="6h")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     d = Daemon(p.base)
     d.update_gates()
@@ -6796,7 +6796,7 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
     prompt, _ = turn("machine_condition", "a condition opened")
     assert "disabled auto power cycle" in prompt, "a machine event shows the ledger"
-    ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
+    ml.add_change("box-c", "a second change", "undo it", "demo", expires="6h")
     prompt, _ = turn("task_failed")
     assert "a second change" in prompt, "a changed ledger is shown whole"
     prompt, _ = turn("observation", "box-c is slow")
@@ -6811,7 +6811,7 @@ def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworde
     mm.add("box-c", tags="device")
     mm.add("box-d", tags="device")
     _resources(p, "- box-c\n- box-d")
-    first = ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "other", expires="6h")
+    first = ml.add_change("box-c", "disabled auto power cycle " + "z" * 3000, "enable it", "demo", expires="6h")
     ml.report("proj-a", "box-d", "held", "a hold")
     gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
                         "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
@@ -6836,12 +6836,12 @@ def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworde
     assert len(text) < 600 < len(whole)
     # New: an outage and a second change; the first change stays as last turn.
     ml.set_outage("box-c", "planned maintenance", "other", "6h")
-    ml.add_change("box-c", "a second change", "undo it", "other", expires="6h")
+    ml.add_change("box-c", "a second change", "undo it", "demo", expires="6h")
     text, seen = ledger(seen)
     assert "known outage" in text and "a second change" in text and "zzzz" not in text and "box-d held" not in text
     assert "4 open" in text and "2 as last turn" in text
     # Removed: the first change closes and the hold clears; counted as gone, nothing else repeated.
-    ml.close_change(first["id"], "done", by="other")
+    ml.close_change(first["id"], "done", by="demo")
     ml.report("proj-a", "box-d", "held", cleared=True)
     text, seen = ledger(seen)
     assert text == "## Shared machines in your Resources: 2 open; new or changed since last turn below, 2 as last turn, 2 gone"
@@ -53544,19 +53544,61 @@ def test_the_digest_lists_shared_machine_changes_only_for_machines_in_resources(
     p = make(env)
     for a in ("box-a", "box-b", "box-ab"):
         mm.add(a, tags="device")
-    ml.add_change("box-a", "disabled auto power cycle", "enable it", "other", expires="6h")
+    ml.add_change("box-a", "disabled auto power cycle", "enable it", "demo", expires="6h")
     ml.add_change("box-b", "paused the queue", "resume it", "other", expires="6h")
     ml.add_change("box-ab", "a drop-in", "rm it", "other", expires="6h")
     assert "Shared machines in your Resources" not in coord.digest(p, {}, [], [])
     _resources(p, "- box-a: the device machine (shared with other projects)")
     dig = coord.digest(p, {}, [], [])
     sec = dig.split("## Shared machines in your Resources")[1].split("\n## ")[0]
-    assert "#1 box-a: disabled auto power cycle (by other; undo: `enable it`" in sec
+    assert "#1 box-a: disabled auto power cycle (by demo; undo: `enable it`" in sec
     assert "box-b" not in sec and "a drop-in" not in sec
     assert "No recovery owner set for box-a" in sec
     assert "No recovery owner set" not in coord.digest(p, {}, [], []), "the gap is named once"
     ml.report("other", "box-a", "held", "hold never recovers")
     assert "box-a held since" in coord.digest(p, {}, [], [])
+
+
+def test_the_digest_clips_machine_changes_and_counts_other_projects_self_ending_ones(env):
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    _resources(p, "- box-a\n- box-b")
+    long = "paused the queue for a firmware soak " + "detail " * 300
+    mine = ml.add_change("box-a", long, "resume-queue " + "--flag " * 60, "demo", expires="6h")
+    probe = ml.add_change("box-a", long, "rm-drop-in", "other", until_probe="test -e /tmp/x " + "&& true " * 60)
+    late = ml.add_change("box-b", long, "undo-late", "other", expires="1h", now=time.time() - 7200)
+    for n in range(5):
+        ml.add_change("box-a", f"other change {n} " + "x" * 400, "undo-it", "other", expires="6h")
+    ml.add_change("box-b", "a self-ending change", "undo-b", "other", expires="6h")
+    ml.add_power_cycle("box-b", "2h", "other", "a planned power cycle")
+    ml.report("other", "box-a", "held", "a hold")
+    ml.set_outage("box-a", "maintenance " + "y" * 280, "other", "6h")
+    lines = dict(ml.digest_items(p))
+    # Each change keeps its id, alias, author, the start of its reason, its undo and its end, within the bound.
+    for c in (mine, probe, late):
+        ln = lines[f"change:{c['id']}"]
+        assert len(ln) <= ml.DIGEST_LINE_CHARS + 5, ln
+        assert ln.startswith(f"#{c['id']} {c['alias']}: paused the queue for a firmware soak")
+        assert f"by {c['by']};" in ln and "undo: `" in ln
+    assert "ends " in lines[f"change:{mine['id']}"] and "resume-queue --flag" in lines[f"change:{mine['id']}"]
+    assert "until-probe `test -e /tmp/x" in lines[f"change:{probe['id']}"]
+    assert lines[f"change:{late['id']}"].endswith("OVERDUE: expired " + lines[f"change:{late['id']}"].split("OVERDUE: expired ")[1])
+    # Other projects' changes that end by themselves (a set end, a power cycle) are one count per machine.
+    assert lines["others:box-a"].startswith("box-a: 5 more open changes by other projects")
+    assert lines["others:box-b"].startswith("box-b: 2 more open changes by other projects")
+    assert "other change" not in "\n".join(lines.values()) and "a self-ending change" not in "\n".join(lines.values())
+    # The machine's own conditions and outages show whole; the full entry stays in the ledger.
+    assert "box-a held since" in lines["condition:box-a:held"] and "y" * 280 in lines["outage:box-a"]
+    assert len(lines["outage:box-a"]) > ml.DIGEST_LINE_CHARS
+    assert mine["what"] in ml.change_line(mine) and len(mine["what"]) > ml.DIGEST_LINE_CHARS - 20
+    # The digest section stays small: before the fix it held every line whole.
+    sec = dict(coord.digest_parts(p, {}, [], [])[0])["machine_ledger"]
+    whole = sum(len(ml.change_line(c)) for c in ml.changes({"box-a", "box-b"}))
+    assert len(sec) < 2500 < whole
 
 
 def _inbox():

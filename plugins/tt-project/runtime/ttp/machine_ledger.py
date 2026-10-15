@@ -94,6 +94,11 @@ POWER_CYCLE = "power_cycle"
 POWER_CYCLE_LEAD_S = 600     # running workers on the machine are told to hand off this long before the cycle
 POWER_CYCLE_AFTER_S = 3600   # a power-cycle intent closes itself this long after its time
 USER = "the user"
+# The coordinator digest shows each change on one line of about DIGEST_LINE_CHARS (change_line's clip): a
+# long reason, undo or probe would otherwise fill the digest, which every turn writes to the cache again.
+DIGEST_LINE_CHARS = 300
+CLIP_PART_CHARS = 80   # an undo, until-probe or overdue cause in a clipped line
+CLIP_WHAT_MIN = 60     # the reason keeps at least this much
 
 
 def _path(name: str) -> Path:
@@ -279,14 +284,25 @@ def expects_now(c: dict, now: float | None = None) -> list[str]:
     return [str(x) for x in c.get("expects") or []]
 
 
-def change_line(c: dict, now: float | None = None, where=None) -> str:
+def _clip(text: Any, n: int) -> str:
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= n else s[:max(n - 1, 0)].rstrip(" ,;:") + "…"
+
+
+def change_line(c: dict, now: float | None = None, where=None, clip: int | None = None) -> str:
+    """Entry `c` on one line. `clip`: at most about that many characters (the coordinator digest): the
+    reason is cut first, then a long undo, probe or overdue cause, so the id, alias, author, the start of
+    the reason, the undo and the end always show."""
     late = overdue(c, now, where)
-    end = f"until-probe `{c['probe']}`, at the latest {ends.shown(c['expires'], where)}" if c.get("probe") \
+    part = (lambda t: _clip(t, CLIP_PART_CHARS)) if clip else str
+    end = f"until-probe `{part(c['probe'])}`, at the latest {ends.shown(c['expires'], where)}" if c.get("probe") \
         else f"ends {ends.shown(c['expires'], where)}"
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
-    return (f"#{c['id']} {c['alias']}: {c['what']} (by {by}; undo: `{c['undo']}`; {end})"
-            + (f" OVERDUE: {late}" if late else ""))
+    head, tail = f"#{c['id']} {c['alias']}: ", (f" (by {by}; undo: `{part(c['undo'])}`; {end})"
+                                                + (f" OVERDUE: {part(late)}" if late else ""))
+    what = _clip(c["what"], max(clip - len(head) - len(tail), CLIP_WHAT_MIN)) if clip else c["what"]
+    return head + what + tail
 
 
 # conditions ---------------------------------------------------------------------------------------
@@ -805,15 +821,32 @@ def digest_lines(p, now: float | None = None) -> list[str]:
 GAP_ITEM = "no_owner"   # digest_items' key of the line naming machines without a recovery owner
 
 
+def _ends_itself(c: dict, p, now: float) -> bool:
+    """Whether open entry `c` is another project's that ends by itself and needs nothing from `p`: a
+    power-cycle intent, or a change with a set end time (no until-probe) that is not overdue yet. Its author
+    is paged once it is overdue, and then it shows in full again."""
+    return (c.get("by") != getattr(p, "name", None) and not overdue(c, now)
+            and not c.get("probe"))
+
+
 def digest_items(p, now: float | None = None) -> list[tuple[str, str]]:
     """digest_lines as (stable key, line): a change by its id, a condition by alias and condition, an
-    outage by alias, so a reworded line keeps its key (the digest shows only new or reworded lines)."""
+    outage by alias, so a reworded line keeps its key (the digest shows only new or reworded lines).
+    Changes are clipped (DIGEST_LINE_CHARS); other projects' that end by themselves are one count per
+    machine. Conditions and outages show in full."""
     now = time.time() if now is None else now
     mine = resource_machines(p)
     if not mine:
         return []
     known = machines.load()
-    items = [(f"change:{c.get('id')}", change_line(c, now, p)) for c in changes(set(mine))]
+    items, quiet = [], {}
+    for c in changes(set(mine)):
+        if _ends_itself(c, p, now):
+            quiet[c["alias"]] = quiet.get(c["alias"], 0) + 1
+        else:
+            items.append((f"change:{c.get('id')}", change_line(c, now, p, clip=DIGEST_LINE_CHARS)))
+    items += [(f"others:{a}", f"{a}: {n} more open change{'s' if n > 1 else ''} by other projects that end by "
+               f"themselves (`ttp machines change list {a}`)") for a, n in sorted(quiet.items())]
     for key, c in conditions().items():
         if c.get("alias") in mine:
             owner = (known.get(c["alias"]) or {}).get("recovery_owner")
