@@ -37,7 +37,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, locks, push, runner, worktree
+from . import checkcap, checkdirs, locks, push, pushpass, runner, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1026,17 +1026,35 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
+        env = push.check_env("target", self.tip, self.check_run_dir)
+        tree, run = pushpass.tree_of(self.wt, head), []
+        for cmd in todo:
+            eid = pushpass.env_id(self.wt, str(cmd), env, self.tip or "")
+            if hit := pushpass.passed(self.p, tree, str(cmd), eid):
+                say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
+                self.checks["reused"] = self.checks.get("reused", 0) + 1
+            else:
+                run.append((cmd, eid))
+        if not run:
+            return None
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch))
         started = time.time()   # a wait for the host-wide slot is not check time
         try:
-            for cmd in todo:
+            for cmd, eid in run:
+                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
+                extra = pushpass.resume_env(resume, env) if resume else {}
+                if done := pushpass.resumed(resume) if resume else []:
+                    say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
-                                      env={**push.check_env("target", self.tip, self.check_run_dir), **slot.env()},
-                                      pass_fds=checkdirs.inherited())
+                                      env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited())
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id):
+                    say(f"could not record the pass of {cmd}: {why}")
+                if resume:
+                    resume.unlink(missing_ok=True)
         finally:
             slot.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)

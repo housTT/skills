@@ -24538,6 +24538,199 @@ def test_a_push_batch_checkout_gets_the_projects_venv_link(env, monkeypatch):
     assert rc == 0 and m["outcome"] == "pushed", m
 
 
+def test_a_push_batch_reuses_a_pass_on_the_same_tree_and_never_a_failure(env, monkeypatch, capsys):
+    """A batch retried on the same merged tree (as after a reboot cut the first) does not run again a
+    check that passed there; the check that failed runs again, and a check skipped by if_exists is
+    never recorded as a pass. The record is on disk, so a new batch process reads it."""
+    from ttp import pushpass
+    ran, flag = env["tmp"] / "ran", env["tmp"] / "flag"
+    flag.write_text("")
+    a = f"git rev-parse HEAD^{{tree}} >> {ran}"
+    b = f"test ! -f {flag} -o ! -f f1.txt"
+    gone = {"run": "true", "if_exists": "absent.txt"}
+    p, repo, origin, other = _push_setup(env, monkeypatch, [a, b, gone])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["results"][0]["status"] != "pushed", m
+    first = ran.read_text().split()
+    assert len(first) == 2, "the head, then the tip alone"
+    store = json.loads((p.state / pushpass.STORE).read_text())["passes"]
+    assert sorted(e["cmd"] for e in store) == sorted([a, a, b]), "passes only: never b's failure, never the skipped check"
+    flag.unlink()
+    capsys.readouterr()
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert ran.read_text().split() == first, "a's pass on the same tree was reused, not run again"
+    assert f"reused pass from b1 (tree {first[0][:10]}): {a}" in capsys.readouterr().out
+    assert m["checks"]["reused"] == 1
+
+
+def _pass_key_parts(env, monkeypatch):
+    from ttp import push, pushpass
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tree = pushpass.tree_of(repo, "HEAD")
+    return p, repo, tree, dict(os.environ)
+
+
+def test_push_check_passes_are_keyed_on_tree_command_and_interpreter(env, monkeypatch):
+    from ttp import pushpass
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    p, repo, tree, cenv = _pass_key_parts(env, monkeypatch)
+    eid = pushpass.env_id(repo, "python3 -m pytest -q", cenv, "tip")
+    assert pushpass.record(p, tree, "python3 -m pytest -q", eid, "b1") == ""
+    assert pushpass.passed(p, tree, "python3 -m pytest -q", eid)["batch"] == "b1"
+    assert pushpass.passed(p, "0" * 40, "python3 -m pytest -q", eid) is None, "another tree"
+    assert pushpass.passed(p, tree, "python3 -m pytest -q -x", eid) is None, "another command"
+    assert pushpass.env_id(repo, "python3 -m pytest -q", cenv, "other") != eid, "another tip"
+    bin_ = env["tmp"] / "otherbin"
+    bin_.mkdir()
+    (bin_ / "python3").write_text("#!/bin/sh\n")
+    (bin_ / "python3").chmod(0o755)
+    other = {**cenv, "PATH": f"{bin_}{os.pathsep}{cenv.get('PATH', '')}"}
+    assert pushpass.env_id(repo, "python3 -m pytest -q", other, "tip") != eid, "another python3"
+    venv = _fake_venv(repo / ".venv")
+    (venv / "bin" / "python").chmod(0o755)
+    (venv / "bin" / "pytest").write_text("")
+    with_venv = pushpass.env_id(repo, "python3 -m pytest -q", cenv, "tip")
+    assert with_venv != eid, "a venv the check now runs with"
+    site = venv / "lib" / "python3" / "site-packages"
+    site.mkdir(parents=True)
+    os.utime(site, ns=(1, 1))
+    before = pushpass.env_id(repo, "python3 -m pytest -q", cenv, "tip")
+    (site / "newpkg").mkdir()
+    assert pushpass.env_id(repo, "python3 -m pytest -q", cenv, "tip") != before, "a package installed in the venv"
+
+
+def test_push_check_passes_and_resume_files_are_pruned(env, monkeypatch):
+    from ttp import pushpass
+    p, repo, tree, cenv = _pass_key_parts(env, monkeypatch)
+    real = time.time
+    monkeypatch.setattr(pushpass, "MAX", 3)
+    for n in range(5):
+        pushpass.record(p, tree, f"c{n}", "e", f"b{n}")
+    store = json.loads((p.state / pushpass.STORE).read_text())["passes"]
+    assert [e["cmd"] for e in store] == ["c2", "c3", "c4"]
+    clock = time.time() + pushpass.MAX_AGE_S + 1
+    monkeypatch.setattr(pushpass.time, "time", lambda: clock)
+    assert pushpass.passed(p, tree, "c4", "e") is None, "an entry past MAX_AGE_S is not served"
+    pushpass.record(p, tree, "c5", "e", "b5")
+    assert [e["cmd"] for e in json.loads((p.state / pushpass.STORE).read_text())["passes"]] == ["c5"]
+    monkeypatch.setattr(pushpass.time, "time", real)
+    folder = p.state / pushpass.RESUME_DIR
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(pushpass, "RESUME_MAX", 2)
+    now = time.time()
+    for n in range(4):
+        (folder / f"k{n}.txt").write_text("a.py\n")
+        os.utime(folder / f"k{n}.txt", (now - 10 + n, now - 10 + n))
+    (folder / "old.txt").write_text("")
+    os.utime(folder / "old.txt", (now - pushpass.RESUME_MAX_AGE_S - 5,) * 2)
+    keep = folder / "k0.txt"
+    pushpass.prune(folder, keep=keep)
+    assert sorted(f.name for f in folder.iterdir()) == ["k0.txt", "k2.txt", "k3.txt"]
+
+
+_RESUME_TESTS = {
+    "test_a.py": "def test_a1(log): log('a1')\ndef test_a2(log): log('a2')\n",
+    "test_b.py": "import os\ndef test_b(log):\n    log('b')\n    assert not os.path.exists(os.environ['FLAG'])\n",
+    "test_c.py": "def test_c(log): log('c')\n",
+    "conftest.py": ("import os, pytest\n@pytest.fixture\ndef log():\n"
+                    "    return lambda s: open(os.environ['LOG'], 'a').write(s + '\\n')\n"),
+}
+
+
+def test_the_resume_plugin_skips_only_test_files_that_passed(env, tmp_path):
+    """The pytest plugin records each file whose tests all passed; the next run skips those and runs
+    the rest, and a run with every file recorded passes without running any."""
+    from ttp import pushpass
+    suite, log, flag = tmp_path / "suite", tmp_path / "log", tmp_path / "flag"
+    suite.mkdir()
+    for name, text in _RESUME_TESTS.items():
+        (suite / name).write_text(text)
+    flag.write_text("")
+    record = tmp_path / "state" / "k.txt"
+    base = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+    base.update(LOG=str(log), FLAG=str(flag))
+
+    def run():
+        e = {**base, **pushpass.resume_env(record, base)}
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "."], cwd=suite,
+                              env=e, capture_output=True, text=True)
+
+    r = run()
+    assert r.returncode == 1, r.stdout
+    assert sorted(pushpass.resumed(record)) == ["test_a.py", "test_c.py"], "never the file that failed"
+    assert log.read_text().split() == ["a1", "a2", "b", "c"]
+    flag.unlink()
+    log.write_text("")
+    r = run()
+    assert r.returncode == 0, r.stdout
+    assert log.read_text().split() == ["b"], "only the file that did not pass runs"
+    assert "ttp: resuming: 2 test file(s) passed" in r.stdout
+    log.write_text("")
+    r = run()
+    assert r.returncode == 0 and log.read_text() == "", r.stdout
+
+
+def test_the_resume_plugin_keeps_itself_out_of_a_pytest_a_test_starts(env, tmp_path):
+    from ttp import pushpass
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_env.py").write_text(
+        "import os\ndef test_env():\n    assert 'TTP_PYTEST_RESUME' not in os.environ\n"
+        "    assert 'ttp_pytest_resume' not in os.environ.get('PYTEST_ADDOPTS', '')\n")
+    base = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+    e = {**base, **pushpass.resume_env(tmp_path / "k.txt", base)}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "."], cwd=suite, env=e,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
+    assert pushpass.resumed(tmp_path / "k.txt") == ["test_env.py"]
+
+
+def test_only_a_single_plain_pytest_run_resumes():
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import pushpass
+    assert pushpass.resumable("python3 -m pytest -q tests/a.py")
+    assert pushpass.resumable("cd sub && timeout 600 pytest -q")
+    assert not pushpass.resumable("pytest -q a.py && pytest -q b.py"), "two runs could share a file"
+    assert not pushpass.resumable("PYTHONPATH=src pytest -q"), "it would drop the plugin's path"
+    assert not pushpass.resumable("PYTEST_ADDOPTS=-x pytest -q")
+    assert not pushpass.resumable("./run_tests.sh")
+
+
+def test_a_push_batch_resumes_a_pytest_check_that_was_cut(env, monkeypatch, capsys):
+    """A pytest check that did not finish on a tree runs, on the next batch of that tree, only the
+    test files that did not pass; its whole pass then removes the resume record."""
+    from ttp import pushpass
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.setenv("PATH", f"{pathlib.Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
+    log, flag = env["tmp"] / "log", env["tmp"] / "flag"
+    monkeypatch.setenv("LOG", str(log))
+    monkeypatch.setenv("FLAG", str(flag))
+    cmd = "python3 -m pytest -q -p no:cacheprovider suite"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [cmd])
+    for name, text in _RESUME_TESTS.items():
+        (repo / "suite").mkdir(exist_ok=True)
+        (repo / "suite" / name).write_text(text.replace("assert not", "assert not os.path.exists('f1.txt') or not"))
+    _git_out(repo, "add", "suite")
+    _git_out(repo, "commit", "-qm", "suite")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    flag.write_text("")
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["results"][0]["status"] != "pushed", m
+    assert log.read_text().split() == ["a1", "a2", "b", "c"] * 2, "the head, then the tip alone"
+    flag.unlink()
+    log.write_text("")
+    capsys.readouterr()
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert log.read_text().split() == ["b"]
+    assert f"resuming {cmd}: 2 test file(s) passed" in capsys.readouterr().out
+    assert not list((p.state / pushpass.RESUME_DIR).glob("*.txt")), "a whole pass removes its resume record"
+
+
 def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypatch, capsys):
     from ttp import batch
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
