@@ -27545,7 +27545,8 @@ def test_worker_prompt_says_how_to_wait_on_a_job_on_another_machine():
     assert "For a job on another machine" in flat
     assert "start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`" in flat
     assert "`ttp detach --check --host <alias> <dir>/<name>`" in flat and "255 while ssh fails" in flat
-    assert "Prefer it to a bare `ssh <host> test -e <marker>`" in flat
+    assert "Never a bare `ssh <host> test -e <marker>`" in flat
+    assert "add `--rows <file> --after <n>` (0 on a new row, the end or a dead driver)" in flat
     assert 'set `"survives_reboot": true`' in flat
     # Device runners stay first: a device job goes through one, not a remote driver.
     assert "a device job goes through a device runner instead" in flat
