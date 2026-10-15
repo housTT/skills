@@ -49,7 +49,9 @@ intent: an entry of kind `power_cycle` that needs no undo and closes itself POWE
 (never overdue; any co-tenant daemon closes it once past). It expects the machine `down` only from
 POWER_CYCLE_LEAD_S before T until it ends (expects_now), so it never hides an outage outside the cycle. From POWER_CYCLE_LEAD_S before T until as long after it, each
 daemon tells its running workers on that machine (the daemon's own host, or a task resource on it) once,
-through their steer.md, to commit and hand off now (daemon.power_cycle_notices).
+through their steer.md, to commit and hand off now (daemon.power_cycle_notices). An intent `ttp drain
+--reboot` writes carries `hold_from`, when it was written: its window starts there when that is earlier
+(cycle_window), so the drain is held and steered from its start (hostcycle).
 
 Both files live next to machines.json, written whole under one lock, so co-tenant daemons and CLIs never
 lose each other's writes. Other projects' state is only read (their database, read-only), never written.
@@ -181,11 +183,40 @@ def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | Non
                       extra={**(extra or {}), "kind": POWER_CYCLE, "at": when})
 
 
+def cycle_window(c: dict) -> tuple[float, float]:
+    """(start, end) of power-cycle intent c's window: POWER_CYCLE_LEAD_S either side of its time, starting
+    at its `hold_from` instead when that is earlier (a drain's intent holds from when it was written)."""
+    at = float(c.get("at") or 0)
+    start = at - POWER_CYCLE_LEAD_S
+    if isinstance(c.get("hold_from"), (int, float)):
+        start = min(start, float(c["hold_from"]))
+    return start, at + POWER_CYCLE_LEAD_S
+
+
 def power_cycles_due(now: float | None = None) -> list[dict]:
-    """Open power-cycle intents whose time is within POWER_CYCLE_LEAD_S of now, either side."""
+    """Open power-cycle intents whose window (cycle_window) holds now."""
     now = time.time() if now is None else now
     return [c for c in changes() if c.get("kind") == POWER_CYCLE
-            and abs(float(c.get("at") or 0) - now) <= POWER_CYCLE_LEAD_S]
+            and cycle_window(c)[0] <= now <= cycle_window(c)[1]]
+
+
+def retime_power_cycle(cid: int, at: float, by: str, now: float | None = None) -> dict:
+    """Move open power-cycle intent #cid to epoch time `at` (its end follows), with an edit trail: a drain
+    that runs longer pushes it on, and the cycle itself, once recorded, brings it to now."""
+    now = time.time() if now is None else now
+    with _locked():
+        doc = _read(LEDGER, {"next": 1, "changes": []})
+        c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid
+                  and c.get("kind") == POWER_CYCLE and not c.get("closed")), None)
+        if c is None:
+            raise ValueError(f"no open power-cycle intent #{cid}")
+        what = str(c.get("what") or "")
+        new = {"at": at, "expires": at + POWER_CYCLE_AFTER_S,
+               "what": f"power-cycle intent, at {ends.shown(at)}" + (f": {what.split(': ', 1)[1]}" if ": " in what else "")}
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": {k: c.get(k) for k in new}})
+        c.update(new)
+        _write(LEDGER, doc)
+        return c
 
 
 def changes(aliases=None, open_only: bool = True) -> list[dict]:
@@ -276,14 +307,14 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
 
 def expects_now(c: dict, now: float | None = None) -> list[str]:
     """What entry `c` expects at `now`: nothing once it is closed or overdue, and for a power-cycle intent
-    nothing outside its window (POWER_CYCLE_LEAD_S before T until its end), so it never quiets an outage
+    nothing outside its window (cycle_window's start until its end), so it never quiets an outage
     days before the cycle, or after it when nobody closed it."""
     now = time.time() if now is None else now
     if c.get("closed") or overdue(c, now):
         return []
     if c.get("kind") == POWER_CYCLE:
         at = float(c.get("at") or 0)
-        if not at - POWER_CYCLE_LEAD_S <= now < float(c.get("expires") or at + POWER_CYCLE_AFTER_S):
+        if not cycle_window(c)[0] <= now < float(c.get("expires") or at + POWER_CYCLE_AFTER_S):
             return []
     return [str(x) for x in c.get("expects") or []]
 

@@ -108,7 +108,7 @@ def test_drain_reboot_waits_for_and_lists_other_projects_runs_with_its_own_exit_
     cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.3"])   # exit 0: its own runs decide
     out = capsys.readouterr().out
     assert time.time() - t0 >= 0.3, "the wait lasts while another project's run is in flight"
-    assert f"other projects on this host: 1 run(s) in flight" in out and f"other run {rid} (worker, task #7)" in out
+    assert "other projects on this host: 1 run(s) or push(es) in flight" in out and f"other run {rid} (worker, task #7)" in out
     # The other project's run ends during the wait: drain returns early.
     p.db.set_paused(False)
     threading.Timer(0.2, lambda: Project(q.base).db.x("UPDATE runs SET status='done', ended=? WHERE id=?",
@@ -131,3 +131,102 @@ def test_drain_reboot_on_an_unlisted_host_records_the_cycle_and_says_others_are_
     cap = capsys.readouterr()
     assert "no entry in `ttp machines list`" in cap.err and "planned host cycle recorded" in cap.out
     assert not ml.changes() and hostcycle.hold(p) is None
+
+
+def test_a_drain_intent_holds_and_steers_from_its_start_and_after_an_early_return(env, monkeypatch, capsys, tmp_path):
+    """--wait longer than POWER_CYCLE_LEAD_S: the co-tenant is held and its workers told from the drain's
+    start, not only POWER_CYCLE_LEAD_S before the drain's end; a drain that returns early moves the
+    cycle to then, so the hold covers it."""
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1200, now=t0)
+    assert wrote and c["at"] == t0 + 1200 and c["hold_from"] == t0
+    assert ml.cycle_window(c)[0] == t0
+    for t in (t0, t0 + 1, t0 + 599):
+        assert hostcycle.hold(q, t)["id"] == c["id"], t
+    assert hostcycle.hold(q, t0 - 1) is None, "not before the drain began"
+    tid = q.db.add_task("co-tenant work", "s", kind="code", origin="user")
+    (tmp_path / "w").mkdir()
+    rid = q.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+                 (tid, "worker", t0, "running", str(tmp_path / "w")))
+    _hold_daemon(q.base, []).power_cycle_notices(t0 + 1)
+    assert f"machine change #{c['id']}" in (tmp_path / "w" / "steer.md").read_text(), "told at the drain's start"
+    ml.close_change(c["id"], "test")
+    q.db.x("UPDATE runs SET status='done', ended=? WHERE id=?", (time.time(), rid))
+    # The CLI: an idle host drains at once, and the cycle is due then.
+    t1 = time.time()
+    cli.main(["drain", "demo", "--reboot", "firmware update", "--wait", "1200"])
+    capsys.readouterr()
+    (c,) = ml.changes()
+    assert c["at"] == pytest.approx(t1, abs=5), "the cycle is recorded now, not at the end of the wait"
+    assert hostcycle.hold(q)["id"] == c["id"] and not hostcycle.lapsed()
+    assert hostcycle.hold(q, c["at"] + ml.POWER_CYCLE_LEAD_S) is None
+
+
+def test_a_drain_does_not_reuse_an_intent_planned_for_later(env, monkeypatch, capsys):
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    later = ml.add_power_cycle("testhost", "2d", "other", "planned maintenance")
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0"])
+    assert "already announced" not in capsys.readouterr().out
+    mine = [c for c in ml.changes() if c["id"] != later["id"]]
+    assert len(mine) == 1 and mine[0]["by"] == "demo"
+    assert hostcycle.hold(q)["id"] == mine[0]["id"], "held now, by the drain's own intent"
+    assert next(c for c in ml.changes() if c["id"] == later["id"])["at"] == later["at"], "the later one is untouched"
+
+
+def test_a_retried_drain_does_not_lapse_before_its_record(env, monkeypatch):
+    """The recipe retries a drain that timed out: each retry reuses the due intent and pushes it on, and
+    the record brings it to the cycle itself, so the hold never lapses mid-drain."""
+    from ttp import hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    t0 = time.time()
+    c, wrote, _ = hostcycle.open_intent(p, "bus reset", 1200, now=t0)
+    hostcycle.cycle_now(p, c, now=t0 + 1200)          # timed out: recorded, retried at once
+    c2, wrote2, line = hostcycle.open_intent(p, "bus reset", 1200, now=t0 + 1201)
+    assert not wrote2 and c2["id"] == c["id"] and c2["at"] == t0 + 2401 and "already announced" in line
+    for t in (t0 + 1800, t0 + 2400):   # past the first try's lapse
+        assert hostcycle.hold(q, t)["id"] == c["id"] and not hostcycle.lapsed(t), t
+    hostcycle.cycle_now(p, c2, now=t0 + 2000)          # drained early this time
+    (c3,) = ml.changes()
+    assert c3["at"] == t0 + 2000 and c3["expires"] == t0 + 2000 + ml.POWER_CYCLE_AFTER_S
+    assert [e["by"] for e in c3["edits"]] == ["demo"] * 3
+    assert hostcycle.hold(q, t0 + 2599) and hostcycle.lapsed(t0 + 2600) == [ml.changes()[0]]
+
+
+def test_resume_withdraws_an_intent_its_own_drain_never_recorded(env, monkeypatch, capsys):
+    from ttp import cli, hostcycle
+    from ttp import machine_ledger as ml
+    p, q = _hold_setup(env, monkeypatch)
+    theirs = ml.add_power_cycle("testhost", "2d", "other", "their cycle")
+    c, wrote, _ = hostcycle.open_intent(p, "firmware update", 1200)   # the drain was stopped: no record
+    assert wrote and c["id"] != theirs["id"]
+    cli.main(["resume", "demo"])
+    assert f"planned host cycle withdrawn (machine change #{c['id']})" in capsys.readouterr().out
+    assert [x["id"] for x in ml.changes()] == [theirs["id"]], "only its own unrecorded intent closes"
+    # One its drain recorded stays.
+    cli.main(["drain", "demo", "--reboot", "firmware update", "--wait", "0"])
+    capsys.readouterr()
+    cli.main(["resume", "demo"])
+    assert "withdrawn" not in capsys.readouterr().out and len(ml.changes()) == 2
+
+
+def test_drain_reboot_waits_for_other_projects_pushes_but_not_their_coordinators(env, monkeypatch, capsys):
+    from ttp import cli
+    p, q = _hold_setup(env, monkeypatch)
+    rid = q.db.x("INSERT INTO runs(role,provider,started,status) VALUES('coordinator','claude',?,'running')",
+                 (time.time(),))
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "10"])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 8, "another project's coordinator run is not waited for"
+    assert f"other run {rid} (coordinator)" in out, "but it is listed"
+    tid = q.db.add_task("t", "s")
+    q.db.x("UPDATE tasks SET status='pushing' WHERE id=?", (tid,))
+    t0 = time.time()
+    cli.main(["drain", "demo", "--reboot", "kernel update", "--wait", "0.3"])
+    assert time.time() - t0 >= 0.3 and f"other push of task #{tid}" in capsys.readouterr().out

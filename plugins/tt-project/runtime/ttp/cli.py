@@ -4020,6 +4020,10 @@ def cmd_pause(a) -> None:
         p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or ("host power cycle (until reboot)" if boot else ""))
     except ValueError as e:
         die(f"{e}: pass --reason")
+    if a.cmd != "pause":
+        from . import hostcycle
+        for cid in hostcycle.release(p):
+            print(f"planned host cycle withdrawn (machine change #{cid}): its drain recorded none")
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
                           + (" until the host reboots; the daemon lifts it on its first tick after boot" if boot else "")))
 
@@ -4040,8 +4044,10 @@ def cmd_drain(a) -> None:
     them too. With --reboot it records the planned host cycle (hostcycle), so the next boot does not
     count the jobs it cuts as the tasks' reboot losses. --reboot also announces the cycle in the machine
     ledger as it starts (hostcycle.open_intent): every project on this host then starts no new worker
-    or reviewer run, checks or push, and their running workers are told to hand off. Its wait also lasts
-    while other projects' runs here are in flight, and lists them; only this project's decide the exit."""
+    or reviewer run, checks or push, and their running workers are told to hand off; once it records the
+    cycle, the intent's time moves to then (hostcycle.cycle_now). Its wait also lasts while other
+    projects' runs (but their coordinators) and pushes here are in flight, and lists them all; only this
+    project's decide the exit."""
     from . import hostcycle
     p = need(a.name, sys.argv[1:])
     if not p.db.kv("paused", False):
@@ -4058,7 +4064,8 @@ def cmd_drain(a) -> None:
     while True:
         left, jobs = _draining_runs(p), hostcycle.running_jobs(p)
         others = hostcycle.host_runs(p) if a.reboot else []
-        if not left and not (a.jobs and jobs) and not others or time.time() >= end:
+        if not left and not (a.jobs and jobs) and all(r["role"] == "coordinator" for _, r in others) \
+                or time.time() >= end:
             break
         time.sleep(min(poll_s(2.0), max(0.1, end - time.time())))
     if a.reboot:
@@ -4069,11 +4076,15 @@ def cmd_drain(a) -> None:
                 from . import machine_ledger as ml
                 ml.close_change(intent["id"], "ttp drain could not record the planned host cycle", by=p.name)
             die(f"could not record the planned host cycle: {e}")
+        if intent:
+            hostcycle.cycle_now(p, intent)
         print(f"planned host cycle recorded: {rec}")
     if others:
-        print(f"other projects on this host: {len(others)} run(s) in flight, told to hand off before the cycle; "
-              "a reboot ends them: " + ", ".join(f"{n} run {r['id']} ({r['role']}"
-                                                 + (f", task #{r['task']})" if r["task"] else ")") for n, r in others))
+        print(f"other projects on this host: {len(others)} run(s) or push(es) in flight, workers told to hand off "
+              "before the cycle; a reboot ends them: "
+              + ", ".join(f"{n} push of task #{r['task']}" if r["role"] == "push" else
+                          f"{n} run {r['id']} ({r['role']}" + (f", task #{r['task']})" if r["task"] else ")")
+                          for n, r in others))
     if jobs:
         print(f"{p.name}: {len(jobs)} detached job(s) still running on this host; a reboot ends them"
               + (" (recorded as interrupted by the planned cycle)" if a.reboot else "") + f": {hostcycle.describe(jobs)}",
