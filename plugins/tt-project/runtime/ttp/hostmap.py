@@ -9,8 +9,8 @@ device lock name (`device.locks`) also finds the entry of the name it shares the
 host is probed as it is. Moving a resource is then one config change, and every waiting probe
 follows it.
 
-The probe checks the host itself: strict host-key checking (a `StrictHostKeyChecking no` in the
-user's ssh config does not apply) and no connection sharing (an open ControlMaster connection would
+The probe checks the host itself: strict host-key checking (a user ssh config that turns checking off does not apply:
+it cannot mask a missing key) and no connection sharing (an open ControlMaster connection would
 answer for a host that is gone or now presents another key). ssh's own failures are classified:
 10 the host key did not verify (changed, or not yet known), 11 authentication failed, 255 the host
 is not reachable (12 with `classified=True`: callers that want a distinct code; retry_when probes
