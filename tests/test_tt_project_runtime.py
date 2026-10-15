@@ -43988,23 +43988,35 @@ _ROWS_UNDER_RUNNING = "awk '/^RUNNING/{f=1;next} /^[A-Z]/{f=0} f&&NF{n++} END{ex
     ("grep -q RUNNING", True),
     ("grep -qi 'running'", True),
     ('grep -q -e "QUEUED"', True),
+    ("grep -q '^RUNNING'", True),
+    ("grep -q '^RUNNING$'", True),
     (_ROWS_UNDER_RUNNING, False),
     ("grep -q 'RUNNING.*#[0-9]'", False),
     ("grep -q running", False),          # case-sensitive: not the header
+    # Whole probes (not replayed): the usual ssh-quoted form, and Slurm state probes, where the word is a job's state.
+    ("ssh box 'tt-device-mcp status | grep -q RUNNING'", True),
+    ('ssh box "tt-device-mcp status | grep -q RUNNING"', True),
+    ("ssh box 'tt-device-mcp status 2>&1 | grep -q \"^QUEUED\"'", True),
+    ("ssh box 'tt-device-mcp status | grep -q \"#[0-9]\"'", False),
+    ("squeue -h -j 123 -o %T | grep -q RUNNING", False),
+    ("sacct -n -j 5 -o State | grep -q PENDING", False),
+    ("ssh login 'squeue -h -j 123 -o %T | grep -q RUNNING'", False),
+    ("ssh box 'tt-device-mcp status' && squeue -h -j 1 -o %T | grep -q PENDING", False),
 ])
 def test_a_probe_grepping_an_always_printed_status_header_is_flagged(env, busy, flagged):
     import subprocess
     from ttp import cli, coordinator as coord, waitheal
-    probe = f"s=$(ssh -o BatchMode=yes box 'tt-device-mcp status 2>&1') && echo \"$s\" | {busy}"
+    whole = busy.startswith(("ssh ", "squeue ", "sacct "))
+    probe = busy if whole else f"s=$(ssh -o BatchMode=yes box 'tt-device-mcp status 2>&1') && echo \"$s\" | {busy}"
     assert bool(waitheal.header_grep(probe)) is flagged
     assert ("never grep a header word" in (coord.marker_only_probe(probe) or "")) is flagged
     # Replay a status whose RUNNING section is empty: the row test says not busy, the header grep says busy.
-    rc = subprocess.run(["sh", "-c", busy], input=_STATUS_EMPTY_RUNNING, text=True).returncode
+    rc = None if whole else subprocess.run(["sh", "-c", busy], input=_STATUS_EMPTY_RUNNING, text=True).returncode
     if busy == _ROWS_UNDER_RUNNING:
         assert rc == 1
         assert subprocess.run(["sh", "-c", busy], input="RUNNING\n  #11 tenant run.sh\nQUEUED\n",
                               text=True).returncode == 0
-    elif flagged:
+    elif flagged and not whole:
         assert rc == 0
     if flagged:
         p = make(env)

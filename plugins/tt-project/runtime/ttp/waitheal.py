@@ -103,18 +103,28 @@ def end_marker_only(probe: str | None) -> str:
 
 # A grep whose whole pattern is one section header word a status listing always prints, such as the
 # device broker's RUNNING or QUEUED: the header shows with no job under it too, so the grep always matches.
+# Only a probe reading the broker's status listing: in a Slurm pipeline (squeue -o %T) the word is a job's state.
 HEADER_WORDS = ("RUNNING", "QUEUED", "PENDING")
-_HEADER_GREP_RE = re.compile(r"\b[ef]?grep((?:\s+-[A-Za-z]+)*)\s+(?:-e\s+)?([\"']?)(" + "|".join(HEADER_WORDS)
-                             + r")\2(?=$|[\s;&|)])", re.I)
+_HEADER_GREP_RE = re.compile(r"\b[ef]?grep((?:\s+-[A-Za-z]+)*)\s+(?:-e\s+)?([\"']?)\^?(" + "|".join(HEADER_WORDS)
+                             + r")\$?\2(?=$|[\s;&|)'\"])", re.I)
+_STATUS_LISTING_RE = re.compile(r"\b(?:tt-device-mcp|\S*broker\S*)(?:\s+[^\s|;&'\"]+)*?\s+status\b", re.I)
+_SLURM_RE = re.compile(r"\b(?:squeue|sacct|scontrol|sinfo)\b")
 HEADER_GREP_HINT = ("it greps `{word}`, a section header the status output prints even when no job is under it, "
                     "so it always matches: test the job rows instead (a row under the section, or the jobs' "
                     "status in the broker's JSON job list); never grep a header word that is always printed")
 
 
 def header_grep(probe: str | None) -> str:
-    """HEADER_GREP_HINT when a probe greps only a status section header word (as written, or in any
-    case with -i), else "". A flag only, never a refusal."""
-    for m in _HEADER_GREP_RE.finditer(str(probe or "")):
+    """HEADER_GREP_HINT when a probe reading the device broker's status listing greps only a section
+    header word (as written, or in any case with -i), else "". A grep fed by a Slurm command is not
+    flagged. A flag only, never a refusal."""
+    probe = str(probe or "")
+    if not _STATUS_LISTING_RE.search(probe):
+        return ""
+    for m in _HEADER_GREP_RE.finditer(probe):
+        feed = re.split(r"&&|\|\||[;\n]", probe[:m.start()])[-1]   # the pipeline this grep reads
+        if _SLURM_RE.search(feed):
+            continue
         if m[3].isupper() or "i" in m[1].replace("-", ""):
             return HEADER_GREP_HINT.format(word=m[3])
     return ""
