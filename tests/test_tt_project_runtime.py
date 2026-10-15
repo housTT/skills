@@ -43895,6 +43895,46 @@ def test_detach_check_rows_never_reads_a_path_with_no_driver_recorded_as_gone(en
 
 
 @pytest.mark.parametrize("where", ["local", "host"])
+def test_detach_check_reads_a_series_driver_dir_by_its_pid_and_exit(env, tmp_path, where):
+    """A series driver's own dir (<dir>/cmd, log, pid, optional EXIT; no .rc, .pid or .boot next to
+    it): its pid alive and no EXIT is running (1); a dead pid or an EXIT wakes the check, with
+    `--rows` (0) and without (4 for a dead pid or an EXIT with no exit code, else EXIT's code)."""
+    p = _device_project(env, device=False)
+    d = tmp_path / "series" / "run"
+    d.mkdir(parents=True)
+    for f in ("cmd", "log"):
+        (d / f).write_text("x\n")
+    (d / "pid").write_text(f"{os.getpid()}\n")   # this test's own process: alive
+    e = _ssh_stub(tmp_path) if where == "host" else None
+    host = ["--host", "box-b"] if where == "host" else []
+    rows = ["--rows", str(d / "log"), "--after", "5"]
+    check = lambda *extra: _ttp_run(p, "detach", "--check", *host, f"{d}.rc", *extra, env=e)
+    r = check(*rows)
+    assert r.returncode == 1 and "running" in r.stdout and "gone" not in r.stdout, r.stdout
+    assert check().returncode == 1
+    assert not list(d.parent.glob("run.*")), "the check left a marker next to the series dir"
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    (d / "pid").write_text(f"{dead.pid}\n")
+    r = check(*rows)
+    assert r.returncode == 0 and "series driver" in r.stdout and "gone" in r.stdout, r.stdout
+    r = check()
+    assert r.returncode == 4 and "gone" in r.stdout, r.stdout
+    (d / "pid").write_text(f"{os.getpid()}\n")
+    (d / "EXIT").write_text("0\n")   # EXIT wins over a live pid
+    r = check(*rows)
+    assert r.returncode == 0 and "job finished rc=0" in r.stdout, r.stdout
+    assert check().returncode == 0
+    (d / "EXIT").write_text("3\n")
+    r = check()
+    assert r.returncode == 4 and "job finished rc=3" in r.stdout, r.stdout
+    (d / "EXIT").write_text("")
+    r = check()
+    assert r.returncode == 4 and "job finished rc=?" in r.stdout, r.stdout
+    assert check(*rows).returncode == 0
+
+
+@pytest.mark.parametrize("where", ["local", "host"])
 def test_detach_check_options_after_the_paths_are_options(env, tmp_path, where):
     """`--rows`, `--after` and `--host` given after the first path (or as --opt=value) count as
     options, never as more paths to check."""

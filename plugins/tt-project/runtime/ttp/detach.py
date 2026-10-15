@@ -469,6 +469,33 @@ def recorded(rc: Path) -> bool:
             or not locks.any_free([locks.job_lock(rc)]))
 
 
+def series(rc: Path) -> tuple[str, str] | None:
+    """A series driver's own dir at this path less its .rc (<dir>/pid, optional <dir>/EXIT holding
+    its exit code), as state() reads a job: ("ended", code, "?" when EXIT holds none) once EXIT
+    exists, ("running", "") while the pid lives, ("lost", why) once it is dead. None for no such dir."""
+    rc = Path(rc).expanduser()
+    d = rc.with_suffix("") if rc.suffix == ".rc" else rc
+    if not d.is_dir():
+        return None
+    if (d / "EXIT").exists():
+        try:
+            code = "".join((d / "EXIT").read_text(errors="replace").split())[:16]
+        except OSError:
+            code = ""
+        return "ended", code if code.isdigit() else "?"
+    try:
+        pid = int((d / "pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "lost", f"series driver pid {pid} is dead with no EXIT; see {d / 'log'}"
+    except PermissionError:
+        pass
+    return "running", ""
+
+
 def state(rc: Path) -> tuple[str, str]:
     """("ended", exit code), ("running" or "queued", ""), or ("lost", why). The first look at a lost
     job records why in <name>.lost."""

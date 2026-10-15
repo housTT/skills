@@ -2916,7 +2916,8 @@ def cmd_detach(a) -> None:
     the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. With
     `--rows <file> --after <n>` it exits 0 also once that file has more than n lines, and 0 (never 4)
     once a job ended or is gone, else 1: one probe that wakes on a new result row, the end or a dead
-    driver; a path no `ttp detach` recorded is never gone then, only a new row wakes it. From a command a sandbox would end with everything it started,
+    driver; a path no `ttp detach` recorded is never gone then, only a new row wakes it. A series
+    driver's own dir (<dir>/pid, optional <dir>/EXIT) runs while its pid lives and ends at EXIT or a dead pid. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
@@ -2948,17 +2949,19 @@ def cmd_detach(a) -> None:
     if a.check is not None:
         ended, failed, one_ended = True, False, False
         for rc in map(Path, a.check):
-            if rows is not None and not detach.recorded(rc):   # no driver to read: only a new row wakes it
+            rec = detach.recorded(rc)
+            ser = None if rec else detach.series(rc)   # a series driver's own dir, read by its pid and EXIT
+            if ser is None and rows is not None and not rec:   # no driver to read: only a new row wakes it
                 ended = False
                 print(f"{rc.stem}: no detached job recorded at {rc}; waking only on a new row in {rows}")
                 continue
-            st, why = detach.state(rc)
+            st, why = ser or detach.state(rc)
             if st == "ended":
                 failed = failed or why != "0"
                 print(f"{rc.stem}: job finished rc={why}")
             elif st == "lost":
                 failed = True
-                print(f"{rc.stem}: gone without an exit code ({why}); see {rc.with_suffix('.log')}")
+                print(f"{rc.stem}: gone without an exit code ({why})" + ("" if ser else f"; see {rc.with_suffix('.log')}"))
             else:
                 ended = False
                 print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}")
@@ -3042,8 +3045,17 @@ echo "started $(cat "$p.pid") $p"
 
 _REMOTE_CHECK = r'''p=$1
 case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
-p=${p%.rc}
+p=${p%/}; p=${p%.rc}
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
+if [ ! -s "$p.pid" ] && [ -d "$p" ] && { [ -e "$p/EXIT" ] || [ -s "$p/pid" ]; }; then
+  if [ -e "$p/EXIT" ]; then
+    c=$(tr -d " \t\r\n" <"$p/EXIT" 2>/dev/null | head -c 16)
+    case $c in ""|*[!0-9]*) echo "rc" ;; *) echo "rc $c" ;; esac; exit 0
+  fi
+  pid=$(cat "$p/pid")
+  if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then echo "running $pid"; else echo "series"; fi
+  exit 0
+fi
 if [ ! -s "$p.pid" ]; then echo "none $p"; exit 0; fi
 if [ -s "$p.boot" ]; then
   r=$(cat "$p.boot") s=
@@ -3164,7 +3176,9 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
     any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read.
     With `rows` (a file on that host): 0 once it has more than `after` lines or one job ended or is
     gone, else 1 (_rows_verdict); a path with no driver recorded (no .rc, no .pid) is never read as
-    gone then, only a new row wakes it; ssh failing is still 255."""
+    gone then, only a new row wakes it; ssh failing is still 255. A series driver's own dir
+    (<dir>/pid, optional <dir>/EXIT holding its exit code) is read by those: running while the pid
+    lives, ended once EXIT exists, gone once the pid is dead."""
     from .detach import FAILED_RC
     ended, failed, one_ended, n = True, False, False, None
     for i, pre in enumerate(prefixes):
@@ -3182,7 +3196,7 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
                 return 2
             n = None if got[1].strip() == "none" else int(got[1]) if got[1].strip().isdigit() else 0
         out = (lines or [""])[-1].split(" ", 1)
-        if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone"):
+        if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone", "series"):
             print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
             return 2
         if out[0] == "rc":
@@ -3199,6 +3213,9 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
         elif out[0] == "none":
             failed = True
             print(f"{name}: gone without an exit code: no driver was recorded at {pre} on {host}")
+        elif out[0] == "series":
+            failed = True
+            print(f"{name}: series driver gone without an EXIT (its pid is dead); see {pre.removesuffix('.rc')}/log on {host}")
         else:
             failed = True
             why = "the host restarted" if out[0] == "boot" else "killed, or the host restarted"
