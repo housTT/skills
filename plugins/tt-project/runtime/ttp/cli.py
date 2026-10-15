@@ -3419,7 +3419,12 @@ def cmd_task(a) -> None:
             die(str(e))
         print(f"task #{tid} queued" + note)
     elif a.action == "list":
-        for t in p.db.q("SELECT id,status,kind,result,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
+        rows = p.db.q("SELECT id,status,kind,result,tier,title,labels FROM tasks ORDER BY id DESC LIMIT 50")
+        if a.json:
+            print(json.dumps([{"id": t["id"], "status": task_outcome(t), "kind": t["kind"], "tier": t["tier"],
+                               "title": t["title"], **task_timing(t)} for t in rows], indent=2))
+            return
+        for t in rows:
             print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{t['title']}")
     elif a.action == "show":
         if not a.title.strip().isdigit():
@@ -3459,6 +3464,15 @@ def cmd_task(a) -> None:
             die(str(e))
 
 
+def task_timing(t: dict) -> dict:
+    """A task's start_when, start_after (epoch seconds), why and retry_when, only those set."""
+    from .db import deferral, load_result
+    d = deferral(t)
+    out = {"start_when": d.get("when"), "start_after": d.get("after"), "start_why": d.get("why"),
+           "retry_when": load_result(t["result"]).get("retry_when")}
+    return {k: v for k, v in out.items() if v}
+
+
 def show_task(t: dict) -> str:
     """`ttp task show`: a task's title, kind, status, spec and stored hand-off (summary, follow-ups, notes,
     review findings). Read-only."""
@@ -3466,6 +3480,8 @@ def show_task(t: dict) -> str:
     r = load_result(t["result"])
     out = [f"#{t['id']} {t['title']}", f"kind: {t['kind']}   status: {task_outcome(t)}   tier: {t['tier']}",
            "", "spec:", t["spec"] or "(none)"]
+    for key, v in task_timing(t).items():
+        out.insert(2, f"{key}: {v}")
     for key in ("summary", "question", "followups", "notes", "findings"):
         v = r.get(key)
         if v:
@@ -5769,6 +5785,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work")
+    s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")

@@ -58490,3 +58490,23 @@ def test_workers_may_write_the_host_wide_check_slots(env):
     assert slot.parent == env["home"] / "check-slots", "the slot root must not move"
     assert any(slot.is_relative_to(r) for r in roots), roots
     assert checkcap.slot_dir().is_dir() and str(env["home"]) not in roots
+
+
+def test_task_show_and_list_json_print_start_when_and_retry_when_only_when_set(env, capsys):
+    p = make(env)
+    from ttp import cli
+    plain = p.db.add_task("plain", "s")
+    cli.main(["task", "demo", "show", str(plain)])
+    out = capsys.readouterr().out
+    assert "start_when" not in out and "retry_when" not in out
+    waiting = p.db.add_task("later", "s")
+    p.db.update_task(waiting, result=json.dumps({"retry_when": "test -e /tmp/x"}),
+                     labels=json.dumps(["start_when:exit 0", "start_why:soon", "start_after:1900000000"]))
+    cli.main(["task", "demo", "show", str(waiting)])
+    out = capsys.readouterr().out
+    for line in ("start_when: exit 0", "start_after: 1900000000", "start_why: soon", "retry_when: test -e /tmp/x"):
+        assert line in out, out
+    cli.main(["task", "demo", "list", "--json"])
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows[waiting]["start_when"] == "exit 0" and rows[waiting]["retry_when"] == "test -e /tmp/x"
+    assert "start_when" not in rows[plain] and "retry_when" not in rows[plain]
