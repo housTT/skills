@@ -166,7 +166,11 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
             return False
         return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":
-        return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
+        if (db.kv("gates", {}).get(arg) or {}).get("level") == "red":
+            return True
+        # A dip inside an open red episode (Daemon._red_episodes) is not out of red: one flap, one alert.
+        return any(isinstance(e, dict) and e.get("open")
+                   for e in ((db.kv("budget_red_episodes", {}) or {}).get(arg) or {}).values())
     if kind == "account-mismatch":   # the gate keeps the flag while the login has no plan readings of its own
         return bool(((db.kv("gates", {}).get(arg) or {}).get("numbers") or {}).get("account_mismatch"))
     if kind == "relayed":   # conditions told to the chat while the coordinator could not run: while one is open

@@ -31825,6 +31825,29 @@ def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
     assert not any("is now green" in m["text"] for m in said), "leaving red is said once, by the cleared alert"
 
 
+def test_a_dip_inside_an_open_red_episode_keeps_the_budget_alert_open(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.update_gates()
+    p.db.spend("fake", 150.0, "task:1")
+    d.update_gates()
+    for dollars in (90.0, 150.0):   # a brief dip above the clear ratio, then red again in the same episode
+        p.db.x("DELETE FROM ledger")
+        p.db.spend("fake", dollars, "task:1")
+        d.update_gates()
+        d.sweep_alerts()
+    told = lambda: p.db.q("SELECT text FROM messages WHERE ref='budget:fake' AND kind IN ('alert','resolved')")
+    assert len(_episodes(p, "budget:fake")) == 1 and _episodes(p, "budget:fake")[0]["cleared"] is None
+    assert not any(m["text"].startswith("Cleared") for m in told()), told()
+    p.db.x("DELETE FROM ledger")
+    p.db.spend("fake", 10.0, "task:1")
+    d.update_gates()
+    d.sweep_alerts()
+    said = told()
+    assert len(said) == 2 and said[-1]["text"].startswith("Cleared: Budget for fake"), said
+
+
 def test_coordinator_failure_alert_clears_on_a_successful_turn(env):
     p = make(env)
     from types import SimpleNamespace
