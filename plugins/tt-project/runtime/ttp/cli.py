@@ -2540,6 +2540,16 @@ def cmd_skill(a) -> None:
     die("no installed tt-project skills found; run `<plugin-root>/bin/ttp setup`", 1)
 
 
+def cmd_broker_released(a) -> None:
+    """Probe: exit 0 once a device broker's hold is released, 1 while not (brokerhold.released), from
+    /health JSON and log text in the files named, or on stdin."""
+    from . import brokerhold
+    text = "".join(Path(f).read_text(errors="replace") for f in a.files) if a.files else sys.stdin.read()
+    ok, why = brokerhold.released(text)
+    print(f"ttp broker-released: {'released' if ok else 'not released'} ({why})")
+    sys.exit(0 if ok else 1)
+
+
 def cmd_killscan(a) -> None:
     """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
@@ -5432,6 +5442,12 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("skill", help="print the path of an installed tt-project skill's SKILL.md (no name: list them)")
     s.add_argument("name", nargs="?", help="e.g. tt-project-harness")
     s.set_defaults(fn=cmd_skill)
+
+    s = sub.add_parser("broker-released", help="probe: exit 0 once a device broker's hold is released (/health "
+                                               "held false with a healthy fsm, or a 'hold released' or "
+                                               "device_released log line), 1 while not")
+    s.add_argument("files", nargs="*", help="/health JSON and log text to read (default: stdin)")
+    s.set_defaults(fn=cmd_broker_released)
 
     s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill, killall, pgrep/pidof, ps | grep into kill) "
                                         "in scripts before running them; --shim writes stand-ins that only log")

@@ -168,7 +168,10 @@ never write to a run folder named in earlier context):
   from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`); size each step's timeout to its tool.
   Retry transient faults (a busy device, a recovering broker, an ssh stall) inside it with
   bounded backoff; mark failure only for a non-transient fault or once retries run out. A wait
-  for a device or box checks it live (its broker's status), never a readiness marker file.
+  for a device or box checks it live (its broker's status), never a readiness marker file. A wait
+  for a broker hold to end uses `ttp broker-released` on its /health answer and log tail: a
+  `device_released` event is not the only sign (also /health `held` false with a healthy fsm, or a
+  `hold released` log line).
   When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
   passes the daemon runs it model-free from the project root with your HOME (600 s by default;
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off written to

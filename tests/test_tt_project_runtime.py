@@ -65682,3 +65682,33 @@ def test_machine_change_broken_probe_reported_once_per_kind_not_per_stderr(env, 
     assert len(events()) == 2
     from ttp import coordinator
     assert coordinator.EFFORT_EVENT_TRIGGERS[ml.PROBE_BROKEN_KIND] == "resource"
+
+
+def test_broker_released_counts_health_held_false_and_hold_released_log_lines(env, tmp_path, capsys, monkeypatch):
+    from ttp import brokerhold, cli
+    rel = brokerhold.released
+    log = "21:00:01 STARTUP hold engaged until the fabric check passes\n21:43:41 STARTUP hold released after 2949s\n"
+    # The log line alone, with no device_released event anywhere, counts as released.
+    assert rel(log)[0] and "STARTUP hold released" in rel(log)[1]
+    assert rel("12:00 hold released by recovery\n")[0]
+    assert rel('{"event": "device_released"}\n')[0]
+    # /health held false with a healthy fsm counts, also as curl's unterminated answer before a log tail.
+    assert rel('{"held": false, "fsm": "healthy"}')[0]
+    assert rel('{"held": false, "fsm": {"state": "Healthy"}}12:00 server up\n')[0]
+    # Live /health wins over an older release line: still held, or an fsm that is not healthy.
+    assert not rel(log + '{"held": true, "fsm": "healthy"}\n')[0]
+    assert not rel(log + '{"held": false, "fsm": "recovering"}\n')[0]
+    # /health with no fsm falls back to the log; a hold set after the release is held again.
+    assert rel('{"held": false}\n' + log)[0]
+    assert not rel(log + "22:10:00 hold set by recovery\n")[0]
+    assert not rel("")[0] and not rel("12:00 no hold today\n")[0]
+    # The CLI probe: 0 released, 1 not, from files or stdin.
+    f = tmp_path / "server.log"
+    f.write_text(log)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["broker-released", str(f)])
+    assert e.value.code == 0 and "released (released: 21:43:41 STARTUP hold released" in capsys.readouterr().out
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"held": true, "fsm": "healthy"}\n'))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["broker-released"])
+    assert e.value.code == 1 and "not released (/health: held true" in capsys.readouterr().out
