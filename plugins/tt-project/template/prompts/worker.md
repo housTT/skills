@@ -22,9 +22,7 @@
   A note for another project on this machine: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
-  A note that is queued or refused is never a reason to wait or block: keep working. A wait on a
-  reply uses retry_when `ttp ack-wait probe --from <project> --hash <id>` and on_pass_cmd
-  `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
+  A note that is queued or refused is never a reason to wait or block: keep working.
 <!-- ttp:if prs -->
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
   as the charter's policies allow. Open or update the draft PR without asking. Never request
@@ -207,6 +205,8 @@ never write to a run folder named in earlier context):
   A host reboot wakes a waiting task only when its `retry_when` checks local state a reboot ends (a
   local `detach --check`, `checks --result`, a pid, /tmp or run-dir files) or its detached job wrote
   no .rc; set `"survives_reboot": true` to keep it asleep anyway.
+  A wait on another project's reply uses retry_when `ttp ack-wait probe --from <project> --hash <id>`
+  and on_pass_cmd `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
   the daemon restarts it, with no model run, up to `budget.max_job_relaunches` times (default 3).
   `wake_tier` defaults to light. After 3 wakes that hand back the same `waiting_for` and

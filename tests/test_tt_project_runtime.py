@@ -29913,7 +29913,7 @@ def test_a_malformed_checks_pid_does_not_stop_other_tasks_waking(env, tmp_path):
         (run_dir / cli.CHECKS_PID).write_text(json.dumps({**info, field: value}))
         bad[tid] = field
     later = p.db.add_task("later", "s", kind="work", tier="light", origin="user")
-    _waiting_from_before_the_boot(p, later, job=False)
+    _waiting_from_before_the_boot(p, later, job=False, retry_when="test -e /tmp/later.done")
     d = Daemon(p.base)
     d.boot_at = time.time() - 300
     d.wake_after_reboot()
