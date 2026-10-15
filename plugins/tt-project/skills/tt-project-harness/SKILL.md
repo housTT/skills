@@ -146,6 +146,19 @@ add `--reboot "<why>"` to the drain. It records the cycle in `state/host-cycle/<
 every project here reads the records of all projects on this host: a detached job that a matching
 cycle (not a dry run, started at most 2 h before the boot) cut short is not counted toward the
 task's `budget.max_reboot_losses`, and the boot notice and the woken task's next run say it was planned.
+
+`--reboot` also holds the whole host, not only this project. As it starts, the drain writes a
+power-cycle intent for this host into the shared machine ledger. While the intent is due, every
+project's daemon on this host starts no new worker or reviewer run and no push-queue push, and
+`ttp checks` exits 75 instead of starting; coordinators still run, and workers already running get
+the usual notice to hand off. `ttp status` and the digest's paused section show the hold. The drain's
+wait and its list also cover the other projects' runs and pushes on this host (their coordinators
+are listed, not waited for); its exit codes do not change. The hold lifts when the intent closes
+(a record for it with `dry_run` or `rebooted` false, or `ttp resume` before the drain recorded the
+cycle), once the host booted again, or 10 min after the intent's time, with one low feed line in
+each project. Other projects are held only when this host is in `ttp machines list`: the ledger is
+keyed by its alias there.
+
 A recovery tool of its own may write the same record itself, and must fsync it (and any other state
 it writes) before the cycle: on some filesystems a record written seconds before a power cycle is
 lost otherwise. Such a helper pauses the project with `ttp pause <name> --until-reboot --reason
