@@ -258,7 +258,7 @@ def test_harness_tasks_stay_in_their_own_harness():
         text = " ".join(path.read_text(encoding="utf-8").split())
         assert "only this project's own harness" in text, f"{path.name}: harness tasks stay in their own harness"
         assert re.search(r"[Nn]ever edit[s]?, or (create|make)s? a worktree or branch in, the tt-project "
-                         r"plugin's source repository or (any other|another) project's harness", text), path.name
+                         r"plugin's source repo(sitory)? or (any other|another) project's harness", text), path.name
         assert "upstream note" in text and "`upstream: " in text, f"{path.name}: names the upstream notes"
     worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
     assert "in the same run, before the hand-off" in worker and "never leave the entry to a later task" in worker
@@ -414,7 +414,7 @@ def test_local_web_forwards_ask_once_and_exposing_tunnels_ask():
     assert "Tunnels need the user's OK first" not in skill and "--tunnel --keep" in skill
     for prompt in ("coordinator.md", "worker.md"):
         text = " ".join((PLUGIN / "template" / "prompts" / prompt).read_text(encoding="utf-8").split())
-        assert re.search(r"Never ask (or tell )?the user to do what (you or )?the project can do", text), prompt
+        assert re.search(r"Never ask (or tell )?the user to do(, or offer to do,)? what (you or )?the project can do", text), prompt
 
 
 def test_new_and_connect_reply_with_a_verified_web_link():
