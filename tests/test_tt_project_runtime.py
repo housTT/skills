@@ -14383,14 +14383,14 @@ def test_upgrade_keeps_a_runtime_edit_that_drops_a_name_nothing_needs(env, monke
 
 
 def test_upgrade_still_restores_a_runtime_file_that_lost_a_name_the_daemon_imports(env, monkeypatch, capsys):
-    p, cli = _upgrade_after_local_drop(env, monkeypatch, "db.py", "OPEN_ASK_MAX_AGE_S")
+    p, cli = _upgrade_after_local_drop(env, monkeypatch, "db.py", "WORKSPACE_TRIES_KEY")
     h = p.harness
-    assert "OPEN_ASK_MAX_AGE_S" in _imports(h / "runtime").stderr
+    assert "WORKSPACE_TRIES_KEY" in _imports(h / "runtime").stderr
     capsys.readouterr()
     cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
-    assert "runtime/ttp/db.py (lost OPEN_ASK_MAX_AGE_S)" in out and "kept runtime files" not in out
-    assert "OPEN_ASK_MAX_AGE_S = " in (h / "runtime" / "ttp" / "db.py").read_text()
+    assert "runtime/ttp/db.py (lost WORKSPACE_TRIES_KEY)" in out and "kept runtime files" not in out
+    assert "WORKSPACE_TRIES_KEY = " in (h / "runtime" / "ttp" / "db.py").read_text()
     assert any(s.startswith("restore runtime files main lost: runtime/ttp/db.py")
                for s in _git_out(h, "log", "--format=%s", "-6").splitlines())
     assert _imports(h / "runtime").returncode == 0 and not p.db.one("SELECT * FROM tasks WHERE kind='harness'")
