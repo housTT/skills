@@ -22,6 +22,7 @@ WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB.
 PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
 PUSH_QUEUE_MIGRATION = "push_queue"   # meta: set once the push queue's tables exist (see pushq.py)
 LEDGER_ACCOUNT_MIGRATION = "ledger_account"   # meta: set once old ledger rows got their run's account
+WATCH_KEY_SINCE = "issue_watch_key_since"   # meta: when issues got watch_key (keyless issues before it predate keys)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -325,14 +326,25 @@ class DB:
     def _migrate_issue_watch_key(self) -> None:
         # The stable key a watcher JSON line gave its issue (screen.py), and the times a keyed issue
         # reopened lately (JSON list): watchdup groups issues by the key's kind and counts each reopen.
+        # WATCH_KEY_SINCE records when the column came: watchdup ignores keyless issues opened before it.
         want = ("watch_key", "reopens")
-        if set(want) <= {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+        if set(want) <= {r["name"] for r in self.q("PRAGMA table_info(issues)")} and self.meta(WATCH_KEY_SINCE):
             return
         with self.tx():
             have = {r["name"] for r in self.q("PRAGMA table_info(issues)")}
+            if "watch_key" not in have:
+                since = time.time()
+            elif self.meta(WATCH_KEY_SINCE):
+                since = None
+            else:   # added before this was recorded: from the first keyed issue, else now; 0 with no issues
+                r = self.one("SELECT MIN(first_seen) AS t, COUNT(*) AS n FROM issues WHERE watch_key IS NOT NULL")
+                any_issue = self.one("SELECT 1 AS x FROM issues LIMIT 1")
+                since = r["t"] if r["n"] else (time.time() if any_issue else 0)
             for col in want:
                 if col not in have:
                     self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
+            if since is not None:
+                self.set_meta(WATCH_KEY_SINCE, repr(float(since)))
 
     def _migrate_issue_episode(self) -> None:
         # The episode a keyed watcher line named (screen._supersede). Older issues have none.

@@ -10,7 +10,8 @@ review. It never wakes anyone and changes no issue: the fix is in the watcher's 
 `key`, or `"whole": true`).
 
 Issues of one kind are duplicates; distinct stable keys are distinct conditions. All issues opened
-under no key on a subject are one kind (their text changed). A keyed issue's kind is its condition
+under no key on a subject are one kind (their text changed), except those opened before issues had
+keys (db.WATCH_KEY_SINCE), which are not counted. A keyed issue's kind is its condition
 class: the key, normalized as issue text and subjects are (lower-cased, numbers masked), split at ':',
 '/' and '#', without the segments that name its subject (and a leading '<subject>' and separator), and
 without the trailing segments that hold a number (a value, a count, an episode, a time), each other run
@@ -27,7 +28,7 @@ import json
 import re
 import time
 
-from .db import DB
+from .db import DB, WATCH_KEY_SINCE
 from . import screen   # a module, not its names: screen imports this module too
 
 WINDOW_S = 86400.0
@@ -72,12 +73,18 @@ def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[
     under no key once ('') when it is new, a keyed one once per open (new or reopened); no subject is ''."""
     out: dict[tuple[str, str], list[str]] = {}
     since = now - window_s
+    try:   # a keyless issue opened before issues had keys says nothing about the watcher's keys
+        keyed_since = float(db.meta(WATCH_KEY_SINCE) or 0)
+    except ValueError:
+        keyed_since = 0.0
     for r in db.q("SELECT COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k, first_seen, reopens "
                   "FROM issues WHERE source=? AND (first_seen>? OR COALESCE(opened,0)>?) ORDER BY first_seen, id",
                   (source, since, since)):
         opens = int(float(r["first_seen"] or 0) > since)
         if r["k"]:
             opens += sum(1 for t in reopen_times(r["reopens"]) if t > since)
+        elif float(r["first_seen"] or 0) < keyed_since:
+            continue
         if opens:
             out.setdefault((r["subject"], key_kind(r["k"], r["subject"])), []).extend([r["k"]] * opens)
     return [(subject, kind, keys) for (subject, kind), keys in out.items()]

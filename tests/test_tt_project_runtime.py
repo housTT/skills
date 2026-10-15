@@ -2952,6 +2952,45 @@ def test_watcher_same_subject_warning_counts_only_one_key_kind_and_lists_the_key
     assert f"+{watchdup.STORED_KEYS + 5 - watchdup.SHOWN_KEYS} more)" in watchdup.describe(w)
 
 
+def test_watcher_same_subject_warning_ignores_keyless_issues_from_before_issues_had_keys(env, monkeypatch):
+    from ttp import watchdup
+    from ttp.db import DB, WATCH_KEY_SINCE
+    run, issues, p = _json_watcher(env, monkeypatch)
+    # Five keyless issues on one subject, opened an hour ago by a database without the watch_key column.
+    for i in range(5):
+        run("old", {"text": f"box-a: unreachable (reason {chr(97 + i)})", "severity": "high", "whole": True})
+    assert len(issues("old")) == 5
+    p.db.x("UPDATE issues SET first_seen=first_seen-3600, opened=opened-3600")
+    p.db.x("ALTER TABLE issues DROP COLUMN watch_key")
+    p.db.x("ALTER TABLE issues DROP COLUMN reopens")
+    p.db.x("DELETE FROM meta WHERE key=?", (WATCH_KEY_SINCE,))
+    p.db.set_kv(watchdup.KEY, {})
+    box_a = (p.logs / "daemon.log").read_text().count("subject 'box-a'")
+    before = time.time()
+    db = DB(p.db.path)   # the migration adds the columns and records when
+    assert float(db.meta(WATCH_KEY_SINCE)) >= before
+    assert watchdup.counts(db, "watcher:old", time.time()) == []
+    assert watchdup.check(db, {}, ["watcher:old"]) == []
+    # Keyless issues opened after the migration still warn.
+    for i in range(4):
+        run("old", {"text": f"box-b: unreachable (reason {chr(97 + i)})", "severity": "high", "whole": True})
+    assert watchdup.counts(db, "watcher:old", time.time()) == [("box-b", 4)]
+    log = (p.logs / "daemon.log").read_text()
+    assert "watcher:old opened 4 issues on subject 'box-b' within 24 h under no key (changing text)" in log
+    assert log.count("subject 'box-a'") == box_a   # no new line for the old issues
+    # A database migrated before the time was recorded starts at its first keyed issue, else now.
+    run("keyed", {"text": "box-c: held", "severity": "high", "key": "box-c:held"})
+    db.x("UPDATE issues SET first_seen=? WHERE source='watcher:keyed'", (before - 60,))
+    db.x("DELETE FROM meta WHERE key=?", (WATCH_KEY_SINCE,))
+    assert float(DB(db.path).meta(WATCH_KEY_SINCE)) == before - 60
+    db.x("DELETE FROM issues WHERE watch_key IS NOT NULL")
+    db.x("DELETE FROM meta WHERE key=?", (WATCH_KEY_SINCE,))
+    assert float(DB(db.path).meta(WATCH_KEY_SINCE)) >= before
+    # A new database has no issues from before keys.
+    fresh = DB(p.base / "fresh.db")
+    assert float(fresh.meta(WATCH_KEY_SINCE)) == 0
+
+
 def test_watcher_same_subject_warning_counts_reopen_churn_per_key_not_distinct_keys(env, monkeypatch):
     from ttp import watchdup
     run, issues, p = _json_watcher(env, monkeypatch)
