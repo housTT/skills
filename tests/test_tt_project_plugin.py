@@ -179,8 +179,10 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
                 names = [node.module.split(".")[0]]
             else:
                 continue
+            # The resume plugin is loaded only into the checked repo's own pytest, never by the runtime.
+            plugin = py.parent.name == "pytest_resume" and names == ["pytest"]
             for n in names:
-                assert n in stdlib or n == "ttp", f"{py}: imports non-stdlib module {n}"
+                assert n in stdlib or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
         if re.search(r"\w\]?\s*\|\s*None\b", src):
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 

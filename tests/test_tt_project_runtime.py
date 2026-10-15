@@ -36574,6 +36574,7 @@ DURABLE_EXEMPT = {
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
     ("project.py", 'open(path, "a")'): "inside durable_append",
+    ("ttp_pytest_resume.py", 'open(self.path, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one passed file per line, flushed and fsynced; a cut last line is ignored on read",
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
     ("release.py", "upgrade.log"): "a log",
     ("service.py", "restart.log"): "a log",
