@@ -3291,9 +3291,21 @@ def test_a_fetch_then_ancestor_probe_goes_through_ttp_landed_and_a_queued_head_w
     now = time.time()
     p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
            "VALUES(?, ?, ?, 'origin/proj', 'approved', ?, ?)", (review, branch, head, now, now))
-    for raw in probes + [f"git merge-base --is-ancestor {head} origin/proj"]:
+    for raw in probes:
         assert landed.probe_command(raw, p) == f"ttp landed --task {tid}", raw
     assert landed.check(p, repo, tid=tid)[0] == 0
+    # Only the push branch waits on the task: another ref keeps its ref and does not pass while the
+    # head is only on the push branch; a bare ancestor probe keeps its ref as before.
+    bare = f"git merge-base --is-ancestor {head} origin/proj"
+    assert landed.probe_command(bare, p) == f"ttp landed {head} --onto origin/proj"
+    for raw in (f"git merge-base --is-ancestor {head} origin/other",
+                f"git fetch -q origin other && git merge-base --is-ancestor {head} FETCH_HEAD",
+                f"git fetch upstream proj && git merge-base --is-ancestor {head} upstream/proj"):
+        cmd = landed.probe_command(raw, p)
+        assert "--task" not in cmd and cmd.endswith(("--onto origin/other", "--onto upstream/proj")), cmd
+        with pytest.raises(SystemExit) as e:
+            cli.main(shlex.split(cmd)[1:])
+        assert e.value.code != 0, cmd
     # A row whose branch no task owns waits on the row's own task.
     p.db.x("UPDATE push_queue SET branch='gone'")
     assert landed.probe_command(probes[0], p) == f"ttp landed --task {review}"

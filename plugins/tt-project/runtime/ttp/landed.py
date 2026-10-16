@@ -45,20 +45,32 @@ NOT_YET, CANNOT = 1, 2
 
 def probe_command(probe: str, p=None) -> str:
     """The shell command the daemon runs for a start_when or retry_when: `landed:#<id>` and an
-    ancestor probe (bare, or after a `git fetch` of the ref it reads) become `ttp landed`; anything
-    else runs as written. With project `p`, a sha a push-queue row holds as its head waits on that
-    row's task (`ttp landed --task <id>`), which also counts a landing the queue recorded."""
+    ancestor probe (bare, or after a `git fetch` of the ref it reads) become `ttp landed` on the
+    probe's own ref; anything else runs as written. With project `p`, a fetch probe of the push
+    branch (`delivery.push_branch` on its remote) whose sha a push-queue row holds as its head waits
+    on that row's task (`ttp landed --task <id>`), which also counts a landing the queue recorded.
+    Known gap, accepted: a probe of any other ref (main, another branch) keeps that ref and gets no
+    task-based wait, so a sha the queue rebased may never appear there; no heuristic covers it, as
+    waiting on the push branch instead would pass long before the sha reaches the ref asked for."""
     if m := LANDED_PROBE.fullmatch(probe or ""):
         return f"ttp landed --task {m.group(1)}"
     if m := ANCESTOR_PROBE.fullmatch(probe or ""):
-        sha, onto = m.group(1), m.group(2)
-    elif (m := FETCH_ANCESTOR_PROBE.fullmatch(probe or "")) and m.group(4) in ("FETCH_HEAD", f"{m.group(1)}/{m.group(2)}"):
-        sha, onto = m.group(3), f"{m.group(1)}/{m.group(2)}"
-    else:
+        return f"ttp landed {m.group(1)} --onto {shlex.quote(m.group(2))}"
+    if not ((m := FETCH_ANCESTOR_PROBE.fullmatch(probe or ""))
+            and m.group(4) in ("FETCH_HEAD", f"{m.group(1)}/{m.group(2)}")):
         return probe
-    if p is not None and (tid := queued_task(p.db, sha)) is not None:
+    remote, branch, sha = m.group(1), m.group(2), m.group(3)
+    if p is not None and _is_push_branch(p, remote, branch) and (tid := queued_task(p.db, sha)) is not None:
         return f"ttp landed --task {tid}"
-    return f"ttp landed {sha} --onto {shlex.quote(onto)}"
+    return f"ttp landed {sha} --onto {shlex.quote(f'{remote}/{branch}')}"
+
+
+def _is_push_branch(p, remote: str, branch: str) -> bool:
+    """Whether <remote>/<branch> is the project's push branch; False when none is configured."""
+    try:
+        return push.target(p, p.root) == (remote, branch)
+    except Exception:
+        return False
 
 
 def queued_task(db, sha: str) -> int | None:
