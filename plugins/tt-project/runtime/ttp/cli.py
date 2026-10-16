@@ -1088,7 +1088,8 @@ def status_text(p: Project) -> str:
     from .coordinator import BROKEN_START
     for t in h["deferred"][:5]:
         broken = t["starts"].startswith(BROKEN_START + ":")
-        lines.append(f"  #{t['id']} {t['starts'] if broken else 'deferred, ' + t['starts']}: {t['title']}")
+        lines.append(f"  #{t['id']} {t['starts'] if broken else 'deferred, ' + t['starts']}: {t['title']}"
+                     + (f" — {t['gate']['text']}" if t.get("gate") else ""))
     if h["undelivered"]:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now, tz)}; "

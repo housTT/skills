@@ -9936,6 +9936,76 @@ def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event
 
 
 
+def test_a_false_start_when_shows_its_last_result_and_age_and_warns_only_past_the_threshold(env):
+    """A deferred task's start_when gate shows its last result (exit code and the probe's last word),
+    when it last ran and how long it has said not yet, in ttp status and the web app's task row. Past
+    waiting.start_gate_warn_s it is a warning in the feed (a status row), never a 'needs you' item."""
+    from ttp import startgate
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import attention, state_payload
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user",
+                        labels=["start_when:test -e /nonexistent/marker", f"deferred_since:{time.time()}"])
+    now = time.time()
+    d._probe_out[tid] = ("waiting for the marker\n", now, "test -e /nonexistent/marker")
+    d._start_verdict(p.db.task(tid), 1, now - 20 * 60)   # first false 20 min ago
+    d._start_verdict(p.db.task(tid), 1, now - 2 * 60)    # last checked 2 min ago
+    line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    assert "gate not yet (exit 1: waiting for the marker), checked 2 min ago, false for 20 min" in line, line
+    assert "warning" not in line, "no warning before the threshold"
+    row = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)
+    assert row["gate"]["rc"] == 1 and not row["gate"]["warn"] and "false for 20 min" in row["gate"]["text"]
+    assert not [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "gate"]
+    # Past the threshold (first false 40 min ago): a warning, in the feed as a status row.
+    gates = p.db.kv(startgate.KEY)
+    gates[str(tid)]["since"] = now - 40 * 60
+    p.db.set_kv(startgate.KEY, gates)
+    line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    assert "false for 40 min; warning: still false after 30 min" in line, line
+    pay = state_payload(p, p.db)
+    assert next(t for t in pay["tasks"] if t["id"] == tid)["gate"]["warn"]
+    rows = [m for m in pay["feed"] if m["kind"] == "gate"]
+    assert len(rows) == 1 and rows[0]["state"] == "status" and f"#{tid} bench waits to start" in rows[0]["text"]
+    assert not attention(p.db, time.time()), "a stale gate never needs the user"
+    assert "needs you" not in status_text(p)
+    # A higher threshold (or 0) takes the warning off; a pass forgets the gate.
+    p.set_config("waiting.start_gate_warn_s", 3600)
+    assert "warning" not in next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    d._start_verdict(p.db.task(tid), 0, now)
+    assert str(tid) not in (p.db.kv(startgate.KEY) or {})
+
+
+def test_a_landed_start_gate_names_its_producers_state(env):
+    """A landed:#<id> gate that says not yet names the producer's state, e.g. 'producer #N in review';
+    the first-false time survives later verdicts and resets once the probe is re-pointed."""
+    from ttp import startgate
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    prod = p.db.add_task("producer", "s", kind="code", origin="user")
+    p.db.update_task(prod, status="review")
+    tid = p.db.add_task("consumer", "s", kind="work", tier="light", origin="user",
+                        labels=[f"start_when:landed:#{prod}", f"deferred_since:{time.time()}"])
+    now = time.time()
+    d._start_verdict(p.db.task(tid), 1, now - 600)
+    p.db.update_task(prod, status="pushing")
+    d._start_verdict(p.db.task(tid), 1, now - 60)
+    g = p.db.kv(startgate.KEY)[str(tid)]
+    assert g["reason"] == f"producer #{prod} being pushed" and g["since"] == now - 600 and g["at"] == now - 60
+    p.db.update_task(prod, status="review")
+    assert startgate.reason(p.db, f"landed:#{prod}", 1) == f"producer #{prod} in review"
+    assert startgate.reason(p.db, f"ttp landed --task {prod}", 1) == f"producer #{prod} in review"
+    line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    assert f"starts when #{prod} lands" in line and f"producer #{prod} being pushed" in line, line
+    # Re-pointed: the old verdict is not credited to the new probe.
+    p.db.update_task(tid, labels=["start_when:false", f"deferred_since:{time.time()}"])
+    d._drop_stale_probe(tid, "false")
+    assert str(tid) not in (p.db.kv(startgate.KEY) or {})
+
+
 @pytest.mark.parametrize("probe", ["landed:abc", "landed:#12 && true", "landed: #", " landed:#1x"])
 def test_check_probe_rejects_a_malformed_landed_probe(probe):
     from ttp import coordinator as coord

@@ -19,7 +19,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, heal, identity, obligations, projpause, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
-from . import timefmt, trend, upstream
+from . import startgate, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -291,7 +291,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
     # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
-    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz, db=db)}
+    start_gates, warn_s = db.kv(startgate.KEY, {}) or {}, startgate.warn_after(cfg)
+    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz, db=db),
+                 "gate": startgate.view(db, t, now, warn_s, start_gates)}   # its last result, age, stale warning
                 for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
                               "ORDER BY COALESCE(not_before, 0), id")]
     deferred = [t for t in deferred if t["starts"]]
@@ -553,6 +555,7 @@ def state_payload(p: Project, db: DB) -> dict:
                  "WHEN 'review' THEN 2 WHEN 'pushing' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
     in_review = db.review_since()
+    start_gates, warn_s = db.kv(startgate.KEY, {}) or {}, startgate.warn_after(p.config())
     # The dependency graph and start/retry conditions, so outside tools need not infer them.
     unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
     asks = waits.open_asks(db)
@@ -569,6 +572,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
         # Plain words for the board; the probe itself stays in start_when, the task's detail.
         t["starts"] = coord.starts_text(t, now, plain=True, where=tz, db=db) if t["status"] == "queued" else ""
+        t["gate"] = startgate.view(db, t, now, warn_s, start_gates) if t["status"] == "queued" else None
         t["wait"] = waits.wait_kind(t, asks, now, tz, paused) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
@@ -597,7 +601,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db, timefmt.home(p)),
         "attention": attention(db, now),
-        "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db), key=lambda m: -float(m["ts"] or 0)),
+        "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),

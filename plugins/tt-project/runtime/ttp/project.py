@@ -104,6 +104,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # a queued task whose start_when says not yet this long while it names a device or
                 # serving resource is raised once (0: never)
                 "start_resource_stale_s": 10800,
+                # a start_when still false this long shows as a warning in status and the feed (0: never)
+                "start_gate_warn_s": 1800,
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
                 # every task that could start waits on hosts this machine cannot reach (probe exit 255),
                 # nothing runs: one normal alert this long into the outage (0: never); the outage ends

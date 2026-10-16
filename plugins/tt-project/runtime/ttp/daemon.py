@@ -88,6 +88,7 @@ from . import schedule as sched
 from . import service
 from . import settinghold
 from . import sharedchecks
+from . import startgate
 from . import sweep
 from . import timefmt
 from . import ttr
@@ -6027,6 +6028,7 @@ class Daemon:
         ids = {t["id"] for t in deferred}
         for tid in [k for k in self._start_rc if k not in ids]:
             del self._start_rc[tid]   # started, cancelled or no longer deferred
+        startgate.forget(db, keep=ids)
         for t in deferred:
             d = deferral(t)
             if not d.get("when") or (t["not_before"] or 0) > now:
@@ -6080,12 +6082,14 @@ class Daemon:
             self._probed.pop(tid, None)
         if tid in self._start_rc and self._start_rc[tid][2] != probe:
             del self._start_rc[tid]
+            startgate.forget(self.p.db, tid=tid)
 
     def _start_verdict(self, task: dict, rc, now: float) -> None:
         d = deferral(task)
         if rc == 0:
             self._probe_rc.pop(task["id"], None)
             self._start_rc.pop(task["id"], None)
+            startgate.forget(self.p.db, tid=task["id"])
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
@@ -6093,6 +6097,10 @@ class Daemon:
             # Kept apart from _probe_rc, whose verdicts tasks on the same probe take and pop: the
             # network outage check reads it.
             self._start_rc[task["id"]] = (rc, now, d.get("when") or "")
+            got = self._probe_out.get(task["id"])
+            out = got[0] if got and got[2] == d.get("when") else ""
+            startgate.record(self.p.db, task["id"], d.get("when") or "", rc,
+                             startgate.reason(self.p.db, d.get("when") or "", rc, out), now)
         if rc in NOT_YET_RCS:
             self._start_resource_stale(task, d, now)
         elif detach.failed_check(d.get("when") or "", rc):
