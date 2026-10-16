@@ -383,12 +383,14 @@ prolonged whole-box outage.
   pattern), a resource pause the user set, or a deferral only until a time. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
-  sha by 15:00", "ETA 18:30") is recorded as a promise, unless the same batch backs it with an
-  obligation. It holds the chat, the promised words, the due time (the time it names, in the home
-  zone, else `coordinator.promise_default_h`, 6, later) and the batch's task that replies to that
-  chat. The digest lists open promises and marks overdue ones; the blocker sweep lists an overdue
+  sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
+  words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,
+  later; a named date over 14 days ahead counts as a misread and gets the default), the batch's task
+  that replies to that chat, and any obligation the same batch records or attaches that such a task
+  owns. The digest lists open promises and marks overdue ones; the blocker sweep lists an overdue
   one as an item. Once overdue, one high-effort wake asks for the deliverable or an honest update in
-  that chat. A promise closes when its tasks finish and a reply reaches its chat, or when the
+  that chat. A promise closes when its tasks finish and a reply reaches its chat, when every linked
+  obligation has its receipt or is dropped, or when the
   coordinator closes it (`obligation` with its key, or a sweep outcome `closed` or `retired`).
   Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
   `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped

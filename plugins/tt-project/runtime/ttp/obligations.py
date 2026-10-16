@@ -40,11 +40,12 @@ sha by 15:00", "ETA 18:30") is recorded as an obligation with a `promise` field 
 when the turn's actions are applied): the chat, the message, the promised sentences, the due time (the
 first time named, in the project's home zone; else coordinator.promise_default_h, PROMISE_DEFAULT_H,
 after the reply) and the tasks of the same batch that will reply to that chat (task_add or task_update
-with that `reply_chat`). A batch that records or attaches an obligation is taken to track its promises
-itself: no second record. The same promise sent again to the same chat updates the open record. A
+with that `reply_chat`). It is always recorded; an obligation the same batch records or attaches is
+linked to it only when one of its owners is such a task, and once every linked obligation has its
+receipt or is dropped, the promise closes too. The same promise sent again to the same chat updates the open record. A
 promise has no owner clocks: it is due once, at its due time, when check() raises one high
 `promise_overdue` event (`obligation:<id>:promise:<due>`). It closes like any obligation (receipt or drop,
-the coordinator's `obligation` action), on a blocker sweep outcome `closed` or `retired`, or by itself
+the coordinator's `obligation` action), with its linked obligations, on a blocker sweep outcome `closed` or `retired`, or by itself
 once all its tasks finished and a reply went to its chat after that. Detection is conservative
 (first-person future plus a delivery verb, or plus a time; never a question or an offer): a commitment
 worded otherwise is not caught, and the coordinator prompt asks for a task or obligation to back it.
@@ -486,7 +487,7 @@ def check(p, now: float | None = None) -> list[str]:
         changed = False
         for o in st["items"].values():
             changed = _check_milestones(p, o, now, raised) or changed
-            changed = _check_promise(p, o, now, raised) or changed
+            changed = _check_promise(p, o, st, now, raised) or changed
             late = overdue(o, now)
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
@@ -556,12 +557,14 @@ _DELIVER = (r"(?:report|deliver|share|confirm|follow up|come back|get back|circl
 COMMIT_RE = re.compile(_FUTURE + r"(?:[\w'’-]+\s+){0,3}?" + _DELIVER, re.I)
 FUTURE_RE = re.compile(_FUTURE + r"|\byou(?:'ll|’ll|\s+will)\s+(?:have|get|see|hear)\b", re.I)
 ETA_RE = re.compile(r"\bETA\b", re.I)
-OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want me to|"
-                      r"shall I|would you like)\b", re.I)
+OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want\s+me\s+to|"
+                      r"shall\s+I|would you like)\b", re.I)
 CLOCK_RE = re.compile(r"\b(?P<h>[01]?\d|2[0-3])(?::(?P<m>[0-5]\d))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*(?P<utc>UTC|GMT)\b)?", re.I)
 IN_RE = re.compile(r"\b(?:in|within)\s+(?:about\s+|around\s+|roughly\s+|~)?(?P<n>\d+(?:\.\d+)?)\s*"
                    r"(?P<u>minutes?|mins?|m|hours?|hrs?|h)\b", re.I)
-DAY_RE = re.compile(r"\b(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(?P<d>[0-3]?\d)\b", re.I)
+DAY_RE = re.compile(r"\b(?P<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+                    r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(?P<d>[0-3]?\d)\b", re.I)
+PROMISE_DATE_MAX_D = 14   # a named date further ahead is a misread, not a promise: the default due applies
 MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 
 
@@ -589,7 +592,8 @@ def commitments(text: str) -> list[str]:
 
 def promise_due(text: str, now: float, tz) -> float | None:
     """The first time `text` names, as an epoch: 'in 90 min', '15:00', '3pm', '15:00 UTC', with 'tomorrow'
-    or a 'Oct 15' date. A bare clock time is its next occurrence after `now`, in the zone `tz`."""
+    or a 'Oct 15' date. A bare clock time is its next occurrence after `now`, in the zone `tz`. A date already
+    past is ignored; one more than PROMISE_DATE_MAX_D days ahead gives None (the default due)."""
     from datetime import timedelta, timezone
     m = IN_RE.search(text)
     clock = next((c for c in CLOCK_RE.finditer(text) if c.group("m") or c.group("ap")), None)
@@ -616,7 +620,10 @@ def promise_due(text: str, now: float, tz) -> float | None:
             return None
         if when.timestamp() < now - 180 * 86400:   # a date early in the year said late in the last one
             when = when.replace(year=when.year + 1)
-        return when.timestamp()
+        if when.timestamp() > now + PROMISE_DATE_MAX_D * 86400:
+            return None
+        if when.timestamp() > now:
+            return when.timestamp()
     when = base.replace(hour=h, minute=mi, second=0, microsecond=0)
     if re.search(r"\btomorrow\b", text, re.I):
         when += timedelta(days=1)
@@ -642,16 +649,15 @@ def _open(o: dict) -> bool:
 
 
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
-                    tracked: bool = False, now: float | None = None) -> list[str]:
+                    obligations: list[str] = (), now: float | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
-    tasks by id with their reply_chat; one replying to a promise's chat owns it. `tracked`: the batch
-    recorded or attached an obligation, which tracks its promises itself. Returns a note per promise."""
+    tasks by id with their reply_chat; one replying to a promise's chat owns it. `obligations`: the ids the
+    batch recorded or attached owners to; one owned by a task that owns the promise is linked to it, and
+    the promise closes with it. Every promise is recorded. Returns a note per promise."""
     now = time.time() if now is None else now
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
     if not found:
         return []
-    if tracked:
-        return [f"promise in message #{mid} is tracked by this batch's obligation" for mid, _, _ in found]
     from . import timefmt
     tz = timefmt.tzinfo(p)
     hours = default_h(p.config())
@@ -662,11 +668,14 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
             text = " ".join(" ".join(said).split())[:PROMISE_TEXT_MAX]
             due = next((d for s in said if (d := promise_due(s, now, tz)) is not None), None)
             owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat)
+            links = sorted({oid for oid in obligations if (o := st["items"].get(oid)) and not o.get("promise")
+                            and set(o["owners"]) & {str(t) for t in owners}})
             same = next((o for o in st["items"].values() if _open(o) and o.get("promise")
                          and o["promise"]["chat"] == chat and o["text"] == text), None)
             if same:
                 pr = same["promise"]
                 pr["tasks"] = sorted(set(pr["tasks"]) | set(owners))
+                pr["obligations"] = sorted(set(pr.get("obligations") or []) | set(links))
                 if pr["message"] == mid:
                     continue   # the same turn applied again
                 pr["message"] = mid
@@ -679,16 +688,22 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
             st["items"][oid] = {"id": oid, "text": text, "by": "coordinator", "created": now, "owners": {},
                                 "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": [],
                                 "promise": {"chat": chat, "message": mid, "due": due if due else now + hours * 3600,
-                                            "timed": due is not None, "tasks": owners, "raised": None}}
+                                            "timed": due is not None, "tasks": owners, "obligations": links,
+                                            "raised": None}}
             notes.append(f"promise {oid} recorded from message #{mid}: due {timefmt.long(st['items'][oid]['promise']['due'], p)}"
-                         + (f", owned by #{', #'.join(map(str, owners))}" if owners else ", no task owns it"))
+                         + (f", owned by #{', #'.join(map(str, owners))}" if owners else ", no task owns it")
+                         + (f", linked to {', '.join(links)}" if links else ""))
         p.db.set_kv(KV, st)
     return notes
 
 
-def _kept(db, o: dict) -> str | None:
-    """Evidence that a promise's tasks all finished and a reply went to its chat after the last of them."""
+def _kept(db, o: dict, st: dict) -> str | None:
+    """Evidence that a promise's linked obligations all closed, or that its tasks all finished and a reply
+    went to its chat after the last of them."""
     pr = o["promise"]
+    links = [st["items"].get(oid) for oid in pr.get("obligations") or []]
+    if links and all(x is None or not _open(x) for x in links):
+        return f"linked {', '.join(pr['obligations'])} closed"
     if not pr["tasks"]:
         return None
     rows = db.q(f"SELECT id, status, updated FROM tasks WHERE id IN ({','.join('?' * len(pr['tasks']))})", pr["tasks"])
@@ -702,13 +717,13 @@ def _kept(db, o: dict) -> str | None:
     return m and f"#{', #'.join(str(r['id']) for r in rows)} finished; reply #{m['id']} went to the chat"
 
 
-def _check_promise(p, o: dict, now: float, raised: list[str]) -> bool:
+def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     """Close a kept promise, or raise its one overdue event. Returns whether `o` changed."""
     pr = o.get("promise")
     if not pr or not _open(o):
         return False
     fp = f"obligation:{o['id']}:promise"
-    kept = _kept(p.db, o)
+    kept = _kept(p.db, o, st)
     if kept:
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)

@@ -1303,10 +1303,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     restr_edited = False
     replies: list[int] = []
     # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
-    # their reply_chat, and whether it recorded or attached an obligation.
+    # their reply_chat, and the obligations it recorded or attached owners to.
     sent: list[tuple[int, str | None, str]] = []
     batch_tasks: dict[int, str | None] = {}
-    tracked = False
+    batch_obls: list[str] = []
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
@@ -1972,7 +1972,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
                     notes.append(f"obligation {oid} recorded")
-                    tracked = True
+                    batch_obls.append(oid)
                 elif str(a.get("evidence") or "").strip():
                     notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None,
                                                      milestone=a.get("milestone")))
@@ -1984,7 +1984,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             obligations.add_milestones(p, oid, a["milestones"])
                         if owners:
                             obligations.attach(p, oid, owners)
-                            tracked = True
+                            batch_obls.append(oid)
                 else:
                     raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach), "
                                      "`milestones` (add), `evidence` (receipt, optional `milestone`) or `why` (drop)")
@@ -2037,7 +2037,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         _restriction_conflicts(p, restr_before, rules_added)
     try:   # a reply already went out: recording its promise never undoes or rejects it
         from . import obligations
-        notes += obligations.record_promises(p, sent, batch_tasks, tracked)
+        notes += obligations.record_promises(p, sent, batch_tasks, batch_obls)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
     db.set_kv(NOTES_KEY, notes)

@@ -11021,3 +11021,50 @@ def test_empty_cache_ttl_is_auto_flagged_by_doctor_and_set_to_auto_by_upgrade(en
     p.set_config("coordinator.cache_ttl", "5m")         # the project's own choice stays
     assert cli._auto_cache_ttl(p) == ""
     assert p.raw_config()["coordinator"]["cache_ttl"] == "5m"
+
+
+
+def test_promise_due_reads_only_real_month_names_and_bounds_dates():
+    """Words that start like a month ('decision 2', 'marker 3', 'JUnit 5') are not dates; a real date
+    within PROMISE_DATE_MAX_D days is kept and one further out falls back to the default (None)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import obligations as ob
+    tz = ZoneInfo("America/Los_Angeles")
+    now = datetime(2026, 10, 15, 10, 0, tzinfo=tz).timestamp()
+    at_15 = datetime(2026, 10, 15, 15, 0, tzinfo=tz).timestamp()
+    for text in ("I will report the decision 2 results by 15:00", "I'll post the marker 3 numbers by 15:00",
+                 "I'll share the JUnit 5 results by 15:00"):
+        assert ob.promise_due(text, now, tz) == at_15, text
+    assert ob.promise_due("I'll deliver it Oct 15 at 15:00", now, tz) == at_15
+    assert ob.promise_due("I'll deliver it October 17 at 3pm", now, tz) == \
+        datetime(2026, 10, 17, 15, 0, tzinfo=tz).timestamp()
+    assert ob.promise_due("I'll deliver it Dec 2 at 15:00", now, tz) is None, "a date weeks out is a misread"
+    for offer in ("Shall I report it by 15:00?", "Want me to share the sha by 15:00", "Should I deliver it by 3pm?"):
+        assert ob.commitments(offer) == [], offer
+
+
+
+def test_promise_is_recorded_beside_an_unrelated_obligation_and_linked_to_its_own(env, monkeypatch):
+    """An obligation in the same batch never suppresses a chat promise. It is linked only when one of
+    its owners is a batch task replying to the promise's chat, and the promise closes with it."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("unrelated", "s", kind="work", tier="light", origin="coordinator")
+    assert coord.apply(p, [{"type": "obligation", "text": "unrelated report", "owners": [other]},
+                           {"type": "reply", "chat": "c1", "text": "I'll report the sha by 15:00."}]) == []
+    promise = next(o for o in ob.items(p.db) if o.get("promise"))
+    assert promise["promise"]["chat"] == "c1" and promise["promise"]["obligations"] == []
+    p.db.update_task(tid, reply_chat="c2")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 2},
+                           {"type": "obligation", "text": "the bench numbers", "owners": [tid]},
+                           {"type": "obligation", "key": "o1", "owners": [other]},
+                           {"type": "reply", "chat": "c2", "text": "I'll deliver the bench numbers by 16:00."}]) == []
+    linked = next(o for o in ob.items(p.db) if o.get("promise") and o["promise"]["chat"] == "c2")
+    own = next(o["id"] for o in ob.items(p.db) if o["text"] == "the bench numbers")
+    assert linked["promise"]["obligations"] == [own] and linked["promise"]["tasks"] == [tid]
+    ob.record(p, own, "receipt", "bench numbers posted", None)
+    check(now + 60)
+    assert ob.get(p.db, linked["id"])["receipt"], "the promise closes with its linked obligation"
+    assert not ob.get(p.db, promise["id"])["receipt"], "the unlinked promise stays open"
