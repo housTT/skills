@@ -495,6 +495,15 @@ def _reboot_note(reboot, tz: str | None = None) -> str:
     notes = [str(x) for x in reboot.get("notes") or []]
     if notes:
         out += "The last run's notes:\n" + "".join(f"- {x}\n" for x in notes)
+    if isinstance(at, (int, float)):
+        from . import activity
+        try:
+            ran = activity.before_boot(float(at), tz)
+        except Exception:   # an unreadable log must not stop the prompt
+            ran = []
+        if ran:
+            out += (f"Locks and detached jobs on this host in the {activity.REBOOT_WINDOW_S // 60} min before the "
+                    "boot, from every project here (one of them may explain it):\n" + "".join(f"- {x}\n" for x in ran))
     return out
 
 

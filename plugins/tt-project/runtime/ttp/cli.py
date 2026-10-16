@@ -2786,7 +2786,9 @@ def cmd_lock(a) -> None:
     its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
     started. The lock is held until the command has ended, however it ends. Every name in config
     `device.locks` is the one device lock. Waiters are served in arrival order, and a nested
-    `ttp lock` of a lock this command already holds just runs.
+    `ttp lock` of a lock this command already holds just runs. Each take and release goes to the
+    project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a command that
+    may reset, power-cycle or reboot what it holds.
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall), does not count
     toward the run's wall clock (which grows by at most its own length this way), and gives up after
@@ -2799,10 +2801,12 @@ def cmd_lock(a) -> None:
     """
     from . import locks as lk
     cmd = list(a.command or [])
+    while cmd and cmd[0] == "--disruptive":   # given after the resource, where the command's words start
+        a.disruptive, cmd = True, cmd[1:]
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd and not a.probe:
-        die("usage: ttp lock <resource> -- <command...>  |  ttp lock --probe <resource>")
+        die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
     base = os.environ.get("TTP_PROJECT")
     if not base and a.probe:
         base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
@@ -2868,10 +2872,26 @@ def cmd_lock(a) -> None:
     except (OSError, ValueError):
         spec = {}
     waiting = False
+    from . import activity
+    from .runner import boot_id
+
+    def _logged(mode: str, run) -> int:
+        # The take and the release go to the project's activity log (`ttp machines activity`).
+        aid = activity.new_id()
+        activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=res, mode=mode, cmd=activity.head(cmd),
+                                               start=time.time(), pid=os.getpid(), boot=boot_id(),
+                                               **({"disruptive": True} if a.disruptive else {})))
+        rc = 1
+        try:
+            rc = run()
+            return rc
+        finally:
+            activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
+
     if res in {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}:
         # This run's task holds the resource for its whole run already.
         _refuse_paused()
-        sys.exit(subprocess.call(cmd, env=child_env))
+        sys.exit(_logged("exclusive", lambda: subprocess.call(cmd, env=child_env)))
     timeout = a.timeout
     cap = float(spec.get("stall_s") or 0) / 2
     capped = False
@@ -2927,11 +2947,14 @@ def cmd_lock(a) -> None:
 
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, _forward)
-            try:
-                rc = proc.wait()
-            finally:
-                f.close()
-            sys.exit(rc)
+
+            def _wait() -> int:
+                try:
+                    return proc.wait()
+                finally:
+                    f.close()
+
+            sys.exit(_logged("lock", _wait))
         if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.
@@ -3096,10 +3119,15 @@ def cmd_detach(a) -> None:
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
         die(f"a detached job named {a.name} already ran in this run; pick another name")
     pid = None
+    from . import activity
+    job_env, aid = dict(os.environ), activity.new_id()
+    state = rd.parent.parent if rd.parent.name == "runs" else None
+    if state is not None:   # the wrapper appends the job's end to the project's activity log
+        job_env.update({activity.ENV_LOG: str(activity.log_path(state)), activity.ENV_ID: aid})
     if getattr(a, "resumable", False):   # before it starts: a reboot right after still finds it
-        detach.save_resume(rc, logf, cmd, os.getcwd(), dict(os.environ), boot_id())
-    if _boxed() and rd.parent.name == "runs":   # this command's sandbox would end the job: the daemon starts it
-        detach.enqueue(rd.parent.parent, rc, logf, cmd, os.getcwd(), dict(os.environ))
+        detach.save_resume(rc, logf, cmd, os.getcwd(), job_env, boot_id())
+    if _boxed() and state is not None:   # this command's sandbox would end the job: the daemon starts it
+        detach.enqueue(state, rc, logf, cmd, os.getcwd(), job_env)
     else:
         # The job inherits this lock and holds it while any of its processes lives, so a job gone
         # without an .rc is told apart from one still running (detach.state).
@@ -3107,9 +3135,12 @@ def cmd_detach(a) -> None:
         if lock is None:
             die(f"a detached job named {a.name} is still running in this run; pick another name")
         try:
-            pid = detach.start(rc, logf, cmd, os.getcwd(), dict(os.environ), lock)
+            pid = detach.start(rc, logf, cmd, os.getcwd(), job_env, lock)
         finally:
             lock.close()
+    if state is not None:
+        activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
+                                             rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
     reg = rd / "detached.json"
     try:
         jobs = json.loads(reg.read_text())
@@ -3308,6 +3339,10 @@ def _detach_remote(a, ttp: str) -> None:
         die(f"could not start {a.name} on {a.remote} (exit {r.returncode}): "
             f"{(r.stdout + r.stderr).strip()[-300:]}")
     pid, prefix = out[1], out[2]
+    from . import activity
+    if p := here():   # its end is known only on that host: the log keeps the start
+        activity.append(p.state, activity.base(p.name, ev="job", id=activity.new_id(), job=a.name,
+                                               machine=a.remote, cmd=activity.head(cmd), start=time.time()))
     print(f"detached {a.name} on {a.remote} (pid {pid})\nlog: {prefix}.log\nrc:  {prefix}.rc\n"
           f"hand off: status waiting, survives_reboot true, retry_when "
           f"\"{ttp} detach --check --host {shlex.quote(a.remote)} {shlex.quote(prefix)}\"")
@@ -3993,6 +4028,8 @@ def cmd_machines(a) -> None:
         return _machine_change(a)
     if a.action == "outage":
         return _machine_outage(a)
+    if a.action == "activity":
+        return _machine_activity(a)
     if a.action == "status":
         from . import responsibilities
         view = responsibilities.machine_status(a.alias)
@@ -4040,6 +4077,23 @@ def cmd_machines(a) -> None:
             print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
         for alias in sorted(known):
             print(mm.line(alias, known[alias]))
+
+
+def _machine_activity(a) -> None:
+    """`ttp machines activity <alias> [--since] [--json]`: who holds, waits for or runs on the machine
+    now, and the locks and detached jobs every project here logged on it since then (activity.py). Read only."""
+    from . import activity
+    now = time.time()
+    try:
+        since = activity.parse_since(a.since, now)
+    except ValueError as e:
+        die(str(e))
+    view = activity.machine_view(a.alias, since, now)
+    if a.json:
+        print(json.dumps(view, indent=2, sort_keys=True))
+        return
+    p = here()
+    print("\n".join(activity.lines(view, p)))
 
 
 def _machine_outage(a) -> None:
@@ -5879,6 +5933,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
                         "inside a run: at most half its stall limit")
+    s.add_argument("--disruptive", action="store_true",
+                   help="the command may reset, power-cycle or reboot what it holds: `ttp machines activity` "
+                        "and the resume note after a reboot list it first")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_lock)
 
@@ -6097,6 +6154,11 @@ def main(argv: list[str] | None = None) -> None:
     m = ms.add_parser("status", help="per machine: the projects using it, its recovery owner, pauses, open changes, "
                                      "heal checks and problems in 24 h (read only)")
     m.add_argument("alias", nargs="?", help="only this machine")
+    m.add_argument("--json", action="store_true")
+    m = ms.add_parser("activity", help="who holds, waits for or runs on a machine now, and the locks and detached "
+                                       "jobs logged on it, from all your projects here (read only)")
+    m.add_argument("alias")
+    m.add_argument("--since", help="window start: a delay back (30m, 6h, 2d) or an ISO time (default 24h)")
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")
     m.add_argument("alias")

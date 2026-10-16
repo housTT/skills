@@ -85,8 +85,12 @@ def failed_why(probe: str, rc, cwd=None) -> str:
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
 _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
-WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
-           'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"')
+# With TTP_ACTIVITY_LOG and TTP_ACTIVITY_ID set (unset before the job runs), the job's end is appended
+# to that project's activity log (activity.py).
+WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
+           'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
+           'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
+           'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")
 
 
