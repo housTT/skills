@@ -11216,6 +11216,82 @@ def test_blocker_sweep_human_indispensable_on_a_user_paused_resource_carries_eve
     assert {i["ends"] for i in sweep.items(db, now + 180, cfg) if i["task"]} == {None}
 
 
+def _covered_by_user_pause(p, now):
+    from ttp import sweep
+    a, b = _board_work(p, now)
+    sweep.record(p.db, {"id": a, "outcome": "human_indispensable", "why": "only the user lifts it"}, None, now + 60)
+    assert {i["ends"] for i in sweep.items(p.db, now + 120, p.config()) if i["task"]} == {"user"}
+    return a, b
+
+
+def test_blocker_sweep_a_note_relaying_the_users_verbatim_words_rearms_a_user_pause_cover(env):
+    """Another project's note that carries the user's verbatim words (the relay label) ends a user
+    pause's cover like a direct user message: the items are judged again. The cover rests on the
+    outcome's time, so a later outcome covers them again."""
+    from ttp import relay, sweep, upstream
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    _covered_by_user_pause(p, now)
+    text = (f"Relaying a user message. {relay.VERBATIM}: \"board-a: lift the pause, the cable is fixed\" "
+            f"{relay.CONTEXT}: sent on from the chat")
+    assert upstream.send("peer", 3, p.name, text) == "sent"
+    assert upstream.ingest(p, cfg, now + 180) == 1
+    assert {i["ends"] for i in sweep.items(db, now + 240, cfg) if i["task"]} == {None}
+    assert db.kv(sweep.RELAYED_KEY) == now + 180
+    sweep.record(db, {"id": _board_ids(db)[0], "outcome": "human_indispensable", "why": "still the user's"},
+                 None, now + 300)
+    assert {i["ends"] for i in sweep.items(db, now + 360, cfg) if i["task"]} == {"user"}
+
+
+def _board_ids(db):
+    return [t["id"] for t in db.q("SELECT id FROM tasks ORDER BY id")]
+
+
+def test_blocker_sweep_a_note_with_only_relayer_context_keeps_a_user_pause_cover(env):
+    """A note whose user part is empty or missing (the relayer's own context only, or a plain worker
+    note), and a note the other project's daemon routed, are no user word: the cover holds."""
+    from ttp import relay, sweep, upstream
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    _covered_by_user_pause(p, now)
+    notes = [f"{relay.CONTEXT}: the user may lift the board-a pause soon",
+             f"{relay.VERBATIM}: {relay.CONTEXT}: the user said to lift board-a",
+             "board-a: lift the pause, the cable is fixed"]
+    for k, text in enumerate(notes):
+        assert upstream.send("peer", k + 1, p.name, text) == "sent"
+    assert upstream.send("peer", None, p.name, f"{relay.VERBATIM}: lift board-a", sender="daemon") == "sent"
+    assert upstream.ingest(p, cfg, now + 180) == 4
+    assert db.kv(sweep.RELAYED_KEY) is None
+    assert {i["ends"] for i in sweep.items(db, now + 240, cfg) if i["task"]} == {"user"}
+    assert not relay.carries_user_words(f"{relay.VERBATIM}: {relay.MARK} only context")
+    assert relay.carries_user_words(f"USER\u2019S WORDS (VERBATIM) \"go ahead\"")
+
+
+@pytest.mark.parametrize("stored", ["human_indispensable", {"outcome": "human_indispensable", "ts": 0,
+                                                            "pause": "board-a", "why": "old format"}])
+def test_blocker_sweep_an_old_format_outcome_is_no_cover_and_never_crashes_the_sweep(env, stored):
+    """An outcome stored in an older format (a plain string, or a `pause` that is no fingerprint map)
+    is no cover: the sweep judges the item again, and every reader of the outcomes skips it."""
+    from ttp import coordinator as coord, sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    a, b = _board_work(p, now)
+    stored = {**stored, "ts": now} if isinstance(stored, dict) else stored
+    db.set_kv(sweep.OUTCOMES_KEY, {f"task:{a}": stored, f"task:{b}": stored})
+    assert sweep.pause_covers(db) == {}
+    live = sweep.items(db, now + 60, cfg)
+    assert {i["ends"] for i in live if i["task"]} == {None}
+    assert sweep.due(db, cfg, now + 60)
+    eid = sweep.start(db, cfg, "every 6h", now + 60)
+    assert f"- #{a} " in coord.digest(p, {}, [eid], [])
+    sweep.review_lines(db, now + 7 * 3600, 0.0)
+    sweep.flags(db, db.kv(sweep.STATE_KEY), live, now + 120)
+    sweep.record(db, {"id": a, "outcome": "human_indispensable", "why": "only the user lifts it"}, None, now + 180)
+    outs = db.kv(sweep.OUTCOMES_KEY)
+    assert set(outs) == {f"task:{a}"} if isinstance(stored, str) else {f"task:{a}", f"task:{b}"}
+    assert {i["ends"] for i in sweep.items(db, now + 240, cfg) if i["task"]} == {"user"}
+
+
 def test_blocker_sweep_while_every_item_ends_with_the_user_only_a_pause_ending_brings_it_forward(env):
     """While every live item is a hold no turn lifts, unrelated signals (a budget kind change, resolved
     upstream notes) do not bring the sweep forward; a pause ending or a built-in re-arm signal does, and

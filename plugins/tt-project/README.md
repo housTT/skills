@@ -415,7 +415,11 @@ prolonged whole-box outage.
   next sweep. Reviews older than `coordinator.review_backlog_h` (6) get a line on why their review
   has not run. A hold no turn can lift needs no outcome and is listed as no action: a user pause (a
   probe that only tests for a marker file named `user-*`; `coordinator.user_pause_marker` sets the
-  pattern), a resource pause the user set, or a deferral only until a time. A waiting task on a user-pause probe is never reported
+  pattern), a resource pause the user set, or a deferral only until a time. A `human_indispensable`
+  outcome on a task a user-set resource pause holds covers every task naming that resource until
+  the pause row changes, a user message arrives, or another project's note relays the user's words
+  (a non-empty `user's words (verbatim)` part); then the sweep judges them again. An outcome stored
+  in an older format is no cover. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised

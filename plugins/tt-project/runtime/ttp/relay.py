@@ -41,6 +41,16 @@ def split(text: str, context: str | None = None) -> tuple[str, str]:
     return head.strip(), "\n".join(parts)
 
 
+_VERBATIM_PART = re.compile(r"user[’']s words \(verbatim\)\s*:?(.*?)(?:" + re.escape(CONTEXT) + "|"
+                            + re.escape(MARK) + r"|$)", re.I | re.S)
+
+
+def carries_user_words(text: str | None) -> bool:
+    """Text relayed on (a note from another project) that holds a VERBATIM part with words in it: the
+    user's own words, not only the relayer's context."""
+    return any(_WORD.search(m.group(1).lower()) for m in _VERBATIM_PART.finditer(text or ""))
+
+
 def _words(text: str) -> list[str]:
     return [w.strip("._-") for w in _WORD.findall((text or "").lower()) if w.strip("._-")]
 

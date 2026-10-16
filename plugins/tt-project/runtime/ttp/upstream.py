@@ -542,6 +542,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             if n.get("project") and n.get("project") != p.name:
                 from .pauseends import note_arrived
                 note_arrived(p, n["project"], now)   # a pause waiting on that project's report
+                from . import relay, sweep
+                if to and n.get("from") != "daemon" and relay.carries_user_words(n.get("spec")):
+                    sweep.user_words_relayed(p.db, now)   # the user's words relayed: re-judge pause covers
     return added
 
 

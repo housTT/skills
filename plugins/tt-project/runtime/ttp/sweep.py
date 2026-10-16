@@ -52,6 +52,7 @@ SWEEP_KIND = "blocker_sweep"
 STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...],
 #                                         "seen": {key: {"status", "since"}}: when each item was first seen stuck}
 OUTCOMES_KEY = "blocker_sweep_outcomes"  # kv: {key: {"outcome", "ts", "until", "probe", "next", "why", "sweep"}}
+RELAYED_KEY = "blocker_sweep_user_relayed"  # kv: when the user's words last came relayed in another project's note
 SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why", "rearm"}]: signal() requests not yet swept
 OUTCOMES = ("unblocked", "rerouted", "retired", "closed", "still_blocked", "human_indispensable")
 EVERY_H = 6.0
@@ -95,6 +96,26 @@ def signal(db: DB, why: str, rearm: bool = False) -> None:
     db.set_kv(SIGNAL_KEY, sigs + [{"ts": time.time(), "why": _clip(why, 200), "rearm": bool(rearm)}])
 
 
+def user_words_relayed(db: DB, now: float | None = None) -> None:
+    """The user's verbatim words came relayed in another project's note: like a user message, it ends
+    every pause cover recorded before it, so the sweep re-judges those items. It lifts nothing itself."""
+    now = time.time() if now is None else now
+    db.set_kv(RELAYED_KEY, max(now, _num(db.kv(RELAYED_KEY, 0))))
+
+
+def _num(v: Any) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def outcomes(db: DB) -> dict[str, dict]:
+    """The recorded sweep outcomes; an entry in another (older) format is dropped: its item is re-judged."""
+    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    return {k: v for k, v in outs.items() if isinstance(v, dict)} if isinstance(outs, dict) else {}
+
+
 def _pause_fp(row: dict) -> str:
     """A resource pause row's fingerprint: any change to it (a re-pause, a new reason) changes it."""
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -111,16 +132,18 @@ def _task_resources(t: dict) -> set[str]:
 
 def pause_covers(db: DB, paused: dict[str, dict] | None = None) -> dict[str, float]:
     """User-paused resources a recorded `human_indispensable` still covers: name -> when that outcome
-    was recorded. Each holds while its pause row is unchanged and no user message came since."""
+    was recorded. Each holds while its pause row is unchanged and no user message came since, nor the
+    user's words relayed in another project's note (user_words_relayed)."""
     paused = _user_paused(db.paused_resources()) if paused is None else paused
-    outs = [o for o in (db.kv(OUTCOMES_KEY, {}) or {}).values() if isinstance(o, dict)
-            and o.get("outcome") == "human_indispensable" and o.get("pause")] if paused else []
+    outs = [o for o in outcomes(db).values() if o.get("outcome") == "human_indispensable"
+            and isinstance(o.get("pause"), dict) and o["pause"]] if paused else []
     if not outs:
         return {}
-    said = float((db.one("SELECT MAX(ts) ts FROM messages WHERE direction='in' AND kind='user'") or {}).get("ts") or 0)
+    said = max(_num((db.one("SELECT MAX(ts) ts FROM messages WHERE direction='in' AND kind='user'") or {}).get("ts")),
+               _num(db.kv(RELAYED_KEY, 0)))
     out: dict[str, float] = {}
     for o in outs:
-        ts = float(o.get("ts") or 0)
+        ts = _num(o.get("ts"))
         for name, fp in o["pause"].items():
             if ts >= said and name in paused and fp == _pause_fp(paused[name]):
                 out[name] = min(out.get(name, ts), ts)
@@ -333,7 +356,7 @@ def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool
         if last < until <= now:
             out.append(f"provider pause over: {r['key'].split(':', 1)[1]}")
     keys = {i["key"] for i in live if not i.get("ends")}
-    for key, o in (db.kv(OUTCOMES_KEY, {}) or {}).items():
+    for key, o in outcomes(db).items():
         if key in keys and o.get("outcome") == "still_blocked" and o.get("next") and last < float(o["next"]) <= now:
             out.append(f"next check due: {key}")
     return out
@@ -353,7 +376,7 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     state = db.kv(STATE_KEY, {}) or {}
     since = now - float(state.get("last") or 0)
     if since >= every:
-        outs = db.kv(OUTCOMES_KEY, {}) or {}
+        outs = outcomes(db)
         prev = state.get("items") or {}
         rethought = rethink(db, cfg, live, now)
         if not holdloops.flagged(db) and all(_carries(i, state, outs, now) and not loop(db, i, prev.get(i["key"]))
@@ -389,7 +412,7 @@ def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
     re-checkable condition or past its next check."""
     last = float(state.get("last") or 0)
     prev = state.get("items") or {}
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    outs = outcomes(db)
     out = {}
     for i in live:
         o = outs.get(i["key"])
@@ -410,7 +433,7 @@ def rethink(db: DB, cfg: dict, live: list[dict], now: float) -> dict[str, str]:
     `still_blocked` on one is flagged, never carried. The coordinator decides the ask itself, or
     records `human_indispensable` with why only the user can answer it."""
     held = askrethink.held_tasks(db, cfg, now)
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    outs = outcomes(db)
     return {i["key"]: f"held by open ask {held[i['task']]} past {askrethink.hours(cfg):g}h: decide the ask "
                       f"yourself, or record human_indispensable with why only the user can"
             for i in live if i["task"] in held and i.get("cover") is None
@@ -446,7 +469,7 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     backlog = _cfg(cfg, "review_backlog_h", REVIEW_BACKLOG_H) * 3600
     reviews = {i["key"]: review_diagnosis(db, i["task"], now, hold_of) for i in live
                if i["kind"] == "review" and backlog > 0 and (i["age_s"] or 0) >= backlog}
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    outs = outcomes(db)
     carry = [i["key"] for i in live if i["key"] not in loops and i["key"] not in reviews
              and i["key"] not in flagged and carried(outs.get(i["key"]), i, now)]
     n = int(state.get("n") or 0) + 1
@@ -538,9 +561,9 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
         if names:   # held by the user's own pause: carries the items naming it until the row changes
             o["pause"] = {n: _pause_fp(paused[n]) for n in sorted(names)}
     o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    outs = outcomes(db)
     outs[key] = o
-    db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - float(v.get("ts") or 0) < 30 * 86400})
+    db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - _num(v.get("ts")) < 30 * 86400})
     return key
 
 
@@ -638,7 +661,7 @@ def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
         return
     data = json.loads(event["data"] or "{}")
     live = _covered(db, data, now, cfg)
-    state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
+    state, outs = db.kv(STATE_KEY, {}) or {}, outcomes(db)
     budget = min(16000, max(2048, positive((cfg.get("coordinator") or {}).get("sweep_prompt_chars"), 12000)))
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
     live.sort(key=lambda i: (i["key"] not in flagged and i["key"] not in loops, -(i["age_s"] or 0)))
@@ -675,7 +698,7 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
     if not events:
         return []
     now = time.time() if now is None else now
-    state, outs = db.kv(STATE_KEY, {}) or {}, db.kv(OUTCOMES_KEY, {}) or {}
+    state, outs = db.kv(STATE_KEY, {}) or {}, outcomes(db)
     live = {i["key"]: i for e in events for i in _covered(db, json.loads(e["data"] or "{}"), now, cfg)}
     flagged, loops = state.get("flags") or {}, state.get("loops") or {}
     ordered = sorted(live.values(), key=lambda i: (i["key"] not in flagged and i["key"] not in loops,
@@ -696,7 +719,7 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
     """For the daily review: every item stuck longer than `hours`, with its reason and sweep outcome
     (times in the home zone of `where`)."""
     now = time.time() if now is None else now
-    outs = db.kv(OUTCOMES_KEY, {}) or {}
+    outs = outcomes(db)
     state = db.kv(STATE_KEY, {}) or {}
     loops = state.get("loops") or {}
     rows = [i for i in items(db, now, where) if i["age_s"] is not None and i["age_s"] >= hours * 3600]
