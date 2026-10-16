@@ -33,15 +33,19 @@ from that moment.
 
 Change ledger. Every live change to a shared machine (a drop-in, a disabled recovery switch, a pause) is
 recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expires <t> | --until-probe
-"<cmd>")`: who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
+"<cmd>" | --until-task <id>)`: who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
 digest lists the open entries for machines in its Resources, one line each. An entry is overdue when it
-expires or its until-probe passes (exit 0: what it waited for is over, so the undo is due); a probe-only
-entry also expires after PROBE_END_S. An overdue entry pages the project that made it, then the machine's
+expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due) or its until-task
+(a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
+cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_S, and a continuation task
+re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
+project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
 then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
 from its root, as end probes do; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
-timeout) queues one low `change_probe_broken` event per kind of breakage. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe]`
+timeout) queues one low `change_probe_broken` event per kind of breakage; the same daemon reads its until-tasks'
+states. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe | --until-task]`
 corrects an open entry in place (same id), with an edit trail in the entry.
 
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
@@ -76,6 +80,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import detach, ends, machines, project
+from .db import TERMINAL_TASK_STATES
 
 LEDGER = "machine-changes.json"
 ROUTES = "machine-routes.json"
@@ -85,7 +90,7 @@ UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
 GRACE_S = 1800               # default: how long a condition lasts before it is routed
 CONDITION_GONE_S = 3 * 3600  # a condition nobody reported this long is over
-PROBE_END_S = 7 * 86400      # an entry with only an until-probe is overdue after this anyway
+PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task is overdue after this anyway
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
@@ -142,18 +147,23 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 # ledger -------------------------------------------------------------------------------------------
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
-               task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None) -> dict:
+               task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
+               until_task: int | None = None) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `expects`: the
     event fingerprints or machine conditions (down, held) the change is known to cause, which then
-    keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind)."""
+    keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind).
+    `until_task`: a task of project `by` whose end (done, failed, cancelled, gone) makes it overdue
+    (check_task validates it)."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
     what, undo, probe = _one_line(what), _one_line(undo, 1000), _one_line(until_probe, ends.PROBE_CHARS)
     if not what or not undo:
         raise ValueError("say what changed and give the --undo command")
-    if not expires and not probe:
-        raise ValueError("give an end: --expires <delay or time> or --until-probe <command>")
+    if probe and until_task:
+        raise ValueError("give one end: --until-probe or --until-task (with --expires as the latest end)")
+    if not expires and not probe and not until_task:
+        raise ValueError(END_HINT)
     if probe:
         ends.check_sh(probe, "--until-probe")
     end = float(expires) if isinstance(expires, (int, float)) else \
@@ -162,7 +172,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         doc = _read(LEDGER, {"next": 1, "changes": []})
         n = int(doc.get("next") or 1)
         entry = {"id": n, "alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now,
-                 "expires": end, "probe": probe or None, **(extra or {})}
+                 "expires": end, "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
+                 **(extra or {})}
         if expects:
             entry["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
         doc["next"] = n + 1
@@ -257,6 +268,29 @@ def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | No
         return c
 
 
+END_HINT = "give an end: --expires <delay or time>, --until-probe <command> or --until-task <id>"
+
+
+def check_task(p, tid: int) -> None:
+    """Refuse an until-task that is not an open task of project `p` (the entry's author)."""
+    row = p.db.task(int(tid))
+    if row is None:
+        raise ValueError(f"no task #{tid} in project {p.name}: --until-task names one of its open tasks")
+    if row["status"] in TERMINAL_TASK_STATES:
+        raise ValueError(f"task #{tid} is {row['status']} already: give an open task, or another end")
+
+
+def task_over(p, tid: Any) -> str:
+    """Why until-task `tid` of project `p` is over ("" while it is open): done, failed, cancelled or gone."""
+    try:
+        row = p.db.task(int(tid))
+    except (TypeError, ValueError):
+        return f"its until-task #{tid} is not a task id"
+    if row is None:
+        return f"its until-task #{tid} is gone"
+    return f"its until-task #{tid} is {row['status']}" if row["status"] in TERMINAL_TASK_STATES else ""
+
+
 def changes(aliases=None, open_only: bool = True) -> list[dict]:
     doc = _read(LEDGER, {"changes": []})
     return [c for c in doc.get("changes", []) if isinstance(c, dict) and (not open_only or not c.get("closed"))
@@ -276,15 +310,16 @@ def close_change(cid: int, why: str = "", by: str = "", now: float | None = None
 
 
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
-                until_probe: str | None = None, now: float | None = None) -> dict:
-    """Correct open entry #cid in place: its text, undo command or end (--expires or --until-probe, as
-    add_change takes them). Keeps its id, alias, author and creation time; records who edited it, when
+                until_probe: str | None = None, now: float | None = None, until_task: int | None = None) -> dict:
+    """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
+    --until-task, as add_change takes them; the same until-task again restarts its PROBE_END_S, so a
+    continuation task re-extends the entry). Keeps its id, alias, author and creation time; records who edited it, when
     and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
     that changes nothing."""
     now = time.time() if now is None else now
-    if expires and until_probe:
-        raise ValueError("give one end: --expires or --until-probe")
+    if sum(map(bool, (expires, until_probe, until_task))) > 1:
+        raise ValueError("give one end: --expires, --until-probe or --until-task")
     new: dict[str, Any] = {}
     if what is not None:
         new["what"] = _one_line(what)
@@ -297,12 +332,14 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if not probe:
             raise ValueError("the --until-probe command cannot be empty")
         ends.check_sh(probe, "--until-probe")
-        new.update(probe=probe, expires=now + PROBE_END_S)
+        new.update(probe=probe, until_task=None, expires=now + PROBE_END_S)
+    elif until_task:
+        new.update(probe=None, until_task=int(until_task), expires=now + PROBE_END_S)
     elif expires:
-        new.update(probe=None, expires=float(expires) if isinstance(expires, (int, float))
+        new.update(probe=None, until_task=None, expires=float(expires) if isinstance(expires, (int, float))
                    else ends.parse_expires(expires, now))
     if not new:
-        raise ValueError("say what to change: --what, --undo, --expires or --until-probe")
+        raise ValueError("say what to change: --what, --undo, --expires, --until-probe or --until-task")
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
@@ -321,7 +358,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         for k in was:
             c[k] = new[k]
         if "expires" in was:
-            for k in ("probe_passed", "probe_job_failed", "page"):
+            for k in ("probe_passed", "probe_job_failed", "task_ended", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
@@ -338,6 +375,8 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
         return f"the detached job its until-probe waits on ended but failed ({c['probe_job_failed'] if isinstance(c['probe_job_failed'], str) else 'probe exit ' + str(c['probe_job_failed'])})"
     if c.get("probe_passed"):
         return "its until-probe passed"
+    if c.get("task_ended"):
+        return str(c.get("task_end_why") or f"its until-task #{c.get('until_task')} ended")
     if float(c.get("expires") or 0) <= now:
         return f"expired {ends.shown(float(c['expires']), where)}"
     return ""
@@ -370,7 +409,8 @@ def change_line(c: dict, now: float | None = None, where=None, clip: int | None 
     late = overdue(c, now, where)
     part = (lambda t: _clip(t, CLIP_PART_CHARS)) if clip else str
     end = f"until-probe `{part(c['probe'])}`, at the latest {ends.shown(c['expires'], where)}" if c.get("probe") \
-        else f"ends {ends.shown(c['expires'], where)}"
+        else f"until task #{c['until_task']} ends, at the latest {ends.shown(c['expires'], where)}" \
+        if c.get("until_task") else f"ends {ends.shown(c['expires'], where)}"
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     head, tail = f"#{c['id']} {c['alias']}: ", (f" (by {by}; undo: `{part(c['undo'])}`; {end})"
@@ -834,6 +874,7 @@ class Probes:
                         if ids[(c["id"], c["probe"])]:
                             c["probe_job_failed"] = detach.failed_why(c["probe"], ids[(c["id"], c["probe"])], self.p.root)
                 _write(LEDGER, doc)
+        self._tasks(now)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
                 with contextlib.suppress(ValueError):   # another daemon closed it first
@@ -848,6 +889,20 @@ class Probes:
                 self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")
+
+    def _tasks(self, now: float) -> None:
+        """Mark this project's open entries whose until-task is over (task_ended), so any daemon's route
+        pages it as overdue."""
+        over = {(c["id"], c["until_task"]): why for c in changes() if c.get("by") == self.p.name
+                and c.get("until_task") and not c.get("task_ended") and (why := task_over(self.p, c["until_task"]))}
+        if not over:
+            return
+        with _locked():
+            doc = _read(LEDGER, {"next": 1, "changes": []})
+            for c in doc.get("changes", []):   # not an until-task an edit replaced meanwhile
+                if (c.get("id"), c.get("until_task")) in over and not c.get("closed") and not c.get("task_ended"):
+                    c.update(task_ended=now, task_end_why=over[(c["id"], c["until_task"])])
+            _write(LEDGER, doc)
 
     def _broken(self, cid: int, probe: str, rc, err: str, now: float) -> None:
         """Log a broken until-probe and queue one low event for the coordinator, keyed on the change, the
@@ -956,3 +1011,12 @@ def review_lines(p, now: float | None = None) -> list[str]:
             f"{', '.join(q.get('seen_by') or []) or '?'}), last {ends.shown(float(q['at']), p)}: not paged: {q.get('why')}"
             for a, q in sorted(got.items()) if a in mine and isinstance(q, dict)
             and now - float(q.get("at") or 0) < REVIEW_S]
+
+
+def task_lines(p) -> list[str]:
+    """For the daily review: each open entry project `p` made whose until-task is over (done, failed,
+    cancelled or gone) and that nobody undid and closed yet; one line each."""
+    return [f"{change_line(c, where=p)} (task over: {why}; undo it and `ttp machines change close {c['id']}`, or "
+            f"re-extend it for a continuation: `ttp machines change edit {c['id']} --until-task <id>`)"
+            for c in changes() if c.get("by") == p.name and c.get("until_task")
+            and (why := task_over(p, c["until_task"]))]

@@ -12239,3 +12239,80 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     probs = coord.apply(p, [{"type": "memory_add", "text": "Anything at all."}], turn=7)
     assert probs and "cannot be read" in probs[0]
     assert not list(p.memory_dir.glob("*anything*.md"))
+
+
+def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_extends_it(env, monkeypatch, capsys):
+    """`--until-task <id>`: the entry is overdue once that task of its project is done, failed, cancelled
+    or gone (marked by that project's daemon), at the latest after PROBE_END_S; a continuation re-extends it
+    with its own id, the same id renews the latest end, and the daily review lists entries whose task is over."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    build = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    use = p.db.add_task("use the staged tree", "s", kind="work", tier="light", origin="user")
+    with pytest.raises(ValueError, match="give one end"):
+        ml.add_change("box-a", "staged tree", "rm -r tree", p.name, until_probe="true", until_task=use)
+    c = ml.add_change("box-a", "staged build tree", "rm -r tree", p.name, task=build, until_task=use, now=now)
+    assert c["until_task"] == use and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
+    assert f"until task #{use} ends, at the latest" in ml.change_line(c, now)
+    probes = ml.Probes(p)
+    probes.tick(now + 1)
+    assert not ml.overdue(ml.changes()[0], now + 1) and ml.task_lines(p) == []
+    # Another project's daemon never reads this project's tasks.
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (use,))
+    ml.Probes(type("Other", (), {"name": "other", "root": p.root, "db": p.db})()).tick(now + 2)
+    assert "task_ended" not in ml.changes()[0]
+    probes.tick(now + 3)
+    [got] = ml.changes()
+    assert ml.overdue(got, now + 3) == f"its until-task #{use} is done"
+    [line] = ml.task_lines(p)
+    assert f"#{c['id']} box-a: staged build tree" in line and f"edit {c['id']} --until-task <id>" in line
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    assert d._schedule_llm({"name": "daily-review", "budget_usd_day": None, "last_run": None,
+                            "description": "review"}, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Open machine changes whose until-task is over" in spec and f"- {line}" in spec
+    # A continuation re-extends it with its own id: the end starts afresh.
+    cont = p.db.add_task("continue: use the staged tree", "s", kind="work", tier="light", origin="user")
+    got = ml.edit_change(c["id"], p.name, until_task=cont, now=now + 10)
+    assert got["until_task"] == cont and "task_ended" not in got and not ml.overdue(got, now + 10)
+    assert got["edits"][-1]["was"]["until_task"] == use and ml.task_lines(p) == []
+    again = ml.edit_change(c["id"], p.name, until_task=cont, now=now + 86400)
+    assert again["expires"] == pytest.approx(now + 86400 + ml.PROBE_END_S)
+    assert ml.overdue(again, now + 86400 + ml.PROBE_END_S).startswith("expired")
+    # Each end of the task counts, a deleted task too.
+    for i, end in enumerate(("failed", "cancelled", "gone")):
+        if end == "gone":
+            p.db.x("DELETE FROM tasks WHERE id=?", (cont,))
+        else:
+            p.db.x("UPDATE tasks SET status=? WHERE id=?", (end, cont))
+        probes.tick(now + 20 + i)
+        assert ml.overdue(ml.changes()[0], now + 20 + i) == f"its until-task #{cont} is {end}"
+        if end != "gone":
+            ml.edit_change(c["id"], p.name, until_task=cont, now=now + 20 + i)
+            p.db.x("UPDATE tasks SET status='running' WHERE id=?", (cont,))
+    # Switching to another end drops the until-task.
+    got = ml.edit_change(c["id"], p.name, expires="2h", now=now + 30)
+    assert got["until_task"] is None and "task_ended" not in got and "ends " in ml.change_line(got, now + 30)
+    # The CLI takes only an open task of the project it runs in.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    for bad, why in (([str(use)], "is done already"), (["999"], "no task #999"),
+                     ([str(build), "--by", "other"], "run it inside that project"),
+                     ([str(build), "--expires", "1h"], "")):
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "change", "add", "box-a", "tree", "--undo", "rm -r tree", "--until-task", *bad])
+        assert why in capsys.readouterr().err
+    cli.main(["machines", "change", "add", "box-a", "tree", "--undo", "rm -r tree", "--until-task", str(build)])
+    assert f"until task #{build} ends" in capsys.readouterr().out
+    new = ml.changes()[-1]["id"]
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "edit", str(new), "--until-task", str(use)])
+    assert "is done already" in capsys.readouterr().err
+    cli.main(["machines", "change", "edit", str(new), "--until-task", str(build)])
+    assert f"until task #{build} ends" in capsys.readouterr().out

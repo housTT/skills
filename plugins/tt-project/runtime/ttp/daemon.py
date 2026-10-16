@@ -4147,6 +4147,11 @@ class Daemon:
                     spec += ("\n\nShared-machine outages not paged (last 24 h; known, under repair, owned by a "
                              "person or ticket, paused, or needed by no open work):\n"
                              + "\n".join(f"- {line}" for line in quiet))
+                gone = machine_ledger.task_lines(self.p)
+                if gone:
+                    spec += ("\n\nOpen machine changes whose until-task is over (undo and close each, or "
+                             "re-extend it for the task that continues the work):\n"
+                             + "\n".join(f"- {line}" for line in gone))
             except Exception as e:   # nor must the machine ledger
                 log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):

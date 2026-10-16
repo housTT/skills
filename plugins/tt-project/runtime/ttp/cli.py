@@ -4216,7 +4216,10 @@ def _machine_change(a) -> None:
         return
     if a.change == "edit":
         try:
-            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe)
+            if a.until_task:
+                c = next((c for c in ml.changes() if c.get("id") == a.id), None)
+                _until_task_ok(p, c.get("by") if c else by, a.until_task)
+            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task)
         except ValueError as e:
             die(str(e))
         print(f"edited {ml.change_line(c)}")
@@ -4225,18 +4228,31 @@ def _machine_change(a) -> None:
         die("run it inside a project, or say whose change it is: --by <project>")
     task = os.environ.get("TTP_TASK")
     tid = int(task) if task and task.isdigit() else None
-    if a.power_cycle_at and (a.undo or a.expires or a.until_probe):
-        die("a power cycle needs no --undo, --expires or --until-probe: it closes itself after its time")
+    if a.power_cycle_at and (a.undo or a.expires or a.until_probe or a.until_task):
+        die("a power cycle needs no --undo, --expires, --until-probe or --until-task: it closes itself after its time")
     if not a.power_cycle_at and not a.undo:
         die("give the --undo command (or --power-cycle-at <t> for a planned power cycle)")
-    if not a.power_cycle_at and not (a.expires or a.until_probe):
-        die("give an end: --expires <delay or time> or --until-probe <command>")
+    if not a.power_cycle_at and not (a.expires or a.until_probe or a.until_task):
+        die(ml.END_HINT)
     try:
+        if a.until_task:
+            _until_task_ok(p, by, a.until_task)
         c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid) if a.power_cycle_at else \
-            ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect)
+            ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
+                          until_task=a.until_task)
     except ValueError as e:
         die(str(e))
     print(f"recorded {ml.change_line(c)}")
+
+
+def _until_task_ok(p: Project | None, by: str, tid: int) -> None:
+    """Refuse an until-task unless it is an open task of the project the entry is by, run inside it: only
+    that project's daemon reads its tasks' states."""
+    from . import machine_ledger as ml
+    if p is None or p.name != by:
+        raise ValueError(f"--until-task names a task of the project the change is by ({by or '?'}): run it "
+                         f"inside that project")
+    ml.check_task(p, tid)
 
 
 def _pause_by(p: Project) -> str:
@@ -6317,6 +6333,9 @@ def main(argv: list[str] | None = None) -> None:
     end.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time")
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
+    end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
+                     help="it ends once this open task of the project is done, failed or cancelled (a staged "
+                          "build tree a follow-up task needs); at the latest after 7 days")
     end.add_argument("--power-cycle-at", dest="power_cycle_at", metavar="T",
                      help="a planned power cycle at T (a delay or a time): running workers on the machine are "
                           "told to commit and hand off shortly before; the entry closes itself after")
@@ -6340,6 +6359,9 @@ def main(argv: list[str] | None = None) -> None:
     end.add_argument("--expires", help="a new end: a delay (6h, 3d) or a time")
     end.add_argument("--until-probe", dest="until_probe",
                      help="a new end: a command that exits 0 once the change should be undone")
+    end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
+                     help="a new end: once this open task ends; a continuation task gives its own id "
+                          "to re-extend the entry (again 7 days at the latest)")
     c.add_argument("--by", help="who edits it (default: the project you are in)")
     s.set_defaults(fn=cmd_machines)
 
