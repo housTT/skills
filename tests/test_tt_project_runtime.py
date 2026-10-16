@@ -13111,15 +13111,15 @@ def _until(flag):
     return ["sh", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do sleep 0.05; done"]
 
 
-def _exclusive_run_detaching(p, task_id, run_id, run_dir, job_cmd, wait=True):
+def _exclusive_run_detaching(p, task_id, run_id, run_dir, job_cmd, wait=True, opts=()):
     """A run supervisor of exclusive task `task_id` holding the board, whose agent detaches `job_cmd`
-    and ends at once, as a worker that hands off `waiting` on its job does."""
+    (with `ttp detach` options `opts`) and ends at once, as a worker that hands off `waiting` on its job does."""
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     run_dir.mkdir(parents=True)
     (run_dir / "prompt.md").write_text("x")
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": [sys.executable, str(TTP), "detach", "job", "--", *job_cmd],
+        "argv": [sys.executable, str(TTP), "detach", "job", *opts, "--", *job_cmd],
         "env": {"TTP_TASK": str(task_id), "TTP_RUN_ID": str(run_id), "TTP_RUN_DIR": str(run_dir),
                 "TTP_PROJECT": str(p.base)},
         "cwd": str(p.root), "timeout_s": 60, "provider": "fake", "holds": str(p.state / "holds"),

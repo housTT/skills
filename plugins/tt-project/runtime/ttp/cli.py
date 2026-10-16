@@ -3063,7 +3063,8 @@ def cmd_detach(a) -> None:
     driver's own dir (<dir>/pid, optional <dir>/EXIT) runs while its pid lives and ends at EXIT or a dead pid. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
-    resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py).
+    resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py), or
+    until the host a `--remote-host` job drives reset or its remote pid died (detach.remote_verdict).
     `--resumable` records the job's argv, cwd and environment (no secrets) so the daemon can start it
     again after a host reboot cut it short, while its task still waits on it (daemon._relaunch_jobs)."""
     from . import detach, jobuse
@@ -3088,6 +3089,11 @@ def cmd_detach(a) -> None:
         die("--rows and --after go with --check")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
+    rhost = getattr(a, "remote_host", None)
+    if (getattr(a, "remote_pid", None) or getattr(a, "remote_marker", None)) and not rhost:
+        die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
+    if rhost and (a.remote or a.check is not None):
+        die("--remote-host is for a local job that drives another host; --remote starts the job there itself")
     if a.remote:
         _detach_remote(a, _own_ttp())
         return
@@ -3147,6 +3153,12 @@ def cmd_detach(a) -> None:
             pid = detach.start(rc, logf, cmd, os.getcwd(), job_env, lock)
         finally:
             lock.close()
+    remote = None
+    if rhost:   # after the start: a slow or dead host never delays the job (detach.remote_verdict)
+        remote = {"host": rhost, "boot": detach.remote_start(rhost), "pid": getattr(a, "remote_pid", None) or "",
+                  "marker": getattr(a, "remote_marker", None) or ""}
+        if not remote["boot"]:
+            print(f"ttp detach: {rhost} did not answer; its boot id is recorded at the first answer", file=sys.stderr)
     if state is not None:
         activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
                                              rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
@@ -3159,6 +3171,7 @@ def cmd_detach(a) -> None:
     jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),
+                 **({"remote": remote} if remote else {}),
                  "requested": jobuse.requested(cmd, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                jobuse.daemon_env(rd.parent.parent / "daemon.pid")
@@ -3169,6 +3182,13 @@ def cmd_detach(a) -> None:
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
 
+
+# Sets $b to the host's boot id, as the remote side of `ttp detach --remote` records it (below) and
+# detach.remote_liveness reads it for a local job's --remote-host.
+REMOTE_BOOT_SH = r'''b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+[ -n "$b" ] || b=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
+[ -n "$b" ] || b=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
+'''
 
 # The remote side of `ttp detach --remote`, run by POSIX sh over ssh. The driver's wrapper records its
 # own pid and its process start (field 22 of /proc/<pid>/stat; without /proc, as on macOS, ps's lstart),
@@ -3182,10 +3202,7 @@ case $d in "~"|"~/"*) d=$HOME${d#\~} ;; esac
 mkdir -p "$d" || exit 3
 p=$d/$n
 if [ -e "$p.log" ] || [ -e "$p.rc" ] || [ -e "$p.pid" ]; then echo "exists $p"; exit 4; fi
-b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
-[ -n "$b" ] || b=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
-[ -n "$b" ] || b=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
-if [ -n "$b" ]; then echo "$b"; fi >"$p.boot"
+''' + REMOTE_BOOT_SH + r'''if [ -n "$b" ]; then echo "$b"; fi >"$p.boot"
 setsid nohup sh -c 'p=$1; shift
 s=$(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)
 [ -n "$s" ] || s=$(ps -o lstart= -p $$ 2>/dev/null | tr -s " " _)
@@ -3244,7 +3261,7 @@ def _start_options(a) -> None:
     never runs as the command."""
     words = list(a.command or [])
     known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None,
-             **({"--dir": str} if a.remote else {})}
+             **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str})}
     while words and words[0].startswith("-") and words[0] != "--":
         w = words.pop(0)
         key, eq, val = w.partition("=")
@@ -6039,6 +6056,14 @@ def main(argv: list[str] | None = None) -> None:
                    "records that host's boot id, so a driver gone without an exit code reads as died with the "
                    "host reboot (boot id changed), crashed or killed (same boot), or unknown (unreadable)")
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
+    s.add_argument("--remote-host", metavar="HOST",
+                   help="a local job that drives a job on this ssh host: records its boot id, and an exclusive "
+                   "run's hold keeper ends the job and lets its hold go once that host reset or --remote-pid is "
+                   "gone without --remote-marker (an unreachable host keeps the hold)")
+    s.add_argument("--remote-pid", metavar="PID|FILE", help="with --remote-host: the remote driver's pid, or a "
+                   "file on that host holding it")
+    s.add_argument("--remote-marker", metavar="PATH", help="with --remote-host: the file on that host the remote "
+                   "side writes once it finished; while it exists the job is never ended as dead")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
     s.add_argument("--rows", metavar="FILE",

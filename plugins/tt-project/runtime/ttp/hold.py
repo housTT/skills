@@ -7,7 +7,10 @@ the agent started with `ttp detach` may still use the resource then, and its own
 through on the run's hold. So when the agent ends with such a job alive, the supervisor hands its
 open slot files to a keeper (`python -m ttp.hold <run_dir> <fd...>`, a session of its own): the lock
 never lapses, and it ends once every job wrote its .rc or is gone (a kill, a reboot), or when a later
-run of the same task takes the slots over (`hold.handover` in the run folder).
+run of the same task takes the slots over (`hold.handover` in the run folder). A job that drives
+another host itself (`ttp detach --remote-host`) also ends once that host reset or its remote pid is
+gone with no completion marker: the keeper asks the host every REMOTE_PROBE_S, from a thread of its own
+so a slow ssh never delays a handover, and ends the job with that verdict (detach.remote_verdict).
 
 <run_dir>/hold.json records the hold; the keeper holds <run_dir>/hold.lock while it lives. The
 project's state/holds/<run>.json points at it, so the daemon (tend) logs each release, and rebuilds the
@@ -21,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +32,7 @@ from . import locks, poll_s, timefmt
 from .project import durable_write
 
 POLL_S = 2
+REMOTE_PROBE_S = 120   # how often a keeper asks a remote host whether a job's remote side lives
 RECORD, LIVE, HANDOVER = "hold.json", "hold.lock", "hold.handover"
 LABEL = "detached jobs"
 WHOLE_RUN = "whole run"
@@ -181,10 +186,23 @@ def _settle(run_dir: Path, rec: dict, state: str, why: str) -> None:
         pass
 
 
+def _remote_round(jobs: list[str], memo: dict, verdicts: list[str]) -> None:
+    """End each job whose remote side is dead (detach.remote_verdict), its verdict noted first."""
+    from . import detach
+    for rc in jobs:
+        why = detach.remote_verdict(Path(rc), memo.setdefault(rc, {}))
+        if why:
+            verdicts.append(f"{Path(rc).stem}: {why}")
+            detach.end_remote(Path(rc), why)
+
+
 def watch(run_dir: Path, fds: list[int]) -> int:
     """The keeper: hold the inherited slots until every job ended or a later run takes them over."""
     run_dir = Path(run_dir)
     lock_fd, slot_fds = fds[0], fds[1:]
+    memo: dict = {}
+    verdicts: list[str] = []
+    probe, next_probe = None, time.time() + poll_s(REMOTE_PROBE_S)
     while True:
         rec = read(run_dir)
         if rec is None or rec.get("state") != "holding":
@@ -194,7 +212,15 @@ def watch(run_dir: Path, fds: list[int]) -> int:
             why, state = f"released: handed over to run {nxt or '?'} of the same task", "handed_over"
         elif not live(rec.get("jobs") or []):
             why, state = "released: every detached job of the run ended", "released"
+            if verdicts:
+                why += f" ({'; '.join(verdicts)})"
         else:
+            if probe is not None and not probe.is_alive():
+                probe, next_probe = None, time.time() + poll_s(REMOTE_PROBE_S)
+            if probe is None and time.time() >= next_probe:
+                probe = threading.Thread(target=_remote_round, args=(live(rec.get("jobs") or []), memo, verdicts),
+                                         daemon=True)
+                probe.start()
             time.sleep(poll_s(POLL_S))
             continue
         if why:   # recorded first, so a slot seen free always reads as released

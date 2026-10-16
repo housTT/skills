@@ -47,3 +47,12 @@ Scripts that walk `/proc` (to find a process by command line, say): a pid can ex
 
 - Start it with `ttp detach --remote` and poll it with `ttp detach --check --host`: "driver gone and no done marker" is terminal there (exit 4).
   In any custom poll loop, treat "driver pid gone and no done marker" as terminal on its own, whatever the output row count; waiting for a result row as well polls to the deadline after a reset.
+
+## A local driver of a remote job: `ttp detach --remote-host`
+
+A local `ttp detach` job that drives a job on another host itself (it starts it over ssh and polls a completion marker) can name that host: `ttp detach <name> --remote-host <ssh alias> [--remote-pid <pid or remote file holding it>] [--remote-marker <remote path>] -- <command...>`.
+It records the host's boot id at start (at the first answer, if the host did not answer then).
+While an exclusive run's hold keeper keeps the run's resources for the job, it asks that host every 2 minutes, read-only and with a bounded ssh timeout, and ends the job with a verdict in `<name>.lost` (which `ttp detach --check` prints) once the host's boot id changed (`remote reset`) or the remote pid read dead on two probes in a row while the marker is missing (`remote driver gone`); the hold is released at once instead of at the job's deadline.
+A marker that exists means the remote side finished: the job is never ended as dead then, so give `--remote-marker` whenever the remote side writes one.
+An unreachable host is no proof of death: the job and its hold stay until the job ends or its own deadline does.
+`ttp detach --remote` (the driver runs on the host itself) needs none of this: its check already reads the host's boot id and pid.

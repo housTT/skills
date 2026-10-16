@@ -528,3 +528,101 @@ def state(rc: Path) -> tuple[str, str]:
                "id could not be read, so which is unknown")
     _mark_lost(rc, why)
     return "lost", why
+
+
+# A local job that drives a job on another host itself (`ttp detach <name> --remote-host <alias>
+# [--remote-pid <pid or remote file holding it>] [--remote-marker <remote path>] -- <command...>`) records
+# that host's boot id at start in its detached.json entry ("remote"). The keeper of an exclusive run's
+# hold (hold.watch) asks the host now and then, read-only and bounded, whether the remote side still
+# lives: a changed boot id (the host reset) or a remote pid gone with no completion marker ends the
+# local job (stop) with that verdict in <name>.lost, so its hold goes before the job's own deadline.
+# A host it cannot reach proves nothing: the job and its hold stay. Run by POSIX sh over ssh, with the
+# pid (or the remote file holding it) as $1 and the marker as $2, either "" when not given.
+REMOTE_TIMEOUT_S = 30
+GONE_CONFIRM = 2   # probes in a row that read the remote pid dead with no marker before the job is ended
+_REMOTE_LIVE = r'''pid=$1 m=$2
+case $pid in "~/"*) pid=$HOME${pid#\~} ;; esac
+case $m in "~/"*) m=$HOME${m#\~} ;; esac
+%s
+echo "boot $b"
+if [ -n "$m" ] && [ -e "$m" ]; then echo "marker"; fi
+case $pid in
+  ""|*[!0-9]*) if [ -n "$pid" ] && [ -s "$pid" ]; then pid=$(tr -cd 0-9 <"$pid" | head -c 12); else pid=; fi ;;
+esac
+if [ -n "$pid" ] && [ "$pid" -gt 1 ]; then
+  if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then echo "alive $pid"; else echo "dead $pid"; fi
+fi
+echo "end"
+'''
+
+
+def _remote_sh(host: str, pid: str = "", marker: str = "") -> dict | None:
+    """What the remote host says of a job's remote side: {"boot", "marker" (bool), "alive" / "dead"
+    (the pid)}; None when ssh fails, times out or the answer is cut short."""
+    from .cli import REMOTE_BOOT_SH
+    script = _REMOTE_LIVE % REMOTE_BOOT_SH
+    remote = "sh -c " + " ".join(shlex.quote(x) for x in (script, "sh", pid or "", marker or ""))
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={REMOTE_TIMEOUT_S // 2}",
+                            host, remote], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=REMOTE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or "end" not in lines:
+        return None
+    out: dict = {"marker": "marker" in lines}
+    for ln in lines:
+        key, _, val = ln.partition(" ")
+        if key in ("boot", "alive", "dead"):
+            out[key] = val.strip()
+    return out
+
+
+def remote_start(host: str) -> str:
+    """The boot id of the host a local job drives, read as it starts; "" when the host does not answer."""
+    return (_remote_sh(host) or {}).get("boot") or ""
+
+
+def remote_verdict(rc: Path, memo: dict) -> str | None:
+    """Why a local job's remote side is dead (its host reset, or its remote pid is gone with no completion
+    marker on GONE_CONFIRM probes in a row), else None: alive, finished (its marker is there), no remote
+    contract, or the host did not answer. `memo` keeps what earlier probes of this job learned."""
+    c = _entry(Path(rc)).get("remote")
+    if not isinstance(c, dict) or not c.get("host"):
+        return None
+    host = str(c["host"])
+    seen = _remote_sh(host, str(c.get("pid") or ""), str(c.get("marker") or ""))
+    if seen is None:
+        return None   # unreachable is no proof of death: keep it until its deadline
+    if seen["marker"]:
+        memo.pop("dead", None)
+        return None
+    boot = c.get("boot") or memo.get("boot")
+    if not boot and seen.get("boot"):
+        memo["boot"] = seen["boot"]   # unreachable at start: the first answer names its boot
+    elif boot and seen.get("boot") and seen["boot"] != boot:
+        return f"remote reset: {host} restarted (its boot id changed) while the job ran"
+    if not seen.get("dead"):
+        memo.pop("dead", None)
+        return None
+    memo["dead"] = memo.get("dead", 0) + 1
+    if memo["dead"] < GONE_CONFIRM:
+        return None
+    mark = f" and its completion marker {c['marker']} is missing" if c.get("marker") else ""
+    return f"remote driver gone: pid {seen['dead']} on {host} is dead{mark}"
+
+
+def end_remote(rc: Path, why: str) -> None:
+    """End a local job whose remote side is dead: kill its wrapper's process group and record why."""
+    rc = Path(rc)
+    pid = _entry(rc).get("pid")
+    if not (isinstance(pid, int) and pid > 1):
+        try:
+            pid = int(started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pid = 0
+    if pid > 1 and not locks.any_free([locks.job_lock(rc)]):
+        stop(rc, pid, why)
+    else:
+        _mark_lost(rc, why)
