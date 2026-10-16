@@ -57,7 +57,7 @@ def feature_blocks(text: str, on: set[str]) -> str:
 
 def coordinator_features(p: Project) -> set[str]:
     """The features whose fenced rules the coordinator's role prompt carries (feature_blocks)."""
-    from . import machines, obligations, push
+    from . import forbidden, machines, obligations, push
     cfg = p.config()
     d = cfg.get("delivery") or {}
     on = set()
@@ -97,6 +97,11 @@ def coordinator_features(p: Project) -> set[str]:
         on.add("clusters")
     if change_windows(charter):
         on.add("change_windows")
+    # Pointer rule for projects that keep their data out of git: on once any forbidden-data pattern is declared.
+    mem = cfg.get("memory") or {}
+    if mem.get("forbidden_patterns") or mem.get("forbidden_patterns_file") or any(
+            forbidden.is_section(h) for h, _ in charter_sections(charter)):
+        on.add("forbidden_data")
     try:
         if any(o.get("receipt") is None and o.get("dropped") is None for o in obligations.items(p.db)):
             on.add("obligations")

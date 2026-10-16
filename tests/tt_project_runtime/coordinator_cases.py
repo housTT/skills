@@ -12025,7 +12025,10 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
         return subprocess.run(["git", "-C", str(p.harness), "log", "--format=%B"], capture_output=True,
                               text=True).stdout
 
-    # No pattern is declared by default: a figure is just text.
+    # No pattern is declared by default: a figure is just text, and the role prompt skips the pointer rule.
+    from ttp.prompts import coordinator_role
+    rule = "carry pointers (the work file's path, what it holds)"
+    assert rule not in " ".join(coordinator_role(p).split())
     assert coord.apply(p, [{"type": "memory_add", "text": "The test rig cost $5 to rent.", "title": "rig"}],
                        turn=1) == []
     with p.charter_path.open("a") as f:
@@ -12036,6 +12039,7 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     p.set_config("memory.forbidden_patterns_file", "state/forbidden.txt")
     before = sorted(f.name for f in p.memory_dir.glob("*.md")), p.memory_index.read_text(), git_log()
     charter = p.charter_path.read_text()
+    assert rule in " ".join(coordinator_role(p).split())
 
     with pytest.raises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
         cli.main(["memory", "demo", "Paid $1,234 into account 1234567890."])
