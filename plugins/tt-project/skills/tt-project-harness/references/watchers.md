@@ -33,3 +33,12 @@ A `to` naming this project, an unknown project or a machine without an owner her
 With a Jev key, Jev rates each new observation; each call is logged with its cost and the coordinator wake it skipped, and a Jev use that saves nothing over `jev.window_days` (at least `jev.min_calls` calls) switches itself off once, reported, as does one whose last `jev.idle_calls` (20) calls changed none of the rules' decisions; `jev.uses.<use>` = `on`/`off` forces it (uses: `screen`; `effort`, which may start a short-lookup task the coordinator queued at standard at light)
 
 Scripts that walk `/proc` (to find a process by command line, say): a pid can exit mid-sweep. In bash, `cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)` applies the input redirect before the stderr one, so the log still gets "No such file or directory". Use `cmd=$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ')` instead.
+
+## Snapshotting a launcher, and reading kernel logs across boots
+
+- A snapshot guard must follow exec indirection. If the entry point only launches something else (a wrapper, `setpriv`, `sudo`, or an env var naming a further executable), snapshotting it leaves the real payload live and editable mid-run, while the record looks complete.
+  List every further executable the entry point runs, copy each into the snapshot, point its variable at the copy and record each full sha256.
+  Refuse to run when such a variable is set but its target is missing.
+  Offer a device-free self-test that prints the list of followed executables, so a gap shows without a live run.
+- `journalctl -k` is `--dmesg`, which implies `-b` (current boot only). `-k --since/--until` over a span reaching past the current boot silently returns nothing, a false negative on boxes that reboot often.
+  Use `journalctl _TRANSPORT=kernel --since ... --until ...` across boots, or `journalctl -k -b <boot-id>` for one boot.
