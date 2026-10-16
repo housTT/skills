@@ -287,8 +287,9 @@ cc -o ird_e2e_hello ird_e2e_hello.c; ./ird_e2e_hello"
 # Summaries come from stdout only; stderr goes to a log and is shown only when a step fails.
 ERRF="$RUN_DIR/step4.err"; : > "$ERRF"
 WORK=$(on_machine "$SCRIPT" 2>>"$ERRF") || fail "clone/edit/build: $(printf '%s\n%s' "$WORK" "$(cat "$ERRF")" | tail -n 3)"
-SMI=$(on_machine "tt-smi -s" 2>>"$ERRF"); rc=$?
-[ $rc -eq 0 ] || fail "tt-smi -s (rc $rc): $(printf '%s\n%s' "$SMI" "$(cat "$ERRF")" | tail -n 3)"
+SMI_ERRF="$RUN_DIR/step4-smi.err"; : > "$SMI_ERRF"  # its own file: the build's stderr never shows here
+SMI=$(on_machine "tt-smi -s" 2>>"$SMI_ERRF"); rc=$?
+[ $rc -eq 0 ] || fail "tt-smi -s (rc $rc): $(printf '%s\n%s' "$SMI" "$(cat "$SMI_ERRF")" | tail -n 3)"
 BOARDS=$(printf '%s\n' "$SMI" | grep -o '"board_type": *"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/' | sort | uniq -c | sed 's/^ *\([0-9]*\) /\1x /' | paste -s -d, -)
 note "step 4 work: PASS $(printf '%s' "$WORK" | tr '\n' ';' | sed 's/;$//'); tt-smi -s ok, boards: ${BOARDS:-none listed} ($(( $(date +%s) - T0 ))s)"
 
