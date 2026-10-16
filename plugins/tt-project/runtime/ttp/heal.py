@@ -577,12 +577,25 @@ def box_silent(spec: dict, cwd: str) -> str:
     return f"{box} does not answer ping while {peer} does: it is off or rebooting"
 
 
-def suppressed(host: Any, name: str, spec: dict, cwd: str, env: dict) -> bool:
+def _unknown_suppressed(host: Any, name: str, spec: dict, st: dict, cwd: str, env: dict) -> bool:
+    """An unknown stretch past its escalation point, on a block whose `suppress` probe says the resource is
+    down on purpose: no escalation. Logged once per stretch (st["suppressed"]), cleared when the probe says no."""
+    if not spec.get("suppress"):
+        return False
+    if not suppressed(host, name, spec, cwd, env, quiet=bool(st.get("suppressed"))):
+        st.pop("suppressed", None)
+        return False
+    st["suppressed"] = True
+    return True
+
+
+def suppressed(host: Any, name: str, spec: dict, cwd: str, env: dict, quiet: bool = False) -> bool:
     """Whether the block's `suppress` probe says the resource is down on purpose (exit 0; module doc).
     Exit 1 says no; any other exit or a timeout is a broken probe: logged, and it heals normally."""
     rc, out = _exec(spec["suppress"], cwd, min(spec["timeout_s"], SUPPRESS_S), env)
     if rc == 0:
-        _log(host, f"heal check {name}: suppressed: deliberately down")
+        if not quiet:
+            _log(host, f"heal check {name}: suppressed: deliberately down")
         return True
     if rc != 1:
         tail = out.strip().splitlines()[-1][:200] if out.strip() else ""
@@ -814,7 +827,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             st["task"] = keep
     owned = known_run(rc, out)
     if owned:   # a known, owned state: ends the unknown stretch; no cap message, fix or task
-        for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown"):
+        for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown", "suppressed"):
             st.pop(key, None)
         st["known_run"] = f"{owned[0]}: {owned[1]}"[:300]
         _save(db, name, st)
@@ -860,6 +873,9 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             # serves nothing either: escalated as unhealthy past the outage window, never fixed blind.
             window = min(spec["grace_s"] or OUTAGE_S, OUTAGE_S)
             dark = now - float(st["unknown_since"])
+            if dark >= window and _unknown_suppressed(host, name, spec, st, cwd, env):
+                _save(db, name, st)
+                return "ok (unknown, suppressed: deliberately down)", None
             if dark >= window:
                 st["status"] = "unhealthy"
                 st.setdefault("since", st["unknown_since"])
@@ -879,7 +895,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             again = float(st["unknown_since"]) + window
         told = ""
         cap = float(spec.get("unknown_cap_s", DEFAULTS["unknown_cap_s"]) or 0)
-        if not spec.get("outage") and not known and cap and not st.get("unknown_told") and now - float(st["unknown_since"]) >= cap:
+        if (not spec.get("outage") and not known and cap and not st.get("unknown_told")
+                and now - float(st["unknown_since"]) >= cap and not _unknown_suppressed(host, name, spec, st, cwd, env)):
             st["unknown_told"] = now   # once per stretch: the next healthy or unhealthy result ends it
             told = "; " + _tell_unknown(host, name, spec, st, rc, out, now)
         _save(db, name, st)
@@ -887,7 +904,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             return f"ok (unknown, rc {rc}{told})", again
         return f"error: heal check exited {rc}{told}: {out[-150:]}", again
     dark = now - float(st.get("unknown_since") or now)
-    for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown"):
+    for key in ("unknown_since", "route_only", "unknown_told", "paged_unknown", "suppressed"):
         st.pop(key, None)
     if dark > max(_grace(spec), FRESH_UNKNOWN_S) and was_rc in UNKNOWN_RCS:   # not a broken check
         t = db.task(int(st["task"])) if st.get("task") else None

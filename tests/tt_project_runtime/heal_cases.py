@@ -2573,3 +2573,26 @@ def test_heal_self_fix_note_is_appended_to_the_self_fix_spec_only_when_set(env):
     assert coord.apply(p, [action]) == []
     stored = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")["payload"])["heal"]
     assert heal.validate(stored)["self_fix_note"] == "note"
+
+
+def test_heal_unknown_past_the_outage_window_honours_suppress(env):
+    """A box shut down on purpose makes the check unknown: `suppress` exit 0 means no escalation and one log
+    line; with the probe saying no (or absent) the outage escalates as before."""
+    from ttp import heal
+    down = env["repo"] / "planned-down"
+    down.touch()
+    p, d, up = _heal_setup(env, fix=None, outage=True, check="exit 255", suppress=f"test -e {down}")
+    spec, now = _heal_spec(p), time.time()
+    heal.run(d, "svc", spec, now)
+    for t in (heal.OUTAGE_S, heal.OUTAGE_S + 600):
+        assert heal.run(d, "svc", spec, now + t)[0] == "ok (unknown, suppressed: deliberately down)"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    assert (p.logs / "daemon.log").read_text().count("svc: suppressed: deliberately down") == 1
+    down.unlink()
+    heal.run(d, "svc", spec, now + heal.OUTAGE_S + 1200)
+    assert heal.state(p.db, "svc").get("escalated") or p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    p2, d2, _ = _heal_setup(env, fix=None, outage=True, check="exit 255")
+    spec2 = _heal_spec(p2)
+    heal.run(d2, "svc", spec2, now)
+    heal.run(d2, "svc", spec2, now + heal.OUTAGE_S)
+    assert heal.state(p2.db, "svc").get("escalated") or p2.db.q("SELECT id FROM tasks WHERE origin='daemon'")
