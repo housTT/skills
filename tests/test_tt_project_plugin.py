@@ -3525,3 +3525,9 @@ def test_prompts_tell_senders_to_label_relayed_user_words():
         text = " ".join((PLUGIN / "template" / "prompts" / name).read_text(encoding="utf-8").split())
         assert "quote them under the label \"user's words (verbatim)\"" in text, name
         assert "apart from your own context" in text, name
+
+
+def test_setup_box_ssh_workflow_scripts_resolve_own_dir():
+    text = (SKILLS / "setup-box" / "ssh-workflow.md").read_text(encoding="utf-8")
+    assert "finds its location from its own directory" in text
+    assert "never from a hard-coded absolute path" in text

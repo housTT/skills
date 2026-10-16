@@ -75,3 +75,5 @@ ssh <box-alias> 'mkdir -p <workdir>/runs/<task> && cd <workdir>/runs/<task> &&
   deploy key the user set up.
 - Use agent forwarding (`ForwardAgent`) only where the user's ssh config already sets it; never
   add it.
+- A script copied to another box finds its location from its own directory (`$(dirname "$0")`,
+  `Path(__file__)`), never from a hard-coded absolute path.
