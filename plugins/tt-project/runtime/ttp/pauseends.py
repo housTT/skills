@@ -351,7 +351,7 @@ class PauseEnds:
               json.dumps({"resource": name, "by": "daemon", "origin": entry.get("origin"),
                           "project": entry.get("project"), "generation": entry.get("generation"),
                           "why": entry["why"]}), "queued"))
-        sweep.signal(db, f"pause ended: {name}")
+        sweep.signal(db, f"pause ended: {name}", rearm=True)
 
     def _after(self, name: str) -> None:
         from . import coordinator as coord

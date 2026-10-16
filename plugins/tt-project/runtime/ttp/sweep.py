@@ -16,13 +16,20 @@ valid `still_blocked` whose next check is still ahead, on an item that has not c
 spec, reason) and is no loop, is carried forward as one collapsed CARRIED line that needs no action; a
 sweep due only to its interval is skipped while every item is carried. A hold no turn can lift (`ends`:
 a user pause or a time-only deferral, userpause) is carried without an outcome, listed as HELD BY USER
-PAUSE or DEFERRED (no action), and left out of signals and loop detection.
+PAUSE or DEFERRED (no action), and left out of signals and loop detection. Once a sweep records
+`human_indispensable` for an item a user-set resource pause holds, the outcome keeps that pause row's
+fingerprint (`pause`); until a user message arrives or the row changes or ends, every stuck task naming
+that resource (its `resource:`/`exclusive:` labels, which dispatch already holds) ends with the user
+too: carried, not re-judged, and free of flags raised before that outcome.
 
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
 a provider's limit or logout pause ended, a provider's account or budget kind changed (budgetkind),
 a `still_blocked` next check came due, or another module
-called signal() (the hook for later checks, such as a broker's health lifting a pause).
+called signal() (the hook for later checks, such as a broker's health lifting a pause). While every
+item ends without a turn (`ends`), only a pause ending or one of the built-in signals above brings a
+sweep forward; other signal() requests (a budget kind change, resolved upstream notes) wait for the
+interval, so a sweep still runs at least every coordinator.blocker_sweep_h hours.
 
 Loops: a task handed off stuck twice in a row with the same normalized reason, or whose spec changed
 while it stayed in the same stuck state since the last sweep, is shown as LOOP: resolve it, do not
@@ -45,7 +52,7 @@ SWEEP_KIND = "blocker_sweep"
 STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...],
 #                                         "seen": {key: {"status", "since"}}: when each item was first seen stuck}
 OUTCOMES_KEY = "blocker_sweep_outcomes"  # kv: {key: {"outcome", "ts", "until", "probe", "next", "why", "sweep"}}
-SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why"}]: signal() requests not yet swept
+SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why", "rearm"}]: signal() requests not yet swept
 OUTCOMES = ("unblocked", "rerouted", "retired", "closed", "still_blocked", "human_indispensable")
 EVERY_H = 6.0
 MIN_GAP_H = 1.0
@@ -78,12 +85,46 @@ def _clip(text: Any, n: int = REASON_CHARS) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
-def signal(db: DB, why: str) -> None:
+def signal(db: DB, why: str, rearm: bool = False) -> None:
     """Ask for an early sweep (kept until the next sweep starts). The hook for other modules: call it
-    when something a stuck item may wait on changed, e.g. a resource's health check lifts its pause."""
+    when something a stuck item may wait on changed, e.g. a resource's health check lifts its pause.
+    `rearm`: it may end a hold no turn can lift (a pause ending), so it counts even while every item
+    is such a hold."""
     sigs = db.kv(SIGNAL_KEY, []) or []
     sigs = [s for s in sigs if isinstance(s, dict)][-19:]
-    db.set_kv(SIGNAL_KEY, sigs + [{"ts": time.time(), "why": _clip(why, 200)}])
+    db.set_kv(SIGNAL_KEY, sigs + [{"ts": time.time(), "why": _clip(why, 200), "rearm": bool(rearm)}])
+
+
+def _pause_fp(row: dict) -> str:
+    """A resource pause row's fingerprint: any change to it (a re-pause, a new reason) changes it."""
+    return hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _user_paused(rows: dict[str, dict]) -> dict[str, dict]:
+    return {k: v for k, v in rows.items() if isinstance(v, dict) and v.get("by") == "user"}
+
+
+def _task_resources(t: dict) -> set[str]:
+    from .coordinator import task_resources
+    return task_resources(t)
+
+
+def pause_covers(db: DB, paused: dict[str, dict] | None = None) -> dict[str, float]:
+    """User-paused resources a recorded `human_indispensable` still covers: name -> when that outcome
+    was recorded. Each holds while its pause row is unchanged and no user message came since."""
+    paused = _user_paused(db.paused_resources()) if paused is None else paused
+    outs = [o for o in (db.kv(OUTCOMES_KEY, {}) or {}).values() if isinstance(o, dict)
+            and o.get("outcome") == "human_indispensable" and o.get("pause")] if paused else []
+    if not outs:
+        return {}
+    said = float((db.one("SELECT MAX(ts) ts FROM messages WHERE direction='in' AND kind='user'") or {}).get("ts") or 0)
+    out: dict[str, float] = {}
+    for o in outs:
+        ts = float(o.get("ts") or 0)
+        for name, fp in o["pause"].items():
+            if ts >= said and name in paused and fp == _pause_fp(paused[name]):
+                out[name] = min(out.get(name, ts), ts)
+    return out
 
 
 def _last_stuck_events(db: DB, tid: int, n: int = 2) -> list[dict]:
@@ -127,6 +168,8 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     since_review = db.review_since()
     seen = (db.kv(STATE_KEY, {}) or {}).get("seen") or {}
     cfg = userpause.settings(where)
+    paused = db.paused_resources()
+    covers = pause_covers(db, _user_paused(paused))
     for t in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','review','queued') ORDER BY id"):
         kind, start, reason, ends = t["status"], None, _reason(t), None
         if kind == "queued":
@@ -155,8 +198,13 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                 reason = _clip(unblock.wait_reason(last[0])) or reason
             if kind == "blocked" and settinghold.held_key(t):
                 kind = "setting-held"
+        cover = None
         if kind != "review" and (pause := userpause.probe_of(t, cfg)):
             kind, ends, reason = "user-pause", "user", f"held by user pause until `{_clip(pause, 160)}` passes"
+        elif kind != "review" and not ends and (names := sorted(_task_resources(t) & covers.keys())):
+            # The user said only they can lift this pause: no turn re-judges what dispatch holds on it.
+            ends, cover = "user", min(covers[n] for n in names)
+            reason = _clip(f"held by user pause on {', '.join(names)}" + (f"; {reason}" if reason else ""))
         if not isinstance(start, (int, float)):
             prev = seen.get(f"task:{t['id']}") or {}
             start = prev.get("since") if prev.get("status") == t["status"] else None
@@ -165,8 +213,8 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
         out.append({"key": f"task:{t['id']}", "kind": kind, "task": t["id"], "resource": None,
                     "title": t["title"], "age_s": None if start is None else max(0.0, now - float(start)),
                     "since": start, "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t),
-                    "ends": ends})
-    for name, v in sorted(db.paused_resources().items()):
+                    "ends": ends, **({"cover": cover} if cover is not None else {})})
+    for name, v in sorted(paused.items()):
         since = v.get("since") if isinstance(v.get("since"), (int, float)) else None
         out.append({"key": f"resource:{name}", "kind": "paused", "task": None, "resource": name, "title": name,
                     "age_s": None if since is None else max(0.0, now - float(since)), "since": since,
@@ -256,10 +304,12 @@ def review_diagnosis(db: DB, tid: int, now: float, hold_of: Callable[[dict], str
         f": {summary}" if summary else "")
 
 
-def _signals(db: DB, state: dict, live: list[dict], now: float) -> list[str]:
-    """What changed since the last sweep that may unblock something."""
+def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool = False) -> list[str]:
+    """What changed since the last sweep that may unblock something. rearm_only: of signal()'s
+    requests, only those that may end a hold no turn lifts (a pause ending)."""
     last = float(state.get("last") or 0)
-    out = [str(s.get("why") or "signal") for s in (db.kv(SIGNAL_KEY, []) or []) if isinstance(s, dict)]
+    out = [str(s.get("why") or "signal") for s in (db.kv(SIGNAL_KEY, []) or []) if isinstance(s, dict)
+           and (not rearm_only or s.get("rearm") or str(s.get("why") or "").startswith("pause ended"))]
     paused_now = {i["resource"] for i in live if i["kind"] == "paused"}
     gone = sorted(set(state.get("paused") or []) - paused_now)
     if gone:
@@ -314,7 +364,8 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
         return f"every {every / 3600:g}h"
     if since < min(every, _cfg(cfg, "blocker_sweep_min_gap_h", MIN_GAP_H) * 3600):
         return None
-    sigs = _signals(db, state, live, now)
+    # Every item ends without a turn: only what may end one brings the sweep forward.
+    sigs = _signals(db, state, live, now, rearm_only=all(i.get("ends") for i in live))
     return "; ".join(sigs)[:300] if sigs else None
 
 
@@ -362,7 +413,7 @@ def rethink(db: DB, cfg: dict, live: list[dict], now: float) -> dict[str, str]:
     outs = db.kv(OUTCOMES_KEY, {}) or {}
     return {i["key"]: f"held by open ask {held[i['task']]} past {askrethink.hours(cfg):g}h: decide the ask "
                       f"yourself, or record human_indispensable with why only the user can"
-            for i in live if i["task"] in held
+            for i in live if i["task"] in held and i.get("cover") is None
             and (outs.get(i["key"]) or {}).get("outcome") != "human_indispensable"}
 
 
@@ -458,6 +509,11 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None) -> 
     elif outcome == "human_indispensable":
         if not str(a.get("why") or "").strip():
             raise ValueError(f"{key} human_indispensable needs `why` only a person can do it")
+        paused = _user_paused(db.paused_resources())
+        names = ({key[9:]} if key.startswith("resource:") else
+                 _task_resources(db.task(int(key[5:])) or {}) if key.startswith("task:") else set()) & paused.keys()
+        if names:   # held by the user's own pause: carries the items naming it until the row changes
+            o["pause"] = {n: _pause_fp(paused[n]) for n in sorted(names)}
     o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
     outs = db.kv(OUTCOMES_KEY, {}) or {}
     outs[key] = o
@@ -490,8 +546,12 @@ def _header(n: int, carry: int = 0) -> str:
 
 
 def _carries(i: dict, state: dict, outs: dict, now: float) -> bool:
-    return not any(i["key"] in (state.get(f) or {}) for f in ("flags", "loops", "reviews")) \
-        and carried(outs.get(i["key"]), i, now)
+    # An item a user pause's outcome covers ignores flags raised before it was covered: no sweep flags
+    # a covered item, and a loop counts only once a sweep after the outcome found it again.
+    marks = ("flags", "loops", "reviews")
+    if i.get("cover") is not None:
+        marks = ("reviews",) if float(i["cover"]) >= float(state.get("last") or 0) else ("loops", "reviews")
+    return not any(i["key"] in (state.get(f) or {}) for f in marks) and carried(outs.get(i["key"]), i, now)
 
 
 def _who(i: dict, n: int) -> str:

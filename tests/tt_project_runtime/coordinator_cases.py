@@ -11115,6 +11115,186 @@ def test_blocker_sweep_carries_a_user_set_resource_pause_and_still_sweeps_a_coor
 
 
 
+def _board_work(p, now, n=2):
+    """A user-set pause on board-a and `n` deferred tasks that name it (dispatch holds them on it)."""
+    from ttp import coordinator as coord
+    coord.pause_resource(p, "board-a", True, reason="hold for the user", by="user")
+    return [p.db.add_task(f"bench {k} on board-a", labels=["resource:board-a", "start_when:test -e out/board-ready",
+                                                           f"deferred_since:{now - 600}"]) for k in range(1, n + 1)]
+
+
+def _set_pause_row(db, name, row):
+    from ttp.db import PAUSED_RESOURCES_KEY
+    rows = dict(db.kv(PAUSED_RESOURCES_KEY, {}) or {})
+    if row is None:
+        rows.pop(name, None)
+    else:
+        rows[name] = row
+    db.set_kv(PAUSED_RESOURCES_KEY, rows)
+
+
+def test_blocker_sweep_human_indispensable_on_a_user_paused_resource_carries_every_item_naming_it(env):
+    """Once a sweep records human_indispensable for an item a user-set resource pause holds, the outcome
+    keeps the pause row's fingerprint and every stuck task naming that resource ends with the user:
+    carried, not re-judged, until a user message, a change of the pause row or its lift."""
+    from ttp import coordinator as coord, sweep
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    a, b = _board_work(p, now)
+    assert {i["key"]: i["ends"] for i in sweep.items(db, now, cfg)} == {
+        f"task:{a}": None, f"task:{b}": None, "resource:board-a": "user"}
+    eid = sweep.start(db, cfg, sweep.due(db, cfg, now), now)
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    assert coord.apply(p, [{"type": "sweep", "id": a, "outcome": "human_indispensable",
+                            "why": "only the user lifts the board-a pause"}]) == []
+    row = db.kv(PAUSED_RESOURCES_KEY)["board-a"]
+    assert db.kv(sweep.OUTCOMES_KEY)[f"task:{a}"]["pause"] == {"board-a": sweep._pause_fp(row)}
+    live = {i["key"]: i for i in sweep.items(db, now + 60, cfg)}
+    for t in (a, b):
+        assert live[f"task:{t}"]["ends"] == "user", live[f"task:{t}"]
+        assert live[f"task:{t}"]["reason"].startswith("held by user pause on board-a")
+    # The next sweep carries both without an outcome, and none is due while nothing changes.
+    eid = sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    state = db.kv(sweep.STATE_KEY)
+    assert not state["flags"] and {f"task:{a}", f"task:{b}"} <= set(state["carried"])
+    text = coord.digest(p, {}, [eid], [])
+    assert "HELD BY USER PAUSE (no action): held by user pause on board-a" in next(
+        ln for ln in text.splitlines() if ln.startswith(f"- #{b} "))
+    assert sweep.due(db, cfg, now + 14 * 3600) is None
+    # A user message ends the cover: the items are judged again.
+    mid = db.post("in", "board-a: try the other cable", chat="c1", kind="user")
+    assert {i["ends"] for i in sweep.items(db, now + 60, cfg) if i["task"]} == {None}
+    db.x("DELETE FROM messages WHERE id=?", (mid,))
+    assert {i["ends"] for i in sweep.items(db, now + 60, cfg) if i["task"]} == {"user"}
+    # So does any change of the pause row (a re-pause, a new reason) ...
+    _set_pause_row(db, "board-a", {**row, "reason": "hold for the user: new firmware"})
+    assert {i["ends"] for i in sweep.items(db, now + 60, cfg) if i["task"]} == {None}
+    _set_pause_row(db, "board-a", row)
+    assert {i["ends"] for i in sweep.items(db, now + 60, cfg) if i["task"]} == {"user"}
+    # ... and its lift.
+    _set_pause_row(db, "board-a", None)
+    assert {i["ends"] for i in sweep.items(db, now + 60, cfg) if i["task"]} == {None}
+    # A pause the coordinator set is no cover: its outcome keeps no fingerprint.
+    coord.pause_resource(p, "board-a", True, reason="flaky", by="coordinator")
+    sweep.record(db, {"id": b, "outcome": "human_indispensable", "why": "needs a person"}, None, now + 120)
+    assert "pause" not in db.kv(sweep.OUTCOMES_KEY)[f"task:{b}"]
+    assert {i["ends"] for i in sweep.items(db, now + 180, cfg) if i["task"]} == {None}
+
+
+def test_blocker_sweep_while_every_item_ends_with_the_user_only_a_pause_ending_brings_it_forward(env):
+    """While every live item is a hold no turn lifts, unrelated signals (a budget kind change, resolved
+    upstream notes) do not bring the sweep forward; a pause ending or a built-in re-arm signal does, and
+    with any item a turn could act on, every signal counts again."""
+    from ttp import coordinator as coord, sweep
+    p = make(env)
+    db, cfg, t = p.db, p.config(), time.time()
+    a, b = _board_work(p, t)
+    now = t + 2 * 3600
+    sweep.start(db, cfg, "every 6h", t)
+    db.x("UPDATE events SET status='handled'")
+    sweep.record(db, {"id": a, "outcome": "human_indispensable", "why": "only the user lifts it"}, None, t + 60)
+    assert all(i["ends"] == "user" for i in sweep.items(db, now, cfg))
+    sweep.signal(db, "claude budget changed: plan -> api")
+    sweep.signal(db, "upstream notes resolved: 0123abcd")
+    assert sweep.due(db, cfg, now) is None
+    # A built-in re-arm signal still counts: an ask resolved since the last sweep.
+    from ttp import unblock
+    db.set_kv(unblock.RESOLVED_KEY, {"7": {"ts": now - 60}})
+    assert sweep.due(db, cfg, now) == "ask #7 resolved"
+    db.set_kv(unblock.RESOLVED_KEY, {})
+    # A pause ending (pauseends' signal, or a pause the last sweep saw gone) brings it forward.
+    sweep.signal(db, "pause ended: board-b", rearm=True)
+    assert sweep.due(db, cfg, now) == "pause ended: board-b"
+    db.set_kv(sweep.SIGNAL_KEY, [{"ts": now - 60, "why": "claude budget changed: plan -> api"}])
+    coord.pause_resource(p, "board-c", True, reason="hold", by="user")
+    state = db.kv(sweep.STATE_KEY)
+    db.set_kv(sweep.STATE_KEY, {**state, "paused": [*state["paused"], "board-d"]})
+    assert sweep.due(db, cfg, now) == "pause ended: board-d"
+    db.set_kv(sweep.STATE_KEY, state)
+    assert sweep.due(db, cfg, now) is None
+    # An item a turn could act on: the unrelated signal counts again.
+    other = db.add_task("needs a key")
+    db.update_task(other, status="blocked", blocked_reason="needs the vendor's key")
+    assert sweep.due(db, cfg, now) == "claude budget changed: plan -> api"
+
+
+def test_blocker_sweep_keeps_its_6h_floor_while_every_item_ends_with_the_user(env):
+    """Unrelated signals wait for the interval, not forever: past blocker_sweep_h they start the sweep."""
+    from ttp import sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    a, _ = _board_work(p, now)
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    sweep.record(db, {"id": a, "outcome": "human_indispensable", "why": "only the user lifts it"}, None, now + 60)
+    sweep.signal(db, "upstream notes resolved: 0123abcd")
+    assert sweep.due(db, cfg, now + 5 * 3600) is None
+    assert sweep.due(db, cfg, now + 6 * 3600) == "upstream notes resolved: 0123abcd"
+
+
+def test_blocker_sweep_item_newly_covered_by_a_user_pause_ignores_flags_raised_before_it(env):
+    """A task flagged at the last sweep (no outcome) that a user pause's human_indispensable then covers
+    carries without that old flag, so an interval sweep is skipped while nothing else is stuck."""
+    from ttp import coordinator as coord, sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    a, b = _board_work(p, now)
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    eid = sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert set(db.kv(sweep.STATE_KEY)["flags"]) == {f"task:{a}", f"task:{b}"}
+    sweep.record(db, {"id": a, "outcome": "human_indispensable", "why": "only the user lifts it"}, None,
+                 now + 7 * 3600 + 60)
+    state, outs = db.kv(sweep.STATE_KEY), db.kv(sweep.OUTCOMES_KEY)
+    live = {i["key"]: i for i in sweep.items(db, now + 8 * 3600, cfg)}
+    assert sweep._carries(live[f"task:{b}"], state, outs, now + 8 * 3600)
+    assert "HELD BY USER PAUSE (no action)" in next(ln for ln in coord.digest(p, {}, [eid], []).splitlines()
+                                                    if ln.startswith(f"- #{b} "))
+    assert sweep.due(db, cfg, now + 14 * 3600) is None
+    # A loop a later sweep raised on a covered item (a model-free hold loop) still counts.
+    db.set_kv(sweep.STATE_KEY, {**state, "last": now + 7 * 3600 + 120, "loops": {f"task:{b}": "loop: x"}})
+    assert not sweep._carries(live[f"task:{b}"], db.kv(sweep.STATE_KEY), outs, now + 8 * 3600)
+
+
+def test_blocker_sweep_replay_of_a_day_of_unrelated_signals_over_user_paused_work(env):
+    """The upstream note's day: deferred tasks held only by a user-set resource pause, a sweep that
+    records human_indispensable for them, then budget kind changes and resolved upstream notes every
+    few hours. Before, 7 of those signals each brought a sweep forward that re-judged the same tasks;
+    now none does, and only the 6h floor sweeps run, every item carried."""
+    from ttp import sweep
+    p = make(env)
+    db, cfg, t0 = p.db, p.config(), time.time()
+    tasks = _board_work(p, t0, n=3)
+    eid = sweep.start(db, cfg, sweep.due(db, cfg, t0), t0)
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    for t in tasks:
+        sweep.record(db, {"id": t, "outcome": "human_indispensable", "why": "only the user lifts the pause"},
+                     None, t0 + 60)
+    signals = {1.5: "claude budget changed: plan -> api", 3: "upstream notes resolved: 01", 4.5: "upstream notes resolved: 02",
+               8: "codex budget changed: api -> plan", 10: "upstream notes resolved: 03", 14: "upstream notes resolved: 04",
+               20: "claude budget changed: api -> plan"}
+    sweeps = []
+    for step in range(1, 24 * 4 + 1):      # the daemon's check every 15 minutes
+        h = step / 4
+        now = t0 + h * 3600
+        if h in signals:
+            sweep.signal(db, signals[h])
+        why = sweep.due(db, cfg, now)
+        if why:
+            eid = sweep.start(db, cfg, why, now)
+            db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+            state = db.kv(sweep.STATE_KEY)
+            sweeps.append((h, not state["flags"] and set(state["carried"]) >= {f"task:{t}" for t in tasks}))
+    hours = [h for h, _ in sweeps]
+    early = [b for a, b in zip([0.0, *hours], hours) if b - a < 6]
+    assert not early, f"sweeps brought forward at {early}h by unrelated signals"
+    assert 1 <= len(sweeps) <= 4 and all(carried for _, carried in sweeps), sweeps
+
+
+
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
     from ttp import coordinator as coord, reviewreuse
     p = make(env)
