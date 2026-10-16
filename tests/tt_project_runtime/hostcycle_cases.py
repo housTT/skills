@@ -498,9 +498,78 @@ def test_held_by_task_names_only_the_tasks_own_device_and_machine_locks():
     held = ["board: task #7 (run 3) since 10:02 PDT", "box-device: demo task #7 (run ?) since 10:02 PDT",
             "push:origin%2Fmain: task #7 (run 3) since 10:00 PDT", "harness-upgrade: task #7 (run 3) since 10:00 PDT",
             "rig: reserved for task #7 (run 3)", "board2: task #70 (run 3) since 10:02 PDT",
-            "box: other task #7 (run 3) since 10:02 PDT", "bench: task #7 (run 3) since 10:01 PDT"]
-    assert held_by_task(held, 7, "demo") == ["board", "box-device", "bench"]
+            "box: other task #7 (run 3) since 10:02 PDT", "bench: task #7 (run 3) since 10:01 PDT",
+            "rack: task #7 (run 3), whole run since 10:03 PDT", "probe: demo task #7 (run 4), detached jobs since 10:04 PDT",
+            "rack2: other task #7 (run 3), whole run since 10:03 PDT"]
+    assert held_by_task(held, 7, "demo") == ["board", "box-device", "bench", "rack", "probe"]
     assert held_by_task(held, 8, "demo") == [] and held_by_task(None, 7, "demo") == []
+
+
+def test_every_hold_label_form_round_trips_through_the_one_parser():
+    from ttp import hold
+    for kind in ("", hold.WHOLE_RUN, hold.LABEL):
+        for run in ("3", 41, None):
+            lbl = hold.label(hold.who(7), run, kind)
+            assert hold.task_of(lbl) == 7 and hold.task_of(lbl, "demo") == 7, lbl
+            shared_lbl = hold.label(f"demo {hold.who(7)}", run, kind)
+            assert hold.task_of(shared_lbl, "demo") == 7 and hold.task_of(shared_lbl, "other") is None, shared_lbl
+            assert hold.own_keeper(lbl, hold.who(7)) is (kind == hold.LABEL)
+            assert not hold.own_keeper(lbl, hold.who(70)) and not hold.own_keeper(shared_lbl, hold.who(7))
+    # Foreign or malformed labels name no task.
+    for lbl in (None, "", "task #7", "task #7 (run 3", "task #? (run 3)", "task #7 (run 3), lunch", "reserved for task #7",
+                "keeper of run 3", "no project task #7 (run 1)", "a b task #7 (run 3)", "task #7 (run 3) since 10:02 PDT",
+                "xtask #7 (run 3)", "task #7x (run 3)", " task #7 (run 3)"):
+        assert hold.task_of(lbl) is None and hold.parse(lbl) is None, lbl
+    assert hold.who(None) == "task #?" and hold.task_of(hold.label(hold.who(None), None)) is None
+
+
+def _heartbeat_held(p):
+    """What the daemon's heartbeat records as held right now (shared.held), as JSON from a subprocess."""
+    return ["python3", "-c", "import json, sys; from ttp import shared; from ttp.project import Project; "
+            "print('HELD=' + json.dumps(shared.held(Project(sys.argv[1]))))", str(p.base)]
+
+
+def test_a_ttp_lock_hold_is_found_by_held_by_task(env):
+    p = make(env)
+    from ttp.daemon import held_by_task
+    out = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", *_heartbeat_held(p)],
+                         env=dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK="7", TTP_RUN_ID="12",
+                                  PYTHONPATH=str(RUNTIME)), capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    held = json.loads(out.stdout.split("HELD=", 1)[1])
+    assert any(x.startswith("board: task #7 (run 12) since ") for x in held), held
+    assert held_by_task(held, 7, p.name) == ["board"] and held_by_task(held, 8, p.name) == []
+
+
+def test_a_whole_run_hold_is_found_by_held_by_task(env, tmp_path):
+    p = make(env)
+    from ttp import shared
+    from ttp.daemon import held_by_task
+    release = tmp_path / "release"
+    proc, _ = _hold_exclusive(p, tmp_path, release)
+    try:
+        held = shared.held(p)
+    finally:
+        release.touch()
+    assert proc.wait(timeout=60) == 0
+    assert any(x.startswith("board: task #7 (run ?), whole run since ") for x in held), held
+    assert held_by_task(held, 7, p.name) == ["board"] and held_by_task(held, 8, p.name) == []
+
+
+def test_a_detached_jobs_keepers_hold_is_found_by_held_by_task(env, tmp_path):
+    p = make(env)
+    from ttp import shared
+    from ttp.daemon import held_by_task
+    mine = _board_task(p, "flash")
+    run_dir, release = p.runs / "41", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 41, run_dir, _until(release))
+    try:
+        held = shared.held(p)
+    finally:
+        release.touch()
+    assert _until_true(lambda: (run_dir / "job.rc").exists())
+    assert any(x.startswith(f"board: task #{mine['id']} (run 41), detached jobs since ") for x in held), held
+    assert held_by_task(held, mine["id"], p.name) == ["board"] and held_by_task(held, mine["id"] + 1, p.name) == []
 
 
 def test_a_run_lost_to_an_abrupt_reboot_while_its_task_held_a_device_is_not_retried(env, tmp_path):

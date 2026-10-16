@@ -605,8 +605,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
     task keeps for its detached jobs (hold.py) is handed over, and those jobs go to `inherited`. The
     wait ends at the deadline or on a stop; None when it ended without the slots."""
     from . import hold, locks
-    task = f"task #{env.get('TTP_TASK') or '?'}"
-    who = f"{task} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
+    task = hold.who(env.get('TTP_TASK'))
     held, told, asked = [], 0.0, set()
     where = Project(env["TTP_PROJECT"]) if env.get("TTP_PROJECT") else None   # holders' times in its zone
     for res in wanted:
@@ -617,7 +616,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
         while True:
             # Not in the `ttp lock` arrival queue: the reservation below already holds new commands
             # off, and a queued command that is waiting on the reservation must not hold this off.
-            f = locks.try_take(paths, who if mine == task else f"{mine}{who[len(task):]}", "exclusive")
+            f = locks.try_take(paths, hold.label(mine, env.get("TTP_RUN_ID"), hold.WHOLE_RUN), "exclusive")
             if f:
                 held.append(f)
                 if mark:

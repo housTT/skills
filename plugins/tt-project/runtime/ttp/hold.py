@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -29,16 +30,46 @@ from .project import durable_write
 POLL_S = 2
 RECORD, LIVE, HANDOVER = "hold.json", "hold.lock", "hold.handover"
 LABEL = "detached jobs"
+WHOLE_RUN = "whole run"
+
+# Every hold label is built by label() and read by parse(): a `ttp lock` command's "task #7 (run 3)",
+# a run supervisor's "task #7 (run 3), whole run" and a keeper's "task #7 (run 3), detached jobs". On a
+# shared resource the holder names the project first (shared.holder): "demo task #7 (run 3)".
+_LABEL_RE = re.compile(r"(?P<holder>(?:(?P<project>[A-Za-z0-9][A-Za-z0-9._-]*) )?task #(?P<task>\d+))"
+                       rf" \(run [^()]*\)(?:, (?P<kind>{WHOLE_RUN}|{LABEL}))?")
 
 
-def label(holder: str, run: str) -> str:
-    """What a kept slot reads as in `ttp status` and the web app."""
-    return f"{holder} (run {run}), {LABEL}"
+def who(task) -> str:
+    """The holder a task's holds and reservations name (shared.holder adds the project on a shared one)."""
+    return f"task #{task if task not in (None, '') else '?'}"
+
+
+def label(holder: str, run, kind: str = "") -> str:
+    """A slot's hold label, as `ttp status` and the web app show it: kind is "" for a `ttp lock` command,
+    WHOLE_RUN for an exclusive task's run supervisor and LABEL for a keeper of its detached jobs."""
+    return f"{holder} (run {run if run not in (None, '') else '?'})" + (f", {kind}" if kind else "")
+
+
+def parse(lbl) -> dict | None:
+    """A label() as {"holder", "project" (None when not shared), "task" (int), "kind"}; None for any
+    other text (a reservation, another lock's label, a hold taken outside a task)."""
+    m = _LABEL_RE.fullmatch(str(lbl or ""))
+    return m and {"holder": m["holder"], "project": m["project"], "task": int(m["task"]), "kind": m["kind"] or ""}
+
+
+def task_of(lbl, project: str | None = None) -> int | None:
+    """The task id a hold label names; None when it is not a hold label, or names a project other than
+    `project` (when given)."""
+    h = parse(lbl)
+    if not h or (project is not None and h["project"] not in (None, project)):
+        return None
+    return h["task"]
 
 
 def own_keeper(lbl: str, holder: str) -> bool:
     """Whether a slot label is a keeper's of this holder (a task, or a project's task when shared)."""
-    return lbl.startswith(f"{holder} (run ") and lbl.endswith(f", {LABEL}")
+    h = parse(lbl)
+    return bool(h) and h["kind"] == LABEL and h["holder"] == holder
 
 
 def read(run_dir: Path) -> dict | None:
@@ -91,12 +122,12 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
         return None
     resources = []
     for w, f in zip(wanted, held):   # the same open file: relabelled, never let go
-        holder = w.get("holder") or f"task #{task}"   # a shared resource's names the project too
+        holder = w.get("holder") or who(task)   # a shared resource's names the project too
         resources.append({"resource": w.get("resource"), "path": f.name, "holder": holder,
-                          "label": label(holder, run)})
+                          "label": label(holder, run, LABEL)})
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({"holder": label(holder, run), "since": time.time(), "command": LABEL}))
+        f.write(json.dumps({"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL}))
         f.flush()
     rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
            "jobs": jobs}

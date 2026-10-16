@@ -2809,7 +2809,7 @@ def cmd_lock(a) -> None:
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75.
     """
-    from . import locks as lk
+    from . import hold, locks as lk
     cmd = list(a.command or [])
     while cmd and cmd[0] == "--disruptive":   # given after the resource, where the command's words start
         a.disruptive, cmd = True, cmd[1:]
@@ -2866,8 +2866,7 @@ def cmd_lock(a) -> None:
         print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths, p)) or 'nobody'}"
                                                       f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
         sys.exit(0 if free else 75)
-    who = shared.holder(p, res, f"task #{os.environ.get('TTP_TASK') or '?'} "
-                                f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
+    who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
     if res in held_locks:
         sys.exit(subprocess.call(cmd))   # an enclosing `ttp lock` of this command holds it already

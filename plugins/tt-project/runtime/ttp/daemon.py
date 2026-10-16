@@ -1799,7 +1799,7 @@ class Daemon:
                     "exclusive": [{"resource": res, "lock": locks.canonical(self.cfg, res),
                                    "paths": [str(x) for x in self._slot_paths(res)],
                                    "reserve": str(self._reserve_path(res)),
-                                   "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
+                                   "holder": shared.holder(self.p, res, hold.who(task['id']), self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
                     "holds": str(self.p.state / "holds"),   # where a hold kept for detached jobs is registered
@@ -5079,7 +5079,7 @@ class Daemon:
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
-            locks.unreserve(self._reserve_path(res), shared.holder(self.p, res, f"task #{task['id']}", self.cfg))
+            locks.unreserve(self._reserve_path(res), shared.holder(self.p, res, hold.who(task['id']), self.cfg))
 
     def _committed_usd(self) -> float:
         """Budget that running workers on providers under the dollar caps have left to spend."""
@@ -7465,7 +7465,7 @@ class Daemon:
                 return False
             paths = self._slot_paths(res)
             if not locks.any_free(paths):
-                mine = shared.holder(self.p, res, f"task #{task['id']}", self.cfg)
+                mine = shared.holder(self.p, res, hold.who(task['id']), self.cfg)
                 if any(hold.own_keeper(lb, mine) for lb in locks.held_labels(paths)):
                     continue   # kept for this task's own detached jobs: its run takes the slot over
                 if reserve:
@@ -9183,16 +9183,17 @@ def _task_note(run_dir: Path, text: str) -> None:
 def held_by_task(held, tid: int, project: str) -> list[str]:
     """The resources (a device, a machine, a remote build directory: any lock but the harness's own push
     and upgrade locks) task tid of `project` held, as a heartbeat's `held` list names them ("board: task
-    #7 (run 3) since 10:02 PDT"; on a shared resource the holder names the project first). A reservation
-    is not a hold."""
+    #7 (run 3), whole run since 10:02 PDT"): any hold label hold.label builds, read by hold.task_of. A
+    reservation is not a hold.
+    Gaps, left open: a device used only through a broker queue (`ttp devq`) without `ttp lock` holds no
+    slot, so it is not listed; neither is a hold taken after the last heartbeat before the reboot."""
     from .release import UPGRADE_RESOURCE
-    who = re.compile(rf"(?:{re.escape(project)} )?task #{int(tid)} \(run [^)]*\)")
     out = []
     for item in held or []:
         res, _, holder = str(item).partition(": ")
         if res.startswith("push:") or res == UPGRADE_RESOURCE:
             continue
-        if who.fullmatch(re.sub(r" since .*$", "", holder)) and res not in out:
+        if hold.task_of(holder.rsplit(" since ", 1)[0], project) == int(tid) and res not in out:
             out.append(res)
     return out
 
