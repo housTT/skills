@@ -2862,6 +2862,9 @@ class Daemon:
                 summary = result["summary"]
         waiting = status == "ok" and rstatus == "waiting"
         refusal = ackwait.unmanaged_wait(result, self._other_projects(), bool(jobs), self.cfg, self.p.harness) if waiting else ""
+        both = on_pass_both_warning(result) if waiting else ""
+        if both:
+            log(self.p, f"task {r['task']} hand-off: {both}")
         if refusal:
             # A wait on another project's reply without `ttp ack-wait probe` would wake a model run on
             # every timer to read the inbox: not taken as a wait. Its next run hands off again.
@@ -6731,13 +6734,26 @@ class Daemon:
         out record the hand-off's `on_pass` through the normal finish (review and push queue as
         usual); checks that failed only on tests failing elsewhere too are held (_shared_hold); others
         that failed or were killed wake the task at once at its own tier with their output's tail.
-        Anything unclear wakes it as any passed probe does."""
+        Anything unclear wakes it as any passed probe does. A hand-off that also names an on_pass_cmd
+        runs that command first (_start_on_pass): its on_pass counts only once the command exits 0."""
         why = "probe passed"
         try:
             got = self._checks_wait(task)
         except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
             log(self.p, f"task {task['id']}: could not read its checks: {type(e).__name__}: {e}")
             got = None
+        if got and got[0] == "pass" and load_result(task["result"]).get("on_pass_cmd") is not None:
+            # Its on_pass_cmd (a publish step, say) takes precedence: on_pass is recorded only once
+            # that command exits 0 without writing a hand-off of its own; a failure wakes the task.
+            _, r, run_dir, on_pass, head = got
+            try:
+                started = self._start_on_pass(task, now, fallback=on_pass)
+            except Exception as e:   # a wake is always safe
+                started = f"it could not start: {type(e).__name__}: {e}"
+            if started is True:
+                return
+            self._wake_waiting(task, f"{why}; its checks passed but its on_pass_cmd was not run: {started}", now)
+            return
         if got and got[0] == "pass":
             _, r, run_dir, on_pass, head = got
             from .providers.base import RunUsage
@@ -6860,13 +6876,16 @@ class Daemon:
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
         self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True})
 
-    def _start_on_pass(self, task: dict, now: float, said: str = "probe passed") -> bool | str | None:
+    def _start_on_pass(self, task: dict, now: float, said: str = "probe passed",
+                       fallback: dict | None = None) -> bool | str | None:
         """A passed probe of a hand-off naming an `on_pass_cmd`: run that command model-free from the
         project root with the owner's HOME (command_env), only once the run that named it has ended,
         in the background, and keep the task asleep while it runs (_poll_on_pass settles it). True when
         it runs (or already ran from an earlier pass of the same probe, or waits for its run to end),
         None when the hand-off names none, else why it was not run. `said` is what the probe found
-        (JOB_FAILED for a detached job that failed): the log and the wake say it."""
+        (JOB_FAILED for a detached job that failed): the log and the wake say it. `fallback` (the
+        hand-off's on_pass, once its checks passed) is recorded when the command exits 0 without
+        writing a hand-off to $TTP_RESULT."""
         tid = task["id"]
         if tid in self._on_pass:
             return True
@@ -6906,7 +6925,7 @@ class Daemon:
                                     stderr=subprocess.STDOUT, start_new_session=True,
                                     env=env)
         where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
-        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said)
+        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said, fallback)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
                               blocked_reason=f"its {said}; running its on_pass_cmd model-free "
@@ -6921,7 +6940,7 @@ class Daemon:
         the task at once at its own tier; anything else wakes it as any passed probe does. Either way
         the wake carries the command's exit and the end of its output."""
         db = self.p.db
-        for tid, (proc, started, timeout, out, run_id, cmd, where, said) in list(self._on_pass.items()):
+        for tid, (proc, started, timeout, out, run_id, cmd, where, said, fallback) in list(self._on_pass.items()):
             rc = proc.poll()
             if rc is None and now - started < timeout:
                 continue
@@ -6948,6 +6967,8 @@ class Daemon:
                 lines = []
             tail = "\n".join(lines)[-1500:] or "(no output)"
             result = _read_result(out / RESULT_FILE)
+            if rc == 0 and result is None and fallback is not None:
+                result = fallback   # its checks passed and the command succeeded: the hand-off's on_pass
             if rc is None:
                 why = f"timed out after {timeout / 60:g} min"
             elif rc != 0:
@@ -8652,6 +8673,23 @@ def relay_hint(dependents: list[dict]) -> str:
         shown += f" and {len(dependents) - RELAY_SHOWN} more"
     return (f"\nWaiting on it: {shown}. Hand them the accepted commit, evidence path, verdict and open "
             "gates with a spec-only task_update; requeue or add no task only to relay it.")
+
+
+def on_pass_both_warning(result: dict) -> str:
+    """A waiting hand-off naming both `on_pass` and `on_pass_cmd`: what the daemon does with them,
+    or "". The command takes precedence (_probe_passed); on_pass is only its fallback after a passed
+    `ttp checks --result` wait, recorded when the command exits 0 without writing $TTP_RESULT."""
+    if not isinstance(result, dict) or "on_pass" not in result or result.get("on_pass_cmd") is None:
+        return ""
+    try:
+        words = shlex.split(str(result.get("retry_when") or ""))
+    except ValueError:
+        words = []
+    if len(words) == 4 and Path(words[0]).name == "ttp" and words[1:3] == ["checks", "--result"]:
+        return ("names both on_pass and on_pass_cmd: on_pass_cmd takes precedence; on_pass is recorded only "
+                "if its checks pass and the command exits 0 without writing a hand-off to $TTP_RESULT")
+    return ("names both on_pass and on_pass_cmd, but its retry_when is no `ttp checks --result` wait: on_pass "
+            "is ignored and only on_pass_cmd decides")
 
 
 def on_pass_problem(on_pass) -> str:

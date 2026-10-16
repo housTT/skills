@@ -175,7 +175,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
   passes the daemon runs it model-free from the project root with your HOME (600 s by default;
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off written to
-  `$TTP_RESULT` ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
+  `$TTP_RESULT` ends the task (it takes precedence over `on_pass`); anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
   when the check is mechanical.
 <!-- ttp:if remote -->

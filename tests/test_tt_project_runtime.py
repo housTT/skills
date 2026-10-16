@@ -18699,7 +18699,7 @@ def test_a_waiting_task_wakes_when_its_probe_passes_and_says_so(env, monkeypatch
     assert "Woken because: probe passed." in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
-def _checks_wait_task(p, tmp_path, on_pass=None, rc="0", tier="standard"):
+def _checks_wait_task(p, tmp_path, on_pass=None, rc="0", tier="standard", on_pass_cmd=None):
     """A code task that handed off `waiting` on its own detached `ttp checks`, which ended with `rc`."""
     from ttp import push, worktree
     now = time.time()
@@ -18720,6 +18720,8 @@ def _checks_wait_task(p, tmp_path, on_pass=None, rc="0", tier="standard"):
             "retry_when": f"{push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}"}
     if on_pass is not None:
         hand["on_pass"] = on_pass
+    if on_pass_cmd is not None:
+        hand["on_pass_cmd"] = on_pass_cmd
     (run_dir / "result.json").write_text(json.dumps(hand))
     if rc is not None:
         (run_dir / "checks.rc").write_text(f"{rc}\n")
@@ -18757,6 +18759,49 @@ def test_passed_checks_record_the_on_pass_hand_off_without_a_model_run(env, monk
     for _ in range(3):
         d.tick()
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+@pytest.mark.parametrize("exit_code, writes, status, summary", [
+    (1, False, "queued", None),
+    (0, False, "done", "parser fixed; checks pass"),
+    (0, True, "done", "published"),
+])
+def test_passed_checks_with_an_on_pass_cmd_run_it_and_record_on_pass_only_after_it_succeeds(
+        env, monkeypatch, tmp_path, exit_code, writes, status, summary):
+    """Its on_pass_cmd (a publish step) takes precedence over on_pass: a passed checks wait never
+    records on_pass without running it, and a failing command leaves the task not done."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    ran = tmp_path / "ran"
+    cmd = f"echo publishing > {ran}; "
+    if writes:
+        cmd += """printf '{"status":"done","summary":"published"}' > "$TTP_RESULT"; """
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS, on_pass_cmd=cmd + f"exit {exit_code}")
+    _settle_on_pass(d, tid)
+    assert ran.read_text() == "publishing\n", "the on_pass_cmd did not run"
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == status, (task["status"], task["blocked_reason"], res)
+    log_text = (p.logs / "daemon.log").read_text()
+    assert "recorded its on_pass (done) model-free" not in log_text
+    if status == "done":
+        assert res["summary"] == summary and res["run_status"] == "model-free"
+        assert "on_pass_cmd recorded done model-free" in log_text
+    else:
+        assert _ready(p, tid) and "exit 1" in res["woke"] and res.get("escalated_wake"), res
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+
+
+def test_a_hand_off_naming_on_pass_and_on_pass_cmd_is_warned_about():
+    from ttp.daemon import on_pass_both_warning
+    hand = {"status": "waiting", "on_pass": DONE_ON_PASS, "on_pass_cmd": "./publish.sh",
+            "retry_when": "/x/ttp checks --result /runs/7"}
+    assert "on_pass_cmd takes precedence" in on_pass_both_warning(hand)
+    assert "on_pass is ignored" in on_pass_both_warning({**hand, "retry_when": "test -e /tmp/done"})
+    assert on_pass_both_warning({k: v for k, v in hand.items() if k != "on_pass_cmd"}) == ""
+    assert on_pass_both_warning({k: v for k, v in hand.items() if k != "on_pass"}) == ""
 
 
 def _on_pass_cmd_task(p, tmp_path, cmd, probe="true"):
