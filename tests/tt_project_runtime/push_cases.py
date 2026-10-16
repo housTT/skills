@@ -7636,9 +7636,9 @@ def test_the_hourly_push_audit_raises_one_issue_per_missing_push_and_closes_them
     p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
     _commit(repo, "a.txt", "a\n")
     sha = _git_out(repo, "rev-parse", "HEAD")
-    tid = p.db.add_task("ship it", "s", kind="code", origin="user")
+    tid = p.db.add_task("ship it", "s", kind="code", origin="user", branch="work")
     p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": f"pushed {sha[:10]} to origin/proj"}))
-    quiet = p.db.add_task("plain", "s", kind="code", origin="user")
+    quiet = p.db.add_task("plain", "s", kind="code", origin="user", branch="work")
     p.db.update_task(quiet, status="done", result=json.dumps({"status": "done", "summary": "no push here"}))
     d = dmod.Daemon(p.base)
     open_ = lambda: p.db.q("SELECT watch_key, title FROM issues WHERE source='daemon:push-audit' AND status='open'")
@@ -7686,7 +7686,7 @@ def _slow_claims(env, monkeypatch, n, sleep_s=0.1):
     monkeypatch.setattr(pushclaim, "_git", git)
     tids = []
     for i in range(n):
-        tid = p.db.add_task(f"ship {i}", "s", kind="code", origin="user")
+        tid = p.db.add_task(f"ship {i}", "s", kind="code", origin="user", branch="work")
         claim = {"remote": "origin", "ref": f"refs/heads/b{i}", "sha": sha, "source": "summary", "strict": True}
         p.db.update_task(tid, status="pushing", result=dump_result({"status": "pushing", "summary": f"pushed {i}",
                          pushclaim.KEY: {"claims": [claim], "since": time.time(), "tries": 0, "next": 0}}))
@@ -7802,7 +7802,7 @@ def test_answers_carried_from_an_out_of_time_tick_never_fail_a_push_that_landed_
     monkeypatch.setattr(pushclaim, "_git", git)
 
     def pushing(ref, sha):
-        tid = p.db.add_task(f"ship {ref}", "s", kind="code", origin="user")
+        tid = p.db.add_task(f"ship {ref}", "s", kind="code", origin="user", branch="work")
         claim = {"remote": "origin", "ref": f"refs/heads/{ref}", "sha": sha, "source": "summary", "strict": True}
         p.db.update_task(tid, status="pushing", result=dump_result({"status": "pushing", "summary": f"pushed {sha[:10]}",
                          pushclaim.KEY: {"claims": [claim], "since": time.time(), "tries": 0, "next": 0}}))
@@ -7886,7 +7886,7 @@ def test_the_push_audit_counts_an_on_pass_done_whose_on_pass_cmd_never_ran(env, 
     now = time.time()
 
     def done(title, summary, cmd=None, ran=False):
-        tid = p.db.add_task(title, "s", kind="code", origin="user")
+        tid = p.db.add_task(title, "s", kind="code", origin="user", branch="work")
         run_dir = tmp_path / f"run-{tid}"
         run_dir.mkdir()
         (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "on_pass_cmd": cmd} if cmd else {}))
@@ -7911,3 +7911,69 @@ def test_the_push_audit_counts_an_on_pass_done_whose_on_pass_cmd_never_ran(env, 
     with contextlib.suppress(SystemExit):
         cli.main(["push-audit", "demo", "--json"])
     assert json.loads(capsys.readouterr().out)["counts"] == {"confirmed": 1, "missing": 2, "unknown": 0}
+
+
+def _audit_done(p, title, summary, branch="work", kind="code"):
+    tid = p.db.add_task(title, "s", kind=kind, origin="user", branch=branch)
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": summary}))
+    return tid
+
+
+def test_the_push_audit_decides_landed_by_ancestry_not_by_the_ref_or_subject_named(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "c.txt", "c\n")
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-")
+    _git_out(repo, "cherry-pick", mine)         # a replay: another sha, the same change
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _audit_done(p, "unrelated title", f"pushed {mine[:10]} to origin/elsewhere")
+    a = pushclaim.audit(p)
+    assert a["counts"]["missing"] == 0 and a["gaps"] == [], a
+
+
+def test_the_push_audit_skips_tasks_with_no_branch_of_their_own(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _audit_done(p, "question", f"pushed {sha[:10]} to origin/proj", branch=None, kind="question")
+    _audit_done(p, "no branch", f"pushed {sha[:10]} to origin/proj", branch=None)
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["missing"] == 0, a
+
+
+def test_the_push_audit_reports_a_second_claim_on_one_commit_as_shared_not_missing(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "branch", "owner", sha)
+    _git_out(repo, "branch", "other", "HEAD~1")
+    owner = _audit_done(p, "owner", f"pushed {sha[:10]} to origin/proj", branch="owner")
+    other = _audit_done(p, "other", f"pushed {sha[:10]} to origin/proj", branch="other")
+    a = pushclaim.audit(p)
+    states = {g["task"]: g["state"] for g in a["gaps"]}
+    assert states == {owner: "missing", other: "shared"}, a
+    assert a["counts"]["shared"] == 1 and a["counts"]["missing"] == 1
+
+
+def test_the_push_audit_does_not_flag_an_on_pass_cmd_whose_push_is_on_the_remote(env, monkeypatch, tmp_path):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = _audit_done(p, "waited", f"pushed {sha[:10]} to origin/proj")
+    p.db.update_task(tid, result=json.dumps({"status": "done", "summary": f"pushed {sha[:10]} to origin/proj",
+                                             "run_status": "model-free"}))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "on_pass_cmd": "ttp push --result x"}))
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
