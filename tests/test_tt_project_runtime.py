@@ -23649,6 +23649,42 @@ def test_a_forwarded_upstream_note_gets_its_resolution_back_and_its_ack_reaches_
     assert upstream.state(fp) == "closed"
 
 
+def test_a_regression_made_on_the_receiving_side_reaches_the_filer_once(env, monkeypatch):
+    """A regression recorded for a note resolved by the target travels back as a regression line; sent
+    twice it is one record there, and --resolved lists the note as regressed."""
+    from ttp import upstream
+    upstream.set_forward_to(["example-host"])
+    note = {"title": "upstream: y", "spec": "z"}
+    upstream.append("demo", 4, [note])
+    fp = upstream.fingerprint(note["title"], note["spec"])
+    sent = []
+
+    def fake(target, lines, timeout):
+        sent.append(lines)
+        return {"accepted": len(lines), "duplicates": 0, "rejected": 0, "resolved": []}, ""
+    monkeypatch.setattr(upstream, "_ssh_receive", fake)
+    upstream._take_resolved("example-host", [{"fp": fp, "fixed_in": "0.2.10", "note": "", "by": "m", "ts": 3}])
+    upstream.regress(fp, "still loses it", "demo")
+    now = time.time()
+    upstream.forward(now)
+    lines = [json.loads(x) for batch in sent for x in batch]
+    reg = [x for x in lines if x.get("kind") == "regression"]
+    assert len(reg) == 1 and reg[0]["project"] == "demo" and reg[0]["note"] == "still loses it"
+    # Receiving side: a copy of the line is filed once, a resend is a duplicate.
+    far = [x for x in (upstream._records()) if x["kind"] == "regression"]
+    assert far and "via" not in far[0]
+    other = {"title": "upstream: o", "spec": "p"}
+    ofp = upstream.fingerprint(other["title"], other["spec"])
+    upstream.resolve(ofp, "0.2.10")
+    line = (json.dumps({**reg[0], "fp": ofp}) + "\n").encode()
+    ack, _ = upstream.receive(line, "far-host")
+    assert (ack["accepted"], ack["duplicates"]) == (1, 0)
+    ack, _ = upstream.receive(line, "far-host")
+    assert (ack["accepted"], ack["duplicates"]) == (0, 1)
+    assert sum(r["kind"] == "regression" and r["fp"] == ofp for r in upstream._records()) == 1
+    assert upstream.regressed(ofp) and "regressed: still loses it" in "\n".join(upstream.listing(None))
+
+
 def test_upstream_closure_skips_an_older_receiver_and_rejects_acks_it_cannot_place(env, monkeypatch):
     """A target whose answers carry no resolutions (an older release) gets no ack lines and is asked only at
     the probe interval; a receiver refuses an ack with no resolution there, or malformed, and files one

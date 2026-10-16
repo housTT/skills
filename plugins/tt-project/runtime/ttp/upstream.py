@@ -919,6 +919,15 @@ def regress(fp: str, note: str, name: str = "", now: float | None = None) -> dic
     return _record(rec)
 
 
+def regression(fp: str, recs: list[dict] | None = None) -> dict | None:
+    """The latest regression recorded for note `fp` since its latest resolution, or None."""
+    recs = _records() if recs is None else recs
+    res = resolution(fp, recs)
+    got = [r for r in recs if r.get("kind") == "regression" and r.get("fp") == fp
+           and res and float(r.get("ts") or 0) >= float(res["ts"])]
+    return got[-1] if got else None
+
+
 def regressed(fp: str, recs: list[dict] | None = None) -> bool:
     """True when a regression was recorded for note `fp` after its latest resolution (`ttp upstream
     --regress`, or the filer filing the same note again). Regress records stay on this machine."""
@@ -1045,7 +1054,8 @@ def listing(name: str | None, now: float | None = None) -> list[str]:
         title = n.get("title") or (f"filed by {n.get('project')}" if n.get("project") else "")
         out.append(f"{fp} {st}" + (f" in {res['fixed_in']}" if res else "") + (f": {title[:120]}" if title else "")
                    + (f" — {res['note'][:200]}" if res and res.get("note") and not name else "")
-                   + (f" — {wf['note'][:200]}" if (wf := wontfixed(fp, recs)) and wf.get("note") else ""))
+                   + (f" — {wf['note'][:200]}" if (wf := wontfixed(fp, recs)) and wf.get("note") else "")
+                   + (f" — regressed: {rg['note'][:200]}" if (rg := regression(fp, recs)) else ""))
     return out
 
 
@@ -1145,7 +1155,7 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
             n = json.loads(ln)
         except ValueError:
             return {"error": "a line is not JSON; nothing was filed"}, 2
-        if isinstance(n, dict) and n.get("kind") == "ack":
+        if isinstance(n, dict) and n.get("kind") in ("ack", "regression"):
             acks.append(n)
         else:
             got.append(_valid(n))
@@ -1194,6 +1204,23 @@ PULL_WATCH_S = 30 * 86400    # notes older than this no longer make a sender ask
 RESOLVED_BACK_MAX = 100      # resolutions one answer carries (the latest)
 
 
+def _receive_regression(a: dict, recs: list[dict], via: str, now: float | None) -> str:
+    """File one regression a sender passed along (it needs a resolution here); the count key it falls under."""
+    fp, name, note, ts = a.get("fp"), a.get("project"), a.get("note"), a.get("ts")
+    if not (isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) and isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", name) and isinstance(note, str) and note.strip()
+            and len(note) <= SPEC_CHARS and isinstance(ts, (int, float)) and not isinstance(ts, bool)
+            and resolution(fp, recs)):
+        return "rejected"
+    if any(r.get("kind") == "regression" and r.get("fp") == fp and r.get("project") == name
+           and r.get("regressed_at") == ts for r in recs):
+        return "duplicates"
+    # Stamped with this machine's clock, so it counts against the resolution recorded here.
+    recs.append(_record({"kind": "regression", "fp": fp, "project": name, "note": cut(" ".join(note.split()), "it"),
+                         "ts": now or time.time(), "regressed_at": ts, "via": via}))
+    return "accepted"
+
+
 def _receive_acks(acks: list, via: str, now: float | None) -> dict:
     """File the acks a sender passed along (each needs a resolution here); counts for the receive ack."""
     out = {"accepted": 0, "duplicates": 0, "rejected": 0}
@@ -1201,6 +1228,9 @@ def _receive_acks(acks: list, via: str, now: float | None) -> dict:
         return out
     recs = _records()
     for a in acks:
+        if a.get("kind") == "regression":
+            out[_receive_regression(a, recs, via, now)] += 1
+            continue
         fp, name, ev, ts = a.get("fp"), a.get("project"), a.get("evidence"), a.get("ts")
         if not (isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) and isinstance(name, str)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", name) and isinstance(ev, str) and ev.strip()
@@ -1310,9 +1340,10 @@ def _acks_to_send(target: str, offset: int, room: int) -> tuple[list[bytes], int
             a = json.loads(ln)
         except ValueError:
             a = None
-        if isinstance(a, dict) and a.get("kind") == "ack" and not a.get("via") and \
-                (resolution(a.get("fp"), recs) or {}).get("via") == target:
-            line = (json.dumps({k: a.get(k) for k in ("kind", "fp", "project", "evidence", "ts")}, sort_keys=True)
+        if isinstance(a, dict) and a.get("kind") in ("ack", "regression") and not a.get("via") and \
+                (a["kind"] == "ack" or a.get("project")) and (resolution(a.get("fp"), recs) or {}).get("via") == target:
+            keys = ("kind", "fp", "project", "evidence", "ts") if a["kind"] == "ack" else ("kind", "fp", "project", "note", "ts")
+            line = (json.dumps({k: a.get(k) for k in keys}, sort_keys=True)
                     + "\n").encode()
             if len(out) == FORWARD_BATCH or nbytes + len(line) > room:
                 break
