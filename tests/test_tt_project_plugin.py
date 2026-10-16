@@ -2926,6 +2926,7 @@ exec "$FAKE_DIR/bin/ssh" "$@"
 """
 
 E2E_CC = r"""#!/bin/sh
+[ -n "$FAKE_CC_NOISE" ] && for i in 1 2 3 4; do echo "build-noise-$i" >&2; done
 while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out=$2; shift; done
 printf '#!/bin/sh\necho ird-e2e build ok\n' > "$out"; chmod +x "$out"
 """
@@ -3040,6 +3041,17 @@ def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird
     assert (f"  ssh -G m-idle: hostname=m-idle port=40100 proxyjump=<ird-mgmt-alias> "
             f"stricthostkeychecking=accept-new userknownhostsfile={kh}") in out, out
     assert "ssh block and known_hosts file removed" in out and not kh.exists(), out
+
+
+def test_setup_box_ird_e2e_step4_smi_failure_shows_only_smi_output(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env = {**env, "FAKE_CC_NOISE": "1", "FAKE_SMI_FAIL": "1"}
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "tt-smi -s (rc 1): no devices" in out, out
+    assert "build-noise" not in out, out
 
 
 @pytest.mark.parametrize("how", ["fail", "ctrl-c"])
