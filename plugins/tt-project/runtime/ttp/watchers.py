@@ -13,7 +13,7 @@
   work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
   the user for a review). A bot's re-post of a finding it already made (after each push, say) is one
   finding, not new work, and an empty COMMENTED review that only wraps the runs' own or a bot's inline
-  comments is no activity (a person's inline-only review, or one whose comments are unknown, counts). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
+  comments is no activity (a person's inline-only review, or one whose comments are unknown, counts; a failed read keeps the last known activity). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
 from __future__ import annotations
@@ -132,9 +132,9 @@ def watch_prs(daemon) -> str:
             heads[key] = {"sha": pr["headRefOid"], "seen": time.time()}   # what an approval binds to
         # One GraphQL read serves the findings and which empty reviews only wrap the runs' replies.
         data = None
-        if key and (pr.get("state") == "OPEN" or any(
-                str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip()
-                for r in pr.get("reviews") or [])):
+        wrappers = any(str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip()
+                       for r in pr.get("reviews") or [])
+        if key and (pr.get("state") == "OPEN" or wrappers):
             owner, rest = key.split("/", 1)
             name, number = rest.split("#")
             data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
@@ -146,6 +146,10 @@ def watch_prs(daemon) -> str:
         old = seen.get(t["pr_url"])
         if old and sig["mergeable"] == "UNKNOWN" and old.get("mergeable") not in (None, "UNKNOWN"):
             sig = {**sig, "mergeable": old["mergeable"]}   # GitHub is recomputing: keep the last known value
+        if old and wrappers and data is None:
+            # The inline comments could not be read: keep the last known activity, so a failed read and
+            # the next good one raise no pr_changed. A first sighting counts the unknown wrappers.
+            sig = {**sig, "activity": old.get("activity"), "n_human": old.get("n_human")}
         if sig == old:
             continue
         seen[t["pr_url"]] = sig

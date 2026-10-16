@@ -9218,6 +9218,14 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     # pr-watch reads the inline comments itself: a person's inline-only review is new activity.
     watchers.watch_prs(d)
     assert events("pr_changed") == []
+    # A failed read of the inline comments, then a good one: the wrappers' last known state holds.
+    good = watchers._gh
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else pr)
+    watchers.watch_prs(d)
+    assert events("pr_changed") == []
+    monkeypatch.setattr(watchers, "_gh", good)
+    watchers.watch_prs(d)
+    assert events("pr_changed") == []
     pr["reviews"].append(unmarked)
     watchers.watch_prs(d)
     assert len(events("pr_changed")) == 1 and "new review/comment activity (1 human" in events("pr_changed")[0]
