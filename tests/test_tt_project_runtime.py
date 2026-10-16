@@ -5305,6 +5305,19 @@ def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
         assert marks + prov.own_cache_breakpoints <= base.MAX_CACHE_BREAKPOINTS, name
 
 
+def test_worker_prompt_pins_the_watcher_thread_clause_and_one_snapshot_rule(env):
+    from ttp.prompts import worker_prompt
+    p = make(env)
+    tid = p.db.add_task("fix", "fix it", kind="code", tier="light", origin="user")
+    prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
+    for phrase in ("reentrant lock", "stage_timeout", "stall guard",
+                   "dumps all thread stacks and exits non-zero"):
+        assert phrase in prompt, phrase
+    assert prompt.count("private snapshot") == 1
+    assert "private snapshot" in prompt and "sha256" in prompt
+    assert "per-script marker" in prompt
+
+
 def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
