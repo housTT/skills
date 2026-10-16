@@ -209,6 +209,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   no .rc; set `"survives_reboot": true` to keep it asleep anyway.
   A wait on another project's reply uses retry_when `ttp ack-wait probe --from <project> --hash <id>`
   and on_pass_cmd `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
+  A wait on another task landing uses retry_when `landed:#<id>`, never a sha (landing rebases it).
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
   the daemon restarts it, with no model run, up to `budget.max_job_relaunches` times (default 3).
   `wake_tier` defaults to light. After 3 wakes that hand back the same `waiting_for` and

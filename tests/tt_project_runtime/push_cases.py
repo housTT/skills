@@ -3262,6 +3262,43 @@ def test_ttp_landed_finds_a_rebased_commit_by_patch_id_or_author_date_and_subjec
     assert "not on origin/proj yet" in capsys.readouterr().out
 
 
+def test_a_fetch_then_ancestor_probe_goes_through_ttp_landed_and_a_queued_head_waits_on_its_task(env, monkeypatch):
+    """`git fetch -q <remote> <branch> && git merge-base --is-ancestor <sha> FETCH_HEAD` (or
+    <remote>/<branch>) never passes once the push queue rebased <sha>: it becomes `ttp landed`, and a
+    sha a push-queue row holds as its head waits on the task owning that row's branch."""
+    import shlex
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    probes = [f"git fetch -q origin proj && git merge-base --is-ancestor {head[:8]} FETCH_HEAD",
+              f"git fetch origin proj&&git merge-base --is-ancestor {head} origin/proj",
+              f" git fetch --quiet origin proj  &&  git merge-base --is-ancestor {head} origin/proj "]
+    for raw in probes:
+        assert subprocess.run(raw, shell=True, cwd=repo, capture_output=True).returncode == 1, raw
+        cmd = landed.probe_command(raw)
+        assert cmd.startswith("ttp landed ") and cmd.endswith(" --onto origin/proj"), cmd
+        with pytest.raises(SystemExit) as e:
+            cli.main(shlex.split(cmd)[1:])
+        assert e.value.code == 0, "the rebased landing passes"
+    # Unrelated compound probes run as written: another ref than the one fetched, more commands.
+    for raw in (f"git fetch -q origin proj && git merge-base --is-ancestor {head} origin/other",
+                f"git fetch -q origin proj && git merge-base --is-ancestor {head} FETCH_HEAD && rm -f x",
+                f"git fetch -q origin proj; git merge-base --is-ancestor {head} FETCH_HEAD",
+                "git fetch -q origin proj && test -f x"):
+        assert landed.probe_command(raw) == raw == landed.probe_command(raw, p)
+    # No push-queue row: the sha probe, even with the project.
+    assert landed.probe_command(probes[0], p) == f"ttp landed {head[:8]} --onto origin/proj"
+    review = p.db.add_task(f"Review #{tid}", "r", kind="review", origin="coordinator")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
+           "VALUES(?, ?, ?, 'origin/proj', 'approved', ?, ?)", (review, branch, head, now, now))
+    for raw in probes + [f"git merge-base --is-ancestor {head} origin/proj"]:
+        assert landed.probe_command(raw, p) == f"ttp landed --task {tid}", raw
+    assert landed.check(p, repo, tid=tid)[0] == 0
+    # A row whose branch no task owns waits on the row's own task.
+    p.db.x("UPDATE push_queue SET branch='gone'")
+    assert landed.probe_command(probes[0], p) == f"ttp landed --task {review}"
+
+
 def test_landed_task_prefers_the_push_queues_recorded_commit_and_waits_until_it_is_on_the_branch(env, monkeypatch):
     """A review's approval the queue landed counts for the code task it reviews: its landed_sha."""
     from ttp import landed

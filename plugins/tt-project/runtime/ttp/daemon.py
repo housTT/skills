@@ -6698,7 +6698,7 @@ class Daemon:
         try:
             # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill.
             out = tempfile.TemporaryFile()
-            proc = subprocess.Popen(landed.probe_command(probe), shell=True, cwd=str(self.p.root),
+            proc = subprocess.Popen(landed.probe_command(probe, self.p), shell=True, cwd=str(self.p.root),
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                     start_new_session=True, env=self._probe_env())
         except OSError as e:

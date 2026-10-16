@@ -142,7 +142,7 @@ def never_passes(p, probe: str, rc=None, output: str = "") -> str:
     if rc in (None, 2):   # dash's exit for a syntax error; None: the wait just started
         from .ends import SH, sh_syntax_error
         from .landed import probe_command
-        err = sh_syntax_error(probe_command(probe))
+        err = sh_syntax_error(probe_command(probe, p))
         if err:
             return f"{SH}, which runs it, cannot parse it ({err}): it must be POSIX sh, not bash-only syntax"
     gone = gone_paths(p, probe)

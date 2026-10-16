@@ -9,7 +9,8 @@ shas. The push queue (and `ttp push`) rebase each approved head onto the branch 
   review fix and its re-review, a rebase or re-done task: carriers), a successful detached push, the
   commit a task recorded as superseding it (`ttp task <project> superseded <id> <sha>`), else (once
   it is done and committed something) its branch's commits by patch.
-- `git merge-base --is-ancestor <sha> <ref>`, as a whole probe, also passes when every commit of
+- `git merge-base --is-ancestor <sha> <ref>`, as a whole probe (or after `git fetch [-q] <remote>
+  <branch> &&`, on FETCH_HEAD or <remote>/<branch>), also passes when every commit of
   <sha> has an equivalent on <ref>: the same `git patch-id --stable` (git cherry), the same author,
   author date and subject (a rebase keeps them; a settled conflict changes the patch), or a commit
   the push queue replayed from it (its trailer).
@@ -31,6 +32,10 @@ from .db import review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
 ANCESTOR_PROBE = re.compile(r"\s*git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./@{}^~-]+)\s*")
+# `git fetch [-q] <remote> <branch> && git merge-base --is-ancestor <sha> FETCH_HEAD|<remote>/<branch>`.
+FETCH_ANCESTOR_PROBE = re.compile(
+    r"\s*git\s+fetch(?:\s+(?:-q|--quiet))*\s+([\w.-]+)\s+([\w./-]+)\s*&&\s*"
+    r"git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./-]+)\s*")
 # `ttp landed --task <id>` / `ttp landed #<id>` inside a longer probe: the task it waits on.
 _LANDED_TASK = re.compile(r"\bttp\s+landed\b[^|;&\n]*?(?:--task(?:=|\s+)|\s#)['\"]?([^\s'\"|;&)]+)")
 REPLAYED = "Ttp-Replayed-From"   # batch.REPLAYED: a commit the push queue settled names the one it replays
@@ -38,14 +43,36 @@ FETCH_S = 40                     # within the daemon's 60 s probe timeout
 NOT_YET, CANNOT = 1, 2
 
 
-def probe_command(probe: str) -> str:
-    """The shell command the daemon runs for a start_when or retry_when: `landed:#<id>` and a bare
-    ancestor probe become `ttp landed`; anything else runs as written."""
+def probe_command(probe: str, p=None) -> str:
+    """The shell command the daemon runs for a start_when or retry_when: `landed:#<id>` and an
+    ancestor probe (bare, or after a `git fetch` of the ref it reads) become `ttp landed`; anything
+    else runs as written. With project `p`, a sha a push-queue row holds as its head waits on that
+    row's task (`ttp landed --task <id>`), which also counts a landing the queue recorded."""
     if m := LANDED_PROBE.fullmatch(probe or ""):
         return f"ttp landed --task {m.group(1)}"
     if m := ANCESTOR_PROBE.fullmatch(probe or ""):
-        return f"ttp landed {m.group(1)} --onto {shlex.quote(m.group(2))}"
-    return probe
+        sha, onto = m.group(1), m.group(2)
+    elif (m := FETCH_ANCESTOR_PROBE.fullmatch(probe or "")) and m.group(4) in ("FETCH_HEAD", f"{m.group(1)}/{m.group(2)}"):
+        sha, onto = m.group(3), f"{m.group(1)}/{m.group(2)}"
+    else:
+        return probe
+    if p is not None and (tid := queued_task(p.db, sha)) is not None:
+        return f"ttp landed --task {tid}"
+    return f"ttp landed {sha} --onto {shlex.quote(onto)}"
+
+
+def queued_task(db, sha: str) -> int | None:
+    """The task a push-queue row with head `sha` (or a prefix of it) carries: the task that owns the
+    row's branch, else the row's own task (the review that approved it). None when no row has it."""
+    try:
+        row = db.one("SELECT task, branch FROM push_queue WHERE head LIKE ? ORDER BY id DESC LIMIT 1",
+                     (sha.lower() + "%",))
+        if not row:
+            return None
+        owner = db.one("SELECT id FROM tasks WHERE branch=? AND kind!='review' ORDER BY id LIMIT 1", (row["branch"],))
+    except Exception:
+        return None
+    return int(owner["id"] if owner else row["task"])
 
 
 def task_refs(probe: str | None) -> list[str]:
