@@ -3039,6 +3039,8 @@ def cmd_detach(a) -> None:
             die("--after must be 0 or more")
         if a.host:
             sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0))
+    if a.check is None:
+        _start_options(a)
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
         die("--rows and --after go with --check")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
@@ -3176,6 +3178,36 @@ fi
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
 echo "gone"
 '''
+
+
+def _start_options(a) -> None:
+    """`ttp detach <name> --devices 1 -- <command...>`: argparse leaves the options given after the
+    name among the command's words; take them back out up to the first `--` or the first word that is
+    no option, so they count as if they came before the name. Any other option there is refused, so it
+    never runs as the command."""
+    words = list(a.command or [])
+    known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None,
+             **({"--dir": str} if a.remote else {})}
+    while words and words[0].startswith("-") and words[0] != "--":
+        w = words.pop(0)
+        key, eq, val = w.partition("=")
+        if key not in known:
+            die(f"ttp detach: unknown option {w} before the command (put the command after --)")
+        kind = known[key]
+        if kind is None:
+            if eq:
+                die(f"{key} takes no value")
+            a.resumable = True
+            continue
+        if not eq:
+            if not words or words[0] == "--":
+                die(f"{key} needs a value")
+            val = words.pop(0)
+        try:
+            setattr(a, key[2:].replace("-", "_"), kind(val))
+        except ValueError:
+            die(f"{key} needs a {'whole ' if kind is int else ''}number, not {val!r}")
+    a.command = words
 
 
 def _check_options(a) -> None:

@@ -31583,6 +31583,51 @@ def test_detach_remote_runs_the_driver_over_ssh_and_its_check_reports_running_th
     assert again.returncode != 0 and "already ran" in again.stderr + again.stdout
 
 
+def test_detach_options_after_the_name_count_as_before_it_and_never_join_the_command(env, tmp_path):
+    """The reported failure: `ttp detach <name> --devices 1 -- <cmd>` ran `--devices 1 -- <cmd>` as the
+    job (exit 127 remotely). The options after the name now count as if they came before it; any other
+    option there is refused (exit 2) and starts nothing."""
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "22"
+    run_dir.mkdir(parents=True)
+    e = {"TTP_RUN_DIR": str(run_dir)}
+    opts = ["--cores", "3", "--devices=1", "--mem-gb", "2.5", "--resumable"]
+    before = _ttp_run(p, "detach", *opts, "pre", "--", "sh", "-c", "echo ran", env=e)
+    after = _ttp_run(p, "detach", "post", *opts, "--", "sh", "-c", "echo ran", env=e)
+    assert before.returncode == 0 and after.returncode == 0, before.stderr + after.stderr
+    for name in ("pre", "post"):
+        assert _wait_for_path(run_dir / f"{name}.rc")
+        assert (run_dir / f"{name}.rc").read_text().strip() == "0"
+        assert (run_dir / f"{name}.log").read_text().strip() == "ran"
+    jobs = {j["name"]: j for j in json.loads((run_dir / "detached.json").read_text())}
+    for k in ("command", "requested", "resumable"):
+        assert jobs["pre"][k] == jobs["post"][k], k
+    assert jobs["post"]["requested"] == {"cores": 3, "devices": 1, "mem_gb": 2.5}
+    assert jobs["post"]["command"] == "sh -c echo ran"
+    for bad in (["--frobnicate"], ["--dir", "x"], ["--devices"], ["--cores", "many"]):
+        r = _ttp_run(p, "detach", "bad", *bad, "--", "true", env=e)
+        assert r.returncode == 2 and bad[0] in r.stderr, (bad, r.stderr)
+        assert not any(run_dir.glob("bad.*")), bad
+    assert set(jobs) == {j["name"] for j in json.loads((run_dir / "detached.json").read_text())}
+
+    s = {**_ssh_stub(tmp_path), **e}
+    remote = tmp_path / "home" / "jobs"
+    outs = [_ttp_run(p, "detach", "--remote", "box-a", "--dir", str(remote), "--devices", "1", "rpre", "--",
+                     "sh", "-c", "echo ran", env=s),
+            _ttp_run(p, "detach", "--remote", "box-a", "rpost", "--dir", str(remote), "--devices", "1", "--",
+                     "sh", "-c", "echo ran", env=s)]
+    for name, r in zip(("rpre", "rpost"), outs):
+        assert r.returncode == 0, r.stderr
+        assert _remote_probe(r.stdout)[-1] == str(remote / name)
+        assert _wait_for_path(remote / f"{name}.rc")
+        assert (remote / f"{name}.rc").read_text().strip() == "0", (remote / f"{name}.log").read_text()
+        assert (remote / f"{name}.log").read_text().strip() == "ran"
+    calls = (tmp_path / "ssh.log").read_text().split()
+    r = _ttp_run(p, "detach", "--remote", "box-a", "rbad", "--frobnicate", "--", "true", env=s)
+    assert r.returncode == 2 and "--frobnicate" in r.stderr, r.stderr
+    assert (tmp_path / "ssh.log").read_text().split() == calls, "a refused option reaches no host"
+
+
 def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failure_as_255(env, tmp_path):
     p = _device_project(env, device=False)
     e = _ssh_stub(tmp_path)
