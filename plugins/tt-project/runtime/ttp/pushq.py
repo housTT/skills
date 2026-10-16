@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, locks, push, runner, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, locks, push, runner, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -653,6 +653,23 @@ def _known_bad(db, rows: list[dict]) -> dict | None:
     return {"tip": bad["tip"], "fresh": fresh, "cmd": bad.get("cmd")}
 
 
+def bad_tip_ids(db) -> list[str]:
+    """The failing test ids the known-bad tip's own checks showed (sharedchecks), [] when none is known."""
+    bad = _state(db).get("bad_tip") or {}
+    if not bad.get("tip") or int(bad.get("fails") or 0) < TIP_FAILS or not isinstance(bad.get("ids"), list):
+        return []
+    return [str(i) for i in bad["ids"]]
+
+
+def touches(p: Project, old: str, new: str, files: list[str]) -> bool:
+    """A commit in old..new changes one of `files`; True when git cannot tell (a rerun is the safe side)."""
+    try:
+        r = _git(p, "log", "--format=%H", f"{old}..{new}", "--", *files, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode != 0 or bool(r.stdout.strip())
+
+
 def batch_argv(marker: Path) -> list[str]:
     """The batch process (T1's `ttp push --batch`); tests put a stub here."""
     return [sys.executable, "-m", "ttp", "push", "--batch", str(marker)]
@@ -1252,7 +1269,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             shown = m.get("tip_tried") if isinstance(m.get("tip_tried"), list) else [r["id"] for r in rows]
             tried |= {r["id"] for r in rows if r["id"] in shown}
             st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried), "at": now,
-                             "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS}
+                             "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS,
+                             "ids": sharedchecks.failing_ids(str(d.get("tail") or first.get("tail") or ""))[0]}
             if fails >= TIP_FAILS and not (same and bad.get("alerted")):
                 later.append((BAD_TIP_ALERT, f"The push branch {b['target']} fails its own checks at {_short(tip)} "
                                              f"(`{cmd}`) in {fails} push batches in a row. The queue no longer checks "

@@ -689,6 +689,16 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
   and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
   `ttp push --own` publishes a task's branch and queues like task checks.
+- Shared check failures: a task waiting on its own detached `ttp checks` that failed only on pytest
+  ids (the failing command's `FAILED`/`ERROR path::name` lines, complete against pytest's summary)
+  that also failed in at least `checks.shared_min_tasks` (default 2) other tasks' checks on other
+  heads within `checks.shared_window_h` (default 6), or on the push queue's known-bad tip, is held
+  asleep instead of woken at its tier. Its checks run again on the same head, model-free, once the
+  push branch's tip moves past a commit changing a failing test's file, or after
+  `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
+  is one incident with one fix task and one low feed line; the daily audit lists the tasks held and
+  the wakes avoided with their estimated $. Any other runner, a cut list or one failing id not seen
+  elsewhere wakes the task as before. A task still lands only after its own checks pass.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.

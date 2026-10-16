@@ -85,6 +85,7 @@ from . import runner
 from . import schedule as sched
 from . import service
 from . import settinghold
+from . import sharedchecks
 from . import sweep
 from . import timefmt
 from . import ttr
@@ -6145,23 +6146,9 @@ class Daemon:
                        "LIKE ? AND ts>?", (tid, f"checks_relaunched:{tid}:%:{head[:12]}", since or 0)) or {}).get("n", 0)
         if same >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
             return False, (same if self._shutdown(boot) == "abrupt" else 0)
-        why = ""
-        try:
-            if not worktree.is_git(Path(wt)):
-                why = f"its worktree {wt} is gone"
-            elif (now := worktree._git(Path(wt), "rev-parse", "HEAD")) != head:
-                why = f"its worktree moved from {head[:12]} to {now[:12]}"
-            elif worktree._git(Path(wt), "status", "--porcelain", "--untracked-files=no"):
-                why = f"its worktree {wt} has uncommitted changes"
-        except Exception as e:
-            why = f"its worktree could not be read: {e}"
+        why = self._restart_checks(tid, out, info, f"relaunch-t{tid}")
         if why:
             log(self.p, f"task {tid}: the reboot killed its checks, not started again: {why}")
-            return False, 0
-        argv = (["--fresh"] if info.get("fresh") else []) + (["--full"] if info.get("full") else []) \
-            + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
-        r = self._start_checks(Path(wt), out, f"relaunch-t{tid}", tid, argv)
-        if not r:
             return False, 0
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "daemon", "checks_relaunched", mine + head[:12], "low",
@@ -6281,6 +6268,29 @@ class Daemon:
         rows = db.q("SELECT fingerprint FROM events WHERE kind='job_relaunched' AND task=? AND ts>? AND fingerprint "
                     "LIKE ?", (tid, since or 0, f"job_relaunched:{tid}:%:loss:%"))
         return len({r["fingerprint"].split(":")[2] for r in rows})
+
+    def _restart_checks(self, tid: int, out: Path, info: dict, run_id: str) -> str:
+        """Start the checks that checks.pid `info` names again in run dir `out`, only while their
+        worktree still exists, holds the head they ran on and has no uncommitted changes to tracked
+        files (untracked ones never count, as for `ttp checks`): '' once started, else why not."""
+        wt, head, cmd = info.get("worktree"), info.get("head"), info.get("cmd")
+        if not all(isinstance(x, str) and x for x in (wt, head)) or not isinstance(cmd, list):
+            return "its checks.pid does not name a worktree, head and command"
+        why = ""
+        try:
+            if not worktree.is_git(Path(wt)):
+                why = f"its worktree {wt} is gone"
+            elif (now := worktree._git(Path(wt), "rev-parse", "HEAD")) != head:
+                why = f"its worktree moved from {head[:12]} to {now[:12]}"
+            elif worktree._git(Path(wt), "status", "--porcelain", "--untracked-files=no"):
+                why = f"its worktree {wt} has uncommitted changes"
+        except Exception as e:
+            why = f"its worktree could not be read: {e}"
+        if why:
+            return why
+        argv = (["--fresh"] if info.get("fresh") else []) + (["--full"] if info.get("full") else []) \
+            + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
+        return "" if self._start_checks(Path(wt), out, run_id, tid, argv) else "they could not be started"
 
     def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
         """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,
@@ -6709,8 +6719,9 @@ class Daemon:
         """A waiting task's probe passed. A wait on its own detached `ttp checks` is settled here
         without a model run where the outcome is clear: checks that passed on the head still checked
         out record the hand-off's `on_pass` through the normal finish (review and push queue as
-        usual); checks that failed or were killed wake the task at once at its own tier with their
-        output's tail. Anything unclear wakes it as any passed probe does."""
+        usual); checks that failed only on tests failing elsewhere too are held (_shared_hold); others
+        that failed or were killed wake the task at once at its own tier with their output's tail.
+        Anything unclear wakes it as any passed probe does."""
         why = "probe passed"
         try:
             got = self._checks_wait(task)
@@ -6728,7 +6739,12 @@ class Daemon:
                         f"recorded its on_pass ({on_pass['status']}) model-free")
             return
         if got and got[0] == "fail":
-            _, rc, tail = got
+            _, rc, tail, run_dir = got
+            try:
+                if self._shared_hold(task, rc, run_dir, now):
+                    return
+            except Exception as e:   # a wake is always safe
+                log(self.p, f"task {task['id']}: could not classify its checks failure: {type(e).__name__}: {e}")
             tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
             self._wake_waiting(task, f"its checks failed ({'killed' if rc == 'killed' else f'exit {rc}'}); "
                                      f"the end of checks.out:\n{tail}", now,
@@ -6746,6 +6762,75 @@ class Daemon:
             if started:
                 why += f"; its on_pass_cmd was not run: {started}"
         self._wake_waiting(task, why, now)
+
+    def _shared_hold(self, task: dict, rc: str, run_dir: Path, now: float) -> bool:
+        """Its checks failed only on pytest ids that also fail in other tasks' checks or on the push
+        queue's known-bad tip (sharedchecks): keep the task asleep without a model run, counted in one
+        incident with one fix task. While held, its checks run again on the same head once the push
+        branch's tip moves past a commit touching a failing test's file, or after the backoff; after
+        RERUNS_MAX reruns it wakes. False: wake it as before (another runner, an id not shared...)."""
+        from .cli import _read_checks_pid
+        db, tid = self.p.db, task["id"]
+        if rc == "killed":
+            return False
+        try:
+            fail = json.loads((run_dir / "check_failure.json").read_text())
+        except (OSError, ValueError):
+            return False
+        if not isinstance(fail, dict) or fail.get("kind") != "check_failed" or not isinstance(fail.get("head"), str):
+            return False
+        head, out = fail["head"], str(fail.get("output") or "")
+        ids, complete = sharedchecks.failing_ids(out)
+        if not head or not ids or not complete:
+            return False
+        started = _read_checks_pid(run_dir).get("ts")
+        prev = load_result(task["result"])
+        hold = prev.get("shared_hold") if isinstance(prev.get("shared_hold"), dict) else {}
+        if hold.get("run_dir") != str(run_dir) or hold.get("head") != head:
+            hold = {}
+        tip = self._push_tip()
+        if hold and hold.get("started") == started:   # the failure it was held on: release or sleep on
+            moved = bool(tip and hold.get("tip") and tip != hold["tip"]
+                          and pushq.touches(self.p, hold["tip"], tip, sharedchecks.files(hold.get("ids") or ids)))
+            if not moved and now < float(hold.get("until") or 0):
+                if (task["not_before"] or 0) <= now + PROBE_EVERY_S:
+                    db.update_task(tid, not_before=float(hold["until"]) + 2 * PROBE_EVERY_S)
+                return True
+            why = self._restart_checks(tid, run_dir, _read_checks_pid(run_dir), f"shared-t{tid}")
+            if why:
+                log(self.p, f"task {tid}: held on a shared checks failure; its checks not run again: {why}")
+                return False
+            self._probe_rc.pop(tid, None)
+            hold = {**hold, "reruns": int(hold.get("reruns") or 0) + 1, "rerun_at": now}
+            db.update_task(tid, not_before=now + max(_retry_s(prev), 3600.0),
+                           result=dump_result({**prev, "shared_hold": hold}))
+            log(self.p, f"task {tid}: shared checks failure, " + ("the push-branch tip changed its failing tests"
+                        if moved else "backoff over") + f"; its checks run again on {head[:12]}, no model run")
+            return True
+        sharedchecks.record(db, tid, head, ids, now)
+        if int(hold.get("reruns") or 0) >= sharedchecks.RERUNS_MAX:
+            return False
+        if not sharedchecks.shared(db, tid, head, ids, now, self.cfg, pushq.bad_tip_ids(db)):
+            return False
+        tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
+        with db.tx():
+            iid, opened = sharedchecks.incident(db, task, ids, out, now, self.cfg)
+            sharedchecks.avoided(db, iid, tid, sharedchecks.wake_usd(db, tier, now))
+            until = now + sharedchecks.settings(self.cfg)["backoff_s"]
+            db.update_task(tid, not_before=until + 2 * PROBE_EVERY_S, result=dump_result({**prev, "shared_hold": {
+                "run_dir": str(run_dir), "head": head, "ids": ids, "incident": iid, "started": started,
+                "tip": tip, "since": now, "until": until, "reruns": int(hold.get("reruns") or 0)}}))
+        log(self.p, f"task {tid}: its checks failed on {len(ids)} test(s) failing in other tasks too "
+                    f"(incident {iid}{', opened' if opened else ''}); held without a model run")
+        return True
+
+    def _push_tip(self) -> str:
+        """The push branch's tip as last fetched ('' without one)."""
+        t = pushq.target(self.p)
+        try:
+            return pushq._tracking_tip(self.p, *t) if t else ""
+        except Exception:
+            return ""
 
     def _job_failed(self, task: dict, now: float) -> None:
         """A waiting task's `ttp detach --check` found its jobs ended, but one failed or left no exit
@@ -6908,7 +6993,7 @@ class Daemon:
     def _checks_wait(self, task: dict) -> tuple | None:
         """What a passed `ttp checks --result <run dir>` probe of one of this task's runs settles:
         ("pass", run row, run dir, on_pass, head), ("fail", rc, tail), ("unclear", why), or None when
-        the wait is not on such checks or they left no exit code."""
+        the wait is not on such checks or they left no exit code. A "fail" also carries the run dir."""
         from .cli import CHECKS_OUT, CHECKS_RC
         prev = load_result(task["result"])
         if task["status"] != "queued" or prev.get("status") != "waiting":
@@ -6933,7 +7018,7 @@ class Daemon:
                 lines = (run_dir / CHECKS_OUT).read_text(errors="replace").splitlines()[-20:]
             except OSError:
                 lines = []
-            return "fail", rc, "\n".join(lines)[-1500:] or "(no output)"
+            return "fail", rc, "\n".join(lines)[-1500:] or "(no output)", run_dir
         if rc != "0":
             return None
         full = _read_result(run_dir / RESULT_FILE) or {}
