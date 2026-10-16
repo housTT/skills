@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from . import push
+from .project import durable_write
 
 GIT_ERROR, IDENTITY_ERROR, INPUT_ERROR = 20, 65, 66
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -280,7 +281,7 @@ def refresh(repo: Path, definition_path: str, paths: list[str]) -> list[str]:
         return []
     if done:
         indent = 2 if "\n" in text.strip() else None
-        file.write_text(json.dumps(plan, indent=indent) + ("\n" if text.endswith("\n") else ""))
+        durable_write(file, json.dumps(plan, indent=indent) + ("\n" if text.endswith("\n") else ""))
     return done
 
 
