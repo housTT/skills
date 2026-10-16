@@ -143,7 +143,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 <!-- ttp:if device -->
  "needs_deep": "device task only: the problem you could not solve at this tier; its retry runs deep",
 <!-- /ttp:if device -->
+<!-- ttp:if prs -->
  "pr": "URL if you opened or updated one",
+<!-- /ttp:if prs -->
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
  "outcome": "if it applies: landed, kept, shelved or rejected",
@@ -152,7 +154,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 ```
 
 - `done` only with evidence: tests run, numbers measured, files produced.
-- `waiting` when a resource is busy (a reservation, a queue, a review). The task returns after
+- `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a
   `retry_when`: the harness runs it model-free every few minutes in the project root. Keep it
   read-only and under a minute. It must exit 0 once the wait is over whatever the outcome (the job
@@ -222,8 +224,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   encrypted input or one in a macOS privacy-protected folder too: block once, naming the file), or the next step cannot be undone and is outside the charter. Say exactly what. Make
   judgment calls yourself; state each and why in the summary.
 - Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`.
-- Read another task's record with `ttp task <project> show <id>`,
-  never project.db.
+- Read another task's record with `ttp task <project> show <id>`, never project.db.
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
   `retry_when` `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or
   `ttp upstream --fp "<title>" "<spec>"`); once it passes, check the fix and close the note:
@@ -231,10 +232,10 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - A dead or stuck component the project owns (a worker, service, runner, schedule, watcher, queue,
   a hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
   never handed off `blocked` as a question about what to do.
-- `failed` when the approach does not work. Say what you learned. A clean exit is not the task
+- `failed` when the approach does not work; say what you learned. A clean exit is not the task
   done: judge the outcome.
-- A failed job's exit code alone never names its cause (exit 5 may be the script's own guard).
-  To diagnose one, quote its last 20 log lines and its first error line, and base the cause on them.
+- A failed job's exit code alone never names its cause (exit 5 may be the script's own guard):
+  quote its last 20 log lines and its first error line, and base the cause on them.
 - Never ask the user to do, or offer to do, what you or the project can do: do it, or put it
   in `followups`, and report.
 
@@ -243,17 +244,25 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - No progress possible within your budget or wall clock: stop early with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or `needs_review`.
 - Never block one tool call longer than about 5 minutes: submit long work detached and hand off
-  `waiting`. Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
+  `waiting`.
+<!-- ttp:if wait -->
+  Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
   (your task branch). A command your task's rules say to run in the foreground gets your
   longest timeout.
+<!-- /ttp:if wait -->
 - Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
   `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
+<!-- ttp:if wait -->
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
-- Write large results incrementally: append and flush as you go, and flush before any step that may reset the host.
-- A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch, with its sha256 in the notes (follow exec indirection and snapshot every executable it launches; for `journalctl` over boots, see watchers.md). Edit shared scripts via a temporary file plus `mv`, never in place; concurrent edits go under `ttp lock <name>` or git.
+<!-- /ttp:if wait -->
+- Write large results incrementally, flushing as you go and before any step that may reset the host.
+- A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch (sha256 in the notes; follow exec indirection and snapshot every executable it launches; for `journalctl` over boots, see watchers.md). Edit shared scripts via a temporary file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
 - A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or the harness says you passed the split line, finish the step, commit and hand off `done` with a
-  `followups` entry titled `continue: ...` (what is done, branch and head, what is left). A review does not split this way: it finishes its verdict.
+  `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
+<!-- ttp:if prs -->
+  A review does not split this way: it finishes its verdict.
+<!-- /ttp:if prs -->
 - No `result.json`, no credit: a run ending without one is an unfinished attempt.

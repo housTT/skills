@@ -26508,6 +26508,10 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
         s = rendered(t)
         assert "on_pass_cmd" not in s and "wake_tier" not in s
         assert "`waiting` when a resource is busy" in s, "the waiting basics stay for every kind"
+        assert "ttp push --own --detach" not in s and "setsid nohup" not in s
+        assert "A review does not split" not in s and '"pr": "URL' not in s
+    assert "ttp push --own --detach" in rendered(code) and "setsid nohup" in rendered(code)
+    assert "A review does not split" in rendered({"kind": "review"}) and '"pr": "URL' in rendered(code)
     # Harness-only rules only for harness tasks.
     assert "only this project's own harness" in rendered({"kind": "harness"})
     assert "only this project's own harness" not in rendered(code)
