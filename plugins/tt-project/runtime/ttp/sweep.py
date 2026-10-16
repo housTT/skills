@@ -475,9 +475,28 @@ def _item_key(a: dict) -> str:
     return f"resource:{name}"
 
 
-def record(db: DB, a: dict, next_at: float | None, now: float | None = None) -> str:
+def still_deferred(db: DB, tid: int, now: float, where=None) -> str:
+    """What still defers queued task `tid` ('' when nothing): a start_after ahead, a start_when not yet
+    passed. '' too for a task this sweep showed blocked, waiting or in review that is queued now: its
+    requeue in this turn kept the deferral as planned."""
+    t = db.task(tid)
+    if not t or t["status"] != "queued":
+        return ""
+    snap = ((db.kv(STATE_KEY, {}) or {}).get("items") or {}).get(f"task:{tid}")
+    if snap and snap.get("status") != "queued":
+        return ""
+    d, holds = deferral(t), []
+    if float(d.get("after") or 0) > now:
+        holds.append(f"start_after {timefmt.long(float(d['after']), where)}")
+    if d.get("when"):
+        holds.append(f"start_when `{_clip(d['when'], 160)}`")
+    return " and ".join(holds)
+
+
+def record(db: DB, a: dict, next_at: float | None, now: float | None = None, where=None) -> str:
     """Record one `sweep` action's outcome (next_at: its `start_after`, already parsed). Raises
-    ValueError on a bad one, which the turn reports back."""
+    ValueError on a bad one, which the turn reports back. `unblocked` never lifts a deferral: on a task
+    still deferred it is refused, so only a task_update that clears start_after/start_when ends it."""
     now = time.time() if now is None else now
     outcome = str(a.get("outcome") or "")
     if outcome not in OUTCOMES:
@@ -485,6 +504,10 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None) -> 
     key = _item_key(a)
     if key.startswith("task:") and not db.task(int(key[5:])):
         raise ValueError(f"no task #{key[5:]}")
+    if outcome == "unblocked" and key.startswith("task:") and (held := still_deferred(db, int(key[5:]), now, where)):
+        raise ValueError(f"#{key[5:]} is still deferred ({held}): `unblocked` keeps that deferral, so it would "
+                         f"not start. Record still_blocked with its start as the next check, or clear the deferral "
+                         f"first in this turn (task_update start_after \"now\", start_when \"\")")
     if key.startswith("promise:"):
         o = obligations.get(db, key[8:])
         if not o or not o.get("promise"):

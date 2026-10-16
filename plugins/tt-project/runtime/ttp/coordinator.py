@@ -2017,7 +2017,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if scr.hold_cap_note(m, a.get("escalate_after_h")):
                     notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
             elif t == "sweep":
-                sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)))
+                sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
             elif t in ("noop", "escalate", None):
                 pass   # an escalation is the daemon's (Daemon._finish_coordinator); here it changes nothing
             else:

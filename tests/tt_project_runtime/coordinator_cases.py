@@ -10452,6 +10452,39 @@ def test_sweep_action_records_one_validated_outcome_per_item(env):
 
 
 
+def test_sweep_unblocked_keeps_a_pending_deferral_unless_the_turn_clears_it(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    from ttp.db import deferral
+    db, now = p.db, time.time()
+    later = db.add_task("planned", labels=[f"start_after:{now + 8 * 3600}", f"deferred_since:{now - 600}"])
+    db.update_task(later, not_before=now + 8 * 3600)
+    gated = db.add_task("gated", labels=[f"start_after:{now - 600}", "start_when:test -e out/ready"])
+    db.update_task(gated, not_before=now - 600)
+    held = db.add_task("held", labels=[f"start_after:{now + 3600}"])
+    db.update_task(held, status="blocked", blocked_reason="x", not_before=now + 3600)
+    db.set_kv(sweep.STATE_KEY, {"n": 1, "items": {f"task:{gated}": {"status": "queued"},
+                                                  f"task:{held}": {"status": "blocked"}}})
+    probs = coord.apply(p, [{"type": "sweep", "id": later, "outcome": "unblocked"},
+                            {"type": "sweep", "id": gated, "outcome": "unblocked"}])
+    assert len(probs) == 2 and "still deferred (start_after" in probs[0] and "start_when `test -e out/ready`" in probs[1]
+    assert db.kv(sweep.OUTCOMES_KEY) is None
+    assert deferral(db.task(later))["after"] == now + 8 * 3600 and db.task(later)["not_before"] == now + 8 * 3600
+    assert deferral(db.task(gated))["when"] == "test -e out/ready"
+    # A requeue from blocked keeps the planned start; clearing the deferral first makes `unblocked` hold.
+    assert coord.apply(p, [{"type": "task_update", "id": held, "status": "queued"},
+                           {"type": "sweep", "id": held, "outcome": "unblocked"},
+                           {"type": "task_update", "id": gated, "start_after": "now", "start_when": ""},
+                           {"type": "sweep", "id": gated, "outcome": "unblocked"},
+                           {"type": "sweep", "id": later, "outcome": "still_blocked",
+                            "until": "its planned start time arrives", "start_after": "9h"}]) == []
+    t = db.task(held)
+    assert t["status"] == "queued" and t["not_before"] == now + 3600 and deferral(t)["after"] == now + 3600
+    assert deferral(db.task(gated)) == {} and not db.task(gated)["not_before"]
+    assert {k: v["outcome"] for k, v in db.kv(sweep.OUTCOMES_KEY).items()} == {
+        f"task:{held}": "unblocked", f"task:{gated}": "unblocked", f"task:{later}": "still_blocked"}
+
+
 def test_blocker_sweep_carries_and_flags_items_left_without_an_outcome(env):
     p = make(env)
     from ttp import coordinator as coord, sweep
