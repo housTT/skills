@@ -255,36 +255,79 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     return [head], f"its branch {branch}"
 
 
-def record_superseded(p, tid: int, sha: str) -> str:
-    """Record that done task `tid`'s work landed on the push branch as `sha` (re-landed under another
-    commit, e.g. after a push conflict), so the local-only check stops flagging its branch at the
-    head it has now. Refused unless the task is done and `sha` is on the push branch, came after the
-    branch left it (not the branch's base or an older commit) and changes a file the branch changes;
-    ValueError says why."""
+def _task_repos(p, tid: int) -> list[Path]:
+    """The repositories other than the project root's that task `tid` worked in, newest run first:
+    each run's recorded working directory (run.json cwd), or the nearest folder above it once that
+    worktree is gone. One that shares the project root's git directory is left out (it is the root)."""
+    def common(path: Path) -> str:
+        out = _git(path, "rev-parse", "--git-common-dir")
+        return str((path / out.stdout.strip()).resolve()) if out.returncode == 0 and out.stdout.strip() else ""
+    seen, out = {common(p.root)} - {""}, []
+    for r in p.db.q("SELECT id, dir FROM runs WHERE task=? ORDER BY id DESC", (tid,)):
+        try:
+            cwd = json.loads(((Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])) / "run.json").read_text())["cwd"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        path = Path(str(cwd or "")).expanduser()
+        if not path.is_absolute():
+            continue
+        while not path.is_dir() and path != path.parent:
+            path = path.parent
+        key = common(path)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
+    """Record that done task `tid`'s work landed as `sha` (re-landed under another commit, e.g. after
+    a push conflict), so the local-only check stops flagging its branch at the head it has now. The
+    branch and `sha` are read in the repository the task worked in (its runs' working directories),
+    else the project root. Refused unless the task is done and `sha` is on `ref` (default: the push
+    branch in the project root; any other ref of a second repository), came after the branch left it
+    (not the branch's base or an older commit) and changes a file the branch changes; ValueError says
+    why."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
     if task.get("status") != "done":
         raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not done")
     branch = task.get("branch") or ""
-    head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
-    if not head:
-        raise ValueError(f"task #{tid} has no branch here to record")
-    full = _commit(p.root, sha)
+    if not branch:
+        raise ValueError(f"task #{tid} has no branch to record")
+    checked = []
+    for repo in [*_task_repos(p, tid), p.root]:
+        head = _commit(repo, f"refs/heads/{branch}")
+        if head:
+            break
+        checked.append(str(repo))
+    else:
+        raise ValueError(f"task #{tid} has no branch {branch} to record (checked {', '.join(checked)})")
+    full = _commit(repo, sha)
     if not full:
-        raise ValueError(f"no commit {sha} in {p.root}")
-    rc, words = check(p, p.root, full)
-    if rc != 0:
-        raise ValueError(f"not recorded: {words}")
-    if _git(p.root, "merge-base", "--is-ancestor", full, head).returncode == 0:
+        raise ValueError(f"no commit {sha} in {repo}, the repository with branch {branch}")
+    if repo == p.root or ref:
+        onto = ref or _push_ref(p, repo)
+        rc, words = check(p, repo, full, onto=onto)
+        if rc != 0:
+            raise ValueError(f"not recorded: {words} in {repo}")
+        tip = _tip(repo, onto, False)[0]
+    else:
+        holders = [h for h in _git(repo, "for-each-ref", "--contains", full, "--format=%(refname:short)",
+                                   "refs/heads", "refs/remotes").stdout.split() if h != branch]
+        if not holders:
+            raise ValueError(f"not recorded: {full[:10]} is on no branch of {repo} but {branch}; "
+                             "name the ref that holds it with --ref")
+        tip, words = full, f"{full[:10]} is on {holders[0]} in {repo}"
+    if _git(repo, "merge-base", "--is-ancestor", full, head).returncode == 0:
         raise ValueError(f"not recorded: {full[:10]} is already in branch {branch}, so it predates the work")
-    tip = _tip(p.root, _push_ref(p, p.root), False)[0]
-    base = _git(p.root, "merge-base", head, tip).stdout.strip() if tip else ""
+    base = _git(repo, "merge-base", head, tip).stdout.strip() if tip else ""
     if not base:
-        raise ValueError(f"not recorded: branch {branch} shares no history with the push branch")
-    theirs = set(_git(p.root, "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", "-m",
+        raise ValueError(f"not recorded: branch {branch} shares no history with {ref or 'the push branch'}")
+    theirs = set(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", "-m",
                       "--first-parent", "-z", full).stdout.split("\0")) - {""}
-    mine = set(_git(p.root, "diff", "--name-only", "--no-renames", "-z", base, head).stdout.split("\0")) - {""}
+    mine = set(_git(repo, "diff", "--name-only", "--no-renames", "-z", base, head).stdout.split("\0")) - {""}
     if not theirs & mine:
         raise ValueError(f"not recorded: {full[:10]} changes none of the files branch {branch} changes")
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",

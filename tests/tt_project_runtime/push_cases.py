@@ -184,6 +184,78 @@ def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, mon
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "the undelivered work stays flagged"
 
 
+def _run_in(p, tid, cwd):
+    """A finished run of task `tid` whose run.json records `cwd` as its working directory."""
+    rid = p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,?,?,?,?)",
+                 (tid, "worker", "done", time.time(), time.time()))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd)}))
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+
+
+def test_superseded_reads_a_task_branch_in_the_second_repository_it_worked_in(env, monkeypatch, tmp_path, capsys):
+    """A task that worked in another repository's worktree (<repo>/wt/t<id>) and delivered to that
+    repo's PR head branch has no branch in the project root: the record reads its branch and commit
+    in the repository its runs worked in, accepts a commit another branch there (or --ref) holds,
+    and names the repository when the commit is missing. A task of the project root's own repo keeps
+    the push-branch rule even with its worktree recorded."""
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _run_in(p, tid, path)   # the root's own worktree: not a second repository
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    _commit(path, "more.txt", "a\nb\n")
+    mine = _git_out(path, "rev-parse", "HEAD")
+    assert ttp_task("superseded", str(tid), mine) not in (0, None), "the push-branch rule still holds"
+    assert "is not on" in capsys.readouterr().err
+
+    origin2, second = tmp_path / "second.git", tmp_path / "second"
+    _git_out(tmp_path, "init", "-q", "--bare", str(origin2))
+    _git_out(tmp_path, "init", "-q", "-b", "main", str(second))
+    _commit(second, "lib.txt", "one\n")
+    _git_out(second, "remote", "add", "origin", str(origin2))
+    _git_out(second, "push", "-q", "origin", "main")
+    tid2 = p.db.add_task("work in the second repo", "s", kind="code", tier="light", origin="user")
+    wt = second / "wt" / f"t{tid2}"
+    _git_out(second, "worktree", "add", "-q", "-b", "feat-x", str(wt), "main")
+    _commit(wt, "lib.txt", "one\ntwo\n")
+    p.db.update_task(tid2, status="done", branch="feat-x")
+    _run_in(p, tid2, wt)
+    _git_out(second, "checkout", "-q", "-b", "pr-head", "main")
+    _commit(second, "lib.txt", "one\ntwo, settled\n")
+    relanded = _git_out(second, "rev-parse", "HEAD")
+    _git_out(second, "push", "-q", "origin", "pr-head")
+    _git_out(second, "checkout", "-q", "main")
+    _git_out(second, "branch", "-q", "-D", "pr-head")   # only the remote ref holds it now
+
+    assert ttp_task("superseded", str(tid2), "deadbeef" * 5) not in (0, None)
+    err = capsys.readouterr().err
+    assert f"no commit {'deadbeef' * 5} in {wt}" in err and "feat-x" in err
+    with pytest.raises(ValueError, match="not on origin/main"):
+        landed.record_superseded(p, tid2, relanded, ref="origin/main")
+    assert p.db.q("SELECT * FROM task_superseded WHERE task=?", (tid2,)) == []
+    assert ttp_task("superseded", str(tid2), relanded[:12]) == 0
+    out = capsys.readouterr().out
+    assert f"recorded as superseded by {relanded[:10]}" in out and "origin/pr-head" in out
+    feat = _git_out(wt, "rev-parse", "HEAD")
+    assert landed.superseded(p.db, [tid2]) == {tid2: [(feat, relanded)]}
+
+    # Once the worktree is gone, the folder above it still names the repository.
+    _git_out(second, "worktree", "remove", "--force", str(wt))
+    p.db.x("DELETE FROM task_superseded WHERE task=?", (tid2,))
+    assert landed.record_superseded(p, tid2, relanded, ref="origin/pr-head")
+    # A branch in no repository the task worked in: the error lists each one checked.
+    p.db.update_task(tid2, branch="gone-branch")
+    with pytest.raises(ValueError, match=f"no branch gone-branch to record \\(checked {second}/wt, {repo}\\)"):
+        landed.record_superseded(p, tid2, relanded)
+
+
 def test_a_task_whose_change_landed_under_another_commit_gets_no_review_or_fix(env, monkeypatch):
     """Replay of a duplicate: a code task's one commit (its change plus a version bump and changeset)
     sits in review while a fix chain of another task rebased the change and the push queue landed it
