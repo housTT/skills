@@ -368,6 +368,45 @@ def test_heal_fix_that_fails_or_does_not_help_queues_the_task(env):
     assert "it has no fix" in heal.run(d, "svc", dict(spec, fix=None), now)[0]
 
 
+def test_heal_suppress_exit_0_skips_the_fix_and_escalation_until_it_says_no(env):
+    """A deliberate shutdown: `suppress` exits 0, so nothing is fixed or escalated and the log says so;
+    once it exits 1 the still-open episode heals normally."""
+    from ttp import heal
+    down = env["repo"] / "planned-down"
+    down.touch()
+    p, d, up = _heal_setup(env, suppress=f"test -e {down}", max_fixes=0)
+    spec, now = _heal_spec(p), time.time()
+    for t in (now, now + 600):
+        assert heal.run(d, "svc", spec, t) == ("unhealthy (suppressed: deliberately down)", None)
+    assert not up.exists() and not heal.state(p.db, "svc").get("fixes")
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")   # max_fixes 0 would escalate at once
+    assert "svc: suppressed: deliberately down" in (p.logs / "daemon.log").read_text()
+    down.unlink()
+    p2, d2, up2 = _heal_setup(env, suppress=f"test -e {down}")
+    assert heal.run(d2, "svc", _heal_spec(p2), now)[0] == "unhealthy (fixed; rechecking)"
+    assert up2.exists() and "probe broken" not in (p2.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("probe", ["exit 7", "no-such-suppress-probe-xyz", "sleep 5"])
+def test_heal_broken_or_hung_suppress_heals_normally_and_is_logged(env, monkeypatch, probe):
+    from ttp import heal
+    monkeypatch.setattr(heal, "SUPPRESS_S", 1)
+    p, d, up = _heal_setup(env, suppress=probe)
+    assert heal.run(d, "svc", _heal_spec(p), time.time())[0] == "unhealthy (fixed; rechecking)"
+    assert up.exists()
+    log = (p.logs / "daemon.log").read_text()
+    assert "svc: suppress probe broken (exit " in log and "healing normally" in log, log
+    assert "timed out" in log if probe.startswith("sleep") else True
+
+
+def test_heal_suppress_is_validated_text_and_in_the_coordinator_schema(env):
+    from ttp import coordinator, heal
+    with pytest.raises(ValueError, match="suppress"):
+        heal.validate({"check": "false", "suppress": 1})
+    assert heal.validate({"check": "false", "suppress": "true"})["suppress"] == "true"
+    assert coordinator.HEAL_SCHEMA["properties"]["suppress"] == {"type": "string"}
+
+
 def test_heal_restart_mid_fix_counts_the_fix_and_rechecks(env):
     from ttp import heal
     p, d, up = _heal_setup(env, max_fixes=1)

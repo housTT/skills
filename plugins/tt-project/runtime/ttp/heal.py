@@ -4,7 +4,7 @@
 
 A command schedule may carry a `heal` block in its payload (harness/schedules.json or schedule_set):
 
-    "heal": {"check": "<probe>", "fix": "<safe command>", "resource": "<lock>", "grace_s": 300,
+    "heal": {"check": "<probe>", "fix": "<safe command>", "suppress": "<probe>", "resource": "<lock>", "grace_s": 300,
              "settle_s": 60, "max_fixes": 3, "window_h": 1, "timeout_s": 120, "unknown_cap_s": 3600}
 
 `check` exits 0 healthy, 1 unhealthy, 75 or 255 unknown (the codes of start_when); any other exit,
@@ -24,6 +24,11 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   any other one high coordinator observation (`heal:<name>:paused:<since>`); never a lift of the pause;
   a fix that itself exits 75 counts like any other) and the check runs again `settle_s` later. Healthy then: one low feed line and a digest
   record ("fixed X, n today"), no coordinator wake.
+- deliberately down: a block with `suppress` (a read-only probe) runs it first, before the fix, the
+  cap or the escalation below, for at most SUPPRESS_S. Exit 0 says the resource is down on purpose
+  (a planned shutdown): nothing is fixed or escalated and the daemon log says "suppressed: deliberately
+  down"; the episode stays open, so once the probe exits non-zero the fix runs on the next run. Exit 1
+  heals normally; any other exit or a timeout (a broken probe) heals normally too and is logged.
 - the fix failed, did not help, `max_fixes` per `window_h` is used up, or there is no fix: one
   priority-1 self-fix task is queued (label `heal:<name>`, so one is open per check), carrying the
   check's and the fix's output. Only once that task fails, blocks, or ends while the check still
@@ -175,6 +180,7 @@ OUTAGE_S = 3600                 # a whole box or resource serving nothing this l
 PAUSED_QUIET_S = 21600          # heal.paused_quiet_s default: an outage under a pause it is not known by
 KNOWN_FAULT_S = 7 * 86400       # a known fault's longest life: `until` at most this far ahead, else this long
 LOCK_WAIT_S = 30                # how long a fix waits for its resource lock before it is deferred
+SUPPRESS_S = 30                 # a `suppress` probe's longest run (or timeout_s, if shorter); then it heals
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
 FINDING = "ttp-heal: not-outage"   # a check output line: unhealthy, but the box is up (module doc)
@@ -202,7 +208,7 @@ OPEN = ("queued", "running", "waiting", "needs_review")
 _TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}
 KNOWN_FAULT_KEYS = ("why", "match", "until")   # known_fault as an object (module doc)
 COMMON_FIELDS: dict[str, dict] = {
-    **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate",
+    **dict.fromkeys(("check", "fix", "suppress", "resource", "machine", "condition", "preset", "escalate",
                      "ping_host", "ping_peer", "to", "self_fix_note"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
@@ -242,7 +248,7 @@ def validate(block: Any, where: str = "heal") -> dict:
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
     out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
-    for k in ("check", "fix", "resource", "machine", "self_fix_note"):
+    for k in ("check", "fix", "suppress", "resource", "machine", "self_fix_note"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
     if out.get("self_fix_note") is not None:
@@ -569,6 +575,19 @@ def box_silent(spec: dict, cwd: str) -> str:
     if not (box and peer) or _pings(box, cwd) is not False or _pings(peer, cwd) is not True:
         return ""
     return f"{box} does not answer ping while {peer} does: it is off or rebooting"
+
+
+def suppressed(host: Any, name: str, spec: dict, cwd: str, env: dict) -> bool:
+    """Whether the block's `suppress` probe says the resource is down on purpose (exit 0; module doc).
+    Exit 1 says no; any other exit or a timeout is a broken probe: logged, and it heals normally."""
+    rc, out = _exec(spec["suppress"], cwd, min(spec["timeout_s"], SUPPRESS_S), env)
+    if rc == 0:
+        _log(host, f"heal check {name}: suppressed: deliberately down")
+        return True
+    if rc != 1:
+        tail = out.strip().splitlines()[-1][:200] if out.strip() else ""
+        _log(host, f"heal check {name}: suppress probe broken (exit {rc}{': ' + tail if tail else ''}); healing normally")
+    return False
 
 
 def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
@@ -911,6 +930,9 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if down < grace:
         _save(db, name, st)
         return f"unhealthy ({down:.0f} s, grace {grace:.0f} s)", float(since) + grace
+    if spec.get("suppress") and suppressed(host, name, spec, cwd, env):
+        _save(db, name, st)
+        return "unhealthy (suppressed: deliberately down)", None
     if not spec.get("fix"):
         return _escalate(host, name, spec, st, now, "it has no fix")
     window = spec["window_h"] * 3600
