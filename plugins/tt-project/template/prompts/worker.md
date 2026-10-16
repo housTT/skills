@@ -247,6 +247,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
+- Write large results incrementally: append and flush as you go, and flush before any step that may reset the host.
+- A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch, with its sha256 in the notes. Edit shared scripts via a temporary file plus `mv`, never in place; concurrent edits go under `ttp lock <name>` or git.
+- A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or the harness says you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left). A review does not split this way: it finishes its verdict.
