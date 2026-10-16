@@ -3320,7 +3320,7 @@ def install_env(tmp_path):
     home, tools, tmp = tmp_path / "home", tmp_path / "bin", tmp_path / "tmp"
     for d in (home, tools, tmp):
         d.mkdir()
-    for tool in ("git", "python3", "sh", "bash", "dash", "mktemp", "rm", "cp", "mv", "mkdir", "sed", "head",
+    for tool in ("git", "python3", "sh", "bash", "dash", "zsh", "mktemp", "rm", "cp", "mv", "mkdir", "sed", "head",
                  "dirname", "cat"):
         found = shutil.which(tool)
         if found:
@@ -3377,15 +3377,21 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
         assert raw not in line, raw
     readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
-    assert "Release tags are fixed and never moved; a later release gets a new tag name" in readme
+    readme = " ".join(readme.split())
+    assert "Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now" in readme
+    assert "a release tag the publisher moves forward as a release channel gives the latest release" in readme
     assert os.access(PLUGIN / "install.sh", os.X_OK)
 
 
-@pytest.mark.parametrize("shell", ["bash", "dash"])
-def test_one_line_install_installs_for_every_host_present(install_env, shell):
+def _need_shell(shell: str) -> None:
     import shutil
     if not shutil.which(shell):
-        pytest.skip(f"no {shell}")
+        pytest.skip(f"{shell} is not installed on this machine, so the one-line install was not run under it")
+
+
+@pytest.mark.parametrize("shell", ["bash", "dash", "zsh"])   # zsh: the macOS default login shell
+def test_one_line_install_installs_for_every_host_present(install_env, shell):
+    _need_shell(shell)
     r = install_env(shell=shell)
     assert r.returncode == 0, r.stdout + r.stderr
     home, dest = install_env.home, install_env.home / ".local/share/tt-project/skills"
@@ -3453,6 +3459,36 @@ def test_one_line_install_reruns_update_the_clone_in_place_without_duplicates(in
     assert pinned.returncode == 0, pinned.stderr
     assert _clone_head(home) == _head(repo, "v1") != _head(repo)
     assert "(v1)" in pinned.stdout
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_one_line_install_rerun_with_the_same_ref_follows_a_moved_tag_or_an_advanced_branch(install_env, shell):
+    """A publisher may keep one tag as a moving release channel: rerunning the line with that tag
+    installs the commit the tag points at now, on every host, not the one installed before."""
+    _need_shell(shell)
+    home, repo = install_env.home, install_env.repo
+    first = install_env(ref="v1", shell=shell)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert _clone_head(home) == _head(repo, "v1")
+    _bump(repo, "1.0.1")
+    _git(repo, "tag", "-f", "v1")    # the tag moves forward to the new release
+    second = install_env(ref="v1", shell=shell)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert second.stderr == "" and "1.0.1 (v1)" in second.stdout
+    assert _clone_head(home) == _head(repo, "v1") == _head(repo)
+    dest = str(home / ".local/share/tt-project/skills")
+    assert (home / "claude-market").read_text().splitlines() == [dest]    # Claude Code loads the clone in place
+    assert "claude plugin update tt-project@tenstorrent-skills" in _calls(home)
+    assert json.loads((home / "codex-cache/.claude-plugin/plugin.json").read_text())["version"] == "1.0.1"
+    cursor = home / ".cursor/plugins/local/tt-project/.claude-plugin/plugin.json"
+    assert json.loads(cursor.read_text())["version"] == "1.0.1"
+    # a branch ref that advanced, rerun the same way
+    _bump(repo, "1.0.2")
+    third = install_env(ref="main", shell=shell)
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert _clone_head(home) == _head(repo, "main") != _head(repo, "v1")
+    assert json.loads(cursor.read_text())["version"] == "1.0.2"
+    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
 
 
 def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_env):

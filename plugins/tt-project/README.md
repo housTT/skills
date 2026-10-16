@@ -41,8 +41,9 @@ plugin into Cursor's local plugin folder and ends with `ttp setup`. Rerun the li
 another tag to switch: it updates that clone and the same entries in place. A ref without the
 installer fails with a message to set `TT_PROJECT_REF` to a release tag.
 
-Release tags are fixed and never moved; a later release gets a new tag name, so a reader pinned to a
-tag stays on exactly that release.
+Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now: a branch
+gives its latest commit, and a release tag the publisher moves forward as a release channel gives the
+latest release. A tag that is never moved keeps you on exactly that release.
 
 When it ends, the installer says how to load the plugin, only for the tools it installed for:
 
