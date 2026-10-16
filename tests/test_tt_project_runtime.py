@@ -26486,6 +26486,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
     assert len(rules["code"]) <= 13_500, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
+    # A question task cannot detach, so it skips the rule for long-running scripts in shared folders.
+    assert "private snapshot taken at launch" in rules["code"]
+    assert "private snapshot taken at launch" not in rules["question"]
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
     assert len(every) <= 18_000, len(every)
     for t in (None, code, question):

@@ -262,7 +262,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - A watcher thread: reentrant lock, bounded acquires recording a stage_timeout, a stall guard that dumps all thread stacks and exits non-zero.
 <!-- /ttp:if wait -->
 - Write large results incrementally, flushing as you go and before any step that may reset the host.
+<!-- ttp:if wait -->
 - A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot every executable it launches too; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temp file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
+<!-- /ttp:if wait -->
 - A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or the harness says you passed the split line, finish the step, commit and hand off `done` with a
