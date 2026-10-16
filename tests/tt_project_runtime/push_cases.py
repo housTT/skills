@@ -5588,10 +5588,8 @@ def test_run_notes_memory_ends_sweep_spend_and_deploy_times_use_the_home_zone_on
     now = time.time()
     tid = p.db.add_task("later", "spec", kind="work", not_before=now + 3600)
     p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(coord.defer_labels(now + 3600, None)), tid))
-    for where in (p, p.config()):
-        [item] = [i for i in sweep.items(p.db, now, where) if i["task"] == tid]
-        assert item["reason"].startswith("starts after ") and pac.search(item["reason"]), item
-        assert " UTC" not in item["reason"]
+    for where in (p, p.config()):   # a planned deferral (start_after ahead) is no sweep item
+        assert [i for i in sweep.items(p.db, now, where) if i["task"] == tid] == []
     assert "sweep.review_lines(db, where=self.p)" in (RUNTIME / "ttp" / "daemon.py").read_text()
     # A coordinator update in a run's steer.md (which workers quote) is stamped in the home zone.
     rd = p.runs / "9999"

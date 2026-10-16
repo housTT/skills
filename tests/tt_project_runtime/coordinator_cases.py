@@ -10297,9 +10297,9 @@ def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_c
     _sweep_ev(db, review, "task_review", "x", now - 8 * 3600)
     held = db.add_task("held on a setting")
     db.update_task(held, status="blocked", blocked_reason=f"{settinghold.NOTE}{next(iter(settinghold.SETTINGS))} is off")
-    deferred = db.add_task("deferred", labels=[f"start_after:{now + 3600}", f"deferred_since:{now - 600}",
-                                                          "start_why:after the window"])
-    db.update_task(deferred, not_before=now + 3600)
+    deferred = db.add_task("deferred", labels=[f"start_after:{now - 600}", f"deferred_since:{now - 7200}",
+                                                          "start_when:test -e out/ready", "start_why:after the window"])
+    db.update_task(deferred, not_before=now - 600)
     db.add_task("ready to run")                                      # queued and not deferred: not stuck
     db.set_kv("paused_resources", {"rig": {"since": now - 2 * 3600, "by": "coordinator", "reason": "flaky"}})
     kinds = {i["key"]: (i["kind"], round(i["age_s"] / 3600, 1) if i["age_s"] is not None else None)
@@ -10965,35 +10965,27 @@ def test_blocker_sweep_carries_user_pause_holds_without_an_outcome_and_starts_no
 
 
 
-def test_blocker_sweep_carries_a_time_only_deferral_without_an_outcome(env):
-    """A queued task held only by `start_after` ends on its own: carried and listed as DEFERRED, never
-    a reason for a sweep, a due-check signal or a loop. A deferral on a probe still needs an outcome."""
+def test_blocker_sweep_leaves_out_planned_deferrals(env):
+    """A queued task whose `start_after` is ahead is planned, not stuck: no item, no sweep, one count line.
+    Past `start_after` with a probe it counts from start_after; a probe-only deferral counts as before."""
     p = make(env)
-    from ttp import coordinator as coord, sweep
+    from ttp import sweep
     db, cfg, now = p.db, p.config(), time.time()
     later = db.add_task("after the window", labels=[f"start_after:{now + 86400}", f"deferred_since:{now - 600}",
                                                     "start_why:after the window"])
     db.update_task(later, not_before=now + 86400)
-    [item] = sweep.items(db, now, cfg)
-    assert (item["kind"], item["ends"]) == ("deferred", "time")
-    assert sweep.due(db, cfg, now) is None, "only a time deferral: no sweep turn"
-    # A still_blocked recorded on it earlier whose next check passed is no signal.
-    db.set_kv(sweep.OUTCOMES_KEY, {f"task:{later}": {"outcome": "still_blocked", "ts": now - 7200,
-                                                      "probe": "true", "next": now - 60}})
-    db.set_kv(sweep.STATE_KEY, {"last": now - 3600})
-    assert sweep.due(db, cfg, now) is None
-    probed = db.add_task("after the build", labels=["start_when:test -e out/build-done",
-                                                    f"deferred_since:{now - 600}"])
-    kinds = {i["key"]: i["ends"] for i in sweep.items(db, now, cfg)}
-    assert kinds == {f"task:{later}": "time", f"task:{probed}": None}
-    assert sweep.due(db, cfg, now + 7 * 3600) == "every 6h"
-    eid = sweep.start(db, cfg, "every 6h", now + 7 * 3600)
-    assert db.kv(sweep.STATE_KEY)["carried"] == [f"task:{later}"]
-    text = coord.digest(p, {}, [eid], [])
-    assert next(ln for ln in text.splitlines() if ln.startswith(f"- #{later} ")).startswith(
-        f"- #{later} after the window | DEFERRED (no action): after the window")
-    assert "no action" not in next(ln for ln in text.splitlines() if ln.startswith(f"- #{probed} "))
-
+    assert sweep.items(db, now, cfg) == []
+    assert sweep.planned_deferrals(db, now) == 1
+    assert sweep.due(db, cfg, now + 7 * 3600) is None
+    assert sweep.review_lines(db, now, where=p) == ["nothing stuck longer than 6h", "planned deferrals: 1"]
+    # Past start_after, still on a probe: aged from start_after, not from deferred_since.
+    both = db.add_task("past", labels=[f"start_after:{now - 3600}", f"deferred_since:{now - 90000}",
+                                       "start_when:test -e out/done"])
+    probe_only = db.add_task("probe only", labels=["start_when:test -e out/done", f"deferred_since:{now - 7200}"])
+    by = {i["task"]: i for i in sweep.items(db, now, cfg)}
+    assert set(by) == {both, probe_only}
+    assert 3500 < by[both]["age_s"] < 3700 and 7100 < by[probe_only]["age_s"] < 7300
+    assert sweep.planned_deferrals(db, now) == 1
 
 
 def test_blocker_sweep_carries_a_user_set_resource_pause_and_still_sweeps_a_coordinator_pause(env):

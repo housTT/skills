@@ -108,6 +108,12 @@ def _moved_at(db: DB, tid: int) -> float:
     return max(float((ev or {}).get("ts") or 0), float((run or {}).get("ts") or 0))
 
 
+def planned_deferrals(db: DB, now: float | None = None) -> int:
+    """Queued tasks deliberately deferred, their start_after still ahead: not stuck, so left out of items()."""
+    now = time.time() if now is None else now
+    return sum(1 for t in db.q("SELECT * FROM tasks WHERE status='queued'") if float(deferral(t).get("after") or 0) > now)
+
+
 def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
     unknown), since, reason, status, spec_sha, ends}. Kinds: blocked, setting-held, waiting (not a self-wait),
@@ -127,7 +133,9 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
             d = deferral(t)
             if not d or (not d.get("when") and float(t["not_before"] or 0) <= now):
                 continue
-            kind, start = "deferred", d.get("since")
+            if float(d.get("after") or 0) > now:   # a planned deferral, not stuck yet (planned_deferrals())
+                continue
+            kind, start = "deferred", d.get("after") or d.get("since")
             reason = _clip(d.get("why") or d.get("when") or "") or (
                 f"starts after {timefmt.long(float(t['not_before']), where)}"
                 if t["not_before"] else "")
@@ -596,6 +604,8 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
             path = credits.unblock_path(db, cfg or {}, prov, now)
             out.append(f"- provider {prov} held (no sweep action; {_clip('; '.join(g.get('reasons') or []), 160)}) | "
                        f"unblock path: {path or 'none reported (no free resets or paid credits)'}")
+    if n := planned_deferrals(db, now):
+        out.append(f"planned deferrals: {n}")
     return out
 
 
@@ -607,8 +617,10 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
     state = db.kv(STATE_KEY, {}) or {}
     loops = state.get("loops") or {}
     rows = [i for i in items(db, now, where) if i["age_s"] is not None and i["age_s"] >= hours * 3600]
+    plan = planned_deferrals(db, now)
+    tail = [f"planned deferrals: {plan}"] if plan else []
     if not rows:
-        return [f"nothing stuck longer than {hours:g}h"]
+        return [f"nothing stuck longer than {hours:g}h", *tail]
     out = []
     for i in sorted(rows, key=lambda x: -x["age_s"]):
         who = _who(i, 60)
@@ -617,4 +629,4 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
                    + (f"{o['outcome']} {_dur(now - float(o['ts']))} ago" if o
                       else f"none needed (ends by {i['ends']})" if i.get("ends") else "no outcome yet")
                    + (" (LOOP)" if i["key"] in loops else ""))
-    return out
+    return out + tail

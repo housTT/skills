@@ -41640,8 +41640,7 @@ def test_a_start_after_deferral_after_a_user_marker_wait_is_time_deferred(env):
     db.update_task(t, not_before=now + 3600, result=json.dumps(
         {"status": "waiting", "summary": "paused", "retry_when": "test -e state/user-go || exit 1"}))
     assert userpause.probe_of(db.task(t), cfg) is None
-    [item] = sweep.items(db, now, cfg)
-    assert (item["kind"], item["ends"]) == ("deferred", "time")
+    assert sweep.items(db, now, cfg) == [] and sweep.planned_deferrals(db, now) == 1   # planned, not stuck
     # Once the window has passed, a queued task after that waiting hand-off is still a user pause.
     db.update_task(t, labels=[], not_before=0)
     assert userpause.probe_of(db.task(t), cfg) == "test -e state/user-go || exit 1"
