@@ -735,7 +735,8 @@ def remove(p: Project, task_id: int, force: bool = False) -> None:
     Ignored files go with it (sweep archives hand-off artifacts first). No --force: git itself then
     refuses a worktree with changes or with submodules, whose commits may live only in the worktree's
     own git directory. `force` only once its tracked changes are in a verified archived patch."""
-    remove_path(p.root, p.worktrees / f"t{task_id}", force)
+    path = p.worktrees / f"t{task_id}"
+    remove_path(_repo_of(path) or p.root, path, force)   # a PR fix's may be a worktree of another clone (ensure_in)
 
 
 def remove_path(repo: Path, path: Path, force: bool = False) -> None:
@@ -762,6 +763,95 @@ def _repo_of(path: Path) -> Path | None:
     except OSError:
         common = gd.parent.parent.resolve()
     return common.parent if common.name == ".git" else None
+
+
+def _origin_slug(repo: Path) -> str:
+    """"owner/repo" (lower case) of `repo`'s origin URL, or "" when it has none."""
+    try:
+        url = _git(repo, "config", "--get", "remote.origin.url", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r"[/:]([^/:]+)/([^/]+?)(?:\.git)?/*$", url)
+    return f"{m.group(1)}/{m.group(2)}".lower() if m else ""
+
+
+def pr_clone(p: Project, key: str) -> Path | None:
+    """A local clone of the repository of PR `key` ("owner/repo#N") when that is not the project
+    root's own repository (a root that is no git repository, or a clone of another one): a clone
+    directly in the root, or the repository of a linked worktree one folder below the root or in the
+    project's worktrees folder (one a task made by hand). None when the root is that repository or
+    no clone of it is found."""
+    want = (key or "").partition("#")[0].lower()
+    root = p.root.resolve()
+    if not want or (is_git(root) and _origin_slug(root) == want):
+        return None
+    base, dirs = p.base.resolve(), []
+    for top in (root, p.worktrees):
+        try:
+            dirs += sorted(Path(d.path) for d in os.scandir(top) if d.is_dir(follow_symlinks=False)
+                           and Path(d.path).resolve() != base)
+        except OSError:
+            pass
+    for d in [d for d in dirs if d.parent == root and not (d / ".git").exists()]:
+        try:
+            dirs += sorted(Path(k.path) for k in os.scandir(d) if k.is_dir(follow_symlinks=False))
+        except OSError:
+            pass
+    seen = set()
+    for d in dirs:
+        git = d / ".git"
+        repo = d if git.is_dir() else _repo_of(d) if git.is_file() else None
+        if repo and repo.resolve() not in seen:
+            seen.add(repo.resolve())
+            if _origin_slug(repo) == want:
+                return repo.resolve()
+    return None
+
+
+def pr_repo(p: Project, task: dict) -> Path | None:
+    """pr_clone for the PR a PR-fix task fixes (its `pr_fix:<owner/repo>#<n>` label), or None."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return None
+    key = next((lb[7:] for lb in labels if isinstance(lb, str) and lb.startswith("pr_fix:")), "")
+    return pr_clone(p, key) if key else None
+
+
+def ensure_in(p: Project, task: dict, repo: Path) -> tuple[Path, str]:
+    """ensure() for a task whose PR is in another repository than the project root's (pr_repo): its
+    worktree at worktrees/t<id> is a linked worktree of `repo`, reused as it is by a retry. A new one
+    checks out the task's stored branch, else its carried branch (the PR's) when no other worktree of
+    `repo` holds it, else a branch of its own from that branch's head (the local one first, so a
+    holder's unpushed commits carry over). Raises when neither branch is found."""
+    path, t, env = p.worktrees / f"t{task['id']}", git_timeout(p), checkout_env(p)
+    if path.is_dir() and _repo_of(path) == repo.resolve() and is_git(path):
+        return path, _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+
+    def ref(b: str) -> str:
+        return next((c for c in (b, f"origin/{b}") if b and _git(
+            repo, "rev-parse", "--verify", "--quiet", f"{c}^{{commit}}", check=False, timeout=t)), "")
+    _git(repo, "fetch", "--quiet", "origin", check=False, timeout=t)
+    _git(repo, "worktree", "prune", check=False, timeout=t)
+    held = {r["branch"] for r in _records(p, repo).values() if not r["prunable"]}
+    want = task.get("branch") or carried_branch(task)
+    p.worktrees.mkdir(parents=True, exist_ok=True)
+    if want and want not in held and (start := ref(want)):
+        branch = want
+        if start == want:
+            _git(repo, "worktree", "add", str(path), want, timeout=t, env=env)
+            _git(path, "merge", "--ff-only", "--quiet", f"origin/{want}", check=False, timeout=t, env=env)
+        else:
+            _git(repo, "worktree", "add", "-b", want, str(path), start, timeout=t, env=env)
+    else:
+        if not (start := ref(want)):
+            raise RuntimeError(f"branch {want or '(none)'} not found in {repo}")
+        branch = f"ttp/t{task['id']}-{slug(task['title'])}"
+        exists = _git(repo, "rev-parse", "--verify", "--quiet", branch, check=False, timeout=t)
+        _git(repo, "worktree", "add", *((str(path), branch) if exists else ("-b", branch, str(path), start)),
+             timeout=t, env=env)
+    prepare(p, path, repo)
+    return path, branch
 
 
 def run_worktree_dirs(p: Project) -> list[Path]:

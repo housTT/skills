@@ -8212,7 +8212,7 @@ class Daemon:
         branch = branch or src["branch"] or ""
         try:   # a branch another worktree holds cannot be checked out again: then build on its head
             held = branch and f"branch refs/heads/{branch}" in worktree._git(
-                self.p.root, "worktree", "list", "--porcelain").splitlines()
+                worktree.pr_clone(self.p, key) or self.p.root, "worktree", "list", "--porcelain").splitlines()
         except Exception:
             held = True
         base_title = re.sub(r"^(?:Fix PR findings: )+", "", src["title"])
@@ -8355,6 +8355,10 @@ class Daemon:
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":   # its own worktree of the harness while another works there
             return str(harnesstree.workdir(self.p, task["id"])), None
+        if task["kind"] not in worktree.NEVER_OWN_KINDS and (repo := worktree.pr_repo(self.p, task)):
+            # A PR fix whose PR is in another repository than the root's: a worktree of its clone.
+            path, branch = worktree.ensure_in(self.p, task, repo)
+            return str(path), branch
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):

@@ -4293,6 +4293,67 @@ def test_a_pr_fix_task_publishes_onto_the_prs_branch_whether_it_is_free_or_held(
         push.own_target(p, path)
 
 
+def test_a_pr_fix_task_gets_a_worktree_of_the_prs_clone_when_the_root_is_another_repo(env, monkeypatch):
+    """A PR-fix task whose PR is in another repository than the project root's (here a root that is no
+    git repository) still gets its own worktree, worktrees/t<id>, as a linked worktree of a local
+    clone of the PR's repository found through a worktree a task made by hand below the root or a
+    clone directly in it: on the PR's branch when it is free, else on its own branch from that
+    branch's head. A retry reuses it and the sweep's remove() removes it from that clone. A task
+    with no clone of its PR's repository keeps working in the root."""
+    from ttp import cli, worktree
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    tmp = env["tmp"]
+    root = tmp / "plain"
+    root.mkdir()
+    p = cli.bootstrap(root, "plain", MAKE_BRIEF, "fake")
+    register("plain", {"host": "testhost", "dir": str(root)})
+    assert not worktree.is_git(root)
+    origin, clone = _bare_init(env, tmp / "acme" / "widgets.git"), tmp / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+    _commit(clone, "a.txt", "a\n")
+    _git_out(clone, "push", "-q", "origin", "HEAD:refs/heads/main")
+    url, key = "https://github.com/acme/widgets/pull/7", "acme/widgets#7"
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    pr_branch = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", pr_url=url, branch=pr_branch)
+    # The delivering task's worktree, made by hand below the root, holds the PR's branch.
+    held_wt = root / "wt" / f"t{src}"
+    _git_out(clone, "worktree", "add", "-q", "-b", pr_branch, str(held_wt))
+    _commit(held_wt, "pr.txt", "pr\n")
+    _git_out(held_wt, "push", "-q", "origin", f"HEAD:refs/heads/{pr_branch}")
+    assert worktree.pr_clone(p, key) == clone.resolve()
+    d = Daemon(p.base)
+    rec = {"task": src, "branch": pr_branch, "url": url}
+    fix, made = d.pr_findings_owner(key, rec, "CI failing: tests")
+    assert made and fix["branch"] is None and "checked out elsewhere" in fix["spec"]
+    cwd, branch = d._workdir_for(fix)
+    path = p.worktrees / f"t{fix['id']}"
+    assert cwd == str(path) and branch == f"ttp/t{fix['id']}-fix-pr-findings-speed-up-the-loader"
+    assert worktree._repo_of(path) == clone.resolve()
+    assert _git_out(path, "rev-parse", "HEAD") == _git_out(held_wt, "rev-parse", "HEAD")
+    assert d._workdir_for(dict(fix, branch=branch)) == (cwd, branch)   # a retry reuses it
+    p.db.update_task(fix["id"], status="done", branch=branch)
+    worktree.remove(p, fix["id"])
+    assert not path.exists() and str(path) not in _git_out(clone, "worktree", "list")
+    # Free: the next fix works on the PR's branch itself, found through a clone directly in the root.
+    _git_out(clone, "worktree", "remove", str(held_wt))
+    shutil.move(str(clone), str(root / "widgets"))
+    assert worktree.pr_clone(p, key) == (root / "widgets").resolve()
+    fix, made = d.pr_findings_owner(key, rec, "CI failing: tests")
+    assert made and fix["branch"] == pr_branch and "build on it" in fix["spec"]
+    cwd, branch = d._workdir_for(fix)
+    assert cwd == str(p.worktrees / f"t{fix['id']}") and branch == pr_branch
+    assert _git_out(p.worktrees / f"t{fix['id']}", "rev-parse", "--abbrev-ref", "HEAD") == pr_branch
+    # No clone of the PR's repository: the root, as before.
+    other = p.db.add_task("Fix PR findings: other", "s", kind="code", labels=["pr_fix:acme/gadgets#3"])
+    assert worktree.pr_repo(p, p.db.task(other)) is None
+    assert d._workdir_for(p.db.task(other)) == (str(p.root), None)
+
+
 def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
     """A follow-up (`continues` on a done task) that names a finished task's branch but has no
     `pr_branch:` line carries no branch, so it lands on the push branch with `ttp push`; one with its
