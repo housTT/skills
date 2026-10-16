@@ -474,7 +474,8 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
             problems.append(f"{f} is off")
             off = True
     events = _field(data, spec["recovery_off_field"]) if spec.get("recovery_off_field") else None
-    if events and not (isinstance(events, (int, float)) and not isinstance(events, bool) and events <= 0):
+    if (isinstance(events, list) and events) or events is True or (
+            isinstance(events, (int, float)) and not isinstance(events, bool) and events > 0):
         # The service's own runtime report of a disabled recovery step: it counts whatever the flags say.
         problems.append(f"{spec['recovery_off_field']} reports recovery disabled: {json.dumps(events)[:200]}")
         off = True
@@ -897,6 +898,9 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
     if paused:
+        # Choice: a pause the project set on the check's own resource still quiets a recovery-off result.
+        # The pause is the owner's explicit word and nothing is fixed under it; it is the one exemption
+        # (unlike owner lines, outages and known_fault), and the paused-quiet ask still reaches the coordinator.
         return _paused_outage(host, name, st, paused, now)
     if st.get("task") or st.get("escalated"):
         return _escalated(host, name, spec, st, now)

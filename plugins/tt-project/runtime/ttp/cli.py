@@ -3826,7 +3826,7 @@ def cmd_heal(a) -> None:
     rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root), command_env(p))
     word = heal.classify(rc, out)
     print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
-    sys.exit(0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else 75)
+    sys.exit(1 if heal.recovery_off(out) else 0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else 75)
 
 
 def cmd_obligation(a) -> None:

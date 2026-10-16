@@ -551,7 +551,7 @@ def test_heal_broker_preset_reads_the_services_own_recovery_off_report(env, monk
     bk = heal.validate({"preset": "broker", "status_command": "status", "recovery_off_field": "recovery.disabled"})
     flags = {"held": False, "auto_power_cycle": True, "auto_reboot": True}
     for events, off in (([], False), (0, False), (None, False), (["power_cycle disabled"], True), (2, True),
-                        (True, True)):
+                        (True, True), ("false", False), ("none", False), ("", False), ({}, False)):
         status.clear()
         status.update(flags, recovery={"disabled": events})
         rc, out = heal.check(bk, {}, ".")
@@ -559,6 +559,40 @@ def test_heal_broker_preset_reads_the_services_own_recovery_off_report(env, monk
     status.update(flags, auto_reboot=False, recovery={})
     rc, out = heal.check(bk, {}, ".")
     assert rc == 1 and heal.recovery_off(out) and "auto_reboot is off" in out
+
+
+def test_heal_known_fault_bookkeeping_skips_a_recovery_off_result(env):
+    """known_key/known_since are set only for a result without the recovery-off line (`kf and not off`)."""
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", known_fault="handed to the backup owner")
+    spec, now = _heal_spec(p), time.time()
+    off = dict(spec, check=f"echo x; echo '{heal.RECOVERY_OFF}'; exit 1")
+    heal.run(d, "svc", off, now)
+    heal.run(d, "svc", off, now + 3600)
+    assert "known_key" not in heal.state(p.db, "svc")
+    heal.run(d, "svc", dict(spec, check="echo x; exit 1"), now + 7200)
+    assert "known_key" in heal.state(p.db, "svc")
+
+
+def test_heal_check_command_exits_1_for_recovery_off(env, capsys):
+    """`ttp heal check` agrees with the daemon: a recovery-off run is unhealthy whatever its exit code."""
+    from ttp import cli, heal
+    assert heal.classify(75, heal.RECOVERY_OFF) == "unhealthy, automatic recovery off"
+    src = open(cli.__file__).read()
+    assert "sys.exit(1 if heal.recovery_off(out) else" in src
+
+
+def test_heal_project_pause_still_quiets_a_recovery_off_result(env):
+    """Choice: a pause the project set on the check's own resource quiets a recovery-off result too."""
+    from ttp import coordinator as coord
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None, escalate="coordinator", outage=True, resource="box-a-device")
+    coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    spec, now = _heal_spec(p), time.time()
+    off = dict(spec, check=f"echo x; echo '{heal.RECOVERY_OFF}'; exit 1", resource="box-a-device", outage=True)
+    for t in (0, 3600, 86400):
+        heal.run(d, "svc", off, now + t)
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
 
 
 def test_heal_outage_check_known_owned_runs_never_escalate_as_an_outage(env):
