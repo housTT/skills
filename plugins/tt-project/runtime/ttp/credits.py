@@ -10,7 +10,10 @@ A provider's rate-limit answer may say more than its window percentages:
   one consumed resets the windows at once.
 
 `parse` reads them from any provider's answer into one structure; a missing or malformed field is
-None (unknown), never "has credits". The daemon stores the latest reading per provider (`record`).
+None (unknown), never "has credits". The daemon stores the latest reading per provider (`record`),
+with the account it was read for. Claude reports no credits block: its run's rate_limit_event
+overage fields map to paid credits (providers.claude.credits_from_event), open only while
+`overageStatus` is 'allowed'.
 
 Auto-consume (budget.reset_credits_auto, default on) spends one free reset, earliest-expiring
 first, at most once per window of a provider:

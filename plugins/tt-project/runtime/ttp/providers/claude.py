@@ -267,6 +267,7 @@ class Claude(Provider):
             t = ev.get("type")
             if t == "rate_limit_event":
                 u.extra["windows"] = windows_from_event(ev)
+                u.extra["credits"] = credits_from_event(ev)
                 info = ev.get("rate_limit_info") or {}
                 if info.get("status") == "rejected":
                     rejected = f"rate limit rejected: {info.get('rateLimitType') or 'unknown'}"
@@ -413,6 +414,25 @@ def windows_from_event(ev: dict) -> list[dict]:
         out.append({"window": name, "utilization": util * 100 if util <= 1.0 else util,
                     "resets_at": w.get("resetsAt")})
     return out
+
+
+def credits_from_event(ev: dict) -> dict:
+    """The event's overage fields as a credits.parse reading: paid credits are open only when
+    `overageStatus` is 'allowed', closed for any other status or a disabled reason, and unknown
+    (None) when the event carries neither."""
+    from ..credits import parse
+    info = ev.get("rate_limit_info") or {}
+    status, reason = info.get("overageStatus"), info.get("overageDisabledReason")
+    has = None
+    if isinstance(status, str) and status:
+        has = status == "allowed" and not reason
+    elif isinstance(reason, str) and reason:
+        has = False
+    reading = parse({"credits": {"hasCredits": has}})
+    reading["overage"] = {"status": status if isinstance(status, str) else None,
+                          "using": info.get("isUsingOverage") if isinstance(info.get("isUsingOverage"), bool) else None,
+                          "disabled_reason": reason if isinstance(reason, str) else None}
+    return reading
 
 
 def as_windows(extra_windows: list[dict], account: str) -> list[Window]:

@@ -3234,3 +3234,56 @@ def test_cache_gap_cohort_keeps_the_previous_turn_outside_the_window(env):
                "VALUES('coordinator',?,?,'ok',10,90,?)", (started, ended, note))
     cohort = bud.coordinator_cache(p.db, now)['3d']['gap_5_60m']
     assert cohort['turns'] == 1 and cohort['hit_pct'] == 90
+
+
+def _claude_overage_gate(p, tmp_path, now, **overage):
+    """A Claude run whose rate_limit_event puts five_hour at 92%, with the given overage fields,
+    recorded the way the daemon records a finished run; then Claude's gate."""
+    from ttp import budget as bud, daemon as dm
+    from ttp.providers import get_provider
+    out = tmp_path / "o.jsonl"
+    out.write_text(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "allowed_warning", **overage, "unifiedWindows": {
+            "five_hour": {"utilization": 0.92, "resetsAt": now + 3 * 3600},
+            "seven_day": {"utilization": 0.4, "resetsAt": now + 4 * 86400}}}}) + "\n")
+    u = get_provider("claude").parse(out)
+    with p.db.tx():
+        dm.Daemon._record_readings(p.db, "claude", "acct", u, now)
+    return bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+
+
+def test_claude_overage_allowed_opens_paid_credits_past_the_line_under_the_dollar_caps(env, tmp_path):
+    from ttp import credits
+    p = make(env)
+    now = time.time()
+    g = _claude_overage_gate(p, tmp_path, now, overageStatus="allowed", isUsingOverage=False)
+    assert g.regime == "windows" and "paid_credits" in g.numbers, (g.regime, g.numbers)
+    assert g.level != "red" and g.allow_new_work, (g.level, g.reasons)
+    r = credits.latest(p.db, "claude", now)
+    assert r["account"] == "acct" and credits.paid_open(r) and r["overage"]["status"] == "allowed"
+    # Spend since the first reading at the line is real money: the project's daily cap (100) holds it.
+    p.db.x("UPDATE snapshots SET ts=ts-600")
+    p.db.spend("claude", 120.0, "task:1", ts=now - 60)
+    p.db.spend("claude", 500.0, "task:0", ts=now - 3600)   # before the line: plan spend
+    g = _claude_overage_gate(p, tmp_path, now, overageStatus="allowed", isUsingOverage=True)
+    assert g.numbers["paid_credits"]["usd"] == 120.0 and g.level == "red" and not g.allow_new_work, g.numbers
+    assert any(r.startswith("cap reached") for r in g.reasons), g.reasons
+
+
+def test_claude_overage_rejected_or_disabled_holds_at_the_line_like_no_reading(env, tmp_path):
+    from ttp import credits
+    p = make(env)
+    now = time.time()
+    g = _claude_overage_gate(p, tmp_path, now, overageStatus="rejected")
+    assert g.regime == "windows" and "paid_credits" not in g.numbers
+    assert g.level == "red" and not g.allow_new_work, (g.level, g.reasons)
+    assert credits.latest(p.db, "claude", now)["paid"]["has_credits"] is False
+    # No overage fields: unknown, not open; the gate is the same one.
+    bare = _claude_overage_gate(p, tmp_path, now)
+    assert credits.latest(p.db, "claude", now)["paid"]["has_credits"] is None
+    off = _claude_overage_gate(p, tmp_path, now, overageStatus="rejected", isUsingOverage=False,
+                               overageDisabledReason="org_level_disabled")
+    assert credits.latest(p.db, "claude", now)["overage"]["disabled_reason"] == "org_level_disabled"
+    assert (off.level, off.regime, off.allow_new_work, off.reasons) == (
+        bare.level, bare.regime, bare.allow_new_work, bare.reasons), (off.reasons, bare.reasons)
+    assert "paid_credits" not in off.numbers

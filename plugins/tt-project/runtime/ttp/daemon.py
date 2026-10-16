@@ -2399,12 +2399,7 @@ class Daemon:
                      tokens_out=usage.output_tokens, ts=ended)
             if r["task"]:
                 db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
-            wins = usage.extra.get("windows")
-            if wins and r["provider"] == "claude":
-                bud.record_windows(db, as_windows(wins, r["account"] or ""))
-            elif wins:
-                bud.record_windows(db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
-                                                   r["account"] or "") for w in wins])
+            self._record_readings(db, r["provider"], r["account"] or "", usage, ended)
             if usage.limited:
                 until = time.time() + 3600
                 db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
@@ -3267,6 +3262,18 @@ class Daemon:
                     self._meter_one(db, name, prov)
             except Exception:
                 log(self.p, f"meter {name} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
+
+    @staticmethod
+    def _record_readings(db, provider: str, account: str, usage, now: float | None = None) -> None:
+        """A run's plan windows and its credit reading (Claude's overage fields), for its account."""
+        wins = usage.extra.get("windows")
+        if wins and provider == "claude":
+            bud.record_windows(db, as_windows(wins, account))
+        elif wins:
+            bud.record_windows(db, [bud.Window(provider, w["window"], w["utilization"], w.get("resets_at"), account)
+                                    for w in wins])
+        if isinstance(usage.extra.get("credits"), dict):
+            credits.record(db, provider, usage.extra["credits"], account, now)
 
     @staticmethod
     def _meter_one(db, name: str, prov) -> list:
