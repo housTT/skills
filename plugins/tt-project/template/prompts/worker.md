@@ -258,7 +258,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 <!-- /ttp:if wait -->
+<!-- ttp:if wait -->
 - A watching harness: a reentrant lock (or no re-entry) for state shared with a watcher thread; bounded poll-loop acquires recording a stage_timeout; a heartbeat and stall guard that dumps all thread stacks and exits non-zero when the main loop stalls.
+<!-- /ttp:if wait -->
 - Write large results incrementally, flushing as you go and before any step that may reset the host.
 - A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch (sha256 in the notes; re-exec only via a per-script marker; follow exec indirection and snapshot every executable it launches; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temporary file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
 - A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
