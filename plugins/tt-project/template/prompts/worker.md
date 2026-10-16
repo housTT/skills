@@ -7,7 +7,7 @@
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use
   `git ls-files | grep <name>` or a `find` rooted in the repo.
-- Disk space: `df <path>` on the path you need. Never `du` from / or a home folder (a network mount
+- Disk space: `df <path>`. Never `du` from / or a home folder (a network mount
   stalls it); size only your own directories with `du -x` under a `timeout`. A scan that times out
   is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
@@ -82,7 +82,7 @@ Other workers run other tasks of this project at the same time.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`), nor let scripts and test stubs you run do so: that ends other workers' runs and your
   own tool shell (a separate session or process group does not protect it). Check a script with
-  `ttp killscan <script>` (it flags `pkill`, `killall`, `kill $(pgrep -f ...)`/`pidof` and
+  `ttp killscan <script>` (it also flags `kill $(pgrep -f ...)`/`pidof` and
   `ps | grep` feeding a kill). If it finds one, run it first with `ttp killscan --shim <dir>`
   stand-ins on PATH (`PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or call by absolute
   path.
@@ -133,7 +133,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
  "retry_after_s": 1800,
  "retry_when": "if waiting: a quick shell check (below)",
 <!-- ttp:if wait -->
- "wake_tier": "if waiting: light (the next run only checks) or standard (real work follows)",
+ "wake_tier": "if waiting: light (default: the next run only checks) or standard (real work follows)",
  "next_step": "if waiting: one short mechanical command a light wake runs",
  "on_pass": {"status": "done", "summary": "if waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
@@ -146,7 +146,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
  "outcome": "if it applies: landed, kept, shelved or rejected",
- "tried": [{"title": "each lever you tried", "outcome": "kept | shelved | rejected", "result": "the number or bound reached"}],
+ "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 
@@ -167,10 +167,12 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   step into tail/head, logs each step's exit code and writes the first non-zero one to the marker
   from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`); size each step's timeout to its tool.
   Retry transient faults (busy device, recovering broker, ssh stall) inside it with
-  bounded backoff; fail only on a non-transient fault or spent retries. A device or box wait reads its
-  broker's job rows live, never a header it always prints (`grep RUNNING`) or a marker file.
-  A wait for a broker hold to end uses `ttp broker-released` on its /health answer and log tail: a
-  `device_released` event is not the only sign.
+  bounded backoff; fail only on a non-transient fault or spent retries.
+<!-- ttp:if device -->
+  A device or box wait reads its broker's job rows live, never a header it always prints
+  (`grep RUNNING`) or a marker file. A wait for a broker hold to end uses `ttp broker-released` on
+  its /health answer and log tail: a `device_released` event is not the only sign.
+<!-- /ttp:if device -->
   When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
   passes the daemon runs it model-free from the project root with your HOME (600 s default;
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
@@ -178,8 +180,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
   when the check is mechanical.
 <!-- ttp:if remote -->
-  For a job on another machine (a device job goes through a device runner instead, when your task
-  header lists them), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
+  For a job on another machine (a device job goes through a device runner instead, when one is
+  listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
   (also a chain that only drives it over ssh), set `"survives_reboot": true` and use the `retry_when` it
   prints, `ttp detach --check --host <alias> <dir>/<name>`: 0 once the job exited 0, 4 once it
   failed or is gone (your `on_pass_cmd` then decides, else you wake with its exit code), 1 while it
@@ -195,7 +197,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   probe then follows the resource when it moves to another box. Other hosts: `ttp ssh-preflight <host>`.
 <!-- /ttp:if hostmap -->
 <!-- ttp:if devq -->
-  When your task header lists device runners, a device job goes through one of them:
+  A device job goes through a device runner your task header lists:
   `ttp devq submit <runner> --id <unique id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
   (build and set up first: those are not device jobs). A runner with a reservation cap refuses a
   longer `--timeout`. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
@@ -210,15 +212,15 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   and on_pass_cmd `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
   A wait on another task landing uses retry_when `landed:#<id>`, never a sha.
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
-  the daemon restarts it, with no model run, up to `budget.max_job_relaunches` times (default 3).
-  `wake_tier` defaults to light. After 3 wakes that hand back the same `waiting_for` and
+  the daemon restarts it up to `budget.max_job_relaunches` times (default 3).
+  After 3 wakes that hand back the same `waiting_for` and
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing (an
   encrypted input or one in a macOS privacy-protected folder too: block once, naming the file), or the next step cannot be undone and is outside the charter. Say exactly what. Make
   judgment calls yourself; state each and why in the summary.
-- Read another task's record (spec, hand-off, findings) with `ttp task <project> show <id>`,
+- Read another task's record with `ttp task <project> show <id>`,
   never project.db.
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
   `retry_when` `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or
@@ -236,15 +238,14 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 
 ## Budget and time
 
-- No progress possible within your budget or wall clock (shown with the task): stop early with an
-  honest hand-off.
+- No progress possible within your budget or wall clock: stop early with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or `needs_review`.
 - Never block one tool call longer than about 5 minutes: submit long work detached and hand off
   `waiting`. Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
   (your task branch). A command your task's rules say to run in the foreground gets your
   longest timeout.
-- Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>`, which writes
-  `<name>.log` and `<name>.rc` in your run folder, printing the `retry_when`), or it dies with you.
+- Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
+  `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run

@@ -26511,11 +26511,13 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "only this project's own harness" not in rendered(code)
     assert "--purpose harness" in rendered({"kind": "harness"}) and "--purpose harness" not in rendered(code)
     # Nothing configured: no device, runner, remote-driver or cluster rules.
-    for marker in ("TTP_NO_DEVICE=1", "ttp devq submit", "ttp detach --remote", "## Shared clusters", "needs_deep"):
+    for marker in ("TTP_NO_DEVICE=1", "ttp devq submit", "ttp detach --remote", "## Shared clusters", "needs_deep",
+                   "`ttp broker-released`", "`grep RUNNING`"):
         assert marker not in rendered(code), marker
     # A device lock, a device task, a device machine named in the charter, or this host being one.
     p.set_config("device", {"locks": ["box-device"]})
     assert "TTP_NO_DEVICE=1" in rendered(code) and "needs_deep" in rendered(code)
+    assert "`ttp broker-released`" in rendered(code) and "`grep RUNNING`" in rendered(code)
     p.set_config("device", {})
     assert "TTP_NO_DEVICE=1" in rendered({"kind": "code", "labels": _json.dumps(["needs_device"])})
     assert "TTP_NO_DEVICE=1" not in rendered(code)
