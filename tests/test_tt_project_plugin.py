@@ -152,8 +152,9 @@ def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
     names = {json.loads((repo / f).read_text())["name"] for f in
              (".claude-plugin/marketplace.json", ".agents/plugins/marketplace.json")}
     assert len(names) == 1
-    market, plugin, tag = names.pop(), json.loads(MANIFESTS[0].read_text())["name"], PUBLISHED_REFS[0]
-    assert f"claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#{tag}'" in section
+    market, plugin, tag = names.pop(), json.loads(MANIFESTS[0].read_text())["name"], "$TT_PROJECT_REF"
+    assert not any(ref in section for ref in PUBLISHED_REFS)
+    assert f'claude plugin marketplace add "https://github.com/tenstorrent/skills.git#{tag}"' in section
     assert f"codex plugin marketplace add tenstorrent/skills --ref {tag}" in section
     assert f"git clone --depth 1 --branch {tag} " in section
     for cmd in (f"claude plugin install {plugin}@{market}", f"codex plugin add {plugin}@{market}",
