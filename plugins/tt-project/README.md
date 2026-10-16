@@ -1188,5 +1188,11 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls
   by absolute path must be edited out). `pkill -P <pid>` is not flagged. A pattern kill in a script
   can match the worker's own tool shell.
+- `ttp svcscan <script>` flags service unit changes (`systemctl stop`, `disable`, `mask`, `start`,
+  `restart`, `enable`, `unmask` and kin, also under `sudo -n`, and `service <unit> stop`) before a
+  worker runs a driver on a shared machine; `--shim <dir>` writes stand-ins for `systemctl`,
+  `service` and `sudo` that only log a change (read-only queries such as `systemctl is-active` reach
+  the real one; `sudo` runs nothing else). Calls by absolute path or over ssh are flagged as such:
+  a local shim does not stop them.
 - Resuming a lost run's session works on Claude Code and Codex; Cursor starts fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

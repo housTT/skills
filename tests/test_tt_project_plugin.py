@@ -792,6 +792,12 @@ def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
         assert part in text, part
 
 
+def test_worker_prompt_points_at_svcscan_for_service_changes_in_drivers():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("restart a shared service", "`ttp svcscan <script>`", "`ttp svcscan --shim <dir>`"):
+        assert part in text, part
+
+
 def test_suite_keeps_pytest_temp_dirs_small(pytestconfig):
     # The runtime suite makes hundreds of thousands of files under the pytest temp root; on a shared
     # host the default (keep every tmp_path of the last 3 sessions) fills /tmp and slows boot cleanup.

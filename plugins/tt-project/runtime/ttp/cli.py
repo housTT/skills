@@ -2750,6 +2750,34 @@ def cmd_killscan(a) -> None:
     sys.exit(1 if hits else 0)
 
 
+def cmd_svcscan(a) -> None:
+    """Check scripts for service unit changes (`systemctl stop|disable|mask|start|restart|...`, also
+    under `sudo -n`) before running them on a shared machine. Exits 1 when one is found. `--shim <dir>`
+    writes logging stand-ins for systemctl, service and sudo; put <dir> first on PATH to exercise the
+    script without changing a real unit."""
+    from . import svcscan
+    if a.shim:
+        folder = Path(a.shim).resolve()
+        svcscan.write_shims(folder)
+        print(f"shims for {', '.join(svcscan.SHIMMED)} in {folder}; calls are logged to "
+              f"{folder / 'svcscan.log'}. Run the script with: PATH={shlex.quote(str(folder))}:\"$PATH\" <script>")
+    hits = 0
+    for name in a.files:
+        try:
+            text = Path(name).read_text(errors="replace")
+        except OSError as e:
+            die(f"ttp svcscan: cannot read {name}: {e.strerror or e}")
+        for n, reason, line in svcscan.scan(text):
+            hits += 1
+            print(f"{name}:{n}: {reason}: {line}")
+    if a.files:
+        print(f"ttp svcscan: {hits} service unit change(s) found" if hits else
+              "ttp svcscan: no service unit changes found")
+    elif not a.shim:
+        die("usage: ttp svcscan <script>... [--shim <dir>]")
+    sys.exit(1 if hits else 0)
+
+
 def cmd_ssh_preflight(a) -> None:
     """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when; 12 with
     --classified), 10 when its host key does not verify, 11 when authentication fails (both wake a
@@ -6056,6 +6084,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for pkill, killall, pgrep and pidof "
                                                  "into DIR (put DIR first on PATH)")
     s.set_defaults(fn=cmd_killscan)
+
+    s = sub.add_parser("svcscan", help="flag service unit changes (systemctl stop/disable/mask/start/restart/"
+                                       "enable/unmask, also under sudo) in scripts before running them; "
+                                       "--shim writes stand-ins that only log")
+    s.add_argument("files", nargs="*", help="scripts to check; exits 1 if one changes a unit, 2 if one cannot be read")
+    s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for systemctl, service and sudo "
+                                                 "into DIR (put DIR first on PATH)")
+    s.set_defaults(fn=cmd_svcscan)
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "
                                     "75 could not check")

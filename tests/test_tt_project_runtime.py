@@ -24952,6 +24952,7 @@ DURABLE_EXEMPT = {
     ("project.py", '"daemon.log", "a") as f'): "a log line",
     ("db.py", 'with log.open("a") as fh'): "logs/slow-tx.log, a diagnostic report line",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
+    ("svcscan.py", "path.write_text(body)"): "a worker's throwaway shim scripts, re-written by each `ttp svcscan --shim`",
 }
 
 
@@ -33984,6 +33985,78 @@ def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path)
     assert "pkill -u " + os.environ.get("USER", "") + " -f ttp-killscan-none" in log, log
     assert "killall ttp-killscan-none" in log and "pgrep -f ttp-killscan-none" in log and \
         "pidof ttp-killscan-none" in log, log
+
+
+SERVICE_SCRIPT = "\n".join([
+    "#!/bin/sh", "# systemctl stop in a comment is fine", "sudo -n systemctl stop ttp-svcscan-none.service",
+    "systemctl --user disable --now ttp-svcscan-none", "sudo systemctl mask ttp-svcscan-none",
+    "systemctl -q restart ttp-svcscan-none", "systemctl start ttp-svcscan-none; echo started",
+    "sudo -n -u root systemctl enable ttp-svcscan-none", "sudo -n systemctl unmask ttp-svcscan-none",
+    "service ttp-svcscan-none restart", "/usr/bin/systemctl stop ttp-svcscan-none",
+    "ssh box 'sudo -n systemctl stop ttp-svcscan-none'", "/usr/bin/sudo systemctl stop ttp-svcscan-none",
+    "systemctl is-active ttp-svcscan-none || true", "systemctl status ttp-svcscan-stop-x | head -1 || true",
+    "systemctl show -p ActiveState ttp-svcscan-none; echo restart", "echo stopping", "exit 0"])
+
+
+def test_svcscan_flags_every_unit_change_and_no_read_only_query(env):
+    from ttp import svcscan
+    hits = {n: reason for n, reason, _ in svcscan.scan(SERVICE_SCRIPT)}
+    assert sorted(hits) == list(range(3, 14)), hits
+    assert all("systemctl changes a unit" in hits[n] for n in (*range(3, 10), 11, 12, 13)), hits
+    assert "service changes a unit" in hits[10], hits
+    assert "absolute path" in hits[11] and "absolute path" in hits[13] and "over ssh" in hits[12], hits
+    assert not any("absolute path" in hits[n] or "ssh" in hits[n] for n in range(3, 11)), hits
+    for verb in svcscan.VERBS:
+        assert svcscan.scan(f"sudo -n systemctl {verb} x\n"), verb
+    for query in ("is-active", "is-enabled", "status", "show", "cat", "list-units", "daemon-reload"):
+        assert svcscan.scan(f"sudo -n systemctl {query} x\n") == [], query
+
+
+def test_ttp_svcscan_exits_1_on_a_hit_and_its_shims_change_no_unit(env, tmp_path):
+    script = tmp_path / "driver.sh"
+    script.write_text("\n".join(line for line in SERVICE_SCRIPT.splitlines()
+                                if not line.startswith(("/usr/bin/", "ssh "))) + "\n")
+    clean = tmp_path / "clean.sh"
+    clean.write_text("#!/bin/sh\nsystemctl is-active ttp-svcscan-none\n")
+
+    def ttp(*args):
+        return subprocess.run([sys.executable, str(TTP), "svcscan", *args], capture_output=True, text=True)
+    r = ttp(str(script))
+    assert r.returncode == 1 and "driver.sh:3: systemctl changes a unit" in r.stdout and \
+        "8 service unit change(s)" in r.stdout, r.stdout
+    r = ttp(str(clean))
+    assert r.returncode == 0 and "no service unit changes" in r.stdout, r.stdout
+    assert ttp(str(tmp_path / "missing.sh")).returncode == 2, "unreadable is not a hit"
+    shims = tmp_path / "shims"
+    r = ttp("--shim", str(shims))
+    assert r.returncode == 0 and f"PATH={shims}:" in r.stdout, r.stdout
+    # With the shims first on PATH the driver runs to its end and every unit change is only logged;
+    # a real systemctl elsewhere on PATH is never reached for a change, but answers a query.
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "systemctl").write_text(f"#!/bin/sh\necho \"real $*\" >> {tmp_path / 'real.log'}\n")
+    (real / "systemctl").chmod(0o755)
+    r = subprocess.run(["sh", str(script)], capture_output=True, text=True,
+                       env={**os.environ, "PATH": f"{shims}:{real}:{os.environ['PATH']}"})
+    assert r.returncode == 0, r.stderr
+    log = (shims / "svcscan.log").read_text().splitlines()
+    for call in ("sudo -n systemctl stop ttp-svcscan-none.service", "systemctl stop ttp-svcscan-none.service",
+                 "systemctl --user disable --now ttp-svcscan-none", "systemctl mask ttp-svcscan-none",
+                 "sudo -n -u root systemctl enable ttp-svcscan-none", "systemctl enable ttp-svcscan-none",
+                 "service ttp-svcscan-none restart"):
+        assert call in log, (call, log)
+    assert (tmp_path / "real.log").read_text().splitlines() == [
+        "real is-active ttp-svcscan-none", "real status ttp-svcscan-stop-x", "real show -p ActiveState ttp-svcscan-none"]
+    # sudo through the shim runs only systemctl/service (through their shims), never another command
+    marker = tmp_path / "ran"
+    r = subprocess.run(["sudo", "-n", "touch", str(marker)], capture_output=True, text=True,
+                       env={**os.environ, "PATH": f"{shims}:{os.environ['PATH']}"})
+    assert r.returncode == 0 and not marker.exists() and f"sudo -n touch {marker}" in \
+        (shims / "svcscan.log").read_text()
+    # a changing verb after an option with a value (`-H <host> stop`) is still only logged
+    r = subprocess.run(["systemctl", "-H", "box", "stop", "x"], capture_output=True, text=True,
+                       env={**os.environ, "PATH": f"{shims}:{real}"})
+    assert r.returncode == 0 and "real -H" not in (tmp_path / "real.log").read_text()
 
 
 def test_no_test_resolves_or_starts_a_real_agent_cli(env, tmp_path_factory):
