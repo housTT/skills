@@ -5337,6 +5337,23 @@ def test_a_nested_ttp_lock_runs_under_its_outer_one_unless_it_upgrades_a_shared_
 
 
 
+def test_a_shared_ttp_lock_of_a_device_lock_is_refused_and_runs_nothing(env, tmp_path):
+    p = make(env)
+    p.set_config("device.locks", ["board-a", "board-b"])
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    ran = tmp_path / "ran"
+    for name in ("x-device", "board-a", "board-b"):
+        out = subprocess.run(_lock_cmd("--shared", name, "--", "touch", str(ran)), env=run_env,
+                             capture_output=True, text=True, timeout=60)
+        assert out.returncode == 2 and "plain `ttp lock" in out.stderr, (name, out)
+        assert not ran.exists(), f"a shared lock of device lock {name} ran its command"
+        # Its probe answers as the plain one does, so a retry_when that names it keeps working.
+        assert subprocess.run(_lock_cmd("--probe", "--shared", name), env=run_env,
+                              capture_output=True).returncode == 0
+    assert subprocess.run(_lock_cmd("x-device", "--", "touch", str(ran)), env=run_env).returncode == 0
+    assert ran.exists()
+
+
 def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

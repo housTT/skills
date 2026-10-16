@@ -2801,7 +2801,10 @@ def cmd_lock(a) -> None:
 
     `ttp lock --shared <resource> -- <cmd...>` is for read-only work: shared holders run together,
     while an exclusive holder (a plain `ttp lock`, or an exclusive task's whole-run hold) and shared
-    ones exclude each other. A queued exclusive waiter is not jumped by later shared ones.
+    ones exclude each other. A queued exclusive waiter is not jumped by later shared ones. Not for a
+    device lock (one in config `device.locks` or ending in `-device`): at most one command at a time
+    may be in the device phase, so `--shared` on one exits 2 at once and runs nothing. `--probe
+    --shared` on one answers as the plain probe does.
 
     Nested: a `ttp lock` inside one that holds the same lock in the same or a stronger mode (or
     inside an exclusive task's run) just runs, saying so on stderr. An exclusive one inside a shared
@@ -2854,6 +2857,12 @@ def cmd_lock(a) -> None:
     cfg = p.config()
     res = lk.canonical(cfg, a.resource)
     where = shared.locks_dir(p, res, cfg)
+    is_device = res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device")
+    if a.shared and is_device:
+        if not a.probe:
+            die(f"{a.resource} is a device lock: one command at a time may use the device, so it cannot be "
+                f"held shared. Use a plain `ttp lock {a.resource} -- <command>`", 2)
+        a.shared = False   # a probe in a retry_when keeps working: it answers for the plain lock
 
     def _unwritable(e: OSError) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.
@@ -2888,7 +2897,7 @@ def cmd_lock(a) -> None:
             f"Take the exclusive lock around the whole command instead", 2)
     child_env = {**os.environ, **({"TTP_LOCKS_SHARED": ",".join(shared_locks + [res])} if a.shared
                                   else {"TTP_LOCKS_HELD": ",".join(held_locks + [res])})}
-    if res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device"):
+    if is_device:
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
     detached = bool(os.environ.get("TTP_DETACHED"))
@@ -6078,7 +6087,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--probe", action="store_true",
                    help="exit 0 if the resource is free, not paused and nobody queues for it, else 75 (for retry_when)")
     s.add_argument("--shared", action="store_true",
-                   help="read mode: run alongside other shared holders; exclusive holders and these exclude each other")
+                   help="read mode: run alongside other shared holders; exclusive holders and these exclude each other "
+                        "(not for device locks)")
     s.add_argument("resource")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
