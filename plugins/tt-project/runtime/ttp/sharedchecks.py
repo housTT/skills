@@ -3,7 +3,8 @@ also fail elsewhere is held asleep instead of woken at its tier (Daemon._probe_p
 
 A failure is shared when every failing pytest id (the failing command's `FAILED`/`ERROR path::name`
 lines, complete against pytest's summary counts) also failed in at least `checks.shared_min_tasks`
-other tasks' checks on other heads within `checks.shared_window_h`, or the push queue's known-bad
+other tasks' checks on other heads and of other lineages (a change's own earlier tasks, its review
+fixes and `continue:` tasks, do not count) within `checks.shared_window_h`, or the push queue's known-bad
 tip lists it. Any other runner, an incomplete list or one id not shared wakes the task as before.
 A held task's checks run again on its same head, model-free, once the push-branch tip moves past a
 commit touching a failing test's file, or after `checks.shared_backoff_h`; after RERUNS_MAX reruns
@@ -21,7 +22,7 @@ from .db import TERMINAL_TASK_STATES, DB
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks_failures (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task INTEGER NOT NULL, head TEXT NOT NULL, ts REAL NOT NULL,
-  ids TEXT NOT NULL);
+  ids TEXT NOT NULL, root INTEGER);
 CREATE INDEX IF NOT EXISTS checks_failures_ts ON checks_failures(ts);
 CREATE TABLE IF NOT EXISTS checks_incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ids TEXT NOT NULL, opened REAL NOT NULL, last REAL,
@@ -35,7 +36,8 @@ RERUNS_MAX = 3         # reruns on one head before the task wakes as before
 KEEP_S = 7 * 86400     # failure rows kept this long
 
 _ID = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?)(?=\s|$)", re.M)
-_SUMMARY = re.compile(r"^=+ (.*\bin [\d.]+s.*?) =+\s*$", re.M)
+# pytest's last summary line: bare under -q, wrapped in '=' at the default verbosity.
+_SUMMARY = re.compile(r"^(?:=+ )?(\d+ [a-z]+(?:, \d+ [a-z]+)* in [\d.]+s\b[^=\n]*?)(?: =+)?\s*$", re.M)
 
 
 def settings(cfg: dict) -> dict:
@@ -47,7 +49,8 @@ def settings(cfg: dict) -> dict:
 
 def failing_ids(output: str) -> tuple[list[str], bool]:
     """The failing pytest ids in a check's output, and whether they are all of them: pytest's last
-    summary line counts as many failed and errors as there are FAILED/ERROR lines. Any other
+    summary line (bare or in '=' bars) counts as many failed and errors as there are FAILED/ERROR
+    lines. Any other
     runner's output gives ([], False)."""
     lines = _ID.findall(output or "")
     ids = sorted(set(lines))
@@ -63,26 +66,38 @@ def ensure(db: DB) -> None:
     for stmt in SCHEMA.split(";"):
         if stmt.strip():
             db.x(stmt)
+    if "root" not in {r["name"] for r in db.q("PRAGMA table_info(checks_failures)")}:
+        db.x("ALTER TABLE checks_failures ADD COLUMN root INTEGER")
+
+
+def root(db: DB, task: int) -> int:
+    """The first task of `task`'s lineage (chaincap.chain: `continues:` and `continue:` hops), itself
+    when it has none: one change's code, fix and continue tasks share it."""
+    from .chaincap import chain
+    ch = chain(db, task)
+    return int(ch[0]["id"]) if ch else task
 
 
 def record(db: DB, task: int, head: str, ids: list[str], now: float) -> None:
-    """One task's failing ids on one head (each head once)."""
+    """One task's failing ids on one head (each head once), with its lineage's root."""
     ensure(db)
     db.x("DELETE FROM checks_failures WHERE ts<?", (now - KEEP_S,))
     if not db.one("SELECT id FROM checks_failures WHERE task=? AND head=? AND ids=?", (task, head, json.dumps(ids))):
-        db.x("INSERT INTO checks_failures(task,head,ts,ids) VALUES(?,?,?,?)", (task, head, now, json.dumps(ids)))
+        db.x("INSERT INTO checks_failures(task,head,ts,ids,root) VALUES(?,?,?,?,?)",
+             (task, head, now, json.dumps(ids), root(db, task)))
 
 
 def shared(db: DB, task: int, head: str, ids: list[str], now: float, cfg: dict,
            tip_ids: list[str] | None = None) -> bool:
-    """Every id failed in `min_tasks` other tasks on other heads within the window, or on the tip."""
+    """Every id failed in `min_tasks` other tasks on other heads and of other lineages within the
+    window, or on the tip."""
     if not ids:
         return False
     s = settings(cfg)
     ensure(db)
     seen: dict[str, set[int]] = {}
-    for r in db.q("SELECT task, ids FROM checks_failures WHERE ts>=? AND task!=? AND head!=?",
-                  (now - s["window_s"], task, head)):
+    for r in db.q("SELECT task, ids FROM checks_failures WHERE ts>=? AND task!=? AND head!=? "
+                  "AND COALESCE(root, task)!=?", (now - s["window_s"], task, head, root(db, task))):
         try:
             got = json.loads(r["ids"])
         except ValueError:

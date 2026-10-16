@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 
-def _pytest_out(ids, extra_failed=0, passed=40):
-    lines = ["tests/test_a.py ..F.", "=" * 20 + " short test summary info " + "=" * 20]
+def _pytest_out(ids, extra_failed=0, passed=40, bars=False):
+    """pytest's output: `-q` (the required command) prints its last summary line bare, the default
+    verbosity (`bars`) wraps it in '='; the suite's own line may follow it."""
+    lines = ["..F.", "=" * 20 + " short test summary info " + "=" * 20]
     lines += [f"FAILED {i} - AssertionError: boom" for i in ids]
-    lines.append(f"{'=' * 10} {len(ids) + extra_failed} failed, {passed} passed in 3.21s {'=' * 10}")
+    summary = f"{len(ids) + extra_failed} failed, {passed} passed, 2 skipped in 3.21s (0:00:03)"
+    lines.append(f"{'=' * 10} {summary} {'=' * 10}" if bars else summary)
+    lines.append("ttp-suite: wall 3.2s cpu 9.1s in 3.21s")
     return "\n".join(lines) + "\n"
 
 
@@ -45,11 +49,23 @@ def test_failing_ids_reads_pytest_summaries_and_nothing_else():
     assert sharedchecks.failing_ids(_pytest_out(_IDS)) == (sorted(_IDS), True)
     out = _pytest_out(["tests/test_a.py::test_one"]).replace("FAILED", "ERROR").replace(" failed,", " error,")
     assert sharedchecks.failing_ids(out) == (["tests/test_a.py::test_one"], True)
+    assert sharedchecks.failing_ids(_pytest_out(_IDS, bars=True)) == (sorted(_IDS), True)
     # A summary counting more failures than the lines shown (cut output): not complete.
     assert sharedchecks.failing_ids(_pytest_out(_IDS, extra_failed=1))[1] is False
+    assert sharedchecks.failing_ids(_pytest_out(_IDS, extra_failed=1, bars=True))[1] is False
     # Another runner's output.
     assert sharedchecks.failing_ids("error[E0308]: mismatched types\nerror: could not compile `x`\n") == ([], False)
     assert sharedchecks.failing_ids("FAILED (failures=2)\nRan 9 tests in 0.1s\n") == ([], False)
+
+
+def test_failing_ids_reads_real_pytest_q_output(tmp_path):
+    from ttp import sharedchecks
+    (tmp_path / "test_tiny.py").write_text("def test_ok():\n    pass\n\ndef test_bad():\n    assert 0\n")
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_tiny.py"],
+                       cwd=tmp_path, capture_output=True, text=True, timeout=120,
+                       env={k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert sharedchecks.failing_ids(r.stdout) == (["test_tiny.py::test_bad"], True), r.stdout
 
 
 def test_a_shared_checks_failure_holds_tasks_in_one_incident_with_one_fix_task(env, monkeypatch, tmp_path):
@@ -79,6 +95,24 @@ def test_a_shared_checks_failure_holds_tasks_in_one_incident_with_one_fix_task(e
     line = sharedchecks.audit_line(p.db, now - 60)
     assert "1 incident(s), 2 task(s) held, 2 wakes avoided" in line, line
     assert line in audit.lines(p.db, now + 1)
+
+
+def test_failures_of_one_changes_own_earlier_tasks_are_not_shared(env):
+    """A code task, its review fix and its `continue:` task fail the same id on successive heads:
+    that is the change's own regression, so it is not shared; two tasks of other lineages make it so."""
+    from ttp import sharedchecks
+    p = make(env)
+    now = time.time()
+    code = p.db.add_task("code: change", "spec", kind="code")
+    fix = p.db.add_task("Fix review #1: change", "spec", kind="code", labels=[f"continues:{code}"])
+    cont = p.db.add_task("continue: change", "spec", kind="code", labels=[f"continues:{fix}"])
+    for k, t in enumerate((code, fix)):
+        sharedchecks.record(p.db, t, f"{k + 1:040x}", _IDS, now - 600)
+    assert not sharedchecks.shared(p.db, cont, f"{9:040x}", _IDS, now, {})
+    for k in range(2):
+        other = p.db.add_task(f"code: other {k}", "spec", kind="code")
+        sharedchecks.record(p.db, other, f"{k + 5:040x}", _IDS, now - 600)
+    assert sharedchecks.shared(p.db, cont, f"{9:040x}", _IDS, now, {})
 
 
 def test_the_known_bad_push_tip_makes_a_failure_shared(env, monkeypatch, tmp_path):
