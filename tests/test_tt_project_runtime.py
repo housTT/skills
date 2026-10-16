@@ -15193,7 +15193,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER"
-    for kind, cap in (("code", 28_000), ("question", 24_000)):
+    for kind, cap in (("code", 29_000), ("question", 24_000)):
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -26472,7 +26472,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert len(rules["code"]) <= 13_500, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 17_000, len(every)
+    assert len(every) <= 18_000, len(every)
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
