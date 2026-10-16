@@ -7422,6 +7422,6 @@ def test_the_hourly_push_audit_raises_one_issue_per_missing_push_and_closes_them
 def test_review_rules_do_not_tell_reviews_to_publish_another_tasks_branch():
     """The review template never invites --own onto a branch another task carries (the push refuses it)."""
     import re
-    text = (pathlib.Path(__file__).resolve().parents[2] / "plugins/tt-project/template/prompts/kind-review.md").read_text()
+    text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
     assert "the change carries" not in text
     assert re.search(r"Never publish another task's `ttp/t<id>-\.\.\.` branch", text)
