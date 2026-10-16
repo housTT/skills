@@ -170,8 +170,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   bounded backoff; fail only on a non-transient fault or spent retries. A device or box wait reads its
   broker's job rows live, never a header it always prints (`grep RUNNING`) or a marker file.
   A wait for a broker hold to end uses `ttp broker-released` on its /health answer and log tail: a
-  `device_released` event is not the only sign (also /health `held` false with a healthy fsm, or a
-  `hold released` log line).
+  `device_released` event is not the only sign.
   When only checking the outcome is left, make that check the `on_pass_cmd`: once `retry_when`
   passes the daemon runs it model-free from the project root with your HOME (600 s default;
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
@@ -209,7 +208,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   no .rc; set `"survives_reboot": true` to keep it asleep anyway.
   A wait on another project's reply uses retry_when `ttp ack-wait probe --from <project> --hash <id>`
   and on_pass_cmd `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
-  A wait on another task landing uses retry_when `landed:#<id>`, never a sha (landing rebases it).
+  A wait on another task landing uses retry_when `landed:#<id>`, never a sha.
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
   the daemon restarts it, with no model run, up to `budget.max_job_relaunches` times (default 3).
   `wake_tier` defaults to light. After 3 wakes that hand back the same `waiting_for` and
