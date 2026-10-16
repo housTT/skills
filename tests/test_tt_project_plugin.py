@@ -3518,3 +3518,10 @@ def test_worker_prompt_waits_on_landed_instead_of_blocking_on_another_task():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`." in text
     assert all(len(line) <= 1000 for line in (PLUGIN / "template" / "prompts" / "worker.md").read_text().splitlines())
+
+
+def test_prompts_tell_senders_to_label_relayed_user_words():
+    for name in ("worker.md", "coordinator.md"):
+        text = " ".join((PLUGIN / "template" / "prompts" / name).read_text(encoding="utf-8").split())
+        assert "quote them under the label \"user's words (verbatim)\"" in text, name
+        assert "apart from your own context" in text, name

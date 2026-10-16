@@ -23,6 +23,7 @@
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
   A note that is queued or refused is never a reason to wait or block: keep working.
+  When the note relays the user's words, quote them under the label "user's words (verbatim)", apart from your own context.
 <!-- ttp:if prs -->
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
   as the charter's policies allow. Open or update the draft PR without asking. Never request
