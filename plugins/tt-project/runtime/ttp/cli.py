@@ -1993,6 +1993,16 @@ def cmd_checks(a) -> None:
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
+        # A stale coverage digest fails a harness check-plan at once: found here, it fails before the wait
+        # for a checks slot, not after it (the check needs no slot to fail).
+        from . import checkplan
+        for c in todo if purpose == "harness" and not hit else []:
+            if why := checkplan.stale(Path(top), str(c)):
+                said = f"not queued for a checks slot: {c} would fail: {why}"
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
+                passed, failed, todo = False, c, []
+                break
         arrived = _checks_arrived()
         slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived)
                 if todo and not hit else None)
@@ -4903,6 +4913,9 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     if not running:
         _git(h, "add", "-A")
         files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if plans := _refresh_plan_digests(p, files):
+            _git(h, "--literal-pathspecs", "add", "--", *plans)
+            files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
         if files:
             _commit_listing(p, ident, msg, files, kept_out)
         return []
@@ -4917,6 +4930,8 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
         except OSError:
             left.append(n)
     if old:
+        # A plan file a running task edited stays its own: its digests are not refreshed here.
+        old += [n for n in _refresh_plan_digests(p, old, set(left)) if n not in old]
         spec = p.state / "upgrade-commit-paths"
         spec.write_text("\0".join(old) + "\0")
         try:
@@ -4932,6 +4947,43 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
         print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
               f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
     return left
+
+
+def _refresh_plan_digests(p: Project, files: list[str], busy: set[str] = frozenset()) -> list[str]:
+    """The project's harness check plans pin inputs by digest; a pre-upgrade commit of `files` that
+    changes one would fail the next harness task's checks on a digest that task never touched. A plan
+    read at HEAD (--definition-at-head) gets their digests refreshed in the working copy, to go in the
+    same commit; one in `busy` (a running task's uncommitted edit) or at a pinned definition commit
+    cannot be, and is named. Returns the plan files rewritten."""
+    from . import checkplan, push
+    h, plans = p.harness, []
+    try:
+        checks = push.check_list((p.config().get("delivery") or {}).get("push_checks"))
+    except Exception:
+        return []
+    for c in checks:
+        args = checkplan.harness_args(str(c)) if getattr(c, "purpose", "") == "harness" else None
+        if not args or args[1] in plans:
+            continue
+        pinned, path = args
+        if pinned or path in busy:
+            try:
+                pins = json.loads((h / path).read_text())["coverage"]["paths"]
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            hit = sorted(n for n in files if isinstance(pins, dict) and n in pins and pins[n] != checkplan.COMMITTED)
+            if hit:
+                why = (f"its definition is pinned at commit {pinned[:12]}" if pinned
+                       else "a running harness task has uncommitted edits to it")
+                print(f"upgrade note: this commit changes {', '.join(hit)}, which harness check plan {path} pins "
+                      f"by digest; {why}, so the digest was not refreshed and harness checks fail on it until a "
+                      f"harness task refreshes it")
+            continue
+        done = checkplan.refresh(h, path, files)
+        if done:
+            plans.append(path)
+            print(f"refreshed the digests of {', '.join(done)} in harness check plan {path}: this commit changes them")
+    return plans
 
 
 # Untracked files with these names are runtime data a harness's tools write as they run (append-only logs,

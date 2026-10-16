@@ -8055,3 +8055,96 @@ def test_the_push_audit_does_not_flag_an_on_pass_cmd_whose_push_is_on_the_remote
            (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
     a = pushclaim.audit(p)
     assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+
+
+def _pinned_plan(repo, git_cmd, plan="checks/harness.json"):
+    """A committed harness check plan that pins watch.py by digest; its at-HEAD check-plan command."""
+    import hashlib
+    (repo / "checks").mkdir(exist_ok=True)
+    (repo / "watch.py").write_text("print('watch')\n")
+    cover = {"paths": {"watch.py": hashlib.sha256(b"print('watch')\n").hexdigest()}, "commands": ["true"]}
+    (repo / plan).write_text(json.dumps({"purpose": "harness", "coverage": cover}, indent=2) + "\n")
+    subprocess.run([*git_cmd, "add", "watch.py", plan], check=True)
+    subprocess.run([*git_cmd, "commit", "-qm", "harness plan"], check=True)
+    return f"ttp check-plan --purpose harness --definition-at-head --definition-path {plan}"
+
+
+def test_ttp_checks_purpose_harness_fails_a_stale_digest_before_queuing_for_a_slot(env, tmp_path, monkeypatch,
+                                                                                   capsys):
+    """Replay: a template upgrade's pre-merge commit changed a file the harness check plan pins, and the
+    next unrelated harness task waited over an hour for a checks slot only to fail check-plan on that
+    digest. The stale digest now fails at once, naming the commit that changed the input, and no slot
+    is asked for; with the digest refreshed the checks run as before."""
+    from ttp import checkplan, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    cmd = _pinned_plan(repo, git)
+    p.set_config("delivery.push_checks", [{"run": cmd, "purpose": "harness"}])
+    assert checkplan.stale(repo, cmd) == ""
+    (repo / "watch.py").write_text("print('watch, edited live')\n")
+    subprocess.run([*git, "commit", "-qam", "local harness changes before template upgrade"], check=True)
+    (repo / "b.txt").write_text("the task's own change\n")
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "unrelated harness change"], check=True)
+    why = checkplan.stale(repo / "checks", cmd)       # from a subdirectory too
+    assert why.startswith("uncovered committed input: watch.py") and "before template upgrade" in why, why
+    asked, slot = [], cli._checks_slot
+    monkeypatch.setattr(cli, "_checks_slot", lambda *a, **k: asked.append(a) or None)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--purpose", "harness"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and not asked and not log.exists(), out
+    assert "not queued for a checks slot" in out and "last changed in" in out and "before template upgrade" in out
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+    # Refreshed in a commit of its own: the plan runs (through the slot) and passes.
+    assert checkplan.refresh(repo, "checks/harness.json", ["watch.py", "b.txt"]) == ["watch.py"]
+    subprocess.run([*git, "commit", "-qam", "refresh the digest"], check=True)
+    assert checkplan.stale(repo, cmd) == ""
+    monkeypatch.setattr(cli, "_checks_slot", slot)
+    cli.main(["checks", "--purpose", "harness", "--fresh"])
+    assert log.read_text() == "plan\n"
+    # Other problems (an absent definition commit, a malformed command) are left to the real run.
+    assert checkplan.stale(repo, HARNESS_PLAN) == "" and checkplan.stale(repo, "ttp check-plan --bogus") == ""
+
+
+@pytest.mark.parametrize("how", ["at_head", "running_task", "pinned"])
+def test_upgrade_refreshes_the_digests_its_pre_merge_commit_changes(env, monkeypatch, capsys, how):
+    """The pre-upgrade commit of live harness edits refreshes the digests a harness check plan read at
+    HEAD pins for the inputs it commits, in the same commit, so the next harness task's checks do not
+    fail on them. A plan pinned at a definition commit cannot be refreshed: the upgrade says so."""
+    p = make(env)
+    from ttp import checkplan, cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _fake_check_plan_ttp(env["home"], monkeypatch, env["home"] / "plan.log")
+    h = p.harness
+    mark = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    _install_template(env)
+    mark.write_text("aaaa1111\n")
+    cli.main(["upgrade", "demo"])
+    git_cmd = ["git", "-C", str(h), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    cmd = _pinned_plan(h, git_cmd)
+    if how == "pinned":
+        cmd = cmd.replace("--definition-at-head", "--definition-commit " + _git_out(h, "rev-parse", "HEAD"))
+    p.set_config("delivery.push_checks", [{"run": cmd, "purpose": "harness"}])
+    subprocess.run([*git_cmd, "commit", "-qam", "config"], check=True)
+    (h / "watch.py").write_text("print('watch, edited live')\n")
+    if how == "running_task":     # the edit predates the running harness task, so the upgrade commits it
+        now = time.time()
+        os.utime(h / "watch.py", (now - 7200, now - 7200))
+        tid = p.db.add_task("Unrelated", "spec", kind="harness")
+        p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'running')",
+               (tid, now - 3600))
+    capsys.readouterr()
+    mark.write_text("bbbb2222\n")
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    swept = _git_out(h, "log", "--format=%H", "--grep", "before template upgrade", "-1")
+    files = _git_out(h, "show", "--name-only", "--format=", swept).split("\n")
+    assert "watch.py" in files, out
+    if how == "pinned":
+        assert "checks/harness.json" not in files and "pinned at commit" in out, out
+        assert checkplan.stale(h, cmd).startswith("uncovered committed input: watch.py")
+    else:
+        assert "checks/harness.json" in files and "refreshed the digests of watch.py" in out, out
+        assert checkplan.stale(h, cmd) == "" and checkplan.run(h, None, "checks/harness.json", "harness") == 0

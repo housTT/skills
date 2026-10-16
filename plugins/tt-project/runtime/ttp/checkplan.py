@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -103,13 +104,20 @@ def _scope(scope, committed: bool = False) -> dict:
     return scope
 
 
+def _uncovered(path: str, blob: bytes, expected: str, definition_path: str) -> str:
+    """Why `blob` at HEAD is not the content `path` is pinned to, or ""."""
+    if expected == COMMITTED or (digest := hashlib.sha256(blob).hexdigest()) == expected:
+        return ""
+    hint = (f'; refresh its digest in {definition_path}, or bind it to "{COMMITTED}" there when any '
+            "committed content is covered" if definition_path else "")
+    return f"uncovered committed input: {path} (sha256 at HEAD: {digest}){hint}"
+
+
 def _verify(repo: Path, head: str, scope: dict, definition_path: str = "") -> None:
     for path, expected in scope["paths"].items():
         blob = _blob(repo, head, path)
-        if expected != COMMITTED and (digest := hashlib.sha256(blob).hexdigest()) != expected:
-            hint = (f'; refresh its digest in {definition_path}, or bind it to "{COMMITTED}" there when any '
-                    "committed content is covered" if definition_path else "")
-            raise PlanError(IDENTITY_ERROR, f"uncovered committed input: {path} (sha256 at HEAD: {digest}){hint}")
+        if why := _uncovered(path, blob, expected, definition_path):
+            raise PlanError(IDENTITY_ERROR, why)
         file = repo / path
         try:
             if not file.resolve().is_relative_to(repo.resolve()) or file.is_symlink():
@@ -194,6 +202,86 @@ def run(repo: Path, definition_commit: str | None, definition_path: str, purpose
     except PlanError as e:
         print(f"check-plan: {e}", file=sys.stderr)
         return e.code
+
+
+def harness_args(cmd: str) -> tuple[str | None, str] | None:
+    """(definition commit, or None when read at HEAD; definition path) of a well-formed harness
+    check-plan command (push.harness_plan_problem), else None."""
+    if push.harness_plan_problem(cmd):
+        return None
+    opts: dict[str, str] = {}
+    rest = shlex.split(cmd)[2:]
+    while rest:
+        flag, eq, value = rest.pop(0).partition("=")
+        if flag != "--definition-at-head" and not eq:
+            value = rest.pop(0)
+        opts[flag] = value
+    return opts.get("--definition-commit"), opts["--definition-path"]
+
+
+def stale(repo: Path, cmd: str) -> str:
+    """The stale coverage digest the harness check-plan command `cmd` would fail on at HEAD, found
+    without running anything, so `ttp checks` can fail before it queues for a checks slot; it names the
+    commit that last changed the input (another writer's, such as a template upgrade's pre-merge commit,
+    is not the task's own). "" when every digest matches, and on any other problem: the real run
+    reports that one."""
+    args = harness_args(cmd)
+    if not args:
+        return ""
+    definition_commit, definition_path = args
+    try:
+        top = _has(repo, "rev-parse", "--show-toplevel")
+        if top is None:
+            return ""
+        repo = Path(top.decode().strip())
+        head = _read_git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+        definition_commit = definition_commit or head
+        if _has(repo, "cat-file", "-e", f"{definition_commit}^{{commit}}") is None:
+            return ""
+        plan = json.loads(_blob(repo, definition_commit, definition_path))
+        if not isinstance(plan, dict) or set(plan) != {"purpose", "coverage"} or plan["purpose"] != "harness":
+            return ""
+        for path, expected in _scope(plan["coverage"], committed=True)["paths"].items():
+            if why := _uncovered(path, _blob(repo, head, path), expected, definition_path):
+                last = (_has(repo, "log", "-1", "--format=%h %s", head, "--", f":(literal){path}") or b"")
+                last = last.decode(errors="replace").strip()
+                return why + (f"; last changed in {last}" if last else "")
+    except (PlanError, ValueError, UnicodeError):
+        return ""
+    return ""
+
+
+def refresh(repo: Path, definition_path: str, paths: list[str]) -> list[str]:
+    """Rewrite the working copy of the harness definition at `definition_path` so the inputs in
+    `paths` it pins by digest are pinned to their working content. For a definition read at HEAD,
+    committed with those inputs: a commit that changes them carries their digests along. Returns the
+    inputs refreshed (none when the file is not a harness definition)."""
+    file = repo / definition_path
+    try:
+        text = file.read_text()
+        plan = json.loads(text)
+        coverage = plan["coverage"] if isinstance(plan, dict) and plan.get("purpose") == "harness" else None
+        pinned = coverage.get("paths") if isinstance(coverage, dict) else None
+        if not isinstance(pinned, dict):
+            return []
+        done = []
+        for path in paths:
+            expected = pinned.get(path)
+            if not (isinstance(expected, str) and _DIGEST.fullmatch(expected)) or not _path(path):
+                continue
+            input_file = repo / path
+            if input_file.is_symlink() or not input_file.is_file():
+                continue
+            digest = hashlib.sha256(input_file.read_bytes()).hexdigest()
+            if digest != expected:
+                pinned[path] = digest
+                done.append(path)
+    except (OSError, ValueError, UnicodeError):
+        return []
+    if done:
+        indent = 2 if "\n" in text.strip() else None
+        file.write_text(json.dumps(plan, indent=indent) + ("\n" if text.endswith("\n") else ""))
+    return done
 
 
 def command(args) -> None:
