@@ -514,6 +514,53 @@ def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_lin
     assert [e["fingerprint"] for e in _heal_told(p)[1]] == [f"heal:svc:unknown:{t0 + 61 * 60:.0f}"]
 
 
+@pytest.mark.parametrize("exemption", ["owner line", "known outage", "known fault"])
+def test_heal_no_exemption_covers_automatic_recovery_switched_off(env, exemption):
+    """An override that switches a service's last automatic recovery step off must surface, whoever owns the
+    machine: neither an owner line, a known machine outage nor a known_fault keeps it quiet. The same
+    exemption still quiets a result without the recovery-off line."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    kf = {"known_fault": "handed to the backup owner"} if exemption == "known fault" else {}
+    p, d, up = _heal_setup(env, fix=None, machine="box-a", escalate="coordinator", **kf)
+    spec, now = _heal_spec(p), time.time()
+    owner = "echo 'ttp-heal: known backup-owner: recovery drop-in on purpose'; " if exemption == "owner line" else ""
+    if exemption == "known outage":
+        ml.set_outage("box-a", "repair handed to the backup owner", "user", "2d", now=now)
+    quiet = dict(spec, check=f"{owner}echo 'auto power cycle is off'; exit 1")
+    off = dict(spec, check=f"{owner}echo 'auto power cycle is off'; echo '{heal.RECOVERY_OFF}'; exit 75")
+    assert "known" in heal.run(d, "svc", quiet, now)[0]
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    assert heal.classify(75, f"ttp-heal: known x: y\n{heal.RECOVERY_OFF}") == "unhealthy, automatic recovery off"
+    for t in (0, 3600, 86400):   # a day of it: escalated on the first run past grace, never kept quiet
+        out = heal.run(d, "svc", off, now + 1 + t)[0]
+        assert "known" not in out and "quiet" not in out, out
+    assert heal.state(p.db, "svc")["status"] == "unhealthy"
+    assert len(p.db.q("SELECT id FROM tasks WHERE origin='daemon'")) == 1
+
+
+def test_heal_broker_preset_reads_the_services_own_recovery_off_report(env, monkeypatch):
+    """The config flags may read on while the service reports at runtime that a recovery step is disabled:
+    that report counts as recovery off."""
+    from ttp import heal
+    status = {}
+    monkeypatch.setattr(heal, "_shell", lambda cmd, cwd, timeout: (0, json.dumps(status)))
+    bk = heal.validate({"preset": "broker", "status_command": "status", "recovery_off_field": "recovery.disabled"})
+    flags = {"held": False, "auto_power_cycle": True, "auto_reboot": True}
+    for events, off in (([], False), (0, False), (None, False), (["power_cycle disabled"], True), (2, True),
+                        (True, True)):
+        status.clear()
+        status.update(flags, recovery={"disabled": events})
+        rc, out = heal.check(bk, {}, ".")
+        assert (rc, heal.recovery_off(out)) == ((1, True) if off else (0, False)), (events, out)
+    status.update(flags, auto_reboot=False, recovery={})
+    rc, out = heal.check(bk, {}, ".")
+    assert rc == 1 and heal.recovery_off(out) and "auto_reboot is off" in out
+
+
 def test_heal_outage_check_known_owned_runs_never_escalate_as_an_outage(env):
     from ttp import heal
     p, d, up = _heal_setup(env, outage=True, grace_s=600)
@@ -1166,7 +1213,7 @@ def test_heal_presets_read_systemd_and_broker_status(env, monkeypatch):
     out["status"] = (0, json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
     assert heal.check(bk, {}, ".") == (0, "no hold; automatic recovery on")
     out["status"] = (0, json.dumps({"held": True, "auto_power_cycle": False, "auto_reboot": True}))
-    assert heal.check(bk, {}, ".") == (1, "held is set; auto_power_cycle is off")
+    assert heal.check(bk, {}, ".") == (1, f"held is set; auto_power_cycle is off\n{heal.RECOVERY_OFF}")
     out["status"] = (0, json.dumps({"held": False}))
     assert heal.check(bk, {}, ".")[0] == 75
     out["status"] = (255, "ssh: connect failed")
@@ -1220,18 +1267,41 @@ def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outag
     assert alerts.sweep(p.db, now + ceiling + 1001) == [] and "hold_since" in heal.state(p.db, "svc")
     holder.touch()
     heal.run(d, "svc", {**spec, "check": "exit 1"}, now + ceiling + 1200)
+    assert "hold_since" in heal.state(p.db, "svc")   # one clear run does not end the episode
+    clear = now + ceiling + 1200 + heal.HOLD_CLEAR_S
+    heal.run(d, "svc", {**spec, "check": "exit 1"}, clear)
     assert "hold_since" not in heal.state(p.db, "svc")
     if escalate == "user":
-        assert [e["key"] for e in alerts.sweep(p.db, now + ceiling + 1201)] == ["heal-hold:svc"]
+        assert [e["key"] for e in alerts.sweep(p.db, clear + 1)] == ["heal-hold:svc"]
         assert p.db.one("SELECT cleared_why FROM alerts WHERE key='heal-hold:svc'")["cleared_why"] == \
             "condition cleared"
     # The project's heal.untenanted_hold_s sets the ceiling.
     d.cfg.setdefault("heal", {})["untenanted_hold_s"] = 600
     holder.unlink()
-    t1 = now + 2 * ceiling
+    t1 = now + 3 * ceiling
     heal.run(d, "svc", spec, t1)
     heal.run(d, "svc", spec, t1 + 600)
     assert len(pages()[0 if escalate == "user" else 1]) == 2
+
+
+def test_heal_hold_age_counts_from_the_episode_not_the_last_automatic_reset(env):
+    """A loop of failing automatic resets frees the device for a moment between runs: a run that lands in
+    such a gap does not restart the hold's age, so the page still goes at the ceiling from the first run."""
+    from ttp import heal
+    p, d, up = _heal_setup(env)
+    holder = p.root / "holder"
+    spec = _hold_check(p, holder)
+    now, ceiling = time.time(), heal.UNTENANTED_HOLD_S
+    gap = {**spec, "check": "echo 'reset ran; device free'; exit 1"}
+    t = now
+    while t < now + ceiling:
+        heal.run(d, "svc", spec, t)
+        heal.run(d, "svc", gap, t + 600)   # the reset frees it, then it is held again
+        t += 1800
+    heal.run(d, "svc", spec, now + ceiling)
+    assert heal.state(p.db, "svc")["hold_since"] == now
+    assert [a["ref"] for a in p.db.q("SELECT ref FROM messages WHERE kind='alert' AND ref LIKE 'heal-hold:%'")] \
+        == ["heal-hold:svc"]
 
 
 def test_heal_stays_quiet_for_an_ordinary_outage_and_a_user_paused_hold(env):

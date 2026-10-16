@@ -93,8 +93,10 @@ no tenant, so queued work cannot use it. Seen on every run (any exit code, 75 in
 quiet: a known machine outage, a check standing down with 75, a known fault or an observation mute. The
 page is a keyed high alert `heal-hold:<name>` to the user, or with `escalate` "coordinator" one high
 observation. Only a pause of the check's `resource` that the user set, or whose reason names the check,
-keeps it quiet. The alert lives like the check's `heal:<name>` one (cleared_why with `hold`): the sweep
-clears it once a run answers (0 or 1) without the line, the check loses its enabled schedule or heal
+keeps it quiet. Its age is the episode's: the stretch ends only once runs answer (0 or 1) without the line
+for HOLD_CLEAR_S (1 h), so a loop of failing automatic resets that frees the device between two runs never
+restarts it. The alert lives like the check's `heal:<name>` one (cleared_why with `hold`): the sweep
+clears it once that stretch ends, the check loses its enabled schedule or heal
 block, escalation moves to the coordinator or such a pause covers it. An outage keeps silencing
 everything else the check reports.
 
@@ -103,6 +105,12 @@ the box or resource is up and something narrower is wrong. That run counts as pl
 on a check without `outage`: its own grace, its fix, `known_fault` keeps it quiet, the ordinary self-fix
 task, no outage wording, and nothing reported to the machine ledger (an earlier down report clears).
 A check that never prints the line keeps the behaviour above.
+
+Recovery switched off: a check that prints a line `ttp-heal: recovery-off` (RECOVERY_OFF; the broker preset
+prints it while an `auto_fields` flag is off or its optional `recovery_off_field` reports a disabled
+recovery step) counts as unhealthy (exit 1) whatever its exit code, and no exemption covers it: not a
+known, owned state below, a known machine outage, nor a `known_fault`. It runs the normal grace, fix,
+task and escalation, so an override that switches recovery off always surfaces, whoever owns the machine.
 
 Known, owned states: a check that exits 75 or 1 and prints a line `ttp-heal: known <owner>: <why>` (KNOWN_RE)
 says it knows what is going on and who owns it (a pause it reads, a machine outage, a fault handed to a
@@ -174,6 +182,8 @@ KNOWN_RE = re.compile(r"ttp-heal: known ([^:\s][^:]*?): *(\S.*)")   # a check ou
 UNTENANTED = "ttp-heal: untenanted-hold"   # a check output line: a device held with no tenant (module doc)
 UNTENANTED_HOLD_S = 14400       # heal.untenanted_hold_s default: an untenanted hold pages after this long
 HOLD_KEY = "heal-hold:"         # alert key of an untenanted hold's page
+HOLD_CLEAR_S = 3600             # an untenanted hold's stretch ends only once runs answer without it this long
+RECOVERY_OFF = "ttp-heal: recovery-off"   # a check output line: automatic recovery is switched off (module doc)
 # An unknown check result that is only its route failing (module doc): ssh's own exit code, or its words.
 ROUTE_RC = 255
 ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out|no route to host|"
@@ -201,6 +211,7 @@ PRESET_FIELDS: dict[str, dict[str, dict]] = {
     "systemd": {"unit": _TEXT, "user": _FLAG, "host": _TEXT},
     "http": {"url": _TEXT, "expect": {"type": "array", "items": {"type": "integer"}}},
     "broker": {"status_command": _TEXT, "hold_field": _TEXT, "holder_field": _TEXT, "auto_fields": {"type": "array", "items": _TEXT},
+               "recovery_off_field": _TEXT,
                "expected_count": _COUNT, "max_recent_failures": _COUNT},
 }
 _COMMON = set(COMMON_FIELDS)
@@ -454,13 +465,19 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
         problems.append(f"{spec.get('hold_field') or BROKER_HOLD} is set")
         if spec.get("holder_field") and not _field(data, spec["holder_field"]):
             problems.append(f"{spec['holder_field']} is empty\n{UNTENANTED}")
-    missing = []
+    missing, off = [], False
     for f in spec.get("auto_fields") or BROKER_AUTO:
         v = _field(data, f)
         if v is None:
             missing.append(f)
         elif not v:
             problems.append(f"{f} is off")
+            off = True
+    events = _field(data, spec["recovery_off_field"]) if spec.get("recovery_off_field") else None
+    if events and not (isinstance(events, (int, float)) and not isinstance(events, bool) and events <= 0):
+        # The service's own runtime report of a disabled recovery step: it counts whatever the flags say.
+        problems.append(f"{spec['recovery_off_field']} reports recovery disabled: {json.dumps(events)[:200]}")
+        off = True
     for option, field in (("expected_count", "count"), ("max_recent_failures", "recent_failures")):
         if option not in spec:
             continue
@@ -470,7 +487,7 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
         elif (value != spec[option] if option == "expected_count" else value > spec[option]):
             problems.append(f"{field} is {value} ({option} {spec[option]})")
     if problems:
-        return 1, "; ".join(problems)
+        return 1, "; ".join(problems) + (f"\n{RECOVERY_OFF}" if off else "")
     if missing:
         return 75, f"status does not report {', '.join(missing)}"
     return 0, "no hold; automatic recovery on"
@@ -495,8 +512,9 @@ def finding(rc: int, out: str) -> bool:
 
 
 def known_run(rc: int, out: str) -> tuple[str, str] | None:
-    """(owner, why) of a run that exits 75 or 1 with a KNOWN_RE line of its own (module doc), else None."""
-    if rc not in (1, 75):
+    """(owner, why) of a run that exits 75 or 1 with a KNOWN_RE line of its own (module doc), else None;
+    never for a run reporting automatic recovery off (RECOVERY_OFF): no owner covers that."""
+    if rc not in (1, 75) or recovery_off(out):
         return None
     for line in (out or "").splitlines():
         m = KNOWN_RE.fullmatch(line.strip())
@@ -511,9 +529,16 @@ def classify(rc: int, out: str) -> str:
     owned = known_run(rc, out)
     if owned:
         return f"known ({owned[0]}: {owned[1]})"
+    if recovery_off(out):
+        return "unhealthy, automatic recovery off"
     if finding(rc, out):
         return "unhealthy, not an outage"
     return {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
+
+
+def recovery_off(out: str) -> bool:
+    """A check result that reports automatic recovery switched off: a RECOVERY_OFF line in its output."""
+    return any(line.strip() == RECOVERY_OFF for line in (out or "").splitlines())
 
 
 def untenanted(out: str) -> bool:
@@ -743,6 +768,12 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     from . import pauseends
     pauses = pauseends.owned(p)
     rc, out = check(spec, st, cwd, env)
+    off = recovery_off(out)
+    if off:   # recovery switched off is unhealthy whatever the exit code, and no exemption covers it
+        rc = 1
+        st["recovery_off"] = True
+    else:
+        st.pop("recovery_off", None)
     pauseends.health_result(p, name, rc, now, pauses)
     ping = getattr(host, "_progress", None)
     if callable(ping):
@@ -752,7 +783,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     _untenanted_hold(host, name, spec, st, rc, out, now)
     live = known_outage(spec, now)
     # An outage covering other parts: this result is handled normally, in the episode it is in.
-    known = live if live and outage_explains(live[1], name, spec, rc, out) else None
+    known = live if live and not off and outage_explains(live[1], name, spec, rc, out) else None
     if known:
         st["known_outage"] = known[0]
     elif st.pop("known_outage", None) and not live:   # the known outage ended: a check still failing gets its grace,
@@ -783,7 +814,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if rc == 0:
         was = st.get("status")
         nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported",
-                                  "hold_since", "known_key", "known_since", "known_ended")
+                                  "hold_since", "hold_clear_since", "known_key", "known_since", "known_ended")
                if k in st}   # a flapping fault keeps its end
         _save(db, name, {**nxt, "status": "healthy"})
         t = db.task(int(st["task"])) if st.get("task") else None
@@ -848,7 +879,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if known:
         return _quiet_outage(host, name, st, known, now)
     kf = known_fault(spec)
-    if kf and _confirmed(spec, st, now) and _known_covers(kf, st):
+    if kf and not off and _confirmed(spec, st, now) and _known_covers(kf, st):
         key = _known_key(kf)
         if st.get("known_key") != key:   # first applied (or changed): its implicit end counts from now
             st.update(known_key=key, known_since=now)
@@ -1107,9 +1138,15 @@ def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: s
     repeats quiet and the alerts sweep ends it (cleared_why with `hold`). Changes `st`; its caller saves it."""
     db = host.p.db
     if not untenanted(out):
-        if rc in (0, 1):
-            st.pop("hold_since", None)
+        # The stretch is the episode: only answers without the line for HOLD_CLEAR_S end it, so a loop of
+        # failing automatic resets that frees the device for a moment between runs never restarts its age.
+        if rc in (0, 1) and "hold_since" in st:
+            clear = float(st.setdefault("hold_clear_since", now))
+            if now - clear >= HOLD_CLEAR_S:
+                st.pop("hold_since", None)
+                st.pop("hold_clear_since", None)
         return
+    st.pop("hold_clear_since", None)
     since = float(st.setdefault("hold_since", now))
     ceiling = _untenanted_s(host)
     if now - since < ceiling or _hold_known(db, spec, name):
@@ -1225,8 +1262,9 @@ def _confirmed(spec: dict, st: dict, now: float) -> bool:
 
 
 def _known_fault(spec: dict, st: dict, now: float) -> bool:
-    """A live known fault (its match finds the output, its end has not passed) covers a confirmed failure."""
-    return _confirmed(spec, st, now) and bool(_known_live(spec, st, now))
+    """A live known fault (its match finds the output, its end has not passed) covers a confirmed failure,
+    never one with automatic recovery switched off (RECOVERY_OFF)."""
+    return not st.get("recovery_off") and _confirmed(spec, st, now) and bool(_known_live(spec, st, now))
 
 
 def _known_ended(db: DB, name: str, kf: dict, st: dict, now: float) -> None:
