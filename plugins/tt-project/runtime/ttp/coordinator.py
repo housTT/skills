@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, hostcycle, jevuse, landed, machine_ledger, machines, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -101,7 +101,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
-            "milestone": {"type": "string"},
+            "milestone": {"type": "string"}, "promise": {"type": "string"},
             "milestones": {"type": "array", "items": {"type": "object", "properties": {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
@@ -241,7 +241,7 @@ EFFORT_EVENT_TRIGGERS = {
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
     "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
-    "missing_task_ref": "stuck",
+    "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck",
     "review_stall": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
@@ -884,6 +884,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 when = "waits for the user"
             lines.append(f"- ask #{b['id']} ({when}): {b['text'][:300]}")
     section("asks", lines)
+    section("promises", obligations.promise_lines(db, now, home))
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
                 "ORDER BY id DESC LIMIT ?", (RECENT_OUT,))
@@ -1301,6 +1302,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     rules_added: list[tuple[str, str]] = []
     restr_edited = False
     replies: list[int] = []
+    # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
+    # their reply_chat, and whether it recorded or attached an obligation.
+    sent: list[tuple[int, str | None, str]] = []
+    batch_tasks: dict[int, str | None] = {}
+    tracked = False
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
@@ -1316,6 +1322,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 chat = a.get("chat") or default_chat
                 replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                        severity=_norm_severity(a.get("severity") or "normal")))
+                sent.append((replies[-1], chat, a["text"]))
             elif t == "task_add":
                 title = str(a.get("title") or "").strip()
                 missing = [f for f, v in (("title", title), ("spec", str(a.get("spec") or "").strip())) if not v]
@@ -1473,6 +1480,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
                                          labels=labels, not_before=after,
                                          parent=followup["id"] if followup else None)
+                    batch_tasks[new_id] = a.get("reply_chat") or None
                     for r in {r["id"]: r for n, r in autos.items() if n not in started}.values():
                         db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
                         _take_over_dependents(db, r["id"], new_id)
@@ -1513,6 +1521,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 task = db.task(int(a["id"]))
                 if not task:
                     raise ValueError(f"no task #{a.get('id')}")
+                batch_tasks[task["id"]] = task["reply_chat"]
                 upd: dict[str, Any] = {}
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
                     if task["status"] == "running" and a["status"] != "cancelled":
@@ -1763,7 +1772,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg)
                 if why:
                     raise ValueError(f"notify rejected: {why}")
-                db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
+                sent.append((db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity"))),
+                             None, a["text"]))
             elif t == "memory_add":
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
@@ -1962,6 +1972,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
                     notes.append(f"obligation {oid} recorded")
+                    tracked = True
                 elif str(a.get("evidence") or "").strip():
                     notes.append(obligations.record(p, oid, "receipt", str(a["evidence"]), None,
                                                      milestone=a.get("milestone")))
@@ -1973,6 +1984,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             obligations.add_milestones(p, oid, a["milestones"])
                         if owners:
                             obligations.attach(p, oid, owners)
+                            tracked = True
                 else:
                     raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach), "
                                      "`milestones` (add), `evidence` (receipt, optional `milestone`) or `why` (drop)")
@@ -2023,6 +2035,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             f"turn went through")
     if user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
+    try:   # a reply already went out: recording its promise never undoes or rejects it
+        from . import obligations
+        notes += obligations.record_promises(p, sent, batch_tasks, tracked)
+    except Exception as e:
+        notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
     db.set_kv(NOTES_KEY, notes)
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.

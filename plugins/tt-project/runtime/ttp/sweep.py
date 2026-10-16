@@ -37,7 +37,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, obligations, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -166,6 +166,16 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                     "status": "paused", "spec_sha": "",
                     # A pause the user set is lifted on their word only; no turn needs to re-check it.
                     "ends": "user" if v.get("by") == "user" else None})
+    for o in obligations.open_promises(db):
+        pr, late = o["promise"], now >= o["promise"]["due"]
+        out.append({"key": f"promise:{o['id']}", "kind": "promise", "task": None, "resource": None,
+                    "promise": o["id"], "title": o["text"], "age_s": max(0.0, now - float(o["created"])),
+                    "since": o["created"], "status": "overdue" if late else "promised", "spec_sha": "",
+                    "reason": f"promised in chat {pr['chat']} (message #{pr['message']}), due "
+                              f"{timefmt.long(pr['due'], where)}" + (" OVERDUE" if late else "")
+                              + (f", owner #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else ""),
+                    # Not due yet: listed, no outcome needed; overdue: an item like any other.
+                    "ends": None if late else "due"})
     return out
 
 
@@ -398,9 +408,11 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
 def _item_key(a: dict) -> str:
     if a.get("id") is not None:
         return f"task:{int(a['id'])}"
+    if str(a.get("promise") or "").strip():
+        return f"promise:{str(a['promise']).strip()}"
     name = str(a.get("resource") or "").strip()
     if not name:
-        raise ValueError("sweep needs `id` (a task) or `resource` (a paused resource)")
+        raise ValueError("sweep needs `id` (a task), `promise` (its obligation id) or `resource` (a paused resource)")
     return f"resource:{name}"
 
 
@@ -414,6 +426,13 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None) -> 
     key = _item_key(a)
     if key.startswith("task:") and not db.task(int(key[5:])):
         raise ValueError(f"no task #{key[5:]}")
+    if key.startswith("promise:"):
+        o = obligations.get(db, key[8:])
+        if not o or not o.get("promise"):
+            raise ValueError(f"no promise {key[8:]}")
+        if outcome in ("closed", "retired"):   # kept or no longer owed: the promise is closed
+            obligations.close_promise(db, key[8:], f"sweep {outcome}: " + str(a.get("why") or a.get("reason") or ""),
+                                      "coordinator", now)
     o = {"outcome": outcome, "ts": now, "sweep": int((db.kv(STATE_KEY, {}) or {}).get("n") or 0)}
     if outcome == "still_blocked":
         o.update(until=_clip(a.get("until") or a.get("reason") or "", 300),
@@ -454,7 +473,7 @@ def _last_check(o: dict | None, now: float) -> str:
 def _header(n: int, carry: int = 0) -> str:
     return (f"## Blocker sweep (high effort): {n} item(s)" + (f", {carry} CARRIED" if carry else "")
             + ". Return exactly one `sweep` action per item not marked CARRIED, "
-            "with `id` (task) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
+            "with `id` (task), `promise` (its id) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
             "closed) | still_blocked (both required: `until_probe` or `until`, the concrete condition, AND "
             "`start_after`, the next check: a delay such as 90m, 6h or 3d, or an ISO time such as "
             "2026-10-05T09:00 in the home zone) | human_indispensable (`why`). A CARRIED item keeps its last "
@@ -467,10 +486,18 @@ def _carries(i: dict, state: dict, outs: dict, now: float) -> bool:
         and carried(outs.get(i["key"]), i, now)
 
 
+def _who(i: dict, n: int) -> str:
+    if i["task"]:
+        return f"#{i['task']} {_clip(i['title'], n)}"
+    if i.get("promise") or i["key"].startswith("promise:"):
+        return f"promise {i['key'][8:]} {_clip(i['title'], n)}"
+    return f"resource {i['resource']}"
+
+
 def _line(i: dict, state: dict, outs: dict, now: float) -> str:
-    who = f"#{i['task']} {_clip(i['title'], 70)}" if i["task"] else f"resource {i['resource']}"
+    who = _who(i, 70)
     if i.get("ends") and _carries(i, state, outs, now):
-        what = "HELD BY USER PAUSE" if i["ends"] == "user" else "DEFERRED"
+        what = {"user": "HELD BY USER PAUSE", "due": "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
         return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
     if _carries(i, state, outs, now):
         return f"- {who} | CARRIED (no action): {_last_check(outs.get(i['key']), now)}"
@@ -494,6 +521,11 @@ def _settled(db: DB, key: str) -> dict:
                 "title": t["title"] if t else "(no longer exists)", "age_s": None, "since": None,
                 "reason": f"no longer stuck (now {status}): record closed or unblocked", "status": status,
                 "spec_sha": _spec_sha(t) if t else "", "ends": None}
+    if kind == "promise":
+        o = obligations.get(db, ident) or {}
+        return {"key": key, "kind": "resolved", "task": None, "resource": None, "promise": ident,
+                "title": o.get("text") or "(no longer exists)", "age_s": None, "since": None,
+                "reason": "promise closed: record closed", "status": "closed", "spec_sha": "", "ends": None}
     return {"key": key, "kind": "resumed", "task": None, "resource": ident, "title": ident, "age_s": None,
             "since": None, "reason": "no longer paused: record closed or unblocked", "status": "resumed",
             "spec_sha": "", "ends": None}
@@ -579,7 +611,7 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
         return [f"nothing stuck longer than {hours:g}h"]
     out = []
     for i in sorted(rows, key=lambda x: -x["age_s"]):
-        who = f"#{i['task']} {_clip(i['title'], 60)}" if i["task"] else f"resource {i['resource']}"
+        who = _who(i, 60)
         o = outs.get(i["key"])
         out.append(f"{who}: {i['kind']} {_dur(i['age_s'])}: {i['reason'] or 'no reason given'}; sweep: "
                    + (f"{o['outcome']} {_dur(now - float(o['ts']))} ago" if o

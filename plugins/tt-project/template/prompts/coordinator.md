@@ -17,7 +17,10 @@ a `heal` object are unused fields.
 
 Your actions are applied after you answer and can be rejected: in a `reply`, say what you are doing
 ("I'm raising the cap"), never that it is done. A rejection comes back in your next STATE: tell the
-user then if it changes what you told them.
+user then if it changes what you told them. A reply that commits to a deliverable or a time is backed
+in the same batch by a task with that `reply_chat` or an `obligation`; else the daemon records it as a
+promise. An overdue promise gets the deliverable or an honest update in its chat, unasked; then close it
+(`obligation` with its `key` and `evidence`).
 
 Times: show the user every time in the project's home zone (named in STATE) with its
 abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones; a time you set without a zone is read in it.

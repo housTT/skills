@@ -34,6 +34,20 @@ stall is caught only by the 2 h progress rule (or a milestone falling due). A da
 was dropped: it took ordinary waits, backoffs and review stacks for stuck owners and woke the coordinator.
 
 A mistaken or no longer wanted obligation is withdrawn with `ttp obligation drop <id> "<why>"`.
+
+Promises: a coordinator `reply` or `notify` that commits to a deliverable or a time ("I'll report the
+sha by 15:00", "ETA 18:30") is recorded as an obligation with a `promise` field (record_promises, called
+when the turn's actions are applied): the chat, the message, the promised sentences, the due time (the
+first time named, in the project's home zone; else coordinator.promise_default_h, PROMISE_DEFAULT_H,
+after the reply) and the tasks of the same batch that will reply to that chat (task_add or task_update
+with that `reply_chat`). A batch that records or attaches an obligation is taken to track its promises
+itself: no second record. The same promise sent again to the same chat updates the open record. A
+promise has no owner clocks: it is due once, at its due time, when check() raises one high
+`promise_overdue` event (`obligation:<id>:promise:<due>`). It closes like any obligation (receipt or drop,
+the coordinator's `obligation` action), on a blocker sweep outcome `closed` or `retired`, or by itself
+once all its tasks finished and a reply went to its chat after that. Detection is conservative
+(first-person future plus a delivery verb, or plus a time; never a question or an offer): a commitment
+worded otherwise is not caught, and the coordinator prompt asks for a task or obligation to back it.
 """
 from __future__ import annotations
 
@@ -54,6 +68,10 @@ CLOSED = ("done", "failed", "cancelled")
 TEXT_MAX = 500
 EVIDENCE_MAX = 300
 EVIDENCE_KEPT = 10
+PROMISE_DEFAULT_H = 6.0       # coordinator.promise_default_h: when a promise naming no time is due
+PROMISE_KIND = "promise_overdue"
+PROMISE_TEXT_MAX = 300
+PROMISE_FINISH_SLACK_S = 60   # a reply this close before an owner's last update still counts as after it
 
 
 def _load(db) -> dict:
@@ -178,6 +196,7 @@ def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> s
             return f"{oid} was already dropped"
         o["dropped"] = {"at": now, "by": by, "why": why}
         _retire(p.db, now, "obligation dropped", prefix=f"obligation:{oid}:milestone:")
+        _retire(p.db, now, "promise dropped", prefix=f"obligation:{oid}:promise")
         p.db.set_kv(KV, st)
     return f"{oid} dropped; it is no longer owed"
 
@@ -297,6 +316,7 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
         else:
             o["receipt"] = {"at": now, "task": task, "evidence": evidence}
             _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
+            _retire(p.db, now, "promise kept", prefix=f"obligation:{oid}:promise")
             msg = f"{oid} has its receipt; it is no longer owed"
         p.db.set_kv(KV, st)
     return msg
@@ -372,8 +392,9 @@ def _last(own: dict) -> float:
 
 
 def overdue(o: dict, now: float) -> list[tuple[str, float]]:
-    """(owner task id, or "" for no owner; seconds since its last durable progress) for each clock run out."""
-    if o["receipt"] or o.get("dropped"):
+    """(owner task id, or "" for no owner; seconds since its last durable progress) for each clock run out.
+    A promise has no owner clocks: only its due time counts (promise_late)."""
+    if o["receipt"] or o.get("dropped") or o.get("promise"):
         return []
     if not o["owners"]:
         age = now - float(o["created"])
@@ -465,6 +486,7 @@ def check(p, now: float | None = None) -> list[str]:
         changed = False
         for o in st["items"].values():
             changed = _check_milestones(p, o, now, raised) or changed
+            changed = _check_promise(p, o, now, raised) or changed
             late = overdue(o, now)
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
@@ -507,6 +529,8 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
             state = f"received ({o['receipt']['evidence'][:80]})"
         elif o.get("dropped"):
             state = f"dropped ({o['dropped']['why'][:80]})"
+        elif o.get("promise"):
+            state = "promised; " + _promise_state(o, now, where)
         else:
             late = {t for t, _ in overdue(o, now)}
             owners = ", ".join(
@@ -521,3 +545,227 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
                     state += " OVERDUE"
         out.append(f"{o['id']}  {o['text'][:100]}  [{state}]")
     return out
+
+
+# promises -----------------------------------------------------------------------------------------
+_FUTURE = r"\b(?:I|we)(?:'ll|’ll|\s+will|\s+shall|\s+am going to|'m going to|’m going to|\s+are going to|'re going to|’re going to)\s+(?!not\b|never\b)"
+_DELIVER = (r"(?:report|deliver|share|confirm|follow up|come back|get back|circle back|let you know|tell you|"
+            r"update you|ping you|reply|write (?:it |this |that )?up|send (?:you|it over|back|an update|word)|"
+            r"post (?:it|them|an update|updates|the results?|back|here)|have (?:it|them|the|a|an|your|that|this)\b"
+            r"[^.;!?]{0,80}?\bready)\b")
+COMMIT_RE = re.compile(_FUTURE + r"(?:[\w'’-]+\s+){0,3}?" + _DELIVER, re.I)
+FUTURE_RE = re.compile(_FUTURE + r"|\byou(?:'ll|’ll|\s+will)\s+(?:have|get|see|hear)\b", re.I)
+ETA_RE = re.compile(r"\bETA\b", re.I)
+OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want me to|"
+                      r"shall I|would you like)\b", re.I)
+CLOCK_RE = re.compile(r"\b(?P<h>[01]?\d|2[0-3])(?::(?P<m>[0-5]\d))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*(?P<utc>UTC|GMT)\b)?", re.I)
+IN_RE = re.compile(r"\b(?:in|within)\s+(?:about\s+|around\s+|roughly\s+|~)?(?P<n>\d+(?:\.\d+)?)\s*"
+                   r"(?P<u>minutes?|mins?|m|hours?|hrs?|h)\b", re.I)
+DAY_RE = re.compile(r"\b(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(?P<d>[0-3]?\d)\b", re.I)
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text or "") if s.strip()]
+
+
+def _has_time(sentence: str) -> bool:
+    return bool(IN_RE.search(sentence) or any(m.group("m") or m.group("ap") for m in CLOCK_RE.finditer(sentence)))
+
+
+def commitments(text: str) -> list[str]:
+    """The sentences of `text` that commit the sender to a deliverable or a time: first-person future with
+    a delivery verb ("I'll report back"), first-person future with a time ("we'll have it by 15:00"), or
+    an ETA with a time. Never a question or an offer ("if you want, I'll ...")."""
+    out = []
+    for s in _sentences(text):
+        if s.endswith("?") or OFFER_RE.search(s):
+            continue
+        timed = _has_time(s)
+        if COMMIT_RE.search(s) or (timed and (FUTURE_RE.search(s) or ETA_RE.search(s))):
+            out.append(s)
+    return out
+
+
+def promise_due(text: str, now: float, tz) -> float | None:
+    """The first time `text` names, as an epoch: 'in 90 min', '15:00', '3pm', '15:00 UTC', with 'tomorrow'
+    or a 'Oct 15' date. A bare clock time is its next occurrence after `now`, in the zone `tz`."""
+    from datetime import timedelta, timezone
+    m = IN_RE.search(text)
+    clock = next((c for c in CLOCK_RE.finditer(text) if c.group("m") or c.group("ap")), None)
+    if m and (not clock or m.start() < clock.start()):
+        n = float(m.group("n"))
+        return now + n * (60 if m.group("u").lower().startswith("m") else 3600)
+    if not clock:
+        return None
+    h, mi, ap = int(clock.group("h")), int(clock.group("m") or 0), (clock.group("ap") or "").lower()
+    if ap and not 1 <= h <= 12:
+        return None
+    if ap.startswith("p") and h != 12:
+        h += 12
+    elif ap.startswith("a") and h == 12:
+        h = 0
+    zone = timezone.utc if clock.group("utc") else tz
+    base = datetime.fromtimestamp(now, zone)
+    day = DAY_RE.search(text)
+    if day:
+        try:
+            when = base.replace(month=MONTHS.index(day.group("mon")[:3].lower()) + 1, day=int(day.group("d")),
+                                hour=h, minute=mi, second=0, microsecond=0)
+        except ValueError:
+            return None
+        if when.timestamp() < now - 180 * 86400:   # a date early in the year said late in the last one
+            when = when.replace(year=when.year + 1)
+        return when.timestamp()
+    when = base.replace(hour=h, minute=mi, second=0, microsecond=0)
+    if re.search(r"\btomorrow\b", text, re.I):
+        when += timedelta(days=1)
+    elif when.timestamp() <= now:
+        when += timedelta(days=1)
+    return when.timestamp()
+
+
+def default_h(cfg: dict) -> float:
+    try:
+        v = float(((cfg or {}).get("coordinator") or {}).get("promise_default_h", PROMISE_DEFAULT_H))
+    except (TypeError, ValueError):
+        return PROMISE_DEFAULT_H
+    return v if math.isfinite(v) and v > 0 else PROMISE_DEFAULT_H
+
+
+def _chat(c) -> str:
+    return "all" if c in (None, "", "all") else str(c)
+
+
+def _open(o: dict) -> bool:
+    return not (o["receipt"] or o.get("dropped"))
+
+
+def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
+                    tracked: bool = False, now: float | None = None) -> list[str]:
+    """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
+    tasks by id with their reply_chat; one replying to a promise's chat owns it. `tracked`: the batch
+    recorded or attached an obligation, which tracks its promises itself. Returns a note per promise."""
+    now = time.time() if now is None else now
+    found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
+    if not found:
+        return []
+    if tracked:
+        return [f"promise in message #{mid} is tracked by this batch's obligation" for mid, _, _ in found]
+    from . import timefmt
+    tz = timefmt.tzinfo(p)
+    hours = default_h(p.config())
+    notes = []
+    with p.db.tx():
+        st = _load(p.db)
+        for mid, chat, said in found:
+            text = " ".join(" ".join(said).split())[:PROMISE_TEXT_MAX]
+            due = next((d for s in said if (d := promise_due(s, now, tz)) is not None), None)
+            owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat)
+            same = next((o for o in st["items"].values() if _open(o) and o.get("promise")
+                         and o["promise"]["chat"] == chat and o["text"] == text), None)
+            if same:
+                pr = same["promise"]
+                pr["tasks"] = sorted(set(pr["tasks"]) | set(owners))
+                if pr["message"] == mid:
+                    continue   # the same turn applied again
+                pr["message"] = mid
+                if due is not None and due != pr["due"]:
+                    pr.update(due=due, timed=True, raised=None)
+                notes.append(f"promise {same['id']} in chat {chat} updated from message #{mid}")
+                continue
+            oid = f"o{st['next']}"
+            st["next"] += 1
+            st["items"][oid] = {"id": oid, "text": text, "by": "coordinator", "created": now, "owners": {},
+                                "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": [],
+                                "promise": {"chat": chat, "message": mid, "due": due if due else now + hours * 3600,
+                                            "timed": due is not None, "tasks": owners, "raised": None}}
+            notes.append(f"promise {oid} recorded from message #{mid}: due {timefmt.long(st['items'][oid]['promise']['due'], p)}"
+                         + (f", owned by #{', #'.join(map(str, owners))}" if owners else ", no task owns it"))
+        p.db.set_kv(KV, st)
+    return notes
+
+
+def _kept(db, o: dict) -> str | None:
+    """Evidence that a promise's tasks all finished and a reply went to its chat after the last of them."""
+    pr = o["promise"]
+    if not pr["tasks"]:
+        return None
+    rows = db.q(f"SELECT id, status, updated FROM tasks WHERE id IN ({','.join('?' * len(pr['tasks']))})", pr["tasks"])
+    if len(rows) < len(pr["tasks"]) or any(r["status"] not in CLOSED for r in rows):
+        return None
+    finished = max(float(r["updated"] or 0) for r in rows)
+    chat = None if pr["chat"] == "all" else pr["chat"]
+    m = db.one("SELECT id FROM messages WHERE direction='out' AND kind='reply' AND id>? AND ts>=? "
+               "AND (chat IS NULL OR chat=?) ORDER BY id LIMIT 1",
+               (int(pr["message"] or 0), finished - PROMISE_FINISH_SLACK_S, chat))
+    return m and f"#{', #'.join(str(r['id']) for r in rows)} finished; reply #{m['id']} went to the chat"
+
+
+def _check_promise(p, o: dict, now: float, raised: list[str]) -> bool:
+    """Close a kept promise, or raise its one overdue event. Returns whether `o` changed."""
+    pr = o.get("promise")
+    if not pr or not _open(o):
+        return False
+    fp = f"obligation:{o['id']}:promise"
+    kept = _kept(p.db, o)
+    if kept:
+        o["receipt"] = {"at": now, "task": None, "evidence": kept}
+        _retire(p.db, now, "promise kept", prefix=fp)
+        return True
+    if now < pr["due"] or pr.get("raised") is not None:
+        return False
+    from . import timefmt
+    pr["raised"] = now
+    owners = ", ".join(f"#{t}" for t in pr["tasks"]) or "no task"
+    text = (f"Promise {o['id']} to the user is overdue (due {timefmt.long(pr['due'], p)}"
+            + ("" if pr["timed"] else ", the default for a promise naming no time")
+            + f"): in chat {pr['chat']}, message #{pr['message']}, you said: {o['text']}\n"
+              f"Owner: {owners}. Send the deliverable or an honest update in that chat now, without being asked "
+              f"(new ETA and why). Then close it: `obligation` with key {o['id']} and `evidence` (what was sent) "
+              f"or `why` (no longer owed). A new promise in the update is tracked anew.")
+    fp += f":{int(pr['due'])}"   # a promise given a new due time can fall due once more
+    if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None):
+        raised.append(fp)
+    return True
+
+
+def _promise_state(o: dict, now: float, where) -> str:
+    from . import timefmt
+    pr = o["promise"]
+    late = now >= pr["due"]
+    return (f"chat {pr['chat']}, message #{pr['message']}, "
+            + (f"owner #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else "no owner task")
+            + f"; due {timefmt.long(pr['due'], where)}" + ("" if pr["timed"] else " (default)")
+            + (f" OVERDUE {(now - pr['due']) / 3600:.1f} h" if late else ""))
+
+
+def open_promises(db) -> list[dict]:
+    return [o for o in items(db) if o.get("promise") and _open(o)]
+
+
+def promise_lines(db, now: float | None = None, where=None) -> list[str]:
+    """The digest's section: every open promise, overdue ones first."""
+    now = time.time() if now is None else now
+    rows = sorted(open_promises(db), key=lambda o: o["promise"]["due"])
+    if not rows:
+        return []
+    late = sum(1 for o in rows if now >= o["promise"]["due"])
+    out = [f"## Promises made in chat: {len(rows)} open" + (f", {late} OVERDUE" if late else "")
+           + " (send each deliverable or an honest update in its chat; close with `obligation` key + evidence)"]
+    out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}]" for o in rows]
+    return out
+
+
+def close_promise(db, oid: str, why: str, by: str, now: float | None = None) -> bool:
+    """Close an open promise (a blocker sweep outcome); False when `oid` is no open promise."""
+    now = time.time() if now is None else now
+    with db.tx():
+        st = _load(db)
+        o = st["items"].get(oid)
+        if not o or not o.get("promise") or not _open(o):
+            return False
+        o["receipt"] = {"at": now, "task": None, "evidence": (" ".join(str(why or "").split()) or by)[:EVIDENCE_MAX]}
+        _retire(db, now, "promise closed", prefix=f"obligation:{oid}:promise")
+        db.set_kv(KV, st)
+    return True
