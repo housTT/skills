@@ -257,7 +257,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 <!-- /ttp:if wait -->
 - Write large results incrementally, flushing as you go and before any step that may reset the host.
-- A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch (sha256 in the notes; follow exec indirection and snapshot every executable it launches; for `journalctl` over boots, see watchers.md). Edit shared scripts via a temporary file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
+- A long-running script in a shared non-git directory (local or remote) runs from a private snapshot taken at launch (sha256 in the notes; follow exec indirection and snapshot every executable it launches; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temporary file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
 - A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or the harness says you passed the split line, finish the step, commit and hand off `done` with a
