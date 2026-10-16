@@ -189,7 +189,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   prints, `ttp detach --check --host <alias> <dir>/<name>`: 0 once the job exited 0, 4 once it
   failed or is gone (your `on_pass_cmd` then decides, else you wake with its exit code), 1 while it
   runs, 255 while ssh fails. To also wake on a new result row, add `--rows <file> --after <n>` (0 on a
-  new row, the end or a dead driver). Never a bare `ssh <host> test -e <marker>`: a driver killed by a
+  new row, the end or a dead driver). It tells a host reboot from a crash. A long device run appends
+  and fsyncs each step's result as it ends, not only an end-of-run summary. Never a bare `ssh <host> test -e <marker>`: a driver killed by a
   reboot never writes it. Copy a script to a
   host under a temporary name, then `mv` it into place (overwriting a running one corrupts it).
   Stop a driver by its process group (`kill -- -<pgid>`).

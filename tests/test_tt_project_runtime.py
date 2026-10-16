@@ -31508,7 +31508,9 @@ def test_a_detached_job_gone_without_an_exit_code_says_why(env, monkeypatch):
     assert detach.state(run_dir / "never.rc") == ("lost", detach.lost(run_dir / "never.rc").read_text().strip())
     assert "never started" in detach.state(run_dir / "never.rc")[1]
     assert "killed after it started" in detach.state(run_dir / "killed.rc")[1]
+    assert "same boot: it crashed" in detach.state(run_dir / "killed.rc")[1]
     assert "host restarted" in detach.state(run_dir / "reboot.rc")[1]
+    assert "driver died with the host reboot" in detach.state(run_dir / "reboot.rc")[1]
     assert all(locks.job_ended(run_dir / f"{n}.rc") for n in ("never", "killed", "reboot"))
     # A job the daemon did not start in time is recorded as lost, never started late.
     monkeypatch.setenv("TTP_PIDNS", "pid:[1]")
@@ -31655,7 +31657,7 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
         assert boot.strip(), "the boot is recorded (boot_id, or kern.boottime without /proc)"
         (rdir / "long.boot").write_text("another-boot\n")
         gone = _ttp_run(p, *probe[1:], env=e)
-        assert gone.returncode == 4 and "gone without an exit code" in gone.stdout, gone.stdout
+        assert gone.returncode == 4 and "gone without an exit code (driver died with the host reboot" in gone.stdout, gone.stdout
         (rdir / "long.boot").write_text(boot)
         assert _ttp_run(p, *probe[1:], env=e).returncode == 1
     finally:
@@ -31665,7 +31667,7 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
     while time.time() < deadline and _ttp_run(p, *probe[1:], env=e).returncode == 1:
         time.sleep(0.1)
     gone = _ttp_run(p, *probe[1:], env=e)
-    assert gone.returncode == 4 and "gone without an exit code (killed, or the host restarted)" in gone.stdout
+    assert gone.returncode == 4 and "gone without an exit code (the driver crashed or was killed: same boot" in gone.stdout
     assert not (rdir / "long.rc").exists()
     # A pid now taken by another process (its start differs) is gone too.
     (rdir / "long.pid").write_text(f"{os.getpid()}\n")
@@ -31746,7 +31748,7 @@ def test_detach_remote_check_rows_wakes_on_a_new_row_the_end_or_a_dead_driver(en
         boot = (rdir / "rowjob.boot").read_text()
         (rdir / "rowjob.boot").write_text("another-boot\n")
         r = _ttp_run(p, *probe, env=e)
-        assert r.returncode == 0 and "the host restarted" in r.stdout, r.stdout
+        assert r.returncode == 0 and "driver died with the host reboot" in r.stdout, r.stdout
         (rdir / "rowjob.boot").write_text(boot)
         assert _ttp_run(p, *probe, env=e).returncode == 1
     finally:
@@ -31886,14 +31888,14 @@ def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, 
         assert sh(check, rdir / "job") == "boot"
         booted.write_text("1700000000")
         (rdir / "job.pid").write_text(f"{os.getpid()}\n")   # the pid now belongs to another process
-        assert sh(check, rdir / "job") == "gone"
+        assert sh(check, rdir / "job") == "gone same"
         (rdir / "job.pid").write_text(f"{pid}\n")
     finally:
         _kill_driver(pid)
     deadline = time.time() + 20
-    while time.time() < deadline and sh(check, rdir / "job") != "gone":
+    while time.time() < deadline and sh(check, rdir / "job") != "gone same":
         time.sleep(0.1)
-    assert sh(check, rdir / "job") == "gone"
+    assert sh(check, rdir / "job") == "gone same"
     # With kern.bootsessionuuid (macOS), the uuid is the boot: a stepped clock that moves kern.boottime is
     # no reboot, and a .boot an older version wrote with kern.boottime's seconds still names this boot.
     (tmp_path / "uuid").write_text("6A1C0E4B-0000-4000-8000-000000000001")
@@ -31913,6 +31915,76 @@ def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, 
         assert sh(check, rdir / "job2") == "boot"
     finally:
         _kill_driver(pid)
+
+
+def test_detach_remote_check_tells_a_host_reboot_from_a_crash_and_an_unreadable_boot_id(env, tmp_path, monkeypatch, capsys):
+    """A remote driver gone without a .rc: the boot id recorded at launch, against the host's current
+    one, says which. Same boot = it crashed or was killed; changed = it died with the host reboot;
+    none recorded or none readable now = unknown, never read as a reboot. Simulated without /proc."""
+    from ttp import cli
+    noproc, fake = str(tmp_path / "noproc") + "/", tmp_path / "fakebin"
+    fake.mkdir()
+    booted = tmp_path / "booted"
+    _fake_sysctl(fake, booted, tmp_path / "no-uuid")
+    start, check = (x.replace("/proc/", noproc) for x in (cli._REMOTE_START, cli._REMOTE_CHECK))
+    e = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+    if not shutil.which("setsid"):
+        (fake / "setsid").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (fake / "setsid").chmod(0o755)
+    rdir = tmp_path / "remote"
+
+    def sh(script, *args):
+        return subprocess.run(["sh", "-c", script, "sh", *map(str, args)], env=e, capture_output=True, text=True,
+                              timeout=30).stdout.strip()
+
+    def gone(job):
+        pid = int((rdir / f"{job}.pid").read_text())
+        _kill_driver(pid)
+        deadline = time.time() + 20
+        while time.time() < deadline and sh(check, rdir / job).startswith("running"):
+            time.sleep(0.1)
+
+    booted.write_text("1700000000")
+    assert sh(start, rdir, "job", "sleep", "60").startswith("started ")
+    gone("job")
+    assert sh(check, rdir / "job") == "gone same"   # same boot: a crash or a kill
+    booted.write_text("1700099999")
+    assert sh(check, rdir / "job") == "boot"        # the boot id changed: the host rebooted
+    booted.unlink()                                  # the boot id cannot be read now
+    assert sh(check, rdir / "job") == "gone unknown"
+    assert sh(start, rdir, "blind", "sleep", "60").startswith("started ")
+    assert (rdir / "blind.boot").read_text() == "", "no boot id was readable at launch"
+    booted.write_text("1700000000")
+    gone("blind")
+    assert sh(check, rdir / "blind") == "gone unknown"
+
+    # What the probe (and so the wake, which carries its output) says for each answer; all exit 4.
+    answers = {"boot": "driver died with the host reboot", "gone same": "the driver crashed or was killed: same boot",
+               "gone unknown": "killed, or the host restarted: the boot id could not be read",
+               "gone": "killed, or the host restarted: the boot id could not be read"}
+    for answer, said in answers.items():
+        monkeypatch.setattr(cli, "_ssh_sh", lambda host, script, args, timeout=60, a=answer:
+                            subprocess.CompletedProcess(["ssh"], 0, a + "\n", ""))
+        assert cli._detach_check_remote("box-c", ["/r/job"]) == 4
+        out = capsys.readouterr().out
+        assert f"job: gone without an exit code ({said}" in out and "see /r/job.log on box-c" in out, (answer, out)
+
+
+def test_a_lost_local_job_with_an_unreadable_boot_id_reads_as_unknown_not_a_reboot(env, monkeypatch):
+    from ttp import detach, runner
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    jobs = [{"name": n, "rc": str(run_dir / f"{n}.rc"), "log": str(run_dir / f"{n}.log"), "boot": b}
+            for n, b in (("unrecorded", "unknown"), ("unreadable", runner.boot_id()), ("crash", runner.boot_id()))]
+    (run_dir / "detached.json").write_text(json.dumps(jobs))
+    for n in ("unrecorded", "unreadable", "crash"):
+        detach.started(run_dir / f"{n}.rc").write_text("123\n")
+    assert "same boot: it crashed" in detach.state(run_dir / "crash.rc")[1]
+    assert "boot id could not be read" in detach.state(run_dir / "unrecorded.rc")[1]
+    monkeypatch.setattr(runner, "boot_id", lambda: "unknown")
+    why = detach.state(run_dir / "unreadable.rc")[1]
+    assert "boot id could not be read" in why and "host reboot" not in why, why
 
 
 def _fake_sysctl(fake, booted, uuid):

@@ -513,14 +513,18 @@ def state(rc: Path) -> tuple[str, str]:
             return "queued", ""
         if not locks.any_free([locks.job_lock(rc)]):
             return "running", ""
-    from .runner import same_boot
+    from .runner import boot_id, same_boot
     boot = _entry(rc).get("boot")
-    if boot and not same_boot(boot):
-        why = "the host restarted while it ran"
+    known = bool(boot) and "unknown" not in (boot, boot_id())   # a boot id recorded at launch and readable now
+    if known and not same_boot(boot):
+        why = "the driver died with the host reboot: the host restarted while it ran (its boot id changed)"
     elif not started(rc).exists():
         why = ("it never started: it was killed with the command that ran `ttp detach` (a sandbox or tool "
                "that ends the processes a command starts)")
+    elif known:
+        why = "it was killed after it started, before it wrote an exit code (same boot: it crashed or was killed)"
     else:
-        why = "it was killed after it started, before it wrote an exit code"
+        why = ("it was killed after it started, before it wrote an exit code, or the host restarted: the boot "
+               "id could not be read, so which is unknown")
     _mark_lost(rc, why)
     return "lost", why

@@ -3175,6 +3175,8 @@ def cmd_detach(a) -> None:
 # next to the host's boot_id (else kern.bootsessionuuid, else kern.boottime's seconds, which moves when the
 # clock is stepped): a pid alive with another start, or a boot that changed, is a driver that is gone even
 # with no .rc. A .boot holding kern.boottime's seconds, as older versions wrote, still names its boot.
+# A driver gone with no .rc reads "boot" (it died with the host reboot), "gone same" (same boot: it
+# crashed or was killed) or "gone unknown" (no boot id recorded or readable now: either).
 _REMOTE_START = r'''d=$1 n=$2; shift 2
 case $d in "~"|"~/"*) d=$HOME${d#\~} ;; esac
 mkdir -p "$d" || exit 3
@@ -3210,6 +3212,7 @@ if [ ! -s "$p.pid" ] && [ -d "$p" ] && { [ -e "$p/EXIT" ] || [ -s "$p/pid" ]; };
   exit 0
 fi
 if [ ! -s "$p.pid" ]; then echo "none $p"; exit 0; fi
+k=unknown
 if [ -s "$p.boot" ]; then
   r=$(cat "$p.boot") s=
   b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
@@ -3217,7 +3220,10 @@ if [ -s "$p.boot" ]; then
     b=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
     s=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
   fi
-  if [ "$r" != "${b:-$s}" ] && [ "$r" != "$s" ]; then echo "boot"; exit 0; fi
+  if [ -n "$b$s" ]; then
+    if [ "$r" != "${b:-$s}" ] && [ "$r" != "$s" ]; then echo "boot"; exit 0; fi
+    k=same
+  fi
 fi
 pid=$(cat "$p.pid")
 if kill -0 "$pid" 2>/dev/null; then
@@ -3227,7 +3233,7 @@ if kill -0 "$pid" 2>/dev/null; then
   if [ -z "$st" ] || [ -z "$want" ] || [ "$st" = "$want" ]; then echo "running $pid"; exit 0; fi
 fi
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
-echo "gone"
+echo "gone $k"
 '''
 
 
@@ -3328,8 +3334,8 @@ def _detach_remote(a, ttp: str) -> None:
     on that host with setsid nohup, so it outlives this run, ssh and a reboot of this host. <name>.log,
     .rc, .pid, .boot and .start go to the remote folder (default ~/.ttp-detach/<run>); the retry_when
     it prints, `ttp detach --check --host <alias> <dir>/<name>`, exits 0 once the .rc holds 0, 4 once it
-    holds another exit code or the driver is gone (pid dead, or the host restarted), 1 while it runs
-    and 255 when ssh fails."""
+    holds another exit code or the driver is gone (pid dead, or the host restarted: the .boot recorded at
+    launch tells a host reboot from a crash, _GONE_WHY), 1 while it runs and 255 when ssh fails."""
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -3355,6 +3361,12 @@ def _detach_remote(a, ttp: str) -> None:
     print(f"detached {a.name} on {a.remote} (pid {pid})\nlog: {prefix}.log\nrc:  {prefix}.rc\n"
           f"hand off: status waiting, survives_reboot true, retry_when "
           f"\"{ttp} detach --check --host {shlex.quote(a.remote)} {shlex.quote(prefix)}\"")
+
+
+# Why a remote driver is gone without an exit code, by what its host's boot id says (_REMOTE_CHECK).
+_GONE_WHY = {"boot": "driver died with the host reboot: the host's boot id changed since launch",
+             "same": "the driver crashed or was killed: same boot, so not a host reboot",
+             "unknown": "killed, or the host restarted: the boot id could not be read, so which is unknown"}
 
 
 def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, after: int = 0) -> int:
@@ -3405,7 +3417,7 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
             print(f"{name}: series driver gone without an EXIT (its pid is dead); see {pre.removesuffix('.rc')}/log on {host}")
         else:
             failed = True
-            why = "the host restarted" if out[0] == "boot" else "killed, or the host restarted"
+            why = _GONE_WHY.get(out[-1].strip(), _GONE_WHY["unknown"])   # "boot", "gone same", "gone unknown"
             print(f"{name}: gone without an exit code ({why}); see {pre}.log on {host}")
         one_ended = one_ended or out[0] != "running"
     if rows is not None:
@@ -6023,14 +6035,18 @@ def main(argv: list[str] | None = None) -> None:
                    help="exit 0 once every job of these .rc paths ended with exit 0, 4 once all ended or are "
                    "gone but one failed or left no exit code, else 1 (for retry_when)")
     s.add_argument("--remote", metavar="HOST",
-                   help="start the job on this ssh host with setsid nohup; it survives this run and a reboot here")
+                   help="start the job on this ssh host with setsid nohup; it survives this run and a reboot here. It "
+                   "records that host's boot id, so a driver gone without an exit code reads as died with the "
+                   "host reboot (boot id changed), crashed or killed (same boot), or unknown (unreadable)")
     s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
     s.add_argument("--rows", metavar="FILE",
                    help="with --check (and --host: a file on that host): also exit 0 once this file has more "
                    "than --after lines; with it, 0 also once a job ended or its driver is gone (killed, a "
-                   "reboot or power cycle), else 1, so one probe wakes on a new result row, the end or a dead driver")
+                   "reboot or power cycle), else 1, so one probe wakes on a new result row, the end or a dead driver. A long "
+                   "device run appends each step's result to it and fsyncs it as the step ends, not only an "
+                   "end-of-run summary, so a reboot or crash keeps the steps already done")
     s.add_argument("--after", type=int, metavar="N", help="with --rows: the line count already seen (default 0)")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
