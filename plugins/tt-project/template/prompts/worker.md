@@ -42,7 +42,7 @@
   host's, UTC or `Z`: convert times you copy from UTC logs.
 - `ttp notify "<text>"` (`--severity low|normal`) only when your spec says to tell the user; say so
   in your hand-off. `high`: urgent, to the coordinator now (2/run).
-- Make durable progress early (commit, write files): a killed run keeps what's on disk.
+- Make durable progress early (commit, write files): a killed run keeps what's on disk. With no git repo to commit to, writing files incrementally to the task's artifacts folder meets this.
 - Run builds and test suites as `ttp clip -- <command>`: it shows the failures or head and tail,
   and the full log's path.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read
