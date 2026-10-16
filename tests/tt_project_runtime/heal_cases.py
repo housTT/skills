@@ -2230,7 +2230,7 @@ def test_health_pause_shared_release_survives_interruption(env, monkeypatch, cut
             raise RuntimeError("interrupted before removal")
         monkeypatch.setattr(shared, "update_pause", cut_short)
     elif cut == "after_removal":   # the file is gone, the database commit is cut off
-        monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+        monkeypatch.setattr(sweep, "signal", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("interrupted")))
     if cut == "after_commit":
         d._pause_ends.tick(now + 1800)
     else:
@@ -2255,7 +2255,7 @@ def test_health_pause_shared_recovery_keeps_a_replacement_users_pause(env, monke
     for dt in (0, 900, 1800):
         heal.run(d, "svc", _heal_spec(p), now + dt)
     signal = sweep.signal
-    monkeypatch.setattr(sweep, "signal", lambda *a: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    monkeypatch.setattr(sweep, "signal", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("interrupted")))
     with pytest.raises(RuntimeError):
         d._pause_ends.tick(now + 1800)
     monkeypatch.setattr(sweep, "signal", signal)
