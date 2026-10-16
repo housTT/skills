@@ -56,6 +56,7 @@ from . import ends
 from . import harnesstree
 from . import heal
 from . import holdloops
+from . import headline
 from . import pauseends
 from . import hold
 from . import identity
@@ -8814,7 +8815,7 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
         if sent >= NOTIFIES_PER_RUN:
             log(p, f"task #{task['id']}: dropped `ttp notify` lines past {NOTIFIES_PER_RUN} in run {run_dir.name}")
             break
-        text = f"#{task['id']} {task['title'][:80]}: {body}"
+        text = headline.join(task['title'], body, 80, f"#{task['id']} ")
         if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
                   (text, time.time() - 86400)):
             continue

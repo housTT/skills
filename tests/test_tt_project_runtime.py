@@ -43259,3 +43259,25 @@ def test_headline_clip_inside_parenthesis_or_number():
     assert headline.clip("fix the parser (see the 3 open cases below)", 24) == "fix the parser…"
     out = headline.clip("took 2h58m to recover after 123456 retries", 33)
     assert out.endswith("…") and "123456" not in out and not out.endswith("12…")
+
+
+def test_worker_notify_relay_sends_body_alone_when_it_restates_a_long_title(env, monkeypatch):
+    from ttp import daemon
+    p = make(env)
+    title = "triage: box-a 15:57-18:55 off-bus hold took 2h58m to recover (3 brokers restarted, 6 faults)"
+    tid = p.db.add_task(title, "spec", kind="work", tier="standard", origin="coordinator")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    body = "box-a 15:57-18:55 hold (2h58m) was 6 separate faults"
+    (run_dir / daemon.NOTIFY_FILE).write_text(json.dumps({"text": body}) + "\n")
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 1
+    assert p.db.one("SELECT text FROM messages WHERE kind='alert'")["text"] == f"#{tid} {body}"
+
+
+def test_headline_fuzzy_restatement_and_unclipped_titles():
+    from ttp import headline
+    t = "triage: box-a 15:57-18:55 off-bus hold took 2h58m to recover (3 brokers restarted)"
+    assert headline.join(t, "box-a 15:57-18:55 hold (2h58m) was 6 separate faults", 60) == \
+        "box-a 15:57-18:55 hold (2h58m) was 6 separate faults"
+    assert ": " in headline.join(t, "box-a hold was short and everything else is unrelated here", 60)
+    assert headline.join("fix", "fixed the parser after the hang") == "fix: fixed the parser after the hang"
+    assert headline.join("Review #12", "review 123 passed") == "Review #12: review 123 passed"
