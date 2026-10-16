@@ -335,6 +335,44 @@ def test_superseded_ref_names_the_branch_of_a_done_task_whose_work_is_in_a_secon
     assert "superseded by" in landed.record_superseded(p, tid2, relanded, ref=f"ttp/t{tid2}-x")
 
 
+def test_superseded_with_ref_records_a_task_that_never_had_a_branch(env, monkeypatch, capsys):
+    """A done task with no branch (it never pushed): without --ref the record is refused with a hint;
+    with --ref it is made from that ref and commit alone (head ""), answers `landed:#<id>`, and is
+    refused when the commit is not on the ref or does not exist."""
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    tid2 = p.db.add_task("work that never had a branch", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid2, status="done", branch=None)
+    _commit(other, "elsewhere.txt", "carried\n")
+    carried = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/side")
+    _git_out(repo, "fetch", "-q", "origin")
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    assert ttp_task("superseded", str(tid2), carried) not in (0, None)
+    assert "no branch on record" in capsys.readouterr().err
+    assert ttp_task("superseded", str(tid2), carried, "--ref", "origin/proj") not in (0, None)
+    assert "is not on origin/proj" in capsys.readouterr().err
+    assert ttp_task("superseded", str(tid2), "deadbeef" * 5, "--ref", "origin/side") not in (0, None)
+    assert f"no commit {'deadbeef' * 5}" in capsys.readouterr().err
+    assert p.db.q("SELECT * FROM task_superseded WHERE task=?", (tid2,)) == []
+    assert landed.check(p, repo, tid=tid2)[0] != 0
+    assert ttp_task("superseded", str(tid2), carried[:12], "--ref", "origin/side") == 0
+    assert f"recorded as superseded by {carried[:10]}" in capsys.readouterr().out
+    assert landed.superseded(p.db, [tid2]) == {tid2: [("", carried)]}
+    assert landed.check(p, repo, tid=tid2, onto="origin/side")[0] == 0
+    # A local branch that already holds the commit is a ref it is on, not the task's own branch.
+    p.db.x("DELETE FROM task_superseded WHERE task=?", (tid2,))
+    _git_out(repo, "branch", "side-local", "origin/side")
+    assert "no branch; recorded as superseded" in landed.record_superseded(p, tid2, carried, ref="side-local")
+    assert landed.superseded(p.db, [tid2]) == {tid2: [("", carried)]}
+
+
 def test_a_task_whose_change_landed_under_another_commit_gets_no_review_or_fix(env, monkeypatch):
     """Replay of a duplicate: a code task's one commit (its change plus a version bump and changeset)
     sits in review while a fix chain of another task rebased the change and the push queue landed it

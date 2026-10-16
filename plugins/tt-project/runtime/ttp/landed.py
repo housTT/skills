@@ -337,8 +337,9 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     else the project root. Refused unless the task is done and `sha` is on `ref` (default: the push
     branch in the project root; any other ref of a second repository), came after the branch left it
     (not the branch's base or an older commit) and changes a file the branch changes; ValueError says
-    why. A task with no branch on record (its work is on a branch of a second repository) needs `ref`
-    naming that branch, looked up also in the repositories of its runs' worktrees."""
+    why. A task with no branch on record needs `ref`: when it names a branch (looked up also in the
+    repositories of its runs' worktrees) that does not hold `sha`, that branch is the task's work in a
+    second repository; else only `sha` on `ref` is needed (_record_branchless)."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
@@ -348,12 +349,17 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     repos = _task_repos(p, tid)
     if not branch:
         # A task whose work sits in a worktree of a second repository it made itself has no branch
-        # on record: --ref names that branch, then read in each repository its runs touched.
+        # on record: --ref names that branch, then read in each repository its runs touched. A task
+        # that never had a branch at all: --ref is a ref that already holds the commit.
         if not ref:
-            raise ValueError(f"task #{tid} has no branch on record; name the branch that holds its work "
-                             "with --ref <branch>")
+            raise ValueError(f"task #{tid} has no branch on record; name the branch that holds its work, "
+                             "or a ref its commit is on, with --ref <branch>")
+        extra = _run_dir_repos(p, tid)
+        heads = [(r, h) for r in dict.fromkeys([*repos, *extra, p.root]) if (h := _commit(r, f"refs/heads/{ref}"))]
+        if not heads or any(_git(r, "merge-base", "--is-ancestor", sha, h).returncode == 0 for r, h in heads):
+            return _record_branchless(p, tid, sha, ref, [*repos, p.root, *extra])
         branch, ref = ref, None
-        repos += _run_dir_repos(p, tid)
+        repos += extra
     checked = []
     for repo in dict.fromkeys([*repos, p.root]):
         head = _commit(repo, f"refs/heads/{branch}")
@@ -391,6 +397,22 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
            (tid, head, full, time.time()))
     return f"task #{tid}: branch {branch} at {head[:10]} recorded as superseded by {full[:10]} ({words})"
+
+
+def _record_branchless(p, tid: int, sha: str, ref: str, repos: list[Path]) -> str:
+    """record_superseded for done task `tid` that never had a branch: `sha` must be on `ref`, read in
+    the first of `repos` that has the commit. The record has no branch head ("")."""
+    repos = list(dict.fromkeys(repos))
+    repo = next((r for r in repos if _commit(r, sha)), None)
+    if repo is None:
+        raise ValueError(f"no commit {sha} in {', '.join(map(str, repos))}")
+    full = _commit(repo, sha)
+    rc, words = check(p, repo, full, onto=ref)
+    if rc != 0:
+        raise ValueError(f"not recorded: {words} in {repo}")
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
+           (tid, "", full, time.time()))
+    return f"task #{tid}: no branch; recorded as superseded by {full[:10]} ({words})"
 
 
 def _keys(repo: Path, args: list[str], skip: list[str]) -> list[tuple[str, str]]:

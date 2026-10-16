@@ -5995,7 +5995,7 @@ def main(argv: list[str] | None = None) -> None:
                    "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
-                   "the branch of a second repository that holds its work")
+                   "required: the branch of a second repository that holds its work, or a ref the commit is on")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
