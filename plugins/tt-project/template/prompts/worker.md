@@ -223,7 +223,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
   `retry_when` `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or
   `ttp upstream --fp "<title>" "<spec>"`); once it passes, check the fix and close the note:
-  `ttp upstream --ack <fp> "<evidence>"`; if the shipped fix did not hold, `ttp upstream --regress <fp> "<note>"`.
+  `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (a worker, service, runner, schedule, watcher, queue,
   a hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
   never handed off `blocked` as a question about what to do.
