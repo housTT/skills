@@ -49,7 +49,7 @@ import re
 import time
 from typing import Any
 
-from . import failover
+from . import failover, headline
 from .db import DB, deferral, load_result
 
 KIND = "budget_kind_change"
@@ -191,7 +191,7 @@ def tied_tasks(db: DB, cfg: dict, provider: str, resets: list[float] | None = No
         if failover.NOTE_PREFIX in (t["spec"] or "") and re.search(
                 r"moved (?:at once )?from " + re.escape(provider) + r"\b", t["spec"] or ""):
             out.append({"task": t, "what": "moved",
-                        "line": f"#{t['id']} {t['title'][:80]}: failed over off {provider}; may move back"})
+                        "line": headline.join(t["title"], f"failed over off {provider}; may move back", 80, f"#{t['id']} ")})
             continue
         if (t["provider"] or core) != provider:
             continue
@@ -205,7 +205,7 @@ def tied_tasks(db: DB, cfg: dict, provider: str, resets: list[float] | None = No
             why = "until the old plan window's reset"
         if what in ("deferred", "waiting", "blocked") and (at_reset or LIMIT_RE.search(why)):
             out.append({"task": t, "what": what, "at_reset": bool(at_reset),
-                        "line": f"#{t['id']} {t['title'][:80]}: {what} ({' '.join(why.split())[:120]})"})
+                        "line": headline.join(t["title"], f"{what} ({' '.join(why.split())[:120]})", 80, f"#{t['id']} ")})
     return out
 
 

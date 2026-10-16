@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import headline
 from .db import DB, SEVERITY_RANK
 from .project import FOLDER, HOME_DIR, Project, durable_write, hostname, load_registry, write_json
 
@@ -64,7 +65,7 @@ def _remote_alerts(entry: dict, name: str, after: int, floor: str) -> list[dict]
 
 
 def show(title: str, body: str, url: str | None = None) -> None:
-    body = body.replace("\n", " ")[:240]
+    body = headline.clip(body, 240)
     if sys.platform == "darwin":
         tn = shutil.which("terminal-notifier")
         if tn:

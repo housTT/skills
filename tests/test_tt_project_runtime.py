@@ -43230,3 +43230,32 @@ def test_memory_supersedes_keeps_a_shared_audience(env):
     d = p.add_memory("Delta fact.", title="aud d", audience="workers")
     new, _ = p.supersede_memory("Gamma and delta facts.", [c.stem, d.stem])
     assert not re.search(r"^audience:", new.read_text(), re.M)
+
+
+def test_headline_body_restating_clipped_title_is_sent_alone():
+    from ttp import headline
+    body = "box-a 15:57-18:55 off-bus hold took 2h58m to recover (3 brokers restarted, 6 separate faults)"
+    title = "box-a 15:57-18:55 off-bus hold took 2h58m to recover (3 bro"
+    assert headline.join(title, body, 80, "#7 ") == "#7 " + body
+
+
+def test_headline_long_title_clips_at_word_boundary_with_ellipsis():
+    from ttp import headline
+    title = "investigate why the nightly regression run keeps timing out on the second shard of box-a"
+    out = headline.join(title, "blocked (waiting on a device)", 40)
+    head = out.split(": ")[0]
+    assert head.endswith("…") and len(head) <= 40
+    assert title.startswith(head[:-1].rstrip()) and title[len(head) - 1] == " "
+    assert out.endswith(": blocked (waiting on a device)")
+
+
+def test_headline_short_title_joins_unchanged():
+    from ttp import headline
+    assert headline.join("fix the parser", "deferred (limit)", 80, "#3 ") == "#3 fix the parser: deferred (limit)"
+
+
+def test_headline_clip_inside_parenthesis_or_number():
+    from ttp import headline
+    assert headline.clip("fix the parser (see the 3 open cases below)", 24) == "fix the parser…"
+    out = headline.clip("took 2h58m to recover after 123456 retries", 33)
+    assert out.endswith("…") and "123456" not in out and not out.endswith("12…")

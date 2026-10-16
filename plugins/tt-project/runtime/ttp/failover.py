@@ -33,7 +33,7 @@ import re
 import time
 from typing import Any
 
-from . import timefmt
+from . import headline, timefmt
 from .db import DB
 
 KIND = "provider_failover"
@@ -269,7 +269,7 @@ def apply(db: DB, cfg: dict, move: dict, now: float, where) -> str:
     """Re-route one task as `move` says; returns the feed line."""
     t, body = move["task"], " ".join(note(move, where).split())
     text = f"{NOTE_PREFIX} {timefmt.long(now, where)}] {body[0].upper()}{body[1:]}"
-    line = f"#{t['id']} {t['title'][:80]}: {body}"
+    line = headline.join(t["title"], body, 80, f"#{t['id']} ")
     with db.tx():
         db.update_task(t["id"], provider=move["new"], model=None, effort=move.get("effort"), tier=move["tier"],
                        spec=f"{t['spec']}\n\n{text}" if t["spec"] else text)
@@ -287,8 +287,9 @@ def report_running(db: DB, items: list[dict], now: float, where) -> list[str]:
         if key in seen:
             continue
         until = f"until {timefmt.long(r['ends'], where)}" if r["ends"] else "with no known end"
-        line = (f"#{r['task']['id']} {r['task']['title'][:80]}: left running on {r['provider']}, which cannot "
-                f"start new work ({r['why']}) {until}; a later run of it moves unless its pin is required")
+        line = headline.join(r["task"]["title"], f"left running on {r['provider']}, which cannot "
+                             f"start new work ({r['why']}) {until}; a later run of it moves unless its pin is required",
+                             80, f"#{r['task']['id']} ")
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (now, "daemon", KIND, "low", line[:500], "handled", r["task"]["id"]))
         seen[key] = now
