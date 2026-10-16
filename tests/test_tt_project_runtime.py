@@ -23066,6 +23066,86 @@ def test_a_note_to_another_project_is_refused_when_it_cannot_be_delivered(env, m
     assert [n["to"] for n in _upstream_inbox(env)] == ["far"]
 
 
+def _peer_answers(monkeypatch, answers):
+    """Stand in for ssh to the forward targets: `answers` maps a target to what `ttp upstream
+    --has-project` printed there (a dict), or to the error ssh_pipe returns."""
+    from ttp import upstream
+    asked = []
+
+    def fake(target, args, data, timeout):
+        asked.append((target, args))
+        got = answers[target]
+        return (json.dumps(got).encode() + b"\n", "") if isinstance(got, dict) else (None, got)
+    monkeypatch.setattr(upstream, "ssh_pipe", fake)
+    return asked
+
+
+def test_a_note_reaches_a_project_registered_only_on_a_forward_target(env, monkeypatch, capsys):
+    """`ttp note --to` a project this machine's registry does not know asks the forward targets over ssh
+    whether they run it, files the note for the one that does, and the forwarder sends it only there."""
+    from ttp import cli, upstream
+    from ttp.project import register
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    upstream.set_forward_to(["sib-a", "sib-b"])
+    asked = _peer_answers(monkeypatch, {"sib-a": {"project": "peer", "here": False},
+                                        "sib-b": {"project": "peer", "here": True}})
+    assert _note(cli, "--to", "peer", "please rerun the sweep") == 0
+    assert "sends it on to sib-b" in capsys.readouterr().out
+    assert asked == [("sib-a", "upstream --has-project peer"), ("sib-b", "upstream --has-project peer")]
+    (n,) = _upstream_inbox(env)
+    assert (n["to"], n["at"]) == ("peer", "sib-b")
+    sent = []
+    monkeypatch.setattr(upstream, "_ssh_receive", lambda target, lines, timeout: sent.append((target, lines)) or (
+        {"accepted": len(lines), "duplicates": 0, "rejected": 0, "resolved": []}, ""))
+    assert upstream.forward(time.time()) == 1
+    assert [(t, [json.loads(x)["to"] for x in lines]) for t, lines in sent if lines] == [("sib-b", ["peer"])]
+    assert upstream._valid(json.loads(sent[-1][1][0])), "the receiver files it"
+    # The machine that runs it answers yes; one where it is not registered here answers no.
+    register("peer", {"dir": str(p.base)})
+    assert upstream.has_project("peer") and not upstream.has_project("nosuch")
+    assert _upstream_cli(cli, "--has-project", "peer") == 0
+    assert json.loads(capsys.readouterr().out) == {"project": "peer", "here": True}
+
+
+def test_a_note_to_a_peer_keeps_its_target_when_it_waits(env, monkeypatch):
+    """A note for a peer found on a forward target keeps that target in the run's queue (a sandbox that
+    cannot write the inbox) and in the project's outbox (past the hourly limit)."""
+    from ttp import upstream
+    p = make(env)
+    run_dir = env["tmp"] / "run-peer"
+    run_dir.mkdir()
+    upstream.queue(run_dir, "peer", "from the run's queue", at="sib-b")
+    assert upstream.send_queued(run_dir, p.name, 5)["sent"] == 1
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR - 1):     # the queued note above counts too
+        assert upstream.send(p.name, 5, "peer", f"filler {i}", now=now, at="sib-b") == "sent"
+    assert upstream.send_or_queue(p.state, p.name, 5, "peer", "from the outbox", now=now, at="sib-b")[0] == "queued"
+    assert upstream.drain_outbox(p.state, p.name, now + 3601)[0] == 1
+    assert {n["at"] for n in _upstream_inbox(env)} == {"sib-b"}
+    assert len(_upstream_inbox(env)) == upstream.NOTES_PER_HOUR + 1
+
+
+def test_a_note_to_a_name_no_machine_runs_fails_naming_the_machines_checked(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    upstream.set_forward_to(["sib-a", "sib-b", "sib-c"])
+    _peer_answers(monkeypatch, {"sib-a": {"project": "nosuch", "here": False},
+                                "sib-b": "no answer within 20 s",
+                                "sib-c": "exit 2: ttp: error: unrecognized arguments: --has-project nosuch"})
+    assert _note(cli, "--to", "nosuch", "hello") != 0
+    err = capsys.readouterr().err
+    assert "unknown project nosuch: not on this machine" in err
+    assert "sib-a (no such project)" in err and "sib-b (no answer: no answer within 20 s)" in err
+    assert "sib-c (its tt-project is too old to answer)" in err
+    assert not upstream.path().exists(), "nothing filed"
+    # A name no note could carry is never sent to another machine to ask about.
+    asked = _peer_answers(monkeypatch, {})
+    assert _note(cli, "--to", "bad name;rm", "hello") != 0
+    assert asked == [] and "unknown project bad name;rm" in capsys.readouterr().err
+
+
 def test_a_note_to_tt_project_is_filed_as_an_upstream_note(env, monkeypatch, capsys):
     """`ttp note --to tt-project` with no such project here is a lesson for the maintainers: it lands
     in the upstream inbox as an `upstream: ...` follow-up would, never refused as an unknown project."""

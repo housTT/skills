@@ -82,6 +82,7 @@ FORWARD_TIMEOUT_S = 60      # one send
 FORWARD_BACKOFF_S = (60, 3600)   # after a failed send: first wait, doubling up to the last
 FORWARD_BATCH = 200         # lines per send
 FORWARD_PROBE_S = 6 * 3600  # how often a target is asked whether a project reads its inbox
+PEER_LOOKUP_TIMEOUT_S = 20  # one target's answer to `ttp note --to` asking whether it runs a project
 RECEIVE_BYTES = 4 << 20     # the most `ttp upstream --receive` reads
 _clock = time.monotonic
 
@@ -198,10 +199,11 @@ def note_id(to: str, text: str) -> str:
 
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
-         now: float | None = None, sender: str = "worker") -> str:
+         now: float | None = None, sender: str = "worker", at: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
     same text to the same project is already there) or "limited" (`source` filed NOTES_PER_HOUR
-    addressed notes in the last hour). `sender` "daemon": the source project's daemon routed it, model-free
+    addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
+    registry does not know it (`find_peer`); the forwarder sends the note there. `sender` "daemon": the source project's daemon routed it, model-free
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes."""
     now = now or time.time()
     # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
@@ -223,7 +225,8 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
             return "limited"
         f.write((json.dumps({"ts": now, "project": source, "host": project.hostname(), "task": task,
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
-                             else "normal", "title": title, "spec": text, "fp": fp}, sort_keys=True) + "\n").encode())
+                             else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {})},
+                            sort_keys=True) + "\n").encode())
         f.flush()
     return "sent"
 
@@ -263,7 +266,7 @@ def outbox_pending(state: Path) -> int:
 
 
 def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
-                  now: float | None = None) -> tuple[str, int]:
+                  now: float | None = None, at: str | None = None) -> tuple[str, int]:
     """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
     the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
@@ -277,7 +280,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             if n["fp"] == fp:
                 return "queued", i
         if not waiting:
-            got = send(source, task, to, text, severity, now)
+            got = send(source, task, to, text, severity, now, at=at)
             if got != "limited":
                 return got, 0
         elif _filed(fp):
@@ -287,7 +290,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         box = Path(state) / OUTBOX_FILE
         torn = box.exists() and box.stat().st_size and not box.read_bytes().endswith(b"\n")
         durable_append(box, ("\n" if torn else "") + json.dumps(
-            {"ts": now, "task": task, "to": to, "text": text, "fp": fp,
+            {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
              "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1
 
@@ -315,7 +318,8 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
         filed, stuck = 0, []
         while waiting:
             n = waiting[0]
-            if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now) == "limited":
+            if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
+                    at=_at(n)) == "limited":
                 break
             waiting.pop(0)
             filed += 1
@@ -339,10 +343,17 @@ QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worke
 QUEUED_MAX = 50                  # queued notes one run may leave
 
 
-def queue(run_dir: Path, to: str, text: str, severity: str = "normal") -> None:
+def _at(n: dict) -> str | None:
+    """A queued note's `at` (send): the forwarder only ever sends to one of its own targets, so this
+    only has to be a string."""
+    at = n.get("at")
+    return at if isinstance(at, str) and at else None
+
+
+def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str | None = None) -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
-    line = json.dumps({"to": to, "text": note_text(text), "severity": severity},
+    line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {})},
                       sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -377,9 +388,9 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
         sev = str(n.get("severity") or "normal")
         try:
             if state is None:
-                got[send(source, task, to, text, sev)] += 1
+                got[send(source, task, to, text, sev, at=_at(n))] += 1
             else:
-                r = send_or_queue(state, source, task, to, text, sev)[0]
+                r = send_or_queue(state, source, task, to, text, sev, at=_at(n))[0]
                 got["limited" if r == "full" else r] += 1
         except NoteTooLong:
             got["invalid"] += 1   # `queue` refuses these: only a line written past it is this long
@@ -1360,6 +1371,40 @@ def _remote_projects() -> dict[str, str]:
             if isinstance(e, dict) and e.get("host") and e["host"] != here}
 
 
+def lookup_targets() -> list[str]:
+    """The machines `ttp note --to` asks about a project this machine's registry does not know: the
+    forward targets (`upstream.forward_to`, else the machines of the remote projects)."""
+    configured = forward_to()
+    return configured if configured is not None else sorted(set(_remote_projects().values()))
+
+
+def has_project(name: str) -> bool:
+    """`ttp upstream --has-project`: whether `name` is a project registered on this machine."""
+    e = project.load_registry().get("projects", {}).get(name)
+    return isinstance(e, dict) and e.get("host") in (None, project.hostname()) and bool(e.get("dir")) \
+        and Path(e["dir"]).is_dir()
+
+
+def find_peer(name: str, timeout: float = PEER_LOOKUP_TIMEOUT_S) -> tuple[str | None, list[str]]:
+    """Ask each forward target over ssh whether it runs project `name`: (the first target that does,
+    else None; what each target asked before it answered, for the error naming the machines checked)."""
+    checked = []
+    for target in lookup_targets():
+        out, err = ssh_pipe(target, f"upstream --has-project {shlex.quote(name)}", b"", timeout)
+        if out is None:
+            checked.append(f"{target} (its tt-project is too old to answer)" if "unrecognized arguments" in err
+                           else f"{target} (no answer: {err})")
+            continue
+        try:
+            got = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            got = None
+        if isinstance(got, dict) and got.get("project") == name and got.get("here") is True:
+            return target, checked
+        checked.append(f"{target} (no such project)" if isinstance(got, dict) else f"{target} (no answer it could read)")
+    return None, checked
+
+
 def ssh_pipe(target: str, args: str, data: bytes, timeout: float) -> tuple[bytes | None, str]:
     """Run `ttp <args>` on `target` over ssh (batch mode, known hosts only) with `data` on its stdin:
     (its output, "") or (None, what went wrong). A hung ssh is killed with everything it started
@@ -1480,7 +1525,7 @@ def _forward(now: float, budget_s: float) -> int:
                 n = None
             # Only this machine's own notes: one received from elsewhere (`via`) is never sent on again.
             if isinstance(n, dict) and n.get("fp") and not n.get("via") and n.get("host") == here and (
-                    projects.get(n["to"]) == target if n.get("to") else reads):
+                    (projects.get(n["to"]) or n.get("at")) == target if n.get("to") else reads):
                 if len(ln) > cap:
                     # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
                     # Counted once: a failed send leaves the cursor before it, so later passes see it again.

@@ -19,7 +19,7 @@
   another project to the installed release (`ttp upgrade <name>`) is not editing its harness; hand edits to its charter, memory, config, state or code are.
 <!-- /ttp:if harness -->
 - Lessons for tt-project go in the hand-off as upstream notes (`followups` titled `upstream: ...`).
-  A note for another project on this machine: `ttp note --to <project> "<text>"` (`ttp say` is
+  A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
   A note that is queued or refused is never a reason to wait or block: keep working.

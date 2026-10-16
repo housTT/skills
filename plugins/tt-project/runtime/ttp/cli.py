@@ -1356,7 +1356,9 @@ def _note_to(a, run_dir: str) -> None:
     inbox with this run's project and task (upstream.send); one on another machine is sent on there by
     the daemon (upstream.forward). Nothing of the other project's is written; its daemon reads the
     note as untrusted data from this worker. A note past upstream.SPEC_CHARS once whitespace is joined
-    is refused whole, never cut; a filed or queued one prints the stored length and a short hash."""
+    is refused whole, never cut; a filed or queued one prints the stored length and a short hash. A name
+    this machine's registry does not know is looked up on the forward targets (upstream.find_peer), and
+    the note goes to the one that runs it."""
     from . import upstream
     base = os.environ.get("TTP_PROJECT")
     me = Project(base) if base else None
@@ -1371,10 +1373,17 @@ def _note_to(a, run_dir: str) -> None:
             f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
     if not far and not local_project(a.to) and a.to == upstream.MAINTAINERS:
         return _note_upstream(a, me)
-    if not far and not local_project(a.to):
-        die(f"unknown project {a.to}; `ttp list` shows the projects on this machine")
     if not a.text.strip():
         die("empty note")
+    at = None
+    if not far and not local_project(a.to):
+        checked = []
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", a.to):
+            at, checked = upstream.find_peer(a.to)
+        if not at:
+            die(f"unknown project {a.to}: not on this machine (`ttp list`), "
+                + (f"nor on the machines notes are sent on to: {'; '.join(checked)}" if checked
+                   else "and there is no other machine to ask (`ttp upstream --forward-status`)"))
     try:
         text = upstream.note_text(a.text)
     except upstream.NoteTooLong as e:
@@ -1384,11 +1393,11 @@ def _note_to(a, run_dir: str) -> None:
     task = os.environ.get("TTP_TASK") or ""
     try:
         got, place = upstream.send_or_queue(me.state, me.name, int(task) if task.isdigit() else None, a.to,
-                                            text, a.severity)
+                                            text, a.severity, at=at)
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
-        upstream.queue(Path(run_dir), a.to, text, a.severity)
+        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at)
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, text)} when the run ends{sent}")
         return
@@ -1402,7 +1411,7 @@ def _note_to(a, run_dir: str) -> None:
         return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
-          + (f"; this machine's daemon sends it on to {far.get('ssh') or far['host']}" if far else ""))
+          + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else ""))
 
 
 def _note_upstream(a, me) -> None:
@@ -1440,6 +1449,9 @@ def cmd_upstream(a) -> None:
     hold (its filer's note then never closes by silence, nor as filer unreachable), `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
     follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
     from . import upstream
+    if a.has_project is not None:
+        print(json.dumps({"project": a.has_project, "here": upstream.has_project(a.has_project)}))
+        return
     if a.fp is not None:
         title, spec = a.fp
         task, me = os.environ.get("TTP_TASK") or "", here()
@@ -5613,6 +5625,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
     s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")
     s.add_argument("--resolved", action="store_true", help="every resolved note and where it stands")
+    s.add_argument("--has-project", metavar="NAME", help="print whether project NAME runs on this machine (JSON); "
+                                                         "`ttp note --to` asks the forward targets this over ssh")
     s.set_defaults(fn=cmd_upstream)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")
