@@ -102,6 +102,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"},
+            "delivers": {"type": "array", "items": {"type": "string"}},
             "milestones": {"type": "array", "items": {"type": "object", "properties": {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
@@ -1307,6 +1308,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     sent: list[tuple[int, str | None, str]] = []
     batch_tasks: dict[int, str | None] = {}
     batch_obls: list[str] = []
+    delivered: list[tuple[int, str | None, list]] = []   # replies with `delivers` (obligations.deliver)
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
@@ -1323,6 +1325,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                        severity=_norm_severity(a.get("severity") or "normal")))
                 sent.append((replies[-1], chat, a["text"]))
+                if a.get("delivers"):
+                    delivered.append((replies[-1], chat, list(a["delivers"])))
             elif t == "task_add":
                 title = str(a.get("title") or "").strip()
                 missing = [f for f, v in (("title", title), ("spec", str(a.get("spec") or "").strip())) if not v]
@@ -2035,8 +2039,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             f"turn went through")
     if user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
+    from . import obligations
+    try:   # a reply already went out: marking what it delivered never undoes or rejects it
+        notes += obligations.deliver(p, delivered)
+    except Exception as e:
+        notes.append(f"delivery not recorded: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: recording its promise never undoes or rejects it
-        from . import obligations
         notes += obligations.record_promises(p, sent, batch_tasks, batch_obls)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")

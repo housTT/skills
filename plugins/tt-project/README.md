@@ -420,13 +420,15 @@ prolonged whole-box outage.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
   words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,
-  later; a named date over 14 days ahead counts as a misread and gets the default), the batch's task
+  later; a named date already past or over 14 days ahead is ignored and its clock time applies), the batch's task
   that replies to that chat, and any obligation the same batch records or attaches that such a task
   owns. The digest lists open promises and marks overdue ones; the blocker sweep lists an overdue
   one as an item. Once overdue, one high-effort wake asks for the deliverable or an honest update in
   that chat. A promise closes when its tasks finish and a reply reaches its chat, when every linked
   obligation has its receipt or is dropped, or when the
   coordinator closes it (`obligation` with its key, or a sweep outcome `closed` or `retired`).
+  A reply whose `delivers` names an obligation or promise (`o1`) or its owner task (`#12`) marks it
+  delivered; it closes once every owner task finished. A promise is delivered only in its own chat.
   Large sweeps split into durable consecutive batches, one per turn, with disjoint item coverage.
   `coordinator.sweep_prompt_chars` bounds the sweep section (12000 characters by default, clamped
   to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep

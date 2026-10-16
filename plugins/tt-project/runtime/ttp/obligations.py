@@ -49,6 +49,11 @@ the coordinator's `obligation` action), with its linked obligations, on a blocke
 once all its tasks finished and a reply went to its chat after that. Detection is conservative
 (first-person future plus a delivery verb, or plus a time; never a question or an offer): a commitment
 worded otherwise is not caught, and the coordinator prompt asks for a task or obligation to back it.
+
+Delivery: a coordinator `reply` whose `delivers` names an obligation (`o1`) or an owner task (`#12`, every
+open obligation it owns) marks it delivered by that reply (deliver). It closes once every owner task finished
+as well, at once or on the check() after the last one finishes. A promise is delivered only by a reply to its
+own chat. The link is explicit: no reply text is matched.
 """
 from __future__ import annotations
 
@@ -486,6 +491,10 @@ def check(p, now: float | None = None) -> list[str]:
         st = _load(db)
         changed = False
         for o in st["items"].values():
+            if (ev := _delivered(db, o)) is not None:   # a reply delivered it and its last owner finished
+                _close(db, o, now, ev)
+                changed = True
+                continue
             changed = _check_milestones(p, o, now, raised) or changed
             changed = _check_promise(p, o, st, now, raised) or changed
             late = overdue(o, now)
@@ -564,7 +573,7 @@ IN_RE = re.compile(r"\b(?:in|within)\s+(?:about\s+|around\s+|roughly\s+|~)?(?P<n
                    r"(?P<u>minutes?|mins?|m|hours?|hrs?|h)\b", re.I)
 DAY_RE = re.compile(r"\b(?P<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
                     r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(?P<d>[0-3]?\d)\b", re.I)
-PROMISE_DATE_MAX_D = 14   # a named date further ahead is a misread, not a promise: the default due applies
+PROMISE_DATE_MAX_D = 14   # a named date further ahead is a misread: only its clock time counts
 MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 
 
@@ -593,7 +602,8 @@ def commitments(text: str) -> list[str]:
 def promise_due(text: str, now: float, tz) -> float | None:
     """The first time `text` names, as an epoch: 'in 90 min', '15:00', '3pm', '15:00 UTC', with 'tomorrow'
     or a 'Oct 15' date. A bare clock time is its next occurrence after `now`, in the zone `tz`. A date already
-    past is ignored; one more than PROMISE_DATE_MAX_D days ahead gives None (the default due)."""
+    past, or more than PROMISE_DATE_MAX_D days ahead (a misread), is ignored: the clock time the user was
+    promised still holds, at its next occurrence. None only when no time is named."""
     from datetime import timedelta, timezone
     m = IN_RE.search(text)
     clock = next((c for c in CLOCK_RE.finditer(text) if c.group("m") or c.group("ap")), None)
@@ -620,9 +630,7 @@ def promise_due(text: str, now: float, tz) -> float | None:
             return None
         if when.timestamp() < now - 180 * 86400:   # a date early in the year said late in the last one
             when = when.replace(year=when.year + 1)
-        if when.timestamp() > now + PROMISE_DATE_MAX_D * 86400:
-            return None
-        if when.timestamp() > now:
+        if now < when.timestamp() <= now + PROMISE_DATE_MAX_D * 86400:
             return when.timestamp()
     when = base.replace(hour=h, minute=mi, second=0, microsecond=0)
     if re.search(r"\btomorrow\b", text, re.I):
@@ -784,3 +792,70 @@ def close_promise(db, oid: str, why: str, by: str, now: float | None = None) -> 
         _retire(db, now, "promise closed", prefix=f"obligation:{oid}:promise")
         db.set_kv(KV, st)
     return True
+
+
+# delivery ----------------------------------------------------------------------------------------
+DELIVER_REF_RE = re.compile(r"(?:(?P<oid>o\d+)|#?(?P<task>\d+))")
+
+
+def _owner_ids(o: dict) -> list[int]:
+    return sorted({int(t) for t in o["owners"]} | set((o.get("promise") or {}).get("tasks") or []))
+
+
+def _delivered(db, o: dict) -> str | None:
+    """Evidence that a coordinator reply delivered `o` (its `delivers` named it) and every owner finished."""
+    dv = o.get("delivered")
+    if not dv or not _open(o):
+        return None
+    ids = _owner_ids(o)
+    if ids:
+        rows = db.q(f"SELECT status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
+        if len(rows) < len(ids) or any(r["status"] not in CLOSED for r in rows):
+            return None
+    return f"reply #{dv['message']} delivered it" + (f"; #{', #'.join(map(str, ids))} finished" if ids else "")
+
+
+def _close(db, o: dict, now: float, evidence: str) -> None:
+    o["receipt"] = {"at": now, "task": None, "evidence": evidence[:EVIDENCE_MAX]}
+    _retire(db, now, "obligation delivered", prefix=f"obligation:{o['id']}:")
+
+
+def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = None) -> list[str]:
+    """Mark the obligations this batch's replies deliver (message id, chat, the reply's `delivers`: obligation
+    ids, or owner task ids standing for every open obligation they own). One closes as soon as every owner
+    task finished too; check() closes one whose owners finish later. A promise is delivered only by a reply
+    to its own chat. Returns a note per reference."""
+    now = time.time() if now is None else now
+    notes = []
+    with p.db.tx():
+        st = _load(p.db)
+        for mid, chat, refs in sent:
+            chat = _chat(chat)
+            for ref in refs or []:
+                m = DELIVER_REF_RE.fullmatch(str(ref).strip())
+                if not m:
+                    notes.append(f"delivers {str(ref)[:40]!r}: not an obligation id (o1) or a task id (#12)")
+                    continue
+                if m["oid"]:
+                    o = st["items"].get(m["oid"])
+                    hits = [o] if o and _open(o) else []
+                    if o and o.get("promise") and o["promise"]["chat"] != chat:
+                        notes.append(f"delivers {m['oid']}: that promise was made in chat {o['promise']['chat']}; "
+                                     f"only a reply there delivers it")
+                        continue
+                else:
+                    hits = [o for o in st["items"].values() if _open(o) and int(m["task"]) in _owner_ids(o)
+                            and (not o.get("promise") or o["promise"]["chat"] == chat)]
+                if not hits:
+                    notes.append(f"delivers {str(ref)[:40]}: no open obligation")
+                for o in hits:
+                    o["delivered"] = {"message": mid, "chat": chat, "at": now}
+                    ev = _delivered(p.db, o)
+                    if ev:
+                        _close(p.db, o, now, ev)
+                        notes.append(f"{o['id']} delivered by reply #{mid}; it is no longer owed")
+                    else:
+                        notes.append(f"{o['id']} delivered by reply #{mid}; it closes once "
+                                     f"#{', #'.join(map(str, _owner_ids(o)))} finish")
+        p.db.set_kv(KV, st)
+    return notes

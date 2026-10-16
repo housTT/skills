@@ -11026,7 +11026,7 @@ def test_empty_cache_ttl_is_auto_flagged_by_doctor_and_set_to_auto_by_upgrade(en
 
 def test_promise_due_reads_only_real_month_names_and_bounds_dates():
     """Words that start like a month ('decision 2', 'marker 3', 'JUnit 5') are not dates; a real date
-    within PROMISE_DATE_MAX_D days is kept and one further out falls back to the default (None)."""
+    within PROMISE_DATE_MAX_D days is kept and one further out keeps only its clock time."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     from ttp import obligations as ob
@@ -11039,7 +11039,7 @@ def test_promise_due_reads_only_real_month_names_and_bounds_dates():
     assert ob.promise_due("I'll deliver it Oct 15 at 15:00", now, tz) == at_15
     assert ob.promise_due("I'll deliver it October 17 at 3pm", now, tz) == \
         datetime(2026, 10, 17, 15, 0, tzinfo=tz).timestamp()
-    assert ob.promise_due("I'll deliver it Dec 2 at 15:00", now, tz) is None, "a date weeks out is a misread"
+    assert ob.promise_due("I'll deliver it Dec 2 at 15:00", now, tz) == at_15, "a date weeks out is a misread"
     for offer in ("Shall I report it by 15:00?", "Want me to share the sha by 15:00", "Should I deliver it by 3pm?"):
         assert ob.commitments(offer) == [], offer
 
@@ -11068,3 +11068,261 @@ def test_promise_is_recorded_beside_an_unrelated_obligation_and_linked_to_its_ow
     check(now + 60)
     assert ob.get(p.db, linked["id"])["receipt"], "the promise closes with its linked obligation"
     assert not ob.get(p.db, promise["id"])["receipt"], "the unlinked promise stays open"
+
+
+
+def _pdt(h, m=0, day=15):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime(2026, 10, day, h, m, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+
+
+def _promise_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind='promise_overdue' ORDER BY id")
+
+
+def _next_message_id(p, n):
+    """The next message posted gets id `n` (a replay of real message numbers)."""
+    mid = p.db.post("in", "filler", chat="c0", handled=True)
+    p.db.x("UPDATE messages SET id=? WHERE id=?", (n - 1, mid))
+
+
+I_WILL_DELIVER = "I'll deliver a dogfood-2 candidate sha with checks by around 15:00 PDT on Oct 15."
+
+
+def test_promise_replay_671_recorded_listed_overdue_and_raised_once(env, monkeypatch):
+    """Reply #671 at 11:00 PDT promises a candidate by 15:00 PDT with no task behind it: one promise
+    record due 15:00 PDT, shown OVERDUE at 17:20 in the digest section and the blocker sweep, and exactly
+    one high promise_overdue event across repeated checks, which is a high-effort trigger."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    from ttp import sweep
+    p, d, _, _, check = _ob_setup(env, monkeypatch)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    _next_message_id(p, 671)
+    monkeypatch.setattr(time, "time", lambda: _pdt(11))
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Checks are running. " + I_WILL_DELIVER}]) == []
+    [o] = ob.open_promises(p.db)
+    pr = o["promise"]
+    assert (pr["chat"], pr["message"], pr["due"], pr["timed"], pr["tasks"]) == ("c1", 671, _pdt(15), True, [])
+    assert "dogfood-2 candidate" in o["text"] and "Checks are running" not in o["text"]
+    check(_pdt(14, 59))
+    assert _promise_events(p) == [] and ob.promise_lines(p.db, _pdt(14, 59), p)[0].endswith(
+        "(send each deliverable or an honest update in its chat; close with `obligation` key + evidence)")
+    head, line = ob.promise_lines(p.db, _pdt(17, 20), p)
+    assert "1 open, 1 OVERDUE" in head
+    assert "chat c1, message #671" in line and "15:00 PDT" in line and "OVERDUE 2.3 h" in line
+    for at in (_pdt(17, 20), _pdt(17, 50), _pdt(19), _pdt(23)):
+        check(at)
+    [ev] = _promise_events(p)
+    assert ev["fingerprint"] == f"obligation:{o['id']}:promise:{int(_pdt(15))}" and ev["severity"] == "high"
+    assert "promise_overdue" in coord.effort_triggers(p.db, p.config(), [ev["id"]], None, now=_pdt(17, 20))[0]
+    [item] = [i for i in sweep.items(p.db, _pdt(17, 20), p) if i["kind"] == "promise"]
+    assert (item["key"], item["status"], item["ends"]) == (f"promise:{o['id']}", "overdue", None)
+    assert [i["status"] for i in sweep.items(p.db, _pdt(12), p) if i["kind"] == "promise"] == ["promised"]
+
+
+def test_promise_owner_task_links_resend_merges_and_done_plus_reply_closes(env, monkeypatch):
+    """A batch task replying to the promise's chat owns it; the same promise sent again merges its tasks
+    and obligations into the one record; once every owner is done, a later reply to that chat closes it
+    (a reply to another chat does not)."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    said = "I'll report the candidate sha by 15:00."
+    assert coord.apply(p, [{"type": "task_add", "title": "cut candidate", "spec": "s", "reply_chat": "c1"},
+                           {"type": "reply", "chat": "c1", "text": said}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='cut candidate'")["id"]
+    [o] = ob.open_promises(p.db)
+    assert o["promise"]["tasks"] == [new] and o["promise"]["obligations"] == []
+    p.db.update_task(tid, reply_chat="c1")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 2},
+                           {"type": "obligation", "text": "the candidate sha", "owners": [tid]},
+                           {"type": "reply", "chat": "c1", "text": said}]) == []
+    own = next(x["id"] for x in ob.items(p.db) if x["text"] == "the candidate sha")
+    [o] = ob.open_promises(p.db)
+    assert o["promise"]["tasks"] == sorted([new, tid]) and o["promise"]["obligations"] == [own]
+    assert any(f"promise {o['id']} in chat c1 updated" in n for n in p.db.kv(coord.NOTES_KEY))
+    for t in (new, tid):
+        p.db.update_task(t, status="done")
+    monkeypatch.setattr(time, "time", lambda: now + 60)
+    check(now + 60)
+    assert ob.get(p.db, o["id"])["receipt"] is None, "owners done, but nothing reached the chat yet"
+    assert coord.apply(p, [{"type": "reply", "chat": "c2", "text": "Other news."}]) == []
+    check(now + 120)
+    assert ob.get(p.db, o["id"])["receipt"] is None, "a reply to another chat keeps nothing"
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Candidate sha is abc123."}]) == []
+    check(now + 180)
+    assert "finished; reply #" in ob.get(p.db, o["id"])["receipt"]["evidence"]
+
+
+def test_promise_not_recorded_for_non_commitments_questions_or_offers(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    texts = ("The build passed at 15:00.", "I reported the sha at 15:00.", "I will not deliver it by 15:00.",
+             "We'll never report back.", "Will you send the sha by 15:00?", "I'll report back by 15:00?",
+             "If you want, I'll report the sha by 15:00.", "Should I share the numbers by 3pm",
+             "Would you like me to post the results by 15:00", "Want me to deliver it in 2 hours.",
+             "Checks take about 90 min.")
+    for text in texts:
+        assert ob.commitments(text) == [], text
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": t} for t in texts]) == []
+    assert ob.items(p.db) == []
+
+
+def test_promise_closes_by_obligation_key_and_by_sweep_outcome(env, monkeypatch):
+    """`obligation` with the promise's key and evidence closes it and retires its queued overdue event;
+    a blocker sweep `closed` outcome closes another, which then leaves the sweep."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    from ttp import sweep
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll share the numbers in 30 min."},
+                           {"type": "reply", "chat": "c2", "text": "I'll post the results in 30 min."}]) == []
+    a, b = (o["id"] for o in ob.open_promises(p.db))
+    check(now + 3600)
+    assert [e["status"] for e in _promise_events(p)] == ["queued", "queued"]
+    monkeypatch.setattr(time, "time", lambda: now + 3700)
+    assert coord.apply(p, [{"type": "obligation", "key": a, "evidence": "numbers posted in c1"}]) == []
+    assert ob.get(p.db, a)["receipt"]["evidence"] == "numbers posted in c1"
+    assert {e["fingerprint"].split(":")[1]: e["status"] for e in _promise_events(p)} == {a: "handled", b: "queued"}
+    assert coord.apply(p, [{"type": "sweep", "promise": b, "outcome": "closed", "why": "results posted"}]) == []
+    assert "results posted" in ob.get(p.db, b)["receipt"]["evidence"]
+    assert [e["status"] for e in _promise_events(p)] == ["handled", "handled"]
+    assert ob.open_promises(p.db) == [] and ob.promise_lines(p.db, now + 3700) == []
+    assert not [i for i in sweep.items(p.db, now + 3700) if i["kind"] == "promise"]
+    check(now + 7200)
+    assert len(_promise_events(p)) == 2, "a closed promise never raises again"
+
+
+def test_promise_due_units_past_dates_and_far_dates_keep_the_clock_time():
+    """'in 90 min', '3pm', '15:00 UTC', 'tomorrow 09:30'; a date already past falls through to the next
+    occurrence of its clock time, and so does a date too far ahead to be meant (the time is what was
+    promised); no time at all is None (the default applies)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from ttp import obligations as ob
+    tz = ZoneInfo("America/Los_Angeles")
+    now = _pdt(10)
+    cases = {"I'll report back in 90 min.": now + 5400, "We'll have it ready in 2 hours.": now + 7200,
+             "I'll share it by 3pm.": _pdt(15), "I'll share it by 9am.": _pdt(9, day=16),
+             "ETA 15:00 UTC.": datetime(2026, 10, 16, 15, 0, tzinfo=timezone.utc).timestamp(),
+             "ETA 18:00 UTC.": datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc).timestamp(),
+             "I'll post the results tomorrow 09:30.": _pdt(9, 30, day=16),
+             "I'll send Oct 14 results by 15:00.": _pdt(15),
+             "I'll deliver it by 3pm on Jan 2.": _pdt(15),
+             "I'll deliver it on Oct 20 at 08:00.": _pdt(8, day=20)}
+    for text, due in cases.items():
+        assert ob.promise_due(text, now, tz) == due, text
+    assert ob.promise_due("I'll report back soon.", now, tz) is None
+
+
+def test_promise_closes_with_its_linked_obligation_receipt_or_drop_without_a_reply(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    other = p.db.add_task("second deliverable", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(tid, reply_chat="c1")
+    p.db.update_task(other, reply_chat="c2")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 2},
+                           {"type": "task_update", "id": other, "priority": 2},
+                           {"type": "obligation", "text": "first report", "owners": [tid]},
+                           {"type": "obligation", "text": "second report", "owners": [other]},
+                           {"type": "reply", "chat": "c1", "text": "I'll deliver the first report by 15:00."},
+                           {"type": "reply", "chat": "c2", "text": "I'll deliver the second report by 16:00."}]) == []
+    by_chat = {o["promise"]["chat"]: o for o in ob.open_promises(p.db)}
+    first, second = (next(o["id"] for o in ob.items(p.db) if o["text"] == t) for t in ("first report", "second report"))
+    assert by_chat["c1"]["promise"]["obligations"] == [first] and by_chat["c2"]["promise"]["obligations"] == [second]
+    ob.record(p, first, "receipt", "report at reports/first.md", None, now=now + 60)
+    ob.drop(p, second, "the user withdrew it", now=now + 60)
+    check(now + 120)
+    assert "linked " + first + " closed" in ob.get(p.db, by_chat["c1"]["id"])["receipt"]["evidence"]
+    assert "linked " + second + " closed" in ob.get(p.db, by_chat["c2"]["id"])["receipt"]["evidence"]
+    assert not p.db.q("SELECT id FROM messages WHERE direction='out' AND kind='reply' AND ts>?", (now + 1,))
+
+
+def test_promise_and_delivery_errors_are_notes_and_the_reply_still_goes(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("store unavailable")
+    monkeypatch.setattr(ob, "record_promises", boom)
+    monkeypatch.setattr(ob, "deliver", boom)
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll report the sha by 15:00.",
+                            "delivers": ["o1"]}]) == []
+    assert p.db.one("SELECT text FROM messages WHERE direction='out' AND kind='reply'")["text"].startswith("I'll report")
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert "promise not recorded: RuntimeError: store unavailable" in notes
+    assert "delivery not recorded: RuntimeError: store unavailable" in notes
+
+
+def test_delivered_obligation_closes_once_owner_done_replay_720(env, monkeypatch):
+    """#720: a promise in reply #671 went overdue; the coordinator recorded obligation 'Overdue promise
+    from reply #671' owned by a task. The owner finished and reply #709 delivered the candidate, yet the
+    obligation stayed owed. With the owner done and nothing delivered it stays owed; reply #709 naming it
+    (and the promise) in `delivers` closes both, and no overdue line is left."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, _, owner, check = _ob_setup(env, monkeypatch)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    _next_message_id(p, 671)
+    monkeypatch.setattr(time, "time", lambda: _pdt(11))
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": I_WILL_DELIVER}]) == []
+    [promise] = ob.open_promises(p.db)
+    check(_pdt(17, 20))
+    monkeypatch.setattr(time, "time", lambda: _pdt(17, 25))
+    assert coord.apply(p, [{"type": "obligation", "text": "Overdue promise from reply #671 (dogfood-2 candidate)",
+                            "owners": [owner]},
+                           {"type": "reply", "chat": "c1", "text": "It is late; a task is cutting it now."}]) == []
+    oid = next(o["id"] for o in ob.items(p.db) if o["text"].startswith("Overdue promise"))
+    p.db.update_task(owner, status="done")
+    monkeypatch.setattr(time, "time", lambda: _pdt(18, 40))
+    check(_pdt(18, 40))
+    assert ob.get(p.db, oid)["receipt"] is None, "owner done but nothing delivered: still owed"
+    assert any(line.startswith(oid) and "owed; owners: #" in line for line in ob.lines(p.db, _pdt(18, 40)))
+    _next_message_id(p, 709)
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Dogfood-2 candidate: abc123, all checks passed.",
+                            "delivers": [oid, promise["id"]]}]) == []
+    for o in (ob.get(p.db, oid), ob.get(p.db, promise["id"])):
+        assert o["receipt"]["evidence"].startswith("reply #709 delivered it"), o
+    assert f"#{owner} finished" in ob.get(p.db, oid)["receipt"]["evidence"]
+    check(_pdt(19))
+    assert not [line for line in ob.lines(p.db, _pdt(19)) if "OVERDUE" in line or "owed" in line]
+    assert ob.promise_lines(p.db, _pdt(19)) == []
+    assert [e["status"] for e in _promise_events(p)] == ["handled"], "its queued overdue wake is retired"
+
+
+def test_delivers_by_owner_task_waits_for_the_owner_and_a_promise_only_in_its_chat(env, monkeypatch):
+    """`delivers` naming the owner task marks every open obligation it owns; one whose owner still runs
+    closes on the check after it finishes. A promise is delivered only by a reply to its own chat, and a
+    bad or unknown reference is a note."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    p.db.update_task(tid, reply_chat="c1", status="running")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 2},
+                           {"type": "obligation", "text": "the bench numbers", "owners": [tid]},
+                           {"type": "reply", "chat": "c1", "text": "I'll deliver the bench numbers by 15:00."}]) == []
+    own = next(o["id"] for o in ob.items(p.db) if o["text"] == "the bench numbers")
+    [promise] = ob.open_promises(p.db)
+    assert coord.apply(p, [{"type": "reply", "chat": "c2", "text": "Numbers attached.",
+                            "delivers": [f"#{tid}", promise["id"], "bogus", "o99"]}]) == []
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert f"{own} delivered by reply" in " ".join(notes) and f"closes once #{tid} finish" in " ".join(notes)
+    assert any(f"delivers {promise['id']}: that promise was made in chat c1" in n for n in notes)
+    assert any("'bogus': not an obligation id" in n for n in notes)
+    assert "delivers o99: no open obligation" in notes
+    check(now + 60)
+    assert ob.get(p.db, own)["receipt"] is None, "its owner still runs"
+    assert ob.get(p.db, promise["id"]).get("delivered") is None, "another chat never delivers a promise"
+    p.db.update_task(tid, status="done")
+    check(now + 120)
+    assert ob.get(p.db, own)["receipt"]["evidence"] == f"reply #{ob.get(p.db, own)['delivered']['message']} " \
+                                                       f"delivered it; #{tid} finished"
