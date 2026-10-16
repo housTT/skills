@@ -3974,6 +3974,47 @@ def test_a_slow_write_transaction_is_logged_with_its_caller(tmp_path, monkeypatc
     assert "write lock held" in line and "slow_writer" in line, line
 
 
+def test_the_slow_tx_log_names_the_slowest_subprocess_of_the_transaction(tmp_path, monkeypatch):
+    from ttp import db as dbm
+    monkeypatch.setattr(dbm, "SLOW_TX_S", 0.0)
+    d = dbm.DB(tmp_path / "x.db")
+    with d.tx():
+        subprocess.run(["true"])
+        subprocess.run([sys.executable, "-c", "import time; time.sleep(0.5)"])
+        d.set_kv("a", 1)
+    with d.tx():
+        d.set_kv("b", 1)
+    first, second = (tmp_path / "logs" / "slow-tx.log").read_text().splitlines()[-2:]
+    assert "2 subprocess(es), slowest step" in first and "time.sleep(0.5)" in first, first
+    assert float(first.split("slowest step ")[1].split(" s")[0]) >= 0.5, first
+    assert second.endswith("; no subprocess"), second
+
+
+def test_the_tx_guard_refuses_a_git_network_command_inside_a_write_transaction(tmp_path, monkeypatch):
+    """Under TTP_TX_GUARD=1 (the tests) a git command that asks a remote (ls-remote, fetch, push, pull,
+    clone) raises when it starts inside db.tx(): it would hold the write lock for as long as the network
+    takes. Local git, other commands and the same command outside a transaction are untouched."""
+    from ttp import db as dbm
+    monkeypatch.setenv("TTP_TX_GUARD", "1")
+    d = dbm.DB(tmp_path / "x.db")
+    subprocess.run(["git", "init", "-q", str(tmp_path / "r")], check=True)
+    remote = ["git", "-C", str(tmp_path / "r"), "-c", "core.askPass=true", "ls-remote", str(tmp_path / "none")]
+    assert subprocess.run(remote, capture_output=True).returncode != 0   # outside: runs (and fails)
+    for argv in (remote, ["git", "fetch", "origin"], ["/usr/bin/git", "--git-dir=x", "push", "o", "b"]):
+        with pytest.raises(dbm.TxNetworkError, match="inside a write transaction"):
+            with d.tx():
+                d.set_kv("a", 1)
+                subprocess.run(argv, capture_output=True)
+        assert d.kv("a") is None, "the transaction rolled back"
+    with d.tx():
+        subprocess.run(["git", "-C", str(tmp_path / "r"), "status"], capture_output=True, check=True)
+        subprocess.run(["echo", "push"], capture_output=True, check=True)
+    assert dbm.git_network(["git", "-C", "push", "log"]) == "" and dbm.git_network(["git", "-c", "a=b", "pull"])
+    monkeypatch.delenv("TTP_TX_GUARD")
+    with d.tx():
+        subprocess.run(remote, capture_output=True)   # guard off: only recorded for the slow-tx log
+
+
 def test_run_end_reads_the_root_checkout_after_its_transaction_commits(env, monkeypatch):
     """git status of the project root (_note_dirty_main) can take long in a large repository; it runs
     after the run-end transaction commits, never while every other process waits for its lock."""

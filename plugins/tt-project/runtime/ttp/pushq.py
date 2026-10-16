@@ -48,6 +48,8 @@ RECOVER_FETCH_S = 20            # ... each fetch bounded, as the tick waits for 
 REFUSAL_TIMEOUT_S = 30          # the approval asks the remote for its default branch; never hang the tick
 DEFAULT_BRANCH_TTL_S = 3600     # ... and remembers the answer per remote this long (one ask, not one per approval)
 DEFAULT_BRANCH_RETRY_S = 300    # an unreachable remote is asked again after this, not on every approval
+DEFAULT_BRANCH_KV = "default_branch:"   # + remote: {"until", "branch"}, so a restart does not start cold
+ABSENT_TTL_S = 300              # _absent's answer, asked before a transaction, is read inside it this long
 AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset (alerts.holds)
 AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push last succeeded (alerts.holds)
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
@@ -62,6 +64,7 @@ REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon qu
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 _recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
+_absent_seen: dict[tuple[str, str, str], tuple[float, bool]] = {}   # (root, remote, branch): (until, absent)
 
 
 # settings -----------------------------------------------------------------------------------------
@@ -95,29 +98,43 @@ def _git(p: Project, *args: str, timeout: float = 120, **kw) -> subprocess.Compl
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, **kw)
 
 
-def _default_branch(p: Project, remote: str, now: float | None = None) -> str | None:
+def _asks(p: Project, ask: bool | None) -> bool:
+    """Whether a lookup may ask the remote: never while a write transaction is open (it would hold the
+    lock as long as the network takes), so it reads the answer prefetch left before it opened."""
+    return (not p.db.conn.in_transaction) if ask is None else ask
+
+
+def _default_branch(p: Project, remote: str, now: float | None = None, ask: bool | None = None) -> str | None:
     """The remote's default branch, None when unknown. One `git ls-remote` (up to REFUSAL_TIMEOUT_S)
     per remote and DEFAULT_BRANCH_TTL_S (DEFAULT_BRANCH_RETRY_S while it fails): many approvals in
-    one tick must not each wait on the network."""
+    one tick must not each wait on the network. The answer is kept in the project's kv too, so a
+    restarted daemon does not ask again. Inside a transaction (see _asks) only the kept answer counts."""
     now = time.time() if now is None else now
     key = (str(p.root), remote)
     hit = _default_branches.get(key)
+    if not (hit and hit[0] > now):
+        kept = p.db.kv(DEFAULT_BRANCH_KV + remote)
+        if isinstance(kept, dict) and isinstance(kept.get("until"), (int, float)):
+            hit = _default_branches[key] = (kept["until"], kept.get("branch"))
     if hit and hit[0] > now:
         return hit[1]
+    if not _asks(p, ask):
+        return None   # unknown: as an unreachable remote, it refuses nothing (the batch asks again)
     try:
         ls = _git(p, "ls-remote", "--symref", remote, "HEAD", timeout=REFUSAL_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         ls = None
-    if ls is None or ls.returncode != 0:
-        _default_branches[key] = (now + DEFAULT_BRANCH_RETRY_S, None)
-        return None
-    found = ""
-    for line in ls.stdout.splitlines():
-        ref = line[5:].split("\t")[0] if line.startswith("ref: ") else ""
-        if ref.startswith("refs/heads/"):
-            found = ref[len("refs/heads/"):]
-            break
-    _default_branches[key] = (now + DEFAULT_BRANCH_TTL_S, found)
+    found = None
+    if ls is not None and ls.returncode == 0:
+        found = ""
+        for line in ls.stdout.splitlines():
+            ref = line[5:].split("\t")[0] if line.startswith("ref: ") else ""
+            if ref.startswith("refs/heads/"):
+                found = ref[len("refs/heads/"):]
+                break
+    until = now + (DEFAULT_BRANCH_RETRY_S if found is None else DEFAULT_BRANCH_TTL_S)
+    _default_branches[key] = (until, found)
+    p.db.set_kv(DEFAULT_BRANCH_KV + remote, {"until": until, "branch": found})
     return found
 
 
@@ -388,14 +405,44 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
             **({"inherited": taken} if taken else {}), **({"notes": notes} if notes else {})}
 
 
-def _absent(p: Project, remote: str, branch: str) -> bool:
+def _absent(p: Project, remote: str, branch: str, ask: bool | None = None) -> bool:
     """Whether `remote` answers that it has no branch `branch` (one bounded `git ls-remote`). An
-    unreachable remote is not an answer: False, so the approval is refused as before."""
+    unreachable remote is not an answer: False, so the approval is refused as before. Inside a
+    transaction (see _asks) it reads the answer prefetch got within ABSENT_TTL_S, else False."""
+    key, now = (str(p.root), remote, branch), time.time()
+    if not _asks(p, ask):
+        hit = _absent_seen.get(key)
+        return bool(hit and hit[0] > now and hit[1])
     try:
         ls = _git(p, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout=REFUSAL_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return False
-    return ls.returncode == 0 and not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+    if ls.returncode != 0:
+        return False
+    absent = not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+    _absent_seen[key] = (now + ABSENT_TTL_S, absent)
+    return absent
+
+
+def prefetch(p: Project, task: dict, cfg: dict | None = None) -> None:
+    """Asks the remote, before the transaction that finishes `task`'s run opens, what deciding its
+    hand-off reads there: the default branch (a review's approval: _refusal) and whether each
+    pr_branch label names a branch the remote lacks (check_approval, Daemon._auto_review). Bounded
+    and best effort: an unanswered question reads as before, as an unreachable remote."""
+    d = _delivery(p, cfg)
+    tgt = target(p)
+    if not tgt:
+        return
+    tasks = [task]
+    if task.get("kind") == "review":
+        if d.get("push_queue") is not True or not push_allowed(d):
+            return
+        if not push.allow_protected(d):
+            _default_branch(p, tgt[0], None, True)
+        tasks = push._reviewed(p, str(task["id"]))
+    for t in tasks:
+        if onto := push.pr_elsewhere(p, t, d):
+            _absent(p, tgt[0], onto, True)
 
 
 def approve(p: Project, task_id: int, run_id: int | None, approval: dict) -> list[int]:

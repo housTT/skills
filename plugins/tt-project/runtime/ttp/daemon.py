@@ -2383,6 +2383,8 @@ class Daemon:
             root_now = worktree.checkout_state(p.root) if root_before else None
         except Exception:
             root_now = None
+        if r["role"] != "coordinator" and r["task"]:
+            self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE))
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
@@ -2740,6 +2742,20 @@ class Daemon:
                 log(self.p, f"run {run_id} of #{tid}: queued upstream acks recorded")
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{tid}: {e}")
+
+    def _prefetch_remote(self, task_id: int, result: dict | None) -> None:
+        """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
+        now, before the transaction that records it: inside it the answer is read, never fetched, so
+        the write lock never waits on the network. Best effort: an unanswered question reads as before."""
+        if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
+            return   # only a finished hand-off approves a push or gets its review
+        task = self.p.db.task(task_id)
+        if not task or task["kind"] not in ("code", "review"):
+            return
+        try:
+            pushq.prefetch(self.p, task, self.cfg)
+        except Exception as e:
+            log(self.p, f"task {task_id}: asking the push remote before finishing failed: {type(e).__name__}: {e}")
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
@@ -6698,6 +6714,7 @@ class Daemon:
             _, r, run_dir, on_pass, head = got
             from .providers.base import RunUsage
             self._probe_rc.pop(task["id"], None)
+            self._prefetch_remote(task["id"], on_pass)
             with self.p.db.tx():
                 self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
             log(self.p, f"task {task['id']} retry_when probe passed; its checks passed on {head[:12]}: "
@@ -6842,6 +6859,7 @@ class Daemon:
             if not why and r:
                 from .providers.base import RunUsage
                 self._probe_rc.pop(tid, None)
+                self._prefetch_remote(tid, result)
                 with db.tx():
                     self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
                 log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")

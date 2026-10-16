@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import sys
+import threading
 import time
 from bisect import bisect_right
 from contextlib import contextmanager
@@ -180,6 +183,67 @@ BUSY_RETRY_PAUSES_S = (0.5, 2.0)
 # A write transaction held longer than this is logged with its caller (logs/slow-tx.log next to the
 # database): it makes every other process wait, and past BUSY_TIMEOUT_S their writes fail.
 SLOW_TX_S = 5.0
+# git commands that ask a remote: never run while a write transaction is open (it holds the lock for
+# as long as the network takes). Ask before the transaction, or read a cached answer inside it.
+GIT_NETWORK = frozenset({"ls-remote", "fetch", "push", "pull", "clone"})
+_GIT_OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
+_tx_local = threading.local()   # .spawns: [(seconds into the transaction, argv)] while one is open
+_hooked = False
+
+
+class TxNetworkError(RuntimeError):
+    """A git network command started inside a write transaction while the guard is on (TTP_TX_GUARD=1)."""
+
+
+def git_network(argv: Any) -> str:
+    """The git subcommand when `argv` runs one that asks a remote (GIT_NETWORK), else ""."""
+    if not isinstance(argv, (list, tuple)) or not argv or Path(str(argv[0])).name != "git":
+        return ""
+    skip = False
+    for a in map(str, argv[1:]):
+        if skip:
+            skip = False
+        elif a in _GIT_OPTS_WITH_VALUE:
+            skip = True
+        elif not a.startswith("-"):
+            return a if a in GIT_NETWORK else ""
+    return ""
+
+
+def _audit(event: str, args: tuple) -> None:
+    """Records each subprocess started inside an open write transaction (for the slow-tx log) and,
+    with TTP_TX_GUARD=1 (the tests), refuses a git network command there."""
+    if event != "subprocess.Popen":
+        return
+    spawns = getattr(_tx_local, "spawns", None)
+    if spawns is None:
+        return
+    argv = args[1] if len(args) > 1 else None
+    spawns.append((time.monotonic(), argv))
+    if os.environ.get("TTP_TX_GUARD") == "1" and (sub := git_network(argv)):
+        raise TxNetworkError(f"git {sub} started inside a write transaction (db.tx): ask the remote before "
+                             f"the transaction opens, or read a cached answer: {_argv_text(argv)}")
+
+
+def _argv_text(argv: Any) -> str:
+    return (" ".join(map(str, argv)) if isinstance(argv, (list, tuple)) else str(argv))[:200]
+
+
+def _hook() -> None:
+    global _hooked
+    if not _hooked:
+        _hooked = True
+        sys.addaudithook(_audit)
+
+
+def _slowest(spawns: list, ended: float) -> str:
+    """The slow-tx log's hint: how many subprocesses the transaction started and the one followed by
+    the longest gap (until the next one started, or the commit), which is at most its run time."""
+    if not spawns:
+        return "; no subprocess"
+    gaps = [((spawns[i + 1][0] if i + 1 < len(spawns) else ended) - t, argv) for i, (t, argv) in enumerate(spawns)]
+    gap, argv = max(gaps, key=lambda g: g[0])
+    return f"; {len(spawns)} subprocess(es), slowest step {gap:.1f} s after: {_argv_text(argv)}"
 
 
 def is_busy(e: BaseException) -> bool:
@@ -435,22 +499,28 @@ class DB:
             yield
             return
         retry_busy(lambda: self.conn.execute("BEGIN IMMEDIATE"))
+        _hook()
         began = time.monotonic()
+        outer = getattr(_tx_local, "spawns", None)   # another connection's transaction on this thread
+        spawns = _tx_local.spawns = []
         try:
             yield
         except BaseException:
+            _tx_local.spawns = outer
             self._after_commit.clear()
             self.conn.execute("ROLLBACK")
             raise
+        _tx_local.spawns = outer
         self.conn.execute("COMMIT")
-        held = time.monotonic() - began
+        ended = time.monotonic()
+        held = ended - began
         if held > SLOW_TX_S:
-            self._log_slow_tx(held)
+            self._log_slow_tx(held, _slowest(spawns, ended))
         pending, self._after_commit = self._after_commit, []
         for fn in pending:
             fn()
 
-    def _log_slow_tx(self, held: float) -> None:
+    def _log_slow_tx(self, held: float, slowest: str = "") -> None:
         """One line per slow write transaction, with the code that held it: slow work (git, a subprocess,
         the network) belongs before the transaction or in after_commit. A report only: never raises."""
         try:
@@ -460,7 +530,7 @@ class DB:
             log = Path(self.path).parent / "logs" / "slow-tx.log"
             log.parent.mkdir(parents=True, exist_ok=True)
             with log.open("a") as fh:
-                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} write lock held {held:.1f} s: {where}\n")
+                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} write lock held {held:.1f} s: {where}{slowest}\n")
         except Exception:
             pass
 

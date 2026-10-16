@@ -7089,3 +7089,63 @@ def test_landing_alert_clears_without_approvals_and_is_not_raised_while_paused(e
     assert alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
     s.p.db.x("UPDATE push_queue SET status='withdrawn' WHERE status IN ('approved','batched')")
     assert not alerts.holds(s.p.db, pushq.LANDING_ALERT, time.time() - 1, time.time())
+
+
+def _pq_review_run(s, push=None):
+    """A running review run of `s` that handed off done with `push` (default: its branch at its head)."""
+    s.p.db.update_task(s.review, status="running")
+    rid = s.p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,'worker','codex','',?,"
+                   "'running')", (s.review, time.time() - 60))
+    run_dir = s.p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "looks good",
+         "push": [{"branch": s.branch, "head": s.head}] if push is None else push}))
+    return s.p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def test_a_review_approved_at_run_end_asks_the_remote_before_the_transaction_never_inside(env, monkeypatch):
+    """finish_run records a run's end in one write transaction. The approval's remote lookups (the
+    default branch, a pr_branch the remote may lack) are asked before it opens, so the write lock never
+    waits on the network (reported: 30 s holds, one REFUSAL_TIMEOUT_S ls-remote each, after a restart
+    left the cache cold). Under the guard a git network command inside the transaction raises."""
+    from ttp import pushq
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_TX_GUARD", "1")
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.code, labels=json.dumps(["pr_branch:feature/x"]))   # the remote has no such branch
+    pushq._default_branches.clear()
+    pushq._absent_seen.clear()
+    asked, real = [], pushq._git
+
+    def git(p, *args, **kw):
+        if args[0] == "ls-remote":
+            asked.append((args[1], p.db.conn.in_transaction))
+        return real(p, *args, **kw)
+    monkeypatch.setattr(pushq, "_git", git)
+    Daemon(s.p.base).finish_run(_pq_review_run(s), {"rc": 0, "started": time.time() - 60, "ended": time.time()})
+    assert sorted(asked) == [("--heads", False), ("--symref", False)], asked
+    task = s.p.db.task(s.review)
+    assert task["status"] == "pushing", (task["status"], task["result"])
+    assert "feature/x was ignored" in json.dumps(_pq_events(s.p, task=s.review)), "the prefetched answer was used"
+
+
+def test_the_remotes_default_branch_answer_survives_a_daemon_restart(env, monkeypatch):
+    """The default-branch cache is kept in the project's kv with its expiry: a restarted daemon (empty
+    process cache) reads it, also inside a transaction, where nothing asks the remote."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    subprocess.run(["git", "-C", str(s.origin), "symbolic-ref", "HEAD", "refs/heads/proj"], check=True)
+    pushq._default_branches.clear()
+    assert pushq._default_branch(s.p, "origin") == "proj"
+    pushq._default_branches.clear()   # a restart
+    monkeypatch.setattr(pushq, "_git", lambda *a, **k: pytest.fail("asked the remote again"))
+    with s.p.db.tx():
+        assert pushq._default_branch(s.p, "origin") == "proj"
+        assert "the remote's default branch" in pushq._refusal(s.p, "origin", "proj")
+    assert pushq._default_branch(s.p, "origin") == "proj"
+    # Expired, a transaction reads it as unknown (refuses nothing, as an unreachable remote): never asks.
+    with s.p.db.tx():
+        assert pushq._default_branch(s.p, "origin", time.time() + pushq.DEFAULT_BRANCH_TTL_S + 1) is None
+        assert not pushq._absent(s.p, "origin", "feature/x")
