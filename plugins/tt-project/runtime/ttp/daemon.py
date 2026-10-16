@@ -5320,6 +5320,8 @@ class Daemon:
         self._fixes_checked = now
         try:
             got = upstream.wake_fixed(self.p, str(self.identity.get("version") or ""), now)
+            for fp in upstream.follow_up_unconfirmed(self.p, str(self.identity.get("version") or ""), self.cfg, now):
+                log(self.p, f"upstream note {fp} closed: confirmed by silence")
         except (OSError, ValueError) as e:
             log(self.p, f"checking upstream fixes failed: {type(e).__name__}: {e}")
             return

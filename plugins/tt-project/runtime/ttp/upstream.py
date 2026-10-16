@@ -874,6 +874,87 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
     return out
 
 
+KV_REMINDED = "upstream_reminded"   # "<fp>@<fixed_in>" this project's coordinator was reminded of
+REMIND_AFTER_H = 72
+CLOSE_AFTER_DAYS = 14
+SILENCE = "silence"
+
+
+def regress(fp: str, name: str, reason: str, now: float | None = None) -> dict:
+    """Project `name` reports the fix of note `fp` did not hold: it blocks the close by silence."""
+    fp = _check_fp(fp)
+    return _record({"kind": "regress", "fp": fp, "project": name, "reason": cut(" ".join(str(reason or "").split()), "it"),
+                    "ts": now or time.time()})
+
+
+def regressed(fp: str, recs: list[dict] | None = None) -> bool:
+    """True when a regression was recorded for note `fp` after its latest resolution, or the inbox holds
+    the same fingerprint again from after it (a forwarded copy)."""
+    recs = _records() if recs is None else recs
+    res = resolution(fp, recs)
+    if not res:
+        return False
+    t = float(res["ts"])
+    if any(r.get("kind") == "regress" and r.get("fp") == fp and float(r.get("ts") or 0) >= t for r in recs):
+        return True
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return False
+    return any(n.get("fp") == fp and float(n.get("ts") or 0) > t and n.get("via") for n in notes)
+
+
+def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = None, now: float | None = None) -> list[str]:
+    """For notes this project filed that its daemon (running `version`) has the fix for and nobody acked:
+    after upstream.remind_after_h (72) one more normal event to its own coordinator, once per note; after
+    upstream.unconfirmed_close_days (14) with no regression, close it as 'confirmed by silence' (an ack
+    with that reason, so the note stays listed). Only this project's own notes. Returns the closed fps."""
+    now = now or time.time()
+    conf = (cfg or {}).get("upstream") or {}
+    remind_s = float(conf.get("remind_after_h", REMIND_AFTER_H)) * 3600
+    close_s = float(conf.get("unconfirmed_close_days", CLOSE_AFTER_DAYS)) * 86400
+    if not version or not re.search(r"\d", version):
+        return []
+    recs = _records()
+    mine = filed(p.name)
+    reminded = list(p.db.kv(KV_REMINDED, []) or [])
+    closed, changed = [], False
+    for fp in mine:
+        res = resolution(fp, recs)
+        if not res or wontfixed(fp, recs) or acked(fp, recs) or not at_least(version, res["fixed_in"]):
+            continue
+        age = now - float(res["ts"])
+        if age >= close_s and not regressed(fp, recs):
+            _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": SILENCE,
+                     "evidence": f"confirmed by silence: no ack and no regression note {close_s / 86400:g} days after the fix "
+                                 f"in {res['fixed_in']} reached this project"})
+            closed.append(fp)
+            continue
+        key = f"{fp}@{res['fixed_in']}"
+        if age >= remind_s and key not in reminded:
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (now, "upstream", "observation", "normal",
+                    f"upstream fix not confirmed yet: note {fp} ({mine[fp].get('title', '')[:120]}) is fixed in {res['fixed_in']}, "
+                    f"this project's daemon runs {version}, and nobody acked it for {age / 3600:.0f} h. Check the fix works "
+                    f"here and run `ttp upstream --ack {fp} \"<evidence>\"`; with no regression it closes by silence "
+                    f"{close_s / 86400:g} days after the fix.", "queued"))
+            reminded.append(key)
+            changed = True
+    if changed:
+        p.db.set_kv(KV_REMINDED, reminded[-FIXED_KEPT:])
+    return closed
+
+
+def unconfirmed_summary(name: str | None, now: float | None = None) -> tuple[int, float]:
+    """(how many SHIPPED notes, the oldest one's age in seconds since its resolution)."""
+    now = now or time.time()
+    recs = _records()
+    ages = [now - float(resolution(fp, recs)["ts"]) for fp in unconfirmed(name, now)]
+    return len(ages), max(ages, default=0.0)
+
+
 def unconfirmed(name: str | None, now: float | None = None) -> list[str]:
     """Fingerprints of resolutions SHIPPED with no ack: of notes project `name` filed, or all (None)."""
     recs = _records()

@@ -43281,3 +43281,57 @@ def test_headline_fuzzy_restatement_and_unclipped_titles():
     assert ": " in headline.join(t, "box-a hold was short and everything else is unrelated here", 60)
     assert headline.join("fix", "fixed the parser after the hang") == "fix: fixed the parser after the hang"
     assert headline.join("Review #12", "review 123 passed") == "Review #12: review 123 passed"
+
+
+def _shipped(p, title, age_h, now):
+    from ttp import upstream
+    upstream.append("demo", 4, [{"title": title, "spec": "y"}])
+    fp = upstream.fingerprint(title, "y")
+    upstream.resolve(fp, "1.0.0", now=now - age_h * 3600)
+    return fp
+
+
+def test_upstream_unconfirmed_fix_reminds_once_then_closes_by_silence(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _shipped(p, "upstream: quiet", 80, now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
+    ev = p.db.q("SELECT text,severity FROM events WHERE source='upstream'")
+    assert len(ev) == 1 and f"ttp upstream --ack {fp}" in ev[0]["text"] and "quiet" in ev[0]["text"]
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 15 * 86400) == [fp]
+    assert upstream.state(fp) == "closed" and "confirmed by silence" in upstream.acked(fp)["evidence"]
+    assert any(fp in x and "closed" in x for x in upstream.listing("demo"))
+
+
+def test_upstream_unconfirmed_fix_waits_for_the_filers_version_and_the_reminder_age(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    _shipped(p, "upstream: young", 10, now)
+    _shipped(p, "upstream: old", 400, now)
+    upstream.follow_up_unconfirmed(p, "1.5.0", None, now)
+    n = len(p.db.q("SELECT 1 FROM events WHERE source='upstream'"))
+    assert upstream.follow_up_unconfirmed(p, "0.0.1", None, now + 99 * 86400) == []
+    assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == n
+
+
+def test_upstream_regression_blocks_the_close_by_silence(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _shipped(p, "upstream: back", 20 * 24, now)
+    upstream.regress(fp, "demo", "still broken", now=now - 3600)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
+    assert upstream.state(fp, now) == upstream.SHIPPED
+
+
+def test_upstream_unconfirmed_shows_in_the_audit_with_count_and_oldest_age(env):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    _shipped(p, "upstream: a1", 30, now)
+    _shipped(p, "upstream: a2", 50, now)
+    out = audit.lines(p.db, now, p=p)
+    assert any("not confirmed: 2" in x and "oldest" in x for x in out)

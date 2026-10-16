@@ -30,7 +30,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, sharedchecks, turngate, unblock
+from . import budget, chaincap, ends, sharedchecks, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -352,6 +352,13 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))
+    if p is not None:
+        try:
+            n, oldest = upstream.unconfirmed_summary(p.name, now)
+        except OSError:
+            n, oldest = 0, 0.0
+        if n:
+            out.append(f"upstream fixes shipped, not confirmed: {n}, oldest {_dur(oldest)} since resolved")
     return out or [NOTHING]
 
 
