@@ -7607,3 +7607,84 @@ def test_a_push_check_call_cut_short_by_the_tick_budget_carries_over_and_an_uncu
     assert timeouts == [40, 12]
     cache = {pushclaim.Budget.KEY: pushclaim.Budget(30)}
     assert pushclaim.verify(".", "o", "refs/heads/r", "abc1234", cache)[0] == pushclaim.UNKNOWN
+
+
+def test_answers_carried_from_an_out_of_time_tick_never_fail_a_push_that_landed_after_them(env, monkeypatch):
+    """Tick 1 confirms A (behind origin/proj's tip: a fetch) and runs out on B's slow ref; Y is then
+    pushed to proj and E claims it. The carried ls-remote and fetch of proj predate Y: E ends done."""
+    from ttp import daemon as dmod, pushclaim
+    from ttp.db import dump_result
+    monkeypatch.setattr(pushclaim, "NET_BUDGET_S", 1.2)   # a later call needs 1 s left to start
+    monkeypatch.setattr(pushclaim, "LS_TIMEOUT_S", 5)
+    monkeypatch.setattr(pushclaim, "PER_TICK", 10)
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    x0 = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/slow")
+    _commit(other, "x1.txt", "x1")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    real = pushclaim._git
+
+    def git(r, *args, timeout=30):
+        if args[0] == "ls-remote" and args[-1] == "refs/heads/slow":
+            time.sleep(min(timeout, 1.4))
+            if timeout < 1.4:
+                return subprocess.CompletedProcess(args, 124, "", "TimeoutExpired: too slow")
+        return real(r, *args, timeout=timeout)
+    monkeypatch.setattr(pushclaim, "_git", git)
+
+    def pushing(ref, sha):
+        tid = p.db.add_task(f"ship {ref}", "s", kind="code", origin="user")
+        claim = {"remote": "origin", "ref": f"refs/heads/{ref}", "sha": sha, "source": "summary", "strict": True}
+        p.db.update_task(tid, status="pushing", result=dump_result({"status": "pushing", "summary": f"pushed {sha[:10]}",
+                         pushclaim.KEY: {"claims": [claim], "since": time.time(), "tries": 0, "next": 0}}))
+        return tid
+    a, b = pushing("proj", x0), pushing("slow", x0)
+    d = dmod.Daemon(p.base)
+    d._tick_began = time.monotonic()
+    d.verify_pushes()
+    assert p.db.task(a)["status"] == "done" and p.db.task(b)["status"] == "pushing"
+    assert "verify" in d._push_carry
+    _commit(other, "y.txt", "y")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    e = pushing("proj", _git_out(other, "rev-parse", "HEAD"))
+    for _ in range(4):
+        d._tick_began = time.monotonic()
+        d.verify_pushes()
+        assert p.db.task(e)["status"] in ("pushing", "done"), p.db.task(e)["result"]
+    res = json.loads(p.db.task(e)["result"])
+    assert p.db.task(e)["status"] == "done" and res["status"] == "done", res
+    assert p.db.task(b)["status"] == "done"
+
+
+def test_push_check_answers_are_not_carried_past_carry_s_or_a_network_hold(env, monkeypatch):
+    from ttp import pushclaim
+    p, d, _, _ = _slow_claims(env, monkeypatch, 0)
+    k, held = (".", "origin", "refs/heads/x"), [False]
+    monkeypatch.setattr(d, "net_held", lambda prov: held[0])
+
+    def kept(name, age):
+        d._push_keep(name, {k: (["a"], ""), "since": time.time() - age, pushclaim.CARRIED: set()})
+        d._tick_began = time.monotonic()
+        return d._push_net(name)
+    for name in ("verify", "audit"):
+        c = kept(name, pushclaim.CARRY_S / 2)
+        assert c[k] == (["a"], "") and c[pushclaim.CARRIED] == {k}
+        assert k not in kept(name, pushclaim.CARRY_S + 1)
+        d._push_keep(name, {k: (["a"], ""), "since": time.time()})
+        held[0] = True
+        assert d._push_net(name) is None
+        held[0] = False
+        c = d._push_net(name)
+        assert k not in c and not c[pushclaim.CARRIED]
+
+
+def test_a_missing_that_rests_on_a_carried_answer_is_asked_again(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    stale = {(str(repo), "origin", "refs/heads/gone"): ([], "")}
+    assert pushclaim.verify(repo, "origin", "refs/heads/gone", sha, dict(stale))[0] == pushclaim.MISSING
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/gone")
+    cache = {**stale, pushclaim.CARRIED: set(stale)}
+    assert pushclaim.verify(repo, "origin", "refs/heads/gone", sha, cache)[0] == pushclaim.CONFIRMED
+    assert not cache[pushclaim.CARRIED]

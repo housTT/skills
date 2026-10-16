@@ -18,7 +18,8 @@ named an on_pass_cmd that never ran (no on_pass/ folder in its run).
 
 In the daemon both skip while the core provider's network is held, and share a Budget of
 NET_BUDGET_S of git network time per tick: what it leaves unchecked waits, untouched, for a later
-tick (OutOfTime)."""
+tick (OutOfTime), which reuses the answers read so far for up to CARRY_S. A carried answer never
+alone fails a claim: before a MISSING that rests on one, the remote is asked again."""
 from __future__ import annotations
 
 import json
@@ -37,6 +38,8 @@ BOUND_S = 6 * 3600               # a claim the remote never answered for this lo
 LS_TIMEOUT_S, FETCH_TIMEOUT_S = 20, 40
 PER_TICK = 4                     # tasks checked per daemon tick
 NET_BUDGET_S = 30                # git network time (ls-remote, fetch) push checks spend per daemon tick
+CARRY_S = 120                    # how long an out-of-time tick's remote answers are reused by later ticks
+CARRIED = "carried"              # a cache's keys read on an earlier tick (a set)
 AUDIT_EVERY_S, AUDIT_DAYS, AUDIT_REFS = 3600, 2, 20
 ON_PASS_DIR = "on_pass"          # daemon.ON_PASS_DIR
 
@@ -279,31 +282,44 @@ def _fetch(repo, remote: str, ref: str, cache: dict) -> str:
 def verify(repo, remote: str, ref: str, sha: str, cache: dict | None = None) -> tuple[str, str]:
     """(state, why) of `sha` on `remote`'s `ref`: CONFIRMED when it is the tip per ls-remote or
     reachable from it after a fetch; MISSING when the remote has no such ref or the commit is not on
-    it; UNKNOWN when the remote cannot be read (the network, a timeout)."""
+    it; UNKNOWN when the remote cannot be read (the network, a timeout). A MISSING decided by an
+    answer an earlier tick read (cache[CARRIED]) is asked again first: the push may have landed since."""
     cache = {} if cache is None else cache
+    state, why, by = _verify(repo, remote, ref, sha, cache)
+    carried = cache.get(CARRIED) or set()
+    if state == MISSING and by in carried:
+        carried.discard(by)
+        cache.pop(by, None)
+        state, why, _ = _verify(repo, remote, ref, sha, cache)
+    return state, why
+
+
+def _verify(repo, remote: str, ref: str, sha: str, cache: dict) -> tuple[str, str, tuple]:
+    """verify's (state, why, the cache key of the answer that decided it)."""
     where, s = short_ref(remote, ref), sha[:12]
+    ls, fetched = (str(repo), remote, ref), ("fetch", str(repo), remote, ref)
     tips, err = _ls(repo, remote, ref, cache)
     if tips is None:
-        return UNKNOWN, f"cannot check {s} on {where}: {err}"
+        return UNKNOWN, f"cannot check {s} on {where}: {err}", ls
     if not tips:
-        return MISSING, f"{remote} has no {ref} ({s} claimed there)"
+        return MISSING, f"{remote} has no {ref} ({s} claimed there)", ls
     tip = tips[-1]
     if tip.startswith(sha) or sha.startswith(tip):
-        return CONFIRMED, f"{s} is the tip of {where}"
+        return CONFIRMED, f"{s} is the tip of {where}", ls
     if ref.startswith("refs/tags/"):
-        return MISSING, f"{where} points at {tip[:12]}, not {s}"
+        return MISSING, f"{where} points at {tip[:12]}, not {s}", ls
     after = _fetch(repo, remote, ref, cache)
     if not after:
-        return UNKNOWN, f"cannot fetch {where} to look for {s}"
+        return UNKNOWN, f"cannot fetch {where} to look for {s}", fetched
     full = _commit(repo, sha)
     if not full:
-        return MISSING, f"{s} is not on {where} (tip {tip[:12]}; no such commit after a fetch)"
+        return MISSING, f"{s} is not on {where} (tip {tip[:12]}; no such commit after a fetch)", fetched
     rc = _git(repo, "merge-base", "--is-ancestor", full, after).returncode
     if rc == 0:
-        return CONFIRMED, f"{s} is on {where}"
+        return CONFIRMED, f"{s} is on {where}", fetched
     if rc == 1:
-        return MISSING, f"{s} is not on {where} (tip {after[:12]})"
-    return UNKNOWN, f"cannot tell whether {s} is on {where} (git merge-base exit {rc})"
+        return MISSING, f"{s} is not on {where} (tip {after[:12]})", fetched
+    return UNKNOWN, f"cannot tell whether {s} is on {where} (git merge-base exit {rc})", fetched
 
 
 def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:

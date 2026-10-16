@@ -547,7 +547,7 @@ class Daemon:
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
         self._moved = 0.0        # when the running tick last made progress, monotonic
         self._push_budget: tuple[float, pushclaim.Budget] | None = None   # this tick's git time for push checks
-        self._push_carry: dict[str, dict] = {}   # push checks' remote answers kept for the next tick
+        self._push_carry: dict[str, tuple[float, dict]] = {}   # push checks' remote answers kept for later ticks
         self._step_name = ""     # the tick step running now
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
@@ -2849,12 +2849,22 @@ class Daemon:
     def _push_net(self, carry: str) -> dict | None:
         """The cache a push-claim check asks the remote with: None while the core provider's network
         is held. It holds this tick's shared pushclaim.Budget and the answers `carry` kept from an
-        earlier tick that ran out of time."""
+        earlier tick that ran out of time, marked pushclaim.CARRIED, unless older than
+        pushclaim.CARRY_S or from before a network hold."""
         if self.net_held(self.cfg.get("core_provider") or "claude"):
+            self._push_carry.clear()
             return None
         if not self._tick_began or not self._push_budget or self._push_budget[0] != self._tick_began:
             self._push_budget = (self._tick_began, pushclaim.Budget())
-        return {**self._push_carry.pop(carry, {}), pushclaim.Budget.KEY: self._push_budget[1]}
+        now = time.time()
+        at, kept = self._push_carry.pop(carry, (now, {}))
+        if not kept or now - at > pushclaim.CARRY_S:
+            at, kept = now, {}
+        return {**kept, pushclaim.CARRIED: set(kept), "since": at, pushclaim.Budget.KEY: self._push_budget[1]}
+
+    def _push_keep(self, carry: str, cache: dict) -> None:
+        """Keeps a push check's remote answers for later ticks, dated by the oldest of them."""
+        self._push_carry[carry] = (cache["since"], {k: v for k, v in cache.items() if isinstance(k, tuple)})
 
     def verify_pushes(self) -> None:
         """Tasks waiting in `pushing` on their claimed pushes (_defer_for_push): asked on the remote,
@@ -2876,7 +2886,7 @@ class Daemon:
             try:
                 state, why, _ = pushclaim.check_all(self.p, list(pv.get("claims") or []), cache)
             except pushclaim.OutOfTime as e:
-                self._push_carry["verify"] = cache
+                self._push_keep("verify", cache)
                 log(self.p, f"claimed pushes: {e}; task {tid} and later ones are checked next tick")
                 break
             run_dir = Path(pv.get("dir") or ".")
@@ -2932,7 +2942,7 @@ class Daemon:
         try:
             a = pushclaim.audit(self.p, now=now, max_refs=4, cache=cache)
         except pushclaim.OutOfTime:
-            self._push_carry["audit"] = cache
+            self._push_keep("audit", cache)
             return
         except Exception as e:
             log(self.p, f"push audit failed: {type(e).__name__}: {e}")
