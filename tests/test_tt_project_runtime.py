@@ -23666,7 +23666,8 @@ def test_a_regression_made_on_the_receiving_side_reaches_the_filer_once(env, mon
     upstream._take_resolved("example-host", [{"fp": fp, "fixed_in": "0.2.10", "note": "", "by": "m", "ts": 3}])
     upstream.regress(fp, "still loses it", "demo")
     now = time.time()
-    upstream.forward(now)
+    upstream.forward(now)      # the first send learns the target answers with resolutions; acks follow
+    upstream.forward(now + 1)
     lines = [json.loads(x) for batch in sent for x in batch]
     reg = [x for x in lines if x.get("kind") == "regression"]
     assert len(reg) == 1 and reg[0]["project"] == "demo" and reg[0]["note"] == "still loses it"
