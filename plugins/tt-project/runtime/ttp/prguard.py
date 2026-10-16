@@ -73,7 +73,8 @@ GITHUB = "github"           # an approval's channel when the user took the PR ou
 # The pr-watch watcher records each open PR's open findings (failing CI, bot review comments not
 # fixed or answered); a review or merge ask for a PR waits until they are cleared.
 FINDINGS_KEY = "pr_findings"   # kv: {"owner/repo#N": {"task": id, "url": u, "failing": [..], "pending": b,
-#                                                      "bot_open": n, "bot": [..], "notified": fingerprint}}
+#                                                      "bot_open": n, "bot": [..], "bot_keys": [..],
+#                                                      "notified": fingerprint}}
 CHECKS_FILE = "checks.json"    # in a run's directory: {"head": sha, "passed": bool, "commands": [..], "ts": t}
 
 PR_URL_RE = re.compile(r"https?://[^/\s]+/([\w.-]+)/([\w.-]+)/pull/(\d+)", re.I)

@@ -9113,6 +9113,91 @@ def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review
     assert watchers.bot_open(graph) == []
 
 
+def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wrappers(env, monkeypatch):
+    """A bot re-posting the same finding after each push (same file and text, only links and commit
+    ids differ) is one finding: listed once while open, not open work once any post of it was
+    answered, and no fresh pr_findings report while it stays open under a new URL. An empty COMMENTED
+    review that only wraps inline replies is no review activity. A new finding, and a person's
+    comment or a review with a body, still count."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/9"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','running',?,?)",
+           (url, time.time()))
+    bot, human = {"__typename": "Bot", "login": "scan-bot"}, {"__typename": "User", "login": "dev"}
+
+    def post(n, sha, text="Hardcoded secret found. Rule ID: secret-generic"):
+        return {"author": bot, "url": f"r{n}",
+                "body": f"**{text}** in commit {sha}\nSee https://scan.example.invalid/f/{n}\n<!-- fp:{n} -->"}
+
+    def thread(c, path="src/app.py", outdated=False, resolved=False):
+        return {"isResolved": resolved, "isOutdated": outdated, "path": path, "comments": {"nodes": [c]}}
+
+    threads = [thread(post(1, "abc1234"))]
+    graph = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                     "reviewThreads": {"nodes": threads}}}}}
+    pr = {"url": url, "state": "OPEN", "isDraft": True, "title": "t", "comments": [], "reviews": [],
+          "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}]}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: graph if args[0] == "api" else pr)
+    d = Daemon(p.base)
+
+    def events(kind):
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=? ORDER BY id", (kind,))]
+
+    watchers.watch_prs(d)
+    assert len(events("pr_findings")) == 1
+    # The push outdates the old thread and the bot posts the same finding again: still one, no new report.
+    threads[0]["isOutdated"] = True
+    threads.append(thread(post(2, "def5678")))
+    assert watchers.bot_open(graph) == ["r2"]
+    watchers.watch_prs(d)
+    assert len(events("pr_findings")) == 1
+    # Two open copies of it at once: listed once.
+    threads.append(thread(post(3, "0a1b2c3d")))
+    assert watchers.bot_open(graph) == ["r2"]
+    # Answered in one thread (the reply adds an empty COMMENTED review wrapper): every re-post of it is done.
+    threads[1]["comments"]["nodes"].append({"author": human, "url": "a1", "body": "False positive: test key."})
+    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": ""})
+    assert watchers.bot_open(graph) == []
+    watchers.watch_prs(d)
+    assert len(events("pr_clean")) == 1 and events("pr_changed") == []
+    threads.append(thread(post(4, "9f8e7d6")))
+    assert watchers.bot_open(graph) == []
+    # A new finding still counts: other text, or the same text in another file.
+    threads.append(thread(post(5, "1234abc", "SQL built from user input. Rule ID: sql-injection")))
+    threads.append(thread(post(6, "1234abc"), path="src/other.py"))
+    assert watchers.bot_open(graph) == ["r5", "r6"]
+    watchers.watch_prs(d)
+    assert len(events("pr_findings")) == 2
+    # A bot's top-level re-post after a person answered the first one is a repeat; a new one is not.
+    tops = graph["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+    tops += [{**post(7, "aaa1111", "Coverage dropped."), "createdAt": "2026-01-01T00:00:00Z"},
+             {"author": human, "createdAt": "2026-01-02T00:00:00Z", "url": "h1", "body": "Expected."},
+             {**post(8, "bbb2222", "Coverage dropped."), "createdAt": "2026-01-03T00:00:00Z"},
+             {**post(9, "bbb2222", "License header missing."), "createdAt": "2026-01-03T00:00:00Z"}]
+    assert watchers.bot_open(graph) == ["r5", "r6", "r9"]
+    # Comments without a body are each their own finding.
+    assert watchers.finding_key({"url": "x"}) != watchers.finding_key({"url": "y"})
+    # Empty COMMENTED wrappers are no activity; a person's review with a body and their comments count.
+    base = watchers.pr_signature(pr)
+    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": "  "})
+    assert watchers.pr_signature(pr) == base and base["n_human"] == 0
+    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": "Please split this."})
+    assert watchers.pr_signature(pr)["n_human"] == 1
+    pr["reviews"].append({"author": {"login": "dev"}, "state": "APPROVED", "body": ""})
+    assert watchers.pr_signature(pr)["n_human"] == 2
+    # A record kept before findings had keys, already told these URLs: no fresh report on upgrade.
+    from ttp import prguard
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    rec.pop("bot_keys")
+    rec["notified"] = json.dumps([[], sorted(watchers.bot_open(graph))])
+    p.db.set_kv(prguard.FINDINGS_KEY, {"acme/widgets#9": rec})
+    n = len(events("pr_findings"))
+    watchers.watch_prs(d)
+    assert len(events("pr_findings")) == n and "bot_keys" in p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+
+
 
 def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branch_line(env):
     """A task_add whose spec names a done task's work branch (ttp/t<id>-...) carries it only with a

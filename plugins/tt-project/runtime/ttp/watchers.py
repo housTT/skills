@@ -11,7 +11,8 @@
   that is recorded as their approval, with one line in the feed. Open PRs' findings
   (failing CI, bot review comments neither fixed nor answered) are recorded for prguard and are
   work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
-  the user for a review). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
+  the user for a review). A bot's re-post of a finding it already made (after each push, say) is one
+  finding, not new work, and an empty COMMENTED review that only wraps inline replies is no activity. A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -69,7 +71,10 @@ def pr_signature(pr: dict) -> dict:
                                                                                  "CANCELLED", "ACTION_REQUIRED"))
     pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
                   for c in checks)
-    human = [c for c in (pr.get("comments") or []) + (pr.get("reviews") or [])
+    # An empty COMMENTED review only wraps inline replies (GitHub adds one per reply): no activity.
+    reviews = [r for r in pr.get("reviews") or []
+               if not (str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip())]
+    human = [c for c in (pr.get("comments") or []) + reviews
              if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
     activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]
                                         + str(c.get("state", "")) for c in human]).encode()).hexdigest()[:12]
@@ -199,10 +204,10 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
 
 BOT_QUERY = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
              "pullRequest(number:$number){"
-             "comments(last:100){nodes{author{__typename login} createdAt url}}"
+             "comments(last:100){nodes{author{__typename login} body createdAt url}}"
              "reviews(last:100){nodes{author{__typename login} state body submittedAt url}}"
-             "reviewThreads(first:100){nodes{isResolved isOutdated "
-             "comments(first:50){nodes{author{__typename login} url}}}}}}}")
+             "reviewThreads(first:100){nodes{isResolved isOutdated path "
+             "comments(first:50){nodes{author{__typename login} body url}}}}}}}")
 
 
 def _is_bot(author: dict | None) -> bool:
@@ -210,25 +215,59 @@ def _is_bot(author: dict | None) -> bool:
     return a.get("__typename") == "Bot" or str(a.get("login", "")).endswith("[bot]")
 
 
-def bot_open(data: dict) -> list[str]:
-    """URLs of bot review findings on a PR that are neither fixed nor answered: a review thread a bot
-    started that is unresolved, not outdated and has no reply from a person; a bot's top-level
-    comment, or review asking for changes, with no comment from a person after it."""
+_URL_RE = re.compile(r"https?://\S+")
+_SHA_RE = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
+_HIDDEN_RE = re.compile(r"<!--.*?-->", re.S)
+_RULE_RE = re.compile(r"\brule[ _-]?(?:id|name)?\s*[:=#]\s*[`'\"]?([\w./-]+)", re.I)
+
+
+def finding_key(c: dict, path: str | None = None) -> str:
+    """What makes two bot findings the same one: the file and the comment's text, with links, commit
+    ids and hidden markup (which bots vary per push) left out, plus a rule id the text names. A
+    comment without a body is only itself."""
+    body = str(c.get("body") or "")
+    if not body.strip():
+        return "url:" + str(c.get("url") or id(c))
+    m = _RULE_RE.search(body)
+    text = _SHA_RE.sub(" ", _URL_RE.sub(" ", _HIDDEN_RE.sub(" ", body)).lower())
+    text = " ".join(re.sub(r"\W+", " ", text).split())
+    return hashlib.sha1(json.dumps([path or c.get("path") or "", m.group(1).lower() if m else "", text])
+                        .encode()).hexdigest()[:12]
+
+
+def bot_findings(data: dict) -> list[tuple[str, str]]:
+    """(finding_key, URL) of bot review findings on a PR that are neither fixed nor answered: a review
+    thread a bot started that is unresolved, not outdated and has no reply from a person; a bot's
+    top-level comment, or review asking for changes, with no comment from a person after it. A bot
+    re-posting a finding (same key) is one finding, listed once; once any post of it was answered
+    (or its thread resolved), its re-posts are not open work."""
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
-    out = []
+    items = []   # (key, url, answered, open)
     for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
         cs = (th.get("comments") or {}).get("nodes") or []
-        if cs and _is_bot(cs[0].get("author")) and not th.get("isResolved") and not th.get("isOutdated") \
-                and all(_is_bot(c.get("author")) for c in cs[1:]):
-            out.append(cs[0].get("url") or "?")
+        if cs and _is_bot(cs[0].get("author")):
+            answered = bool(th.get("isResolved")) or not all(_is_bot(c.get("author")) for c in cs[1:])
+            items.append((finding_key(cs[0], th.get("path")), cs[0].get("url") or "?", answered,
+                          not answered and not th.get("isOutdated")))
     comments = (pr.get("comments") or {}).get("nodes") or []
     human_times = sorted(c.get("createdAt") or "" for c in comments if not _is_bot(c.get("author")))
     last_human = human_times[-1] if human_times else ""
-    items = [(c.get("createdAt") or "", c.get("url")) for c in comments if _is_bot(c.get("author"))]
-    items += [(r.get("submittedAt") or "", r.get("url")) for r in (pr.get("reviews") or {}).get("nodes") or []
-              if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
-    out += [u or "?" for ts, u in items if ts > last_human]
+    tops = [(c.get("createdAt") or "", c) for c in comments if _is_bot(c.get("author"))]
+    tops += [(r.get("submittedAt") or "", r) for r in (pr.get("reviews") or {}).get("nodes") or []
+             if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
+    items += [(finding_key(c), c.get("url") or "?", ts <= last_human, ts > last_human) for ts, c in tops]
+    answered = {k for k, _, a, _ in items if a}
+    out, seen = [], set()
+    for k, u, _, live in items:
+        if live and k not in answered and k not in seen:
+            seen.add(k)
+            out.append((k, u))
     return out
+
+
+def bot_open(data: dict) -> list[str]:
+    """URLs of the PR's open bot findings (bot_findings)."""
+    return [u for _, u in bot_findings(data)]
 
 
 def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: str) -> None:
@@ -247,10 +286,15 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: 
     data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
                 "-F", f"number={number}"], root)
     old = findings.get(key) or {}
-    bots = bot_open(data) if data is not None else old.get("bot", [])   # unread: keep what was known
+    if data is not None:
+        found = bot_findings(data)
+        bots, bot_keys = [u for _, u in found], sorted(k for k, _ in found)
+    else:   # unread: keep what was known
+        bots, bot_keys = old.get("bot", []), old.get("bot_keys", sorted(old.get("bot", [])))
     rec = {"task": t["id"], "url": url, "branch": pr.get("headRefName") or old.get("branch"),
            "failing": sig["failing"], "pending": sig["checks"] == "pending",
-           "bot_open": len(bots), "bot": bots[:10], "notified": old.get("notified"), "owner": old.get("owner")}
+           "bot_open": len(bots), "bot": bots[:10], "bot_keys": bot_keys,
+           "notified": old.get("notified"), "owner": old.get("owner")}
     findings[key] = rec
     if rec["pending"]:
         return
@@ -264,7 +308,10 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: 
         else (None, False)
     lost = dirty and not owner and rec["owner"] is not None
     rec["owner"] = owner["id"] if owner else None
-    mark = json.dumps([rec["failing"], sorted(bots)]) if dirty else "clean"
+    # Keyed by finding, not URL: a bot re-posting the same open finding under a new URL is no news.
+    mark = json.dumps([rec["failing"], bot_keys]) if dirty else "clean"
+    if dirty and "bot_keys" not in old and rec["notified"] == json.dumps([rec["failing"], sorted(bots)]):
+        rec["notified"] = mark   # a record from before keys were kept, already told these findings
     if not made and not lost and (mark == rec["notified"] or (not dirty and rec["notified"] is None)):
         rec["notified"] = mark   # a PR clean when first seen needs no news: its task's hand-off said so
         return
