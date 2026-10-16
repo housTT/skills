@@ -29,7 +29,6 @@ import subprocess
 import time
 from pathlib import Path
 
-READ_ONLY_KINDS = ("question", "review")   # tasks that make no commits of their own
 SHARED = "shared"                # a claim on another task's commit
 KEY = "push_verify"              # tasks.result of a task in `pushing` until its claims are verified
 HANDOFF = "push_claim_handoff.json"   # the hand-off waiting on the check, in its run's folder
@@ -420,19 +419,28 @@ def _contains(repo, sha: str, branch: str) -> bool:
     return bool(full) and _git(repo, "merge-base", "--is-ancestor", full, f"refs/heads/{branch}").returncode == 0
 
 
-def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict) -> tuple[str, str]:
+def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict) -> tuple[str, str]:
     """A claim the remote check did not confirm, decided again as `ttp landed` does: CONFIRMED when the
     commit (or one recorded as superseding the task) is on the push branch by ancestry, SHARED when
-    another task's branch holds the commit and this task's does not."""
+    another task's branch holds the commit and this task's does not.
+
+    Local refs only, never a fetch: the push branch's tip is read once per repo per audit (`tips`)
+    from its tracking ref as the remote checks (within the tick's Budget) or an earlier fetch left it.
+    Accepted gap: a commit the local ref has not seen yet stays unconfirmed until an audit after
+    the next fetch."""
     from . import landed
     repo = Path(c.get("repo") or p.root)
     try:
+        if repo not in tips:
+            tips[repo] = landed._tip(repo, landed._push_ref(p, repo), fetch=False)[0]
+        tip = tips[repo]
         shas = [c["sha"]] + [r["sha"] for r in p.db.q("SELECT sha FROM task_superseded WHERE task=?", (t["id"],))]
         for s in shas:
-            if landed.check(p, repo, sha=s)[0] == 0:
+            full = _commit(repo, s)
+            if tip and full and landed.on_branch(repo, full, tip):
                 return CONFIRMED, f"{s[:12]} is on the push branch"
         others = [o for o in claimed.get(c["sha"][:12], []) if o["id"] != t["id"]]
-        if others and not _contains(repo, c["sha"], t["branch"]):
+        if others and not (t["branch"] and _contains(repo, c["sha"], t["branch"])):
             owner = next((o for o in others if o["branch"] and _contains(repo, c["sha"], o["branch"])), None)
             if owner:
                 return SHARED, f"shared claim: {c['sha'][:12]} is #{owner['id']}'s commit (its branch holds it)"
@@ -450,20 +458,25 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
     from .db import load_result
     now = time.time() if now is None else now
     db = p.db
-    rows = db.q("SELECT id, title, result, kind, branch FROM tasks WHERE status='done' AND updated>=? ORDER BY id",
+    rows = db.q("SELECT id, title, result, branch FROM tasks WHERE status='done' AND updated>=? ORDER BY id",
                 (now - days * 86400,))
     counts = {CONFIRMED: 0, MISSING: 0, UNKNOWN: 0}
     gaps: list[dict] = []
     cache = {} if cache is None else cache
     refs: set = set()
+    tips: dict = {}                    # repo -> the push branch's local tip, read once
     claimed: dict[str, list] = {}      # sha -> the tasks claiming it (for a shared claim)
     todo = []
     for t in rows:
         prev = load_result(t["result"])
         run = _last_run(db, t["id"])
         cs = queue_claims(p, t["id"])
-        if not t["branch"] or (t["kind"] in READ_ONLY_KINDS and not cs):
-            continue      # no branch of its own: nothing it could have pushed
+        if not t["branch"] and not cs:
+            # Nothing of its own to push and no landing the queue recorded under it (a review that
+            # approved one has no branch but owns its queue claims). Accepted gap: a task that has a
+            # branch but makes no commits (a question or review kind) and claims a push only in its
+            # summary is still checked, and can be reported.
+            continue
         try:
             cs += [c for c in claims(p, {"id": t["id"]}, prev, dict(run) if run else None)
                    if c.get("marker") or not any(q["sha"].startswith(c["sha"][:12]) or c["sha"].startswith(q["sha"])
@@ -481,13 +494,14 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
         all_ok = bool(cs)
         for c in cs:
             k = c.get("marker") or (c["remote"], c["ref"])
-            if k not in refs and len(refs) >= max_refs:
+            over = k not in refs and len(refs) >= max_refs
+            if over:
                 state, why = UNKNOWN, f"not checked: more than {max_refs} refs in one audit"
             else:
                 refs.add(k)
                 _, state, why = check_all(p, [c], cache)[2][0]
-            if state != CONFIRMED and c.get("sha") and not c.get("marker"):
-                state, why = _reattribute(p, t, c, state, why, claimed)
+            if state != CONFIRMED and not over and c.get("sha") and not c.get("marker"):
+                state, why = _reattribute(p, t, c, state, why, claimed, tips)
             if state == SHARED:
                 counts[SHARED] = counts.get(SHARED, 0) + 1
             else:

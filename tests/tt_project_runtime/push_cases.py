@@ -7934,15 +7934,93 @@ def test_the_push_audit_decides_landed_by_ancestry_not_by_the_ref_or_subject_nam
     assert a["counts"]["missing"] == 0 and a["gaps"] == [], a
 
 
-def test_the_push_audit_skips_tasks_with_no_branch_of_their_own(env, monkeypatch):
+def test_the_push_audit_skips_tasks_with_no_branch_and_no_queue_claims(env, monkeypatch):
     from ttp import pushclaim
     p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
     _commit(repo, "a.txt", "a\n")
     sha = _git_out(repo, "rev-parse", "HEAD")
     _audit_done(p, "question", f"pushed {sha[:10]} to origin/proj", branch=None, kind="question")
+    _audit_done(p, "review", f"pushed {sha[:10]} to origin/proj", branch=None, kind="review")
     _audit_done(p, "no branch", f"pushed {sha[:10]} to origin/proj", branch=None)
     a = pushclaim.audit(p)
     assert a["gaps"] == [] and a["counts"]["missing"] == 0, a
+
+
+def _queue_landed(p, tid, sha):
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+           "VALUES(?, 'work', ?, 'origin/proj', 'landed', ?, ?, ?, ?)", (tid, sha, now, now, sha, sha))
+
+
+def test_the_push_audit_still_checks_a_branchless_review_s_queue_landing(env, monkeypatch):
+    """The queue records a landing under the review that approved it, and reviews have no branch."""
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")     # never pushed
+    review = _audit_done(p, "Review #1", "approved", branch=None, kind="review")
+    _queue_landed(p, review, sha)
+    a = pushclaim.audit(p)
+    assert [(g["task"], g["state"], g["sha"]) for g in a["gaps"]] == [(review, "missing", sha)], a
+    assert a["counts"]["missing"] == 1
+
+
+def _landed_spy(monkeypatch):
+    """Records each fetch the landed re-check could make: _tip(fetch=True), a landed `git fetch`, check()."""
+    from ttp import landed
+    seen = {"tips": 0, "fetches": 0}
+    real_tip, real_git = landed._tip, landed._git
+
+    def tip(repo, onto, fetch):
+        seen["tips"] += 1
+        seen["fetches"] += bool(fetch)
+        return real_tip(repo, onto, fetch)
+
+    def git(repo, *args, timeout=30):
+        seen["fetches"] += args[0] == "fetch"
+        return real_git(repo, *args, timeout=timeout)
+
+    def check(*a, **k):
+        raise AssertionError("landed.check may fetch: the audit's re-check reads local refs only")
+    monkeypatch.setattr(landed, "_tip", tip)
+    monkeypatch.setattr(landed, "_git", git)
+    monkeypatch.setattr(landed, "check", check)
+    return seen
+
+
+def test_the_push_audit_re_check_of_unconfirmed_claims_never_fetches(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    seen = _landed_spy(monkeypatch)
+    tids = []
+    for i in range(3):
+        _commit(repo, f"u{i}.txt", f"{i}\n")
+        tids.append(_audit_done(p, f"t{i}", f"pushed {_git_out(repo, 'rev-parse', 'HEAD')[:10]} to origin/proj"))
+    a = pushclaim.audit(p)
+    assert a["counts"]["missing"] == 3, a
+    assert seen == {"tips": 1, "fetches": 0}, seen      # one local read of the push branch, no fetch
+    seen["tips"] = 0
+    a = pushclaim.audit(p, max_refs=0)                  # past max_refs: unknown, not re-checked
+    assert a["counts"] == {"confirmed": 0, "missing": 0, "unknown": 3} and seen["tips"] == 0, a
+
+
+def test_the_push_audit_out_of_time_with_unconfirmed_claims_resumes_next_tick(env, monkeypatch):
+    from ttp import daemon as dmod, pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    seen = _landed_spy(monkeypatch)
+    for i in range(2):
+        _commit(repo, f"u{i}.txt", f"{i}\n")
+        _audit_done(p, f"t{i}", f"pushed {_git_out(repo, 'rev-parse', 'HEAD')[:10]} to origin/proj")
+    d = dmod.Daemon(p.base)
+    d._tick_began = time.monotonic()
+    spent = pushclaim.Budget()
+    spent.calls, spent.left = 1, 0.0
+    d._push_budget = (d._tick_began, spent)
+    d.audit_pushes()
+    assert p.db.kv(pushclaim.AUDIT_KV) is None and seen["tips"] == 0   # nothing told, nothing re-checked
+    d._tick_began = time.monotonic() + 1                                # the next tick: a fresh Budget
+    d.audit_pushes()
+    assert p.db.kv(pushclaim.AUDIT_KV)["counts"]["missing"] == 2 and seen["fetches"] == 0
 
 
 def test_the_push_audit_reports_a_second_claim_on_one_commit_as_shared_not_missing(env, monkeypatch):
