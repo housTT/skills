@@ -1419,7 +1419,8 @@ def cmd_upstream(a) -> None:
     (0 once this project's running daemon is at or above that version, 1 before, 2 unknown, 3 when the
     note was closed as not a plugin bug: no fix ships), `--resolve <fp> --wontfix "<reason>"` closes a
     not-a-bug note without a release, `--ack <fp>
-    "<evidence>"` closes it for this project, `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
+    "<evidence>"` closes it for this project, `--regress <fp> "<note>"` records that a shipped fix did not
+    hold (a maintainer's ingesting project then never closes it as filer unreachable), `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
     follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
     from . import upstream
     if a.fp is not None:
@@ -1429,7 +1430,7 @@ def cmd_upstream(a) -> None:
         print(upstream.fingerprint(title.strip()[:upstream.TITLE_CHARS], upstream.cut(
             spec.strip(), f"the hand-off of {me.name if me else '?'} #{task}" if task else "its hand-off")))
         return
-    if a.resolve or a.fixed or a.ack or a.mine or a.resolved or a.wontfix is not None:
+    if a.resolve or a.fixed or a.ack or a.regress or a.mine or a.resolved or a.wontfix is not None:
         try:
             if a.wontfix is not None and not a.resolve:
                 die("ttp upstream --wontfix needs --resolve <fp>", 2)
@@ -1474,6 +1475,19 @@ def cmd_upstream(a) -> None:
                 die("no tt-project project here", 2)
             if a.fixed:
                 raise SystemExit(upstream.fixed(p, a.fixed))
+            if a.regress:
+                fp, note = a.regress
+                try:
+                    upstream.regress(fp, note)
+                except OSError as e:
+                    if not os.environ.get("TTP_RUN_DIR"):
+                        raise
+                    upstream.queue_regress(Path(os.environ["TTP_RUN_DIR"]), fp, note)
+                    print(f"regression of note {fp.strip().lower()} queued in this run's directory ({e.strerror or e}); "
+                          f"this project's daemon records it when the run ends")
+                    return
+                print(f"regression of note {fp.strip().lower()} recorded")
+                return
             if a.ack:
                 fp, evidence = a.ack
                 try:
@@ -5569,6 +5583,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
                                                   "fix, 1 before, 2 when unknown, 3 when closed as not a bug (wontfix)")
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
+    s.add_argument("--regress", nargs=2, metavar=("FP", "NOTE"), help="record that note FP's shipped fix did not hold")
     s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
     s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")
     s.add_argument("--resolved", action="store_true", help="every resolved note and where it stands")

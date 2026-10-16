@@ -3894,6 +3894,13 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in recover))
             except Exception as e:   # nor must the incident report
                 log(self.p, f"ttr lines failed: {type(e).__name__}: {e}")
+        if (self.cfg.get("upstream") or {}).get("ingest") and payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                line = upstream.orphans_line()
+                if line:
+                    spec += f"\n\nShipped upstream fixes no filer here can confirm: {line}"
+            except Exception as e:   # nor must the orphan list
+                log(self.p, f"upstream orphans line failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             noisy = watchdup.review_lines(db)
             if noisy:

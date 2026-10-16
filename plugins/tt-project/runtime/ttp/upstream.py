@@ -694,6 +694,14 @@ def queue_ack(run_dir: Path, fp: str, evidence: str) -> None:
     durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"fp": fp, "evidence": evidence}, sort_keys=True) + "\n")
 
 
+def queue_regress(run_dir: Path, fp: str, note: str) -> None:
+    """Keep a worker's regression record in its run's directory when its sandbox cannot write RESOLVED_FILE."""
+    fp = _check_fp(fp)
+    if not resolution(fp):
+        raise ValueError(f"note {fp} has no resolution yet: nothing to regress")
+    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"kind": "regression", "fp": fp, "note": note}, sort_keys=True) + "\n")
+
+
 def queue_resolve(run_dir: Path, fp: str, fixed_in: str, note: str = "") -> None:
     """Keep a worker's resolution in its run's directory when its sandbox cannot write RESOLVED_FILE:
     its project's daemon records it (`file_queued_acks`) when the run ends. Checked as resolve does."""
@@ -731,6 +739,8 @@ def file_queued_acks(run_dir: Path, name: str) -> int:
             a = json.loads(ln)
             if a.get("kind") == "resolve":
                 resolve(a["fp"], a["fixed_in"], a.get("note") or "", name)
+            elif a.get("kind") == "regression":
+                regress(a["fp"], a.get("note") or "")
             elif a.get("kind") == "wontfix":
                 wontfix(a["fp"], a.get("note") or "", name)
             else:

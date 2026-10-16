@@ -7171,3 +7171,30 @@ def test_upstream_orphan_shipped_notes_are_listed_then_closed_unless_regressed(e
     assert upstream.state(orphan, now) == "closed" and upstream.acked(orphan)["project"] == upstream.UNREACHABLE
     assert upstream.state(held, now) == upstream.SHIPPED and upstream.state(mine, now) == upstream.SHIPPED
     assert upstream.close_unreachable(now) == []
+
+
+def test_upstream_regress_queue_stops_the_close_and_orphans_reach_the_daily_review(env):
+    from ttp import daemon as dm, upstream
+    day = 86400
+    t0 = time.time() - 40 * day
+    held, orphan = "b" * 16, "a" * 16
+    upstream.resolve(held, "0.3.0", now=t0)
+    upstream.resolve(orphan, "0.3.0", now=t0)
+    p = make(env)
+    with pytest.raises(ValueError):
+        upstream.regress("d" * 16, "x")
+    run = p.base / "runs-demo"
+    run.mkdir()
+    upstream.queue_regress(run, held, "still broken")
+    assert upstream.file_queued_acks(run, "demo") == 1
+    assert upstream.close_unreachable() == [orphan]
+    assert upstream.state(held, time.time()) == upstream.SHIPPED
+    # The daily review lists orphans only for an ingesting project.
+    upstream.resolve("c" * 16, "0.3.0", now=time.time() - 20 * day)
+    for ingest in (True, False):
+        p.db.x("DELETE FROM tasks")
+        d = dm.Daemon(p.base)
+        d.cfg = {**d.cfg, "upstream": {"ingest": ingest}}
+        d._schedule_llm({"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}, {})
+        spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+        assert ("c" * 16 in spec) is ingest
