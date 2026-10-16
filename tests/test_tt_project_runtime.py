@@ -559,8 +559,34 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     stdlib = {m: dict(vars(m)) for m in _MAKE_STDLIB}
     yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents,
            "_make": (_git_session, patched, stdlib)}
+    _stop_left_checks(repo)
     sys.path.remove(str(RUNTIME))
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
+
+
+def _stop_left_checks(root: pathlib.Path, grace: float = 10.0) -> list[pathlib.Path]:
+    """Stops the detached `ttp checks` a test left running in the project at `root` (the daemon starts
+    them as a review is queued), by their checks.pid, and returns their folders. pytest removes a
+    passed test's folder and gives the next test of the same name the same path, so checks still
+    running would write into that test's project. Cheap: it reads only the state's run folders."""
+    from ttp import cli
+    stopped = []
+    for f in (root / "tt-project" / "state").glob(f"*/*/{cli.CHECKS_PID}"):
+        info = cli._read_checks_pid(f.parent)
+        if not cli._checks_alive(info):
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(info["pid"], sig)
+            except OSError:
+                pass
+            end = time.time() + grace
+            while cli._checks_alive(info) and time.time() < end:
+                time.sleep(0.05)
+            if not cli._checks_alive(info):
+                break
+        stopped.append(f.parent)
+    return stopped
 
 
 @pytest.fixture
@@ -28128,6 +28154,22 @@ def _wait_precheck(out: Path, timeout: float = 180.0) -> str:
         log = next((f.read_text() for f in (out / "checks.log", out / cli.CHECKS_OUT) if f.exists()), "")
         pytest.fail(f"the checks in {out} wrote no {cli.CHECKS_RC} ({cli._read_checks_pid(out)}): {log[-2000:]}")
     return rc.read_text().strip()
+
+
+def test_checks_a_queued_review_started_are_stopped_before_the_test_folder_goes(env, monkeypatch):
+    """The daemon starts the checks of a review it queues in their own session; a test that ends while
+    they run must not leave them writing into its folder, which pytest then gives to the next test of
+    the same name (it found repo/tt-project already there). The env fixture's teardown stops them."""
+    from ttp import cli
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    s.p.set_config("delivery.push_checks", ["sleep 60"])
+    out = Daemon(s.p.base)._precheck(s.p.db.task(s.code), s.head)
+    assert out and cli._checks_alive(cli._read_checks_pid(out))
+    info = cli._read_checks_pid(out)
+    assert _stop_left_checks(env["repo"]) == [out]
+    assert not cli._checks_alive(info)
+    assert _stop_left_checks(env["repo"]) == [], "nothing left to stop"
 
 
 def test_a_pass_of_more_commands_answers_for_the_commands_they_start_with(env):
