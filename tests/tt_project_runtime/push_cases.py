@@ -7485,6 +7485,9 @@ def test_text_claims_reads_push_phrases_and_skips_negated_ones_and_unknown_commi
     assert pick(f"done; pushed {s}.") == one                  # no ref: the push branch
     assert pick(f"not pushed {s} to origin/proj") == []
     assert pick(f"it was never pushed {s}") == []
+    assert pick(f"not yet pushed {s} to origin/proj") == []
+    assert pick(f"it hasn't been pushed {s} to origin/proj") == []
+    assert pick(f"didn't get pushed {s} to origin/proj") == []
     assert pick(f"{s} will be pushed to origin/proj by the review") == []
     assert pick("pushed deadbee1234 to origin/proj") == []    # no such commit here
     assert pick(f"pushed {s} to the branch") == one           # no real ref named: the push branch
@@ -7719,3 +7722,57 @@ def test_a_missing_that_rests_on_a_carried_answer_is_asked_again(env, monkeypatc
     cache = {**stale, pushclaim.CARRIED: set(stale)}
     assert pushclaim.verify(repo, "origin", "refs/heads/gone", sha, cache)[0] == pushclaim.CONFIRMED
     assert not cache[pushclaim.CARRIED]
+
+
+def test_a_pushed_list_naming_a_branch_the_remote_lacks_fails_naming_it(env, monkeypatch, tmp_path):
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path, {"status": "done", "summary": "shipped"})
+    _git_out(path, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    hand = json.loads((tmp_path / f"run-{tid}" / "result.json").read_text())
+    hand["on_pass"]["pushed"] = [{"sha": head, "branch": "nope"}]
+    (tmp_path / f"run-{tid}" / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, result=json.dumps({**hand, "waiting_since": time.time() - 60}))
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "pushing"
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+    assert "origin has no refs/heads/nope" in res["summary"], res["summary"]
+
+
+def test_the_push_audit_counts_an_on_pass_done_whose_on_pass_cmd_never_ran(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli, pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    on = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _commit(repo, "b.txt", "b\n")
+    off = _git_out(repo, "rev-parse", "HEAD")
+    now = time.time()
+
+    def done(title, summary, cmd=None, ran=False):
+        tid = p.db.add_task(title, "s", kind="code", origin="user")
+        run_dir = tmp_path / f"run-{tid}"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "on_pass_cmd": cmd} if cmd else {}))
+        if ran:
+            (run_dir / pushclaim.ON_PASS_DIR).mkdir()
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+        p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": summary,
+                                                                "run_status": "model-free"}))
+        return tid
+
+    done("on", f"pushed {on[:10]} to origin/proj")
+    done("off", f"pushed {off[:10]} to origin/proj")
+    gap = done("skipped", "checks pass", cmd="ttp checks --result x")
+    done("ran", "checks pass", cmd="ttp checks --result y", ran=True)
+    a = pushclaim.audit(p)
+    assert a["counts"] == {"confirmed": 1, "missing": 2, "unknown": 0}, a
+    assert a["tasks"] == 4
+    g = [g for g in a["gaps"] if g["source"] == "on_pass"]
+    assert [x["task"] for x in g] == [gap] and "on_pass_cmd never ran: ttp checks --result x" in g[0]["why"]
+    capsys.readouterr()
+    with contextlib.suppress(SystemExit):
+        cli.main(["push-audit", "demo", "--json"])
+    assert json.loads(capsys.readouterr().out)["counts"] == {"confirmed": 1, "missing": 2, "unknown": 0}

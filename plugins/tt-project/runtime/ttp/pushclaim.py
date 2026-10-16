@@ -50,7 +50,8 @@ _TAG = re.compile(rf"\bpushed\s+(?:the\s+)?tag\s+{_REF}\s+(?:at|to|on)\s+{_SHA}"
 _REF_SHA = re.compile(rf"\b(?:pushed|landed)\s+(?:to|on|onto)\s+{_REF}\s+(?:as|at)\s+{_SHA}", re.I)
 _SHA_REF = re.compile(rf"\b(?:pushed|landed)\s+(?:commit\s+)?(?:as\s+|at\s+)?{_SHA}(?:\s+(?:to|on|onto)\s+{_REF})?",
                       re.I)
-_NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto)\s+$", re.I)
+_NEGATED = re.compile(r"(?:\bnot|\bnever|n't|\bbe|\bwill|\bwould|\bto)"
+                      r"(?:\s+(?:yet|been|being|get|got|gotten|already|actually|really|ever))*\s+$", re.I)
 _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branch", "upstream"}
 
 
@@ -108,7 +109,7 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
     found = []
     for rx, order in ((_TAG, "ref_sha"), (_REF_SHA, "ref_sha"), (_SHA_REF, "sha_ref")):
         for m in rx.finditer(text or ""):
-            if _NEGATED.search(text[max(0, m.start() - 12):m.start()]):
+            if _NEGATED.search(text[max(0, m.start() - 40):m.start()]):
                 continue
             ref, sha = (m.group(1), m.group(2)) if order == "ref_sha" else (m.group(2), m.group(1))
             if any(m.start() < e and s < m.end() for s, e in found):
