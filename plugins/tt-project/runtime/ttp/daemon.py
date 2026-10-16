@@ -7228,6 +7228,9 @@ class Daemon:
             result = _read_result(out / RESULT_FILE)
             if rc == 0 and result is None and fallback is not None:
                 result = fallback   # its checks passed and the command succeeded: the hand-off's on_pass
+            if isinstance(result, dict) and r and r["dir"]:
+                waited = _read_result(Path(r["dir"]) / RESULT_FILE) or {}
+                result = with_waiting_followups(result, waited if _same_probe(waited, prev) else prev)
             if rc is None:
                 why = f"timed out after {timeout / 60:g} min"
             elif rc != 0:
@@ -7330,7 +7333,7 @@ class Daemon:
                                    "not run); run `ttp checks --full`")
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
-        return "pass", r, run_dir, full["on_pass"], head
+        return "pass", r, run_dir, with_waiting_followups(full["on_pass"], full), head
 
     def _probe_env(self) -> dict:
         """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,
@@ -8974,6 +8977,19 @@ def on_pass_problem(on_pass) -> str:
         if key in on_pass and not isinstance(on_pass[key], kind):
             return f"on_pass {key} must be a {kind.__name__}"
     return ""
+
+
+def with_waiting_followups(final: dict, waited: dict) -> dict:
+    """The final hand-off (a waiting hand-off's on_pass, or what its on_pass_cmd wrote) with the
+    waiting hand-off's own top-level followups added, so they are filed as a normal hand-off's are.
+    One already in `final` (same title and spec) is not added twice."""
+    extra = waited.get("followups") if isinstance(waited, dict) else None
+    if not isinstance(final, dict) or not isinstance(extra, list) or not extra:
+        return final
+    own = final.get("followups") if isinstance(final.get("followups"), list) else []
+    seen = {(f.get("title"), f.get("spec")) for f in own if isinstance(f, dict)}
+    add = [f for f in extra if isinstance(f, dict) and (f.get("title"), f.get("spec")) not in seen]
+    return {**final, "followups": [*own, *add]} if add else final
 
 
 def _checked_head(run_dir: Path, task: dict) -> str:

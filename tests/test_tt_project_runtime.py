@@ -18833,6 +18833,35 @@ def test_passed_checks_with_an_on_pass_cmd_run_it_and_record_on_pass_only_after_
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
 
 
+WRITES_OWN = ("printf '{\"status\":\"done\",\"summary\":\"published\","
+              "\"followups\":[{\"title\":\"own\",\"spec\":\"from the command\"}]}' > \"$TTP_RESULT\"")
+
+
+@pytest.mark.parametrize("cmd", [None, "true", WRITES_OWN])
+def test_a_waiting_hand_offs_top_level_followups_survive_its_on_pass(env, monkeypatch, tmp_path, cmd):
+    """The waiting hand-off's own followups (an upstream note among them) are filed when its on_pass,
+    or what its on_pass_cmd records, is applied: alongside the final hand-off's own, none twice."""
+    from ttp import daemon as dmod, upstream
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    note = {"title": "upstream: waits lose their followups", "spec": "keep them"}
+    later = {"title": "tidy the parser", "spec": "later"}
+    tid, _ = _checks_wait_task(p, tmp_path, {**DONE_ON_PASS, "followups": [later]}, on_pass_cmd=cmd)
+    run_dir = tmp_path / f"run-{tid}"
+    hand = {**json.loads((run_dir / "result.json").read_text()), "followups": [note, later]}
+    (run_dir / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, result=json.dumps({**hand, "waiting_since": time.time() - 60}))
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], task["blocked_reason"], res)
+    want = ["own", note["title"], later["title"]] if cmd == WRITES_OWN else [later["title"], note["title"]]
+    assert [f["title"] for f in res["followups"]] == want, res["followups"]
+    filed = [json.loads(x) for x in upstream.path().read_text().splitlines()] if upstream.path().exists() else []
+    assert [n["title"] for n in filed if n["task"] == tid] == [note["title"]]
+
+
 def test_a_hand_off_naming_on_pass_and_on_pass_cmd_is_warned_about():
     from ttp.daemon import on_pass_both_warning
     hand = {"status": "waiting", "on_pass": DONE_ON_PASS, "on_pass_cmd": "./publish.sh",
