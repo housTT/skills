@@ -2320,7 +2320,7 @@ elif cmd == "reserve":
         open(os.path.join(d, "list-fails"), "w").write(os.environ["FAKE_IRD_LIST_FAIL"])
     if os.environ.get("FAKE_IRD_HANG"):  # landed, then hangs until a timeout or a signal
         json.dump(st, open(path, "w")); open(os.environ["FAKE_IRD_HANG"], "w").close()
-        hang(60)
+        hang(60); sys.exit(0)  # never write back this stale state over the caller's release
     if os.environ.get("FAKE_IRD_RC"):
         json.dump(st, open(path, "w")); sys.exit(int(os.environ["FAKE_IRD_RC"]))
 elif cmd in ("release", "change-timeout", "reboot"):
