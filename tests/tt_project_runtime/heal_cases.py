@@ -387,6 +387,26 @@ def test_heal_suppress_exit_0_skips_the_fix_and_escalation_until_it_says_no(env)
     assert up2.exists() and "probe broken" not in (p2.logs / "daemon.log").read_text()
 
 
+def test_heal_suppress_quiets_the_non_outage_unknown_cap_message_until_it_says_no(env):
+    from ttp import heal
+    down = env["repo"] / "planned-down"
+    down.touch()
+    p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=600, escalate="user", suppress=f"test -e {down}")
+    spec, now = _heal_spec(p), time.time()
+    assert not spec.get("outage")
+    dark = dict(spec, check="exit 255")
+    heal.run(d, "svc", dark, now)
+    for t in (700, 800):
+        heal.run(d, "svc", dark, now + t)
+    assert _heal_told(p) == ([], [])
+    assert "unknown_told" not in heal.state(p.db, "svc")
+    assert (p.logs / "daemon.log").read_text().count("svc: suppressed: deliberately down") == 1
+    down.unlink()
+    assert "told" in heal.run(d, "svc", dark, now + 900)[0]
+    msgs, _ = _heal_told(p)
+    assert [m["ref"] for m in msgs] == ["heal-unknown:svc"]
+
+
 @pytest.mark.parametrize("probe", ["exit 7", "no-such-suppress-probe-xyz", "sleep 5"])
 def test_heal_broken_or_hung_suppress_heals_normally_and_is_logged(env, monkeypatch, probe):
     from ttp import heal
