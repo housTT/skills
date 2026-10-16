@@ -43721,3 +43721,15 @@ def test_upstream_unconfirmed_shows_in_the_audit_with_count_and_oldest_age(env):
     _shipped(p, "upstream: a2", 50, now)
     out = audit.lines(p.db, now, p=p)
     assert any("not confirmed: 2" in x and "oldest" in x for x in out)
+
+
+def test_task_show_json_prints_the_record(env, capsys):
+    from ttp import cli
+    p = make(env)
+    tid = p.db.add_task("Show me", "x", kind="work", tier="light", origin="coordinator")
+    cli.main(["task", p.name, "show", str(tid), "--json"])
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["id"] == tid and rec["title"] == "Show me"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", p.name, "show", str(tid + 99), "--json"])
+    assert e.value.code not in (0, None)

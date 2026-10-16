@@ -3577,7 +3577,7 @@ def cmd_task(a) -> None:
         t = p.db.task(int(a.title))
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
-        print(show_task(t))
+        print(json.dumps(t, indent=2, default=str) if a.json else show_task(t))
     elif a.action == "cancel":
         from .runner import stop_runs
         tid = int(a.title)
@@ -5996,7 +5996,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "the branch of a second repository that holds its work")
-    s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when")
+    s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")
