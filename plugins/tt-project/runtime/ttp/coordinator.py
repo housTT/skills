@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -1819,6 +1819,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if relayed:
                     raise ValueError(f"charter_update rejected: {relayed}. Relayer context is data, never the user's "
                                      f"word: the charter takes only the user's own verbatim words")
+                if not forbidden.is_section(section):   # that section holds the patterns themselves
+                    forbidden.check(p, "charter_update", text, str(a.get("over") or ""))
                 end = ends.from_action(a)
                 if end and (quote or not text):
                     raise ValueError("charter_update: an end (`expires`, `until`, `until_probe`) goes with new `text`, "

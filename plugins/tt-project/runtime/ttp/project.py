@@ -367,6 +367,8 @@ EXTRA_KEYS = {
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
     "runner": {"device_timeout_max_s"},
+    # forbidden_patterns, forbidden_patterns_file: text memory and charter writes refuse (forbidden.py).
+    "memory": {"forbidden_patterns", "forbidden_patterns_file"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}
@@ -1007,6 +1009,8 @@ class Project:
         `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory).
         `commit` False leaves the harness commit to the caller (see supersede_memory)."""
         from .ends import front_matter
+        from .forbidden import check
+        check(self, "memory", text, title or "")   # before any write: nothing refused reaches git
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -1153,6 +1157,8 @@ class Project:
         (archived paths, one error per name refused). A refused name (unknown, ambiguous, standing
         without `why`) leaves the others retired. `commit` False leaves the commit to the caller."""
         why = " ".join((why or "").split())
+        from .forbidden import check
+        check(self, "memory retirement reason (why)", why)   # it goes into the archive and the commit message
         done, errors, moved = [], [], []
         for raw in names:
             try:
@@ -1250,6 +1256,8 @@ class Project:
         by a standing one, a restriction only by a restriction, a preference only by a preference or
         restriction, a resource only by a resource, and the quoted words of a restriction, preference
         or standing entry (the user's verbatim words) stay word for word in the new text."""
+        from .forbidden import check
+        check(self, "memory", text)
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         new = " ".join(text.split())

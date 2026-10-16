@@ -12011,3 +12011,66 @@ def test_quiet_idle_wake_skips_back_off_over_days_and_never_overflow(env, monkey
     p.db.set_kv("idle_wake", {**w, "n": 10 ** 6})
     assert idle_wake(p, d.cfg, gates, clock[0])["at"] is not None
     d.maybe_coordinate()
+
+
+
+def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reach_git(env):
+    """A project that keeps its data out of git declares forbidden-data patterns (a charter section, config
+    regexes, a pattern file outside the harness). Every memory and charter write path refuses matching text
+    before writing or committing, and the refusal names the pattern, never the text; pointers pass."""
+    p = make(env)
+    from ttp import cli, coordinator as coord
+
+    def git_log():
+        return subprocess.run(["git", "-C", str(p.harness), "log", "--format=%B"], capture_output=True,
+                              text=True).stdout
+
+    # No pattern is declared by default: a figure is just text.
+    assert coord.apply(p, [{"type": "memory_add", "text": "The test rig cost $5 to rent.", "title": "rig"}],
+                       turn=1) == []
+    with p.charter_path.open("a") as f:
+        f.write("\n## Forbidden data\n- amounts: `\\$\\s?\\d[\\d,]*`\n- account numbers: `\\b\\d{8,}\\b`\n")
+    p.set_config("memory.forbidden_patterns", [{"name": "client names", "regex": "(?i)\\bacme\\b"}])
+    (p.base / "state").mkdir(exist_ok=True)
+    (p.base / "state" / "forbidden.txt").write_text("# kept out of git\n(?i)widgetco\n")
+    p.set_config("memory.forbidden_patterns_file", "state/forbidden.txt")
+    before = sorted(f.name for f in p.memory_dir.glob("*.md")), p.memory_index.read_text(), git_log()
+    charter = p.charter_path.read_text()
+
+    with pytest.raises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "Paid $1,234 into account 1234567890."])
+    assert "'amounts'" in str(e.value) and "'account numbers'" in str(e.value)
+    assert "1,234" not in str(e.value) and "1234567890" not in str(e.value) and "pointer" in str(e.value)
+    probs = coord.apply(p, [
+        {"type": "memory_add", "text": "Invoice from ACME is due.", "memory_kind": "fact"},
+        {"type": "memory_add", "text": "A pointer only", "title": "WidgetCo totals"},
+        {"type": "charter_update", "section": "Policies", "text": "Spend at most $900 a month."}], turn=2)
+    assert len(probs) == 3 and all("refused" in x and "nothing was written" in x for x in probs), probs
+    assert "'client names'" in probs[0] and "forbidden.txt line pattern 1" in probs[1]
+    assert not any(s in x for x in probs for s in ("ACME", "WidgetCo", "$900"))
+    with pytest.raises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "Merged: paid $77.", "--supersedes", next(p.memory_dir.glob("*rig*.md")).stem])
+    assert coord.apply(p, [{"type": "memory_forget", "name": next(p.memory_dir.glob("*rig*.md")).stem,
+                            "why": "acme paid it"}], turn=3)
+    assert (sorted(f.name for f in p.memory_dir.glob("*.md")), p.memory_index.read_text(), git_log()) == before
+    assert p.charter_path.read_text() == charter
+    assert not any(s in git_log() for s in ("1,234", "ACME", "acme", "WidgetCo", "$900", "$77"))
+
+    # A pointer to the work file passes and is committed; the patterns section itself takes new patterns.
+    assert coord.apply(p, [
+        {"type": "memory_add", "text": "Monthly totals: see work/totals.csv (kept out of git).", "title": "totals"},
+        {"type": "charter_update", "section": "Forbidden data", "text": "- card numbers: `\\b\\d{4}( \\d{4}){3}\\b`"}],
+        turn=4) == []
+    assert "memory (fact): totals" in git_log() and "card numbers" in p.charter_path.read_text()
+    probs = coord.apply(p, [{"type": "memory_add", "text": "Card 1111 2222 3333 4444 on file."}], turn=5)
+    assert probs and "'card numbers'" in probs[0] and "4444" not in probs[0]
+
+    # Fail closed: an invalid regex or an unreadable pattern file refuses the write, never lets it through.
+    p.set_config("memory.forbidden_patterns", ["(unclosed"])
+    probs = coord.apply(p, [{"type": "memory_add", "text": "Anything at all."}], turn=6)
+    assert probs and "not a valid regex" in probs[0]
+    p.set_config("memory.forbidden_patterns", [])
+    p.set_config("memory.forbidden_patterns_file", "state/missing.txt")
+    probs = coord.apply(p, [{"type": "memory_add", "text": "Anything at all."}], turn=7)
+    assert probs and "cannot be read" in probs[0]
+    assert not list(p.memory_dir.glob("*anything*.md"))

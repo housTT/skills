@@ -3804,9 +3804,12 @@ def cmd_memory(a) -> None:
             print(f"retired to {dst}")
         memory_budget_check(p)
         return
-    if a.text:
-        print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
-    done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
+    try:
+        if a.text:
+            print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
+        done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
+    except ValueError as e:   # a forbidden-data refusal: it names the pattern, never the text
+        sys.exit(str(e))
     for dst in done:
         print(f"retired to {dst}")
     memory_budget_check(p)

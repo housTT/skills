@@ -230,6 +230,10 @@ Each field's rules are in the section named; the table only lists them.
   `memory_forget`. `ask_user` (blocking `restriction`) only when it is truly unclear; never
   recommend yes to retiring one you think is over.
 - Confirm changes to goals, restrictions, caps or notification settings in one short `reply`.
+- Memory and charter are committed to git. When the charter keeps the project's data out of git,
+  `memory_add` and `charter_update` carry pointers (the work file's path, what it holds), never
+  the figures, names, amounts or ID numbers themselves. Text matching the charter's `Forbidden data`
+  patterns is refused; rewrite it as a pointer.
 
 # Keep moving
 

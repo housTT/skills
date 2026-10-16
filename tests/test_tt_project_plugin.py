@@ -310,6 +310,16 @@ def test_relays_keep_the_users_verbatim_words_apart_from_the_relayers_context():
         assert phrase in coordinator, phrase
 
 
+def test_coordinator_stores_pointers_not_figures_when_data_stays_out_of_git():
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    for phrase in ("When the charter keeps the project's data out of git",
+                   "carry pointers (the work file's path, what it holds), never the figures",
+                   "`Forbidden data` patterns is refused"):
+        assert phrase in coordinator, phrase
+    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8")
+    assert "`memory.forbidden_patterns_file`" in harness and "never the text" in harness
+
+
 def test_harness_tasks_deliver_by_a_local_commit_not_a_push():
     """The harness is a local repo with no remote: a harness task's commit is its delivery. Neither
     the task nor the coordinator's specs ask it to `ttp push --own` or to copy files into a code branch."""
