@@ -5270,6 +5270,8 @@ def test_shared_ttp_locks_run_together_and_exclude_exclusive_holders(env, tmp_pa
         holder.wait(timeout=30)
     assert not locks.shared_holders(paths), "a shared hold outlived its command"
     assert run("--probe", "board").returncode == 0
+    from ttp import activity
+    assert {r["mode"] for r in activity.entries(p.state) if r["ev"] == "take"} == {"shared"}
     # An exclusive holder keeps shared ones out, also from the shared probe.
     release = tmp_path / "excl-release"
     holder = subprocess.Popen(_lock_cmd("board", "--", *_until(release)), env=run_env)
