@@ -7270,7 +7270,7 @@ class Daemon:
                 continue
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, f"task:{task['id']}", CONTINUE_UNQUEUED, "high",
-                  f"#{task['id']} {task['title'][:160]}: its follow-up {conts[0][:200]!r} is {UNQUEUED_TAG} and no "
+                  f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {conts[0][:200]!r} is {UNQUEUED_TAG} and no "
                   f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. Add it with "
                   f"task_add continues #{task['id']}, or drop it on purpose.",
                   json.dumps({"followups": conts}), "queued", task["id"]))

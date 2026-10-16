@@ -36,6 +36,7 @@ import json
 import re
 import time
 
+from . import headline
 from .db import DB, continues_id, load_result
 
 CONT_TITLE = re.compile(r"(?i)^\s*continue\s*:")
@@ -302,7 +303,7 @@ def audit_line(db: DB, since: float, top: int = 8) -> str:
     return (f"continue chains: {len(ls)} lineage(s), {sum(x['hops'] for x in ls)} hops, "
             f"${sum(x['usd'] for x in ls):.2f}, {sum(x['auto'] for x in ls)} hops queued by the daemon, "
             f"{refused} refused by a cap, {sum(x['overridden'] for x in ls)} passed with a reason: " + "; ".join(
-                f"#{x['root']} {x['title'][:50]}: {x['hops']} hops to #{x['tip']} ({x['status']}), ${x['usd']:.2f}"
+                f"#{x['root']} {headline.clip(x['title'], 50)}: {x['hops']} hops to #{x['tip']} ({x['status']}), ${x['usd']:.2f}"
                 + (f", {x['auto']} auto" if x["auto"] else "") + (f", {x['refused']} refused" if x["refused"] else "")
                 + (f", {x['overridden']} overridden" if x["overridden"] else "") for x in ls[:top])
             + (f"; +{len(ls) - top} more" if len(ls) > top else ""))

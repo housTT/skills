@@ -1899,3 +1899,11 @@ def test_failover_review_lines_say_when_a_logout_ended(env):
     got = failover.review_lines(p.db, now, where="America/Los_Angeles")[0]
     assert "no known end" not in got and "(ended " in got and "lasted 2.5 h)" in got, got
     assert got.endswith(f"#{tid} is now done") and (" PDT, " in got or " PST, " in got), got
+
+
+def test_headline_label_prefix_and_word_clip_in_chain_audit():
+    from ttp import headline
+    assert headline.restates("triage: box-a hold", "box-a hold now cleared", False)
+    assert headline.join("triage: box-a hold", "box-a hold", 80) == "box-a hold"
+    out = headline.clip("alpha beta gamma delta " * 5, 50)
+    assert out.endswith("…") and len(out) <= 50 and out[:-1].split()[-1] in {"alpha", "beta", "gamma", "delta"}

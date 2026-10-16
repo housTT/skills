@@ -41,6 +41,8 @@ def restates(title: str, body: str, clipped: bool = True) -> bool:
     # a short leading label ("triage:") may be skipped; most content words appear early in the body
     if title.split()[0].endswith(":") and k > 3:
         t = t[1:]
+        if b[:len(t)] == t:
+            return True
     t = [w for w in t if w not in _STOP]
     if len(t) < 3:
         return False
