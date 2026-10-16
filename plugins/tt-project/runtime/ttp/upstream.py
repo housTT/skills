@@ -482,6 +482,10 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
         if not pending:
             remote_due = now + REMOTE_EVERY_S
     added = _file(p, sources, offsets, known, seen, now)
+    try:
+        close_unreachable(now)
+    except (OSError, ValueError):
+        pass
     db.set_kv(KV_CURSOR, {"offsets": offsets, "seen": seen[-SEEN_KEPT:], "remote_due": remote_due,
                             "remote_pending": pending})
     return added
@@ -541,8 +545,11 @@ def fixes_line(name: str, cfg: dict, now: float | None = None) -> str:
         got = unconfirmed(None if (cfg.get("upstream") or {}).get("ingest") else name, now)
     except OSError:
         return ""
-    return (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED}: {', '.join(got[:5])}"
+    line = (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED}: {', '.join(got[:5])}"
             + ("" if len(got) <= 5 else ", …")) if got else ""
+    if (cfg.get("upstream") or {}).get("ingest"):
+        line = "; ".join(x for x in (line, orphans_line(now)) if x)
+    return line
 
 
 def reader(now: float | None = None) -> dict | None:
@@ -588,6 +595,9 @@ KV_FIXED = "upstream_fixed"   # "<fp>@<fixed_in>" this project's coordinator was
 FIXED_KEPT = 2000
 CONFIRM_S = 86400
 SHIPPED = "shipped, not confirmed"
+ORPHAN_LIST_S = 14 * 86400    # a shipped note no local project filed is listed in the daily review after this
+ORPHAN_CLOSE_S = 30 * 86400   # ...and closed as "filer unreachable" after this, unless a regression is recorded
+UNREACHABLE = "filer unreachable"
 
 
 def resolved_path() -> Path:
@@ -860,6 +870,54 @@ def unconfirmed(name: str | None, now: float | None = None) -> list[str]:
     fps = dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve")
     mine = filed(name) if name else None
     return [fp for fp in fps if (mine is None or fp in mine) and state(fp, now, recs) == SHIPPED]
+
+
+def regress(fp: str, note: str, now: float | None = None) -> dict:
+    """Record that the fix of note `fp` did not hold: it is never auto-closed as unreachable after this."""
+    fp = _check_fp(fp)
+    if not resolution(fp):
+        raise ValueError(f"note {fp} has no resolution yet: nothing to regress")
+    return _record({"kind": "regression", "fp": fp, "note": cut(" ".join(str(note or "").split()), "it"),
+                    "ts": now or time.time()})
+
+
+def orphans(now: float | None = None, min_age_s: float = ORPHAN_LIST_S) -> list[str]:
+    """Fingerprints SHIPPED for at least `min_age_s` whose filer is not a project on this machine (no
+    local, non-forwarded inbox note) and with no regression recorded since the resolution."""
+    now = now or time.time()
+    recs = _records()
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            local = {n.get("fp") for n in _lines(f.read())[0] if n.get("project") and not n.get("via")}
+    except FileNotFoundError:
+        local = set()
+    out = []
+    for fp in dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve"):
+        res = resolution(fp, recs)
+        if fp in local or state(fp, now, recs) != SHIPPED or now - float(res["ts"]) < min_age_s:
+            continue
+        if any(r.get("kind") == "regression" and r.get("fp") == fp and float(r.get("ts") or 0) >= float(res["ts"])
+               for r in recs):
+            continue
+        out.append(fp)
+    return out
+
+
+def close_unreachable(now: float | None = None) -> list[str]:
+    """Close, as UNREACHABLE, the orphans older than ORPHAN_CLOSE_S. Returns their fingerprints."""
+    got = orphans(now, ORPHAN_CLOSE_S)
+    for fp in got:
+        ack(fp, UNREACHABLE, f"no filer project on this machine confirmed within {ORPHAN_CLOSE_S // 86400} days", now)
+    return got
+
+
+def orphans_line(now: float | None = None) -> str:
+    """For the daily review: shipped notes nobody here can confirm, past ORPHAN_LIST_S."""
+    got = orphans(now)
+    return (f"{len(got)} upstream fix{'' if len(got) == 1 else 'es'} {SHIPPED} for {ORPHAN_LIST_S // 86400}+ days "
+            f"with no filer on this machine (closed as '{UNREACHABLE}' after {ORPHAN_CLOSE_S // 86400} days unless a "
+            f"regression is recorded): {', '.join(got[:5])}" + ("" if len(got) <= 5 else ", …")) if got else ""
 
 
 def listing(name: str | None, now: float | None = None) -> list[str]:

@@ -7149,3 +7149,25 @@ def test_the_remotes_default_branch_answer_survives_a_daemon_restart(env, monkey
     with s.p.db.tx():
         assert pushq._default_branch(s.p, "origin", time.time() + pushq.DEFAULT_BRANCH_TTL_S + 1) is None
         assert not pushq._absent(s.p, "origin", "feature/x")
+
+
+def test_upstream_orphan_shipped_notes_are_listed_then_closed_unless_regressed(env):
+    from ttp import upstream
+    day = 86400
+    t0 = time.time() - 40 * day
+    upstream.append("demo", 4, [{"title": "upstream: mine", "spec": "a"}])
+    mine = upstream.fingerprint("upstream: mine", "a")
+    orphan, held, young = "a" * 16, "b" * 16, "c" * 16
+    upstream.resolve(mine, "0.3.0", now=t0)
+    upstream.resolve(orphan, "0.3.0", now=t0)
+    upstream.resolve(held, "0.3.0", now=t0)
+    upstream.regress(held, "still broken", now=t0 + day)
+    upstream.resolve(young, "0.3.0", now=time.time() - 15 * day)
+    now = time.time()
+    assert set(upstream.orphans(now)) == {orphan, young}      # the local filer's note is never an orphan
+    assert upstream.orphans(now, upstream.ORPHAN_CLOSE_S) == [orphan]
+    assert orphan in upstream.orphans_line(now)
+    assert upstream.close_unreachable(now) == [orphan]
+    assert upstream.state(orphan, now) == "closed" and upstream.acked(orphan)["project"] == upstream.UNREACHABLE
+    assert upstream.state(held, now) == upstream.SHIPPED and upstream.state(mine, now) == upstream.SHIPPED
+    assert upstream.close_unreachable(now) == []
