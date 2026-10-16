@@ -1152,17 +1152,19 @@ def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
 
 
 
-def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
+def _coordinator_turns(env, monkeypatch, provider):
+    """(project, turn): turn(text) queues one event, runs a coordinator turn on `provider` ten
+    minutes later and returns its (prompt, start_run kwargs)."""
     p = make(env)
     from ttp.daemon import Daemon
-    from ttp import coordinator as coord
     p.add_memory("Picked the cheaper runner.", kind="decision")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     d = Daemon(p.base)
+    d.cfg["core_provider"] = provider
     d.update_gates()
     clock = [time.time()]
     calls = []
-    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, prov, *a, **k: calls.append((prompt, prov, k)) or 1)
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
     def turn(text):
@@ -1171,8 +1173,16 @@ def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchang
         clock[0] += 600
         d.maybe_coordinate()
         p.db.x("UPDATE events SET status='handled'")
-        return calls[-1]
+        prompt, prov, k = calls[-1]
+        assert prov == provider
+        return prompt, k
+    return p, turn
 
+
+def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
+    # A provider whose cache reuses any matching prefix (codex): the slow sections end the block.
+    from ttp import coordinator as coord
+    p, turn = _coordinator_turns(env, monkeypatch, "codex")
     first, k1 = turn("one")
     second, k2 = turn("two")
     assert k1["context"] == k2["context"], "the cached block changed with nothing slow changing"
@@ -1189,6 +1199,25 @@ def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchang
     assert k3["context"] != k2["context"] and "The build takes 40 minutes." in k3["context"]
     assert k3["context"].startswith(k2["context"].split(coord.RECENT_MEMORY_HEADER, 1)[0]), \
         "a slow change moved the snapshot part of the block"
+
+
+
+def test_claude_turns_keep_slow_sections_in_the_digest_so_a_memory_add_keeps_the_system_prompt(env, monkeypatch):
+    # Claude's cache matches only at a breakpoint, and the whole context block joins the system
+    # prompt: a slow section there would rewrite all of it on every memory change.
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    assert get_provider("claude").partial_prefix_cache is False and get_provider("codex").partial_prefix_cache
+    p, turn = _coordinator_turns(env, monkeypatch, "claude")
+    first, k1 = turn("one")
+    assert coord.RECENT_MEMORY_HEADER not in k1["context"] and "Picked the cheaper runner." not in k1["context"]
+    assert "Picked the cheaper runner." in first.split(coord.RECENT_MEMORY_HEADER, 1)[1]
+    assert k1["note"]["digest"]["cached_chars"] == 0
+    p.add_memory("The build takes 40 minutes.", kind="fact")
+    second, k2 = turn("two")
+    assert (k2["system"], k2["context"]) == (k1["system"], k1["context"]), "a memory add missed the prompt cache"
+    assert coord.join_prompt(k2["system"], k2["context"]) == coord.join_prompt(k1["system"], k1["context"])
+    assert "The build takes 40 minutes." in second and "The build takes 40 minutes." not in first
 
 
 

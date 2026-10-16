@@ -211,6 +211,10 @@ class Provider:
     # Cache breakpoints the agent itself places on one request, at most (on any call of a run, not
     # only the first): runtime-added marks get what is left of MAX_CACHE_BREAKPOINTS.
     own_cache_breakpoints = 0
+    # The cache reuses any prefix that matches, wherever the change starts. False where it matches
+    # only up to a cache breakpoint: one changed line late in the system prompt then rewrites that
+    # whole block, so slow digest sections (coordinator.CACHED_SECTIONS) must stay out of it.
+    partial_prefix_cache = True
     # The agent keys its prompt cache to the session, so a fresh session misses even an identical
     # prefix: coordinator turns continue the last turn's session while warm (cachettl.pick_thread).
     cache_key_per_session = False

@@ -4640,7 +4640,9 @@ class Daemon:
             # Every turn, at any effort, sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               db.kv(coord.DIGEST_SEEN_KEY) or {})
-            cached, parts = coord.split_cached(parts)   # slow sections: in the cached context block
+            # Slow sections end the cached context block only where a change in them leaves the
+            # prefix before them readable; else they stay in the digest.
+            cached, parts = coord.split_cached(parts) if get_provider(provider).partial_prefix_cache else ("", parts)
             prompt = "\n".join(text for _, text in parts)
             # `escalate` is offered only where the daemon would take it: a routine turn that a raise
             # would change, not a rerun, over a batch not escalated before (Daemon._escalate_refusal).
