@@ -34006,10 +34006,25 @@ def test_svcscan_flags_every_unit_change_and_no_read_only_query(env):
     assert "service changes a unit" in hits[10], hits
     assert "absolute path" in hits[11] and "absolute path" in hits[13] and "over ssh" in hits[12], hits
     assert not any("absolute path" in hits[n] or "ssh" in hits[n] for n in range(3, 11)), hits
-    for verb in svcscan.VERBS:
+    # any verb outside the read-only allowlist is a change, also an unknown or variable one
+    for verb in ("stop", "disable", "mask", "start", "restart", "enable", "unmask", "try-restart", "kill",
+                 "isolate", "reboot", "poweroff", "halt", "kexec", "suspend", "hibernate", "reload",
+                 "daemon-reload", "set-property", "reset-failed", "preset", "reenable", "revert", "link",
+                 "edit", "freeze", "thaw", "set-environment", "$verb", "{action}"):
         assert svcscan.scan(f"sudo -n systemctl {verb} x\n"), verb
-    for query in ("is-active", "is-enabled", "status", "show", "cat", "list-units", "daemon-reload"):
-        assert svcscan.scan(f"sudo -n systemctl {query} x\n") == [], query
+    for query in (*(f"{v} x" for v in svcscan.READ_ONLY), "-p ActiveState show x", "-qH box status x",
+                  "--version", "-h", "--user"):
+        assert svcscan.scan(f"sudo -n systemctl {query}\n") == [], query
+    # forms that are not one plain shell line: argv lists, a relative path, backslash continuations
+    for text in ('subprocess.run(["sudo", "-n", "systemctl", "stop", unit])\n',
+                 "run(('systemctl', '--user', 'daemon-reload'))\n", "service x reload\n",
+                 'subprocess.run(["service", unit, "reload"])\n', "./systemctl stop x\n",
+                 "systemctl -H box stop x\n", "sudo -n systemctl \\\n  --user \\\n  restart x\n"):
+        assert [n for n, _, _ in svcscan.scan(text)] == [1], text
+    assert "relative path" in svcscan.scan("./systemctl stop x\n")[0][1]
+    for text in ('subprocess.run(["systemctl", "is-active", unit])\n', 'shutil.which("systemctl")\n',
+                 "echo $(systemctl is-active x)\n", "service x status\n", "systemctl \\\n  status x\n"):
+        assert svcscan.scan(text) == [], text
 
 
 def test_ttp_svcscan_exits_1_on_a_hit_and_its_shims_change_no_unit(env, tmp_path):
@@ -34057,6 +34072,25 @@ def test_ttp_svcscan_exits_1_on_a_hit_and_its_shims_change_no_unit(env, tmp_path
     r = subprocess.run(["systemctl", "-H", "box", "stop", "x"], capture_output=True, text=True,
                        env={**os.environ, "PATH": f"{shims}:{real}"})
     assert r.returncode == 0 and "real -H" not in (tmp_path / "real.log").read_text()
+    # only read-only verbs reach the real one: reboot, reload, daemon-reload... are only logged
+    for verb in ("reboot", "poweroff", "reload", "daemon-reload", "set-property", "reset-failed", "edit"):
+        r = subprocess.run(["sudo", "-n", "systemctl", verb, "x"], capture_output=True, text=True,
+                           env={**os.environ, "PATH": f"{shims}:{real}"})
+        assert r.returncode == 0 and f"systemctl {verb} x" in (shims / "svcscan.log").read_text(), verb
+    assert (tmp_path / "real.log").read_text().splitlines()[3:] == [], "a change reached the real systemctl"
+    # the shim folder on PATH as a relative path, with a trailing slash or twice: a query does not
+    # re-run a shim, it reaches the real one once and logs one line
+    other = tmp_path / "shims2"
+    from ttp import svcscan
+    svcscan.write_shims(other)
+    for path in ("shims", "shims/", f"{shims}/", f"shims:{other}"):
+        (shims / "svcscan.log").write_text("")
+        (tmp_path / "real.log").write_text("")
+        r = subprocess.run(["systemctl", "is-active", "x"], capture_output=True, text=True, timeout=10,
+                           cwd=tmp_path, env={**os.environ, "PATH": f"{path}:{real}:/usr/bin:/bin"})
+        assert r.returncode == 0, (path, r.stderr)
+        assert (shims / "svcscan.log").read_text().splitlines() == ["systemctl is-active x"], path
+        assert (tmp_path / "real.log").read_text().splitlines() == ["real is-active x"], path
 
 
 def test_no_test_resolves_or_starts_a_real_agent_cli(env, tmp_path_factory):

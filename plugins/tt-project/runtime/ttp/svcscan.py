@@ -6,8 +6,9 @@ A driver or test stub that calls `systemctl stop|disable|mask|...` (often as `su
 changes a shared machine's services for everyone on it: a serving process stops, a recovery timer
 is switched off, a unit stays masked after the run. `ttp svcscan <script>` flags those calls;
 `ttp svcscan --shim <dir>` writes stand-ins for `systemctl`, `service` and `sudo` that only log
-changing calls, so the driver can be exercised without touching a real unit. Read-only queries
-(`systemctl is-active`, `status`, `show`, ...) go on to the real `systemctl` when there is one.
+changing calls, so the driver can be exercised without touching a real unit. Only read-only queries
+(`systemctl is-active`, `status`, `show`, ... in READ_ONLY) go on to the real `systemctl` when there
+is one; every other verb counts as a change.
 A call by absolute path (`/usr/bin/systemctl`, `/usr/bin/sudo`) or over ssh bypasses a local shim,
 so it is flagged as such.
 """
@@ -17,64 +18,145 @@ import re
 import shlex
 from pathlib import Path
 
-# the systemctl verbs that change a unit's state or enablement
-VERBS = ("stop", "disable", "mask", "start", "restart", "enable", "unmask", "try-restart",
-         "reload-or-restart", "try-reload-or-restart", "kill", "isolate")
-_CMD = r"(?<![\w./-])(?:/\S*/)?"
+# The only systemctl verbs that leave the machine as it was. Any other verb (stop, reboot, reload,
+# daemon-reload, set-property, an unknown or `$verb` word...) is flagged by scan() and only logged
+# by the shim. A call with no verb (plain `systemctl`, `--version`, `-h`) lists units or prints help.
+READ_ONLY = ("status", "show", "cat", "is-active", "is-enabled", "is-failed", "is-system-running",
+             "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies",
+             "list-jobs", "show-environment", "help")
+# systemctl options that take the next word as their value (`-H <host> stop`, `-p ActiveState`)
+SHORT_WITH_VALUE = "HMPpstno"
+LONG_WITH_VALUE = ("--host", "--machine", "--property", "--type", "--signal", "--state", "--lines",
+                   "--output", "--root", "--image", "--kill-whom", "--kill-value", "--job-mode",
+                   "--what", "--boot-loader-entry", "--reboot-argument", "--timestamp",
+                   "--preset-mode", "--check-inhibitors", "--message", "--when", "--drop-in")
+# service <unit> <action> that changes the unit
+SERVICE_ACTIONS = ("stop", "start", "restart", "reload", "force-reload", "try-restart")
+# a command word, also by path (/usr/bin/, ./, ../bin/) and inside quotes or an argv list
+_CMD = r"(?<![\w./-])(?P<path>[^\s'\",;|&()\[\]]*/)?"
 _END = r"(?![\w.-])"
-# options and other words before the verb, staying within one command (no ; | & or newline)
-_GAP = r"(?:\s+[^\s;|&]+)*?\s+"
-_VERB = r"(?:" + "|".join(re.escape(v) for v in sorted(VERBS, key=len, reverse=True)) + r")" + _END
-_RULES = [
-    ("systemctl changes a unit on the machine", re.compile(_CMD + r"systemctl" + _END + _GAP + _VERB)),
-    ("service changes a unit on the machine",
-     re.compile(_CMD + r"service" + r"\s+[\w@.:-]+\s+(?:stop|start|restart|force-reload|try-restart)" + _END)),
-]
+_SYSTEMCTL = re.compile(_CMD + r"systemctl" + _END)
+_SERVICE = re.compile(_CMD + r"service" + _END)
+# the rest of one command: up to ; | & ) ] or a backtick
+_REST = re.compile(r"[^;|&)\]`]*")
+# words are split by blanks, quotes and commas, so `["sudo", "-n", "systemctl", "stop", u]` reads
+# as `sudo -n systemctl stop u`
+_SEP = re.compile(r"[\s'\",]+")
 _ABSOLUTE = re.compile(r"/\S*/(?:systemctl|service|sudo)\b")
 _SSH = re.compile(r"(?<![\w./-])(?:/\S*/)?ssh" + _END)
 SHIMMED = ("systemctl", "service", "sudo")
 
 
+def systemctl_verb(words) -> str:
+    """The verb of a systemctl call given the words after `systemctl`: the first word that is not
+    an option or an option's value ('' when there is none). Same parse as the shim's."""
+    skip = False
+    after_dashes = False
+    for w in words:
+        if skip:
+            skip = False
+            continue
+        if not after_dashes and w == "--":
+            after_dashes = True
+            continue
+        if not after_dashes and w.startswith("--"):
+            skip = w in LONG_WITH_VALUE
+            continue
+        if not after_dashes and w.startswith("-") and len(w) > 1:
+            # a short cluster (`-qH`) takes the next word only when its first value letter is last
+            at = next((i for i, c in enumerate(w[1:], 1) if c in SHORT_WITH_VALUE), None)
+            skip = at == len(w) - 1
+            continue
+        return w
+    return ""
+
+
+def _logical_lines(text: str):
+    """(first line number, line) with backslash-continued lines joined."""
+    lines = text.splitlines()
+    n = 0
+    while n < len(lines):
+        first, line = n + 1, lines[n]
+        while line.endswith("\\") and n + 1 < len(lines):
+            n += 1
+            line = line[:-1].rstrip() + " " + lines[n].lstrip()
+        n += 1
+        yield first, line
+
+
+def _change(line: str):
+    """(reason, match) for the first unit change on `line`, else None."""
+    for m in _SYSTEMCTL.finditer(line):
+        verb = systemctl_verb(w for w in _SEP.split(_REST.match(line, m.end()).group()) if w)
+        if verb and verb not in READ_ONLY:
+            return "systemctl changes a unit on the machine", m
+    for m in _SERVICE.finditer(line):
+        words = [w for w in _SEP.split(_REST.match(line, m.end()).group()) if w]
+        if len(words) >= 2 and not words[0].startswith("-") and words[1] in SERVICE_ACTIONS:
+            return "service changes a unit on the machine", m
+    return None
+
+
 def scan(text: str) -> list:
-    """[(line number, reason, line)] for each line that changes a service unit. Comment lines are
-    skipped; one reason per line. A call by absolute path or over ssh is marked, since a local
-    PATH shim does not stop it."""
+    """[(line number, reason, line)] for each line that changes a service unit: a systemctl verb
+    outside READ_ONLY, or `service <unit> stop|reload|...`. Comment lines are skipped; one reason
+    per line; a backslash-continued call counts at its first line. A call by path or over ssh is
+    marked, since a local PATH shim does not stop it."""
     found = []
-    for n, raw in enumerate(text.splitlines(), 1):
+    for n, raw in _logical_lines(text):
         line = raw.lstrip()
         if line.startswith("#"):
             continue
-        for reason, rule in _RULES:
-            m = rule.search(line)
-            if not m:
-                continue
-            start = max(line.rfind(c, 0, m.start()) for c in ";|&\n") + 1
-            prefix = line[start:m.end()]
-            if _ABSOLUTE.search(prefix):
-                reason += " (by absolute path: a PATH shim does not stop it)"
-            elif _SSH.search(line[:m.start()]):
-                reason += " (over ssh: a local PATH shim does not stop it)"
-            found.append((n, reason, line.strip()))
-            break
+        hit = _change(line)
+        if not hit:
+            continue
+        reason, m = hit
+        start = max(line.rfind(c, 0, m.start()) for c in ";|&\n") + 1
+        prefix = line[start:m.end()]
+        if _ABSOLUTE.search(prefix):
+            reason += " (by absolute path: a PATH shim does not stop it)"
+        elif m.group("path"):
+            reason += " (by relative path: a PATH shim does not stop it)"
+        elif _SSH.search(line[:m.start()]):
+            reason += " (over ssh: a local PATH shim does not stop it)"
+        found.append((n, reason, line.strip()))
     return found
 
 
 def _systemctl_shim(log: str) -> str:
-    verbs = "|".join(VERBS)
-    # any changing verb among the words (not only the first one: `-H <host> stop`) is only logged
+    # Same parse as systemctl_verb(): only a call with no verb or a READ_ONLY verb reaches a real
+    # systemctl; every other call is only logged. The search for the real one skips every ttp
+    # svcscan shim (this one under any PATH spelling, or another --shim folder), so it cannot loop.
+    long_opts = "|".join(LONG_WITH_VALUE)
+    read_only = "|".join(READ_ONLY)
     return ("#!/bin/sh\n"
             "# ttp svcscan shim: logs every call; changes no unit, read-only queries go to the real one\n"
             f"printf '%s\\n' \"systemctl $*\" >> {log}\n"
+            "verb= skip= dashes=\n"
             "for a in \"$@\"; do\n"
-            "  case \"$a\" in\n"
-            f"    {verbs}) exit 0 ;;\n"
-            "  esac\n"
+            "  if [ -n \"$skip\" ]; then skip=; continue; fi\n"
+            "  if [ -z \"$dashes\" ]; then\n"
+            "    case \"$a\" in\n"
+            "      --) dashes=1; continue ;;\n"
+            f"      {long_opts}) skip=1; continue ;;\n"
+            "      --*) continue ;;\n"
+            f"      -?*) pre=${{a%%[{SHORT_WITH_VALUE}]*}}\n"
+            "           if [ \"$pre\" != \"$a\" ] && [ -z \"${a#\"$pre\"?}\" ]; then skip=1; fi\n"
+            "           continue ;;\n"
+            "    esac\n"
+            "  fi\n"
+            "  verb=$a; break\n"
             "done\n"
-            "self=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+            "case \"$verb\" in\n"
+            f"  ''|{read_only}) ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac\n"
             "IFS=:\n"
             "for d in $PATH; do\n"
-            "  [ \"$d\" = \"$self\" ] && continue\n"
-            "  [ -x \"$d/systemctl\" ] && exec \"$d/systemctl\" \"$@\"\n"
+            "  [ -x \"$d/systemctl\" ] || continue\n"
+            "  [ \"$d/systemctl\" -ef \"$0\" ] && continue\n"
+            "  grep -q '^# ttp svcscan shim' \"$d/systemctl\" 2>/dev/null && continue\n"
+            "  exec \"$d/systemctl\" \"$@\"\n"
             "done\n"
             "exit 0\n")
 
