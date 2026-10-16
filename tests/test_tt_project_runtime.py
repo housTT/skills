@@ -17719,18 +17719,27 @@ def _re_plan(s, label):
 
 
 def _finish_fix(env, p, fix):
-    from ttp.daemon import Daemon
+    """The re-plan `fix` hands off done. A review it queues gets the checks the daemon starts on its head
+    (Daemon._precheck), detached processes in this test's folder: they are waited for here, as a later
+    test can reuse the folder's name once pytest removes it, and a check still running there writes
+    into that test's project."""
+    from ttp import cli
+    from ttp.daemon import Daemon, PRECHECKS_DIR
     from ttp.providers.base import RunUsage as Usage
     p.db.update_task(fix, status="running")
     run_dir = env["tmp"] / f"run-fix-{time.monotonic_ns()}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "narrowed"}))
     Daemon(p.base)._finish_worker({"task": fix}, Usage(cost_usd=1.0), "ok", run_dir)
+    for out in sorted((p.state / PRECHECKS_DIR).glob(f"t{fix}-*")):
+        assert _wait_precheck(out) == "0", (out / cli.CHECKS_OUT).read_text()
+        assert _wait_for(lambda: not cli._checks_alive(cli._read_checks_pid(out))), "the checks wrote their code, never exited"
     return p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done' ORDER BY id DESC", (fix,))
 
 
 @pytest.mark.parametrize("link", ["pr_branch", "continues"])
-def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(env, monkeypatch, link):
+def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(env, monkeypatch, link,
+                                                                              leaked_tmp_processes):
     s = _pq(env, monkeypatch)
     fix, _, _, head = _re_plan(s, f"pr_branch:{s.branch}" if link == "pr_branch" else f"continues:{s.review}")
     again = s.p.db.add_task("Re-review (narrowed)", f"Re-review branch {s.branch} after its re-plan.", kind="review",
@@ -17750,10 +17759,12 @@ def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(e
     _finish_fix(env, s.p, fix)
     assert [r["title"][:len(f"Review #{fix}")] for r in s.p.db.q(
         "SELECT title FROM tasks WHERE kind='review' AND status='queued'")] == [f"Review #{fix}"]
+    assert not leaked_tmp_processes(env["tmp"], 0), "the review's checks outlived the test"
 
 
 @pytest.mark.parametrize("status", ["running", "waiting"])
-def test_a_re_review_that_already_started_does_not_cover_a_later_fix_head(env, monkeypatch, status):
+def test_a_re_review_that_already_started_does_not_cover_a_later_fix_head(env, monkeypatch, status,
+                                                                          leaked_tmp_processes):
     """A re-review of the reviewed branch can start while its re-plan still commits: it approves only
     the head it read, so the re-plan's later commits get their own review instead of none."""
     s = _pq(env, monkeypatch)
@@ -17768,6 +17779,8 @@ def test_a_re_review_that_already_started_does_not_cover_a_later_fix_head(env, m
     _finish_fix(env, s.p, fix)
     assert [r["title"][:len(f"Review #{fix}")] for r in s.p.db.q(
         "SELECT title FROM tasks WHERE kind='review' AND status='queued'")] == [f"Review #{fix}"]
+    # Its checks ended with the test: none is left to write into a later test that gets this folder's name.
+    assert not leaked_tmp_processes(env["tmp"], 0), "the review's checks outlived the test"
 
 
 @pytest.mark.parametrize("setting, push", [("push_allowed", None), ("push_queue", "pushed it")])
