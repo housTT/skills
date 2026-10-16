@@ -11458,3 +11458,56 @@ def test_delivers_by_owner_task_waits_for_the_owner_and_a_promise_only_in_its_ch
     check(now + 120)
     assert ob.get(p.db, own)["receipt"]["evidence"] == f"reply #{ob.get(p.db, own)['delivered']['message']} " \
                                                        f"delivered it; #{tid} finished"
+
+
+_QUOTED_BANS = ("# demo\n\n## Restrictions\n"
+                "- Push only to branch work/x of the repo, plus one release tag moved only forward to a verified "
+                "commit after the suite and the plugin validator passed. Never push to main. Never open pull "
+                "requests (the user opens them), except as the temporary exception (ask 12) allows.\n"
+                "- Every change keeps the test suite green and the plugin validator passing.\n"
+                "- When installed content changes, bump the plugin version and commit a changeset.\n"
+                "- Never modify the other project's folder or its running jobs.\n"
+                "- Never force-push to branch work/x.\n\n## Policies\nReview first.\n")
+
+
+def test_a_quoted_edit_that_drops_a_clause_is_no_contradiction_of_its_siblings(env):
+    # Replacing one item with itself minus a clause adds nothing: its kept sentences overlapped their
+    # siblings already, and the shortened one tightens. Neither it nor a sibling is a contradiction.
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text(_QUOTED_BANS)
+    item = next(x[2:] for x in _QUOTED_BANS.splitlines() if x.startswith("- Push only"))
+    text = item.replace(", except as the temporary exception (ask 12) allows", "")
+    for user_turn in (False, True):
+        assert coord._reject_contradicting_append(p, "Restrictions", text, user_turn, None, None, item) == ""
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": text}],
+                      turn=1, user_turn=True)
+    assert err == [], err
+    body = p.charter_path.read_text()
+    assert "exception (ask 12)" not in body and "the user opens them).\n" in body and "Never force-push" in body
+    # A real contradiction is still refused: the edited item now allows what a sibling forbids.
+    loose = item.replace("Never push to main.", "Pushing to main is allowed.")
+    p.charter_path.write_text(_QUOTED_BANS.replace("## Policies", "- Never push to the main branch.\n\n## Policies"))
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": loose}],
+                      turn=2, user_turn=True)
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    assert "\"Never push to the main branch.\" (section 'Restrictions')" in err[0], err
+    assert "test suite green" not in err[0] and "changeset" not in err[0].split("contradicts")[1], err
+    assert p.charter_path.read_text().count("Never push to main.") == 1
+
+
+def test_a_quoted_edit_that_only_deletes_words_is_judged_when_it_drops_a_ban_or_permits(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    charter = ("# demo\n\n## Restrictions\n- Workers may not push to the release branch. Keep the suite green.\n"
+               "- Never push to the release branch without review.\n\n## Policies\nReview first.\n")
+    p.charter_path.write_text(charter)
+    item = "Workers may not push to the release branch. Keep the suite green."
+    # Deleting "not" turns the ban into a permit: the other ban on the same push still stands.
+    with pytest.raises(ValueError, match="contradicts the Restrictions item"):
+        coord._reject_contradicting_append(p, "Restrictions", item.replace(" not", ""), False, None, None, item)
+    # Deleting a whole sentence, or words that hold no ban, leaves nothing new to judge.
+    assert coord._reject_contradicting_append(p, "Restrictions", "Workers may not push to the release branch.",
+                                              False, None, None, item) == ""
+    assert coord._reject_contradicting_append(p, "Restrictions", item.replace("Keep the suite", "Keep suite"),
+                                              False, None, None, item) == ""

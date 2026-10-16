@@ -3434,13 +3434,14 @@ def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
     """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals,
     Policies or Resources is about, as (item, its section): every item one of its sentences overlaps
     (_overlaps), whatever either one says about it (a lift, a new ban, a condition, a scope). An item
-    the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out. A
+    the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out, and
+    so is every sentence of the text that says nothing the quoted item did not (_quoted_news). A
     false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
     workers obey it. `lifts_only`: only sentences that may permit or loosen something (_may_lift),
     and only items they may lift (_lifts_item; `strict`: the same action on the same object)."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic", "resource")):
         return []
-    new, gone = _sentences(text.splitlines()), _loose(quote)
+    new, gone = _quoted_news(quote, _sentences(text.splitlines())), _loose(quote)
     if lifts_only:
         new = [x for x in new if _may_lift(x)]
     out: list[tuple[str, str]] = []
@@ -3450,6 +3451,27 @@ def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
                 and not _OWN_EXCEPTION_RE.search(item) and any(hit(item, s) for s in new)):
             out.append((item, sec))
     return out
+
+
+def _quoted_news(quote: str, sentences: list[str]) -> list[str]:
+    """The sentences of a quoted edit's text that say something its item (`quote`) did not, all of
+    them without one. Left out: a sentence the item has word for word, and one an item sentence
+    became by only deleting words when none of them bans (_BAN_RE: "never", "not", "only", "without")
+    and it permits nothing (_may_lift), such as a ban that drops its "except as ... allows" clause.
+    Such a sentence overlapped its sibling items before the edit and narrows nothing they say."""
+    olds = _sentences(quote.splitlines())
+    if not olds:
+        return sentences
+    words = lambda x: re.findall(r"[^\s.,;:!?()\"]+", _loose(x))   # punctuation aside
+
+    def shortened(old: str, new: str) -> bool:
+        a, b = words(old), words(new)
+        ops = difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes()
+        return (bool(b) and all(op in ("equal", "delete") for op, *_ in ops)
+                and not _BAN_RE.search(" ".join(" ".join(a[i1:i2]) for op, i1, i2, _, _ in ops if op == "delete")))
+    kept = {_loose(x) for x in olds}
+    return [x for x in sentences if _loose(x) not in kept
+            and (_may_lift(x) or not any(shortened(o, x) for o in olds))]
 
 
 def _may_lift(sentence: str) -> bool:
@@ -4217,12 +4239,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 8
+CHARTER_GUARD_VERSION = 9
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
-                       "_ref_ids", "_companion_exception", "_changed_sentences",
+                       "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval")
-CHARTER_GUARD_PIN = (8, "946695133b41c0b6c9ece0eed310a01b809c244c3839da6cbe2ee5607c3a1fd8")
+CHARTER_GUARD_PIN = (9, "4fc31788ae107276844632fbdf97bec8a73da09b1aa3a14bbbc72a67ede7a825")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
