@@ -61,10 +61,8 @@ Other workers run other tasks of this project at the same time.
   another branch: other tasks branch from it.
 - Shared things (a device, a reserved machine, a remote build directory) are used one command at a
   time: wrap each command that touches one in `ttp lock <resource> -- <command>` (a broker or queue
-  that serializes access is enough). Exit 75 means busy or
-  paused: hand off `waiting` naming it, `retry_when` `ttp lock --probe <resource>`.
-  `--disruptive` marks one that may reset or reboot it; `ttp machines activity <alias>` shows who
-  held what when.
+  that serializes access is enough). Exit 75 means busy or paused: hand off `waiting` naming it,
+  `retry_when` `ttp lock --probe <resource>`.
 <!-- ttp:if device -->
 - Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource,
   never directly, not even through a test fixture. `TTP_NO_DEVICE=1` in your environment means your
@@ -72,6 +70,7 @@ Other workers run other tasks of this project at the same time.
   marker only after `pytest --markers` shows the repo defines it.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
   empty). Never unset or override the masking variables to work around this.
+  Who held a machine when: `ttp machines activity <alias>`.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.

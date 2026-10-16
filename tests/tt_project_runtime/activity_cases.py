@@ -131,3 +131,15 @@ def test_reboot_note_lists_activity_before_the_boot_disruptive_first_within_its_
     assert "task #200" in lines[1] and "no end logged" in lines[1]
     assert "task #300" not in note and "task #400" not in note
     assert "Locks and detached jobs" not in _reboot_note({"at": at - 86400 * 5}, "UTC")
+
+
+def test_spans_join_an_end_logged_before_its_start_and_read_a_job_rc_file_as_a_number(tmp_path):
+    from ttp import activity
+    rc = tmp_path / "j.rc"
+    rc.write_text("4\n")
+    recs = [{"ev": "job_end", "id": "a", "end": 20, "rc": 3},
+            {"ev": "job", "id": "a", "start": 10, "host": "h"},
+            {"ev": "job", "id": "b", "start": 11, "host": "h", "rcfile": str(rc)}]
+    a, b = activity.spans(recs, here="h")
+    assert (a["state"], a["end"], a["rc"]) == ("ended", 20, 3)
+    assert (b["state"], b["rc"]) == ("ended", 4)

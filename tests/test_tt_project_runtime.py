@@ -24908,6 +24908,8 @@ DURABLE_EXEMPT = {
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("locks.py", 'open(path, "a")'): "the lock file itself: its content only describes the holder",
     ("locks.py", '.lock", "a")'): "a flock guard file, never written",
+    ("activity.py", 'open(state / LOCK, "a")'): "a flock guard file, never written",
+    ("activity.py", "os.replace(log, state / OLD)"): "rotates the bounded activity log; a rename lost to a crash leaves the log one generation longer",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",

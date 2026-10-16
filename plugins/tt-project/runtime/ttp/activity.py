@@ -109,13 +109,14 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
     start, end (None while open), rc and state: ended, running or unknown (no end logged: a kill
     or a reboot, or a remote job whose end only its host knows)."""
     here = project.hostname() if here is None else here
+    # A quick job's wrapper may log its end before `ttp detach` logs the start: ends join in any order.
+    ends = {r["id"]: r for r in recs if r.get("ev") in ("release", "job_end")}
     by: dict[str, dict] = {}
     for r in recs:
         ev = r.get("ev")
         if ev in ("take", "job"):
-            by[r["id"]] = {**r, "kind": "lock" if ev == "take" else "job", "end": None, "rc": None}
-        elif ev in ("release", "job_end") and r["id"] in by:
-            by[r["id"]].update(end=r.get("end"), rc=r.get("rc"))
+            e = ends.get(r["id"], {})
+            by[r["id"]] = {**r, "kind": "lock" if ev == "take" else "job", "end": e.get("end"), "rc": e.get("rc")}
     out = []
     for s in by.values():
         s.pop("ev", None)
@@ -124,7 +125,7 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
         elif s["kind"] == "job" and s.get("rcfile") and not s.get("machine"):
             rc = Path(s["rcfile"])
             try:
-                s.update(end=rc.stat().st_mtime, rc=rc.read_text().strip() or None, state="ended")
+                s.update(end=rc.stat().st_mtime, rc=_rc(rc.read_text()), state="ended")
             except OSError:
                 s["state"] = "running" if s.get("host") == here and _held(rc.with_suffix(".lock")) else "unknown"
         elif s["kind"] == "lock" and s.get("host") == here and s.get("pid") and _same_boot(s.get("boot")) \
@@ -134,6 +135,14 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
             s["state"] = "unknown"
         out.append(s)
     return sorted(out, key=lambda s: float(s.get("start") or 0))
+
+
+def _rc(text: str):
+    text = text.strip()
+    try:
+        return int(text)
+    except ValueError:
+        return text or None
 
 
 def _same_boot(boot) -> bool:
