@@ -146,6 +146,37 @@ def test_local_only_clears_a_branch_recorded_as_superseded_by_a_commit_on_the_pu
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "work past the recorded head is flagged again"
 
 
+def test_superseded_on_another_tasks_local_branch_counts_only_once_a_remote_has_the_commit(env, monkeypatch, capsys):
+    """The work of a done task is re-landed as a commit on another task's local branch of the project
+    root, not yet on the push branch: `--ref` names that branch and the record is made, but the
+    local-only check (worktree.is_superseded) keeps flagging the branch until a remote-tracking branch
+    holds the commit."""
+    from ttp import cli, landed, worktree
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _commit(path, "more.txt", "a\nb\n")
+    mine = _git_out(path, "rev-parse", "HEAD")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(other, "pull", "-q", "--rebase", "origin", "proj")
+    (other / "more.txt").write_text("a\nb, settled\n")
+    _git_out(other, "add", "more.txt")
+    _git_out(other, "commit", "-qm", "re-land of the more work")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _git_out(repo, "fetch", "-q", str(other), "HEAD:refs/heads/other-task")
+    assert not _git_out(repo, "branch", "-r", "--contains", relanded)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", p.name, "superseded", str(tid), relanded])
+    assert e.value.code not in (0, None), "off the push branch it needs --ref"
+    capsys.readouterr()
+    cli.main(["task", p.name, "superseded", str(tid), relanded[:12], "--ref", "other-task"])
+    assert f"recorded as superseded by {relanded[:10]}" in capsys.readouterr().out
+    records = landed.superseded(p.db, [tid])[tid]
+    assert records == [(mine, relanded)]
+    assert worktree.is_superseded(repo, mine, records) is False, "no remote has the commit yet"
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    assert worktree.is_superseded(repo, mine, records) is True
+
+
 def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, monkeypatch, capsys):
     """A record hides the branch for good at its head, so it must name a commit that can hold the
     work: not the branch's base or another commit the branch already has, not a later push-branch
