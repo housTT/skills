@@ -3101,6 +3101,16 @@ class Daemon:
             if gap_wait:
                 result, rstatus = gap_wait, "waiting"
                 summary = result["summary"]
+            elif rstatus == "blocked":
+                from . import landwait
+                land = landwait.wait(self.p, task, result)
+                if land:
+                    result, rstatus, summary = land, "waiting", land["summary"]
+                    self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                                (time.time(), "daemon", "task_wait_landed", "low",
+                                 f"#{task['id']} {task['title']}: blocked only on {land['retry_when'][7:]} landing; "
+                                 f"waits on {land['retry_when']}", "handled", task["id"]))
+                    _task_note(run_dir, f"blocked question kept: {summary}")
         waiting = status == "ok" and rstatus == "waiting"
         refusal = ackwait.unmanaged_wait(result, self._other_projects(), bool(jobs), self.cfg, self.p.harness) if waiting else ""
         both = on_pass_both_warning(result) if waiting else ""

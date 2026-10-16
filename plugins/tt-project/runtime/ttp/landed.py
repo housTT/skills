@@ -505,9 +505,11 @@ def _start(repo: Path, branch: str) -> str:
     return log[-1] if log else ""
 
 
-def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: str | None = None) -> tuple[int, str]:
+def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: str | None = None,
+          fetch: bool = True) -> tuple[int, str]:
     """(exit code, words) for `ttp landed`: a sha, or task `tid`'s landing, on `onto` (default the
-    push branch). Reads the local ref first and fetches only when that says not yet."""
+    push branch). Reads the local ref first and fetches only when that says not yet (never with
+    `fetch` False: local refs only)."""
     try:
         onto = onto or _push_ref(p, repo)
     except ValueError as e:
@@ -524,10 +526,10 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
         if not full:
             return CANNOT, f"no commit {sha} in {repo}"
         shas, what = [full], (sha or "")[:10]
-    for fetch in (False, True):
-        tip, ref = _tip(repo, onto, fetch)
+    for fetching in (False, True) if fetch else (False,):
+        tip, ref = _tip(repo, onto, fetching)
         if not tip:
-            if fetch:
+            if fetching:
                 return CANNOT, ref
             continue
         if any(_commit(repo, s) and on_branch(repo, s, tip) for s in shas):

@@ -1991,3 +1991,111 @@ def test_worker_low_and_normal_notify_are_unchanged_by_the_escalation_path(env, 
     assert daemon.relay_worker_escalations(p, p.db.task(tid), 9, run_dir) == (0, 0)
     assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 2
     assert not p.db.one("SELECT id FROM events WHERE fingerprint LIKE 'escalate:%'")
+
+
+def _blocked_on(env, p, question, *, target_status="queued", extra="", target=None):
+    """A running task hands off `blocked` with `question`; a second task (`target`, made in
+    `target_status` unless given) is the one it names as {t}; {me} is the task itself."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    if not (p.config().get("delivery") or {}).get("push_branch"):
+        p.set_config("delivery.push_branch", "origin/proj")
+    if target is None:
+        target = p.db.add_task("the change it needs", "s", origin="coordinator")
+        p.db.update_task(target, status=target_status)
+    tid = p.db.add_task("needs it", "s", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "blocked", "summary": "stuck", "question": question.format(t=target, u=target + 50, me=tid)}))
+    Daemon(p.base)._finish_worker({"task": tid, "note": None}, Usage(cost_usd=1.0), "ok", run_dir)
+    return tid, target
+
+
+def test_a_hand_off_blocked_only_on_one_task_landing_becomes_a_landed_wait(env):
+    p = make(env)
+    tid, target = _blocked_on(env, p, "Re-queue me after #{t} lands on the push branch")
+    row = p.db.task(tid)
+    result = json.loads(row["result"])
+    assert row["status"] == "queued" and result["status"] == "waiting"
+    assert result["retry_when"] == f"landed:#{target}" and "Re-queue me after" in result["summary"]
+    ev = p.db.one("SELECT * FROM events WHERE kind='task_wait_landed' AND task=?", (tid,))
+    assert ev["severity"] == "low" and ev["status"] == "handled"
+    assert not p.db.q("SELECT * FROM events WHERE task=? AND kind='task_blocked'", (tid,))
+
+
+def test_a_branch_name_counts_as_the_named_task(env):
+    p = make(env)
+    tid, target = _blocked_on(env, p, "waiting for ttp/t{t}-fix to be merged")
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == f"landed:#{target}"
+
+
+@pytest.mark.parametrize("question", ["Is #{t} really landed, or #{u}?", "Need a decision about #{t}",
+                                      "Need credentials for the box", "Is the thing landed?",
+                                      "Need ssh credentials for the box; also #{t} must land first",
+                                      "Blocked until the user merges PR #{t}",
+                                      "Ask #{t} must be answered before this can be pushed",
+                                      "Should I wait for #{t} to land or revert it?",
+                                      "owner/repo#{t} must be merged upstream",
+                                      "Which approach do you prefer? Also #{t} must land first.",
+                                      "Can you re-queue me once #{t} lands?",
+                                      "Re-queue me after #{t} lands, then #{u} too",
+                                      "Re-queue me after #{me} lands",
+                                      "Re-queue me after #{u} lands"])
+def test_a_blocked_hand_off_that_is_not_one_task_landing_stays_blocked(env, question):
+    p = make(env)
+    tid, _ = _blocked_on(env, p, question)
+    assert p.db.task(tid)["status"] == "blocked"
+    assert json.loads(p.db.task(tid)["result"])["status"] == "blocked"
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled"])
+def test_a_blocked_hand_off_on_a_failed_or_cancelled_task_stays_blocked(env, state):
+    p = make(env)
+    tid, _ = _blocked_on(env, p, "Re-queue me after #{t} lands", target_status=state)
+    assert p.db.task(tid)["status"] == "blocked"
+
+
+def _no_network(monkeypatch):
+    """Every git fetch, ls-remote, pull or push started while handling the result, recorded."""
+    calls, real = [], subprocess.run
+
+    def run(cmd, *a, **k):
+        if isinstance(cmd, (list, tuple)) and {"fetch", "ls-remote", "pull", "push"} & {str(c) for c in cmd}:
+            calls.append(cmd)
+        return real(cmd, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_a_blocked_hand_off_on_an_already_landed_task_stays_blocked(env, monkeypatch):
+    """Its landing is on the local push-branch ref: a wait would pass at once, so no wait is made."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    target, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    _git_out(path, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    calls = _no_network(monkeypatch)
+    tid, _ = _blocked_on(env, p, "Re-queue me after #{t} lands", target=target)
+    assert p.db.task(tid)["status"] == "blocked" and not calls, calls
+
+
+def test_a_blocked_hand_off_stays_blocked_when_the_push_branch_is_unknown(env, monkeypatch):
+    """No push branch: its `landed:#<id>` probe could never pass, so no wait is made."""
+    from ttp import landed
+    monkeypatch.setattr(landed, "_push_ref", lambda p, repo: (_ for _ in ()).throw(ValueError("no target")))
+    p = make(env)
+    tid, _ = _blocked_on(env, p, "Re-queue me after #{t} lands")
+    assert p.db.task(tid)["status"] == "blocked"
+
+
+def test_the_landed_check_on_a_blocked_hand_off_reads_local_refs_only(env, monkeypatch):
+    """A done target not on the local push-branch ref converts with no fetch: the wait's probe fetches."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    target, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    calls = _no_network(monkeypatch)
+    tid, _ = _blocked_on(env, p, "Re-queue me after #{t} lands", target=target)
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == f"landed:#{target}"
+    assert not calls, calls

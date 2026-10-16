@@ -3512,3 +3512,9 @@ def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_e
     missing = install_env(ref="no-such-tag")
     assert missing.returncode != 0 and _calls(install_env.home) == []
     assert not list(install_env.tmp.iterdir())
+
+
+def test_worker_prompt_waits_on_landed_instead_of_blocking_on_another_task():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`." in text
+    assert all(len(line) <= 1000 for line in (PLUGIN / "template" / "prompts" / "worker.md").read_text().splitlines())

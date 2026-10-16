@@ -220,6 +220,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing (an
   encrypted input or one in a macOS privacy-protected folder too: block once, naming the file), or the next step cannot be undone and is outside the charter. Say exactly what. Make
   judgment calls yourself; state each and why in the summary.
+- Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`.
 - Read another task's record with `ttp task <project> show <id>`,
   never project.db.
 - Waiting on a fix in tt-project itself is `waiting`, never `blocked`: file the upstream note, then
