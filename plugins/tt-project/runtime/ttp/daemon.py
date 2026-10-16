@@ -104,8 +104,8 @@ from . import screen as scr
 from . import shared
 from . import shorttmp
 from . import worktree
-from .db import (CHANGES_NEEDED, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, continues_id, deferral, dependency_ids, pin_of,
-                 dump_result, load_result, unplanned_abrupt, without_deferral)
+from .db import (CHANGES_NEEDED, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
+                 dependency_ids, pin_of, dump_result, load_result, reviewed_ids, task_outcome, unplanned_abrupt, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
@@ -2102,6 +2102,7 @@ class Daemon:
         self._raise_hold_loops(now)
         self._raise_missing_task_refs(now)
         self._raise_review_stalls(now)
+        self._raise_unhandled_failed_reviews(now)
 
     def _raise_review_stalls(self, now: float) -> None:
         """Only 'done' satisfies a dependency, so a task left in 'review' holds its dependents back
@@ -2125,6 +2126,61 @@ class Daemon:
                   f"task_update depends_on, or cancel them.", "queued", rev["id"]))
             log(self.p, f"task {rev['id']} in review {(now - since) / 3600:.1f}h holds {len(deps)} task(s); "
                         f"raised to the coordinator")
+
+    def _raise_unhandled_failed_reviews(self, now: float) -> None:
+        """A task left in 'review' whose latest review failed or asked for changes, with no fix or
+        re-review open for it, waits on a decision nobody is making. Past
+        coordinator.review_failed_unhandled_s after that review ended it is raised once per failed
+        review, as a high-effort trigger; the coordinator queues the fix, never this check."""
+        db = self.p.db
+        try:
+            wait_s = float(self.cfg["coordinator"].get("review_failed_unhandled_s", 3600) or 0)
+        except (TypeError, ValueError):
+            wait_s = 3600.0
+        in_review = db.q("SELECT * FROM tasks WHERE status='review'") if wait_s > 0 else []
+        if not in_review:
+            return
+        ended = {r["task"]: r["ts"] for r in db.q(
+            "SELECT task, MAX(ts) ts FROM events WHERE kind IN ('task_failed','task_changes_needed') "
+            "AND task IS NOT NULL AND ts>? GROUP BY task", (now - reviewcap.LOOKBACK_S,))}
+        failed = [r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
+                  if r["id"] in ended and now - ended[r["id"]] >= wait_s]
+        if not failed:
+            return
+        index = BranchIndex(in_review)
+
+        def covers(review: dict) -> set[int]:
+            return reviewed_ids(review, index) | (set(dependency_ids(review)) & index.ids)
+        open_ = db.q("SELECT * FROM tasks WHERE kind IN ('code','review') AND status NOT IN (?,?,?)",
+                     TERMINAL_TASK_STATES)
+        done: set[int] = set()
+        for rev in failed:
+            tids = sorted(covers(rev) - done)
+            done.update(tids)   # newest review first: an older failed review of these is not their latest
+            later = db.q("SELECT * FROM tasks WHERE kind='review' AND id>?", (rev["id"],)) if tids else []
+            for tid in tids:
+                fp = f"review_failed_unhandled:{rev['id']}:{tid}"
+                if any(tid in covers(r) for r in later) or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                    continue
+                if any(t["id"] != tid and reviewcap.links(t) & {tid, rev["id"]} for t in open_):
+                    continue
+                task = next(t for t in in_review if t["id"] == tid)
+                fups = [str(f.get("title") or "")[:120] for f in load_result(rev.get("result")).get("followups") or []
+                        if isinstance(f, dict)]
+                named = "; ".join(f"{n}. {f}" for n, f in enumerate(fups[:5], 1)) + (
+                    f"; and {len(fups) - 5} more" if len(fups) > 5 else "")
+                verdict = "asked for changes" if task_outcome(rev) == CHANGES_NEEDED else "failed"
+                age = (now - ended[rev["id"]]) / 3600
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
+                     "VALUES(?,?,?,?,?,?,?,?,?)",
+                     (now, "daemon", "review_failed_unhandled", fp, "normal",
+                      f"#{tid} {task['title']} is still in review: its latest review #{rev['id']} {verdict} "
+                      f"{age:.1f}h ago and no fix or re-review is queued or running. Review follow-ups: "
+                      f"{named or 'none listed'}. Options: queue a fix that continues #{tid} and a re-review, "
+                      f"mark it done with task_update status done once its work is verified, requeue it, "
+                      f"or cancel it.", json.dumps({"review": rev["id"], "followups": fups}), "queued", tid))
+                log(self.p, f"task {tid} in review {age:.1f}h after review {rev['id']} {verdict} with no fix "
+                            f"queued; raised to the coordinator")
 
     def task_probes(self, task: dict) -> list[tuple[str, str]]:
         """(what, probe) of every probe `task` waits on: its start_when, a hold's `waits_on when`, and

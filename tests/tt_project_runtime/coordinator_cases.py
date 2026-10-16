@@ -3756,6 +3756,76 @@ def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(e
 
 
 
+def test_a_task_in_review_whose_latest_review_failed_with_no_fix_is_raised_once_after_an_hour(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db, now = p.db, time.time()
+
+    def stuck(title, ago_s, verdict="failed", fups=("Fix the off-by-one", "Add a test")):
+        code = db.add_task(title, "s", kind="code", origin="user")
+        db.update_task(code, status="review")
+        rev = db.add_task(f"Review #{code}: {title}", "s", kind="review", origin="daemon", labels=[f"auto_review:{code}"])
+        db.update_task(rev, status="failed", result=json.dumps(
+            {"status": verdict, "summary": "no", "followups": [{"title": f, "spec": "x"} for f in fups]}))
+        kind = "task_changes_needed" if verdict == "changes_needed" else "task_failed"
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now - ago_s, f"task:{rev}", kind, "normal", "review ended", "handled", rev))
+        return code, rev
+
+    def raised():
+        return db.q("SELECT * FROM events WHERE kind='review_failed_unhandled' ORDER BY id")
+    code, rev = stuck("parser change", 30 * 60, verdict="changes_needed")
+    d._raise_unhandled_failed_reviews(now)
+    assert not raised(), "raised before an hour passed"
+    d._raise_unhandled_failed_reviews(now + 31 * 60)
+    rows = raised()
+    assert len(rows) == 1 and rows[0]["task"] == code and rows[0]["status"] == "queued", rows
+    text = rows[0]["text"]
+    assert f"#{code} parser change" in text and f"review #{rev} asked for changes" in text \
+        and "1. Fix the off-by-one; 2. Add a test" in text, text
+    assert json.loads(rows[0]["data"]) == {"review": rev, "followups": ["Fix the off-by-one", "Add a test"]}
+    # Once per failed review: later checks and ticks do not raise it again.
+    d._raise_unhandled_failed_reviews(now + 3 * 3600)
+    d.tick()
+    assert len(raised()) == 1
+    # It makes the coordinator's turn a high-effort one.
+    assert "review_failed_unhandled" in coord.UNBLOCK_KINDS
+    assert "review_failed_unhandled" in coord.effort_triggers(db, p.config(), [rows[0]["id"]], None)[0]
+
+    # Not while a fix (any open state) or a re-review is open for it; raised once neither is.
+    code2, rev2 = stuck("cache change", 2 * 3600)
+    fix = db.add_task(f"Fix review #{rev2}: cache change", "", kind="code", origin="daemon",
+                      labels=[f"continues:{code2}", f"review_fix:{rev2}"])
+    for status in ("queued", "running", "waiting", "review"):
+        db.update_task(fix, status=status)
+        d._raise_unhandled_failed_reviews(now)
+        assert len(raised()) == 1, status
+    db.update_task(fix, status="cancelled")
+    rerev = db.add_task(f"Review #{code2}: cache change", "s", kind="review", origin="coordinator",
+                        depends_on=[code2])
+    d._raise_unhandled_failed_reviews(now)
+    assert len(raised()) == 1, "a newer review is the latest one"
+    db.update_task(rerev, status="cancelled")
+    d._raise_unhandled_failed_reviews(now)
+    assert len(raised()) == 1, "a newer review, even cancelled, is the latest one: no longer this failure"
+    db.x("DELETE FROM tasks WHERE id=?", (rerev,))
+    d._raise_unhandled_failed_reviews(now)
+    rows = raised()
+    assert len(rows) == 2 and rows[1]["task"] == code2 and f"review #{rev2} failed" in rows[1]["text"], rows
+    # A task no longer in review is not raised; 0 turns the check off.
+    code3, _ = stuck("left review", 2 * 3600)
+    db.update_task(code3, status="done")
+    code4, _ = stuck("check off", 2 * 3600)
+    d.cfg["coordinator"]["review_failed_unhandled_s"] = 0
+    d._raise_unhandled_failed_reviews(now)
+    assert len(raised()) == 2
+    d.cfg["coordinator"]["review_failed_unhandled_s"] = 3600
+    d._raise_unhandled_failed_reviews(now)
+    assert [r["task"] for r in raised()] == [code, code2, code4]
+
+
 def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits_in_review(env):
     p = make(env)
     from ttp import coordinator as coord

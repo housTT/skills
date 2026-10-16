@@ -243,7 +243,7 @@ EFFORT_EVENT_TRIGGERS = {
     "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck",
-    "review_stall": "stuck", askrethink.KIND: "stuck",
+    "review_stall": "stuck", "review_failed_unhandled": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
     "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "change_probe_broken": "resource",

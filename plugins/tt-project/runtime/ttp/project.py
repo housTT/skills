@@ -206,6 +206,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # A queued task waiting on a task in 'review' longer than this is raised to the
                     # coordinator once per review stint; 0 turns it off.
                     "review_stall_s": 14400,
+                    # A task in 'review' whose latest review failed or asked for changes, with no fix
+                    # or re-review open, is raised once per failed review this long after it ended; 0 off.
+                    "review_failed_unhandled_s": 3600,
                     # Provider failover (failover.py): a queued or waiting task whose provider cannot
                     # start new work for longer than provider_failover_after_h hours (0: off) moves to
                     # the first usable of provider_failover_to (provider names), then the core provider.
