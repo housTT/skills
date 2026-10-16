@@ -2921,6 +2921,7 @@ if [ -n "$FAKE_MGMT_DOWN" ] && [ "$last" = true ]; then echo "ssh: Could not res
 # The machine's effective options come from the real ssh -G under the run's own config.
 if [ "$1" = "-F" ] && [ "$3" = "-G" ]; then case "$4" in m-*)
   echo "$*" >> "$FAKE_DIR/ssh.log"; exec "$REAL_SSH" "$@";; esac; fi
+[ -n "$FAKE_SSH_BANNER" ] && [ "$last" != true ] && echo "$FAKE_SSH_BANNER" >&2
 exec "$FAKE_DIR/bin/ssh" "$@"
 """
 
@@ -2989,6 +2990,30 @@ def test_setup_box_ird_e2e_dry_run_lists_and_only_prints_the_rest(fake_ird, tmp_
     assert all(l.startswith("list-machines") for l in fake_ird.ird_log()), fake_ird.ird_log()
 
 
+def test_setup_box_ird_e2e_step_summary_ignores_stderr_banner(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env["FAKE_SSH_BANNER"] = "** WARNING: connection is not using a post-quantum key exchange algorithm"
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("step 4 work: PASS edited 1 file(s);ird-e2e build ok; tt-smi -s ok, boards: "
+            "1x n300 L,1x n300 R") in out, out
+    step4 = [l for l in out.splitlines() if "step 4 work:" in l]
+    assert step4 and "WARNING" not in step4[0], step4
+
+
+def test_setup_box_ird_e2e_failing_step_still_shows_its_error(fake_ird, tmp_path):
+    import subprocess
+    argv, env, _ = _e2e(fake_ird, tmp_path)
+    env["FAKE_SMI_FAIL"] = "1"
+    env["FAKE_SSH_BANNER"] = "** WARNING: banner"
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "tt-smi -s (rc 1)" in out and "no devices" in out, out
+
+
 def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird, tmp_path):
     import subprocess
     argv, env, work = _e2e(fake_ird, tmp_path)
@@ -3010,7 +3035,7 @@ def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird
     # Every ssh ran under the run's own config, which holds only managed content.
     assert not (fake_ird.dir / "no-F.log").exists(), (fake_ird.dir / "no-F.log").read_text()
     cfg = next(tmp_path.glob("ird-e2e.*")) / "ssh_config"
-    assert cfg.read_text() == f'Include "{fake_ird.ird_dir}/ssh-hosts"\n'
+    assert cfg.read_text() == f'Include "{fake_ird.ird_dir}/ssh-hosts"\n\nHost *\n    LogLevel ERROR\n'
     kh = fake_ird.ird_dir / "known_hosts" / "<ird-box>.100"
     assert (f"  ssh -G m-idle: hostname=m-idle port=40100 proxyjump=<ird-mgmt-alias> "
             f"stricthostkeychecking=accept-new userknownhostsfile={kh}") in out, out
@@ -3116,7 +3141,8 @@ def test_setup_box_ird_e2e_reaches_the_management_host_only_through_managed_conf
     assert r.returncode == 0 and "<ird-mgmt-alias> from ird.mgmt_ssh" in out, out
     cfg = sorted(tmp_path.glob("ird-e2e.*"), key=lambda p: p.stat().st_mtime)[-1] / "ssh_config"
     assert cfg.read_text() == (f'Include "{fake_ird.ird_dir}/ssh-hosts"\n\nHost <ird-mgmt-alias>\n'
-                               '    HostName "<mgmt-host>"\n    User "<user>"\n    Port "22"\n')
+                               '    HostName "<mgmt-host>"\n    User "<user>"\n    Port "22"\n'
+                                   '\nHost *\n    LogLevel ERROR\n')
     site["boxes"]["<ird-box>"]["ird"]["mgmt_ssh"] = {"StrictHostKeyChecking": "no"}
     fake_ird.site.write_text(json.dumps(site))
     r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)

@@ -192,6 +192,7 @@ if not isinstance(jump, dict) or any(k not in keys or "\n" in str(v) or not str(
 lines = [f'Include "{include}"']
 if jump:
     lines += ["", f"Host {mgmt}"] + [f'    {k} "{v}"' for k, v in jump.items()]
+lines += ["", "Host *", "    LogLevel ERROR"]  # after the Include (a conditional one would scope it); quiets ssh banners
 open(ssh_cfg, "w").write("\n".join(lines) + "\n")
 print(f"JUMP\t{'site' if jump else ''}")
 for k, v in (("BOX", alias), ("MGMT", mgmt), ("POOL", pool), ("ARCH", arch), ("WORKDIR", workdir)):
@@ -283,9 +284,11 @@ cd src; git worktree add -q -b ird-e2e-$RUN_ID ../wt; cd ../wt
 printf '#include <stdio.h>\nint main(void) { puts(\"ird-e2e build ok\"); return 0; }\n' > ird_e2e_hello.c
 n=\$(git status --short | wc -l); echo \"edited \$((n)) file(s)\"
 cc -o ird_e2e_hello ird_e2e_hello.c; ./ird_e2e_hello"
-WORK=$(on_machine "$SCRIPT" 2>&1) || fail "clone/edit/build: $(printf '%s' "$WORK" | tail -n 3)"
-SMI=$(on_machine "tt-smi -s" 2>&1); rc=$?
-[ $rc -eq 0 ] || fail "tt-smi -s (rc $rc): $(printf '%s' "$SMI" | tail -n 3)"
+# Summaries come from stdout only; stderr goes to a log and is shown only when a step fails.
+ERRF="$RUN_DIR/step4.err"; : > "$ERRF"
+WORK=$(on_machine "$SCRIPT" 2>>"$ERRF") || fail "clone/edit/build: $(printf '%s\n%s' "$WORK" "$(cat "$ERRF")" | tail -n 3)"
+SMI=$(on_machine "tt-smi -s" 2>>"$ERRF"); rc=$?
+[ $rc -eq 0 ] || fail "tt-smi -s (rc $rc): $(printf '%s\n%s' "$SMI" "$(cat "$ERRF")" | tail -n 3)"
 BOARDS=$(printf '%s\n' "$SMI" | grep -o '"board_type": *"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/' | sort | uniq -c | sed 's/^ *\([0-9]*\) /\1x /' | paste -s -d, -)
 note "step 4 work: PASS $(printf '%s' "$WORK" | tr '\n' ';' | sed 's/;$//'); tt-smi -s ok, boards: ${BOARDS:-none listed} ($(( $(date +%s) - T0 ))s)"
 
