@@ -8357,8 +8357,12 @@ class Daemon:
             return str(harnesstree.workdir(self.p, task["id"])), None
         if task["kind"] not in worktree.NEVER_OWN_KINDS and (repo := worktree.pr_repo(self.p, task)):
             # A PR fix whose PR is in another repository than the root's: a worktree of its clone.
-            path, branch = worktree.ensure_in(self.p, task, repo)
-            return str(path), branch
+            try:
+                path, branch = worktree.ensure_in(self.p, task, repo)
+                return str(path), branch
+            except RuntimeError as e:   # e.g. a fork's branch, neither local nor on origin: the root, as before
+                log(self.p, f"task {task['id']}: no worktree in {repo} ({str(e)[:200]}); working in the project root")
+                return str(self.p.root), None
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):

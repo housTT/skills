@@ -4352,6 +4352,11 @@ def test_a_pr_fix_task_gets_a_worktree_of_the_prs_clone_when_the_root_is_another
     other = p.db.add_task("Fix PR findings: other", "s", kind="code", labels=["pr_fix:acme/gadgets#3"])
     assert worktree.pr_repo(p, p.db.task(other)) is None
     assert d._workdir_for(p.db.task(other)) == (str(p.root), None)
+    # The PR's branch is neither local nor on origin (a fork's): the root, not a workspace failure.
+    lost = p.db.add_task("Fix PR findings: fork", "s", kind="code", labels=["pr_fix:acme/widgets#9"],
+                         branch="ttp/gone-from-everywhere")
+    assert worktree.pr_repo(p, p.db.task(lost))
+    assert d._workdir_for(p.db.task(lost)) == (str(p.root), None)
 
 
 def test_follow_ups_and_redos_carry_a_branch_only_when_they_should(env):
