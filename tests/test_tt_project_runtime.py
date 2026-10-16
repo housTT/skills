@@ -25675,6 +25675,59 @@ def test_detached_ttp_checks_finish_record_the_pass_and_a_rerun_stops_the_earlie
     assert _ttp("checks", "--result", str(tmp_path / "nothing")) == 0, "no record must not keep a task asleep"
 
 
+def test_detached_checks_for_another_worktree_or_purpose_never_replace_the_run_dirs_live_ones(
+        env, tmp_path, monkeypatch, capsys):
+    """One run queued `ttp checks --detach` for a worktree; a later `ttp checks --purpose harness`
+    in the same run handed over to detached checks on busy slots and rewrote checks.pid/checks.out,
+    and the first checks were lost without a word. A detached launch for another worktree or purpose
+    now refuses (exit 75) while they own the run dir, prints their probe and leaves them running;
+    a rerun for the same worktree and purpose still replaces them."""
+    from ttp import cli, detach
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    other = tmp_path / "other"
+    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(other)], check=True)
+    started = tmp_path / "started"
+    first = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists)
+        before = (run / cli.CHECKS_PID).read_text()
+        monkeypatch.chdir(other)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--detach", "--", "true"])
+        assert e.value.code == 75
+        cap = capsys.readouterr()
+        assert f"checks --result {run}" in cap.out and f"for {os.path.realpath(repo)} still own" in cap.err
+        assert (run / cli.CHECKS_PID).read_text() == before and not _gone_pid(first), "the first checks were lost"
+        assert cli._checks_result(run) == 1
+        # The same worktree with the harness purpose is another job too; without one it replaces them.
+        assert cli._checks_owner(run, str(repo), "harness") == os.path.realpath(repo)
+        assert cli._checks_owner(run, str(repo), None) == ""
+        monkeypatch.chdir(repo)
+        second = _detached_checks(run, capsys, "true")
+        assert _gone_pid(first) and second != first
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists(), 30)
+        assert cli._checks_owner(run, str(other), None) == "", "finished checks own nothing"
+    finally:
+        try:
+            os.killpg(first, signal.SIGKILL)
+        except OSError:
+            pass
+    # Harness checks for this worktree that live (this process stands in for them) or wait in the
+    # daemon's queue own the run dir too; dead ones without checks.rc do not.
+    me = {"pid": os.getpid(), "started": proc_start(os.getpid()), "worktree": str(repo), "purpose": "harness"}
+    (run / cli.CHECKS_RC).unlink()
+    (run / cli.CHECKS_PID).write_text(json.dumps(me))
+    assert cli._checks_owner(run, str(repo), None) == f"{os.path.realpath(repo)} (purpose harness)"
+    assert cli._checks_owner(run, str(repo), "harness") == ""
+    (run / cli.CHECKS_PID).write_text(json.dumps({**me, "started": "gone"}))
+    assert cli._checks_owner(run, str(other), None) == ""
+    detach.enqueue(p.state, run / cli.CHECKS_RC, run / cli.CHECKS_OUT, [], str(other), {},
+                   checks={"worktree": str(other), "head": "x", "cmd": ["true"], "fresh": False, "full": False})
+    assert cli._checks_owner(run, str(repo), None) == os.path.realpath(other)
+    assert cli._checks_owner(run, str(other), None) == ""
+
+
 def test_queued_checks_survive_the_launching_process_exit(env, tmp_path, monkeypatch):
     from ttp import cli, detach
     from ttp.runner import proc_start

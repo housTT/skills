@@ -1803,7 +1803,9 @@ def cmd_checks(a) -> None:
 
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
-    killed outright. Starting it again stops the run's earlier detached checks.
+    killed outright. Starting it again stops the run's earlier detached checks for the same worktree
+    and purpose; while ones for another worktree or purpose still run, it refuses (exit 75) and
+    prints their `retry_when`, as does a foreground run that would hand over to them.
 
     `--purpose harness` qualifies a harness-preparation head: it runs the harness-tagged and untagged
     project checks plus the commands after `--`, lists candidate-tagged ones as not run, and fails
@@ -2380,20 +2382,61 @@ def _read_checks_pid(run_dir: Path) -> dict:
     return info if isinstance(info, dict) else {}
 
 
+def _checks_scope(worktree, purpose) -> tuple:
+    """What a run dir's detached checks are for: their worktree and purpose."""
+    return (os.path.realpath(worktree) if worktree else "", "harness" if purpose == "harness" else "")
+
+
+def _checks_owner(run_dir: Path, top: str, purpose) -> str:
+    """The run's detached checks for another worktree or purpose that still own `run_dir`'s files
+    (queued for the daemon, or started and without checks.rc), told as '<worktree> (purpose ...)';
+    "" when there are none, or they are for the same worktree and purpose (a rerun replaces them).
+    Where their pid cannot be judged (a sandbox), they count as running until checks.rc is written."""
+    from . import detach
+    rc = run_dir / CHECKS_RC
+    info: dict = {}
+    if detach.pending(rc):
+        q, _ = detach._marker(rc)
+        try:
+            info = json.loads(q.read_text()).get("checks") or {}
+        except (OSError, ValueError, AttributeError):
+            info = {}
+    else:
+        pid_info = _read_checks_pid(run_dir)
+        if pid_info and not rc.exists() and (_checks_alive(pid_info) or (
+                _checks_elsewhere(pid_info) and not _checks_old_boot(pid_info))):
+            info = pid_info
+    if not isinstance(info, dict) or not info.get("worktree"):
+        return ""
+    theirs = _checks_scope(info.get("worktree"), info.get("purpose"))
+    if theirs == _checks_scope(top or os.getcwd(), purpose):
+        return ""
+    return theirs[0] + (f" (purpose {theirs[1]})" if theirs[1] else "")
+
+
 def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
                    arrived: float | None = None) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
-    outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`.
+    outright. This run's earlier detached checks for the same worktree and purpose are stopped
+    first, so nobody needs `pkill`; while ones for another worktree or purpose still own the run
+    dir, it refuses (exit 75) and prints their probe.
     A tool sandbox queues the launch and cancellation through the daemon (detach.tend).
     checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
     again, model-free, after a reboot killed them (Daemon._relaunch_checks). `arrived`: a foreground
     run's place in the host-wide queue, which they keep."""
     from . import checkcap, detach, push
+    rc = run_dir / CHECKS_RC
+    owner = _checks_owner(run_dir, top, getattr(a, "purpose", None))
+    if owner:
+        # One run dir holds one detached checks job's files: replacing another worktree's or
+        # purpose's checks would lose them without a word. Wait for them instead.
+        print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
+        die(f"ttp checks: not started: this run's detached checks for {owner} still own {run_dir} "
+            "(exit 75): hand off waiting with the retry_when above, then run these checks again", 75)
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
-    rc = run_dir / CHECKS_RC
     detach.lost(rc).unlink(missing_ok=True)
     # A request the daemon has not finished starting is replaced through the queue too, so the daemon
     # never starts an older request after this one.
