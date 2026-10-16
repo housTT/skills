@@ -21297,6 +21297,23 @@ def test_budget_line_says_virtual_on_a_plan_and_actual_when_billed_by_use(env):
     assert "in_flight" not in pill and "h.spend.in_flight" in js, pill
 
 
+def test_budget_line_splits_a_billed_to_plan_switch_into_actual_and_virtual(env):
+    p = make(env)
+    from ttp.web import budget_line
+    now = time.time()
+    for h in range(17, 1, -1):      # account A: billed by use for ~17 h, no plan readings
+        p.db.spend("fake", 6.0, "task:1", account="a", ts=now - h * 3600)
+    for m in (50, 30, 10):          # account B: plan windows, plan-billed rows
+        p.db.spend("fake", 1.0, "task:2", account="b", ts=now - m * 60)
+    for w, u in (("five_hour", 4.4), ("seven_day", 21.0)):
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - 3600, "fake", "b", w, u, now + 3600))
+    plan = {"regime": "windows", "numbers": {"window": "five_hour", "utilization": 4.4, "limit": 90.0}}
+    line = budget_line(p.db, now, "fake", plan)
+    assert line.startswith("5h 4%") and "24h $3.00 virtual, $96.00 actual" in line, line
+    assert budget_line(p.db, now, "fake", plan, 99.0) == line, "a passed total gives the same split"
+
+
 def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):
     p = make(env)
     from ttp.web import offline_help, state_payload

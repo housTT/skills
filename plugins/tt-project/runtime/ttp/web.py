@@ -206,9 +206,12 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     n = (gate or {}).get("numbers") or {}
     if not plan and ("spent_today" in n or "global_today" in n):
         return ", ".join([usage_line(n, now), *held])
-    spent = (db.spent_since(now - DAY) if spent_24h is None else spent_24h) if plan else \
-        db.spent_since(now - DAY, billed=True)
-    parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
+    actual = db.spent_since(now - DAY, billed=True)
+    if plan:
+        total = db.spent_since(now - DAY) if spent_24h is None else spent_24h
+        parts.append(f"24h ${max(total - actual, 0):.2f} virtual" + (f", ${actual:.2f} actual" if actual > 0 else ""))
+    else:
+        parts.append(f"24h ${actual:.2f} actual")
     account = next(iter(wins.values())).account if wins else None
     for label, names, span in (("5h avg", FIVE_HOUR, WEEK), ("7d avg", SEVEN_DAY, 3 * WEEK)):
         peaks = window_peaks(db, prov, names, now, span, account) if account is not None else []
