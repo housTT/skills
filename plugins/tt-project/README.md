@@ -31,7 +31,7 @@ that it finds and skips the others with a note. Set `TT_PROJECT_REF` at its fron
 of `tenstorrent/skills`; left empty, it installs whatever `git clone` checks out (the default branch).
 
 ```bash
-(TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+(TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git -c advice.detachedHead=false clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
 ```
 
 It makes a shallow `git clone` with your own git credentials and runs `plugins/tt-project/install.sh`

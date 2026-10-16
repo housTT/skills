@@ -7,7 +7,7 @@
 #
 # Usage, from a shell (set TT_PROJECT_REF to a release tag; empty installs the default branch):
 #
-# (TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+# (TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git -c advice.detachedHead=false clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
 #
 # or `sh <checkout>/plugins/tt-project/install.sh` to install the commit that checkout has.
 # The commit is copied into one clone kept at $XDG_DATA_HOME/tt-project/skills (default

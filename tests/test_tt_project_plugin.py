@@ -3360,7 +3360,7 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     usage = [ln[2:] for ln in (PLUGIN / "install.sh").read_text().splitlines() if ln.startswith("# (TT_PROJECT_REF=")]
     assert usage == [line]
     assert line.startswith("(TT_PROJECT_REF=;")
-    assert f"git clone -q --depth 1 ${{TT_PROJECT_REF:+--branch=$TT_PROJECT_REF}} {INSTALL_URL} " in line
+    assert f"git -c advice.detachedHead=false clone -q --depth 1 ${{TT_PROJECT_REF:+--branch=$TT_PROJECT_REF}} {INSTALL_URL} " in line
     assert 'sh "$d/plugins/tt-project/install.sh"' in line and "set TT_PROJECT_REF to a release tag" in line
     for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
         assert raw not in line, raw
