@@ -80,15 +80,16 @@ tt-project skill, not two. Every `ttp setup` refreshes it. If you already have y
 ## Dogfood install
 
 tt-project is not on `main` yet, so adding the marketplace from `main` does not find it. Install
-the dogfood cut instead: the tag `smartonTT/tt-project-dogfood-1` of `tenstorrent/skills`. To
-follow the latest work, use the branch `smartonTT/tt-project` wherever the commands below say
-`smartonTT/tt-project-dogfood-1`. You need Python 3.9+, `git` with `user.name` and `user.email`
+a release ref instead: a tag or branch of `tenstorrent/skills` that your team publishes for tt-project.
+Set `TT_PROJECT_REF` to it (the commands below use `$TT_PROJECT_REF`; `install.sh` reads the same
+variable, and empty means the default branch). You need Python 3.9+, `git` with `user.name` and `user.email`
 set, and a logged-in agent CLI to run the project's workers.
 
 Claude Code (a branch or tag goes after `#`):
 
 ```bash
-claude plugin marketplace add 'https://github.com/tenstorrent/skills.git#smartonTT/tt-project-dogfood-1'
+export TT_PROJECT_REF=<release tag or branch>
+claude plugin marketplace add "https://github.com/tenstorrent/skills.git#$TT_PROJECT_REF"
 claude plugin install tt-project@tenstorrent-skills
 claude plugin details tt-project    # Skills (3): setup-box, tt-project, tt-project-harness
 "$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
@@ -97,7 +98,7 @@ claude plugin details tt-project    # Skills (3): setup-box, tt-project, tt-proj
 Codex (`--ref` takes a branch or tag):
 
 ```bash
-codex plugin marketplace add tenstorrent/skills --ref smartonTT/tt-project-dogfood-1
+codex plugin marketplace add tenstorrent/skills --ref $TT_PROJECT_REF
 codex plugin add tt-project@tenstorrent-skills
 "$(ls -d "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
 ```
@@ -107,7 +108,7 @@ check out the tag with `git` and copy the plugin into Cursor's local plugin fold
 follow Cursor's plugin documentation and have not been tested end to end yet:
 
 ```bash
-git clone --depth 1 --branch smartonTT/tt-project-dogfood-1 https://github.com/tenstorrent/skills.git tt-skills-dogfood
+git clone --depth 1 --branch $TT_PROJECT_REF https://github.com/tenstorrent/skills.git tt-skills-dogfood
 mkdir -p ~/.cursor/plugins/local
 cp -R tt-skills-dogfood/plugins/tt-project ~/.cursor/plugins/local/tt-project
 ~/.cursor/plugins/local/tt-project/bin/ttp setup
