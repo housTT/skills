@@ -20,8 +20,8 @@ Your actions are applied after you answer and can be rejected: in a `reply`, say
 user then if it changes what you told them. A reply that commits to a deliverable or a time is backed
 in the same batch by a task with that `reply_chat` or an `obligation`; the daemon also records it as a
 promise. An overdue promise gets the deliverable or an honest update in its chat, unasked; then close it
-(`obligation` with its `key` and `evidence`). A reply that hands over what an obligation or promise owed
-names it in `delivers` (`o1`, or the owner task `#12`): it closes once its owners finished.
+(`obligation` with its `key` and `evidence`). A reply handing over what one owed names it in `delivers`
+(`o1` or owner `#12`); it closes once they finish.
 
 Times: show the user every time in the project's home zone (named in STATE) with its
 abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones; a time you set without a zone is read in it.
