@@ -2,10 +2,10 @@
 also fail elsewhere is held asleep instead of woken at its tier (Daemon._probe_passed).
 
 A failure is shared when every failing pytest id (the failing command's `FAILED`/`ERROR path::name`
-lines, complete against pytest's summary counts) also failed in at least `checks.shared_min_tasks`
-other tasks' checks on other heads and of other lineages (a change's own earlier tasks, its review
-fixes and `continue:` tasks, do not count) within `checks.shared_window_h`, or the push queue's known-bad
-tip lists it. Any other runner, an incomplete list or one id not shared wakes the task as before.
+lines, complete against pytest's summary counts) also failed in the checks of at least
+`checks.shared_min_tasks` other changes (lineages: one change's code, review, review-fix and
+`continue:` tasks are one, and its own never count) on other heads within
+`checks.shared_window_h`, or the push queue's known-bad tip lists it. Any other runner, an incomplete list or one id not shared wakes the task as before.
 A held task's checks run again on its same head, model-free, once the push-branch tip moves past a
 commit touching a failing test's file, or after `checks.shared_backoff_h`; after RERUNS_MAX reruns
 it wakes. One incident per shared failure carries one fix task, one low feed line, the tasks held
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS checks_incidents (
   closed REAL, fix_task INTEGER, tasks TEXT NOT NULL DEFAULT '[]', held INTEGER NOT NULL DEFAULT 0,
   avoided_usd REAL NOT NULL DEFAULT 0);
 """
-MIN_TASKS = 2          # checks.shared_min_tasks: other tasks that must have failed each id
+MIN_TASKS = 2          # checks.shared_min_tasks: other changes (lineages) that must have failed each id
 WINDOW_H = 6.0         # checks.shared_window_h: how far back their failures count
 BACKOFF_H = 2.0        # checks.shared_backoff_h: a held task's checks run again after this at the latest
 RERUNS_MAX = 3         # reruns on one head before the task wakes as before
@@ -72,10 +72,30 @@ def ensure(db: DB) -> None:
 
 def root(db: DB, task: int) -> int:
     """The first task of `task`'s lineage (chaincap.chain: `continues:` and `continue:` hops), itself
-    when it has none: one change's code, fix and continue tasks share it."""
-    from .chaincap import chain
-    ch = chain(db, task)
-    return int(ch[0]["id"]) if ch else task
+    when it has none. A review maps to its subject's root (db.review_subject, through re-reviews), so
+    one change's code, fix, continue and review tasks share it."""
+    from .chaincap import MAX_CHAIN, chain, prev_of
+    from .db import review_subject
+    seen: set[int] = set()
+    cur = task
+    while cur not in seen and len(seen) < MAX_CHAIN:
+        seen.add(cur)
+        t = db.task(cur)
+        if t and t["kind"] == "review":
+            if (s := review_subject(t)) is None:
+                return cur
+            cur = s
+            continue
+        ch = chain(db, cur)
+        if not ch:
+            return cur
+        first = ch[0]
+        nxt = prev_of(first)   # chain stops at a review hop: go on through its subject
+        if nxt is None or nxt in seen or not (pt := db.task(nxt)) or pt["kind"] != "review":
+            return int(first["id"])
+        seen.update(int(h["id"]) for h in ch)
+        cur = nxt
+    return cur
 
 
 def record(db: DB, task: int, head: str, ids: list[str], now: float) -> None:
@@ -89,21 +109,21 @@ def record(db: DB, task: int, head: str, ids: list[str], now: float) -> None:
 
 def shared(db: DB, task: int, head: str, ids: list[str], now: float, cfg: dict,
            tip_ids: list[str] | None = None) -> bool:
-    """Every id failed in `min_tasks` other tasks on other heads and of other lineages within the
+    """Every id failed in `min_tasks` other lineages (other changes), on other heads within the
     window, or on the tip."""
     if not ids:
         return False
     s = settings(cfg)
     ensure(db)
-    seen: dict[str, set[int]] = {}
-    for r in db.q("SELECT task, ids FROM checks_failures WHERE ts>=? AND task!=? AND head!=? "
+    seen: dict[str, set[int]] = {}   # id -> the other lineages (roots) it failed in
+    for r in db.q("SELECT COALESCE(root, task) AS lineage, ids FROM checks_failures WHERE ts>=? AND task!=? AND head!=? "
                   "AND COALESCE(root, task)!=?", (now - s["window_s"], task, head, root(db, task))):
         try:
             got = json.loads(r["ids"])
         except ValueError:
             continue
         for i in got if isinstance(got, list) else []:
-            seen.setdefault(i, set()).add(r["task"])
+            seen.setdefault(i, set()).add(r["lineage"])
     on_tip = set(tip_ids or [])
     return all(i in on_tip or len(seen.get(i, ())) >= s["min_tasks"] for i in ids)
 

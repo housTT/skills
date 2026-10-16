@@ -106,13 +106,35 @@ def test_failures_of_one_changes_own_earlier_tasks_are_not_shared(env):
     code = p.db.add_task("code: change", "spec", kind="code")
     fix = p.db.add_task("Fix review #1: change", "spec", kind="code", labels=[f"continues:{code}"])
     cont = p.db.add_task("continue: change", "spec", kind="code", labels=[f"continues:{fix}"])
-    for k, t in enumerate((code, fix)):
-        sharedchecks.record(p.db, t, f"{k + 1:040x}", _IDS, now - 600)
+    review = p.db.add_task(f"Review #{code}: change", "spec", kind="review", labels=[f"auto_review:{code}"])
+    rereview = p.db.add_task(f"Re-review #{review}: change", "spec", kind="review", labels=[f"auto_review:{fix}"])
+    for k, t in enumerate((code, review, fix, rereview)):
+        sharedchecks.record(p.db, t, f"{k // 2 + 1:040x}", _IDS, now - 600)
+    assert len({r["root"] for r in p.db.q("SELECT root FROM checks_failures")}) == 1
+    via_review = p.db.add_task("Fix review: change", "spec", kind="code", labels=[f"continues:{rereview}"])
+    assert sharedchecks.root(p.db, via_review) == code   # a hop through a review keeps the lineage
     assert not sharedchecks.shared(p.db, cont, f"{9:040x}", _IDS, now, {})
     for k in range(2):
         other = p.db.add_task(f"code: other {k}", "spec", kind="code")
         sharedchecks.record(p.db, other, f"{k + 5:040x}", _IDS, now - 600)
     assert sharedchecks.shared(p.db, cont, f"{9:040x}", _IDS, now, {})
+
+
+def test_shared_checks_count_other_lineages_not_tasks(env):
+    """Two tasks of one other change (its code task and its review fix, on successive heads) are one
+    lineage: not enough for shared_min_tasks=2; two other changes are."""
+    from ttp import sharedchecks
+    p = make(env)
+    now = time.time()
+    mine = p.db.add_task("code: mine", "spec", kind="code")
+    other = p.db.add_task("code: other", "spec", kind="code")
+    ofix = p.db.add_task("Fix review #1: other", "spec", kind="code", labels=[f"continues:{other}"])
+    for k, t in enumerate((other, ofix)):
+        sharedchecks.record(p.db, t, f"{k + 1:040x}", _IDS, now - 600)
+    assert not sharedchecks.shared(p.db, mine, f"{9:040x}", _IDS, now, {})
+    third = p.db.add_task("code: third", "spec", kind="code")
+    sharedchecks.record(p.db, third, f"{5:040x}", _IDS, now - 600)
+    assert sharedchecks.shared(p.db, mine, f"{9:040x}", _IDS, now, {})
 
 
 def test_the_known_bad_push_tip_makes_a_failure_shared(env, monkeypatch, tmp_path):

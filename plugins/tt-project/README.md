@@ -691,8 +691,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `ttp push --own` publishes a task's branch and queues like task checks.
 - Shared check failures: a task waiting on its own detached `ttp checks` that failed only on pytest
   ids (the failing command's `FAILED`/`ERROR path::name` lines, complete against pytest's summary)
-  that also failed in at least `checks.shared_min_tasks` (default 2) other tasks' checks on other
-  heads and of other lineages (one change's code, review-fix and `continue:` tasks count once) within `checks.shared_window_h` (default 6), or on the push queue's known-bad tip, is held
+  that also failed in at least `checks.shared_min_tasks` (default 2) other changes' checks on other
+  heads (one change's code, review, review-fix and `continue:` tasks count as one; its own never count) within `checks.shared_window_h` (default 6), or on the push queue's known-bad tip, is held
   asleep instead of woken at its tier. Its checks run again on the same head, model-free, once the
   push branch's tip moves past a commit changing a failing test's file, or after
   `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
