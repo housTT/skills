@@ -11,11 +11,13 @@ open machine ledger changes and outages.
 
 Then a batch of only routine daemon events (`coordinator.quiet_held_kinds`, default idle_capacity), or
 an idle or starve wake with no events, is settled without a model run: its events are handled, a wake
-counts as a repeat (its backoff doubles), and the skip is logged as QUIET. Never skipped: user
+counts as a repeat (its backoff doubles and the next wake waits from the skip), and the skip is
+logged as QUIET. Never skipped: user
 messages, an escalation rerun, any high or critical event, any other kind, and any batch with an effort
 trigger (a raised turn). The state a turn leaves is stored when it finishes; a turn starting clears the
 old one, so one that never finishes leaves nothing to match. `coordinator.quiet_held_max_s` (a day)
-lets one turn through once the last one is that old; `coordinator.quiet_held` false turns the gate off."""
+lets one turn through once the last one started that long ago; 0 sets no such limit (the gate stays on,
+and skipped wakes still back off to one a day). `coordinator.quiet_held` false turns the gate off."""
 from __future__ import annotations
 
 import hashlib
@@ -27,7 +29,7 @@ from .coordinator import task_resources
 from .db import TERMINAL_TASK_STATES as CLOSED, deferral
 
 QUIET = "quiet: all held"
-LEFT_KEY = "quiet_left"      # kv: {fp, ts, run} the state the last finished coordinator turn left
+LEFT_KEY = "quiet_left"      # kv: {fp, ts, run} the state the last finished coordinator turn left, ts its start
 SKIPS_KEY = "quiet_skips"    # kv: [{ts, events, due, usd}] turns skipped, for the daily review
 KEEP_SKIPS_S = 8 * 86400
 ROUTINE_KINDS = ("idle_capacity",)
@@ -96,9 +98,10 @@ def started(db) -> None:
     db.x("DELETE FROM kv WHERE key=?", (LEFT_KEY,))
 
 
-def left(db, fp: str, run, now: float | None = None) -> None:
-    """A turn finished: remember the state it left."""
-    db.set_kv(LEFT_KEY, {"fp": fp, "ts": now or time.time(), "run": run})
+def left(db, fp: str, run, start: float | None = None) -> None:
+    """A turn finished: remember the state it left and when it started (the max age counts from there,
+    as the idle wake does)."""
+    db.set_kv(LEFT_KEY, {"fp": fp, "ts": start or time.time(), "run": run})
 
 
 def quiet(db, cfg: dict, evs: list[dict], msgs: list, escalated: bool, triggers, due: str | None,

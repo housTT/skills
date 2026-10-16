@@ -11661,3 +11661,64 @@ def test_quiet_gate_settles_idle_wakes_but_never_unblock_or_sweep_kinds(env):
     assert not quietgate.quiet(p.db, {}, [ev], [], True, lambda: [], None, fp, now), "an escalation reruns"
     quietgate.started(p.db)
     assert not quiet([ev]), "a turn that started and never finished left nothing to match"
+
+
+def test_quiet_idle_wake_skips_back_off_over_days_and_never_overflow(env, monkeypatch):
+    """A quiet idle-wake skip is a wake of its own: the next one waits the backed-off interval from it,
+    not from the last turn, so skips stay a few per day; a stale last turn still runs; a large stored
+    repeat count never raises; quiet_held_max_s 0 keeps the gate on with no age cap."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import quietgate
+    from ttp.daemon import Daemon, idle_wake
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    t = p.db.add_task("bench", "s", origin="user")
+    p.db.update_task(t, status="waiting", labels=["resource:board-a"])
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"board-a": {"reason": "user", "since": time.time(), "by": "user"}})
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    turns = []
+
+    def start_run(role, prompt, *a, **k):
+        turns.append((clock[0], k["note"]))
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(d, "update_gates", lambda: None)
+
+    def drive(days, step=60):
+        end, pending = clock[0] + days * 86400, None
+        while clock[0] < end:
+            clock[0] += step
+            n = len(turns)
+            d.maybe_coordinate()
+            if len(turns) > n:
+                pending = (clock[0] + 300, p.db.one("SELECT MAX(id) id FROM runs")["id"], turns[-1][1])
+            if pending and clock[0] >= pending[0]:
+                usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="",
+                                        final_text="", cost_usd=0.2)
+                d._finish_coordinator({"id": pending[1], "dir": "x"}, usage, "ok", pending[2])
+                pending = None
+
+    assert quietgate.all_held(p.db, d.cfg, clock[0])
+    start = clock[0]
+    drive(4)
+    skips = quietgate.skipped(p.db, start)["n"]
+    assert 1 <= skips <= 2 * 4, f"{skips} quiet skips in 4 days: each waits its backoff"
+    assert 2 <= len(turns) <= 2 * 4, f"{len(turns)} turns in 4 days"
+    gaps = [b[0] - a[0] for a, b in zip(turns, turns[1:])]
+    assert max(gaps) <= 86400 + 120, "a turn runs once the last one started a day ago, not a backoff later"
+    # No age cap: the gate stays on and the skips still wait out their backoff (at most one a day at the cap).
+    d.cfg["coordinator"]["quiet_held_max_s"] = 0
+    start, n = clock[0], len(turns)
+    drive(5)
+    assert 1 <= quietgate.skipped(p.db, start)["n"] <= 6 and len(turns) == n
+    # A huge stored repeat count never raises, here or in the status view.
+    gates = {k: g.as_dict() for k, g in d.gates.items()}
+    w = p.db.kv("idle_wake")
+    p.db.set_kv("idle_wake", {**w, "n": 10 ** 6})
+    assert idle_wake(p, d.cfg, gates, clock[0])["at"] is not None
+    d.maybe_coordinate()

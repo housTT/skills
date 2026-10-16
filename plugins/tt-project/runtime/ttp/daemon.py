@@ -2639,7 +2639,8 @@ class Daemon:
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
         try:
-            quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"))
+            quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"),
+                           float(db.kv("last_coordinator_turn", 0)) or None)
         except Exception:   # bookkeeping: without it the next routine turn runs
             log(self.p, "coordinator quiet state not saved: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
@@ -4610,7 +4611,8 @@ class Daemon:
                                    coord.UNBLOCK_KINDS, sweep.SWEEP_KIND):
                     usd = quietgate.skip(db, evs, due_now, now)
                     if not evs:
-                        db.set_kv("idle_wake", wake)   # counts as a repeat: the next wake backs off
+                        # Counts as a repeat, and the next wake backs off from this skip.
+                        db.set_kv("idle_wake", {**wake, "skipped": now})
                     log(self.p, f"coordinator turn skipped ({quietgate.QUIET}): "
                         + (f"events {[e['id'] for e in evs]}" if evs else f"{due_now} wake")
                         + f", nothing new since the last turn (~${usd:.2f} saved)")
@@ -8594,7 +8596,8 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     The idle wake comes `idle_wake_s` after the last turn once no task is queued or running, and
     only while the core budget gate allows optional work. The idle-slot wake (`starve_state`) can
     come sooner. A wake turn that met the same state as the previous one had nothing new to
-    decide: each such repeat doubles the wait for both, up to a day. Explicit check-backs use
+    decide: each such repeat doubles the wait for both, up to a day. A wake the quiet gate settled
+    without a turn is a repeat too, and the next wait counts from it. Explicit check-backs use
     schedules.
 
     Returns `at` (next wake, possibly past), `due` ("idle", "starve" or None at `now`), `held`
@@ -8607,16 +8610,22 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     idle_s = float(c.get("idle_wake_s", 3600))
     fp = wake_fingerprint(p, gates, db)
     prev = db.kv("idle_wake", {}) or {}
-    repeats = int(prev.get("n", 0)) if prev.get("fp") == fp else 0
-    backoff = min(idle_s * 2 ** repeats, 86400.0) if repeats else 0.0
+    same = prev.get("fp") == fp
+    repeats = int(prev.get("n", 0)) if same else 0
+    # A wake the quiet gate settled (quietgate.py) is a wake of its own: the next waits from it, but
+    # comes no later than the gate's max age after the last turn, when a turn runs.
+    skipped = float(prev.get("skipped") or 0) if same else 0.0
+    cap = last + quietgate.max_age(cfg) if skipped > last and quietgate.max_age(cfg) else float("inf")
+    last = max(last, skipped)
+    backoff = min(idle_s * 2 ** min(repeats, 30), 86400.0) if repeats else 0.0
     idle_at, held = None, None
     if not db.one("SELECT id FROM tasks WHERE status IN ('queued','running')"):
         if gate is None or gate["allow_optional"]:
-            idle_at = last + max(idle_s, backoff)
+            idle_at = min(last + max(idle_s, backoff), cap)
         else:
             held = f"held by the budget gate ({gate['level']})"
     starve = starve_state(db, cfg, gate, now)
-    starve_at = last + max(backoff, starve["wait"]) if starve else None
+    starve_at = min(last + max(backoff, starve["wait"]), cap) if starve else None
     due = "idle" if idle_at is not None and now > idle_at else \
         "starve" if starve_at is not None and now > starve_at else None
     times = [t for t in (idle_at, starve_at) if t is not None]
