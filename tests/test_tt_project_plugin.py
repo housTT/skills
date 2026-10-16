@@ -78,7 +78,7 @@ def assert_no_leaks(patterns: list, files, allow=frozenset()) -> None:
 
 def plugin_text_files(root: pathlib.Path = PLUGIN):
     return [f for f in sorted(root.rglob("*"))
-            if f.is_file() and f.suffix in {".py", ".md", ".json", ".js", ".html", ".css", ""}]
+            if f.is_file() and f.suffix in {".py", ".md", ".json", ".js", ".html", ".css", ".sh", ""}]
 
 
 def frontmatter(path: pathlib.Path) -> dict:
@@ -3226,3 +3226,230 @@ def test_setup_box_ird_e2e_value_flag_without_value_exits_2(flag):
     r = subprocess.run(["bash", str(IRD_E2E), "--dry-run", flag], capture_output=True, text=True, timeout=10)
     assert r.returncode == 2
     assert "needs a value" in r.stderr
+
+
+# One-line install (README ### One-line install, install.sh). No network: the line's URL is swapped for
+# a file:// fixture repository, and claude, codex, cursor-agent and the fixture's bin/ttp are fakes.
+INSTALL_URL = "https://github.com/tenstorrent/skills.git"
+FAKE_CLAUDE = r"""#!/bin/sh
+# marketplace entries keyed by name, like the real one: a second add repoints, never duplicates
+echo "claude $*" >> "$HOME/calls.log"
+case "$1 $2 $3" in
+"plugin marketplace add") printf '%s\n' "$4" > "$HOME/claude-market" ;;
+"plugin install "*|"plugin update "*) [ -s "$HOME/claude-market" ] || exit 1; echo "$3" > "$HOME/claude-plugin" ;;
+esac
+"""
+FAKE_CODEX = r"""#!/bin/sh
+echo "codex $*" >> "$HOME/calls.log"
+case "$1 $2 $3" in
+"plugin marketplace add")
+  if [ -s "$HOME/codex-market" ] && [ "$(cat "$HOME/codex-market")" != "$4" ]; then
+    echo "Error: marketplace 'tenstorrent-skills' is already added from a different source; remove it before adding this source" >&2; exit 1
+  fi
+  printf '%s\n' "$4" > "$HOME/codex-market" ;;
+"plugin marketplace remove") rm -f "$HOME/codex-market" ;;
+"plugin add "*) [ -s "$HOME/codex-market" ] || exit 1; cp -R "$(cat "$HOME/codex-market")/plugins/tt-project/." "$HOME/codex-cache" ;;
+esac
+"""
+FAKE_TTP = """#!/bin/sh
+echo "ttp $* from $0" >> "$HOME/calls.log"
+mkdir -p "$HOME/.local/bin"
+"""
+
+
+def _install_line() -> str:
+    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    section = readme.split("\n### One-line install\n", 1)[1].split("\n## ", 1)[0]
+    blocks = re.findall(r"```bash\n(.*?)\n```", section, re.S)
+    assert len(blocks) == 1 and "\n" not in blocks[0], "the one-line install must be a single line"
+    return blocks[0]
+
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main",
+                    "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                   cwd=cwd, check=True, capture_output=True)
+
+
+def _fixture_repo(root: pathlib.Path, version: str = "1.0.0") -> pathlib.Path:
+    """A skills repository: tag `old` has no tt-project, tag `v1` and main have its installer."""
+    import shutil
+    repo = root / "skills"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "README.md").write_text("skills\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "before tt-project")
+    _git(repo, "tag", "old")
+    plugin = repo / "plugins" / "tt-project"
+    (plugin / "bin").mkdir(parents=True)
+    (plugin / ".claude-plugin").mkdir()
+    shutil.copy2(PLUGIN / "install.sh", plugin / "install.sh")
+    (plugin / "bin" / "ttp").write_text(FAKE_TTP)
+    (plugin / "bin" / "ttp").chmod(0o755)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "tt-project", "version": version}))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "tt-project " + version)
+    _git(repo, "tag", "v1")
+    return repo
+
+
+def _bump(repo: pathlib.Path, version: str) -> None:
+    (repo / "plugins" / "tt-project" / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "tt-project", "version": version}))
+    _git(repo, "commit", "-qam", "tt-project " + version)
+
+
+@pytest.fixture
+def install_env(tmp_path):
+    """A temp HOME and a PATH holding only the tools the installer needs plus the chosen fakes."""
+    import shutil
+    home, tools, tmp = tmp_path / "home", tmp_path / "bin", tmp_path / "tmp"
+    for d in (home, tools, tmp):
+        d.mkdir()
+    for tool in ("git", "python3", "sh", "bash", "dash", "mktemp", "rm", "cp", "mv", "mkdir", "sed", "head",
+                 "dirname", "cat"):
+        found = shutil.which(tool)
+        if found:
+            (tools / tool).symlink_to(found)
+    repo = _fixture_repo(tmp_path)
+
+    def run(hosts=("claude", "codex", "cursor-agent"), ref="", shell="bash", on_path=True):
+        import subprocess
+        for name, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX), ("cursor-agent", "#!/bin/sh\n")):
+            f = tools / name
+            if name in hosts:
+                f.write_text(body)
+                f.chmod(0o755)
+            elif f.exists():
+                f.unlink()
+        line = _install_line().replace(INSTALL_URL, "file://" + str(repo)).replace(
+            "(TT_PROJECT_REF=;", f"(TT_PROJECT_REF={ref};", 1)
+        path = (str(home / ".local" / "bin") + ":" if on_path else "") + str(tools)
+        env = {"HOME": str(home), "PATH": path, "TMPDIR": str(tmp), "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C"}
+        return subprocess.run([str(tools / shell), "-c", line], env=env, capture_output=True, text=True,
+                              timeout=120)
+
+    run.home, run.repo, run.tmp = home, repo, tmp
+    return run
+
+
+def _calls(home: pathlib.Path) -> list:
+    log = home / "calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _clone_head(home: pathlib.Path) -> str:
+    import subprocess
+    return subprocess.run(["git", "-C", str(home / ".local/share/tt-project/skills"), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _head(repo: pathlib.Path, ref: str = "HEAD") -> str:
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", ref + "^{commit}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_readme_one_line_install_is_the_installers_documented_usage():
+    """The README's line is the one install.sh documents; it clones with git (the reader's own
+    credentials), never a raw download, and names the ref in one variable at its front."""
+    line = _install_line()
+    usage = [ln[2:] for ln in (PLUGIN / "install.sh").read_text().splitlines() if ln.startswith("# (TT_PROJECT_REF=")]
+    assert usage == [line]
+    assert line.startswith("(TT_PROJECT_REF=;")
+    assert f"git clone -q --depth 1 ${{TT_PROJECT_REF:+--branch=$TT_PROJECT_REF}} {INSTALL_URL} " in line
+    assert 'sh "$d/plugins/tt-project/install.sh"' in line and "set TT_PROJECT_REF to a release tag" in line
+    for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
+        assert raw not in line, raw
+    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert "Release tags are fixed and never moved; a later release gets a new tag name" in readme
+    assert os.access(PLUGIN / "install.sh", os.X_OK)
+
+
+@pytest.mark.parametrize("shell", ["bash", "dash"])
+def test_one_line_install_installs_for_every_host_present(install_env, shell):
+    import shutil
+    if not shutil.which(shell):
+        pytest.skip(f"no {shell}")
+    r = install_env(shell=shell)
+    assert r.returncode == 0, r.stdout + r.stderr
+    home, dest = install_env.home, install_env.home / ".local/share/tt-project/skills"
+    calls = _calls(home)
+    assert f"claude plugin marketplace add {dest}" in calls
+    assert "claude plugin install tt-project@tenstorrent-skills" in calls
+    assert f"codex plugin marketplace add {dest}" in calls and "codex plugin add tt-project@tenstorrent-skills" in calls
+    assert calls[-1] == f"ttp setup from {dest}/plugins/tt-project/bin/ttp", calls    # ttp setup comes last
+    assert _clone_head(home) == _head(install_env.repo)
+    cursor = home / ".cursor/plugins/local/tt-project"
+    assert (cursor / "bin" / "ttp").is_file() and not cursor.is_symlink()   # Cursor skips outside symlinks
+    out = r.stdout
+    assert "skipped" not in out
+    for closing in ("Claude Code: start a new session", "Codex: start a new session", "Cursor: restart it",
+                    "ttp: ready in this shell"):
+        assert closing in out, out
+    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
+
+
+def test_one_line_install_skips_absent_hosts_with_a_note_and_closes_only_for_installed_ones(install_env):
+    r = install_env(hosts=("codex",), on_path=False)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out, calls = r.stdout, _calls(install_env.home)
+    assert "tt-project: Claude Code not found (no claude on PATH): skipped" in out
+    assert "tt-project: Cursor not found" in out and "skipped" in out
+    assert not any(c.startswith("claude ") for c in calls)
+    assert not (install_env.home / ".cursor").exists()
+    assert "Codex: start a new session" in out
+    assert "Claude Code: start" not in out and "Cursor: restart" not in out
+    assert "ttp: add ~/.local/bin to PATH" in out
+    # none present: still sets up ttp, and says what to install
+    r = install_env(hosts=())
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no Claude Code, Codex or Cursor found" in r.stdout
+    assert "Codex: start" not in r.stdout
+    assert _calls(install_env.home)[-1].startswith("ttp setup from ")
+
+
+def test_one_line_install_reruns_update_the_clone_in_place_without_duplicates(install_env):
+    home, repo = install_env.home, install_env.repo
+    first = install_env()
+    assert first.returncode == 0, first.stderr
+    (home / ".cursor/plugins/local/tt-project/stale").write_text("from the earlier copy")
+    _bump(repo, "1.0.1")
+    second = install_env()
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "1.0.1" in second.stdout and second.stderr == ""
+    assert _clone_head(home) == _head(repo)
+    dest = str(home / ".local/share/tt-project/skills")
+    assert (home / "claude-market").read_text().splitlines() == [dest]
+    assert (home / "codex-market").read_text().splitlines() == [dest]
+    assert json.loads((home / "codex-cache/.claude-plugin/plugin.json").read_text())["version"] == "1.0.1"
+    cursor = home / ".cursor/plugins/local/tt-project"
+    assert json.loads((cursor / ".claude-plugin/plugin.json").read_text())["version"] == "1.0.1"
+    assert not (cursor / "stale").exists()
+    assert sorted(p.name for p in cursor.parent.iterdir()) == ["tt-project"]
+    # a Codex marketplace of that name from another source is replaced, with a note
+    (home / "codex-market").write_text("/elsewhere\n")
+    third = install_env()
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert "Codex had tenstorrent-skills from another source: replacing it" in third.stdout
+    assert (home / "codex-market").read_text().splitlines() == [dest]
+    # a pinned tag installs exactly that release, even after the branch moved on
+    pinned = install_env(ref="v1")
+    assert pinned.returncode == 0, pinned.stderr
+    assert _clone_head(home) == _head(repo, "v1") != _head(repo)
+    assert "(v1)" in pinned.stdout
+
+
+def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_env):
+    r = install_env(ref="old")
+    assert r.returncode == 1
+    assert "tt-project: no installer at old; set TT_PROJECT_REF to a release tag" in r.stderr
+    assert _calls(install_env.home) == []
+    assert not (install_env.home / ".local/share/tt-project").exists()
+    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
+    missing = install_env(ref="no-such-tag")
+    assert missing.returncode != 0 and _calls(install_env.home) == []
+    assert not list(install_env.tmp.iterdir())

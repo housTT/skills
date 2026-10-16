@@ -18,9 +18,41 @@ name, which is also where it can use local hardware.
 codex plugin add tt-project@tenstorrent-skills     # Codex
 ```
 
-Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`.
+Cursor: copy the plugin folder into `~/.cursor/plugins/local/tt-project` (Cursor skips a symlink
+there that points outside that folder).
 
-Until tt-project is on `main`, install it as described in [Dogfood install](#dogfood-install).
+Until tt-project is on `main`, install it with the one-line install below, or as described in
+[Dogfood install](#dogfood-install).
+
+### One-line install
+
+Paste this line into a terminal. It installs tt-project for each of Claude Code, Codex and Cursor
+that it finds and skips the others with a note. Set `TT_PROJECT_REF` at its front to a release tag
+of `tenstorrent/skills`; left empty, it installs whatever `git clone` checks out (the default branch).
+
+```bash
+(TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+```
+
+It makes a shallow `git clone` with your own git credentials and runs `plugins/tt-project/install.sh`
+from it. The installer keeps one clone at `~/.local/share/tt-project/skills` (under `$XDG_DATA_HOME`
+when set), adds it as the `tenstorrent-skills` marketplace for Claude Code and Codex, copies the
+plugin into Cursor's local plugin folder and ends with `ttp setup`. Rerun the line to update, or with
+another tag to switch: it updates that clone and the same entries in place. A ref without the
+installer fails with a message to set `TT_PROJECT_REF` to a release tag.
+
+Release tags are fixed and never moved; a later release gets a new tag name, so a reader pinned to a
+tag stays on exactly that release.
+
+When it ends, the installer says how to load the plugin, only for the tools it installed for:
+
+- Claude Code: start a new session, or in an open one run `/reload-plugins` (and `/reload-skills`
+  for the plain `/tt-project`).
+- Codex: start a new session; open sessions do not see it.
+- Cursor: restart it, or run **Developer: Reload Window**. On Teams and Enterprise plans an admin
+  must allow local plugin imports.
+- `ttp`: works in an open terminal when `~/.local/bin` is already on its `PATH`; otherwise add that
+  folder to `PATH` in your shell profile and open a new shell.
 
 The first use installs a `ttp` command for your user (`ttp setup`). Python 3.9+ and `git` are the
 only requirements; the runtime uses the standard library.
@@ -120,6 +152,7 @@ claude plugin marketplace remove tenstorrent-skills
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 rm -rf ~/.cursor/plugins/local/tt-project
 rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # the one-line install's clone
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
