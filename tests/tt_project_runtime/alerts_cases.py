@@ -1907,3 +1907,87 @@ def test_headline_label_prefix_and_word_clip_in_chain_audit():
     assert headline.join("triage: box-a hold", "box-a hold", 80) == "box-a hold"
     out = headline.clip("alpha beta gamma delta " * 5, 50)
     assert out.endswith("…") and len(out) <= 50 and out[:-1].split()[-1] in {"alpha", "beta", "gamma", "delta"}
+
+
+def test_a_worker_high_notify_reaches_the_coordinator_while_its_run_lives(env, monkeypatch, capsys):
+    """`ttp notify --severity high`: synced to the run's escalation file, which the daemon reads each
+    tick while the run lives. Each distinct text becomes one high coordinator observation, never a
+    user alert; repeats and rereads add nothing, past ESCALATIONS_PER_RUN texts are counted in the
+    hand-off, and a run killed before any tick still delivers its lines when it is finished."""
+    from ttp import cli, daemon
+    from ttp.daemon import Daemon
+    from ttp.db import load_result
+    from ttp.providers.base import RunUsage as Usage
+
+    def notify(*args) -> int:
+        try:
+            cli.main(["notify", *args])
+        except SystemExit as e:
+            return int(e.code or 0)
+        return 0
+
+    def escalations(tid: int) -> list:
+        return p.db.q("SELECT text, severity, status, kind FROM events WHERE task=? AND fingerprint LIKE 'escalate:%' "
+                      "ORDER BY id", (tid,))
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("probe", "spec", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    rid = p.db.x("INSERT INTO runs(task,role,provider,status,started,dir) VALUES(?,'worker','claude','running',?,?)",
+                 (tid, time.time(), str(run_dir)))
+    assert notify("--severity", "critical", "x") == 2, "critical is refused"
+    assert not (run_dir / daemon.ESCALATE_FILE).exists()
+    assert notify("--severity", "high", "device lost mid-run:\n  results at risk") == 0
+    assert "coordinator" in capsys.readouterr().out
+    assert "escalate: device lost" in (run_dir / "progress.md").read_text()
+    assert not (run_dir / daemon.NOTIFY_FILE).exists(), "high never takes the user's notify path"
+    d.relay_escalations()
+    got = escalations(tid)
+    assert len(got) == 1 and got[0]["severity"] == "high" and got[0]["status"] == "queued", got
+    assert got[0]["kind"] == "observation" and "device lost mid-run: results at risk" in got[0]["text"]
+    # The same text again, an unchanged file, and a reread from scratch (a daemon restart) add nothing.
+    assert notify("--severity", "high", "device lost mid-run: results at risk") == 0
+    d.relay_escalations()
+    d.relay_escalations()
+    d._escalated.clear()
+    d.relay_escalations()
+    assert len(escalations(tid)) == 1
+    # The cap: two distinct texts per run; the rest are counted, never queued.
+    for i in range(3):
+        assert notify("--severity", "high", f"another finding {i}") == 0
+    d.relay_escalations()
+    assert len(escalations(tid)) == daemon.ESCALATIONS_PER_RUN == 2
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'"), "the user is never paged directly"
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "probed"}))
+    d._finish_worker(dict(p.db.one("SELECT * FROM runs WHERE id=?", (rid,))), Usage(cost_usd=0.1), "ok", run_dir)
+    assert len(escalations(tid)) == 2
+    assert load_result(p.db.task(tid)["result"])["escalations_dropped"] == 2
+
+    # A run killed before the daemon ever read its file: its run end (here after a reboot) delivers it.
+    t2 = p.db.add_task("probe two", "spec", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(t2, status="running")
+    run2 = _note_run(env, monkeypatch, p, task=str(t2))
+    r2 = p.db.x("INSERT INTO runs(task,role,provider,status,started,dir) VALUES(?,'worker','claude','running',?,?)",
+                (t2, time.time(), str(run2)))
+    assert notify("--severity", "high", "found corrupt output") == 0
+    (run2 / "result.json").write_text(json.dumps({"status": "failed", "summary": "cut short"}))
+    d._finish_worker(dict(p.db.one("SELECT * FROM runs WHERE id=?", (r2,))), Usage(cost_usd=0.1), "ok", run2,
+                     rebooted=True)
+    assert [e["text"].endswith("found corrupt output") for e in escalations(t2)] == [True]
+    assert "escalations_dropped" not in load_result(p.db.task(t2)["result"])
+
+
+def test_worker_low_and_normal_notify_are_unchanged_by_the_escalation_path(env, monkeypatch, capsys):
+    """Low and normal stay user alerts posted when the run ends; no escalation file, no event."""
+    from ttp import cli, daemon
+    p = make(env)
+    tid = p.db.add_task("probe", "spec", kind="work", tier="standard", origin="coordinator")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    for sev in ("low", "normal"):
+        cli.main(["notify", "--severity", sev, f"{sev} news"])
+    assert "sent when this run ends" in capsys.readouterr().out
+    assert not (run_dir / daemon.ESCALATE_FILE).exists()
+    assert daemon.relay_worker_escalations(p, p.db.task(tid), 9, run_dir) == (0, 0)
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 2
+    assert not p.db.one("SELECT id FROM events WHERE fingerprint LIKE 'escalate:%'")

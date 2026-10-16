@@ -141,6 +141,9 @@ STACKS_MAX_BYTES = 1 << 20          # a longer one is moved to <name>.1 when the
 RESULT_FILE = "result.json"
 NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
 NOTIFIES_PER_RUN = 3
+ESCALATE_FILE = "escalate.jsonl"  # `ttp notify --severity high` lines a run wrote (relay_worker_escalations)
+ESCALATIONS_PER_RUN = 2
+ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it count as nothing
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY)
@@ -537,6 +540,7 @@ class Daemon:
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
         self._reap_errors: dict[int, int] = {}
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
+        self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
         self._start_failures = 0
         self._lock_fd: int | None = None
         self._started = time.time()
@@ -923,7 +927,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
-        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -2239,6 +2243,24 @@ class Daemon:
         for key, _ in due:
             log(self.p, f"hold loop {key} raised to the coordinator")
 
+    def relay_escalations(self) -> None:
+        """Each live worker run's new `ttp notify --severity high` lines become high coordinator events
+        now, not when the run ends (relay_worker_escalations); a file is read again only once it changed."""
+        running = self.p.db.q("SELECT id, task, dir FROM runs WHERE status='running' AND role!='coordinator' "
+                              "AND task IS NOT NULL")
+        self._escalated = {k: v for k, v in self._escalated.items() if k in {r["id"] for r in running}}
+        for r in running:
+            try:
+                st = (self._run_dir(r) / ESCALATE_FILE).stat()
+            except OSError:
+                continue
+            if self._escalated.get(r["id"]) == (st.st_size, st.st_mtime_ns):
+                continue
+            task = self.p.db.task(r["task"])
+            if task:
+                relay_worker_escalations(self.p, task, r["id"], self._run_dir(r))
+            self._escalated[r["id"]] = (st.st_size, st.st_mtime_ns)
+
     def meter_running(self, every_s: float = 60) -> None:
         """Price runs still going from their stream, so status and the caps see a long run's spend
         before it ends. `finish_run` replaces the figures with the final ones."""
@@ -2982,11 +3004,14 @@ class Daemon:
             return
         landed.reconcile_pushes(self.p, task["id"])
         relay_worker_notifies(self.p, task, run_dir)
+        _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
         if handoff is None and not (run_dir / RESULT_FILE).exists():
             self._adopt_misplaced_handoff(r, task, run_dir)
         handoff = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
+        if past_cap and isinstance(result, dict):
+            result = dict(result, escalations_dropped=past_cap)
         if task["status"] == "cancelled":
             # Cancelled while this run was ending: the decision stands. Keep what the run produced,
             # and tell the coordinator only if the work actually got done.
@@ -9153,6 +9178,46 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
     # Only once the posts commit: a rolled-back run end leaves the file to be posted next time.
     db.after_commit(mark_sent)
     return sent
+
+
+def relay_worker_escalations(p: Project, task: dict, run_id, run_dir: Path) -> tuple[int, int]:
+    """Queue the `ttp notify --severity high` lines a worker run wrote (ESCALATE_FILE) as high
+    observations for the coordinator: the user is not paged; the coordinator decides. Read each tick
+    while the run lives (Daemon.relay_escalations) and again when it ends or a reboot ended it, so a
+    killed run's lines still arrive. One event per distinct text per run, the first
+    ESCALATIONS_PER_RUN texts only; the events table is the record, so a second read adds nothing.
+    Returns (events queued now, distinct texts past the cap)."""
+    try:
+        with open(run_dir / ESCALATE_FILE, "rb") as fh:
+            raw = fh.read(ESCALATE_READ_MAX)
+    except OSError:
+        return 0, 0
+    texts: list[str] = []
+    for line in raw.decode(errors="replace").splitlines():
+        try:
+            n = json.loads(line)
+        except ValueError:
+            continue   # a line cut short by the read limit or a crash mid-write
+        body = " ".join(str(n.get("text") or "").split())[:2000] if isinstance(n, dict) else ""
+        if body and body not in texts:
+            texts.append(body)
+    if run_id is None:
+        run_id = run_dir.name
+    queued = 0
+    for body in texts[:ESCALATIONS_PER_RUN]:
+        fp = f"escalate:{run_id}:{hashlib.sha256(body.encode()).hexdigest()[:16]}"
+        if p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            continue
+        text = f"Worker run {run_id} of task #{task['id']} {task['title'][:80]} escalates: {body}"
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (time.time(), f"worker:{task['id']}", "observation", fp, "high", text[:4000], "queued", task["id"]))
+        log(p, f"task #{task['id']}: run {run_id} escalated to the coordinator: {body[:200]}")
+        queued += 1
+    past = max(0, len(texts) - ESCALATIONS_PER_RUN)
+    if queued and past:
+        log(p, f"task #{task['id']}: {past} `ttp notify --severity high` text(s) past {ESCALATIONS_PER_RUN} "
+               f"in run {run_id} not escalated")
+    return queued, past
 
 
 def _last_notes(run_dir: Path, n: int = 5) -> list[str]:

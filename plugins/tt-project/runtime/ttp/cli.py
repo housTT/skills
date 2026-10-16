@@ -1336,15 +1336,26 @@ def cmd_note(a) -> None:
 def cmd_notify(a) -> None:
     """`ttp notify`: a worker's message for the user. The run cannot reach the daemon's database, so
     it is appended to the run's notify file, and the daemon posts it as an alert when the run ends
-    (daemon.relay_worker_notifies): low or normal severity only, a few per run, an identical text
-    once. High severity stays the coordinator's."""
-    from .daemon import NOTIFY_FILE
+    (daemon.relay_worker_notifies): low or normal severity, a few per run, an identical text once.
+    High goes to the coordinator, not the user: it is synced to the run's escalation file, which the
+    daemon reads while the run lives and again at its end (daemon.relay_worker_escalations). Critical
+    stays the coordinator's."""
+    from .daemon import ESCALATE_FILE, ESCALATIONS_PER_RUN, NOTIFY_FILE
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp notify only works inside a tt-project run")
+    if a.severity == "critical":
+        die("ttp notify: critical is the coordinator's; use --severity high to escalate to it")
     text = a.text.strip()
     if not text:
         die("empty notify")
+    if a.severity == "high":
+        durable_append(Path(run_dir) / ESCALATE_FILE, json.dumps({"ts": time.time(), "severity": "high",
+                                                                 "text": text}) + "\n")
+        durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} escalate: {text[:200]}\n")
+        print(f"escalated to the coordinator as a high event within a minute (the first {ESCALATIONS_PER_RUN} "
+              f"distinct texts per run); the user is not paged directly. Keep working")
+        return
     durable_append(Path(run_dir) / NOTIFY_FILE, json.dumps({"ts": time.time(), "severity": a.severity,
                                                            "text": text}) + "\n")
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} notify: {text[:200]}\n")
@@ -5677,8 +5688,9 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("notify", help="(inside a run) tell the user something; sent when the run ends")
     s.add_argument("text")
-    s.add_argument("--severity", choices=["low", "normal"], default="normal",
-                   help="high and critical stay the coordinator's")
+    s.add_argument("--severity", choices=["low", "normal", "high", "critical"], default="normal",
+                   help="high: an urgent report for the coordinator, relayed while the run lives; "
+                        "critical is refused")
     s.set_defaults(fn=cmd_notify)
 
     s = sub.add_parser("upstream", help="upstream notes across machines: receive, forwarding status and targets")

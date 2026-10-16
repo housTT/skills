@@ -23487,7 +23487,7 @@ def test_a_worker_notify_reaches_the_user_once_when_its_run_ends(env, monkeypatc
     tid = p.db.add_task("milestone", "spec", kind="work", tier="standard", origin="coordinator")
     p.db.update_task(tid, status="running")
     run_dir = _note_run(env, monkeypatch, p, task=str(tid))
-    assert notify("--severity", "high", "x") == 2, "high severity stays the coordinator's"
+    assert notify("--severity", "critical", "x") == 2, "critical stays the coordinator's"
     assert notify("  ") != 0
     assert notify("goal met:\n 5.7 s") == 0
     assert "sent when this run ends" in capsys.readouterr().out

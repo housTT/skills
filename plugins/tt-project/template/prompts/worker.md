@@ -40,14 +40,13 @@
 - Every time you write for the user (notes, notify, hand-off summary, drafts, reports) is in the
   project's home zone from your task header, with its abbreviation (e.g. `09:30 CET`), never the
   host's, UTC or `Z`: convert times you copy from UTC logs.
-- `ttp notify "<text>"` (`--severity low|normal`) only when your spec asks you to tell the user
-  something; say so in your hand-off.
-- Make durable progress early (commit, write files): a killed run keeps what is on disk.
+- `ttp notify "<text>"` (`--severity low|normal`) only when your spec says to tell the user; say so
+  in your hand-off. `high`: urgent, to the coordinator now (2/run).
+- Make durable progress early (commit, write files): a killed run keeps what's on disk.
 - Run builds and test suites as `ttp clip -- <command>`: it shows the failures or head and tail,
   and the full log's path.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read
-  with offset and limit). Do not re-read a range you already read: every line read is paid again
-  on each later call.
+  with offset and limit). Do not re-read a range you already read: later calls pay it again.
 <!-- ttp:if harness -->
 - Qualify a harness-preparation commit with `ttp checks --purpose harness`, never by adding its own
   SHA to a publication whitelist. That pass never counts for a PR, an `on_pass` or a push.
