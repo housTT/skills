@@ -42,3 +42,8 @@ Scripts that walk `/proc` (to find a process by command line, say): a pid can ex
   Offer a device-free self-test that prints the list of followed executables, so a gap shows without a live run.
 - `journalctl -k` is `--dmesg`, which implies `-b` (current boot only). `-k --since/--until` over a span reaching past the current boot silently returns nothing, a false negative on boxes that reboot often.
   Use `journalctl _TRANSPORT=kernel --since ... --until ...` across boots, or `journalctl -k -b <boot-id>` for one boot.
+
+## Driving a job on a box that may reset
+
+- Start it with `ttp detach --remote` and poll it with `ttp detach --check --host`: "driver gone and no done marker" is terminal there (exit 4).
+  In any custom poll loop, treat "driver pid gone and no done marker" as terminal on its own, whatever the output row count; waiting for a result row as well polls to the deadline after a reset.
