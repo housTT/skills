@@ -383,7 +383,7 @@ def host_runs(p: Project) -> list[tuple[str, dict]]:
             try:
                 rows = [dict(r) for r in conn.execute("SELECT id,task,role FROM runs WHERE status='running' ORDER BY id")]
                 rows += [{"id": None, "task": t["id"], "role": "push"}
-                         for t in conn.execute("SELECT id FROM tasks WHERE status='pushing' ORDER BY id")]
+                         for t in conn.execute("SELECT id FROM tasks WHERE status='pushing' AND COALESCE(result,'') NOT LIKE '%\"push_verify\"%' ORDER BY id")]
             finally:
                 conn.close()
         except sqlite3.Error:

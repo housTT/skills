@@ -75,6 +75,7 @@ from . import machines
 from . import prguard
 from . import projpause
 from . import push
+from . import pushclaim
 from . import pushq
 from . import rebootwait
 from . import refwaits
@@ -919,6 +920,7 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+                     self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
@@ -942,7 +944,7 @@ class Daemon:
         core_held = self.net_held(core) and not self._net_may_probe(core)
         cycle = self.host_cycle_held(now)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2740,6 +2742,109 @@ class Daemon:
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{tid}: {e}")
 
+    def _defer_for_push(self, r: dict, task: dict, run_dir: Path, usage, ended, result, summary: str) -> bool:
+        """A done hand-off that claims a push waits in `pushing` until verify_pushes finds the push on
+        the remote; True when it does. Offline: it runs inside on_pass's finishing transaction."""
+        try:
+            cs = pushclaim.claims(self.p, task, result if isinstance(result, dict) else {}, r)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: reading its push claims failed: {type(e).__name__}: {e}")
+            return False
+        if not cs:
+            return False
+        db, now = self.p.db, time.time()
+        saved = dict(result) if isinstance(result, dict) else {}
+        saved.setdefault("summary", summary)
+        try:
+            (run_dir / pushclaim.HANDOFF).write_text(json.dumps(saved))
+        except OSError as e:
+            log(self.p, f"task {task['id']}: cannot save its hand-off for the push check: {e}")
+            return False
+        what = pushclaim.describe(cs)
+        db.update_task(task["id"], status="pushing", blocked_reason=f"verifying its claimed push on the remote: {what}"[:500],
+                       result=dump_result({"summary": summary, "status": "pushing", pushclaim.KEY: {
+                           "claims": cs, "run": r.get("id"), "dir": str(run_dir), "ended": ended, "since": now,
+                           "tries": 0, "next": now, "cost": float(usage.cost_usd or 0.0),
+                           "estimated": bool(usage.estimated)}}))
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now, f"task:{task['id']}", "push_verifying", "low",
+              f"#{task['id']} done once its claimed push is on the remote: {what}", "handled", task["id"]))
+        return True
+
+    def verify_pushes(self) -> None:
+        """Tasks waiting in `pushing` on their claimed pushes (_defer_for_push): asked on the remote,
+        outside any transaction, a few per tick with backoff. Confirmed: the hand-off is recorded.
+        Missing, or the remote unreadable past pushclaim.BOUND_S: the task fails naming remote, ref, sha."""
+        db, now = self.p.db, time.time()
+        rows = db.q("SELECT id, result FROM tasks WHERE status='pushing' AND result LIKE ? ORDER BY id",
+                    (f'%"{pushclaim.KEY}"%',))
+        due = []
+        for t in rows:
+            pv = load_result(t["result"]).get(pushclaim.KEY)
+            if isinstance(pv, dict) and float(pv.get("next") or 0) <= now:
+                due.append((t["id"], pv))
+        cache: dict = {}
+        for tid, pv in due[:pushclaim.PER_TICK]:
+            state, why, _ = pushclaim.check_all(self.p, list(pv.get("claims") or []), cache)
+            run_dir = Path(pv.get("dir") or ".")
+            if state == pushclaim.UNKNOWN and now - float(pv.get("since") or now) < pushclaim.BOUND_S:
+                tries = int(pv.get("tries") or 0) + 1
+                with db.tx():
+                    t = db.task(tid)
+                    if t and t["status"] == "pushing":
+                        res = load_result(t["result"])
+                        res[pushclaim.KEY] = {**pv, "tries": tries, "next": now + pushclaim.delay_s(tries), "last": why}
+                        db.update_task(tid, result=dump_result(res),
+                                       blocked_reason=f"verifying its claimed push on the remote: {why}"[:500])
+                continue
+            try:
+                handoff = json.loads((run_dir / pushclaim.HANDOFF).read_text())
+            except (OSError, ValueError):
+                handoff = {"status": "done", "summary": load_result(db.task(tid)["result"]).get("summary", "")}
+            if not isinstance(handoff, dict):
+                handoff = {"status": "done", "summary": str(handoff)}
+            said = str(handoff.get("summary") or "")
+            if state == pushclaim.CONFIRMED:
+                handoff = {**handoff, "summary": f"{said} (push verified: {why})"[:1500]}
+            else:
+                if state == pushclaim.UNKNOWN:
+                    why = f"the remote could not be read for {int(pushclaim.BOUND_S // 3600)} h: {why}"
+                keep = [f for f in handoff.get("followups") or [] if isinstance(f, dict)
+                        and (db.task(tid)["kind"] != "review" or str(f.get("title", "")).startswith("upstream:"))]
+                handoff = {"status": "failed", "followups": keep,
+                           "summary": f"claimed a push that is not on the remote: {why}. Its hand-off said: {said}"[:1500]}
+            log(self.p, f"task {tid}: claimed push {state}: {why[:300]}")
+            run = db.one("SELECT * FROM runs WHERE id=?", (pv.get("run"),)) if pv.get("run") else None
+            from .providers.base import RunUsage
+            usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
+            with db.tx():
+                t = db.task(tid)
+                if not t or t["status"] != "pushing" or pushclaim.KEY not in load_result(t["result"]):
+                    continue
+                self._finish_worker(dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"}, usage,
+                                    "ok", run_dir, pv.get("ended"), handoff=handoff,
+                                    push_verified=state == pushclaim.CONFIRMED)
+
+    def audit_pushes(self) -> None:
+        """Hourly, model-free: done tasks of the last days whose claimed pushes are not on the remote
+        (pushclaim.audit), one keyed observation each; quiet, and earlier ones closed, when none."""
+        db, now = self.p.db, time.time()
+        last = db.kv(pushclaim.AUDIT_KV)
+        if isinstance(last, dict) and now - float(last.get("at") or 0) < pushclaim.AUDIT_EVERY_S:
+            return
+        try:
+            a = pushclaim.audit(self.p, now=now, max_refs=4)
+        except Exception as e:
+            log(self.p, f"push audit failed: {type(e).__name__}: {e}")
+            db.set_kv(pushclaim.AUDIT_KV, {**(last if isinstance(last, dict) else {}), "at": now})
+            return
+        db.set_kv(pushclaim.AUDIT_KV, {**a, "gaps": a["gaps"][:50]})
+        missing = [g for g in a["gaps"] if g["state"] == pushclaim.MISSING]
+        for g in missing:
+            self.observe("daemon:push-audit", pushclaim.gap_text(g), "normal", key=pushclaim.gap_key(g), whole=True)
+        if not missing:
+            scr.close_watcher_issues(db, "daemon:push-audit", why="every claimed push of the last days is on its remote")
+
     def _prefetch_remote(self, task_id: int, result: dict | None) -> None:
         """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
         now, before the transaction that records it: inside it the answer is read, never fetched, so
@@ -2756,8 +2861,9 @@ class Daemon:
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
-                       orderly: bool = False, refused: str = "") -> None:
+                       orderly: bool = False, refused: str = "", push_verified: bool = False) -> None:
         """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
+        `push_verified`: the pushes the hand-off claims were found on the remote (verify_pushes).
         `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task.
         `refused`: why the runner refused to start the agent (runner.check_pin)."""
         db = self.p.db
@@ -3020,6 +3126,9 @@ class Daemon:
                 attempts = int(task["attempts"] or 0)
             elif new == "queued":
                 extra[conflictfix.KEY] = cmark   # its next run is the same conflict fix
+        if new == "done" and not approval and not push_verified and status == "ok" \
+                and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
+            return
         if new in ("done", "pushing"):
             self._mark_verified(task, approval, extra)
         if ended:
@@ -3905,6 +4014,12 @@ class Daemon:
                     spec += f"\n\nShipped upstream fixes no filer here can confirm: {line}"
             except Exception as e:   # nor must the orphan list
                 log(self.p, f"upstream orphans line failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                spec += (f"\n\nClaimed pushes of done tasks on their remotes (`ttp push-audit` for more): "
+                         f"{pushclaim.daily_line(db)}.")
+            except Exception as e:   # nor must the push audit
+                log(self.p, f"push audit line failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             noisy = watchdup.review_lines(db)
             if noisy:

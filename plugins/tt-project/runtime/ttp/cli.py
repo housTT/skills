@@ -1207,6 +1207,22 @@ def cmd_ttr(a) -> None:
           + (f" on {a.alias}" if a.alias else ""))
 
 
+def cmd_push_audit(a) -> None:
+    """Done tasks of the last days whose claimed pushes are not on the remote (pushclaim.audit), with
+    counts: confirmed, missing, unknown. Read-only: it only fetches the remote's tracking refs."""
+    from . import pushclaim
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp push-audit <name>`")
+    got = pushclaim.audit(p, days=a.days)
+    if a.json:
+        print(json.dumps(got, indent=1))
+        return
+    for g in got["gaps"]:
+        print(f"#{g['task']} {g['state']}: {g['why']}")
+    print(pushclaim.summary_line({**got, "gaps": []}))
+
+
 def cmd_spend_today(a) -> None:
     """This machine's projects' spend in [since, until) by provider and account key, and its other
     Claude Code sessions as estimated (globalcap.answer): what another machine's global daily total
@@ -4055,7 +4071,7 @@ def _draining_runs(p: Project) -> list[dict]:
     runs = [dict(r) for r in p.db.q("SELECT id,task,role FROM runs WHERE status='running' ORDER BY id")
             if str(r["id"]) != str(me)]
     return runs + [{"id": None, "task": t["id"], "role": "push"}
-                   for t in p.db.q("SELECT id FROM tasks WHERE status='pushing' ORDER BY id")]
+                   for t in p.db.q("SELECT id FROM tasks WHERE status='pushing' AND COALESCE(result,'') NOT LIKE '%\"push_verify\"%' ORDER BY id")]
 
 
 def cmd_drain(a) -> None:
@@ -5673,6 +5689,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("push-audit", help="done tasks whose claimed pushes are not on the remote, with counts")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--days", type=float, default=2, help="done tasks updated within this many days")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_push_audit)
 
     s = sub.add_parser("ttr", help="time to recover per machine: incidents, median, p90 and max TTR, open ones")
     s.add_argument("name", nargs="?")
