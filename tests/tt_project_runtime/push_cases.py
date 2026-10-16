@@ -287,6 +287,54 @@ def test_superseded_reads_a_task_branch_in_the_second_repository_it_worked_in(en
         landed.record_superseded(p, tid2, relanded)
 
 
+def test_superseded_ref_names_the_branch_of_a_done_task_whose_work_is_in_a_second_repository(env, monkeypatch,
+                                                                                               tmp_path, capsys):
+    """A done task with no branch on record whose worker made its own worktree of a second repository
+    in its run folder (runs/<id>/<name>): --ref names that branch, found in the run worktree's
+    repository (or any repository the project's runs made worktrees of), and the supersession is
+    recorded against a commit another branch there holds. Without --ref the error says to name it."""
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    second = tmp_path / "second"
+    _git_out(tmp_path, "init", "-q", "-b", "main", str(second))
+    _commit(second, "lib.txt", "one\n")
+    tid2 = p.db.add_task("work in the second repo", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid2, status="done", branch=None)
+    _run_in(p, tid2, p.root)   # the run worked from the project root
+    rid = p.db.one("SELECT id FROM runs WHERE task=?", (tid2,))["id"]
+    wt = p.runs / str(rid) / "second"
+    _git_out(second, "worktree", "add", "-q", "-b", f"ttp/t{tid2}-x", str(wt), "main")
+    _commit(wt, "lib.txt", "one\ntwo\n")
+    feat = _git_out(wt, "rev-parse", "HEAD")
+    _git_out(second, "checkout", "-q", "-b", "pr-head", "main")
+    _commit(second, "lib.txt", "one\ntwo, settled\n")
+    relanded = _git_out(second, "rev-parse", "HEAD")
+    _git_out(second, "checkout", "-q", "main")
+
+    assert ttp_task("superseded", str(tid2), relanded) not in (0, None)
+    err = capsys.readouterr().err
+    assert "no branch on record" in err and "--ref <branch>" in err
+    assert ttp_task("superseded", str(tid2), relanded[:12], "--ref", f"ttp/t{tid2}-missing") not in (0, None)
+    assert str(second) in capsys.readouterr().err, "the error names the repositories checked"
+    assert ttp_task("superseded", str(tid2), relanded[:12], "--ref", f"ttp/t{tid2}-x") == 0
+    out = capsys.readouterr().out
+    assert f"recorded as superseded by {relanded[:10]}" in out and "pr-head" in out
+    assert landed.superseded(p.db, [tid2]) == {tid2: [(feat, relanded)]}
+    assert landed.task_shas(p, tid2)[0] == [relanded]
+
+    # A run folder of another task that made a worktree of the same repository still finds it.
+    p.db.x("DELETE FROM task_superseded WHERE task=?", (tid2,))
+    p.db.x("UPDATE runs SET task=? WHERE id=?", (tid, rid))
+    assert "superseded by" in landed.record_superseded(p, tid2, relanded, ref=f"ttp/t{tid2}-x")
+
+
 def test_a_task_whose_change_landed_under_another_commit_gets_no_review_or_fix(env, monkeypatch):
     """Replay of a duplicate: a code task's one commit (its change plus a version bump and changeset)
     sits in review while a fix chain of another task rebased the change and the push queue landed it

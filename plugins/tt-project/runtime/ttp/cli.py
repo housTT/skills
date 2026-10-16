@@ -5982,7 +5982,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
-                   "second repository the task worked in, any of its branches)")
+                   "second repository the task worked in, any of its branches); for a task with no branch on record, "
+                   "the branch of a second repository that holds its work")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")

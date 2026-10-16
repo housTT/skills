@@ -319,6 +319,17 @@ def _task_repos(p, tid: int) -> list[Path]:
     return out
 
 
+def _run_dir_repos(p, tid: int) -> list[Path]:
+    """The repositories of the linked worktrees workers made in run directories (runs/<id>/<name>/.git),
+    task `tid`'s runs first, then the rest of the project's; the project root's is left out."""
+    from .worktree import _repo_of, run_worktree_dirs
+    own = {str((Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])).resolve())
+           for r in p.db.q("SELECT id, dir FROM runs WHERE task=?", (tid,))}
+    dirs = sorted(run_worktree_dirs(p), key=lambda d: str(d.parent.resolve()) not in own)
+    root = p.root.resolve()
+    return list(dict.fromkeys(r for r in map(_repo_of, dirs) if r is not None and r.resolve() != root))
+
+
 def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     """Record that done task `tid`'s work landed as `sha` (re-landed under another commit, e.g. after
     a push conflict), so the local-only check stops flagging its branch at the head it has now. The
@@ -326,17 +337,25 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     else the project root. Refused unless the task is done and `sha` is on `ref` (default: the push
     branch in the project root; any other ref of a second repository), came after the branch left it
     (not the branch's base or an older commit) and changes a file the branch changes; ValueError says
-    why."""
+    why. A task with no branch on record (its work is on a branch of a second repository) needs `ref`
+    naming that branch, looked up also in the repositories of its runs' worktrees."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
     if task.get("status") != "done":
         raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not done")
     branch = task.get("branch") or ""
+    repos = _task_repos(p, tid)
     if not branch:
-        raise ValueError(f"task #{tid} has no branch to record")
+        # A task whose work sits in a worktree of a second repository it made itself has no branch
+        # on record: --ref names that branch, then read in each repository its runs touched.
+        if not ref:
+            raise ValueError(f"task #{tid} has no branch on record; name the branch that holds its work "
+                             "with --ref <branch>")
+        branch, ref = ref, None
+        repos += _run_dir_repos(p, tid)
     checked = []
-    for repo in [*_task_repos(p, tid), p.root]:
+    for repo in dict.fromkeys([*repos, p.root]):
         head = _commit(repo, f"refs/heads/{branch}")
         if head:
             break
