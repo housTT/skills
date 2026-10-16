@@ -7198,3 +7198,224 @@ def test_upstream_regress_queue_stops_the_close_and_orphans_reach_the_daily_revi
         d._schedule_llm({"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}, {})
         spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
         assert ("c" * 16 in spec) is ingest
+
+
+def _claim_setup(env, monkeypatch, tmp_path, on_pass):
+    """_push_setup plus a code task waiting on its own passed checks with `on_pass`, its head not on origin."""
+    from ttp import daemon as dmod
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid, path = _checks_wait_task(p, tmp_path, None)
+    head = _git_out(path, "rev-parse", "HEAD")
+    hand = {**json.loads((tmp_path / f"run-{tid}" / "result.json").read_text()),
+            "on_pass": {k: (v.format(head=head[:10]) if isinstance(v, str) else v) for k, v in on_pass.items()}}
+    (tmp_path / f"run-{tid}" / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, result=json.dumps({**hand, "waiting_since": time.time() - 60}))
+    return p, dmod.Daemon(p.base), tid, path, head, origin
+
+
+def test_a_checks_pass_done_claiming_a_push_the_remote_lacks_fails_and_never_records_done(env, monkeypatch, tmp_path):
+    """Replay: checks pass, the on_pass done says 'pushed <sha> to <branch>' though nothing was published.
+    The task waits in `pushing` until the remote is asked, then fails naming remote, ref and sha."""
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path,
+                                            {"status": "done", "summary": "pushed {head} to origin/proj"})
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "pushing", (task["status"], task["result"])
+    assert "verifying its claimed push" in task["blocked_reason"]
+    assert (tmp_path / f"run-{tid}" / "push_claim_handoff.json").is_file()
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+    assert "claimed a push that is not on the remote" in res["summary"]
+    assert f"{head[:12]} is not on origin/proj" in res["summary"]   # remote, ref and sha
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
+
+
+def test_a_checks_pass_done_whose_claimed_push_is_on_the_remote_is_done_with_the_proof(env, monkeypatch, tmp_path):
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path,
+                                            {"status": "done", "summary": "pushed {head} to origin/proj"})
+    _git_out(path, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "pushing"
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], res)
+    assert res["summary"].startswith(f"pushed {head[:10]} to origin/proj (push verified: ")
+    assert f"{head[:12]} is the tip of origin/proj" in res["summary"]
+    assert p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert "push_verify" not in task["result"]
+
+
+def test_a_done_hand_off_that_claims_no_push_goes_straight_to_done(env, monkeypatch, tmp_path):
+    p, d, tid, *_ = _claim_setup(env, monkeypatch, tmp_path,
+                                 {"status": "done", "summary": "parser fixed; not pushed {head} yet"})
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done", (task["status"], task["result"])
+    assert "push_verify" not in task["result"]
+
+
+def test_an_unreadable_remote_keeps_a_claimed_push_waiting_with_backoff_and_fails_it_past_the_bound(
+        env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod, pushclaim
+    p, d, tid, path, head, origin = _claim_setup(env, monkeypatch, tmp_path,
+                                                 {"status": "done", "summary": "pushed {head} to origin/proj"})
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "pushing"
+    _git_out(p.root, "remote", "set-url", "origin", str(tmp_path / "no-such-remote.git"))
+    clock = [time.time()]
+    fake = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})
+    fake.time = lambda: clock[0]
+    monkeypatch.setattr(dmod, "time", fake)
+
+    def pv():
+        t = p.db.task(tid)
+        return t["status"], json.loads(t["result"]).get(pushclaim.KEY) or {}
+    since = pv()[1]["since"]
+    for tries in (1, 2, 3):
+        d.verify_pushes()
+        status, v = pv()
+        assert status == "pushing" and v["tries"] == tries, (status, v)
+        assert v["next"] == pytest.approx(clock[0] + pushclaim.delay_s(tries))
+        assert "git ls-remote origin failed" in v["last"]
+        clock[0] += 1
+        d.verify_pushes()   # not due yet: untouched
+        assert pv()[1]["tries"] == tries
+        clock[0] = v["next"]
+    clock[0] = since + pushclaim.BOUND_S + 1
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+    assert "could not be read for 6 h" in res["summary"] and head[:12] in res["summary"]
+
+
+def test_verify_confirms_a_commit_below_the_tip_after_a_fetch_and_a_tag_elsewhere_is_missing(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    below = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "b.txt", "b\n")
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "tag", "v1", tip)
+    _git_out(repo, "push", "-q", "origin", "refs/tags/v1")
+    _git_out(repo, "update-ref", "-d", "refs/remotes/origin/proj")
+    assert pushclaim.verify(repo, "origin", "refs/heads/proj", tip)[0] == pushclaim.CONFIRMED
+    state, why = pushclaim.verify(repo, "origin", "refs/heads/proj", below)
+    assert state == pushclaim.CONFIRMED and why == f"{below[:12]} is on origin/proj", why
+    assert _git_out(repo, "rev-parse", "refs/remotes/origin/proj") == tip   # the fetch it needed
+    state, why = pushclaim.verify(repo, "origin", "refs/tags/v1", below)
+    assert state == pushclaim.MISSING and tip[:12] in why, why
+    assert pushclaim.verify(repo, "origin", "refs/tags/v1", tip)[0] == pushclaim.CONFIRMED
+    assert pushclaim.verify(repo, "origin", "refs/heads/gone", tip)[0] == pushclaim.MISSING
+    _commit(repo, "c.txt", "c\n")
+    state, why = pushclaim.verify(repo, "origin", "refs/heads/proj", _git_out(repo, "rev-parse", "HEAD"))
+    assert state == pushclaim.MISSING and "is not on origin/proj" in why, why
+
+
+def test_detached_push_markers_are_unknown_while_running_confirmed_by_sha_and_missing_once_failed(
+        env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    on = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _commit(repo, "b.txt", "b\n")
+    off = _git_out(repo, "rev-parse", "HEAD")
+    tid = p.db.add_task("t", "s", kind="code", origin="user")
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+
+    def state(marker):
+        (pushes / f"t{tid}-x.json").write_text(json.dumps({"run": 7, "target": "origin/proj", **marker}))
+        cs = pushclaim.marker_claims(p, tid, 7)
+        assert len(cs) == 1, cs
+        return pushclaim.check_all(p, cs)[:2]
+    assert state({"status": "queued"})[0] == pushclaim.UNKNOWN
+    assert state({"status": "running", "head": on})[0] == pushclaim.UNKNOWN
+    assert state({"status": "pushed", "sha": on})[0] == pushclaim.CONFIRMED
+    got, why = state({"status": "pushed", "sha": off})
+    assert got == pushclaim.MISSING, why
+    got, why = state({"status": "failed", "head": off, "exit": 4})
+    assert got == pushclaim.MISSING and "ended failed (exit 4)" in why and off[:12] in why, why
+    assert state({"status": "failed", "head": on})[0] == pushclaim.CONFIRMED   # pushed another way
+    # Another run's finished marker is not this run's claim.
+    (pushes / f"t{tid}-x.json").write_text(json.dumps({"run": 8, "status": "failed", "target": "origin/proj"}))
+    assert pushclaim.marker_claims(p, tid, 7) == []
+
+
+def test_a_push_queue_landing_is_checked_by_the_commit_it_landed_as(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    before_rebase = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+    _commit(repo, "a2.txt", "a\n")
+    landed = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = p.db.add_task("t", "s", kind="code", origin="user")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha,landed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (tid, "b", before_rebase, "origin/proj", "landed", now, now,
+                                         before_rebase, landed))
+    cs = pushclaim.queue_claims(p, tid)
+    assert [c["sha"] for c in cs] == [landed] and cs[0]["ref"] == "refs/heads/proj"
+    assert pushclaim.check_all(p, cs)[0] == pushclaim.CONFIRMED
+    p.db.x("UPDATE push_queue SET landed_sha=NULL WHERE task=?", (tid,))
+    assert pushclaim.check_all(p, pushclaim.queue_claims(p, tid))[0] == pushclaim.MISSING
+
+
+def test_text_claims_reads_push_phrases_and_skips_negated_ones_and_unknown_commits(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    s = sha[:10]
+    one = [("origin", "refs/heads/proj", sha)]
+    pick = lambda text: [(c["remote"], c["ref"], c["sha"]) for c in pushclaim.text_claims(p, text)]
+    assert pick(f"pushed {s} to origin/proj") == one
+    assert pick(f"Landed as `{s}` on origin/proj.") == one
+    assert pick(f"pushed to origin/proj as {s}") == one
+    assert pick(f"done; pushed {s}.") == one                  # no ref: the push branch
+    assert pick(f"not pushed {s} to origin/proj") == []
+    assert pick(f"it was never pushed {s}") == []
+    assert pick(f"{s} will be pushed to origin/proj by the review") == []
+    assert pick("pushed deadbee1234 to origin/proj") == []    # no such commit here
+    assert pick(f"pushed {s} to the branch") == one           # no real ref named: the push branch
+    assert pick(f"pushed {s} to nowhere/else") == [("origin", "refs/heads/nowhere/else", sha)]   # a branch of origin
+    _git_out(repo, "tag", "v9", sha)
+    assert pick(f"pushed tag v9 at {s}") == [("origin", "refs/tags/v9", sha)]
+
+
+def test_the_hourly_push_audit_raises_one_issue_per_missing_push_and_closes_them_once_fixed(env, monkeypatch, capsys):
+    from ttp import daemon as dmod, pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = p.db.add_task("ship it", "s", kind="code", origin="user")
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": f"pushed {sha[:10]} to origin/proj"}))
+    quiet = p.db.add_task("plain", "s", kind="code", origin="user")
+    p.db.update_task(quiet, status="done", result=json.dumps({"status": "done", "summary": "no push here"}))
+    d = dmod.Daemon(p.base)
+    open_ = lambda: p.db.q("SELECT watch_key, title FROM issues WHERE source='daemon:push-audit' AND status='open'")
+    d.audit_pushes()
+    got = open_()
+    assert len(got) == 1 and got[0]["watch_key"] == f"push-gap:{tid}:{sha[:12]}" and f"#{tid} ship it" in got[0]["title"]
+    assert pushclaim.daily_line(p.db).startswith("0 confirmed, 1 missing, 0 unknown across 2 done tasks")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    d.audit_pushes()                                  # within the hour: not run again
+    assert len(open_()) == 1
+    p.db.set_kv(pushclaim.AUDIT_KV, {**p.db.kv(pushclaim.AUDIT_KV), "at": time.time() - pushclaim.AUDIT_EVERY_S - 1})
+    d.audit_pushes()
+    assert open_() == []
+    assert pushclaim.daily_line(p.db).startswith("1 confirmed, 0 missing, 0 unknown")
+    from ttp import cli
+    capsys.readouterr()
+    with contextlib.suppress(SystemExit):
+        cli.main(["push-audit", "demo", "--json"])
+    assert json.loads(capsys.readouterr().out)["counts"] == {"confirmed": 1, "missing": 0, "unknown": 0}

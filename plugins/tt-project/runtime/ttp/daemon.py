@@ -2756,7 +2756,7 @@ class Daemon:
         saved = dict(result) if isinstance(result, dict) else {}
         saved.setdefault("summary", summary)
         try:
-            (run_dir / pushclaim.HANDOFF).write_text(json.dumps(saved))
+            durable_write(run_dir / pushclaim.HANDOFF, json.dumps(saved))
         except OSError as e:
             log(self.p, f"task {task['id']}: cannot save its hand-off for the push check: {e}")
             return False
