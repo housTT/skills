@@ -93,6 +93,7 @@ from . import sweep
 from . import timefmt
 from . import ttr
 from . import turngate
+from . import quietgate
 from . import turnsize
 from . import unblock
 from . import upstream
@@ -2637,6 +2638,20 @@ class Daemon:
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+        try:
+            quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"))
+        except Exception:   # bookkeeping: without it the next routine turn runs
+            log(self.p, "coordinator quiet state not saved: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _quiet_fp(self, gates: dict) -> str:
+        """The state quietgate compares across turns, with only the ledger fields a probe never rewrites."""
+        db = self.p.db
+        changes = [[c.get(k) for k in ("id", "alias", "what", "undo", "expires", "probe", "closed")]
+                   for c in machine_ledger.changes()]
+        outages = {a: [o.get(k) for k in ("why", "owner", "until", "covers")]
+                   for a, o in machine_ledger.outages().items()}
+        return quietgate.fingerprint(db, self.cfg, wake_fingerprint(self.p, gates, db), projpause.current(db),
+                                     [changes, outages])
 
     def _keep_messages(self, r: dict, ids: list, problems: list[str]) -> bool:
         """A user turn whose task_add was rejected for a reason it can fix (coord.fixable_rejection)
@@ -4535,7 +4550,7 @@ class Daemon:
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
-        queued = db.q("SELECT id, ts, kind, severity, task FROM events WHERE status='queued' ORDER BY id")
+        queued = db.q("SELECT id, ts, kind, severity, task, source FROM events WHERE status='queued' ORDER BY id")
         max_evs = int(c.get("max_events_per_turn", 40))
         budget = float(c.get("turn_budget_usd", 1.0))
         # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
@@ -4579,6 +4594,29 @@ class Daemon:
                 return
             if not msgs and self._batch_hold(queued, now):
                 return
+        if not msgs and not esc:
+            try:
+                # Every open task held by what no turn lifts, and nothing new since the last turn: a
+                # routine batch or wake is settled without a model run (quietgate.py).
+                gates_now = {k: g.as_dict() for k, g in self.gates.items()}
+                due_now = (w or {}).get("due")
+
+                def pre() -> list[str]:
+                    if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs):
+                        return ["unblock kind"]
+                    return coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due_now, [], gates_now,
+                                                 now, coord.charter_conflicts(self.p))[0]
+                if quietgate.quiet(db, self.cfg, evs, msgs, False, pre, due_now, self._quiet_fp(gates_now), now,
+                                   coord.UNBLOCK_KINDS, sweep.SWEEP_KIND):
+                    usd = quietgate.skip(db, evs, due_now, now)
+                    if not evs:
+                        db.set_kv("idle_wake", wake)   # counts as a repeat: the next wake backs off
+                    log(self.p, f"coordinator turn skipped ({quietgate.QUIET}): "
+                        + (f"events {[e['id'] for e in evs]}" if evs else f"{due_now} wake")
+                        + f", nothing new since the last turn (~${usd:.2f} saved)")
+                    return
+            except Exception:   # the gate only saves money: a failure runs the turn
+                log(self.p, "coordinator quiet gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         seen_now: dict = {}
         if evs and not msgs and not esc:
             try:
@@ -4680,6 +4718,7 @@ class Daemon:
                 log(self.p, "coordinator jev check ref not set: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv("last_coordinator_turn", now)
+        quietgate.started(db)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
         db.set_kv(coord.DIGEST_SEEN_KEY, shown)
         if esc:

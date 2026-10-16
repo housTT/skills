@@ -11540,3 +11540,124 @@ def test_a_quoted_edit_that_only_deletes_words_is_judged_when_it_drops_a_ban_or_
                                               False, None, None, item) == ""
     assert coord._reject_contradicting_append(p, "Restrictions", item.replace("Keep the suite", "Keep suite"),
                                               False, None, None, item) == ""
+
+
+def test_routine_turns_are_skipped_while_every_open_task_is_held_and_nothing_changed(env, monkeypatch):
+    """Idle-capacity turns decided nothing while a user pause, a deferral and a paused resource held
+    every open task. Such a routine batch is settled model-free (quietgate.py) and counted in the daily
+    review; any change since the last turn, a user message, a high or critical event, a task free to
+    run or a stale last turn runs it."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import audit, quietgate
+    from ttp.daemon import Daemon
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    paused = p.db.add_task("tuning", "s", origin="user")
+    p.db.update_task(paused, status="blocked", blocked_reason="paused by the user",
+                     labels=["waits:when:test -e state/user-resume-tuning || exit 1"])
+    on_board = p.db.add_task("bench", "s", origin="user")
+    p.db.update_task(on_board, labels=["resource:board-a"])
+    later = p.db.add_task("later", "s", origin="user")
+    p.db.update_task(later, labels=["start_when:test -e /nonexistent-marker"])
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"board-a": {"reason": "user", "since": time.time(), "by": "user"}})
+    d = Daemon(p.base)
+    d.update_gates()
+    # The repeat gate (turngate) and batching are off here: every turn that runs passed the quiet gate.
+    d.cfg["coordinator"].update(skip_repeat_window_s=0, batch_s=0)
+    clock = [time.time()]
+    notes = []
+
+    def start_run(role, prompt, *a, **k):
+        notes.append(k["note"])
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def event(severity="normal", kind="idle_capacity", source="daemon", gap=600):
+        clock[0] += gap
+        eid = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                     (clock[0], source, kind, severity, f"{kind}:board-b:{int(clock[0])}", "queued"))
+        clock[0] += 60
+        n = len(notes)
+        d.maybe_coordinate()
+        ran = len(notes) > n
+        if ran:
+            rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+            usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="",
+                                    final_text="", cost_usd=0.2)
+            d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
+        assert p.db.one("SELECT status FROM events WHERE id=?", (eid,))["status"] == "handled"
+        return ran
+
+    assert quietgate.all_held(p.db, d.cfg, clock[0])
+    assert event(), "the first batch runs: no turn has left its state yet"
+    assert p.db.kv(quietgate.LEFT_KEY)
+    assert not event(), "a routine batch against the same state, every task held, is skipped"
+    assert not event()
+    assert quietgate.skipped(p.db, 0)["n"] == 2
+    assert f"coordinator turns skipped ({quietgate.QUIET}): 2" in "\n".join(audit.lines(p.db, clock[0]))
+    assert audit.report(p.db, clock[0])["turns_quiet"]["n"] == 2
+    # Urgent events and other kinds always run.
+    assert event(severity="high"), "a high event is never skipped"
+    assert event(severity="critical"), "a critical event is never skipped"
+    assert event(kind="task_note"), "a non-routine kind is never skipped"
+    assert not event()
+    # A user message always runs the turn.
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert event()
+    assert not event()
+    # A change since the last turn runs it: a non-routine event the turn never met, a task's labels, a pause.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "daemon", "task_note", "normal", "x", "handled"))
+    assert event(), "a non-routine event since the last turn is new"
+    assert not event()
+    p.db.update_task(later, labels=["start_when:test -e /nonexistent-marker", "note:x"])
+    assert event(), "a task's labels changed"
+    assert not event()
+    # A task no turn-proof hold keeps (the resource pause lifted) runs every turn.
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    assert not quietgate.all_held(p.db, d.cfg, clock[0])
+    assert event() and event(), "a task free to run keeps every turn"
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"board-a": {"reason": "user", "since": clock[0], "by": "user"}})
+    assert event()
+    assert not event()
+    # A running task keeps every turn.
+    p.db.update_task(on_board, status="running")
+    assert event() and event()
+    p.db.update_task(on_board, status="queued")
+    assert event()
+    # The last turn a day old lets one through; the setting turns the gate off.
+    assert event(gap=86400), "a stale last turn lets one through"
+    assert not event()
+    d.cfg["coordinator"]["quiet_held"] = False
+    assert event()
+
+
+def test_quiet_gate_settles_idle_wakes_but_never_unblock_or_sweep_kinds(env):
+    """An idle or starve wake with no events is quiet like a routine batch; any other wake, an unblock
+    kind, a blocker sweep, an event not from the daemon or a raised trigger runs."""
+    p = make(env)
+    from ttp import quietgate
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    t = p.db.add_task("tuning", "s", origin="user")
+    p.db.update_task(t, labels=["start_after:" + str(time.time() + 86400)])
+    now = time.time()
+    fp = quietgate.fingerprint(p.db, {}, "wake")
+    quietgate.left(p.db, fp, 1, now - 60)
+    ev = {"id": 1, "kind": "idle_capacity", "severity": "normal", "source": "daemon"}
+
+    def quiet(evs, due=None, triggers=lambda: [], **k):
+        return quietgate.quiet(p.db, {}, evs, [], False, triggers, due, fp, now, **k)
+    assert quietgate.all_held(p.db, {}, now)
+    assert quiet([], "idle") and quiet([], "starve") and quiet([ev])
+    assert not quiet([]), "no events and no idle wake: nothing to settle"
+    assert not quiet([ev], triggers=lambda: ["blocked_long"]), "a raised trigger runs"
+    assert not quiet([ev], triggers=["blocked_long"])
+    assert not quiet([ev], unblock_kinds={"idle_capacity"})
+    assert not quiet([ev], sweep_kind="idle_capacity")
+    assert not quiet([{**ev, "source": "task:3"}])
+    assert not quietgate.quiet(p.db, {}, [ev], [], True, lambda: [], None, fp, now), "an escalation reruns"
+    quietgate.started(p.db)
+    assert not quiet([ev]), "a turn that started and never finished left nothing to match"
