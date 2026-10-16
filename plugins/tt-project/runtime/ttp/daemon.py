@@ -546,6 +546,8 @@ class Daemon:
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
         self._moved = 0.0        # when the running tick last made progress, monotonic
+        self._push_budget: tuple[float, pushclaim.Budget] | None = None   # this tick's git time for push checks
+        self._push_carry: dict[str, dict] = {}   # push checks' remote answers kept for the next tick
         self._step_name = ""     # the tick step running now
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
@@ -2844,10 +2846,24 @@ class Daemon:
               f"#{task['id']} done once its claimed push is on the remote: {what}", "handled", task["id"]))
         return True
 
+    def _push_net(self, carry: str) -> dict | None:
+        """The cache a push-claim check asks the remote with: None while the core provider's network
+        is held. It holds this tick's shared pushclaim.Budget and the answers `carry` kept from an
+        earlier tick that ran out of time."""
+        if self.net_held(self.cfg.get("core_provider") or "claude"):
+            return None
+        if not self._tick_began or not self._push_budget or self._push_budget[0] != self._tick_began:
+            self._push_budget = (self._tick_began, pushclaim.Budget())
+        return {**self._push_carry.pop(carry, {}), pushclaim.Budget.KEY: self._push_budget[1]}
+
     def verify_pushes(self) -> None:
         """Tasks waiting in `pushing` on their claimed pushes (_defer_for_push): asked on the remote,
         outside any transaction, a few per tick with backoff. Confirmed: the hand-off is recorded.
-        Missing, or the remote unreadable past pushclaim.BOUND_S: the task fails naming remote, ref, sha."""
+        Missing, or the remote unreadable past pushclaim.BOUND_S: the task fails naming remote, ref, sha.
+        Skipped while the network is held; past the tick's Budget the rest wait, untouched, for the next."""
+        cache = self._push_net("verify")
+        if cache is None:
+            return
         db, now = self.p.db, time.time()
         rows = db.q("SELECT id, result FROM tasks WHERE status='pushing' AND result LIKE ? ORDER BY id",
                     (f'%"{pushclaim.KEY}"%',))
@@ -2856,9 +2872,13 @@ class Daemon:
             pv = load_result(t["result"]).get(pushclaim.KEY)
             if isinstance(pv, dict) and float(pv.get("next") or 0) <= now:
                 due.append((t["id"], pv))
-        cache: dict = {}
         for tid, pv in due[:pushclaim.PER_TICK]:
-            state, why, _ = pushclaim.check_all(self.p, list(pv.get("claims") or []), cache)
+            try:
+                state, why, _ = pushclaim.check_all(self.p, list(pv.get("claims") or []), cache)
+            except pushclaim.OutOfTime as e:
+                self._push_carry["verify"] = cache
+                log(self.p, f"claimed pushes: {e}; task {tid} and later ones are checked next tick")
+                break
             run_dir = Path(pv.get("dir") or ".")
             if state == pushclaim.UNKNOWN and now - float(pv.get("since") or now) < pushclaim.BOUND_S:
                 tries = int(pv.get("tries") or 0) + 1
@@ -2900,13 +2920,20 @@ class Daemon:
 
     def audit_pushes(self) -> None:
         """Hourly, model-free: done tasks of the last days whose claimed pushes are not on the remote
-        (pushclaim.audit), one keyed observation each; quiet, and earlier ones closed, when none."""
+        (pushclaim.audit), one keyed observation each; quiet, and earlier ones closed, when none.
+        Skipped while the network is held; past the tick's Budget it resumes next tick from the answers so far."""
         db, now = self.p.db, time.time()
         last = db.kv(pushclaim.AUDIT_KV)
         if isinstance(last, dict) and now - float(last.get("at") or 0) < pushclaim.AUDIT_EVERY_S:
             return
+        cache = self._push_net("audit")
+        if cache is None:
+            return
         try:
-            a = pushclaim.audit(self.p, now=now, max_refs=4)
+            a = pushclaim.audit(self.p, now=now, max_refs=4, cache=cache)
+        except pushclaim.OutOfTime:
+            self._push_carry["audit"] = cache
+            return
         except Exception as e:
             log(self.p, f"push audit failed: {type(e).__name__}: {e}")
             db.set_kv(pushclaim.AUDIT_KV, {**(last if isinstance(last, dict) else {}), "at": now})

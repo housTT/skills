@@ -14,7 +14,11 @@ after which it fails too. Push-queue landings are checked against the commit the
 `ttp push-audit` lists done tasks of the last days whose claims are not on the remote, with the same
 check; the daemon runs it every AUDIT_EVERY_S, raises one keyed observation per gap and puts one line
 in the daily review. It also flags a done recorded from a checks-wait `on_pass` while the hand-off
-named an on_pass_cmd that never ran (no on_pass/ folder in its run)."""
+named an on_pass_cmd that never ran (no on_pass/ folder in its run).
+
+In the daemon both skip while the core provider's network is held, and share a Budget of
+NET_BUDGET_S of git network time per tick: what it leaves unchecked waits, untouched, for a later
+tick (OutOfTime)."""
 from __future__ import annotations
 
 import json
@@ -32,6 +36,7 @@ BACKOFF_S = (60, 120, 300, 600, 1200, 1800)
 BOUND_S = 6 * 3600               # a claim the remote never answered for this long fails its task
 LS_TIMEOUT_S, FETCH_TIMEOUT_S = 20, 40
 PER_TICK = 4                     # tasks checked per daemon tick
+NET_BUDGET_S = 30                # git network time (ls-remote, fetch) push checks spend per daemon tick
 AUDIT_EVERY_S, AUDIT_DAYS, AUDIT_REFS = 3600, 2, 20
 ON_PASS_DIR = "on_pass"          # daemon.ON_PASS_DIR
 
@@ -204,6 +209,42 @@ def claims(p, task: dict, result: dict, run: dict | None) -> list[dict]:
     return out
 
 
+class OutOfTime(Exception):
+    """This tick's Budget is spent: the claim is checked on a later tick, neither failed nor retried."""
+
+
+class Budget:
+    """Seconds of git network calls one daemon tick spends on push claims, kept in a check's cache.
+    The tick's first call gets its whole timeout, so each tick makes progress; a later one starts
+    only with min(timeout, 1 s) left, its timeout cut to what is left. A cut call that times out is
+    OutOfTime, not an unreadable remote. No tick spends more than max(seconds, the longest timeout)."""
+    KEY = "budget"   # its key in a cache, whose other keys are tuples
+
+    def __init__(self, seconds: float | None = None) -> None:
+        self.seconds = float(NET_BUDGET_S if seconds is None else seconds)
+        self.left, self.calls = self.seconds, 0
+
+    def call(self, repo, *args: str, timeout: float) -> subprocess.CompletedProcess:
+        t = min(timeout, self.left) if self.calls else timeout
+        if self.calls and self.left < min(timeout, 1.0):
+            raise OutOfTime(f"{max(self.left, 0):.0f} s of this tick's {self.seconds:.0f} s left")
+        self.calls += 1
+        began = time.monotonic()
+        try:
+            r = _git(repo, *args, timeout=t)
+        finally:
+            self.left -= time.monotonic() - began
+        if t < timeout and r.returncode == 124 and "TimeoutExpired" in (r.stderr or ""):
+            raise OutOfTime(f"git {args[0]} outlasted this tick's {self.seconds:.0f} s")
+        return r
+
+
+def _net(repo, cache: dict, *args: str, timeout: float) -> subprocess.CompletedProcess:
+    """A git network call, within the cache's Budget when it has one."""
+    b = cache.get(Budget.KEY)
+    return b.call(repo, *args, timeout=timeout) if b else _git(repo, *args, timeout=timeout)
+
+
 def _read_marker(p, name: str) -> dict:
     from . import push
     m = push._read(p.state / push.DETACHED / name)
@@ -214,7 +255,7 @@ def _ls(repo, remote: str, ref: str, cache: dict) -> tuple[list[str] | None, str
     """The shas `remote` has for `ref` (a tag's peeled commit last), None when it cannot be read."""
     k = (str(repo), remote, ref)
     if k not in cache:
-        r = _git(repo, "ls-remote", remote, ref, timeout=LS_TIMEOUT_S)
+        r = _net(repo, cache, "ls-remote", remote, ref, timeout=LS_TIMEOUT_S)
         if r.returncode != 0:
             err = (r.stderr or "").strip().splitlines()
             cache[k] = (None, f"git ls-remote {remote} failed: {err[-1] if err else f'exit {r.returncode}'}")
@@ -229,7 +270,7 @@ def _fetch(repo, remote: str, ref: str, cache: dict) -> str:
     branch = ref[len("refs/heads/"):]
     k = ("fetch", str(repo), remote, ref)
     if k not in cache:
-        r = _git(repo, "fetch", "-q", "--no-write-fetch-head", remote,
+        r = _net(repo, cache, "fetch", "-q", "--no-write-fetch-head", remote,
                  f"+{ref}:refs/remotes/{remote}/{branch}", timeout=FETCH_TIMEOUT_S)
         cache[k] = _commit(repo, f"refs/remotes/{remote}/{branch}") if r.returncode == 0 else ""
     return cache[k]
@@ -306,12 +347,14 @@ def check(p, c: dict, cache: dict) -> tuple[str, str]:
 
 def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, list[tuple[dict, str, str]]]:
     """(overall state, why, each claim's) of claims `cs`: MISSING if any is missing, else UNKNOWN if
-    any cannot be told, else CONFIRMED."""
+    any cannot be told, else CONFIRMED. OutOfTime passes through: nothing was told."""
     cache = {} if cache is None else cache
     each = []
     for c in cs:
         try:
             state, why = check(p, c, cache)
+        except OutOfTime:
+            raise
         except Exception as e:   # an unreadable claim is not a verified one, nor a missing one
             state, why = UNKNOWN, f"could not check {c.get('source')}: {type(e).__name__}: {e}"
         each.append((c, state, why))
@@ -353,10 +396,12 @@ def _on_pass_gap(prev: dict, run) -> str:
     return ""
 
 
-def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int = AUDIT_REFS) -> dict:
+def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int = AUDIT_REFS,
+          cache: dict | None = None) -> dict:
     """Done tasks of the last `days` whose claimed pushes are not on the remote: {"counts": {state: n},
     "gaps": [{"task", "title", "state", "why"}], "tasks": n}. Read-only, apart from fetching the
-    remote's tracking refs. Past `max_refs` distinct refs the rest count as unknown."""
+    remote's tracking refs. Past `max_refs` distinct refs the rest count as unknown. `cache`: the
+    remote's answers so far (with a Budget, an audit that ran out of time resumes from them)."""
     from .db import load_result
     now = time.time() if now is None else now
     db = p.db
@@ -364,7 +409,7 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
                 (now - days * 86400,))
     counts = {CONFIRMED: 0, MISSING: 0, UNKNOWN: 0}
     gaps: list[dict] = []
-    cache: dict = {}
+    cache = {} if cache is None else cache
     refs: set = set()
     for t in rows:
         prev = load_result(t["result"])

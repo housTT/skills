@@ -7497,3 +7497,113 @@ def test_review_rules_do_not_tell_reviews_to_publish_another_tasks_branch():
     text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
     assert "the change carries" not in text
     assert re.search(r"Never publish another task's `ttp/t<id>-\.\.\.` branch", text)
+
+
+def _slow_claims(env, monkeypatch, n, sleep_s=0.1):
+    """`n` tasks in `pushing`, each claiming the project's head on a branch of its own, with a
+    pushclaim._git whose ls-remote sleeps `sleep_s` and answers that head; `calls` lists them."""
+    from ttp import daemon as dmod, pushclaim
+    from ttp.db import dump_result
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    calls, real = [], pushclaim._git
+
+    def git(r, *args, timeout=30):
+        if args[0] in ("ls-remote", "fetch"):
+            calls.append(args)
+            time.sleep(sleep_s)
+            return subprocess.CompletedProcess(args, 0, f"{sha}\t{args[-1]}\n", "")
+        return real(r, *args, timeout=timeout)
+    monkeypatch.setattr(pushclaim, "_git", git)
+    tids = []
+    for i in range(n):
+        tid = p.db.add_task(f"ship {i}", "s", kind="code", origin="user")
+        claim = {"remote": "origin", "ref": f"refs/heads/b{i}", "sha": sha, "source": "summary", "strict": True}
+        p.db.update_task(tid, status="pushing", result=dump_result({"status": "pushing", "summary": f"pushed {i}",
+                         pushclaim.KEY: {"claims": [claim], "since": time.time(), "tries": 0, "next": 0}}))
+        tids.append(tid)
+    return p, dmod.Daemon(p.base), tids, calls
+
+
+def test_push_claim_checks_stay_within_the_tick_budget_and_the_rest_carry_over_untouched(env, monkeypatch):
+    from ttp import pushclaim
+    monkeypatch.setattr(pushclaim, "NET_BUDGET_S", 0.35)
+    monkeypatch.setattr(pushclaim, "LS_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(pushclaim, "PER_TICK", 10)
+    p, d, tids, calls = _slow_claims(env, monkeypatch, 6)
+    status = lambda: [p.db.task(t)["status"] for t in tids]
+    d._tick_began = time.monotonic()
+    began = time.monotonic()
+    d.verify_pushes()
+    took = time.monotonic() - began
+    checked = len(calls)
+    # A call starts only when its timeout fits in what is left: at most 3 of 0.1 s fit in 0.35 s.
+    assert 1 <= checked <= 3 and took < 0.35 + 0.25, (checked, took)
+    assert status() == ["done"] * checked + ["pushing"] * (6 - checked)
+    for t in tids[checked:]:   # not tried, not backed off, not failed
+        pv = json.loads(p.db.task(t)["result"])[pushclaim.KEY]
+        assert pv["tries"] == 0 and pv["next"] == 0 and "last" not in pv, pv
+    d.verify_pushes()   # the same tick: its budget is spent, nothing more is asked
+    assert len(calls) == checked
+    for _ in range(6):
+        if "pushing" not in status():
+            break
+        d._tick_began = time.monotonic()
+        d.verify_pushes()
+    assert status() == ["done"] * 6 and len(calls) == 6
+
+
+def test_the_push_audit_out_of_time_resumes_next_tick_from_the_answers_it_has(env, monkeypatch):
+    from ttp import pushclaim
+    monkeypatch.setattr(pushclaim, "NET_BUDGET_S", 0.15)
+    monkeypatch.setattr(pushclaim, "LS_TIMEOUT_S", 0.15)
+    p, d, tids, calls = _slow_claims(env, monkeypatch, 3)
+    sha = _git_out(env["repo"], "rev-parse", "HEAD")
+    for i, t in enumerate(tids):
+        p.db.update_task(t, status="done", result=json.dumps({"status": "done", "summary": f"pushed {sha[:10]} to origin/b{i}"}))
+    for n in (1, 2):   # one ls-remote per tick: the audit is not recorded until it is whole
+        d._tick_began = time.monotonic()
+        d.audit_pushes()
+        assert len(calls) == n and p.db.kv(pushclaim.AUDIT_KV) is None, calls
+    d._tick_began = time.monotonic()
+    d.audit_pushes()
+    assert len(calls) == 3, calls   # earlier answers were kept, not asked again
+    assert p.db.kv(pushclaim.AUDIT_KV)["counts"] == {"confirmed": 3, "missing": 0, "unknown": 0}
+
+
+def test_push_claim_checks_ask_no_remote_while_the_network_is_held(env, monkeypatch):
+    from ttp import pushclaim
+    p, d, tids, calls = _slow_claims(env, monkeypatch, 2)
+    held = []
+    monkeypatch.setattr(d, "net_held", lambda prov: held.append(prov) or True)
+    before = [p.db.task(t)["result"] for t in tids]
+    d._tick_began = time.monotonic()
+    d.verify_pushes()
+    d.audit_pushes()
+    assert calls == [] and len(held) == 2
+    assert [p.db.task(t)["status"] for t in tids] == ["pushing"] * 2
+    assert [p.db.task(t)["result"] for t in tids] == before and p.db.kv(pushclaim.AUDIT_KV) is None
+    monkeypatch.setattr(d, "net_held", lambda prov: False)
+    d.verify_pushes()
+    assert len(calls) == 2 and [p.db.task(t)["status"] for t in tids] == ["done"] * 2
+
+
+def test_a_push_check_call_cut_short_by_the_tick_budget_carries_over_and_an_uncut_timeout_is_unknown(monkeypatch):
+    from ttp import pushclaim
+    timeouts = []
+
+    def git(r, *args, timeout=30):
+        timeouts.append(timeout)
+        return subprocess.CompletedProcess(args, 124, "", "TimeoutExpired: too slow")
+    monkeypatch.setattr(pushclaim, "_git", git)
+    b = pushclaim.Budget(30)
+    assert b.call(".", "ls-remote", "o", "r", timeout=40).returncode == 124   # the first call: whole timeout
+    b.left = 12
+    with pytest.raises(pushclaim.OutOfTime):                                   # cut to what is left
+        b.call(".", "fetch", "o", "r", timeout=40)
+    b.left = 0.5
+    with pytest.raises(pushclaim.OutOfTime):                                   # too little left to start
+        b.call(".", "fetch", "o", "r", timeout=40)
+    assert timeouts == [40, 12]
+    cache = {pushclaim.Budget.KEY: pushclaim.Budget(30)}
+    assert pushclaim.verify(".", "o", "refs/heads/r", "abc1234", cache)[0] == pushclaim.UNKNOWN
