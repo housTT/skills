@@ -2959,8 +2959,8 @@ def without_lock_probes(probe: Any, gone: set[str], canon: Any = None) -> str | 
 
     def gone_lock(cmd: list[str]) -> bool:
         at = next((i for i in range(1, len(cmd)) if os.path.basename(cmd[i - 1]) == "ttp"), None)
-        return at is not None and cmd[at:at + 2] == ["lock", "--probe"] and len(cmd) == at + 3 \
-            and (canon(cmd[at + 2]) if canon else cmd[at + 2]) in gone
+        args = [x for x in cmd[at:] if x != "--shared"] if at is not None else []
+        return args[:2] == ["lock", "--probe"] and len(args) == 3 and (canon(args[2]) if canon else args[2]) in gone
 
     keep = [r for r, cmd in zip(raw, steps) if not gone_lock(cmd)]
     return None if len(keep) == len(raw) else " && ".join(keep)

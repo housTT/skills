@@ -2795,10 +2795,17 @@ def cmd_lock(a) -> None:
     the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
     its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
     started. The lock is held until the command has ended, however it ends. Every name in config
-    `device.locks` is the one device lock. Waiters are served in arrival order, and a nested
-    `ttp lock` of a lock this command already holds just runs. Each take and release goes to the
-    project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a command that
-    may reset, power-cycle or reboot what it holds.
+    `device.locks` is the one device lock. Waiters are served in arrival order. Each take and release
+    goes to the project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a
+    command that may reset, power-cycle or reboot what it holds.
+
+    `ttp lock --shared <resource> -- <cmd...>` is for read-only work: shared holders run together,
+    while an exclusive holder (a plain `ttp lock`, or an exclusive task's whole-run hold) and shared
+    ones exclude each other. A queued exclusive waiter is not jumped by later shared ones.
+
+    Nested: a `ttp lock` inside one that holds the same lock in the same or a stronger mode (or
+    inside an exclusive task's run) just runs, saying so on stderr. An exclusive one inside a shared
+    hold of the lock exits 2 at once: it could only wait for itself.
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall), does not count
     toward the run's wall clock (which grows by at most its own length this way), and gives up after
@@ -2807,7 +2814,8 @@ def cmd_lock(a) -> None:
     resource exits 75 as well. In a `ttp detach` job, or a background (`nohup ... &`) driver that no longer
     runs under the run's agent, there is no cap.
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
-    nobody queues for it, else 75.
+    nobody queues for it, else 75; with --shared, when no exclusive holder or waiter has it and it is
+    neither paused nor reserved.
     """
     from . import hold, locks as lk
     cmd = list(a.command or [])
@@ -2861,16 +2869,25 @@ def cmd_lock(a) -> None:
         if (held := _pause()) is not None:   # a paused `ttp lock` exits 75, so its probe must too
             print(f"{a.resource}: paused" + (f" ({held['reason']})" if held.get("reason") else ""))
             sys.exit(75)
-        free = lk.probe(where, res, paths)
+        free = lk.probe(where, res, paths, shared=a.shared)
         n, who_r = len(lk.queued(where, res)), lk.reserved_by(lk.reserve_path(where, res))
-        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths, p)) or 'nobody'}"
+        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders_now(paths, p)) or 'nobody'}"
                                                       f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
         sys.exit(0 if free else 75)
     who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
-    if res in held_locks:
-        sys.exit(subprocess.call(cmd))   # an enclosing `ttp lock` of this command holds it already
-    child_env = {**os.environ, "TTP_LOCKS_HELD": ",".join(held_locks + [res])}
+    shared_locks = [x for x in os.environ.get("TTP_LOCKS_SHARED", "").split(",") if x]
+    if res in held_locks or (res in shared_locks and a.shared):
+        # An enclosing `ttp lock` of this command holds it already, in this mode or a stronger one.
+        print(f"ttp lock: {a.resource} is held already by an enclosing ttp lock "
+              f"({'exclusive' if res in held_locks else 'shared'}); running the command under it",
+              file=sys.stderr, flush=True)
+        sys.exit(subprocess.call(cmd))
+    if res in shared_locks:
+        die(f"cannot lock {a.resource} exclusively inside a shared `ttp lock` of it: it would wait for itself. "
+            f"Take the exclusive lock around the whole command instead", 2)
+    child_env = {**os.environ, **({"TTP_LOCKS_SHARED": ",".join(shared_locks + [res])} if a.shared
+                                  else {"TTP_LOCKS_HELD": ",".join(held_locks + [res])})}
     if res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device"):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
@@ -2900,6 +2917,8 @@ def cmd_lock(a) -> None:
     if res in {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}:
         # This run's task holds the resource for its whole run already.
         _refuse_paused()
+        print(f"ttp lock: {a.resource} is held already by this task's whole run; running the command under it",
+              file=sys.stderr, flush=True)
         sys.exit(_logged("exclusive", lambda: subprocess.call(cmd, env=child_env)))
     timeout = a.timeout
     cap = float(spec.get("stall_s") or 0) / 2
@@ -2907,7 +2926,8 @@ def cmd_lock(a) -> None:
     if cap and not detached:
         if timeout is not None and (timeout == 0 or timeout > cap):
             print(f"ttp lock: --timeout {timeout:.0f} capped to {cap:.0f} s inside a run; if it runs out, "
-                  f"hand off `waiting` with retry_when `ttp lock --probe {a.resource}`", file=sys.stderr, flush=True)
+                  f"hand off `waiting` with retry_when `ttp lock --probe{' --shared' if a.shared else ''} {a.resource}`",
+                  file=sys.stderr, flush=True)
         capped = not timeout or timeout > cap
         timeout = cap if timeout is None or timeout == 0 else min(timeout, cap)
     mark = lk.reserve_path(where, res)
@@ -2924,7 +2944,7 @@ def cmd_lock(a) -> None:
             lk.record_wait(wait_dir, wait_key, started, time.time())
 
     try:
-        ticket = lk.enqueue(where, res, who)
+        ticket = lk.enqueue(where, res, who, shared=a.shared)
     except OSError as e:
         _unwritable(e)
     atexit.register(lambda: lk.dequeue(ticket))   # however this ends; a dead process's ticket is dropped too
@@ -2942,7 +2962,8 @@ def cmd_lock(a) -> None:
             ticket = None
             waited = time.time() - started
             if waited > 5:
-                print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
+                print(f"ttp lock: got {a.resource}{' (shared)' if a.shared else ''} after {waited / 60:.1f} min",
+                      file=sys.stderr, flush=True)
             # The lock is held until the command itself has ended. A signal to this process (a
             # timeout, a cancel) is passed on to the command, and the lock is released only once
             # the command is gone, so nobody else ever gets the resource while it is still in use.
@@ -2963,7 +2984,7 @@ def cmd_lock(a) -> None:
                 finally:
                     f.close()
 
-            sys.exit(_logged("lock", _wait))
+            sys.exit(_logged("shared" if a.shared else "lock", _wait))
         if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.
@@ -2983,7 +3004,8 @@ def cmd_lock(a) -> None:
         if time.time() - told >= 120:
             ahead = len(lk.queued(where, res)) - 1
             line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
-                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths, p)) or 'another task'}"
+                    f"waiting for {a.resource}{' (shared)' if a.shared else ''} (held by "
+                    f"{', '.join(lk.holders_now(paths, p)) or 'another task'}"
                     f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
@@ -2996,7 +3018,8 @@ def cmd_lock(a) -> None:
         if timeout and time.time() - started > timeout:
             _end_wait()
             die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
-                f"`waiting`, waiting_for `{a.resource}`, retry_when `ttp lock --probe {a.resource}`", 75)
+                f"`waiting`, waiting_for `{a.resource}`, retry_when "
+                f"`ttp lock --probe{' --shared' if a.shared else ''} {a.resource}`", 75)
         time.sleep(poll_s(3))
 
 def cmd_landed(a) -> None:
@@ -6054,6 +6077,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("--probe", action="store_true",
                    help="exit 0 if the resource is free, not paused and nobody queues for it, else 75 (for retry_when)")
+    s.add_argument("--shared", action="store_true",
+                   help="read mode: run alongside other shared holders; exclusive holders and these exclude each other")
     s.add_argument("resource")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "

@@ -10,6 +10,12 @@ Waiters queue in arrival order (a ticket file per waiting process under <resourc
 first `slots` live tickets may take a slot, so a waiter is never starved by later arrivals. A ticket
 whose process is gone is dropped.
 
+A shared holder (`ttp lock --shared`, for read-only work) takes a read lock on every slot instead
+of one slot's write lock, and labels itself in <resource>.shared: shared holders run together, and
+any slot's exclusive holder keeps them all out, as they keep it out. The queue stays in arrival
+order across modes: a shared waiter goes only once no exclusive waiter is ahead of it, and an
+exclusive one only once no shared waiter is.
+
 Resources named in config `device.locks` are one device: they all map to the first name's lock, so
 at most one command at a time is in the device phase, whatever name it locks by.
 
@@ -71,6 +77,85 @@ def try_take(paths: list[Path], holder: str, what: str = ""):
     return None
 
 
+SHARED_MARK = " (shared)"   # ends a shared holder's label
+
+
+def shared_dir(paths: list[Path]) -> Path:
+    """Where the shared holders of the resource whose slots are `paths` label themselves."""
+    return paths[0].parent / f"{paths[0].name.rsplit('.', 2)[0]}.shared"
+
+
+class SharedHold:
+    """A shared hold: read locks on every slot and the holder's label; close() ends it."""
+
+    def __init__(self, files: list, label: Path):
+        self.files, self.label = files, label
+
+    def close(self) -> None:
+        try:
+            self.label.unlink()
+        except OSError:
+            pass
+        for f in self.files:
+            f.close()
+
+
+def try_take_shared(paths: list[Path], holder: str, what: str = "") -> SharedHold | None:
+    """A shared hold of the resource: a read lock on every slot, so no exclusive holder has one;
+    None if one has. The label ends in SHARED_MARK."""
+    files = []
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            for g in files:
+                g.close()
+            return None
+        files.append(f)
+    d = shared_dir(paths)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{time.time():017.6f}-{os.getpid()}"
+        # Locked under a hidden name first, then renamed in: a reader never sees it unlocked.
+        tmp = d / f".{name}.tmp"
+        lf = open(tmp, "a+")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300]}))
+        lf.flush()
+        os.rename(tmp, d / name)
+    except OSError:
+        for g in files:
+            g.close()
+        raise
+    return SharedHold(files + [lf], d / name)
+
+
+def shared_holders(paths: list[Path]) -> list[dict]:
+    """The labels ({holder, since, command}) of the resource's live shared holders, oldest first;
+    labels whose process is gone are removed."""
+    d, out = shared_dir(paths), []
+    try:
+        names = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    except OSError:
+        return out
+    for name in names:
+        path = d / name
+        if not _ticket_live(path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            out.append(json.loads(path.read_text() or "{}"))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
 def any_free(paths: list[Path]) -> bool:
     """Whether some slot is free right now. Testing takes the slot for an instant; a `ttp lock`
     that tries in that instant just retries."""
@@ -100,7 +185,20 @@ def holders(paths: list[Path], where=None) -> list[str]:
 
 
 def held_labels(paths: list[Path]) -> list[str]:
-    """The holder labels of the slots among paths whose lock is taken right now."""
+    """The holder labels of the slots among paths whose lock is taken right now, then the
+    resource's shared holders."""
+    return _slot_labels(paths) + [str(h.get("holder") or "") for h in shared_holders(paths)] if paths else []
+
+
+def holders_now(paths: list[Path], where=None) -> list[str]:
+    """`holders`, of only the slots whose lock is taken right now, then the shared holders."""
+    out = holders([x for x in paths if _slot_labels([x])], where)
+    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+                  for h in (shared_holders(paths) if paths else [])]
+
+
+def _slot_labels(paths: list[Path]) -> list[str]:
+    """The holder labels of the slots among paths whose lock is taken right now (not shared)."""
     out = []
     for path in paths:
         try:
@@ -137,6 +235,14 @@ def held(locks_dir: Path, where=None) -> list[str]:
         except OSError:
             continue
         out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path], where)]
+    try:
+        groups = sorted(locks_dir.glob("*.shared"))
+    except OSError:
+        groups = []
+    for d in groups:
+        res = d.name[:-len(".shared")]
+        out += [f"{res}: {h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+                for h in shared_holders([d.parent / f"{res}.0.lock"])]
     for path in marks:
         who = reserved_by(path)
         if who:
@@ -248,14 +354,19 @@ def queue_dir(locks_dir: Path, resource: str) -> Path:
 _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
 
 
-def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None) -> Path:
+SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
+
+
+def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
+            shared: bool = False) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
-    is the arrival time to queue at (default now): a waiter that hands over keeps its place."""
+    is the arrival time to queue at (default now): a waiter that hands over keeps its place.
+    A shared waiter's ticket name ends in SHARED_TICKET."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
-    name = f"{time.time() if since is None else since:017.6f}-{os.getpid()}"
+    name = f"{time.time() if since is None else since:017.6f}-{os.getpid()}{SHARED_TICKET if shared else ''}"
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
     f = open(tmp, "a+")
@@ -312,24 +423,41 @@ def queued(locks_dir: Path, resource: str) -> list[Path]:
     return out
 
 
+def is_shared(ticket: Path) -> bool:
+    return ticket.name.endswith(SHARED_TICKET)
+
+
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int) -> bool:
-    """Whether this ticket is among the first `slots` waiters, so it may take a free slot."""
+    """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
+    waiters, one per free slot, with no shared waiter ahead. A shared one: no exclusive waiter
+    ahead, so it never jumps one."""
     q = queued(locks_dir, resource)
-    return ticket not in q or q.index(ticket) < max(int(slots or 0), 0)
+    if ticket not in q:
+        return True
+    ahead = q[:q.index(ticket)]
+    if is_shared(ticket):
+        return all(is_shared(t) for t in ahead)
+    return not any(is_shared(t) for t in ahead) and len(ahead) < max(int(slots or 0), 0)
 
 
 def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = ""):
-    """try_take, but only when this ticket's turn has come: it is among the first waiters, one per
-    free slot, so a later waiter never takes the one slot an earlier one is about to."""
+    """try_take (try_take_shared for a shared ticket), but only when this ticket's turn has come
+    (my_turn), so a later waiter never takes the one slot an earlier one is about to."""
+    if is_shared(ticket):
+        return try_take_shared(paths, holder, what) if my_turn(locks_dir, resource, ticket, 0) else None
     if not my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths))):
         return None
     return try_take(paths, holder, what)
 
 
-def probe(locks_dir: Path, resource: str, paths: list[Path]) -> bool:
-    """Free now, nobody waiting and not reserved: a task that gave up waiting can come back."""
-    return (any_free(paths) and not queued(locks_dir, resource)
-            and not reserved_by(reserve_path(locks_dir, resource)))
+def probe(locks_dir: Path, resource: str, paths: list[Path], shared: bool = False) -> bool:
+    """Free now, nobody waiting and not reserved: a task that gave up waiting can come back. For a
+    shared taker: no exclusive holder, no exclusive waiter and not reserved."""
+    if reserved_by(reserve_path(locks_dir, resource)):
+        return False
+    if shared:
+        return not _slot_labels(paths) and all(is_shared(t) for t in queued(locks_dir, resource))
+    return any_free(paths) and not queued(locks_dir, resource)
 
 
 def job_lock(rc: Path) -> Path:

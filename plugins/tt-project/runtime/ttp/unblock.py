@@ -178,7 +178,7 @@ def wait_probes(retry_when: Any) -> tuple[list[str], list[str]] | None:
             continue
         at = next((i for i, t in enumerate(cmd[1:], 1) if os.path.basename(cmd[i - 1]) == "ttp"
                    and t in ("detach", "lock")), None)   # `ttp`, a path to it or `python3 -m ttp`
-        args = cmd[at:] if at else []
+        args = [x for x in cmd[at:] if not (x == "--shared" and cmd[at] == "lock")] if at else []
         if len(args) >= 3 and args[:2] == ["detach", "--check"] and not any(a.startswith("-") for a in args[2:]):
             rcs += args[2:]
         elif len(args) == 3 and args[:2] == ["lock", "--probe"]:

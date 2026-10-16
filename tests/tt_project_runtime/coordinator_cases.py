@@ -259,6 +259,10 @@ def test_waits_on_live_detach_jobs_or_locks_stay_routine_until_capped_or_stalled
     assert unblock.wait_probes("ttp detach --check /r/a.rc '/r/b c.rc'") == (["/r/a.rc", "/r/b c.rc"], [])
     assert unblock.wait_probes("/x/bin/ttp lock --probe dev-a && python3 -m ttp lock --probe dev-b") == \
         ([], ["dev-a", "dev-b"])
+    assert unblock.wait_probes("ttp lock --probe --shared dev-a && ttp lock --shared --probe dev-b") == \
+        ([], ["dev-a", "dev-b"])
+    assert coord.without_lock_probes("ttp lock --probe --shared dev-a && ttp lock --probe dev-b", {"dev-a"}) == \
+        "ttp lock --probe dev-b"
     for other in ("ttp lock --probe dev-a && ssh h test -e /m", "ttp checks --result /r", "ttp detach --check", ""):
         assert unblock.wait_probes(other) is None
 
@@ -5224,6 +5228,110 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
         release.touch()
         holder.wait(timeout=30)
     assert d._resources_free(task)
+
+
+
+def _lock_cmd(*args):
+    return [sys.executable, str(TTP), "lock", *args]
+
+
+def _wait_held(cond, what):
+    deadline = time.time() + 20
+    while time.time() < deadline and not cond():
+        time.sleep(0.05)
+    assert cond(), what
+
+
+def test_shared_ttp_locks_run_together_and_exclude_exclusive_holders(env, tmp_path):
+    p = make(env)
+    from ttp import locks
+    from ttp.daemon import Daemon
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    paths = Daemon(p.base)._slot_paths("board")
+
+    def run(*args):
+        return subprocess.run(_lock_cmd(*args), env=run_env, capture_output=True, text=True)
+
+    # A shared holder: another shared one runs alongside, an exclusive one waits.
+    release = tmp_path / "shared-release"
+    holder = subprocess.Popen(_lock_cmd("--shared", "board", "--", *_until(release)), env=run_env)
+    try:
+        _wait_held(lambda: locks.shared_holders(paths), "the shared holder never took the board")
+        assert run("--shared", "--timeout", "5", "board", "--", "true").returncode == 0
+        out = run("--timeout", "0.5", "board", "--", "true")
+        assert out.returncode == 75, "an exclusive ttp lock ran beside a shared holder"
+        assert run("--probe", "--shared", "board").returncode == 0
+        out = run("--probe", "board")
+        assert out.returncode == 75 and "(shared)" in out.stdout, out.stdout
+        assert any(h.startswith("board: ") and "(shared) since" in h for h in locks.held(p.state / "locks", p))
+        assert any(lb.endswith(locks.SHARED_MARK) for lb in locks.held_labels(paths))
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert not locks.shared_holders(paths), "a shared hold outlived its command"
+    assert run("--probe", "board").returncode == 0
+    # An exclusive holder keeps shared ones out, also from the shared probe.
+    release = tmp_path / "excl-release"
+    holder = subprocess.Popen(_lock_cmd("board", "--", *_until(release)), env=run_env)
+    try:
+        _wait_held(lambda: locks.held_labels(paths), "the exclusive holder never took the board")
+        assert run("--shared", "--timeout", "0.5", "board", "--", "true").returncode == 75
+        assert run("--probe", "--shared", "board").returncode == 75
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert run("--probe", "--shared", "board").returncode == 0
+    # A whole-run exclusive task hold keeps them out too.
+    release = tmp_path / "run-release"
+    proc, _ = _hold_exclusive(p, tmp_path, release)
+    try:
+        _wait_held(lambda: locks.held_labels(paths), "the exclusive run never took the board")
+        assert run("--shared", "--timeout", "0.5", "board", "--", "true").returncode == 75
+    finally:
+        release.touch()
+    assert proc.wait(timeout=60) == 0
+
+
+def test_a_queued_exclusive_ttp_lock_is_not_jumped_by_later_shared_ones(env, tmp_path):
+    p = make(env)
+    from ttp import locks
+    from ttp.daemon import Daemon
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    paths = Daemon(p.base)._slot_paths("board")
+    release, ran = tmp_path / "release", tmp_path / "exclusive-ran"
+    holder = subprocess.Popen(_lock_cmd("--shared", "board", "--", *_until(release)), env=run_env)
+    waiter = None
+    try:
+        _wait_held(lambda: locks.shared_holders(paths), "the shared holder never took the board")
+        waiter = subprocess.Popen(_lock_cmd("--timeout", "0", "board", "--", "touch", str(ran)), env=run_env)
+        _wait_held(lambda: locks.queued(p.state / "locks", "board"), "the exclusive waiter never queued")
+        late = subprocess.run(_lock_cmd("--shared", "--timeout", "1", "board", "--", "true"), env=run_env,
+                              capture_output=True, text=True)
+        assert late.returncode == 75, "a later shared ttp lock jumped the queued exclusive one"
+        assert subprocess.run(_lock_cmd("--probe", "--shared", "board"), env=run_env,
+                              capture_output=True).returncode == 75
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert waiter.wait(timeout=30) == 0 and ran.exists(), "the exclusive waiter never got the board"
+
+
+def test_a_nested_ttp_lock_runs_under_its_outer_one_unless_it_upgrades_a_shared_hold(env, tmp_path):
+    p = make(env)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+
+    def nested(outer, inner):
+        cmd = _lock_cmd(*outer, "--timeout", "10", "board", "--", *_lock_cmd(*inner, "--timeout", "10", "board", "--", "true"))
+        return subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=60)
+
+    for outer, inner in (([], []), ([], ["--shared"]), (["--shared"], ["--shared"])):
+        out = nested(outer, inner)
+        assert out.returncode == 0, (outer, inner, out.stderr)
+        assert out.stderr.count("held already by an enclosing ttp lock") == 1, out.stderr
+    start = time.time()
+    out = nested(["--shared"], [])
+    assert out.returncode == 2 and "exclusively inside a shared" in out.stderr, out
+    assert time.time() - start < 8, "the refused upgrade waited instead of exiting at once"
 
 
 
