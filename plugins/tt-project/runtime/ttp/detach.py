@@ -626,3 +626,131 @@ def end_remote(rc: Path, why: str) -> None:
         stop(rc, pid, why)
     else:
         _mark_lost(rc, why)
+
+
+# A job started with `ttp detach --remote` keeps its .log and .rc on that host, so a host that stops
+# answering later (it reset, or its network went) would hide a result it already had. Its probe,
+# `ttp detach --check --host <alias> --mirror <run folder> <dir>/<name>`, copies what each answer says
+# into that folder: <name>.remote.log (the last MIRROR_TAIL_BYTES of its log, sent only when the log's
+# size changed), <name>.remote.json (host, remote path, log size, time, and the end once known) and, once
+# it ended, <name>.remote.rc with its exit code. When ssh then fails, the probe reads the mirrored end
+# (exit 0 or 4) instead of 255. An exclusive run's hold keeper refreshes the run's mirrors as it probes
+# (mirror_refresh). Run by POSIX sh over ssh before the check, with the job's path as $1 and the log
+# size already mirrored as $3.
+MIRROR_TAIL_BYTES = 64 * 1024
+_REMOTE_TAIL = r'''q=$1 z=$3
+case $q in "~"|"~/"*) q=$HOME${q#\~} ;; esac
+q=${q%%/}; q=${q%%.rc}
+l=$q.log; [ -f "$l" ] || l=$q/log
+if [ -f "$l" ]; then
+  s=$(wc -c <"$l" | tr -d " ")
+  if [ "$s" = "$z" ]; then echo "tail same $s"
+  elif command -v base64 >/dev/null 2>&1; then echo "tail $s"; tail -c %d "$l" | base64; echo "tail-end"
+  fi
+fi
+'''
+
+
+def mirror_name(pre: str) -> str:
+    """A remote job's name from its path, <dir>/<name> or <dir>/<name>.rc."""
+    return Path(pre[:-3] if pre.endswith(".rc") else pre.rstrip("/")).name
+
+
+def mirror_read(d, name: str, host: str, pre: str) -> dict | None:
+    """The mirror of this remote job in folder `d`, None when there is none or it is another job's."""
+    try:
+        m = json.loads((Path(d) / f"{name}.remote.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) and m.get("host") == host and m.get("path") == pre else None
+
+
+def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None, size=None,
+                end: dict | None = None) -> None:
+    """Record what a remote job's answer said in folder `d`: its log tail and size, and its end
+    ({"rc": code} or {"gone": why}), which is kept once known."""
+    d = Path(d)
+    m = mirror_read(d, name, host, pre) or {"host": host, "path": pre}
+    if tail is not None:
+        durable_write(d / f"{name}.remote.log", tail[-MIRROR_TAIL_BYTES:])
+    if size is not None:
+        m["size"] = str(size)
+    if end and not m.get("end"):
+        m["end"] = end
+        if "rc" in end:
+            durable_write(d / f"{name}.remote.rc", f"{end['rc']}\n")
+    m["at"] = int(time.time())
+    write_json(d / f"{name}.remote.json", m)
+
+
+def _split_tail(out: str) -> tuple[list[str], tuple | None]:
+    """The answer's lines less its tail block, and the tail: (size, bytes), (size, None) when the log
+    is unchanged, None when the answer has none."""
+    import base64
+    lines, tail, i = out.splitlines(), None, 0
+    rest: list[str] = []
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("tail same "):
+            tail = (ln.split()[-1], None)
+        elif ln.startswith("tail ") and "tail-end" in lines[i + 1:]:
+            j = lines.index("tail-end", i + 1)
+            try:
+                tail = (ln.split()[-1], base64.b64decode("".join(lines[i + 1:j])))
+            except ValueError:
+                tail = None
+            i = j
+        elif ln.strip():
+            rest.append(ln)
+        i += 1
+    return rest, tail
+
+
+def mirror_probe(host: str, pre: str, d=None, rows: str | None = None):
+    """One ssh call for a remote job: the rows count (with `rows`), its log tail when mirroring into
+    folder `d`, and the check's verdict (cli._REMOTE_CHECK). (r, lines): r is None or exits 255 when
+    ssh failed; lines are its answer less the tail, which is mirrored into `d` already."""
+    from .cli import _REMOTE_CHECK, _REMOTE_ROWS, _ssh_sh
+    name = mirror_name(pre)
+    seen = (mirror_read(d, name, host, pre) or {}).get("size", "") if d else ""
+    script = (_REMOTE_ROWS if rows is not None else "") + (_REMOTE_TAIL % MIRROR_TAIL_BYTES if d else "") + _REMOTE_CHECK
+    r = _ssh_sh(host, script, [pre, rows or "", seen] if d else [pre, rows] if rows is not None else [pre])
+    if r is None or r.returncode == 255:
+        return r, []
+    lines, tail = _split_tail(r.stdout)
+    if d and tail:
+        try:
+            mirror_save(d, name, host, pre, tail=tail[1], size=tail[0])
+        except OSError:
+            pass
+    return r, lines
+
+
+def mirror_end(answer: str) -> dict | None:
+    """The end a check's verdict line names, for the mirror: {"rc": code} or {"gone": word}, else None."""
+    word, _, rest = answer.partition(" ")
+    if word == "rc":
+        return {"rc": rest.strip() or "?"}
+    if word in ("gone", "boot", "series"):
+        return {"gone": answer.strip()}
+    return None
+
+
+def mirror_refresh(run_dir) -> None:
+    """Refresh the mirrors of a run's remote jobs not known to have ended (the hold keeper, now and then)."""
+    for meta in sorted(Path(run_dir).glob("*.remote.json")):
+        try:
+            m = json.loads(meta.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(m, dict) or m.get("end") or not m.get("host") or not m.get("path"):
+            continue
+        r, lines = mirror_probe(str(m["host"]), str(m["path"]), run_dir)
+        if r is None or r.returncode or not lines:
+            continue
+        end = mirror_end(lines[-1])
+        if end:
+            try:
+                mirror_save(run_dir, mirror_name(str(m["path"])), str(m["host"]), str(m["path"]), end=end)
+            except OSError:
+                pass

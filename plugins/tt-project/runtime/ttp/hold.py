@@ -10,7 +10,8 @@ never lapses, and it ends once every job wrote its .rc or is gone (a kill, a reb
 run of the same task takes the slots over (`hold.handover` in the run folder). A job that drives
 another host itself (`ttp detach --remote-host`) also ends once that host reset or its remote pid is
 gone with no completion marker: the keeper asks the host every REMOTE_PROBE_S, from a thread of its own
-so a slow ssh never delays a handover, and ends the job with that verdict (detach.remote_verdict).
+so a slow ssh never delays a handover, and ends the job with that verdict (detach.remote_verdict). The same probe refreshes the mirrored
+exit code and log tail of the run's `ttp detach --remote` jobs (detach.mirror_refresh).
 
 <run_dir>/hold.json records the hold; the keeper holds <run_dir>/hold.lock while it lives. The
 project's state/holds/<run>.json points at it, so the daemon (tend) logs each release, and rebuilds the
@@ -186,14 +187,17 @@ def _settle(run_dir: Path, rec: dict, state: str, why: str) -> None:
         pass
 
 
-def _remote_round(jobs: list[str], memo: dict, verdicts: list[str]) -> None:
-    """End each job whose remote side is dead (detach.remote_verdict), its verdict noted first."""
+def _remote_round(jobs: list[str], memo: dict, verdicts: list[str], run_dir: Path | None = None) -> None:
+    """End each job whose remote side is dead (detach.remote_verdict), its verdict noted first; then
+    refresh the mirrored exit code and log tail of the run's `--remote` jobs (detach.mirror_refresh)."""
     from . import detach
     for rc in jobs:
         why = detach.remote_verdict(Path(rc), memo.setdefault(rc, {}))
         if why:
             verdicts.append(f"{Path(rc).stem}: {why}")
             detach.end_remote(Path(rc), why)
+    if run_dir is not None:
+        detach.mirror_refresh(run_dir)
 
 
 def watch(run_dir: Path, fds: list[int]) -> int:
@@ -218,7 +222,7 @@ def watch(run_dir: Path, fds: list[int]) -> int:
             if probe is not None and not probe.is_alive():
                 probe, next_probe = None, time.time() + poll_s(REMOTE_PROBE_S)
             if probe is None and time.time() >= next_probe:
-                probe = threading.Thread(target=_remote_round, args=(live(rec.get("jobs") or []), memo, verdicts),
+                probe = threading.Thread(target=_remote_round, args=(live(rec.get("jobs") or []), memo, verdicts, run_dir),
                                          daemon=True)
                 probe.start()
             time.sleep(poll_s(POLL_S))

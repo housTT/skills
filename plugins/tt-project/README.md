@@ -582,7 +582,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that
-  host's boot id changed), 1 while it runs and 255 while ssh fails. A driver gone without an exit code
+  host's boot id changed), 1 while it runs and 255 while ssh fails. Started inside a run, its probe
+  carries `--mirror <run folder>`: each answer copies the job's exit code and the last 64 KiB of its log
+  back as `<name>.remote.rc`, `<name>.remote.log` and `<name>.remote.json` (the tail is sent only when the
+  log grew), and an exclusive run's hold keeper refreshes them as it probes. Once an end was mirrored, a
+  host that stops answering (it reset, or the network went) still yields 0 or 4, not 255. A driver gone without an exit code
   reads as died with the host reboot (the boot id recorded at launch changed), crashed or killed (same
   boot) or unknown (no boot id readable); a local job's check says the same. Long device runs append
   and fsync each step's result as the step ends, not only in an end-of-run summary file; with `--rows <file> --after <n>` it

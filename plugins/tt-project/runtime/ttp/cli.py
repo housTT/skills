@@ -3077,16 +3077,21 @@ def cmd_detach(a) -> None:
         if not a.check:
             die("usage: ttp detach --check <rc path...>  |  ttp detach --check --host <ssh alias> <dir>/<name>...")
         rows, after = getattr(a, "rows", None), getattr(a, "after", None)
+        if getattr(a, "mirror", None) and not a.host:
+            die("--mirror goes with --host: it keeps a remote job's exit code and log tail here")
         if after is not None and rows is None:
             die("--after goes with --rows <file>: the check wakes once that file has more than --after lines")
         if (after or 0) < 0:
             die("--after must be 0 or more")
         if a.host:
-            sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0))
+            mirror = getattr(a, "mirror", None) or os.environ.get("TTP_RUN_DIR") or None
+            sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0, mirror))
     if a.check is None:
         _start_options(a)
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
         die("--rows and --after go with --check")
+    if a.check is None and getattr(a, "mirror", None):
+        die("--mirror goes with --check --host")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
     rhost = getattr(a, "remote_host", None)
@@ -3286,12 +3291,12 @@ def _start_options(a) -> None:
 
 def _check_options(a) -> None:
     """`ttp detach --check`: argparse leaves the options given after the first path (`--rows`,
-    `--after`, `--host`) among the paths; take them back out, so they count wherever they appear."""
+    `--after`, `--host`, `--mirror`) among the paths; take them back out, so they count wherever they appear."""
     paths, words = [], list(a.check)
     while words:
         w = words.pop(0)
         key, eq, val = w.partition("=")
-        if key in ("--rows", "--after", "--host"):
+        if key in ("--rows", "--after", "--host", "--mirror"):
             if not eq:
                 if not words:
                     die(f"{key} needs a value")
@@ -3371,13 +3376,21 @@ def _detach_remote(a, ttp: str) -> None:
         die(f"could not start {a.name} on {a.remote} (exit {r.returncode}): "
             f"{(r.stdout + r.stderr).strip()[-300:]}")
     pid, prefix = out[1], out[2]
-    from . import activity
+    from . import activity, detach
+    mirror = ""
+    if os.environ.get("TTP_RUN_DIR") and Path(os.environ["TTP_RUN_DIR"]).is_dir():   # its rc and log tail come back here
+        rd = Path(os.environ["TTP_RUN_DIR"]).resolve()
+        try:
+            detach.mirror_save(rd, a.name, a.remote, prefix)
+            mirror = f" --mirror {shlex.quote(str(rd))}"
+        except OSError:
+            pass
     if p := here():   # its end is known only on that host: the log keeps the start
         activity.append(p.state, activity.base(p.name, ev="job", id=activity.new_id(), job=a.name,
                                                machine=a.remote, cmd=activity.head(cmd), start=time.time()))
     print(f"detached {a.name} on {a.remote} (pid {pid})\nlog: {prefix}.log\nrc:  {prefix}.rc\n"
           f"hand off: status waiting, survives_reboot true, retry_when "
-          f"\"{ttp} detach --check --host {shlex.quote(a.remote)} {shlex.quote(prefix)}\"")
+          f"\"{ttp} detach --check --host {shlex.quote(a.remote)}{mirror} {shlex.quote(prefix)}\"")
 
 
 # Why a remote driver is gone without an exit code, by what its host's boot id says (_REMOTE_CHECK).
@@ -3386,7 +3399,7 @@ _GONE_WHY = {"boot": "driver died with the host reboot: the host's boot id chang
              "unknown": "killed, or the host restarted: the boot id could not be read, so which is unknown"}
 
 
-def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, after: int = 0) -> int:
+def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, after: int = 0, mirror=None) -> int:
     """`ttp detach --check --host <alias> <dir>/<name>...`: 0 once every job ended with exit 0, 4
     (detach.FAILED_RC) once every one ended or is gone but one failed or left no exit code, 1 while
     any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read.
@@ -3394,17 +3407,28 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
     gone, else 1 (_rows_verdict); a path with no driver recorded (no .rc, no .pid) is never read as
     gone then, only a new row wakes it; ssh failing is still 255. A series driver's own dir
     (<dir>/pid, optional <dir>/EXIT holding its exit code) is read by those: running while the pid
-    lives, ended once EXIT exists, gone once the pid is dead."""
-    from .detach import FAILED_RC
+    lives, ended once EXIT exists, gone once the pid is dead. With `mirror` (a local folder) each answer's
+    log tail and end are copied there (detach.mirror_probe), and a job whose end was mirrored reads as
+    that end when ssh fails, not 255."""
+    from .detach import FAILED_RC, mirror_end, mirror_name, mirror_probe, mirror_read, mirror_save
     ended, failed, one_ended, n = True, False, False, None
     for i, pre in enumerate(prefixes):
-        name = Path(pre[:-3] if pre.endswith(".rc") else pre).name
+        name = mirror_name(pre)
         count = rows is not None and i == 0   # the rows file is read once, in the first job's ssh call
-        r = _ssh_sh(host, _REMOTE_ROWS + _REMOTE_CHECK if count else _REMOTE_CHECK, [pre, rows] if count else [pre])
+        r, lines = mirror_probe(host, pre, mirror, rows if count else None)
         if r is None or r.returncode == 255:
             print(f"{name}: ssh to {host} failed{': ' + r.stderr.strip()[-200:] if r and r.stderr.strip() else ''}")
-            return 255
-        lines = r.stdout.strip().splitlines()
+            kept = mirror_read(mirror, name, host, pre) if mirror else None
+            end = (kept or {}).get("end") or {}
+            if not end:
+                if kept and (Path(mirror) / f"{name}.remote.log").exists():
+                    print(f"{name}: its last log tail mirrored here: {Path(mirror) / f'{name}.remote.log'}")
+                return 255
+            failed = failed or end.get("rc") != "0"
+            one_ended = True
+            print(f"{name}: " + (f"job finished rc={end['rc']}" if "rc" in end else f"gone without an exit code ({end.get('gone')})")
+                  + f", as mirrored before {host} stopped answering; log tail: {Path(mirror) / f'{name}.remote.log'}")
+            continue
         if count:
             got = (lines[0] if lines else "").split(" ", 1)
             if got[0] != "rows" or len(got) < 2:
@@ -3415,6 +3439,11 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
         if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone", "series"):
             print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
             return 2
+        if mirror and (end := mirror_end(lines[-1])):
+            try:
+                mirror_save(mirror, name, host, pre, end=end)
+            except OSError:
+                pass
         if out[0] == "rc":
             code = out[1].strip() if len(out) > 1 and out[1].strip() else "?"
             failed = failed or code != "0"
@@ -6066,6 +6095,10 @@ def main(argv: list[str] | None = None) -> None:
                    "side writes once it finished; while it exists the job is never ended as dead")
     s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
                    "255 when ssh fails")
+    s.add_argument("--mirror", metavar="DIR",
+                   help="with --check --host: the local folder (the launching run's) that keeps each job's exit code "
+                   "and last log lines as <name>.remote.rc/.remote.log/.remote.json, so a result outlives the host "
+                   "answering; when ssh fails, a mirrored end reads as 0 or 4, not 255 (default: $TTP_RUN_DIR)")
     s.add_argument("--rows", metavar="FILE",
                    help="with --check (and --host: a file on that host): also exit 0 once this file has more "
                    "than --after lines; with it, 0 also once a job ended or its driver is gone (killed, a "

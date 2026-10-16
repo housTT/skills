@@ -130,3 +130,100 @@ def test_a_keeper_ends_a_job_whose_remote_driver_died_and_lets_its_hold_go(env, 
         release.touch()
         if driver.poll() is None:
             driver.kill()
+
+
+def _remote_mirror_job(env, tmp_path, script, name="drv"):
+    """A `ttp detach --remote` job started from run 61 through the ssh stub: (project, run dir, remote
+    folder, probe argv, ssh env)."""
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "61"
+    run_dir.mkdir(parents=True)
+    e = _ssh_stub(tmp_path)
+    rdir = tmp_path / "remote"
+    r = _ttp_run(p, "detach", "--remote", "box-m", "--dir", str(rdir), name, "--", "sh", "-c", script,
+                 env={**e, "TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    return p, run_dir, rdir, _remote_probe(r.stdout), e
+
+
+def test_detach_remote_check_mirrors_the_rc_and_reads_it_once_the_host_is_unreachable(env, tmp_path):
+    """The reported failure: a remote job's .log and .rc stayed on a host that then reset, so its probe
+    returned 255 forever though the job had finished. The probe now mirrors both into the run folder,
+    and with ssh failing it reads the mirrored end: 4 for a failure, 0 for a pass, never 255."""
+    p, run_dir, rdir, probe, e = _remote_mirror_job(env, tmp_path, "printf 'out\\377\\n'; exit 3")
+    assert probe[probe.index("--mirror") + 1] == str(run_dir.resolve()), probe
+    meta = json.loads((run_dir / "drv.remote.json").read_text())
+    assert meta["host"] == "box-m" and meta["path"] == str(rdir / "drv") and "end" not in meta
+    assert _wait_for_path(rdir / "drv.rc")
+    first = _ttp_run(p, *probe[1:], env=e)   # the daemon's probe env carries no TTP_RUN_DIR
+    assert first.returncode == 4 and "drv: job finished rc=3" in first.stdout, first.stdout
+    assert (run_dir / "drv.remote.rc").read_text().strip() == "3"
+    assert (run_dir / "drv.remote.log").read_bytes() == b"out\xff\n", "the log tail is mirrored byte for byte"
+    assert json.loads((run_dir / "drv.remote.json").read_text())["end"] == {"rc": "3"}
+    down = _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"})
+    assert down.returncode == 4, down.stdout
+    assert "job finished rc=3, as mirrored before box-m stopped answering" in down.stdout, down.stdout
+    # The check alone with the env's TTP_RUN_DIR mirrors there too; a mirror is never another job's.
+    (run_dir / "drv.remote.json").write_text(json.dumps({"host": "other", "path": str(rdir / "drv"), "end": {"rc": "0"}}))
+    assert _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"}).returncode == 255
+    assert _ttp_run(p, "detach", "--check", str(rdir / "drv.rc"), "--mirror", str(run_dir)).returncode == 2
+    r = _ttp_run(p, "detach", "--remote", "box-m", "--dir", str(rdir), "ok", "--", "echo", "fine",
+                 env={**e, "TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0 and _wait_for_path(rdir / "ok.rc"), r.stderr
+    ok = _remote_probe(r.stdout)
+    assert _ttp_run(p, *ok[1:], env=e).returncode == 0
+    assert _ttp_run(p, *ok[1:], env={**e, "SSH_STUB_FAIL": "1"}).returncode == 0
+
+
+def test_detach_remote_mirror_keeps_a_bounded_log_tail_sent_only_when_it_grew(env, tmp_path, monkeypatch):
+    from ttp import cli, detach
+    big = detach.MIRROR_TAIL_BYTES * 3
+    p, run_dir, rdir, probe, e = _remote_mirror_job(
+        env, tmp_path, f"head -c {big} /dev/zero | tr '\\0' a; echo END; exit 0")
+    assert _wait_for_path(rdir / "drv.rc")
+    for k, v in e.items():
+        monkeypatch.setenv(k, v)
+    sent = []
+    real = cli._ssh_sh
+    monkeypatch.setattr(cli, "_ssh_sh", lambda *a, **k: sent.append(real(*a, **k)) or sent[-1])
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert cli._detach_check_remote("box-m", [str(rdir / "drv")], mirror=str(run_dir)) == 0
+    tail = (run_dir / "drv.remote.log").read_bytes()
+    assert len(tail) == detach.MIRROR_TAIL_BYTES and tail == (rdir / "drv.log").read_bytes()[-len(tail):]
+    assert tail.endswith(b"END\n")
+    assert len(sent[-1].stdout) < detach.MIRROR_TAIL_BYTES * 2, "more than the tail crossed ssh"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert cli._detach_check_remote("box-m", [str(rdir / "drv")], mirror=str(run_dir)) == 0
+    assert "tail same" in sent[-1].stdout and len(sent[-1].stdout) < 200, "an unchanged log was sent again"
+    assert (run_dir / "drv.remote.log").read_bytes() == tail
+
+
+def test_detach_remote_mirror_unreachable_before_the_end_stays_255_and_the_keeper_refreshes(env, tmp_path, monkeypatch):
+    """A host unreachable before any end was mirrored proves nothing: 255 (asleep), naming the log tail
+    kept so far. The hold keeper's probe round refreshes the run's mirrors, so the end is caught while
+    the host still answers even with no check running."""
+    from ttp import detach, hold
+    go = tmp_path / "go"
+    p, run_dir, rdir, probe, e = _remote_mirror_job(
+        env, tmp_path, f"echo step1; while [ ! -e {go} ]; do sleep 0.1; done; echo step2; exit 5")
+    pid = int((rdir / "drv.pid").read_text())
+    try:
+        assert _wait_for_path(rdir / "drv.log") and _until_true(lambda: (rdir / "drv.log").read_text().strip())
+        assert _ttp_run(p, *probe[1:], env=e).returncode == 1
+        assert (run_dir / "drv.remote.log").read_text() == "step1\n"
+        down = _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"})
+        assert down.returncode == 255 and "ssh to box-m failed" in down.stdout, down.stdout
+        assert "last log tail mirrored here" in down.stdout and not (run_dir / "drv.remote.rc").exists()
+        go.touch()
+        assert _wait_for_path(rdir / "drv.rc")
+    finally:
+        _kill_driver(pid)
+    for k, v in e.items():
+        monkeypatch.setenv(k, v)
+    hold._remote_round([], {}, [], run_dir)
+    assert (run_dir / "drv.remote.rc").read_text().strip() == "5"
+    assert (run_dir / "drv.remote.log").read_text() == "step1\nstep2\n"
+    monkeypatch.setenv("SSH_STUB_FAIL", "1")
+    detach.mirror_refresh(run_dir)   # an ended mirror is not asked again; an unreachable host changes nothing
+    down = _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"})
+    assert down.returncode == 4 and "job finished rc=5, as mirrored" in down.stdout, down.stdout

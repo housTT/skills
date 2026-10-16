@@ -31592,7 +31592,8 @@ def test_detach_remote_runs_the_driver_over_ssh_and_its_check_reports_running_th
         assert (remote / f"drv.{ext}").exists(), ext
     assert (remote / "drv.start").read_text().split()[0].isdigit()
     probe = _remote_probe(r.stdout)
-    assert probe[1:] == ["detach", "--check", "--host", "box-a", str(remote / "drv")], probe
+    assert probe[1:] == ["detach", "--check", "--host", "box-a", "--mirror", str(run_dir.resolve()),
+                         str(remote / "drv")], probe
     assert "survives_reboot true" in r.stdout
     check = _ttp_run(p, *probe[1:], env=e)
     assert check.returncode == 1 and "running" in check.stdout, check.stdout
