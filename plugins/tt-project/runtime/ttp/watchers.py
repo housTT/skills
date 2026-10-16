@@ -12,7 +12,8 @@
   (failing CI, bot review comments neither fixed nor answered) are recorded for prguard and are
   work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
   the user for a review). A bot's re-post of a finding it already made (after each push, say) is one
-  finding, not new work, and an empty COMMENTED review that only wraps inline replies is no activity. A move of an open PR's CI alone raises no pr_changed: those reports cover it.
+  finding, not new work, and an empty COMMENTED review that only wraps the runs' own or a bot's inline
+  comments is no activity (a person's inline-only review, or one whose comments are unknown, counts). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
 from __future__ import annotations
@@ -63,6 +64,30 @@ def _own(c: dict, pr: dict) -> bool:
     return TTP_MARKER in str(c.get("body") or "")
 
 
+def _reply_wrapper(r: dict) -> bool:
+    """An empty COMMENTED review GitHub adds around inline comments that are all the runs' own replies
+    (marked) or a bot's: no activity. A review whose inline comments are unknown (gh pr view carries
+    none; _with_review_comments adds them) or include a person's unmarked one is a review and counts."""
+    if str(r.get("state") or "").upper() != "COMMENTED" or str(r.get("body") or "").strip():
+        return False
+    cs = r.get("comments")
+    nodes = (cs.get("nodes") or []) if isinstance(cs, dict) else []
+    if not nodes or int(cs.get("totalCount") or 0) > len(nodes):
+        return False
+    return all(_is_bot(c.get("author")) or TTP_MARKER in str(c.get("body") or "") for c in nodes)
+
+
+def _with_review_comments(pr: dict, data: dict | None) -> dict:
+    """The PR with each review's inline comments from the GraphQL answer (BOT_QUERY), matched by id."""
+    nodes = ((((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}) \
+        .get("reviews") or {}
+    by_id = {n["id"]: n.get("comments") for n in nodes.get("nodes") or [] if n.get("id")}
+    if not by_id:
+        return pr
+    return {**pr, "reviews": [{**r, "comments": by_id[r["id"]]} if r.get("id") in by_id else r
+                              for r in pr.get("reviews") or []]}
+
+
 def pr_signature(pr: dict) -> dict:
     checks = pr.get("statusCheckRollup") or []
     states = sorted({(c.get("conclusion") or c.get("state") or c.get("status") or "").upper() for c in checks})
@@ -71,9 +96,7 @@ def pr_signature(pr: dict) -> dict:
                                                                                  "CANCELLED", "ACTION_REQUIRED"))
     pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
                   for c in checks)
-    # An empty COMMENTED review only wraps inline replies (GitHub adds one per reply): no activity.
-    reviews = [r for r in pr.get("reviews") or []
-               if not (str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip())]
+    reviews = [r for r in pr.get("reviews") or [] if not _reply_wrapper(r)]
     human = [c for c in (pr.get("comments") or []) + reviews
              if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
     activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]
@@ -107,9 +130,19 @@ def watch_prs(daemon) -> str:
         key = prguard.pr_key(pr.get("url") or t["pr_url"])
         if key and pr.get("headRefOid") and (heads.get(key) or {}).get("sha") != pr["headRefOid"]:
             heads[key] = {"sha": pr["headRefOid"], "seen": time.time()}   # what an approval binds to
+        # One GraphQL read serves the findings and which empty reviews only wrap the runs' replies.
+        data = None
+        if key and (pr.get("state") == "OPEN" or any(
+                str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip()
+                for r in pr.get("reviews") or [])):
+            owner, rest = key.split("/", 1)
+            name, number = rest.split("#")
+            data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
+                        "-F", f"number={number}"], root)
+        pr = _with_review_comments(pr, data)
         sig = pr_signature(pr)
         _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
-        _check_findings(daemon, t, pr, sig, findings, root)
+        _check_findings(daemon, t, pr, sig, findings, data)
         old = seen.get(t["pr_url"])
         if old and sig["mergeable"] == "UNKNOWN" and old.get("mergeable") not in (None, "UNKNOWN"):
             sig = {**sig, "mergeable": old["mergeable"]}   # GitHub is recomputing: keep the last known value
@@ -205,7 +238,8 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
 BOT_QUERY = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
              "pullRequest(number:$number){"
              "comments(last:100){nodes{author{__typename login} body createdAt url}}"
-             "reviews(last:100){nodes{author{__typename login} state body submittedAt url}}"
+             "reviews(last:100){nodes{id author{__typename login} state body submittedAt url "
+             "comments(first:50){totalCount nodes{author{__typename login} body}}}}"
              "reviewThreads(first:100){nodes{isResolved isOutdated path "
              "comments(first:50){nodes{author{__typename login} body url}}}}}}}")
 
@@ -270,10 +304,10 @@ def bot_open(data: dict) -> list[str]:
     return [u for _, u in bot_findings(data)]
 
 
-def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: str) -> None:
+def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: dict | None) -> None:
     """Record an open PR's findings and tell the coordinator when they change: CI failing or bot
     review comments open is work (a fix task); CI green with every bot comment fixed or answered is
-    when it may ask the user for a review."""
+    when it may ask the user for a review. `data` is the PR's BOT_QUERY answer (None: unread)."""
     db, url = daemon.p.db, pr.get("url") or t["pr_url"]
     key = prguard.pr_key(url)
     if not key:
@@ -281,10 +315,6 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: 
     if sig["state"] != "OPEN":
         findings.pop(key, None)
         return
-    owner, rest = key.split("/", 1)
-    name, number = rest.split("#")
-    data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
-                "-F", f"number={number}"], root)
     old = findings.get(key) or {}
     if data is not None:
         found = bot_findings(data)

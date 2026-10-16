@@ -9117,8 +9117,9 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     """A bot re-posting the same finding after each push (same file and text, only links and commit
     ids differ) is one finding: listed once while open, not open work once any post of it was
     answered, and no fresh pr_findings report while it stays open under a new URL. An empty COMMENTED
-    review that only wraps inline replies is no review activity. A new finding, and a person's
-    comment or a review with a body, still count."""
+    review that only wraps the runs' own (marked) or a bot's inline comments is no review activity. A
+    new finding, a person's comment, a review with a body, and a person's inline-only review (or one
+    whose inline comments are unknown) still count."""
     from ttp import watchers
     from ttp.daemon import Daemon
     p = make(env)
@@ -9156,9 +9157,18 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     # Two open copies of it at once: listed once.
     threads.append(thread(post(3, "0a1b2c3d")))
     assert watchers.bot_open(graph) == ["r2"]
-    # Answered in one thread (the reply adds an empty COMMENTED review wrapper): every re-post of it is done.
-    threads[1]["comments"]["nodes"].append({"author": human, "url": "a1", "body": "False positive: test key."})
-    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": ""})
+    # A run answers in one thread (the reply adds an empty COMMENTED review wrapper): every re-post is done.
+    reply = {"author": human, "url": "a1", "body": "False positive: test key.\n<!-- ttp -->"}
+    threads[1]["comments"]["nodes"].append(reply)
+    gql_reviews = graph["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+
+    def review(rid, comments, total=None):
+        gql_reviews.append({"id": rid, "author": human, "state": "COMMENTED", "body": "",
+                            "comments": {"totalCount": len(comments) if total is None else total,
+                                         "nodes": comments}})
+        return {"id": rid, "author": {"login": "dev"}, "state": "COMMENTED", "body": ""}
+
+    pr["reviews"].append(review("rv1", [reply]))
     assert watchers.bot_open(graph) == []
     watchers.watch_prs(d)
     assert len(events("pr_clean")) == 1 and events("pr_changed") == []
@@ -9179,14 +9189,39 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     assert watchers.bot_open(graph) == ["r5", "r6", "r9"]
     # Comments without a body are each their own finding.
     assert watchers.finding_key({"url": "x"}) != watchers.finding_key({"url": "y"})
-    # Empty COMMENTED wrappers are no activity; a person's review with a body and their comments count.
-    base = watchers.pr_signature(pr)
-    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": "  "})
-    assert watchers.pr_signature(pr) == base and base["n_human"] == 0
+    # Empty COMMENTED wrappers of marked or bot inline comments are no activity; a person's
+    # inline-only review, one whose inline comments are unknown, and a review with a body count.
+    def sig():
+        return watchers.pr_signature(watchers._with_review_comments(pr, graph))
+
+    base = sig()
+    assert base["n_human"] == 0 and watchers.pr_signature(pr)["n_human"] == 1   # comments unread: counts
+    pr["reviews"].append(review("rv2", [{"author": bot, "body": "Nit."}, {**reply, "body": "Done. <!-- ttp -->"}]))
+    pr["reviews"][-1]["body"] = "  "
+    assert sig() == base
+    unmarked = review("rv3", [{"author": human, "body": "Why is this needed?"}])
+    pr["reviews"].append(unmarked)
+    assert sig()["n_human"] == 1 and sig()["activity"] != base["activity"]
+    pr["reviews"].remove(unmarked)
+    pr["reviews"].append(review("rv4", [reply], total=2))   # more inline comments than were read
+    assert sig()["n_human"] == 1
+    pr["reviews"].pop()
+    pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": ""})   # no id: unknown
+    assert sig()["n_human"] == 1
+    pr["reviews"].pop()
+    assert sig() == base
     pr["reviews"].append({"author": {"login": "dev"}, "state": "COMMENTED", "body": "Please split this."})
-    assert watchers.pr_signature(pr)["n_human"] == 1
+    assert sig()["n_human"] == 1
     pr["reviews"].append({"author": {"login": "dev"}, "state": "APPROVED", "body": ""})
-    assert watchers.pr_signature(pr)["n_human"] == 2
+    assert sig()["n_human"] == 2
+    pr["reviews"][-2:] = []
+    # pr-watch reads the inline comments itself: a person's inline-only review is new activity.
+    watchers.watch_prs(d)
+    assert events("pr_changed") == []
+    pr["reviews"].append(unmarked)
+    watchers.watch_prs(d)
+    assert len(events("pr_changed")) == 1 and "new review/comment activity (1 human" in events("pr_changed")[0]
+    pr["reviews"].remove(unmarked)
     # A record kept before findings had keys, already told these URLs: no fresh report on upgrade.
     from ttp import prguard
     rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
