@@ -2397,3 +2397,36 @@ def test_heal_to_pages_again_once_a_known_run_or_a_fresh_episode_ends_the_last_o
     _heal_to_self_fix_failed(p, d, up, spec, now + 3000)   # back unhealthy: a fresh episode
     assert "ops told" in heal.run(d, "svc", spec, now + 3010)[0]
     assert len([n for n in _notes_to("ops") if "still fails" in n["spec"]]) == 2
+
+
+def test_heal_self_fix_note_is_appended_to_the_self_fix_spec_only_when_set(env):
+    """A heal block's `self_fix_note` reaches its self-fix task under a label; without it the spec is
+    unchanged; a non-text note is refused, a long one cut, and schedule_set keeps it."""
+    from types import SimpleNamespace
+    from ttp import heal
+    from ttp import coordinator as coord
+    p = make(env)
+    now = time.time()
+    st = {"since": now - 7200, "last_rc": 1}
+    plain = heal.validate({"check": "false", "fix": "true"})
+    assert "self_fix_note" not in plain
+    heal._escalate(SimpleNamespace(p=p), "a", plain, dict(st), now, "the fix exited 1")
+    noted = heal.validate({"check": "false", "fix": "true", "self_fix_note": "  Check the unit's env first.  "})
+    assert noted["self_fix_note"] == "Check the unit's env first."
+    heal._escalate(SimpleNamespace(p=p), "b", noted, dict(st), now, "the fix exited 1")
+    heal._escalate(SimpleNamespace(p=p), "c", {**plain, "self_fix_note": ""}, dict(st), now, "the fix exited 1")
+    specs = {r["title"].split()[3]: r["spec"]
+             for r in p.db.q("SELECT title, spec FROM tasks WHERE title LIKE 'Self-fix: heal check %'")}
+    assert "Project note for this check" not in specs["a"]
+    assert specs["c"] == specs["a"].replace("`a`", "`c`").replace("heal test a", "heal test c")
+    assert specs["b"].endswith("\n\nProject note for this check:\nCheck the unit's env first.")
+    assert specs["b"].startswith(specs["a"].replace("`a`", "`b`").replace("heal test a", "heal test b"))
+    for bad in (3, ["x"], {"x": 1}, True):
+        with pytest.raises(ValueError, match="self_fix_note"):
+            heal.validate({"check": "false", "self_fix_note": bad})
+    assert len(heal.validate({"check": "false", "self_fix_note": "x" * 5000})["self_fix_note"]) == heal.NOTE_MAX
+    action = {"type": "schedule_set", "name": "probe", "kind": "command", "every": "30m",
+              "heal": {"check": "false", "self_fix_note": "note"}}
+    assert coord.apply(p, [action]) == []
+    stored = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")["payload"])["heal"]
+    assert heal.validate(stored)["self_fix_note"] == "note"

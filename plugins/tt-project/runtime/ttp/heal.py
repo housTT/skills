@@ -184,6 +184,7 @@ HOST_RE = re.compile(r"[A-Za-z0-9_.:%\[\]][A-Za-z0-9_.:%\[\]-]*")   # one host n
 PING_S = 3                      # how long box_silent waits for each ping reply
 FRESH_UNKNOWN_S = 900          # an unknown stretch shorter than this never starts a fresh episode (module doc)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
+NOTE_MAX = 2000                 # self_fix_note cap: a longer note is cut to this
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
 OPEN = ("queued", "running", "waiting", "needs_review")
 # Every key a block takes, with its JSON type. validate() accepts exactly these keys, and the coordinator's
@@ -192,7 +193,7 @@ _TEXT, _FLAG, _COUNT = {"type": "string"}, {"type": "boolean"}, {"type": "intege
 KNOWN_FAULT_KEYS = ("why", "match", "until")   # known_fault as an object (module doc)
 COMMON_FIELDS: dict[str, dict] = {
     **dict.fromkeys(("check", "fix", "resource", "machine", "condition", "preset", "escalate",
-                     "ping_host", "ping_peer", "to"), _TEXT),
+                     "ping_host", "ping_peer", "to", "self_fix_note"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
     "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
@@ -230,9 +231,11 @@ def validate(block: Any, where: str = "heal") -> dict:
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
     out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
-    for k in ("check", "fix", "resource", "machine"):
+    for k in ("check", "fix", "resource", "machine", "self_fix_note"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
+    if out.get("self_fix_note") is not None:
+        out["self_fix_note"] = out["self_fix_note"].strip()[:NOTE_MAX]
     if out.get("known_fault") is not None:
         _validate_known(out["known_fault"], where)
     if out.get("to") is not None and (not isinstance(out["to"], str) or not out["to"].strip()):
@@ -948,6 +951,8 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
             "credential or a step the charter forbids. Under a recorded known outage or known_fault, the check "
             "ending at exit 75 (known outage, unknown) is the expected end state: do not try to force a pass; "
             "hand off once the check reports the known outage.")
+        if spec.get("self_fix_note"):
+            spec_text += f"\n\nProject note for this check:\n{spec['self_fix_note']}"
         tid = db.add_task(f"Self-fix: heal check {name} failing", spec_text, kind="work", priority=1,
                           origin="daemon", labels=[LABEL + name])
     else:
