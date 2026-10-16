@@ -85,12 +85,16 @@ read the one for the lever you change.
 - Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>` (or `--wontfix "<reason>"` for a note that is not a
   plugin bug: closed, no release), or a
   code task's hand-off lists the note in `resolves` and the push queue records it with the version
-  its batch pushed. A sandboxed `--resolve` or `--ack` is queued in the run's directory and
+  its batch pushed. A sandboxed `--resolve`, `--ack` or `--regress` is queued in the run's directory and
   recorded when the run ends. Work
   waiting on it hands off `waiting` with retry_when `ttp upstream --fixed <fp>` (0 once this
   project's running daemon has the fix). The daemon then tells the coordinator once, and the
   project closes the note with `ttp upstream --ack <fp> "<evidence>"`. With no ack a day after the
-  resolution, it shows as "shipped, not confirmed". `ttp upstream --mine` lists this project's notes.
+  resolution, it shows as "shipped, not confirmed"; the coordinator gets one reminder 72 h after
+  the fix reached this project, and with no ack and no regression the note closes by silence after
+  14 days. If the fix did not hold, run `ttp upstream --regress <fp> "<reason>"` (filer project only,
+  after a resolution; stays on this machine): it blocks the close by silence. Filing the same note
+  again after its resolution counts as a regression. `ttp upstream --mine` lists this project's notes.
 
 ## Maintainer checklist (liveness, progress, deploys)
 

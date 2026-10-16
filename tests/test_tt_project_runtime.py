@@ -43297,7 +43297,9 @@ def test_upstream_unconfirmed_fix_reminds_once_then_closes_by_silence(env):
     now = time.time()
     fp = _shipped(p, "upstream: quiet", 80, now)
     assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
+    assert not p.db.q("SELECT 1 FROM events WHERE source='upstream'")   # first sight: the timers start now
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 80 * 3600) == []
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 81 * 3600) == []
     ev = p.db.q("SELECT text,severity FROM events WHERE source='upstream'")
     assert len(ev) == 1 and f"ttp upstream --ack {fp}" in ev[0]["text"] and "quiet" in ev[0]["text"]
     assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 15 * 86400) == [fp]
@@ -43312,7 +43314,9 @@ def test_upstream_unconfirmed_fix_waits_for_the_filers_version_and_the_reminder_
     _shipped(p, "upstream: young", 10, now)
     _shipped(p, "upstream: old", 400, now)
     upstream.follow_up_unconfirmed(p, "1.5.0", None, now)
+    upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 99 * 3600)
     n = len(p.db.q("SELECT 1 FROM events WHERE source='upstream'"))
+    assert n == 2
     assert upstream.follow_up_unconfirmed(p, "0.0.1", None, now + 99 * 86400) == []
     assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == n
 
@@ -43322,9 +43326,46 @@ def test_upstream_regression_blocks_the_close_by_silence(env):
     p = make(env)
     now = time.time()
     fp = _shipped(p, "upstream: back", 20 * 24, now)
-    upstream.regress(fp, "demo", "still broken", now=now - 3600)
+    upstream.follow_up_unconfirmed(p, "1.5.0", None, now - 30 * 86400)
+    upstream.regress(fp, "still broken", "demo", now=now - 3600)
     assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
     assert upstream.state(fp, now) == upstream.SHIPPED
+
+
+def test_upstream_timers_count_from_when_the_daemon_reached_the_fix(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _shipped(p, "upstream: late", 20 * 24, now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []
+    assert not p.db.q("SELECT 1 FROM events WHERE source='upstream'")
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 73 * 3600) == []
+    assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == 1
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 13 * 86400) == []
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 14 * 86400 + 60) == [fp]
+    assert len(p.db.q("SELECT 1 FROM events WHERE source='upstream'")) == 1
+
+
+def test_upstream_regress_cli_and_refiling_block_the_close_by_silence(env, monkeypatch):
+    from ttp import cli, upstream
+    p = make(env)
+    monkeypatch.chdir(p.base)
+    now = time.time()
+    fp = _shipped(p, "upstream: cli", 1, now)
+    fp2 = _shipped(p, "upstream: refiled", 1, now)
+    assert _upstream_cli(cli, "--regress", "0" * 16, "x") == 2
+    assert _upstream_cli(cli, "--regress", fp, " ") == 2
+    assert _upstream_cli(cli, "--regress", fp, "still broken") == 0
+    assert upstream.regressed(fp)
+    # The filer files the same note again after its resolution: a regression, not a silent drop.
+    assert upstream.append("demo", 9, [{"title": "upstream: refiled", "spec": "y"}]) == 0
+    assert upstream.regressed(fp2)
+    upstream.follow_up_unconfirmed(p, "1.5.0", None, now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 30 * 86400) == []
+    # Another project re-proposing the note is not a regression of the filer's.
+    fp3 = _shipped(p, "upstream: other", 1, now)
+    upstream.append("other", 2, [{"title": "upstream: other", "spec": "y"}])
+    assert not upstream.regressed(fp3)
 
 
 def test_upstream_unconfirmed_shows_in_the_audit_with_count_and_oldest_age(env):

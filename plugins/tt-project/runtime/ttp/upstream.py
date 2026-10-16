@@ -136,13 +136,17 @@ def append(name: str, task: int | None, followups) -> int:
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)   # several daemons of this user append to the same inbox
         f.seek(0)
-        have = {n["fp"] for n in _lines(f.read())[0]}
+        had = {n["fp"]: n for n in _lines(f.read())[0]}
+        have = set(had)
         out = b""
+        again = []
         for n in notes:
             title = str(n["title"]).strip()[:TITLE_CHARS]
             spec = cut(str(n.get("spec") or "").strip(), f"the hand-off of {name} #{task}" if task else "its hand-off")
             fp = fingerprint(title, spec)
             if fp in have:
+                if had.get(fp, {}).get("project") == name and not had[fp].get("via"):
+                    again.append(fp)
                 continue
             have.add(fp)
             out += (json.dumps({"ts": time.time(), "project": name, "host": project.hostname(), "task": task,
@@ -150,6 +154,11 @@ def append(name: str, task: int | None, followups) -> int:
         if out:
             f.write(out)
             f.flush()
+    for fp in again:
+        # The filer files a note again after its resolution: the fix did not hold.
+        recs = _records()
+        if resolution(fp, recs) and not regressed(fp, recs):
+            regress(fp, "filed again after its resolution", name)
     return out.count(b"\n")
 
 
@@ -694,12 +703,17 @@ def queue_ack(run_dir: Path, fp: str, evidence: str) -> None:
     durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"fp": fp, "evidence": evidence}, sort_keys=True) + "\n")
 
 
-def queue_regress(run_dir: Path, fp: str, note: str) -> None:
-    """Keep a worker's regression record in its run's directory when its sandbox cannot write RESOLVED_FILE."""
+def queue_regress(run_dir: Path, fp: str, reason: str) -> None:
+    """Keep a worker's regression record in its run's directory when its sandbox cannot write RESOLVED_FILE:
+    its project's daemon records it (`file_queued_acks`) when the run ends."""
     fp = _check_fp(fp)
+    reason = " ".join(str(reason or "").split())
+    if not reason:
+        raise ValueError("--regress needs a reason")
     if not resolution(fp):
         raise ValueError(f"note {fp} has no resolution yet: nothing to regress")
-    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"kind": "regression", "fp": fp, "note": note}, sort_keys=True) + "\n")
+    durable_append(Path(run_dir) / ACKS_QUEUED, json.dumps({"kind": "regression", "fp": fp, "note": reason},
+                                                           sort_keys=True) + "\n")
 
 
 def queue_resolve(run_dir: Path, fp: str, fixed_in: str, note: str = "") -> None:
@@ -740,7 +754,7 @@ def file_queued_acks(run_dir: Path, name: str) -> int:
             if a.get("kind") == "resolve":
                 resolve(a["fp"], a["fixed_in"], a.get("note") or "", name)
             elif a.get("kind") == "regression":
-                regress(a["fp"], a.get("note") or "")
+                regress(a["fp"], a.get("note") or "", name)
             elif a.get("kind") == "wontfix":
                 wontfix(a["fp"], a.get("note") or "", name)
             else:
@@ -867,6 +881,7 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
                 f"it shows as '{SHIPPED}' {CONFIRM_S // 3600} h after it was resolved.", "queued"))
         told.append(key)
         seen.add(key)
+        reached(p, key, now or time.time())
         out.append(res)
     if out:
         p.db.set_kv(KV_FIXED, told[-FIXED_KEPT:])
@@ -874,36 +889,47 @@ def wake_fixed(p: project.Project, version: str, now: float | None = None) -> li
     return out
 
 
+KV_REACHED = "upstream_reached"   # {"<fp>@<fixed_in>": when this project's daemon was first seen running it}
 KV_REMINDED = "upstream_reminded"   # "<fp>@<fixed_in>" this project's coordinator was reminded of
 REMIND_AFTER_H = 72
 CLOSE_AFTER_DAYS = 14
 SILENCE = "silence"
 
 
-def regress(fp: str, name: str, reason: str, now: float | None = None) -> dict:
-    """Project `name` reports the fix of note `fp` did not hold: it blocks the close by silence."""
+def reached(p: project.Project, key: str, now: float) -> float:
+    """When this project's daemon was first seen running the fix `key` (`<fp>@<fixed_in>`): now, on first sight."""
+    got = dict(p.db.kv(KV_REACHED, {}) or {})
+    if key not in got:
+        got[key] = now
+        p.db.set_kv(KV_REACHED, dict(list(got.items())[-FIXED_KEPT:]))
+    return float(got[key])
+
+
+def regress(fp: str, note: str, name: str = "", now: float | None = None) -> dict:
+    """Record that the fix of note `fp` did not hold (as project `name`'s, when given): it blocks the
+    filer's close by silence, and a maintainer's ingesting project never closes it as filer unreachable."""
     fp = _check_fp(fp)
-    return _record({"kind": "regress", "fp": fp, "project": name, "reason": cut(" ".join(str(reason or "").split()), "it"),
-                    "ts": now or time.time()})
+    if not resolution(fp):
+        raise ValueError(f"note {fp} has no resolution yet: nothing to regress")
+    if not note or not str(note).strip():
+        raise ValueError("a regression needs the reason")
+    rec = {"kind": "regression", "fp": fp, "note": cut(" ".join(str(note or "").split()), "it"), "ts": now or time.time()}
+    if name:
+        rec["project"] = name
+    return _record(rec)
 
 
 def regressed(fp: str, recs: list[dict] | None = None) -> bool:
-    """True when a regression was recorded for note `fp` after its latest resolution, or the inbox holds
-    the same fingerprint again from after it (a forwarded copy)."""
+    """True when a regression was recorded for note `fp` after its latest resolution (`ttp upstream
+    --regress`, or the filer filing the same note again). Regress records stay on this machine."""
     recs = _records() if recs is None else recs
     res = resolution(fp, recs)
     if not res:
         return False
     t = float(res["ts"])
-    if any(r.get("kind") == "regress" and r.get("fp") == fp and float(r.get("ts") or 0) >= t for r in recs):
+    if any(r.get("kind") == "regression" and r.get("fp") == fp and float(r.get("ts") or 0) >= t for r in recs):
         return True
-    try:
-        with open(path(), "rb") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            notes = _lines(f.read())[0]
-    except FileNotFoundError:
-        return False
-    return any(n.get("fp") == fp and float(n.get("ts") or 0) > t and n.get("via") for n in notes)
+    return False
 
 
 def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = None, now: float | None = None) -> list[str]:
@@ -925,21 +951,22 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
         res = resolution(fp, recs)
         if not res or wontfixed(fp, recs) or acked(fp, recs) or not at_least(version, res["fixed_in"]):
             continue
-        age = now - float(res["ts"])
+        key = f"{fp}@{res['fixed_in']}"
+        age = now - reached(p, key, now)
         if age >= close_s and not regressed(fp, recs):
             _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": SILENCE,
                      "evidence": f"confirmed by silence: no ack and no regression note {close_s / 86400:g} days after the fix "
                                  f"in {res['fixed_in']} reached this project"})
             closed.append(fp)
             continue
-        key = f"{fp}@{res['fixed_in']}"
         if age >= remind_s and key not in reminded:
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                    (now, "upstream", "observation", "normal",
                     f"upstream fix not confirmed yet: note {fp} ({mine[fp].get('title', '')[:120]}) is fixed in {res['fixed_in']}, "
                     f"this project's daemon runs {version}, and nobody acked it for {age / 3600:.0f} h. Check the fix works "
-                    f"here and run `ttp upstream --ack {fp} \"<evidence>\"`; with no regression it closes by silence "
-                    f"{close_s / 86400:g} days after the fix.", "queued"))
+                    f"here and run `ttp upstream --ack {fp} \"<evidence>\"`, or `ttp upstream --regress {fp} \"<reason>\"` if it "
+                    f"did not hold; with no regression it closes by silence {close_s / 86400:g} days after the fix reached "
+                    f"this project.", "queued"))
             reminded.append(key)
             changed = True
     if changed:
@@ -961,15 +988,6 @@ def unconfirmed(name: str | None, now: float | None = None) -> list[str]:
     fps = dict.fromkeys(r["fp"] for r in recs if r.get("kind") == "resolve")
     mine = filed(name) if name else None
     return [fp for fp in fps if (mine is None or fp in mine) and state(fp, now, recs) == SHIPPED]
-
-
-def regress(fp: str, note: str, now: float | None = None) -> dict:
-    """Record that the fix of note `fp` did not hold: it is never auto-closed as unreachable after this."""
-    fp = _check_fp(fp)
-    if not resolution(fp):
-        raise ValueError(f"note {fp} has no resolution yet: nothing to regress")
-    return _record({"kind": "regression", "fp": fp, "note": cut(" ".join(str(note or "").split()), "it"),
-                    "ts": now or time.time()})
 
 
 def orphans(now: float | None = None, min_age_s: float = ORPHAN_LIST_S) -> list[str]:
