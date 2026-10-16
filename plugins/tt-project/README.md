@@ -204,7 +204,10 @@ and preferences you add later become part of the project's charter and memory.
   A run a reboot, a sleep or a lost supervisor cut short after real progress
   (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
   working directory with a short prompt, instead of starting over.
-  A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. A
+  A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. So is,
+  at once, a task whose run or detached job held a `ttp lock` resource of this host (a device, a
+  machine; not a push lock) when the host went down abruptly: the coordinator requeues it once the
+  attempt is known not to be implicated. A
   detached job cut by a planned host cycle (`ttp drain <name> --reboot "<why>"`, or another project's
   `state/host-cycle/<id>/record.json` on the same host, or a `ttp machines change add <this host>
   --power-cycle-at <t>` intent) does not count. Such a reboot is reported once as planned, at low

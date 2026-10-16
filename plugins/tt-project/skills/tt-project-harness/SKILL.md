@@ -141,6 +141,11 @@ do not run while the project is paused. A task that must reboot the host its har
    the daemon after the reboot while its task still waits on it, with no model run, up to
    `budget.max_job_relaunches` times (default 3). Abrupt reboots it relaunches through count toward
    `budget.max_reboot_losses`, so a job that takes the host down still gets its task blocked.
+   A task that held a resource through `ttp lock` (a device, a machine, a build directory; not a
+   push lock, and not a lock named after another listed machine) when the host went down abruptly
+   and unplanned is blocked at once, for its run and for its waiting detached jobs: no retry, no
+   relaunch, no boot-time wake. Its high `task_blocked` event names what it held; requeue it once
+   its earlier attempt is known not to be implicated. Reboots where it held nothing resume as before.
 2. `ttp pause <name> --until-reboot --reason "host power cycle"`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back: the daemon

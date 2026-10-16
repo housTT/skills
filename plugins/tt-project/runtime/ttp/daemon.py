@@ -3164,6 +3164,11 @@ class Daemon:
             n = self._reboot_losses(task["id"]) + wakes
             if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
+            elif held := self._held_at_reboot(task["id"], r["boot_id"]):
+                # It held a device or machine when the host went down: a retry may take the host (and
+                # every other run on it) down again. The coordinator decides, not a timer.
+                new, reason = "blocked", held_at_reboot_reason(held)
+                extra["reboot"]["held"] = held
         if waiting:
             # A cheap wake that found real work asks to go on at a higher tier: once per wake, at
             # once, and not as another wait, so the escalated run cannot escalate again.
@@ -6380,11 +6385,18 @@ class Daemon:
             else None
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
-            if prev.get("status") != "waiting" or prev.get("survives_reboot") is True:
+            if prev.get("status") != "waiting":
                 continue
             since = prev.get("waiting_since")
             since = since if isinstance(since, (int, float)) else t["updated"]
             if not since or since >= self.boot_at:
+                continue
+            if held := self._held_at_reboot(t["id"], earlier):
+                # A detached job of its own held a device or machine when the host went down abruptly:
+                # neither relaunched nor woken, whatever its retry_when says. The coordinator decides.
+                self._block_after_reboot(t, prev, held_at_reboot_reason(held))
+                continue
+            if prev.get("survives_reboot") is True:
                 continue
             asleep, relaunched = self._relaunch_checks(t, prev)
             cut = False
@@ -6401,14 +6413,7 @@ class Daemon:
             n = self._reboot_losses(t["id"]) + wakes + relaunched + self._job_relaunch_boots(t["id"])
             if counts and n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 # Its detached job may be what takes the host down: stop waking it.
-                prev.pop("reboot_wakes", None)
-                reason = f"lost to a host reboot {n} times; it may be causing them"
-                with db.tx():
-                    db.update_task(t["id"], status="blocked", blocked_reason=reason, result=dump_result(prev))
-                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                         (time.time(), f"task:{t['id']}", "task_blocked", "high",
-                          f"#{t['id']} {t['title']} → blocked: {reason}", "queued", t["id"]))
-                log(self.p, f"task {t['id']} blocked: {reason}")
+                self._block_after_reboot(t, prev, f"lost to a host reboot {n} times; it may be causing them")
                 continue
             reboot = {"at": self.boot_at}
             if cycle:
@@ -6416,6 +6421,17 @@ class Daemon:
             db.update_task(t["id"], not_before=None, result=dump_result(
                 {**prev, "woke": "the host rebooted", "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
+
+    def _block_after_reboot(self, t: dict, prev: dict, reason: str) -> None:
+        """Block waiting task t at boot for `reason`, with a high task_blocked event for the coordinator."""
+        db = self.p.db
+        prev.pop("reboot_wakes", None)
+        with db.tx():
+            db.update_task(t["id"], status="blocked", blocked_reason=reason[:500], result=dump_result(prev))
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{t['id']}", "task_blocked", "high",
+                  f"#{t['id']} {t['title']} → blocked: {reason}", "queued", t["id"]))
+        log(self.p, f"task {t['id']} blocked: {reason}")
 
     def _relaunch_checks(self, t: dict, prev: dict) -> tuple[bool, int]:
         """A task waiting on its own `ttp checks --detach` (retry_when `ttp checks --result <its run
@@ -6706,6 +6722,27 @@ class Daemon:
                                  check=False)
         except (OSError, subprocess.SubprocessError):
             return ""
+
+    def _held_at_reboot(self, tid: int, boot: str | None) -> list[str]:
+        """The resources task tid held (its run or a detached job of its own, through `ttp lock`) at
+        the last heartbeat before the reboot that ended boot `boot`, when that reboot was abrupt and
+        unplanned; [] otherwise (an orderly shutdown or a planned host cycle was not the task's doing).
+        A resource named after another machine on the machines list (`<alias>` or `<alias>-...`) is
+        used over ssh: this host's reboot did not come from it."""
+        prev = self.p.db.kv("boot_prev") or {}
+        if not boot or not self._this_boot(prev.get("boot")) or prev.get("prev_boot") != boot \
+                or prev.get("shutdown") == "orderly":
+            return []
+        held = held_by_task(prev.get("held"), tid, self.p.name)
+        if held:
+            try:
+                known = machines.load()
+                me = (machines.here(known) or ("",))[0]
+            except Exception:   # an unreadable list must not hide a hold
+                known, me = {}, ""
+            others = [a for a in known if a != me]
+            held = [x for x in held if not any(x == a or x.startswith(a + "-") for a in others)]
+        return held if held and not self._planned_cycle(boot) else []
 
     def _reboot_losses(self, tid: int, key: str = "lost_to_reboot") -> int:
         """Runs of the task lost to an abrupt host reboot (or, by key, a host sleep) since it was last
@@ -9141,6 +9178,29 @@ def _task_note(run_dir: Path, text: str) -> None:
         durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} daemon: {text}\n")
     except OSError:
         pass
+
+
+def held_by_task(held, tid: int, project: str) -> list[str]:
+    """The resources (a device, a machine, a remote build directory: any lock but the harness's own push
+    and upgrade locks) task tid of `project` held, as a heartbeat's `held` list names them ("board: task
+    #7 (run 3) since 10:02 PDT"; on a shared resource the holder names the project first). A reservation
+    is not a hold."""
+    from .release import UPGRADE_RESOURCE
+    who = re.compile(rf"(?:{re.escape(project)} )?task #{int(tid)} \(run [^)]*\)")
+    out = []
+    for item in held or []:
+        res, _, holder = str(item).partition(": ")
+        if res.startswith("push:") or res == UPGRADE_RESOURCE:
+            continue
+        if who.fullmatch(re.sub(r" since .*$", "", holder)) and res not in out:
+            out.append(res)
+    return out
+
+
+def held_at_reboot_reason(held: list[str]) -> str:
+    """Why a task that held `held` when the host went down abruptly is not retried automatically."""
+    return (f"the host rebooted abruptly while this task held {', '.join(held)}, so it may have caused the "
+            f"reset: not retried automatically. Requeue it once its earlier attempt is known not to be implicated")
 
 
 def _reboot_wakes(task: dict) -> int:

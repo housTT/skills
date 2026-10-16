@@ -486,3 +486,105 @@ def test_a_drain_intent_quiets_outages_only_around_the_cycle(env, monkeypatch):
     assert ml.expects_now(c, t0 + 300 - ml.POWER_CYCLE_LEAD_S - 1) == []
     for t in (t0 + 300 - ml.POWER_CYCLE_LEAD_S, t0 + 300, t0 + 600):
         assert ml.expects_now(c, t) == ["down"], t
+
+
+def _abrupt_reboot_held(p, d, held, shutdown="abrupt", boot="an-earlier-boot"):
+    """The record of an abrupt reboot that ended `boot`, with `held` at its last heartbeat."""
+    p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": boot, "held": held, "shutdown": shutdown})
+
+
+def test_held_by_task_names_only_the_tasks_own_device_and_machine_locks():
+    from ttp.daemon import held_by_task
+    held = ["board: task #7 (run 3) since 10:02 PDT", "box-device: demo task #7 (run ?) since 10:02 PDT",
+            "push:origin%2Fmain: task #7 (run 3) since 10:00 PDT", "harness-upgrade: task #7 (run 3) since 10:00 PDT",
+            "rig: reserved for task #7 (run 3)", "board2: task #70 (run 3) since 10:02 PDT",
+            "box: other task #7 (run 3) since 10:02 PDT", "bench: task #7 (run 3) since 10:01 PDT"]
+    assert held_by_task(held, 7, "demo") == ["board", "box-device", "bench"]
+    assert held_by_task(held, 8, "demo") == [] and held_by_task(None, 7, "demo") == []
+
+
+def test_a_run_lost_to_an_abrupt_reboot_while_its_task_held_a_device_is_not_retried(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    dev = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    calm = p.db.add_task("edit docs", "s", kind="work", tier="light", origin="user")
+    push = p.db.add_task("review and push", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [f"board: task #{dev} (run 1) since 10:02 PDT",
+                               f"push:origin%2Fmain: task #{push} (run 2) since 10:01 PDT",
+                               f"rig: reserved for task #{calm} (run 3)"])
+    for tid in (dev, calm, push):
+        _lost_to_reboot(p, d, tmp_path, tid, name=f"lost{tid}")
+    t = p.db.task(dev)
+    assert t["status"] == "blocked" and t["attempts"] == 0, dict(t)
+    assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t["blocked_reason"]
+    assert json.loads(t["result"])["reboot"]["held"] == ["board"]
+    ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (dev,))
+    assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+    # Nothing held, a push lock or a reservation: today's resume, at once and without an attempt.
+    for tid in (calm, push):
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and t["attempts"] == 0 and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+
+
+@pytest.mark.parametrize("case", ["orderly", "planned", "other machine", "other boot"])
+def test_a_hold_at_a_reboot_the_task_did_not_cause_keeps_the_retry(env, tmp_path, monkeypatch, case):
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    res = "board"
+    if case == "other machine":
+        mm.add("farbox")
+        res = "farbox-device"   # held over ssh: a job there cannot reset this host
+    if case == "planned":
+        monkeypatch.setattr(d, "_planned_cycle", lambda boot: {"reason": "firmware", "path": "x"})
+    _abrupt_reboot_held(p, d, [f"{res}: task #{tid} (run 1) since 10:02 PDT"],
+                        shutdown="orderly" if case == "orderly" else "abrupt",
+                        boot="yet-another-boot" if case == "other boot" else "an-earlier-boot")
+    _lost_to_reboot(p, d, tmp_path, tid)
+    assert p.db.task(tid)["status"] == "queued", dict(p.db.task(tid))
+
+
+def test_a_lock_named_after_this_host_still_counts(env, tmp_path):
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    from ttp.project import hostname
+    mm.add(hostname())
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [f"{hostname()}-device: task #{tid} (run 1) since 10:02 PDT"])
+    _lost_to_reboot(p, d, tmp_path, tid)
+    assert p.db.task(tid)["status"] == "blocked"
+
+
+@pytest.mark.parametrize("survives", [False, True])
+def test_a_waiting_task_whose_job_held_a_device_at_an_abrupt_reboot_is_blocked_not_woken(env, monkeypatch, survives):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid)
+    if survives:
+        p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "survives_reboot": True}))
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    _abrupt_reboot_held(p, d, [f"board: task #{tid} (run 1) since 10:02 PDT"])
+    monkeypatch.setattr(d, "_relaunch_jobs", lambda *a: pytest.fail("a job that held the device was relaunched"))
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
+    ev = p.db.q("SELECT severity FROM events WHERE kind='task_blocked' AND task=?", (tid,))
+    assert ev and ev[-1]["severity"] == "high"
+    # The coordinator's requeue is its word that the attempt was not implicated: the next reboot
+    # without a hold wakes it as before.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    _waiting_from_before_the_boot(p, tid)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    _abrupt_reboot_held(p, d, [])
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and (survives or json.loads(t["result"]).get("woke") == "the host rebooted"), dict(t)
