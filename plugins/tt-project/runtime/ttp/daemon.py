@@ -2972,6 +2972,7 @@ class Daemon:
             run = db.one("SELECT * FROM runs WHERE id=?", (pv.get("run"),)) if pv.get("run") else None
             from .providers.base import RunUsage
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
+            self._prefetch_lint(tid, handoff)
             with db.tx():
                 t = db.task(tid)
                 if not t or t["status"] != "pushing" or pushclaim.KEY not in load_result(t["result"]):
@@ -3011,15 +3012,26 @@ class Daemon:
         """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
         now, before the transaction that records it: inside it the answer is read, never fetched, so
         the write lock never waits on the network. Best effort: an unanswered question reads as before."""
+        task = self._prefetch_lint(task_id, result)
         if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
             return   # only a finished hand-off approves a push or gets its review
-        task = self.p.db.task(task_id)
         if not task or task["kind"] not in ("code", "review"):
             return
         try:
             pushq.prefetch(self.p, task, self.cfg)
         except Exception as e:
             log(self.p, f"task {task_id}: asking the push remote before finishing failed: {type(e).__name__}: {e}")
+
+    def _prefetch_lint(self, task_id: int, result) -> dict | None:
+        """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, asked
+        before the transaction. Returns the task."""
+        task = self.p.db.task(task_id)
+        try:
+            if task:
+                handofflint.prefetch(self.p, self.cfg, task, result)
+        except Exception as e:
+            log(self.p, f"task {task_id}: asking the remote for the hand-off lint failed: {type(e).__name__}: {e}")
+        return task
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,

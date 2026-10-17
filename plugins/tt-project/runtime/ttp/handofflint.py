@@ -8,27 +8,37 @@ project.own_creates_pr_branch) publishes it itself with `ttp push --own-branch`.
 proposes pushing that branch while it is not on the remote leaves the task's own step to another
 run. The hand-off is flagged in the digest as a task note, which also keeps the daemon from queueing
 that follow-up as the next hop by itself (a hand-off with notes is the coordinator's). Upstream
-notes are not work and are not linted. The remote is read only when a follow-up matches, and an
-unreadable remote flags nothing."""
+notes and `continue:` hops are not linted. The remote is asked only when a follow-up matches, and
+only by prefetch, before the transaction that records the hand-off (Daemon._prefetch_remote): lint
+runs inside it and reads that answer, so the write lock never waits on the network. No answer, or
+an unreadable remote, flags nothing."""
 from __future__ import annotations
 
+import re
+import time
 from pathlib import Path
 
 from .project import Project, own_creates_pr_branch, own_push
 from . import upstream
 
-REMOTE_TIMEOUT_S = 30   # one ls-remote, in the daemon's tick
+REMOTE_TIMEOUT_S = 30   # one ls-remote, asked before the transaction (prefetch)
+SEEN_TTL_S = 300        # prefetch's answer is read inside the transaction this long
+_seen: dict[tuple[str, str], tuple[float, bool]] = {}   # (root, branch): (until, on the remote)
+
+CONTINUE = re.compile(r"(?i)^\s*continue\s*:")   # a split's hop carries the rest of the work, not a push
+_PUBLISH = r"\bpublish(?:es|ing)?\b|\bopen(?:s|ing)?\s+(?:its\s+|the\s+|a\s+)?(?:draft\s+)?(?:pr|pull\s+request)\b"
+_TO = r"\bpush(?:es|ing)?\s+(?:up\s+)?(?:(?:the|its|this|own|task'?s?|work)\s+)*(?:branch\b|{b}(?![\w./-]))"
 
 
 def proposes_push(result: dict, branch: str) -> str:
-    """The title of the first follow-up of `result` (not an upstream note) that proposes pushing
-    `branch`: its title or spec says "push" and names the branch or calls itself mechanical. "" if none."""
-    b = branch.lower()
+    """The title of the first follow-up of `result` that proposes publishing `branch`: its title or
+    spec says "push <branch>" or "push the branch", "publish" or "open its (draft) PR". Never an
+    upstream note or a `continue:` hop, and never "pushed" or "the push queue". "" if none."""
+    rule = re.compile(f"{_PUBLISH}|{_TO.format(b=re.escape(branch.lower()))}")
     for f in result.get("followups") or []:
-        if not isinstance(f, dict) or upstream.is_note(f):
+        if not isinstance(f, dict) or upstream.is_note(f) or CONTINUE.match(str(f.get("title") or "")):
             continue
-        t = f"{f.get('title') or ''} {f.get('spec') or ''}".lower()
-        if "push" in t and (b in t or "mechanical" in t):
+        if rule.search(f"{f.get('title') or ''} {f.get('spec') or ''}".lower()):
             return str(f.get("title") or "")[:200]
     return ""
 
@@ -38,9 +48,9 @@ def applies(cfg: dict) -> bool:
     return own_push(cfg) == "on" or own_creates_pr_branch(cfg)
 
 
-def _on_remote(p: Project, repo: Path, branch: str) -> bool | None:
+def _ask_remote(p: Project, repo: Path, branch: str) -> bool | None:
     """Whether `branch` exists on the remote `ttp push --own` publishes to; None when unreadable or
-    the repo has no remote."""
+    the repo has no remote. Asks the network: never inside a transaction (prefetch only)."""
     from . import push
     d = p.config().get("delivery") or {}
     try:
@@ -55,13 +65,41 @@ def _on_remote(p: Project, repo: Path, branch: str) -> bool | None:
     return any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
 
 
-def lint(p: Project, cfg: dict, task: dict, result) -> list[str]:
-    """Problems of a code task's hand-off, each one line for the digest; [] when clean or not linted."""
+def _flagged(cfg: dict, task: dict, result) -> tuple[str, str]:
+    """(branch, the matching follow-up's title) when `task`'s hand-off is linted and proposes
+    publishing its branch, else ("", "")."""
     branch = str(task.get("branch") or "")
     if task.get("kind") != "code" or not branch or not isinstance(result, dict) or not applies(cfg):
-        return []
+        return "", ""
     title = proposes_push(result, branch)
-    if not title or _on_remote(p, p.root, branch) is not False:
+    return (branch, title) if title else ("", "")
+
+
+def prefetch(p: Project, cfg: dict, task: dict, result) -> None:
+    """Asks the remote, before the transaction that records `task`'s hand-off, whether its branch is
+    there, only when lint would need the answer. Bounded and best effort."""
+    branch, _ = _flagged(cfg, task, result)
+    if not branch:
+        return
+    on = _ask_remote(p, p.root, branch)
+    key = (str(p.root), branch)
+    if on is None:
+        _seen.pop(key, None)
+    else:
+        _seen[key] = (time.time() + SEEN_TTL_S, on)
+
+
+def _on_remote(p: Project, branch: str) -> bool | None:
+    """prefetch's answer for `branch`, None when it got none within SEEN_TTL_S. Never asks."""
+    hit = _seen.get((str(p.root), branch))
+    return hit[1] if hit and hit[0] > time.time() else None
+
+
+def lint(p: Project, cfg: dict, task: dict, result) -> list[str]:
+    """Problems of a code task's hand-off, each one line for the digest; [] when clean or not linted.
+    Runs inside the transaction: reads only what prefetch got from the remote."""
+    branch, title = _flagged(cfg, task, result)
+    if not title or _on_remote(p, branch) is not False:
         return []
     return [f"hand-off lint: follow-up {title!r} proposes pushing {branch}, which is not on the remote. "
             f"Publishing it is the task's own step (`ttp push --own-branch --detach` from its branch): requeue "
