@@ -97,7 +97,7 @@ Others share these nodes: hold one only while work runs on it.
 - Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or
   limits, stay within them; beyond them needs the user's word: hand off `blocked` asking, never
   widen your own scope. All busy: hand off `waiting`.
-- A claim that a machine was idle or nothing ran must name its evidence (process list, scheduler, broker log, auth log); one empty log class is no proof (auth logs show only the sudo invocation and rotate).
+- A claim that a machine was idle or nothing ran names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo invocations; they rotate).
 - Never take a node that is allocated, drained, reserved for others or down. Never cancel,
   preempt, join or share another user's allocation.
 - Submit the whole test as one batch job (`sbatch`, or `srun` for one command) that exits when the
@@ -256,19 +256,19 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
   `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
 <!-- ttp:if wait -->
-  Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach` here, not
+  Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 <!-- /ttp:if wait -->
 <!-- ttp:if wait -->
 - A watcher thread: reentrant lock, bounded acquires recording a stage_timeout, a stall guard that dumps all thread stacks and exits non-zero.
 <!-- /ttp:if wait -->
-- Write large results incrementally, flushing as you go and before any step that may reset the host.
+- Write large results incrementally, flushing before any host reset.
 <!-- ttp:if wait -->
-- A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot every executable it launches too; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temp file plus `mv`, never in place, concurrently only under `ttp lock <name>` or git.
+- A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot launched executables). Edit shared scripts via a temp file plus `mv`, never in place.
 <!-- /ttp:if wait -->
-- A follow-up implying a device or machine experiment names, in its first sentence, the resource the charter permits for it.
+- A follow-up implying a device or machine experiment names, first, the resource the charter permits.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
-  or the harness says you passed the split line, finish the step, commit and hand off `done` with a
+  or you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
 <!-- ttp:if prs -->
   A review does not split this way: it finishes its verdict.
