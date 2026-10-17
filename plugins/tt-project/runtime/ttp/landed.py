@@ -353,6 +353,10 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
         if not (rp / ".git").exists() and _git(rp, "rev-parse", "--git-dir").returncode != 0:
             raise ValueError(f"--repo {repo} is not a git repository")
         repos = [rp, *repos]
+    top = _git(Path.cwd(), "rev-parse", "--show-toplevel")
+    if top.returncode == 0 and top.stdout.strip():   # the repository `ttp` runs in comes after --repo
+        n = 1 if repo else 0
+        repos = [*repos[:n], Path(top.stdout.strip()), *repos[n:]]
     if not branch:
         # A task whose work sits in a worktree of a second repository it made itself has no branch
         # on record: --ref names that branch, then read in each repository its runs touched. A task
@@ -366,18 +370,23 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
             return _record_branchless(p, tid, sha, ref, [*repos, p.root, *extra])
         branch, ref = ref, None
         repos += extra
-    checked = []
+    checked, first = [], None
     for repo in dict.fromkeys([*repos, p.root]):
         head = _commit(repo, f"refs/heads/{branch}")
-        if head:
+        if head and _commit(repo, sha):
             break
+        if head and not first:
+            first = (repo, head)
         checked.append(str(repo))
     else:
-        raise ValueError(f"task #{tid} has no branch {branch} to record (checked {', '.join(checked)})")
+        if not first:
+            raise ValueError(f"task #{tid} has no branch {branch} to record (checked {', '.join(checked)})")
+        repo, head = first   # the branch is here; the commit is in no repository searched
     full = _commit(repo, sha)
     if not full:
         raise ValueError(f"no commit {sha} in {repo}, the repository with branch {branch} "
-                         f"(searched {', '.join(map(str, dict.fromkeys([*repos, p.root])))})")
+                         f"(searched {', '.join(map(str, dict.fromkeys([*repos, p.root])))}; "
+                         "run from the repository that has it, or pass --repo <path>)")
     if repo == p.root or ref:
         onto = ref or _push_ref(p, repo)
         rc, words = check(p, repo, full, onto=onto)
@@ -399,8 +408,13 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     theirs = set(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", "-m",
                       "--first-parent", "-z", full).stdout.split("\0")) - {""}
     mine = set(_git(repo, "diff", "--name-only", "--no-renames", "-z", base, head).stdout.split("\0")) - {""}
-    if not theirs & mine:
-        raise ValueError(f"not recorded: {full[:10]} changes none of the files branch {branch} changes")
+    on_ref = bool(ref) and any(_commit(repo, r) and _git(repo, "merge-base", "--is-ancestor", full, r).returncode == 0
+                               for r in (f"refs/heads/{ref}", f"refs/remotes/origin/{ref}", ref))
+    if not on_ref and not theirs & mine:
+        raise ValueError(f"not recorded: {full[:10]} changes none of the files branch {branch} changes "
+                         f"(compared: the files of {full[:10]} against the files branch {branch} changed since it left "
+                         f"{ref or 'the push branch'}); if the work landed earlier on a branch, pass it with "
+                         "--ref <branch>: a commit already on that local or remote-tracking ref is accepted")
     p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
            (tid, head, full, time.time()))
     return f"task #{tid}: branch {branch} at {head[:10]} recorded as superseded by {full[:10]} ({words})"

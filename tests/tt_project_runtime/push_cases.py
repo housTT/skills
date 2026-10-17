@@ -283,7 +283,7 @@ def test_superseded_reads_a_task_branch_in_the_second_repository_it_worked_in(en
     assert landed.record_superseded(p, tid2, relanded, ref="origin/pr-head")
     # A branch in no repository the task worked in: the error lists each one checked.
     p.db.update_task(tid2, branch="gone-branch")
-    with pytest.raises(ValueError, match=f"no branch gone-branch to record \\(checked {second}/wt, {repo}\\)"):
+    with pytest.raises(ValueError, match=f"no branch gone-branch to record \\(checked {repo}, {second}/wt\\)"):
         landed.record_superseded(p, tid2, relanded)
 
 
@@ -8314,3 +8314,34 @@ def test_superseded_repo_override_finds_a_commit_only_a_separate_clone_has(env, 
     assert str(clone) in err and str(p.root) in err
     assert ttp_task("superseded", str(tid2), relanded, "--ref", "pr-head", "--repo", str(clone)) == 0
     assert landed.superseded(p.db, [tid2]) == {tid2: [(feat, relanded)]}
+
+
+def test_superseded_reads_the_cwd_repository_and_accepts_a_commit_already_on_the_ref(env, monkeypatch, capsys):
+    """The commit is found in the repository `ttp` runs in when the task's own clone lacks it, and a commit
+    already on --ref (local or remote-tracking) is accepted without the file-overlap check; without --ref
+    the overlap error says what it compares and how to pass the ref."""
+    from ttp import cli
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _commit(path, "more.txt", "a\nb\n")
+    _commit(other, "unrelated.txt", "other work\n")
+    unrelated = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    _git_out(other, "fetch", "-q", str(repo), f"{branch}:{branch}")   # a clone with the branch and the commit
+    monkeypatch.chdir(other)   # the task's own clone has not fetched the commit
+    assert ttp_task("superseded", str(tid), unrelated, "--ref", "origin/proj") == 0
+    assert "recorded as superseded" in capsys.readouterr().out
+    p.db.x("DELETE FROM task_superseded WHERE task=?", (tid,))
+    monkeypatch.chdir(repo)
+    _git_out(repo, "fetch", "-q", "origin")
+    assert ttp_task("superseded", str(tid), unrelated) not in (0, None)
+    err = capsys.readouterr().err
+    assert "changes none of the files" in err and "compared:" in err and "--ref <branch>" in err
+    assert ttp_task("superseded", str(tid), unrelated, "--ref", "origin/proj") == 0
+    assert "recorded as superseded" in capsys.readouterr().out

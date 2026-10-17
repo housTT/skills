@@ -6287,9 +6287,10 @@ def main(argv: list[str] | None = None) -> None:
                    "superseded: the commit on the push branch that carries the task's work")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
-                   "required: the branch of a second repository that holds its work, or a ref the commit is on")
+                   "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "
+                   "local or remote-tracking ref skips the file-overlap check")
     s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
-                   "(default: the repositories the task's runs worked in, then the project root)")
+                   "(then the repository of the current directory, the repositories the task's runs worked in, the project root)")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
