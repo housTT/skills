@@ -28591,13 +28591,14 @@ def test_branch_index_scans_a_long_punctuation_run_in_linear_time(env):
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     p = make(env)
-    # Follow-ups or findings: the coordinator's turn queues the review, so the reviewer sees its decisions.
+    # Follow-ups or findings: the review is still queued in the hand-off step, and the coordinator's
+    # turn still runs for the rest.
     fup = {"status": "done", "summary": "ok", "followups": [{"title": "next", "spec": "s"}]}
     _, _, done, reviews = _finish_code(env, p, "with follow-up", {"a.py": 5}, result=fup)
-    assert reviews == [] and done["status"] == "queued" and "Review #" not in done["text"]
+    assert len(reviews) == 1 and done["status"] == "queued" and "Review #" in done["text"]
     facts = {"status": "done", "summary": "ok", "findings": [{"fact": "x is slow", "source": "a.py"}]}
     _, _, done, reviews = _finish_code(env, p, "with findings", {"b.py": 5}, result=facts)
-    assert reviews == [] and done["status"] == "queued"
+    assert len(reviews) == 1 and done["status"] == "queued"
     # Nothing to review, or no review step in delivery: the coordinator decides.
     _, _, done, reviews = _finish_code(env, p, "no commits", {})
     assert reviews == [] and done["status"] == "queued"
