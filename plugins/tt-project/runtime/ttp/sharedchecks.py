@@ -12,8 +12,8 @@ it wakes. One incident per shared failure carries one fix task, one low feed lin
 and the wakes avoided with their estimated $ (the daily audit's line). A task still lands only after
 its own checks pass: nothing here skips or weakens them.
 
-A new incident with an id whose earlier incident closed within `checks.shared_repeat_h` is a repeat:
-the last fix did not hold. Its fix task runs at standard and its spec asks for the root cause, a fake
+A new incident with an id whose earlier incident's fix task ended done and landed on the push branch
+within `checks.shared_repeat_h` is a repeat: the last fix did not hold. Its fix task runs at standard and its spec asks for the root cause, a fake
 clock or event in place of wall-time assertions, and REPEAT_RUNS passing runs of each repeated test
 under parallel load before done."""
 from __future__ import annotations
@@ -22,7 +22,7 @@ import json
 import re
 import sqlite3
 
-from .db import TERMINAL_TASK_STATES, DB
+from .db import TERMINAL_TASK_STATES, DB, review_subject
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks_failures (
@@ -189,15 +189,42 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
 
 
 def repeats(db: DB, ids: list[str], now: float, cfg: dict) -> list[str]:
-    """The ids among `ids` whose earlier incident closed within the repeat window, timed by its fix
-    task's last update (an incident is only marked closed when the next one is looked up)."""
+    """The ids among `ids` whose earlier incident's fix ended done and landed on the push branch within
+    the repeat window, timed by its landing (else by the fix task's last update: an incident is only
+    marked closed when the next one is looked up). A fix not landed yet, failed, cancelled or gone
+    proves nothing about the tip, so it makes no repeat.
+    Accepted gaps (both err toward no repeat label): a fix that landed outside the push queue, or not
+    as a task, is not recognized; a landing not yet visible in the local records is not landed (this
+    path never fetches)."""
     since = now - settings(cfg)["repeat_s"]
     out: set[str] = set()
-    for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NOT NULL AND closed>=? ORDER BY id", (since,)):
+    landed = None
+    for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NOT NULL ORDER BY id"):
+        if not set(_rows(r["ids"])) & set(ids):
+            continue
         fix = db.task(r["fix_task"]) if r["fix_task"] else None
-        if min(float(r["closed"]), float((fix or {}).get("updated") or r["closed"])) >= since:
+        if fix is None or fix["status"] != "done":
+            continue
+        if landed is None:
+            from .tried import landed_tasks
+            landed = landed_tasks(db)
+        if fix["id"] not in landed:
+            continue
+        at = _landed_at(db, fix) or min(float(r["closed"]), float(fix.get("updated") or r["closed"]))
+        if at >= since:
             out |= set(_rows(r["ids"])) & set(ids)
     return sorted(out)
+
+
+def _landed_at(db: DB, fix: dict) -> float | None:
+    """When the push queue landed `fix` (its own row, its branch's or a review's of it), if it did."""
+    rows = db.q("SELECT q.task, q.branch, q.updated, t.kind, t.labels, t.title FROM push_queue q "
+                "LEFT JOIN tasks t ON t.id=q.task WHERE q.status IN ('pushed','landed') "
+                "AND COALESCE(q.landed_sha, q.pushed_sha) IS NOT NULL")
+    ts = [float(r["updated"]) for r in rows
+          if r["task"] == fix["id"] or (fix.get("branch") and r["branch"] == fix["branch"])
+          or (r["kind"] == "review" and review_subject({"labels": r["labels"], "title": r["title"]}) == fix["id"])]
+    return min(ts) if ts else None
 
 
 def _spec(ids: list[str], excerpt: str, tasks: list[int], again: list[str] = ()) -> str:

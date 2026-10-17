@@ -290,6 +290,7 @@ def test_a_repeat_shared_failure_gets_a_fix_task_that_must_prove_stability(env):
     first = p.db.task(fix1["fix_task"])
     assert first["tier"] == "standard" and "Repeat incident" not in first["spec"]
     p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now + 3600, first["id"]))
+    _land(p, first["id"], now + 7200)
     # The same test fails shared again two days later: the fix did not hold.
     later = now + 2 * 86400
     iid2, opened = sharedchecks.incident(p.db, p.db.task(t2), _IDS, "boom again", later, {})
@@ -309,9 +310,80 @@ def test_a_repeat_shared_failure_gets_a_fix_task_that_must_prove_stability(env):
     # A fix that ended longer ago than the repeat window does not count, even when the incident was
     # only marked closed later.
     p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (later, fix["id"]))
+    _land(p, fix["id"], later)
     much_later = later + 4 * 86400
     iid3, opened = sharedchecks.incident(p.db, p.db.task(t1), _IDS, "boom", much_later, {})
     assert opened
     fix3 = p.db.task(p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid3,))["fix_task"])
     assert "Repeat incident" not in fix3["spec"]
     assert sharedchecks.repeats(p.db, _IDS, much_later, {"checks": {"shared_repeat_h": 200}}) == sorted(_IDS)
+
+
+def _land(p, tid, ts, status="pushed", task=None):
+    """A push queue row recording that `tid`'s change landed at `ts` (pushed by `task`, else itself)."""
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?)", (task or tid, f"ttp/t{tid}", "a" * 40, "main", status, ts, ts, "b" * 40))
+
+
+def _second_spec(p, fix_status, landed, now=1_000_000.0):
+    """The spec of the fix task for a shared failure on the same id one day after an earlier
+    incident whose fix task ended `fix_status` (landed or not)."""
+    from ttp import sharedchecks
+    t1, t2 = (p.db.add_task(f"held {k}", "x", kind="code") for k in range(2))
+    iid1, _ = sharedchecks.incident(p.db, p.db.task(t1), _IDS[:1], "boom", now, {})
+    fix1 = p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid1,))["fix_task"]
+    p.db.x("UPDATE tasks SET status=?, updated=? WHERE id=?", (fix_status, now + 3600, fix1))
+    if landed:
+        _land(p, fix1, now + 7200)
+    iid2, opened = sharedchecks.incident(p.db, p.db.task(t2), _IDS[:1], "boom", now + 86400, {})
+    assert opened and iid2 != iid1
+    return p.db.task(p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid2,))["fix_task"])["spec"]
+
+
+def test_a_shared_failure_after_a_fix_that_did_not_land_is_no_repeat(env):
+    # The fix task handed off done but its change is not on the push branch yet: held tasks that
+    # rerun on the old tip and fail again prove nothing about the fix.
+    spec = _second_spec(make(env), "done", landed=False)
+    assert "Repeat incident" not in spec and "times under parallel load" not in spec
+
+
+def test_a_shared_failure_after_a_landed_fix_is_a_repeat(env):
+    spec = _second_spec(make(env), "done", landed=True)
+    assert "Repeat incident" in spec and f"- {_IDS[0]}" in spec.split("Repeat incident", 1)[1]
+
+
+def test_a_shared_failure_after_a_landed_review_of_the_fix_is_a_repeat(env):
+    from ttp import sharedchecks
+    p = make(env)
+    now = 1_000_000.0
+    t1, t2 = (p.db.add_task(f"held {k}", "x", kind="code") for k in range(2))
+    iid1, _ = sharedchecks.incident(p.db, p.db.task(t1), _IDS[:1], "boom", now, {})
+    fix1 = p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid1,))["fix_task"]
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 10 * 86400, fix1))
+    rev = p.db.add_task(f"Review #{fix1}", "x", kind="review", labels=[f"auto_review:{fix1}"])
+    # Landed by its review one hour ago: the window runs from the landing, not the old hand-off.
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?)", (rev, "ttp/other", "a" * 40, "main", "pushed", now, now, "b" * 40))
+    iid2, _ = sharedchecks.incident(p.db, p.db.task(t2), _IDS[:1], "boom", now + 3600, {})
+    fix2 = p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid2,))["fix_task"]
+    assert "Repeat incident" in p.db.task(fix2)["spec"]
+
+
+def test_a_shared_failure_after_a_failed_or_cancelled_fix_is_no_repeat(env):
+    for status in ("failed", "cancelled"):
+        spec = _second_spec(make(env), status, landed=False)
+        assert "Repeat incident" not in spec, status
+    # Even with a push row (a stale or partial record), a fix that did not end done makes no repeat.
+    spec = _second_spec(make(env), "failed", landed=True)
+    assert "Repeat incident" not in spec
+
+
+def test_a_shared_failure_after_a_missing_fix_task_is_no_repeat(env):
+    from ttp import sharedchecks
+    p = make(env)
+    now = 1_000_000.0
+    t1 = p.db.add_task("held", "x", kind="code")
+    sharedchecks.ensure(p.db)
+    p.db.x("INSERT INTO checks_incidents(ids,opened,last,fix_task,tasks,closed) VALUES(?,?,?,?,?,?)",
+           (json.dumps(_IDS[:1]), now, now, 999_999, json.dumps([t1]), now + 60))
+    assert sharedchecks.repeats(p.db, _IDS, now + 3600, {}) == []
