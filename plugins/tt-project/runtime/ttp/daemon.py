@@ -54,6 +54,7 @@ from . import failover
 from . import outagetask
 from . import grants
 from . import ends
+from . import handofflint
 from . import harnesstree
 from . import heal
 from . import holdloops
@@ -3420,6 +3421,13 @@ class Daemon:
             if plugs:
                 notes += "\nRecommended skill plugins for workers:" + "".join(
                     f"\n- {x['path']}: {x.get('why', '')}" for x in plugs)
+        if fups and task["kind"] == "code":
+            try:   # model-free, on every code hand-off: no worker has to run it
+                for line in handofflint.lint(self.p, self.cfg, task, result):
+                    notes += "\n" + line
+                    log(self.p, f"task {task['id']}: {line}")
+            except Exception:
+                log(self.p, "hand-off lint failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
