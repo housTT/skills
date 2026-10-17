@@ -2289,3 +2289,141 @@ def test_machine_pages_and_status_say_how_long_and_who_acts_now(env):
     Daemon(alpha.base)._machine_page({**pages[0], "key": "machine:old", "text": "Machine box-a held."}, later)
     old = alpha.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='machine:old'")["text"]
     assert old == "Outage: Machine box-a held. Acting now: nobody: escalating to the user.", old
+
+def _due(p, name):
+    p.db.x("UPDATE schedules SET next_run=? WHERE name=?", (time.time() - 1, name))
+
+
+def _settle(d, name, within=20.0):
+    """Tick the schedules until `name`'s run is recorded; its row."""
+    end = time.monotonic() + within
+    d.run_schedules()
+    while name in d._sched_runs and time.monotonic() < end:
+        d.run_schedules()
+    assert name not in d._sched_runs, f"schedule {name} still running after {within} s"
+    return d.p.db.one("SELECT * FROM schedules WHERE name=?", (name,))
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    stat = f"/proc/{pid}/stat"
+    return not os.path.exists(stat) or open(stat).read().rsplit(") ", 1)[1][0] != "Z"
+
+
+def test_a_slow_command_schedule_never_holds_the_tick(env, monkeypatch):
+    """A command that runs far longer than a tick goes on off the tick: the tick's later steps (message
+    handling, dispatch) still run within seconds, and its result is recorded on a later tick."""
+    from ttp import daemon as dm, schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "slow", "command", "1h", payload={"command": "sleep 4; echo '{\"text\": \"done\"}'",
+                                                        "timeout_s": 60})
+    _due(p, "slow")
+    d = dm.Daemon(p.base)
+    later = []
+    monkeypatch.setattr(d, "maybe_coordinate", lambda: later.append("coordinate"))
+    monkeypatch.setattr(d, "dispatch", lambda: later.append("dispatch"))
+    t0 = time.monotonic()
+    d.tick()
+    assert time.monotonic() - t0 < dm.SCHEDULE_WAIT_S + 3, "the tick waited for the slow schedule"
+    assert later == ["coordinate", "dispatch"] and "slow" in d._sched_runs
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='slow'")["last_run"] is None
+    row = _settle(d, "slow")
+    assert row["last_status"] == "ok (1 observations)" and row["last_run"]
+
+
+def test_a_command_schedule_past_its_timeout_has_its_group_killed_and_counts_as_failed(env, tmp_path):
+    """Its whole process group is killed (the shell's background child too) and the run is a failed
+    one: an error observation, and two in a row queue the usual fix task."""
+    from ttp import daemon as dm, schedrun, schedule as sched, screen as scr
+    p = make(env)
+    pidfile = tmp_path / "child.pid"
+    sched.upsert(p.db, "hangs", "command", "1h", payload={
+        "command": f"sleep 60 & echo $! > {pidfile}; wait", "timeout_s": 1})
+    d = dm.Daemon(p.base)
+    for n in (1, 2):
+        _due(p, "hangs")
+        row = _settle(d, "hangs")
+        assert row["last_status"] == "error: timed out after 1 s", row["last_status"]
+        child = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while _alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child), "the command's background child outlived its timeout"
+    assert p.db.q("SELECT id FROM issues WHERE source=? AND status='open'", (scr.error_source("watcher:hangs"),))
+    assert "hangs" in (p.db.kv(d.SCHEDULE_FIXES_KEY) or {}), "two failed runs in a row queue the fix task"
+    assert not p.db.kv(schedrun.GROUPS_KEY), "an ended group is no longer kept"
+
+
+def test_a_schedule_still_running_at_its_next_due_time_is_not_started_twice(env, tmp_path):
+    from ttp import daemon as dm, schedule as sched
+    p = make(env)
+    count = tmp_path / "starts"
+    sched.upsert(p.db, "busy", "command", "1m", payload={"command": f"echo x >> {count}; test $(wc -l < {count}) -gt 1 || sleep 5",
+                                                        "timeout_s": 60})
+    d = dm.Daemon(p.base)
+    for _ in range(2):   # 4 s at most: the first run takes 5
+        _due(p, "busy")
+        d.run_schedules()
+    assert count.read_text().count("x") == 1 and "busy" in d._sched_runs
+    _settle(d, "busy")
+    _due(p, "busy")
+    _settle(d, "busy")
+    assert count.read_text().count("x") == 2, "once it ended it runs again when due"
+
+
+def test_replay_a_hanging_gh_in_the_pr_watcher_does_not_stall_the_tick(env, monkeypatch):
+    """Replay of a tick stalled in run_schedules: the builtin prs watcher sat in a gh call (subprocess
+    communicate) that did not answer. The tick now goes on; a run past its timeout is recorded failed
+    and its late result dropped, and no second run starts while the hung one still goes."""
+    from ttp import daemon as dm, schedule as sched, watchers
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", "https://github.com/acme/widgets/pull/1", time.time()))
+    gate, calls = threading.Event(), []
+
+    def hung_gh(args, cwd):
+        calls.append(args[0])
+        gate.wait(30)
+        return None
+    monkeypatch.setattr(watchers, "_gh", hung_gh)
+    monkeypatch.setattr(dm, "SCHEDULE_GRACE_S", 0)
+    sched.upsert(p.db, "prs", "watcher", "5m", payload={"builtin": "prs", "deadline_s": 1})
+    _due(p, "prs")
+    d = dm.Daemon(p.base)
+    later = []
+    monkeypatch.setattr(d, "dispatch", lambda: later.append("dispatch"))
+    t0 = time.monotonic()
+    d.tick()
+    assert time.monotonic() - t0 < dm.SCHEDULE_WAIT_S + 3 and later == ["dispatch"]
+    time.sleep(1.1)
+    d.run_schedules()
+    row = p.db.one("SELECT * FROM schedules WHERE name='prs'")
+    assert row["last_status"] == "error: timed out after 1 s", row["last_status"]
+    _due(p, "prs")
+    d.run_schedules()
+    assert len(calls) == 1, "the hung run is not started again while it still goes"
+    gate.set()
+    _settle(d, "prs")
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='prs'")["last_status"].startswith("error: timed out")
+
+
+def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs_them_once_more(env, tmp_path):
+    from ttp import daemon as dm, schedrun, schedule as sched
+    p = make(env)
+    first = tmp_path / "first"
+    sched.upsert(p.db, "long", "command", "1h", payload={
+        "command": f"test -f {first} || {{ touch {first}; exec sleep 60; }}", "timeout_s": 120})
+    _due(p, "long")
+    d1 = dm.Daemon(p.base)
+    d1.run_schedules()
+    groups = p.db.kv(schedrun.GROUPS_KEY) or {}
+    assert len(groups) == 1 and "long" in d1._sched_runs
+    pid = int(next(iter(groups)))
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='long'")["last_run"] is None
+    d2 = dm.Daemon(p.base)   # d1 is gone: its tick never records that run
+    row = _settle(d2, "long")
+    assert not _alive(pid), "the earlier daemon's command was killed"
+    assert row["last_status"] == "ok (0 observations)", "the schedule ran once more, recorded once"
