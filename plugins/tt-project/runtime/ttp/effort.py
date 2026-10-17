@@ -118,7 +118,7 @@ def retry_tier(db: DB, task: dict) -> str | None:
             return None
         return up if last.get(RAISED) != attempts else None
     for old in _continued(db, task):   # a fix after a review that asked for changes is no retry
-        if task_outcome(old) == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
+        if old["kind"] != "review" and task_outcome(old) == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
             return up
     return None
 
@@ -198,6 +198,8 @@ def pick(db: DB, cfg: dict, task: dict, provider: str, jev=None) -> dict | None:
         got = {"jev_error": type(e).__name__}
     if not got or "tier" not in got:
         got = {**(got or {}), "tier": rules_tier(task), "by": "rules"}
+    if got.get("tier") == "light" and db._continues_failed_review(_labels(task)):
+        got = {**got, "tier": "standard"}   # a fix of a failed review runs at least standard
     return {**got, "from": task["tier"], "review": review}
 
 

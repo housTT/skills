@@ -8559,3 +8559,17 @@ def test_a_fix_of_a_failed_review_runs_at_least_standard(env, monkeypatch):
     assert p.db.task(deep)["tier"] == "deep"
     plain = p.db.add_task("plain", "x", kind="code", tier="light")
     assert p.db.task(plain)["tier"] == "light"
+    from ttp import effort
+    monkeypatch.setattr(effort, "_jev_tier", lambda *a, **k: {"tier": "light", "by": "jev", "score": 0.2})
+    d = Daemon(p.base)
+
+    def started(tier, label):
+        t = p.db.task(p.db.add_task("c", "x", kind="code", tier=tier, origin="coordinator", labels=[label]))
+        got = d._pick_effort(t, "claude")
+        return p.db.task(t["id"])["tier"]
+    p.db.update_task(rev["id"], tier="standard")
+    assert started("standard", f"continues:{rev['id']}") == "standard"
+    p.db.update_task(rev["id"], tier="light")
+    assert started("light", f"continues:{rev['id']}") == "standard"
+    assert started("deep", f"continues:{rev['id']}") == "deep"
+    assert p.db.task(fid)["tier"] == "standard"
