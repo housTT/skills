@@ -192,7 +192,7 @@ def test_outage_replay_held_box_paused_owner_muted_watcher_reaches_a_task_in_tim
     monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
     held = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True,
                        "machine": "box-a", "condition": "held"})
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, held, ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, held, ""))
     d = dm.Daemon(p.base)
     d._run_command_watcher({"name": "hw"}, {"command": "x"})
     assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held",
