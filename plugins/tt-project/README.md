@@ -322,9 +322,16 @@ prolonged whole-box outage.
   globs (unset or empty: any path may go light). The review run's note records the pick and the
   rule behind it (`review_tier`).
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
-  daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
-  findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
-  Any other hand-off leaves the review to the coordinator's turn. A code task still in review
+  daemon queues the review of each finished code task in the same step that records its hand-off
+  (`review.auto`, on by default). A hand-off with no follow-ups, notes or findings starts no
+  coordinator turn; any other still goes to the coordinator for those, and the review's spec lists
+  its follow-ups. As a backstop, a done code task (or one waiting on something else for
+  `review.sweep_after_s`) whose head is on no push-branch ref, with no review, open continuation,
+  push-queue entry or recorded reason (superseded, rejected, `no_push`, all push-excluded, a PR
+  that carries the head, a push branch no push reaches, a recorded landing), gets its review and
+  a low feed line, at most `review.unreviewed_per_pass` (default 2, 0 off) per pass, for tasks
+  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
+  blocker sweep, reads local refs only, and never queues a second review of one head. A code task still in review
   with no review `review.sweep_after_s` (default 1800, 0 off) after its last run gets its review
   from the daemon. The sweep only queues reviews and never closes a task, so a task whose
   continuation already passed review still gets its own review (one review each, no work lost).

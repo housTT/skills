@@ -236,9 +236,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
     # The daily review's self-efficiency audit lists tasks blocked longer than blocked_long_h hours.
     # A code task left in review with no review sweep_after_s (0 off) after its last run gets one
-    # from the daemon (sweep_reviews), which only queues reviews and never closes a task.
+    # from the daemon (sweep_reviews), which only queues reviews and never closes a task. A done code
+    # task with an unlanded head and no review gets one too (sweep_unreviewed): at most
+    # unreviewed_per_pass (0 off) per pass, for tasks updated within unreviewed_max_age_h hours.
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
-               "area_fail_cap": 3, "blocked_long_h": 12, "sweep_after_s": 1800},
+               "area_fail_cap": 3, "blocked_long_h": 12, "sweep_after_s": 1800,
+               "unreviewed_per_pass": 2, "unreviewed_max_age_h": 72},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a high-effort turn.

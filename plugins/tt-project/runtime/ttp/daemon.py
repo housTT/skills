@@ -266,6 +266,12 @@ CONTINUE_UNQUEUED_WINDOW_S = 86400   # task_done events older than this are not 
 CONTINUE_CHECK_EVERY_S = 300
 KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code tasks left in review with no review
+# sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
+UNREVIEWED_EVENT = "review_unqueued"
+UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass: most reviews one pass queues (0 off)
+UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated longer ago are left alone
+UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
+UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -563,6 +569,7 @@ class Daemon:
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._review_swept = 0.0     # when sweep_reviews last ran
+        self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
@@ -952,7 +959,7 @@ class Daemon:
         core_held = self.net_held(core) and not self._net_may_probe(core)
         cycle = self.host_cycle_held(now)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3394,17 +3401,16 @@ class Daemon:
         # A timeout still does, since the task may need splitting before it times out again.
         quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff",
                                                "refused_wait") or push_quiet
-        # A finished code task's next step is its review. A hand-off with nothing else to decide (no
-        # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
-        # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
+        # A finished code task's next step is its review, queued here in the same step whatever else the
+        # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
+        # A hand-off with nothing else to decide (no follow-ups or notes, normal severity) starts no turn.
         plain = not fups and not notes and sev == "normal"
         # A done hop whose only proposal is the next `continue:` hop, with progress and under the
         # chain caps, gets it from the daemon (chaincap). That hop starts from the base, not this
         # branch, so a code hop's own commits get their review now, as a plain hand-off's do.
         ready = self._continue_ready(dict(task, **upd), fups) \
             if new == "done" and not approval and not notes and sev == "normal" else ""
-        review = self._auto_review(dict(task, **upd), summary, add=plain or bool(ready)) \
-            if new == "done" and task["kind"] == "code" else None
+        review = self._auto_review(dict(task, **upd), summary) if new == "done" and task["kind"] == "code" else None
         if review:
             known = None if review[1] else db.task(review[0])
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else
@@ -4622,6 +4628,7 @@ class Daemon:
                 if prov not in ctx["logged_out"]:
                     ctx["logged_out"][prov] = self._logged_out(prov)
                 return self._start_hold(t, prov, ctx)
+            self.sweep_unreviewed(force=True)   # its data pass: no finished change sits unreviewed into it
             eid = sweep.start(db, self.cfg, why, now, hold_of=hold_of)
             if eid:
                 log(self.p, f"blocker sweep queued ({why})")
@@ -7684,6 +7691,120 @@ class Daemon:
         except Exception:
             log(self.p, "review sweep failed\n" + traceback.format_exc())
 
+    def sweep_unreviewed(self, force: bool = False) -> list[int]:
+        """Model-free invariant backstop: a code task that is done, or has waited externally for
+        review.sweep_after_s, whose branch head is on no push-branch ref (local refs and push_queue
+        rows only, no fetch) gets its review queued (_auto_review), with one low feed line naming it.
+        Left alone: a review of it that is open or ran since its last run (or that names this head),
+        an open task continuing it or on its branch, a push-queue entry for it or its head, and a
+        recorded reason (superseded or rejected, a `no_push`, a diff all under push_exclude_paths, a
+        head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
+        review.unreviewed_per_pass reviews per pass, only tasks updated within
+        review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
+        Every REVIEW_SWEEP_EVERY_S from the tick, and at once (`force`) in the blocker sweep's data
+        pass; returns the tasks it queued a review for."""
+        now = time.time()
+        if not force and now - self._unreviewed_swept < REVIEW_SWEEP_EVERY_S:
+            return []
+        self._unreviewed_swept = now
+        cfg, db, done = self.cfg, self.p.db, []
+        rules, d = cfg.get("review") or {}, cfg.get("delivery") or {}
+        try:
+            cap = int(rules.get("unreviewed_per_pass", UNREVIEWED_PER_PASS))
+            age = float(rules.get("unreviewed_max_age_h", UNREVIEWED_MAX_AGE_H)) * 3600
+            waited = float(rules.get("sweep_after_s", 1800) or 0)
+        except (TypeError, ValueError):
+            cap, age, waited = UNREVIEWED_PER_PASS, UNREVIEWED_MAX_AGE_H * 3600.0, 1800.0
+        if cap <= 0 or not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
+            return []
+        try:
+            todo = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL "
+                        "AND branch!='' AND updated>=? AND updated<=? ORDER BY id",
+                        (now - age, now - UNREVIEWED_GRACE_S))
+            if not todo:
+                return []
+            code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
+                                          "AND branch IS NOT NULL AND branch!=''"))
+            reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id",
+                           (todo[0]["id"],))
+            rows: dict[int, list[dict]] = {}
+            for x in db.q("SELECT * FROM push_queue WHERE task IN (%s)" % ",".join("?" * len(reviews)),
+                          [r["id"] for r in reviews]) if reviews else []:
+                rows.setdefault(x["task"], []).append(x)
+            covers: dict[int, set[int]] = {}
+            live = db.q("SELECT id, branch, labels FROM tasks WHERE status NOT IN (?,?,?)", TERMINAL_TASK_STATES)
+            ref = landed._push_ref(self.p, self.p.root) if d.get("push_branch") else ""
+            never = push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d)) \
+                if d.get("push_branch") and d.get("push_allowed", True) else ""
+        except Exception:
+            log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
+            return []
+        for t in todo:
+            if len(done) >= cap or time.time() - now > UNREVIEWED_PASS_S:
+                break
+            try:
+                if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never, waited, now):
+                    continue
+                review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
+            except Exception as e:
+                log(self.p, f"task {t['id']}: unreviewed check failed: {e}")
+                continue
+            if review and review[1]:
+                done.append(t["id"])
+                log(self.p, f"task {t['id']}: {t['status']} with an unlanded head and no review; queued review "
+                            f"#{review[0]}")
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", UNREVIEWED_EVENT, "low",
+                      f"#{t['id']} {headline.clip(t['title'], 160)}: its commits had no review and were not landed; "
+                      f"review #{review[0]} queued by the daemon.", "handled", t["id"]))
+        return done
+
+    def _unreviewed_skip(self, t: dict, reviews: list[dict], rows: dict, covers: dict, code, live: list[dict],
+                         ref: str, never: str, waited: float, now: float) -> str:
+        """Why sweep_unreviewed leaves code task `t` alone, or "" when it needs its review now. Cheap
+        record checks first, git last."""
+        db, d, tid = self.p.db, self.cfg.get("delivery") or {}, t["id"]
+        result = load_result(t["result"])
+        if t["status"] == "queued":
+            if result.get("status") != "waiting":
+                return "not finished"
+            if unblock.classify_wait(result)[0] == "self" or now - float(t["updated"] or 0) < waited:
+                return "waits on its own work"
+        if str(result.get("outcome") or "").lower() in ("rejected", "shelved") or result.get("superseded_by"):
+            return "rejected or superseded"
+        if never:
+            return f"no push can reach the push branch: {never}"
+        if db.one("SELECT 1 FROM task_superseded WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
+                  "UNION ALL SELECT 1 FROM push_queue WHERE task=?", (tid, tid, tid)):
+            return "superseded, landed or queued"
+        if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"]) for x in live):
+            return "an open task continues it"
+        tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
+        if not tip:
+            return "no branch"
+        ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (tid,))["e"]
+        start = float(ended or t["updated"] or 0)
+        for r in reviews:
+            if r["id"] not in covers:
+                covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
+            if tid in covers[r["id"]] and (r["status"] not in ("done", "failed") or float(r["updated"] or 0) >= start
+                                           or f"review_head:{tip}" in (r["labels"] or "")):
+                return f"review #{r['id']} covers it"
+        if db.one("SELECT 1 FROM push_queue WHERE head=? AND status!='cancelled'", (tip,)):
+            return "its head is in the push queue"
+        if ref and landed.on_branch(self.p.root, tip, ref):
+            return "its head is on the push branch"
+        changes = worktree.diff_lines(self.p, [t["branch"]])
+        if not changes:
+            return "no changes"
+        if d.get("push_branch") and (why := push.kept_off(t, changes, d, self.p)):
+            return why
+        if push.delivered_pr(self.p, t, tip):
+            return "its PR carries this head"
+        if self._landed_elsewhere(t):
+            return "landed under other commits"
+        return ""
+
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
@@ -7753,6 +7874,12 @@ class Daemon:
                  f"head {head}" + (f", PR {pr}" if pr else "") + ".",
                  f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
                  f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]
+        fups = load_result(task.get("result")).get("followups")
+        fups = [str(f["title"])[:120] for f in fups if isinstance(f, dict) and f.get("title")] \
+            if isinstance(fups, list) else []
+        if fups:
+            lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
+                         "change, so not a finding by themselves): " + "; ".join(fups[:MAX_FOLLOWUPS]))
         if prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")

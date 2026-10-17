@@ -76,9 +76,9 @@ Each field's rules are in the section named; the table only lists them.
   without it, the daemon moves a task pinned to another provider than the core one to the core
   provider once that provider's gate holds it; a required pin waits.
 - Reviews the daemon makes: when delivery has a review step, it queues `Review #<id>: <title>` for
-  each finished code task whose hand-off has no follow-ups, notes or findings. Do not add another:
-  steer it with `task_update` `spec`. Any other hand-off gets none: queue the review yourself, with
-  what the reviewer needs. A review you add for work whose daemon review has not started replaces it.
+  each finished code task (its spec lists the hand-off's follow-ups; they stay yours). Do not add
+  another: steer it with `task_update` `spec`. A review you add for work whose daemon review has
+  not started replaces it.
   A failed (or `changes_needed`) review with follow-ups on one code branch or stack gets one daemon
   fix task on it (`Fix review #<id>: ...`) and a re-review: never add these again. `upstream:` notes,
   deferred follow-ups, a third failed round and a failure without fix follow-ups are yours.

@@ -28617,20 +28617,25 @@ def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     assert reviews == [] and done["status"] == "queued"
 
 
-def test_a_non_routine_hand_off_queues_no_review_that_holds_the_coordinator(env):
+def test_a_hand_off_with_follow_ups_gets_its_review_in_the_same_step(env):
+    """Replay of a code task whose done hand-off proposed one follow-up: the review used to be left to
+    the coordinator, which queued none for hours. Now the hand-off queues it, its spec carries the
+    follow-ups, and those stay queued for the coordinator; the batch hold that a review in the only
+    free slot causes ends after coordinator.batch_s."""
     p = make(env)
     from ttp.daemon import Daemon
     p.db.x("UPDATE events SET status='handled'")
     p.db.x("UPDATE tasks SET status='done'")
     p.set_config("budget.max_parallel_workers", 1)
-    fup = {"status": "done", "summary": "ok", "followups": [{"title": "next", "spec": "s"}]}
-    _, _, done, reviews = _finish_code(env, p, "one slot", {"a.py": 5}, result=fup)
-    assert reviews == [] and p.db.ready_tasks() == []
+    fup = {"status": "done", "summary": "ok", "followups": [{"title": "README names the wrong reader", "spec": "s"}]}
+    tid, _, done, (rev,) = _finish_code(env, p, "one slot", {"a.py": 5}, result=fup)
+    assert "README names the wrong reader" in rev["spec"] and f"Review #{rev['id']} queued by the daemon" in done["text"]
     d = Daemon(p.base)
     d.update_gates()
     queued = p.db.q("SELECT * FROM events WHERE status='queued'")
-    assert {e["kind"] for e in queued} >= {"task_done", "followup_proposed"}
-    assert not d._batch_hold(queued, time.time()), "a daemon review filled the free slot and held the turn"
+    assert {e["kind"] for e in queued} >= {"task_done", "followup_proposed"}, "the follow-ups left the coordinator"
+    assert not d._batch_hold(queued, max(e["ts"] for e in queued) + 301)
+    assert d.sweep_unreviewed(force=True) == [] and len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
 
 
 def test_the_daemon_adds_no_review_next_to_one_already_queued(env):
@@ -28741,6 +28746,146 @@ def test_the_review_sweep_only_queues_reviews_and_changes_no_task(env):
     assert not p.db.q("SELECT id FROM events WHERE kind='task_done' AND task IN (?,?)", (old, pr))
     _sweep(d)
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review' AND status='queued'")) == 2, "queued twice"
+
+
+def _unreviewed(env, p, title, result=None, status="done", age=600, labels=None, spec=None, edit=None):
+    """A code task in the state #2800 was left in: committed on its branch, handed off and recorded
+    `status` `age` seconds ago, with no review of it queued; `edit(worktree)` replaces its one file.
+    (task id, branch, head)."""
+    from ttp import worktree
+    from ttp.db import dump_result
+    tid = p.db.add_task(title, spec or f"spec of {title}", kind="code", tier="standard", origin="coordinator",
+                        labels=labels)
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    (edit or (lambda w: (w / f"{tid}.py").write_text(f"{title}\n")))(path)
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", title)
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    when = time.time() - age
+    p.db.update_task(tid, status=status, branch=branch,
+                     result=dump_result(result or {"status": "done", "summary": f"{title} works"}))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, tid))
+    _ran(p, tid, when)
+    return tid, branch, head
+
+
+def _daemon_reviews(p, tid=None):
+    q = "SELECT * FROM tasks WHERE kind='review' AND origin='daemon'"
+    return p.db.q(q + " AND depends_on=?", (json.dumps([tid]),)) if tid else p.db.q(q)
+
+
+def test_replay_2800_a_done_code_task_left_with_no_review_gets_exactly_one(env, monkeypatch):
+    """Replay of #2800: a code task committed, its checks passed (recorded model-free from its on_pass),
+    its done hand-off proposed one follow-up, and no review was queued. The invariant queues exactly one
+    review with a low feed line, a second pass (tick or blocker sweep) queues none, and the tick pass
+    runs at most every REVIEW_SWEEP_EVERY_S."""
+    from ttp import daemon as dm
+    p = make(env)
+    handoff = {"status": "done", "summary": "installer fixed; the full ttp checks passed on this head",
+               "followups": [{"title": "README says the script reads the ref", "spec": "Reword it."}]}
+    tid, branch, head = _unreviewed(env, p, "one-line installer keeps going", result=handoff)
+    assert not _daemon_reviews(p)
+    d = dm.Daemon(p.base)
+    assert d.sweep_unreviewed() == [tid]
+    (rev,) = _daemon_reviews(p, tid)
+    assert rev["title"] == f"Review #{tid}: one-line installer keeps going" and branch in rev["spec"]
+    assert head[:12] in rev["spec"] and "README says the script reads the ref" in rev["spec"]
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (dm.UNREVIEWED_EVENT,))
+    assert ev["task"] == tid and ev["severity"] == "low" and ev["status"] == "handled" and f"#{tid}" in ev["text"]
+    assert d.sweep_unreviewed(force=True) == [] and d.sweep_unreviewed() == []
+    # Done, passed or failed since the task's last run: still one review of this head.
+    for st in ("running", "done", "failed"):
+        p.db.update_task(rev["id"], status=st)
+        assert d.sweep_unreviewed(force=True) == [], st
+    assert len(_daemon_reviews(p)) == 1
+    # The blocker sweep's data pass runs it too.
+    p.db.x("DELETE FROM tasks WHERE kind='review'")
+    d._sweep_checked = 0.0
+    monkeypatch.setattr(dm.sweep, "due", lambda *a: "test")
+    monkeypatch.setattr(dm.sweep, "start", lambda *a, **k: None)
+    d.blocker_sweep()
+    assert len(_daemon_reviews(p, tid)) == 1
+
+
+def test_the_unreviewed_invariant_leaves_each_excluded_task_alone(env, monkeypatch):
+    from ttp import daemon as dm, push
+    p = make(env)
+    _with_origin(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_exclude_paths", ["notes/"])
+    d = dm.Daemon(p.base)
+    cases: dict[str, int] = {}
+
+    def case(name, **kw):
+        cases[name] = _unreviewed(env, p, name, **kw)[0]
+        return cases[name]
+
+    t = case("open review")
+    p.db.add_task("Review it", "Review it.", kind="review", origin="coordinator", depends_on=[t])
+    t = case("review ran since")
+    r = p.db.add_task("Review ran", "Review it.", kind="review", origin="coordinator", depends_on=[t])
+    p.db.update_task(r, status="done")
+    t, _, head = _unreviewed(env, p, "head reviewed")
+    cases["head reviewed"] = t
+    r = p.db.add_task("Review head", "Review it.", kind="review", origin="coordinator", depends_on=[t],
+                      labels=[f"review_head:{head}@x"])
+    p.db.update_task(r, status="failed")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 3600, r))
+    t = case("continued")
+    p.db.add_task("continue it", "s", kind="code", origin="coordinator", labels=[f"continues:{t}"])
+    t, branch, _ = _unreviewed(env, p, "branch in use")
+    cases["branch in use"] = t
+    other = p.db.add_task("on its branch", "s", kind="code", origin="coordinator")
+    p.db.update_task(other, branch=branch)
+    t, branch, head = _unreviewed(env, p, "queued push")
+    cases["queued push"] = t
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,created,updated) VALUES(?,?,?,?,?,?)",
+           (9999, branch, head, "origin/work", time.time(), time.time()))
+    t = case("superseded")
+    p.db.x("INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,?,?,?)", (t, "a" * 40, "b" * 40, time.time()))
+    t = case("landed")
+    p.db.x("INSERT INTO task_landings(marker,task,sha,target) VALUES(?,?,?,?)", ("m", t, "c" * 40, "origin/work"))
+    case("rejected", result={"status": "done", "summary": "no", "outcome": "rejected"})
+    case("no push", spec="Do it.\nno_push: an experiment only")
+    case("excluded diff", edit=lambda w: (w / "notes").mkdir() or (w / "notes" / "n.md").write_text("n\n"))
+    pr = case("delivered pr")
+    monkeypatch.setattr(push, "delivered_pr", lambda _p, task, _h: "https://x/pull/1" if task["id"] == pr else None)
+    t, _, head = _unreviewed(env, p, "on the push branch")
+    cases["on the push branch"] = t
+    _git_out(env["repo"], "update-ref", "refs/remotes/origin/work", head)   # a local ref: no fetch
+    case("still waiting on its checks", status="queued", age=7200, result={
+        "status": "waiting", "summary": "checks", "retry_when": "ttp checks --result x", "wait_kind": "self"})
+    case("waiting briefly", status="queued", age=600, result={"status": "waiting", "summary": "x",
+                                                                 "wait_kind": "external"})
+    case("queued again", status="queued", age=7200)
+    case("too old", age=dm.UNREVIEWED_MAX_AGE_H * 3600 + 600)
+    case("just finished", age=10)
+    p.set_config("review.unreviewed_per_pass", 100)
+    queued = dm.Daemon(p.base).sweep_unreviewed(force=True)
+    left = {name for name, tid in cases.items() if tid in queued}
+    assert left == set(), f"reviewed despite an exclusion: {left}"
+    # The same states with the exclusion gone are reviewed: a long external wait is one.
+    ok = _unreviewed(env, p, "waiting long", status="queued", age=7200, result={
+        "status": "waiting", "summary": "x", "wait_kind": "external"})[0]
+    assert dm.Daemon(p.base).sweep_unreviewed(force=True) == [ok]
+    # A push branch no push can reach (a repo with no remote, as a harness repo) is review only: nothing queued.
+    _git_out(env["repo"], "remote", "remove", "origin")
+    fresh = _unreviewed(env, p, "unreachable")[0]
+    assert fresh not in dm.Daemon(p.base).sweep_unreviewed(force=True)
+
+
+def test_the_unreviewed_invariant_queues_at_most_its_cap_per_pass(env):
+    from ttp import daemon as dm
+    p = make(env)
+    tids = [_unreviewed(env, p, f"change {i}")[0] for i in range(3)]
+    d = dm.Daemon(p.base)
+    first = d.sweep_unreviewed(force=True)
+    assert first == tids[:dm.UNREVIEWED_PER_PASS] == tids[:2]
+    assert d.sweep_unreviewed(force=True) == [tids[2]] and d.sweep_unreviewed(force=True) == []
+    assert len(_daemon_reviews(p)) == 3
+    p.set_config("review.unreviewed_per_pass", 0)
+    more = _unreviewed(env, p, "capped off")[0]
+    assert dm.Daemon(p.base).sweep_unreviewed(force=True) == [] and not _daemon_reviews(p, more)
 
 
 def test_the_daemons_re_review_continues_the_failed_review(env):
