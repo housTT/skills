@@ -221,10 +221,12 @@ def _some(labels: list[str]) -> str:
 
 
 class Slot:
-    """A held slot (or none: cap off or nested); `close()` releases it."""
+    """A held slot (or none: cap off or nested); `close()` releases it. `served`: none is held because
+    `done()` ended the wait (acquire): the caller reads the recorded pass, never runs the checks on it."""
 
-    def __init__(self, f=None):
+    def __init__(self, f=None, served: bool = False):
         self.f = f
+        self.served = served
 
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
@@ -257,7 +259,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 
     `same` keys these checks (project, tree, commands, purpose): while checks with the same key hold a
     slot it waits for them outside the queue, keeping `since`, and queues again once they end. `done()`
-    true (their pass was recorded) ends any wait with no slot held, Slot(); a reason from `stop()`
+    true (their pass was recorded) ends any wait with no slot held, Slot(served=True); a reason from `stop()`
     ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra())."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
@@ -278,7 +280,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if done and (ticket is None or time.time() - checked >= DONE_S):
                 checked = time.time()
                 if done():
-                    return Slot()
+                    return Slot(served=True)
             if stop and (why := stop()):
                 raise Cancelled(why)
             twin = _running(every, same)
@@ -295,7 +297,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 except OSError as e:
                     raise _unavailable(e) from e
                 if done and done():
-                    return Slot()
+                    return Slot(served=True)
             f = None
             if ticket is not None:
                 try:

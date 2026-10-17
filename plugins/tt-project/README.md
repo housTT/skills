@@ -751,7 +751,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   Slots are OS file locks, so a crash or reboot frees them. Workers' sandboxes may write the slot
   directory; where it cannot be written, the checks stop with an error naming it (exit 2; a push
   does not go) instead of running uncapped. The default is one slot per 16 cores (at least one); set it with
-  `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. A
+  `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
+  the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
+  0 turns them off); check commands run under `nice`/`ionice` unless `checks.nice` is false. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own beyond the

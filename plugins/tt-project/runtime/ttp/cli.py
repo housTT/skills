@@ -2008,19 +2008,24 @@ def cmd_checks(a) -> None:
                 break
         arrived = _checks_arrived()
         fresh_ok = not a.fresh
-        slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
-                             _checks_key(p, tree, todo, purpose) if fresh_ok else "",
-                             (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None)
-                if todo and not hit else None)
-        # Checks of the same tree may have passed while these waited (the same checks running beside
-        # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
-        if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
-            slot.close()
-            hit, slot = again, None
-            said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
-                    f"at {timefmt.long(float(hit.get('ts') or 0), p)} (recorded while these waited for a "
-                    f"checks slot); --fresh runs them again (full output: {hit.get('log') or 'not kept'})")
-            out.write(f"{said}\n")
+        slot = None
+        while todo and not hit:
+            slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
+                                _checks_key(p, tree, todo, purpose) if fresh_ok else "",
+                                (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None)
+            # Checks of the same tree may have passed while these waited (the same checks running beside
+            # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
+            if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
+                slot.close()
+                hit, slot = again, None
+                said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
+                        f"at {timefmt.long(float(hit.get('ts') or 0), p)} (recorded while these waited for a "
+                        f"checks slot); --fresh runs them again (full output: {hit.get('log') or 'not kept'})")
+                out.write(f"{said}\n")
+            # A wait a recorded pass ended holds no slot: with that pass unreadable now, queue again
+            # (same arrival time), never run the checks uncapped.
+            if slot is None or not slot.served:
+                break
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
