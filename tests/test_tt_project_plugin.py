@@ -3415,6 +3415,11 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     readme = " ".join(readme.split())
     assert "Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now" in readme
     assert "a release tag the publisher moves forward as a release channel gives the latest release" in readme
+    # Only the line reads TT_PROJECT_REF; install.sh itself never does, so the README must not say it does.
+    code = [ln for ln in (PLUGIN / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
+    assert not any("TT_PROJECT_REF" in ln for ln in code)
+    assert "`install.sh` reads" not in readme
+    assert "the one-line install above reads the same variable" in readme
     assert os.access(PLUGIN / "install.sh", os.X_OK)
 
 
