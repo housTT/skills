@@ -38,7 +38,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, locks, push, pushpass, runner, worktree
+from . import checkcap, checkdirs, locks, push, pushpass, runner, suitecost, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1063,6 +1063,7 @@ class Batch:
                 run.append((cmd, eid))
         if not run:
             return None
+        suite_out: list[str] = []
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch))
         started = time.time()   # a wait for the host-wide slot is not check time
@@ -1074,6 +1075,7 @@ class Batch:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
                                       env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited())
+                suite_out.append(tail)
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail
@@ -1085,6 +1087,10 @@ class Batch:
             slot.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
         push.record_check_s(self.p, time.time() - started)
+        try:
+            suitecost.record(self.p.db, self.id, head, self._version(head), "\n".join(suite_out))
+        except Exception as e:   # a cost note never fails a batch
+            say(f"suite cost not recorded: {e}")
         return None
 
     def _judge(self, tip: str, carried: list, heads: dict, checks: list[str]):

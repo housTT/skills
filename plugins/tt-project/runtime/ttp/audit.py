@@ -31,7 +31,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, quietgate, sharedchecks, turngate, unblock, upstream
+from . import budget, chaincap, ends, quietgate, sharedchecks, suitecost, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -311,6 +311,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(chains)
     if shared := sharedchecks.audit_line(db, since):
         out.append(shared)
+    if suite := suitecost.audit_line(db, now):
+        out.append(suite)
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else
