@@ -39,7 +39,10 @@ import time
 from . import headline
 from .db import DB, continues_id, load_result
 
-CONT_TITLE = re.compile(r"(?i)^\s*continue\s*:")
+CONT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:")
+# A hop that only runs checks, pushes or edits spec or PR text: queued at the light tier (hop_tier).
+MECH_TITLE = re.compile(r"(?i)^\s*mechanical\s*:")
+TIERS = ("light", "standard", "deep")
 REASON_RE = re.compile(r"(?i)\b(?:new|different|changed|other)\s+(?:approach|evidence|design|strategy)\b"
                        r"|\bre-?scop\w*|\bnarrow\w*\s+(?:the\s+)?scope|\bscope[sd]?\s+(?:down|narrow\w*)")
 MIN_REASON = 20
@@ -218,6 +221,15 @@ def hop_ready(p, cfg: dict, task: dict, fup: dict) -> str:
     return progress(p, ch, len(ch) - 1)
 
 
+def hop_tier(task: dict, fup: dict) -> str:
+    """The tier of the hop queued for `fup`: the parent's, or lower when the follow-up asks for it with
+    `"tier"` or a `mechanical:` title (light). Never above the parent's: a hop that needs more is
+    retried a tier up by the daemon."""
+    tier = task["tier"] if task.get("tier") in TIERS else "standard"
+    want = "light" if MECH_TITLE.match(str(fup.get("title") or "")) else str(fup.get("tier") or "").strip().lower()
+    return want if want in TIERS and TIERS.index(want) < TIERS.index(tier) else tier
+
+
 def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
              wait_landed: bool = False) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
@@ -232,7 +244,7 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
     ch = chain(db, task["id"])
     title = str(fup["title"]).strip()[:200]
     action = {"type": "task_add", "title": title, "spec": str(fup.get("spec") or ""), "kind": task["kind"],
-              "tier": task["tier"], "priority": task["priority"], "budget_usd": task["budget_usd"],
+              "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
     if wait_landed:
         action.update(start_when=f"landed:#{task['id']}", why=f"#{task['id']}'s commits land on the push branch")

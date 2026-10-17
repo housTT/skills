@@ -29071,6 +29071,34 @@ def _hop(env, p, tid, files, result):
     Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
 
 
+def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_its_parents_summary(env):
+    p = make(env)
+    from ttp import chaincap
+    from ttp.prompts import worker_prompt
+    light = {"status": "done", "summary": "feature: part done, checks left",
+             "followups": [{"title": "continue: feature", "spec": "Run the checks.", "tier": "light"}]}
+    root, *_ = _finish_code(env, p, "feature", {"a.py": 10}, result=light)
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    assert hop["tier"] == "light" and hop["spec"] == "Run the checks."
+    # A daemon hop of done work is a follow-up (no `continues:` label), yet its worker reads the parent's summary.
+    prompt = worker_prompt(p, p.db.task(hop["id"]), str(p.root), None)
+    assert f"This task continues #{root} feature (done). Its last summary: feature: part done, checks left" in prompt
+    assert "starts from that branch's head" not in prompt
+    mech = {"status": "done", "summary": "other: done, push left",
+            "followups": [{"title": "mechanical: push other", "spec": "Push it."}]}
+    root2, *_ = _finish_code(env, p, "other", {"b.py": 3}, result=mech)
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root2,))
+    assert hop2["tier"] == "light" and hop2["title"] == "mechanical: push other" and hop2["spec"] == "Push it."
+    assert [t["id"] for t in chaincap.chain(p.db, hop2["id"])] == [root2, hop2["id"]]
+    # Downward only: a follow-up never raises the hop above its parent's tier; junk keeps the parent's.
+    std = {"tier": "standard"}
+    assert chaincap.hop_tier(std, {"title": "continue: x", "tier": "deep"}) == "standard"
+    assert chaincap.hop_tier(std, {"title": "continue: x", "tier": "bogus"}) == "standard"
+    assert chaincap.hop_tier(std, {"title": "continue: x"}) == "standard"
+    assert chaincap.hop_tier({"tier": "deep"}, {"title": "continue: x", "tier": "Standard"}) == "standard"
+    assert chaincap.hop_tier({"tier": "light"}, {"title": "mechanical: x", "tier": "deep"}) == "light"
+
+
 def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordinator_turn(env):
     p = make(env)
     from ttp import audit, chaincap

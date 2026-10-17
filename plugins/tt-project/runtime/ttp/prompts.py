@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import conflictfix, settinghold, timefmt
+from . import chaincap, conflictfix, settinghold, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
@@ -565,10 +565,11 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     history += settinghold.prompt_line(p.db, cfg, task, p.root)
     if branch:
         history += recovery_note(p, task)
-    old_id = continues_id(task)
+    # A follow-up of done work (a daemon-queued continue hop) starts fresh but reads its parent's summary.
+    old_id = continues_id(task) or chaincap.follows_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:
-        on = f" on branch {old['branch']}" if own_worktree(old) and old["branch"] else ""
+        on = f" on branch {old['branch']}" if own_worktree(old) and old["branch"] and continues_id(task) else ""
         was = str(load_result(old["result"]).get("summary") or old["blocked_reason"] or "")[:1500]
         history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
