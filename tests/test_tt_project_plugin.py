@@ -3270,6 +3270,7 @@ INSTALL_URL = "https://github.com/tenstorrent/skills.git"
 FAKE_CLAUDE = r"""#!/bin/sh
 # marketplace entries keyed by name, like the real one: a second add repoints, never duplicates
 echo "claude $*" >> "$HOME/calls.log"
+[ "claude $*" != "${FAIL_CALL:-}" ] || exit 3
 case "$1 $2 $3" in
 "plugin marketplace add") printf '%s\n' "$4" > "$HOME/claude-market" ;;
 "plugin install "*|"plugin update "*) [ -s "$HOME/claude-market" ] || exit 1; echo "$3" > "$HOME/claude-plugin" ;;
@@ -3277,6 +3278,11 @@ esac
 """
 FAKE_CODEX = r"""#!/bin/sh
 echo "codex $*" >> "$HOME/calls.log"
+[ "codex $*" != "${FAIL_CALL:-}" ] || exit 3
+# like the real one: a CODEX_HOME that does not exist (Codex installed, never run) is an error
+if [ -n "${CODEX_HOME:-}" ] && [ ! -d "$CODEX_HOME" ]; then
+  echo "Error: CODEX_HOME points to \"$CODEX_HOME\", but that path does not exist" >&2; exit 1
+fi
 case "$1 $2 $3" in
 "plugin marketplace add")
   if [ -s "$HOME/codex-market" ] && [ "$(cat "$HOME/codex-market")" != "$4" ]; then
@@ -3289,6 +3295,7 @@ esac
 """
 FAKE_TTP = """#!/bin/sh
 echo "ttp $* from $0" >> "$HOME/calls.log"
+[ "ttp $*" != "${FAIL_CALL:-}" ] || exit 3
 mkdir -p "$HOME/.local/bin"
 """
 
@@ -3328,6 +3335,7 @@ def _fixture_repo(root: pathlib.Path, version: str = "1.0.0") -> pathlib.Path:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "tt-project " + version)
     _git(repo, "tag", "v1")
+    _git(repo, "tag", "-a", "-m", "release v1", "rel")    # an annotated tag on the same commit
     return repo
 
 
@@ -3351,7 +3359,7 @@ def install_env(tmp_path):
             (tools / tool).symlink_to(found)
     repo = _fixture_repo(tmp_path)
 
-    def run(hosts=("claude", "codex", "cursor-agent"), ref="", shell="bash", on_path=True):
+    def run(hosts=("claude", "codex", "cursor-agent"), ref="", shell="bash", on_path=True, env=None):
         import subprocess
         for name, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX), ("cursor-agent", "#!/bin/sh\n")):
             f = tools / name
@@ -3364,7 +3372,7 @@ def install_env(tmp_path):
             "(TT_PROJECT_REF=;", f"(TT_PROJECT_REF={ref};", 1)
         path = (str(home / ".local" / "bin") + ":" if on_path else "") + str(tools)
         env = {"HOME": str(home), "PATH": path, "TMPDIR": str(tmp), "GIT_CONFIG_NOSYSTEM": "1",
-               "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C"}
+               "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C", **(env or {})}
         return subprocess.run([str(tools / shell), "-c", line], env=env, capture_output=True, text=True,
                               timeout=120)
 
@@ -3396,7 +3404,10 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     usage = [ln[2:] for ln in (PLUGIN / "install.sh").read_text().splitlines() if ln.startswith("# (TT_PROJECT_REF=")]
     assert usage == [line]
     assert line.startswith("(TT_PROJECT_REF=;")
-    assert f"git -c advice.detachedHead=false clone -q --depth 1 ${{TT_PROJECT_REF:+--branch=$TT_PROJECT_REF}} {INSTALL_URL} " in line
+    # init + fetch of the one ref: `git clone --branch <annotated tag>` warns that it "is not a commit"
+    assert (f'git init -q "$d" && git -C "$d" fetch -q --depth 1 {INSTALL_URL} "${{TT_PROJECT_REF:-HEAD}}" && '
+            'git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && ') in line
+    assert " clone " not in line
     assert 'sh "$d/plugins/tt-project/install.sh"' in line and "set TT_PROJECT_REF to a release tag" in line
     for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
         assert raw not in line, raw
@@ -3512,6 +3523,76 @@ def test_one_line_install_rerun_with_the_same_ref_follows_a_moved_tag_or_an_adva
     assert third.returncode == 0, third.stdout + third.stderr
     assert _clone_head(home) == _head(repo, "main") != _head(repo, "v1")
     assert json.loads(cursor.read_text())["version"] == "1.0.2"
+    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
+
+
+def test_one_line_install_from_an_annotated_tag_or_a_commit_prints_no_warning(install_env):
+    home, repo = install_env.home, install_env.repo
+    r = install_env(ref="rel")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stderr == "" and "is not a commit" not in r.stdout
+    assert "1.0.0 (rel)" in r.stdout
+    assert _clone_head(home) == _head(repo, "rel") == _head(repo, "v1")
+    _bump(repo, "1.0.1")
+    sha = _head(repo, "v1")
+    r = install_env(ref=sha)    # a commit the default branch has moved past
+    assert r.returncode == 0 and r.stderr == "", r.stdout + r.stderr
+    assert _clone_head(home) == sha != _head(repo)
+    r = install_env()    # empty: the default branch
+    assert r.returncode == 0 and r.stderr == "", r.stdout + r.stderr
+    assert _clone_head(home) == _head(repo) and f"1.0.1 ({_head(repo)[:7]}" in r.stdout
+    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
+
+
+def test_one_line_install_creates_a_missing_codex_home_before_calling_codex(install_env, tmp_path):
+    """Codex installed but never run: its CODEX_HOME does not exist yet, and Codex refuses it."""
+    codex_home = tmp_path / "codex-home"
+    r = install_env(env={"CODEX_HOME": str(codex_home)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert codex_home.is_dir()
+    assert "codex plugin add tt-project@tenstorrent-skills" in _calls(install_env.home)
+    assert "Codex: start a new session" in r.stdout
+    r = install_env(hosts=("codex",))    # CODEX_HOME unset: the default ~/.codex
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (install_env.home / ".codex").is_dir()
+
+
+@pytest.mark.parametrize("fail_call, tool, skipped", [
+    ("claude plugin install tt-project@tenstorrent-skills", "Claude Code", "claude plugin update"),
+    ("codex plugin add tt-project@tenstorrent-skills", "Codex", None),
+    ("codex plugin marketplace add {dest}", "Codex", "codex plugin add"),
+    ("ttp setup", "ttp setup", None),
+])
+def test_one_line_install_carries_on_when_one_tools_step_fails_and_exits_non_zero(install_env, fail_call, tool,
+                                                                                  skipped):
+    home = install_env.home
+    dest = home / ".local/share/tt-project/skills"
+    fail_call = fail_call.format(dest=dest)
+    r = install_env(env={"FAIL_CALL": fail_call})
+    assert r.returncode == 1, r.stdout + r.stderr
+    calls = _calls(home)
+    assert any(c == fail_call or c.startswith(fail_call + " from ") for c in calls), calls
+    assert calls[-1] == f"ttp setup from {dest}/plugins/tt-project/bin/ttp", calls    # ttp setup still runs
+    if skipped:
+        assert not any(c.startswith(skipped) for c in calls), calls    # only that tool's later steps
+    others = {"Claude Code": "claude plugin update tt-project@tenstorrent-skills",
+              "Codex": "codex plugin add tt-project@tenstorrent-skills"}
+    for other, last in others.items():
+        if other != tool:
+            assert last in calls, (other, calls)
+    assert (home / ".cursor/plugins/local/tt-project/bin/ttp").is_file()
+    summary = r.stderr.split("these steps failed; fix them, then rerun this installer:", 1)
+    assert len(summary) == 2, r.stderr
+    failed = [ln for ln in summary[1].splitlines() if ln.strip()]
+    command = "bin/ttp setup" if tool == "ttp setup" else fail_call
+    assert len(failed) == 1 and failed[0].startswith(f"tt-project:   {tool}: `"), failed
+    assert f"{command}` failed" in failed[0], failed
+    assert "finished with failed steps" in r.stdout and "done. To load it" not in r.stdout
+    closings = {"Claude Code": "Claude Code: start a new session", "Codex": "Codex: start a new session",
+                "ttp setup": "ttp: ready in this shell"}
+    for name, closing in closings.items():
+        assert (closing in r.stdout) == (name != tool), (name, r.stdout)
+    assert "Cursor: restart it" in r.stdout
     assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
 
 

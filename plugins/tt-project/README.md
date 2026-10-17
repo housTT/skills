@@ -28,18 +28,20 @@ Until tt-project is on `main`, install it with the one-line install below, or as
 
 Paste this line into a terminal. It installs tt-project for each of Claude Code, Codex and Cursor
 that it finds and skips the others with a note. Set `TT_PROJECT_REF` at its front to a release tag
-of `tenstorrent/skills`; left empty, it installs whatever `git clone` checks out (the default branch).
+of `tenstorrent/skills` (a branch or commit also works); left empty, it installs the default branch.
 
 ```bash
-(TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git -c advice.detachedHead=false clone -q --depth 1 ${TT_PROJECT_REF:+--branch=$TT_PROJECT_REF} https://github.com/tenstorrent/skills.git "$d" && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+(TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git init -q "$d" && git -C "$d" fetch -q --depth 1 https://github.com/tenstorrent/skills.git "${TT_PROJECT_REF:-HEAD}" && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
 ```
 
-It makes a shallow `git clone` with your own git credentials and runs `plugins/tt-project/install.sh`
-from it. The installer keeps one clone at `~/.local/share/tt-project/skills` (under `$XDG_DATA_HOME`
+It fetches that one commit with `git` and your own git credentials and runs
+`plugins/tt-project/install.sh` from it. The installer keeps one clone at `~/.local/share/tt-project/skills` (under `$XDG_DATA_HOME`
 when set), adds it as the `tenstorrent-skills` marketplace for Claude Code and Codex, copies the
 plugin into Cursor's local plugin folder and ends with `ttp setup`. Rerun the line to update, or with
 another tag to switch: it updates that clone and the same entries in place. A ref without the
-installer fails with a message to set `TT_PROJECT_REF` to a release tag.
+installer fails with a message to set `TT_PROJECT_REF` to a release tag. If one tool's step fails
+(say Codex), the installer still installs for the others and runs `ttp setup`, then lists the failed
+steps and exits non-zero.
 
 Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now: a branch
 gives its latest commit, and a release tag the publisher moves forward as a release channel gives the
