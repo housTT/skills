@@ -89,7 +89,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
-            "user_asked": {"type": "boolean"},
+            "user_asked": {"type": "boolean"}, "outage": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
