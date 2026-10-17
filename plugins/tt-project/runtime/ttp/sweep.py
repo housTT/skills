@@ -55,7 +55,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, obligations, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, mitigate, obligations, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -269,6 +269,17 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                               + (f", owner #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else ""),
                     # Not due yet: listed, no outcome needed; overdue: an item like any other.
                     "ends": None if late else "due"})
+    # An open mitigation (mitigate.py) shows with its due time: not due yet, listed; overdue, an item.
+    keyed = {i["key"]: i for i in out}
+    for t, rec in mitigate.open_ones(db):
+        late, due = now >= float(rec.get("due") or 0), mitigate.due_text(rec, now, where)
+        if (i := keyed.get(f"task:{t['id']}")):
+            i["reason"] = _clip(f"{due}; {i['reason']}")
+            continue
+        out.append({"key": f"task:{t['id']}", "kind": "mitigation", "task": t["id"], "resource": None,
+                    "title": t["title"], "age_s": max(0.0, now - float(rec.get("filed") or t["created"])),
+                    "since": rec.get("filed") or t["created"], "status": t["status"], "spec_sha": _spec_sha(t),
+                    "reason": _clip(f"{t['status']}, {due}, for {rec.get('resource')}"), "ends": None if late else "due"})
     _watch(db, out, paused, now)
     return out
 
@@ -711,7 +722,8 @@ def _who(i: dict, n: int) -> str:
 def _line(i: dict, state: dict, outs: dict, now: float) -> str:
     who = _who(i, 70)
     if i.get("ends") and _carries(i, state, outs, now):
-        what = {"user": "HELD BY USER PAUSE", "due": "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
+        what = {"user": "HELD BY USER PAUSE", "due": "MITIGATION, NOT DUE YET" if i["kind"] == "mitigation"
+                else "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
         return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
     if _carries(i, state, outs, now):
         o = outs.get(i["key"])

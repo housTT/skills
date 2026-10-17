@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -243,7 +243,7 @@ EFFORT_EVENT_TRIGGERS = {
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
     "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
-    "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck",
+    "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
     "review_stall": "stuck", "review_failed_unhandled": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",

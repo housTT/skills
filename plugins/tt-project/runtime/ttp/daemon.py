@@ -72,6 +72,7 @@ from . import netwait
 from . import obligations
 from . import pageto
 from . import machines
+from . import mitigate
 from . import prguard
 from . import projpause
 from . import push
@@ -959,7 +960,7 @@ class Daemon:
         core_held = self.net_held(core) and not self._net_may_probe(core)
         cycle = self.host_cycle_held(now)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3022,6 +3023,11 @@ class Daemon:
         result = handoff or last_json_object(usage.final_text or "") or {}
         if past_cap and isinstance(result, dict):
             result = dict(result, escalations_dropped=past_cap)
+        try:   # a known defect degrading a live service gets a workaround with a due time, beside its fix
+            if (mids := mitigate.file(db, self.cfg, task, result, where=self.p)):
+                log(self.p, f"task {task['id']}: live impact; mitigation " + ", ".join(f"#{m}" for m in mids))
+        except Exception:
+            log(self.p, "mitigation filing failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         if task["status"] == "cancelled":
             # Cancelled while this run was ending: the decision stands. Keep what the run produced,
             # and tell the coordinator only if the work actually got done.
@@ -7691,6 +7697,14 @@ class Daemon:
                   f"task_add continues #{task['id']}, or drop it on purpose.",
                   json.dumps({"followups": conts}), "queued", task["id"]))
             log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")
+
+    def tend_mitigations(self) -> None:
+        """Model-free: an overdue mitigation wakes the coordinator, a done fix lists its measures for undo."""
+        try:
+            for line in mitigate.tend(self.p.db, self.p.name, where=self.p):
+                log(self.p, line)
+        except Exception:
+            log(self.p, "mitigations: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def sweep_reviews(self) -> None:
         """Model-free retry of reviews left to the coordinator: a code task in 'review' whose last run

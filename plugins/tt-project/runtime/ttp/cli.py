@@ -1058,6 +1058,8 @@ def status_text(p: Project) -> str:
     if h.get("coverage"):
         lines.append(h["coverage"])
     lines.extend(h.get("obligations") or [])
+    from . import mitigate
+    lines.extend(mitigate.status_lines(db, now, tz))
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")
