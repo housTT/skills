@@ -12490,3 +12490,64 @@ def test_pr_signature_skips_the_authors_own_items():
     pr["reviews"].append(wrap("other"))
     pr["comments"].append({"author": {"login": "other"}, "body": "Why?"})
     assert watchers.pr_signature(pr)["n_human"] == 2
+
+
+def test_a_projects_own_ask_gate_rules_refuse_matching_asks(env):
+    """project.json ask_gate.refuse adds the project's own refusal rules: every all_of regex must match
+    the ask's text, recommendation or least_disruptive (any case), and `unless`, a passing `blocking`
+    or a long enough override_field lets the ask through. Refusals are counted like built-in ones."""
+    from ttp import coordinator as coord, unblock
+    p = make(env)
+    text = "Approve 300 USD more for the nightly benchmark runs?"
+    assert _ask(p, text, blocking="funds")[0] == []   # no rules: unchanged
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    p.set_config("ask_gate.refuse", [{"label": "benchmark spend", "all_of": ["benchmark", r"\busd\b"],
+                                      "unless": "first time", "pass_blocking": ["review"],
+                                      "override_field": "not_own_call",
+                                      "reason": "benchmark spend is the project's own call: decide it"}])
+    from ttp.project import config_problems
+    assert not [x for x in config_problems(json.loads(p.config_path.read_text())) if "ask_gate" in x]
+    probs, _ = _ask(p, text, blocking="funds")
+    assert probs and "ask_user rejected: benchmark spend is the project's own call" in probs[0], probs
+    # all_of: one regex missing (here only in the recommendation, so it still matches) or absent
+    probs, _ = _ask(p, "Approve more for the nightly benchmark runs?", blocking="funds", recommendation="300 USD")
+    assert probs and "benchmark spend" in probs[0], probs
+    assert _ask(p, "Approve 300 USD more for the nightly test runs?", blocking="funds")[0] == []
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    # unless, pass_blocking and override_field each let it through
+    assert _ask(p, text + " This is the first time.", blocking="funds")[0] == []
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    rule = p.config()["ask_gate"]["refuse"][0]
+    assert coord._project_refused_ask(p, p.config(), {"blocking": "review"}, text, "") is None
+    assert coord._project_refused_ask(p, p.config(), {"blocking": "funds"}, text, "")[0] == "benchmark spend"
+    assert coord._project_refused_ask(
+        p, p.config(), {"blocking": "funds", "not_own_call": "x" * coord.LEAST_DISRUPTIVE_MIN}, text, "") is None
+    assert coord._project_refused_ask(
+        p, p.config(), {"blocking": "funds", "not_own_call": "too short"}, text, "")[0] == "benchmark spend"
+    assert rule["label"] == "benchmark spend"
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "benchmark spend 2" in line, line
+
+
+def test_a_malformed_ask_gate_rule_is_skipped_with_a_warning_never_failing_the_turn(env):
+    """A bad regex, a missing all_of or reason, or a wrong type skips that entry only: the good rules
+    still apply, the turn goes on, daemon.log and `ttp config` problems name the entry."""
+    from ttp import coordinator as coord
+    from ttp.project import config_problems
+    p = make(env)
+    good = {"label": "good", "all_of": ["benchmark"], "reason": "decide benchmark asks yourself"}
+    bad = [{"all_of": ["("], "reason": "x"}, {"all_of": [], "reason": "x"}, {"all_of": ["a"]},
+           {"all_of": ["a"], "reason": "x", "unless": 3}, {"all_of": ["a"], "reason": "x", "pass_blocking": 1},
+           {"all_of": ["a"], "reason": "x", "override_field": ["f"]}, "not a rule"]
+    rules, problems = coord.ask_gate_rules({"ask_gate": {"refuse": bad + [good]}})
+    assert [r["label"] for r in rules] == ["good"]
+    assert [x.split(":")[0] for x in problems] == [f"ask_gate.refuse[{i}]" for i in range(len(bad))], problems
+    assert coord.ask_gate_rules({"ask_gate": {"refuse": "benchmark"}}) == ([], ["ask_gate.refuse: not a list; ignored"])
+    assert coord.ask_gate_rules({}) == ([], []) and coord.ask_gate_rules({"ask_gate": None}) == ([], [])
+    p.set_config("ask_gate.refuse", bad + [good])
+    probs, _ = _ask(p, "Approve 300 USD more for the nightly benchmark runs?", blocking="funds")
+    assert probs and "ask_user rejected: decide benchmark asks yourself" in probs[0], probs
+    assert "warning: ask_gate.refuse[0]:" in (p.logs / "daemon.log").read_text()
+    assert any(x.startswith("ask_gate.refuse[0]") for x in config_problems(json.loads(p.config_path.read_text())))
+    p.set_config("ask_gate.refuse", bad)
+    assert _ask(p, "Approve 300 USD more for the nightly benchmark runs?", blocking="funds")[0] == []

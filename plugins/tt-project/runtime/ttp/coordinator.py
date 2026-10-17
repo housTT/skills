@@ -1698,6 +1698,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      "proceed. If it fits the restrictions, take it (task_add) and memory_add the "
                                      "decision instead of asking. If not, put it in least_disruptive with the "
                                      "restriction it breaks.")
+                why = _project_refused_ask(p, cfg, a, text, least)
+                if why:
+                    _count_refusal(db, key, why[0], text)
+                    raise ValueError(f"ask_user rejected: {why[1]}")
                 why = _self_health_ask(a, text, least)
                 if why:
                     _count_refusal(db, key, "self-health", text)
@@ -3900,6 +3904,71 @@ def _health_hit(text: str) -> bool:
         if any(abs(h - o) <= _NEAR for h in hits for o in objs):
             return True
     return False
+
+
+def ask_gate_rules(cfg: dict) -> tuple[list[dict], list[str]]:
+    """The project's own ask_user refusal rules (project.json `ask_gate.refuse`), compiled, and one
+    problem line per entry skipped as malformed (bad regex, missing all_of or reason, wrong types)."""
+    raw = (cfg.get("ask_gate") or {}).get("refuse") if isinstance(cfg.get("ask_gate"), dict) else None
+    if raw in (None, []):
+        return [], []
+    if not isinstance(raw, list):
+        return [], ["ask_gate.refuse: not a list; ignored"]
+    rules, problems = [], []
+    for i, e in enumerate(raw):
+        where = f"ask_gate.refuse[{i}]"
+        try:
+            if not isinstance(e, dict):
+                raise ValueError("not an object")
+            all_of = e.get("all_of")
+            if isinstance(all_of, str):
+                all_of = [all_of]
+            if not all_of or not isinstance(all_of, list) or not all(isinstance(x, str) and x for x in all_of):
+                raise ValueError("all_of must be a non-empty list of regexes")
+            reason = e.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("reason must be a non-empty string")
+            unless, passing, field = e.get("unless"), e.get("pass_blocking") or [], e.get("override_field")
+            if unless is not None and not isinstance(unless, str):
+                raise ValueError("unless must be a regex string")
+            if isinstance(passing, str):
+                passing = [passing]
+            if not isinstance(passing, list) or not all(isinstance(x, str) for x in passing):
+                raise ValueError("pass_blocking must be a list of blocking reasons")
+            if field is not None and not isinstance(field, str):
+                raise ValueError("override_field must be a field name")
+            rules.append({"label": str(e.get("label") or where), "reason": reason.strip(),
+                          "all_of": [re.compile(x, re.I) for x in all_of],
+                          "unless": re.compile(unless, re.I) if unless else None,
+                          "pass_blocking": set(passing), "override_field": field or None})
+        except (ValueError, re.error) as err:
+            problems.append(f"{where}: {err}; skipped")
+    return rules, problems
+
+
+def _project_refused_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> tuple[str, str] | None:
+    """(label, reason) of the first project ask_gate.refuse rule the ask meets, else None. Malformed
+    rules are skipped with a line in daemon.log; they never fail the turn."""
+    rules, problems = ask_gate_rules(cfg)
+    if problems:
+        from .daemon import log   # daemon imports this module
+        for why in problems:
+            try:
+                log(p, f"warning: {why}")
+            except OSError:
+                pass
+    hay = f"{text} {a.get('recommendation') or ''} {least}"
+    for r in rules:
+        if a.get("blocking") in r["pass_blocking"]:
+            continue
+        if not all(rx.search(hay) for rx in r["all_of"]):
+            continue
+        if r["unless"] and r["unless"].search(hay):
+            continue
+        if r["override_field"] and len(str(a.get(r["override_field"]) or "").strip()) >= LEAST_DISRUPTIVE_MIN:
+            continue
+        return r["label"], r["reason"]
+    return None
 
 
 def _self_health_ask(a: dict, text: str, least: str = "") -> str:

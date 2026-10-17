@@ -318,6 +318,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A wait on another project's reply must be model-free (ackwait.py): `ttp ack-wait probe`, the
     # project's own `<harness>/.../ack_wait.py probe`, or a command listed here (matched on its leading words).
     "ack_wait": {"probe_commands": []},
+    # The project's own ask_user refusal rules, on top of the built-in gate (coordinator.ask_gate_rules):
+    # each {label, all_of: [regex...], unless, pass_blocking: [...], override_field, reason}. An ask is
+    # refused when every all_of regex matches its text, recommendation and least_disruptive.
+    "ask_gate": {"refuse": []},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
@@ -624,8 +628,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip():
         out.append('coordinator.cache_ttl: "" (left by an older template) is read as "auto"; `ttp upgrade` '
                    'sets it to "auto"')
+    from .coordinator import ask_gate_rules
     from .devq import config_problems as runner_problems
     from .hostmap import problems as host_problems
+    out += ask_gate_rules(raw)[1]
     out += host_problems(raw)
     runners = (raw.get("device") or {}).get("runners")
     if runners is not None and not isinstance(runners, dict):
