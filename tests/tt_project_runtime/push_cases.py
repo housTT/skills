@@ -7688,6 +7688,65 @@ def test_a_hand_off_that_claims_a_push_or_does_not_split_still_fails_on_a_stoppe
     assert "claimed a push that is not on the remote" in res["summary"] and head[:12] in res["summary"]
 
 
+def _no_remote_claim_setup(env, monkeypatch, tmp_path, on_branch):
+    """A code repo with no git remote; a task waiting on its passed checks whose run's detached
+    `push --own` (remote 'local') pushed its head to local branch `proj`, which holds that head
+    only when `on_branch`."""
+    from ttp import daemon as dmod
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    assert not _git_out(p.root, "remote")
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid, path = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    head = _git_out(path, "rev-parse", "HEAD")
+    _git_out(p.root, "branch", "-f", "proj", head if on_branch else f"{head}~1")
+    run = p.db.one("SELECT id FROM runs WHERE task=? ORDER BY id DESC", (tid,))["id"]
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{tid}-own.json").write_text(json.dumps({
+        "run": run, "repo": str(path), "head": head, "sha": head, "remote": "local", "branch": "proj",
+        "target": "local/proj", "own": True, "status": "pushed", "exit": 0}))
+    return p, dmod.Daemon(p.base), tid, head
+
+
+@pytest.mark.parametrize("on_branch", [True, False])
+def test_a_detached_own_push_in_a_repo_with_no_remote_is_checked_on_the_local_branch(
+        env, monkeypatch, tmp_path, on_branch):
+    """Replay: in a code repo with no git remote, `push --own` fast-forwards the local branch and its
+    marker names remote 'local'. Its claim is checked there: done when the branch holds the sha, no
+    'could not be verified on the remote' failure; failed naming the local branch and sha when not."""
+    p, d, tid, head = _no_remote_claim_setup(env, monkeypatch, tmp_path, on_branch)
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "pushing"
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    if not on_branch:
+        assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+        assert "claimed a push that is not on the remote" in res["summary"]
+        assert f"{head[:12]} is not on local branch proj" in res["summary"], res["summary"]
+        return
+    assert task["status"] == "done" and res["status"] == "done", (task["status"], res)
+    assert f"{head[:12]} is the tip of local branch proj" in res["summary"], res["summary"]
+    assert "claimed a push" not in task["result"] and "push_verify" not in task["result"]
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND (kind='task_failed' OR (kind='push_verifying' "
+                      "AND severity!='low'))", (tid,))
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND severity IN ('high','critical')", (tid,))
+
+
+def test_the_push_audit_confirms_an_own_push_on_the_local_branch_of_a_repo_with_no_remote(
+        env, monkeypatch, tmp_path):
+    from ttp import pushclaim
+    p, d, tid, head = _no_remote_claim_setup(env, monkeypatch, tmp_path, True)
+    _git_out(p.root, "checkout", "-q", "proj")
+    _commit(p.root, "later.txt", "later\n")   # a later commit on the branch keeps it confirmed
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "parser fixed"}))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+
+
 def test_an_unreadable_remote_keeps_a_claimed_push_waiting_with_backoff_and_fails_it_past_the_bound(
         env, monkeypatch, tmp_path):
     from ttp import daemon as dmod, pushclaim

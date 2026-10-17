@@ -389,11 +389,37 @@ def _marker_local(p, c: dict, state: str, why: str) -> tuple[str, str]:
     return state, why
 
 
+def _check_local(p, c: dict, m: dict) -> tuple[str, str] | None:
+    """An own push in a code repo with no git remote (push.LOCAL) fast-forwarded its local branch:
+    its claimed commit is checked against refs/heads/<branch> there, no network. None when the marker
+    is not such a push. Accepted gap: summary lines and `pushed` entries in such a repo stay unverified."""
+    from . import push
+    if str(m.get("remote") or "") != push.LOCAL:
+        return None
+    repo = m.get("repo") or p.root
+    if not Path(repo).is_dir():   # its task's worktree was pruned since
+        repo = p.root
+    if not push.remote_less(Path(repo)):
+        return None
+    branch = str(m.get("branch") or "")
+    sha = str((m.get("sha") if m.get("status") == "pushed" else m.get("head")) or "")
+    where, s = f"local branch {branch or '?'}", sha[:12] or "?"
+    tip = _commit(repo, f"refs/heads/{branch}") if branch else ""
+    if not tip:
+        return MISSING, f"{c['source']} claimed {s} on {where}, which does not exist"
+    full = _commit(repo, sha) if sha else ""
+    if full and _git(repo, "merge-base", "--is-ancestor", full, tip).returncode == 0:
+        return CONFIRMED, f"{s} is {'the tip of' if full == tip else 'on'} {where}"
+    return MISSING, f"{s} is not on {where} (tip {tip[:12]}; claimed by {c['source']})"
+
+
 def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:
     m = _read_marker(p, c["marker"])
     status, target = m.get("status"), str(m.get("target") or "")
     if status in ("queued", "running"):
         return UNKNOWN, f"{c['source']} is still {status}"
+    if local := _check_local(p, c, m):
+        return local
     repo, to = _marker_target(p, m)
     if not to:
         return UNVERIFIABLE, f"{c['source']} names no remote branch to check ({target or 'no target'})"
