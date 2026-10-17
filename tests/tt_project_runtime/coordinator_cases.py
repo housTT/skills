@@ -4739,7 +4739,7 @@ def test_command_errors_have_their_own_source_beside_explicit_clear_receipts(env
     row = db().one("SELECT payload FROM schedules WHERE name='receipts'")
     db().x("UPDATE schedules SET payload=? WHERE name='receipts'",
            (json.dumps({**json.loads(row["payload"]), "timeout_s": 1}), ))
-    assert tick(command="sleep 3") == ("timeout", 1)
+    assert tick(command="sleep 3") == ("error: timed out after 1 s", 1)   # a failed run
     assert len(open_errors()) == 2 and r["open_titles"]() == pending
     db().x("UPDATE schedules SET payload=? WHERE name='receipts'", (row["payload"], ))   # 1s is too tight under load
     assert tick(command="true")[0] == "ok (0 observations)"
