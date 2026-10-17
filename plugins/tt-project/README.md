@@ -1011,8 +1011,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   creates one. Unset reads as `existing_only` with one exception: a code task's `ttp push --own`
   still creates its own `ttp/t<id>-...` branch while `delivery.draft_prs` is on, the documented
   way a draft PR's branch is first published; a review, another task's branch, a notes branch or
-  a push outside a run never creates one. So a review of a `pr_branch:` or `rebases:` task whose
-  branch the remote lacks is review only, or approves into the push queue when it is on. The
+  a push outside a run never creates one. A code task refused creating another task's branch it
+  carries is told that route: its own branch, published with `ttp push --own-branch`. So a
+  review of a `pr_branch:` or `rebases:` task whose branch the remote lacks is review only, or approves into the push queue when it is on. The
   refusal names the setting. `off`: none; `ttp push --own` refuses and names the push queue, a
   `pr_branch:` or `rebases:` task lands on the push branch like any other change, and no spec the
   daemon writes (reviews, fixes, PR fixes, `review.auto_notes`) mentions `--own`. Set it `off`

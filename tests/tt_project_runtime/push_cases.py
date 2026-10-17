@@ -8641,3 +8641,39 @@ def test_a_fix_of_a_failed_review_runs_at_least_standard(env, monkeypatch):
     assert started("light", f"continues:{rev['id']}") == "standard"
     assert started("deep", f"continues:{rev['id']}") == "deep"
     assert p.db.task(fid)["tier"] == "standard"
+
+
+def test_own_push_existing_only_refusal_of_another_tasks_branch_names_the_own_branch_route(env, monkeypatch, capsys):
+    """A reported case, replayed: with delivery.own_push unset, a code task whose spec's `pr_branch:`
+    line named another task's never-published ttp/t<id>-... branch was refused by `ttp push --own`
+    and handed off blocked, though its own branch was a route that works. The refusal now names
+    it (`ttp push --own-branch`), which creates only the task's own branch. An explicit existing_only
+    stays strict: its refusal names no such route, and the own branch is not created either."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", None)
+    first = p.db.add_task("Drop the link", "s", kind="code")
+    theirs = f"ttp/t{first}-drop-the-link"
+    t = p.db.add_task("Publish it", f"pr_branch: `{theirs}`\nPublish it.", kind="code",
+                     labels=[f"pr_branch:{theirs}"])
+    mine = f"ttp/t{t}-publish-it"
+    _git_out(repo, "checkout", "-q", "-b", theirs)
+    _commit(repo, "fix.txt", "fix\n")
+    heads = lambda: _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    monkeypatch.setenv("TTP_TASK", str(t))
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "not creating it" in err and "ttp push --own-branch --detach" in err and mine in err, err
+    assert heads() == ["proj"]
+    _git_out(repo, "checkout", "-q", "-b", mine)
+    p.set_config("delivery.own_push", "existing_only")
+    assert _ttp("push", "--own-branch") == 2 and heads() == ["proj"]
+    _git_out(repo, "checkout", "-q", theirs)
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "not creating it" in err and "--own-branch" not in err, err
+    p.set_config("delivery.own_push", None)
+    _git_out(repo, "checkout", "-q", mine)
+    assert _ttp("push", "--own-branch") == 0, capsys.readouterr().err
+    assert heads() == ["proj", mine]
+    assert _git_out(origin, "rev-parse", mine) == _git_out(repo, "rev-parse", "HEAD")

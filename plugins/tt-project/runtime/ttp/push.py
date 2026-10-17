@@ -1496,9 +1496,7 @@ def foreign_pr_branch(p: Project, task: str, branch: str, where: str) -> str:
     owners = [foreign_owner(p, r, branch) for r in [t] + _reviewed(p, task)]
     if not owners or None in owners:
         return ""
-    own = str(t.get("branch") or "")
-    if not ((mo := OWN_BRANCH.fullmatch(own)) and mo.group(1) == str(t["id"])):
-        own = f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}"
+    own = own_name(t)
     return (f"--own would push to {where}, task #{owners[0]}'s branch, which task #{task} only inherited "
             f"(a pr_branch label, a task it continues or the branch its worktree started on) and its spec "
             f"names in no `pr_branch:` line: not pushing, another task's branch is not this task's to "
@@ -1506,6 +1504,15 @@ def foreign_pr_branch(p: Project, task: str, branch: str, where: str) -> str:
             f"if it is not checked out) and run `ttp push --own-branch --detach`, which publishes it under "
             f"its own name. If the work must go onto {branch}, hand off blocked saying so: the coordinator "
             f"adds a task whose spec has the line `pr_branch: {branch}`")
+
+
+def own_name(t: dict) -> str:
+    """Task row `t`'s own ttp/t<id>-... branch: its row's branch when that is its own, else the name
+    worktree.ensure gives it."""
+    own = str(t.get("branch") or "")
+    if not ((mo := OWN_BRANCH.fullmatch(own)) and mo.group(1) == str(t["id"])):
+        own = f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}"
+    return own
 
 
 def remote_less(repo: Path) -> bool:
@@ -1736,7 +1743,21 @@ def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
                    if unset else "delivery.own_push = existing_only")
         raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
                          f"only onto a branch the remote already has ({setting}): not "
-                         f"creating it. Never create it another way (no `git push`): {own_landing(cfg)}")
+                         f"creating it. Never create it another way (no `git push`): "
+                         f"{own_route(p, cfg, branch) or own_landing(cfg)}")
+
+
+def own_route(p: Project, cfg: dict, branch: str) -> str:
+    """The route a code task refused creating `branch` (another task's branch it carries) still has, or
+    "": publishing its own ttp/t<id>-... branch under its own name, which own_pr_branch lets it create
+    (delivery.own_push unset, draft PRs on). An explicit existing_only, a review or no run has none."""
+    task = os.environ.get("TTP_TASK")
+    t = _task_row(p, task) if task and own_creates_pr_branch(cfg) else None
+    if not t or str(t.get("kind") or "") != "code" or (own := own_name(t)) == branch:
+        return ""
+    return (f"deliver on this task's own branch instead, which may be created: commit on {own} (`git switch "
+            f"-c {own}` if it is not checked out), run `ttp push --own-branch --detach` and open the PR "
+            f"from {own}")
 
 
 def own_pr_branch(p: Project, cfg: dict, branch: str) -> bool:

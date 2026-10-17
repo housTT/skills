@@ -473,7 +473,8 @@ def push_allowed(d: dict) -> bool:
 # push that publishes as with --own: a notes branch, a pr_branch or rebases: task) may push to.
 # "on" (set explicitly): the task's own or carried branch, created on the remote when new.
 # "existing_only" (the default when unset): only onto a branch the remote already has; never creates
-# one, except a code task's own draft-PR branch while unset (own_creates_pr_branch). "off": none; the
+# one, except a code task's own draft-PR branch while unset (own_creates_pr_branch; push.own_route names
+# that route when another task's branch is refused). An explicit "existing_only" stays strict. "off": none; the
 # push branch, through `ttp push` or the push queue, is the only branch the project pushes, and a
 # pr_branch or rebases: task lands there too. A project whose charter allows only one push branch
 # sets "off". An unknown value reads as "off": a typo never widens what may be pushed.

@@ -5977,7 +5977,8 @@ def main(argv: list[str] | None = None) -> None:
                         "never delivery.push_branch, main or the default branch")
     s.add_argument("--own-branch", action="store_true",
                    help="as --own, but publish this task's own ttp/t<id>-... branch under its own name, never "
-                        "onto a pr_branch it carries")
+                        "onto a pr_branch it carries: the route when --own may not create that pr_branch "
+                        "(delivery.own_push unset lets a code task create its own branch)")
     s.add_argument("--land", action="store_true",
                    help="inside a run: land this task's own ttp/t<id>-... branch on delivery.push_branch even "
                         "though its spec has no landing step (without it such a push is refused)")
