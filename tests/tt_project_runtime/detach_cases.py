@@ -103,6 +103,23 @@ def test_stop_records_its_reason_before_a_reader_can_see_the_job_gone(tmp_path, 
     assert detach.state(rc) == ("lost", "remote driver gone: test")
 
 
+def test_stop_records_its_reason_before_the_job_ends(env, tmp_path, monkeypatch):
+    """The keeper's loop reads the job's state while its probe thread stops it: a look between the kill
+    and the record took the job for one killed with no reason and wrote that, over the remote verdict."""
+    from ttp import detach, locks
+    from ttp.runner import boot_id
+    rc = _remote_job(tmp_path, host="box", boot=boot_id(), pid="", marker="")
+    detach.started(rc).write_text("4242\n")
+    killed, seen = [], []
+    monkeypatch.setattr(locks, "any_free", lambda paths: bool(killed))
+    monkeypatch.setattr(detach.os, "killpg", lambda pid, sig: killed.append(pid) or seen.append(detach.state(rc)))
+    assert detach.state(rc) == ("running", "")
+    why = "remote driver gone: pid 7 on box is dead"
+    detach.stop(rc, 4242, why)
+    assert killed == [4242] and seen == [("lost", why)], seen
+    assert detach.state(rc) == ("lost", why)
+
+
 def test_a_keeper_ends_a_job_whose_remote_driver_died_and_lets_its_hold_go(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import detach, hold, locks
