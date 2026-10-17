@@ -572,7 +572,8 @@ def test_mute_escalates_once_when_a_muted_condition_persists(env):
         return scr.count_muted(p.db, "watcher:hw", text, "high", now=at)
 
     # A 24 h mute whose condition is still seen at 2 h 1 min: exactly one high event, however often seen.
-    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0)
+    # (A hold: its cap, screen.hold_mute_escalate_h, is set to 2 h here, so the 2 h default applies.)
+    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0, hold_cap_h=2)
     for at in (t0, t0 + 3600, t0 + 7260, t0 + 9000, t0 + 10800):
         assert see("box-a: held, auto power cycle off", at)
     [e] = asks()
@@ -591,7 +592,7 @@ def test_mute_escalates_once_when_a_muted_condition_persists(env):
     # Extending the mute keeps an unasked condition's clock (re-muting never hides it); one that already
     # asked re-arms from the new mute.
     see("box-b: held", t0 + 23400)
-    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0 + 25200)
+    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0 + 25200, hold_cap_h=2)
     see("box-b: held", t0 + 30660)   # box-b: 2 h 1 min since first seen
     see("box-a: held, auto power cycle off", t0 + 30660)   # box-a: 1.5 h since the re-mute
     assert len(asks()) == 3 and "box-b" in asks()[-1]["text"]
@@ -607,7 +608,7 @@ def test_mute_escalation_skips_cleared_conditions_and_honours_never(env):
     def asks():
         return p.db.q("SELECT text FROM events WHERE kind='observation' AND text LIKE ?", (f"%{scr.MUTE_PERSISTS}%",))
 
-    scr.mute(p.db, "watcher:hw", "held", 24, now=t0)
+    scr.mute(p.db, "watcher:hw", "held", 24, now=t0, hold_cap_h=2)   # a 2 h hold cap: the default applies
     # Cleared by the watcher, then back for under 2 h: none.
     scr.count_muted(p.db, "watcher:hw", "box-a: held", "high", now=t0 + 600)
     scr.count_muted(p.db, "watcher:hw", "box-a: cleared: held", "info", now=t0 + 1800)
@@ -656,13 +657,13 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
                             {"type": "observation_mute", "source": "watcher:sm", "match": "hold state", "hours": 48,
                              "escalate_after_h": 24},
                             {"type": "observation_mute", "source": "watcher:ok", "match": "held", "hours": 48,
-                             "escalate_after_h": 3}])
+                             "escalate_after_h": 0.5}])
     assert notes == []
     capped = [n for n in p.db.kv(coord.NOTES_KEY, []) if "covers a device hold" in n]
-    assert len(capped) == 2 and "asks after 6 h, not 0" in capped[0] and "not 24" in capped[1], notes
+    assert len(capped) == 2 and "asks after 1 h, not 0" in capped[0] and "not 24" in capped[1], notes
     by = {m["source"]: m for m in scr.mutes(p.db)}
     assert by["watcher:hw"]["escalate_after_h"] == scr.MUTE_HOLD_ESCALATE_H and by["watcher:hw"]["hold"]
-    assert by["watcher:ok"]["escalate_after_h"] == 3   # already within the cap: kept
+    assert by["watcher:ok"]["escalate_after_h"] == 0.5   # already within the cap: kept
     # A mute whose match does not name a hold, but whose conditions or key do, still asks after the cap.
     scr.mute(p.db, "watcher:st", "state machine", 48, why="the vendor has it", escalate_after_h=0)
     scr.mute(p.db, "watcher:kk", "chip lines", 48, why="the vendor has it", escalate_after_h=0)
@@ -671,7 +672,7 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
         scr.count_muted(p.db, "watcher:hw", "box-a: held with no tenant", "high", now=at)
         scr.count_muted(p.db, "watcher:st", "box-a: state machine stuck in hold", "high", now=at)
         scr.count_muted(p.db, "watcher:kk", "box-a: chip lines low", "high", now=at, key="device_held")
-        assert at - t0 >= 6 * 3600 or not asks("watcher:hw")
+        assert at - t0 >= scr.MUTE_HOLD_ESCALATE_H * 3600 or not asks("watcher:hw")
     for src in ("watcher:hw", "watcher:st", "watcher:kk"):
         assert len(asks(src)) == 1, src
     # A mute of something else with escalate_after_h 0 still never asks.
@@ -682,9 +683,9 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
 
 
 
-def test_mute_replay_of_a_held_box_wakes_the_coordinator_two_hours_in(env, monkeypatch):
+def test_mute_replay_of_a_held_box_wakes_the_coordinator_an_hour_in(env, monkeypatch):
     """The post-mortem timeline: muted at 10:01 for 24 h, the watcher reports the held box every 30 min.
-    Before, nothing woke for 24 h; now the coordinator wakes at high effort at about 12:01."""
+    Before, nothing woke for 24 h; now the coordinator wakes at high effort at about 11:01 (the hold cap)."""
     p = make(env)
     from ttp import coordinator as coord
     from ttp import daemon as dm
@@ -707,9 +708,9 @@ def test_mute_replay_of_a_held_box_wakes_the_coordinator_two_hours_in(env, monke
         d._run_command_watcher({"name": "hw"}, {"command": "x"})
         if len(p.db.q("SELECT id FROM events WHERE kind='observation' AND status='queued'")) > n:
             woke.append((clock["t"] - muted_at) / 3600)
-    assert woke == [2.0], woke   # 12:01, and only then
+    assert woke == [1.0], woke   # 11:01, and only then
     [e] = p.db.q("SELECT * FROM events WHERE text LIKE ?", (f"%{scr.MUTE_PERSISTS}%",))
-    assert e["status"] == "queued" and e["severity"] == "high" and e["ts"] == muted_at + 7200, dict(e)
+    assert e["status"] == "queued" and e["severity"] == "high" and e["ts"] == muted_at + 3600, dict(e)
     assert "persisting 5.5 h (asked)" in status_text(p)
     assert "persisting 5.5 h" in coord.digest(p, {}, [], [])
 

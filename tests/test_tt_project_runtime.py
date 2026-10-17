@@ -2999,11 +2999,11 @@ def test_mute_clock_clears_on_a_clean_watcher_run_and_re_arms(env, monkeypatch):
     run, asks, _ = _muted_watcher(env, monkeypatch, held)
     for h in (0.5, 1, 1.5, 2, 2.5):
         run(h, held)
-    assert asks() == [2.0]
+    assert asks() == [1.0], "a hold mute asks after its cap (1 h), not the 2 h default"
     run(3, "")   # a clean run: the daemon counts it as cleared
     for h in (3.5, 4, 4.5, 5, 5.5, 6, 6.5):
         run(h, held)   # back from 3.5 h and held for 3 h
-    assert asks() == [2.0, 5.5], asks()
+    assert asks() == [1.0, 4.5], asks()
 
 
 def test_mute_clock_restarts_after_clean_runs(env, monkeypatch):
@@ -3014,11 +3014,10 @@ def test_mute_clock_restarts_after_clean_runs(env, monkeypatch):
     run(1.5, "")
     run(2, held)   # back: 0 h old, not 2 h
     assert asks() == []
-    for h in (2.5, 3, 3.5):
-        run(h, held)
+    run(2.5, held)
     assert asks() == []
-    run(4, held)
-    assert asks() == [4.0], asks()
+    run(3, held)
+    assert asks() == [3.0], asks()
 
 
 def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
@@ -3035,12 +3034,13 @@ def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
     c = conds()
     assert c["boxes: box-a held"]["first_at"] is None
     assert c["boxes: box-b held"]["first_at"] is not None
+    assert asks() == [1.0] and "box-b" in p.db.one("SELECT text FROM events WHERE text LIKE ?",
+                                                     (f"%{scr.MUTE_PERSISTS}%",))["text"]
     run(1.5, both)   # box-a back: a new clock
     run(2, both)
-    assert asks() == [2.0] and "box-b" in p.db.one("SELECT text FROM events WHERE text LIKE ?",
-                                                     (f"%{scr.MUTE_PERSISTS}%",))["text"]
-    run(3.5, both)
-    assert asks() == [2.0, 3.5], asks()
+    assert asks() == [1.0]
+    run(2.5, both)
+    assert asks() == [1.0, 2.5], asks()
 
 
 def test_mute_tracks_a_whole_json_line_as_one_condition(env, monkeypatch):
@@ -36003,11 +36003,19 @@ def test_a_long_machine_condition_goes_to_its_owner_then_the_fallback_then_the_u
     ml.report("delta", "box-a", "down", now=t0 + 60)
     able = {"alpha": (False, "its daemon is stopped"), "beta": (False, "it is paused")}
     pages = ml.route(t0 + 120, able=able.get)
-    assert [x["target"] for x in pages] == ["alpha"] and pages[0]["kind"] == "machine_condition"
+    # The owner cannot act: its recovery page, and at once an outage task for the fallback (nobody can act).
+    assert [(x["target"], x["kind"]) for x in pages] == [("alpha", "machine_condition"),
+                                                         ("beta", "machine_outage_task")]
     assert "box-a down" in pages[0]["text"] and "gamma, delta" in pages[0]["text"]
     assert ml.route(t0 + 180, able=able.get) == [], "a claimed page goes to one daemon"
     assert ml.delivered(pages[0]) and not ml.delivered(pages[0])
-    assert ml.route(t0 + 180 + ml.UNAVAILABLE_S - 60, able=able.get) == [], "a delivered page is sent once"
+    assert ml.delivered(pages[1])
+    assert ml.route(t0 + 120 + ml.outagetask.TASK_DUE_S - 1, able=able.get) == [], "a delivered page is sent once"
+    # The task is open past its due time and no project can act: one user alert for it.
+    pages = ml.route(t0 + 120 + ml.outagetask.TASK_DUE_S, able=able.get)
+    assert [(x["target"], x["kind"]) for x in pages] == [(ml.USER, "machine_outage_overdue")]
+    assert "no project can act on it" in pages[0]["text"] and pages[0]["severity"] == "normal"
+    ml.delivered(pages[0])
     pages = ml.route(t0 + 180 + ml.UNAVAILABLE_S, able=able.get)
     assert [x["target"] for x in pages] == ["beta"] and "alpha cannot act: its daemon is stopped" in pages[0]["text"]
     ml.delivered(pages[0])
@@ -36093,7 +36101,9 @@ def test_a_machine_page_lost_to_a_crash_goes_out_on_a_later_tick_exactly_once(en
     ml.report("gamma", "box-a", "down", "no answer to ssh", now=time.time() - 3600)
     # A daemon routes the page, then dies before it delivers: the page stays pending, claimed for a while.
     pages = ml.route(claimer="alpha")
-    assert [x["target"] for x in pages] == ["beta"] and _inbox() == []
+    # beta cannot act (not a project here): its outage task goes at once to the detector, gamma.
+    assert [(x["target"], x["kind"]) for x in pages] == [("beta", "machine_condition"),
+                                                         ("gamma", "machine_outage_task")] and _inbox() == []
     d = Daemon(alpha.base)
     d.route_machines()
     assert _inbox() == [], "the claim holds while the crashed daemon might still deliver"
@@ -36101,18 +36111,19 @@ def test_a_machine_page_lost_to_a_crash_goes_out_on_a_later_tick_exactly_once(en
     d._machines_routed = 0
     d.route_machines()
     notes = _inbox()
-    assert [(n["to"], n["from"]) for n in notes] == [("beta", "daemon")]
+    assert [(n["to"], n["from"]) for n in notes] == [("beta", "daemon"), ("gamma", "daemon")]
     assert notes[0]["spec"] == " ".join(pages[0]["text"].split()), "the text is fixed for the step"
+    assert notes[1]["outage"]["label"] == pages[1]["id"] and "outage" not in notes[0]
     d._machines_routed = 0
     d.route_machines()
-    assert len(_inbox()) == 1
+    assert len(_inbox()) == 2
     # A crash after the send but before it was marked: the resend is the same note, dropped as a duplicate.
     ml.report("gamma", "box-a", "held", now=time.time() - 3600)
     page = next(x for x in ml.route(claimer="alpha") if x["key"] == "machine:box-a:held")
     assert d._machine_page(page, time.time())
     d._machines_routed = 0
     d.route_machines()
-    assert len(_inbox()) == 2 and ml.route() == []
+    assert len(_inbox()) == 4 and ml.route() == [], "the resend is dropped; the held outage's task goes once"
     # The same at home: one event per page, however often it is retried.
     mm.set_recovery("box-a", owner="alpha")
     ml.report("gamma", "box-a", "down", cleared=True)
@@ -36149,21 +36160,23 @@ def test_a_limited_machine_page_is_retried_and_daemon_pages_skip_the_worker_note
     monkeypatch.setattr(upstream, "send", flaky)
     d = Daemon(alpha.base)
     d.route_machines()
-    assert calls == ["beta"] and not [n for n in _inbox() if "Machine box-a down" in n["spec"]]
+    # beta's refused page waits; the outage task for the detector gamma (beta cannot act) goes out.
+    assert calls == ["beta", "gamma"] and not [n for n in _inbox() if n["to"] == "beta" and "Machine box-a down" in n["spec"]]
     d._machines_routed = 0
     d.route_machines()
-    assert calls == ["beta", "beta"]
-    assert len([n for n in _inbox() if "Machine box-a down" in n["spec"]]) == 1
+    assert calls == ["beta", "gamma", "beta"]
+    assert len([n for n in _inbox() if n["to"] == "beta" and "Machine box-a down" in n["spec"]]) == 1
     d._machines_routed = 0
     d.route_machines()
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def _router(home, n, now):
     from ttp import machine_ledger as ml
     from ttp import upstream
     for page in ml.route(now, able=lambda name: (True, ""), claimer=f"p{n}"):
-        assert upstream.send(f"p{n}", None, page["target"], page["text"], "high", now=now, sender="daemon") == "sent"
+        assert upstream.send(f"p{n}", None, page["target"], page["text"], "high", now=now, sender="daemon",
+                             extra={"outage": page["outage"]} if page.get("outage") else None) == "sent"
         assert ml.delivered(page)
 
 
@@ -36183,7 +36196,10 @@ def test_two_daemons_routing_at_once_deliver_a_machine_page_once(env):
     for pr in procs:
         pr.join(60)
         assert pr.exitcode == 0
-    assert sorted(n["to"] for n in _inbox()) == ["beta", "gamma"]
+    # The recovery page, the overdue change's page, and one outage task (beta recorded no recovery action
+    # within its budget), each sent once by one of the four daemons.
+    got = sorted((n["to"], bool(n.get("outage"))) for n in _inbox())
+    assert got == [("beta", False), ("gamma", False), ("gamma", True)]
     assert ml.route(now + ml.CLAIM_S, able=lambda name: (True, "")) == []
 
 
@@ -41885,14 +41901,15 @@ def _quiet_box(env, owner="alpha", fallback="beta"):
 
 def _walk(ml, able, t0, cond="down", steps=8):
     """Route the condition through every step of its chain, gamma still seeing it; returns the targets
-    paged, in order."""
+    paged, in order: a recovery page as its target, an outage task's page as `<target>:task`, `:overdue`."""
     got = []
     for i in range(steps):
         t = t0 + i * (ml.UNAVAILABLE_S + 60)
         ml.report("gamma", "box-a", cond, now=t)
         for page in ml.route(t, able=able):
             ml.delivered(page)
-            got.append(page["target"])
+            kind = {"machine_outage_task": ":task", "machine_outage_overdue": ":overdue"}.get(page["kind"], "")
+            got.append(page["target"] + kind)
     return got
 
 
@@ -41916,7 +41933,8 @@ def test_a_known_outage_pages_nobody_and_shows_in_the_daily_review(env, capsys):
     main(["machines", "outage", "box-a", "--clear"])
     t1 = t0 + 5 * ml.UNAVAILABLE_S
     ml.report("gamma", "box-a", "down", now=t1)
-    assert _walk(ml, able, t1) == ["alpha", "beta", ml.USER]
+    # Nobody can act on it: the fallback gets the outage task at once, and the user hears once it is overdue.
+    assert _walk(ml, able, t1) == ["alpha", "beta:task", ml.USER + ":overdue", "beta", ml.USER]
 
 
 def test_an_outage_owned_by_a_person_or_ticket_pages_nobody(env, capsys):
@@ -41991,7 +42009,7 @@ def test_an_outage_no_open_work_needs_escalates_no_further_until_work_needs_it(e
     gamma.db.add_task("run the soak", labels=["resource:box-a-device"])
     t1 = t0 + 5 * ml.UNAVAILABLE_S
     ml.report("gamma", "box-a", "down", now=t1)
-    assert _walk(ml, able, t1) == ["beta", ml.USER]
+    assert _walk(ml, able, t1) == ["beta:task", "beta", ml.USER + ":overdue", ml.USER]
 
 
 def test_an_unexplained_outage_that_open_work_needs_still_pages_the_user(env):
@@ -42000,7 +42018,7 @@ def test_an_unexplained_outage_that_open_work_needs_still_pages_the_user(env):
     gamma.db.add_task("run the soak", labels=["exclusive:box-a"])
     t0 = time.time()
     ml.report("gamma", "box-a", "down", now=t0)
-    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta", ml.USER]
+    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta:task", ml.USER + ":overdue", "beta", ml.USER]
     assert ml.condition_open("box-a:down", now=t0 + 3600) and ml.review_lines(alpha) == []
 
 
@@ -42034,7 +42052,7 @@ def test_the_last_step_pages_the_reporters_coordinator_when_its_heal_check_escal
     t0 = time.time()
     ml.report("gamma", "box-a", "down", now=t0, escalate="coordinator")
     ml.report("delta", "box-a", "down", now=t0, escalate="user")
-    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta", "gamma"]
+    assert _walk(ml, able, t0 + 3600) == ["alpha", "beta:task", "gamma:overdue", "beta", "gamma"]
     ml.report("gamma", "box-a", "down", now=t0 + 3600, escalate="user")
     assert ml.conditions()["box-a:down"].get("escalate_by") == {}
 

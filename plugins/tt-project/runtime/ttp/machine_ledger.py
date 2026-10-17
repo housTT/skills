@@ -647,6 +647,15 @@ def chain(alias: str, first: str | None = None) -> list[str]:
     return out
 
 
+def _ask(able: Callable[[str], tuple[bool, str]], who: str) -> tuple[bool, str]:
+    """able(who); any answer that is not an (ok, why) pair counts as cannot act, as can_act answers for a
+    name it does not know."""
+    got = able(who)
+    if isinstance(got, (tuple, list)) and len(got) == 2:
+        return bool(got[0]), str(got[1] or "")
+    return False, "not a project of this user"
+
+
 def _step(page: dict, targets: list[str], now: float, able: Callable[[str], tuple[bool, str]]) -> str | None:
     """Advance one item's page state; returns the target to page now, or None."""
     if "stage" not in page:
@@ -655,7 +664,7 @@ def _step(page: dict, targets: list[str], now: float, able: Callable[[str], tupl
     stage = int(page["stage"])
     if stage >= len(targets):
         return None   # the user has it
-    ok, why = able(targets[stage])
+    ok, why = _ask(able, targets[stage])
     if ok:
         page.pop("unable_since", None)
         page.pop("why", None)
@@ -695,7 +704,7 @@ def _task_host(c: dict, targets: list[str], able: Callable[[str], tuple[bool, st
     rest = [t for t in targets[1:] if t != owner]
     seen = [s for s in c.get("seen_by") or [] if s != owner and s not in rest]
     for who in rest + seen:
-        if able(who)[0]:
+        if _ask(able, who)[0]:
             return who
     return (rest + seen + [owner])[0]
 
@@ -705,11 +714,12 @@ def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
                status: Callable[[str, str], str | None]) -> None:
     """Advance condition `c`'s outage task (outagetask.py): queue it once its owner cannot act, or did not
     record a recovery action within b['owner_s']; then, past its due time while open, one high page to its
-    project, and past b['escalate_s'] more, one normal-severity user page. A creating page still pending
-    is never replaced."""
+    project, and past b['escalate_s'] more, one normal-severity user page (straight away when no project
+    can act; to the reporter's coordinator when its heal check escalates there). A creating page still
+    pending is never replaced."""
     task, owner = c.get("task"), targets[0]
     if task is None:
-        ok, why = able(owner)
+        ok, why = _ask(able, owner)
         if ok:
             if now - float(c["first"]) < b["owner_s"] or any(
                     a.get("alias") == c["alias"] and float(a.get("added") or 0) >= float(c["first"]) for a in acts):
@@ -739,18 +749,24 @@ def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
     late = f"Outage task {task['label']} in {task['project']} for machine {c['alias']} {c['condition']} " \
            f"(since {ends.shown(c['first'])}) is open past its due time {ends.shown(due)}"
     if stage == 0:
-        target = next((w for w in [task["project"]] + list(c.get("seen_by") or []) if able(w)[0]), USER)
-        task["stage"] = 1
-        task["pending"] = {"target": target, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
-                           "alias": c["alias"], "stage": 1, "id": f"{task['label']}#overdue",
-                           "severity": "high" if target != USER else "normal",
-                           "text": f"{late}: check it and recover the machine now, or say who must act."}
-    elif now >= due + b["escalate_s"]:
-        task["stage"] = 2
-        task["pending"] = {"target": USER, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
-                           "alias": c["alias"], "stage": 2, "id": f"{task['label']}#user", "severity": "normal",
-                           "text": f"{late} by more than {b['escalate_s'] / 60:g} min."}
-
+        target = next((w for w in [task["project"]] + list(c.get("seen_by") or []) if _ask(able, w)[0]), None)
+        if target:
+            task["stage"] = 1
+            task["pending"] = {"target": target, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
+                               "alias": c["alias"], "stage": 1, "id": f"{task['label']}#overdue",
+                               "severity": "high",
+                               "text": f"{late}: check it and recover the machine now, or say who must act."}
+            return
+        tail = "; no project can act on it"   # nobody to wake: straight to the user, once
+    elif now < due + b["escalate_s"]:
+        return
+    else:
+        tail = f" by more than {b['escalate_s'] / 60:g} min"
+    coordinators = [w for w in c.get("seen_by") or [] if (c.get("escalate_by") or {}).get(w) == "coordinator"]
+    task["stage"] = 2
+    task["pending"] = {"target": coordinators[0] if coordinators else USER, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
+                       "alias": c["alias"], "stage": 2, "id": f"{task['label']}#user", "severity": "normal",
+                       "text": f"{late}{tail}."}
 
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
           claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None,
@@ -843,9 +859,11 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 _pending(page, target, "machine_condition", f"machine:{key}", c["alias"], float(c["first"]),
                          condition_text(c, page, targets, target, now))
             claim(page)
+            if why:
+                settle_task(c)   # quiet (paused, a known fault, no work needs it): its owner hears once, no task
+                continue
             _task_step(c, key, targets, page, now, able, b, acts, task_status)
-            if "task" in c:
-                claim(c["task"])
+            claim(c.get("task") or {})
         doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
                         if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
         doc["outages"] = outages(now, doc)
