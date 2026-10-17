@@ -774,6 +774,10 @@ PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
 COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
 # Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
 ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
+# An entry that cites the user's word (`user msg #N`, `(user, <date>)`, "the user's words"): the
+# archive retires one only after the non-user decisions and facts of its age (archive_hidden_memory).
+USER_CITE = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\b|\buser's (?:own |verbatim )?words\b|\(user\b[,);:]"
+                       r"|^\s*(?:\[[^\]]*\]\s*)?user\s+\d{4}-\d{2}-\d{2}", re.I | re.M)
 MEMORY_SHOWN_KEY = "memory_shown"   # kv: when a prompt last carried each entry (see note_memory_shown)
 # Memory audiences an entry's front matter may name (`audience:`); without one, see worker_memory.
 MEMORY_AUDIENCES = ("workers", "coordinator")
@@ -1269,8 +1273,17 @@ class Project:
 
     def archive_hidden_memory(self, days: float) -> list[str]:
         """Retire hidden_memory(days) to memory/archive/ with one harness commit, and drop retired
-        names from the shown map. Returns the names retired."""
+        names from the shown map. Returns the names retired. An entry that cites the user's word
+        (USER_CITE) stays while a decision or fact that does not, created no later than a day after
+        it, stays live: the archive never retires the user's decision before a non-user one of its age."""
         names = self.hidden_memory(days)
+        if names:
+            entries = {e["name"]: e for e in self._memory_entries()}
+            cites = {n for n in names if USER_CITE.search(entries[n]["line"])}
+            kept = [_stamp_ts(e["created"]) for n, e in entries.items() if n not in names
+                    and e["kind"] in ARCHIVABLE_MEMORY_KINDS and not e["standing"] and not USER_CITE.search(e["line"])]
+            names = [n for n in names if n not in cites
+                     or not any(t <= _stamp_ts(entries[n]["created"]) + 86400 for t in kept)]
         done = self.forget_memories(names, why=f"no prompt showed it for {days:g}+ days")[0] if names else []
         with self.db.tx():
             m = self.db.kv(MEMORY_SHOWN_KEY)

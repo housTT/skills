@@ -244,7 +244,10 @@ def event_text(a: dict) -> str:
             + (", ".join(a["files"]) or "unknown")
             + ". The daemon queues no more automatic fixes for it. Re-plan this area: narrow the scope, accept "
               "and document the known gaps, or redesign. Do not add another edge-case fix, and do not raise "
-              "the tier to deep for this alone.")
+              "the tier to deep for this alone. Record the settled design with `memory_add` `memory_kind: "
+              "settled_area` (`files`, `title` as the one-line rule, `text` the decision, `reviews` the failed "
+              "ids), not as a plain decision: it goes to the settled-areas register, which reaches only the "
+              "tasks that touch those files.")
 
 
 def daily_line(db: DB, since: float) -> str:

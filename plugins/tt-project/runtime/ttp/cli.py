@@ -2209,7 +2209,7 @@ def _mark_verified(p: Project | None, head: str, tree: str, cmds: list) -> None:
 
 
 # Files in the project's own harness repo the runtime and other tasks write while a harness task runs.
-HARNESS_STATE_FILES = ("project.json", "schedules.json", "MEMORY.md")
+HARNESS_STATE_FILES = ("project.json", "schedules.json", "MEMORY.md", "settled_areas.json")
 
 
 def _harness_state_path(path: str, own_harness: bool) -> bool:
@@ -4072,6 +4072,23 @@ def cmd_memory(a) -> None:
             tags = ", ".join([e["kind"]] + ["standing"] * e["standing"] + ["archived"] * e["archived"])
             print(f"[{e['name']}] ({tags}) {' '.join(e['text'].split())[:300]}")
         print(f"{len(found)} entr{'y' if len(found) == 1 else 'ies'} found")
+        return
+    if a.settle is not None:
+        from . import settled
+        if a.text or a.forget or a.supersedes:
+            sys.exit("--settle takes only entry names (or none: every review-area settlement in memory)")
+        try:
+            recs, errors = settled.migrate(p, a.settle, dry_run=a.dry_run)
+        except ValueError as e:
+            sys.exit(str(e))
+        for r in recs:
+            print(f"{'would move' if a.dry_run else 'moved'} [{r['source']}] -> {settled.record_text(r, False)}")
+        print(f"{len(recs)} entr{'y' if len(recs) == 1 else 'ies'} {'would move' if a.dry_run else 'moved'} to "
+              f"{settled.FILE}" + ("" if a.dry_run or not recs else " and archived from memory"))
+        if not a.dry_run:
+            memory_budget_check(p)
+        if errors:
+            sys.exit("\n".join(errors))
         return
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
@@ -6464,6 +6481,12 @@ def main(argv: list[str] | None = None) -> None:
                         "be replaced by one not --standing, a restriction, preference or resource by another "
                         "kind, or the quoted (user's verbatim) words of a restriction, preference or standing "
                         "entry are missing from the text")
+    s.add_argument("--settle", nargs="*", metavar="ENTRY",
+                   help="move decision entries into the settled-areas register (harness/settled_areas.json) and "
+                        "archive them from memory, in one harness commit; with no names, every decision that "
+                        "records a review-area-cap settlement. Each entry's whole text stays as the record's "
+                        "decision")
+    s.add_argument("--dry-run", action="store_true", help="with --settle: show what would move; change nothing")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import chaincap, conflictfix, settinghold, timefmt
+from . import chaincap, conflictfix, settinghold, settled, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
@@ -628,6 +628,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
               "`ttp push --own` publishes only onto a branch the remote already has)")
            if own_push(cfg) != "on" and delivery.get("own_push") is not None else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
+        settled.prompt_block(p, dict(task)),
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
 

@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -76,7 +76,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "pin_verify": {"type": "string", "enum": ["strict", "lenient", ""]},
             "budget_usd": {"type": "number"}, "depends_on": {"type": "array", "items": {"type": "integer"}},
             "reply_chat": {"type": "string"}, "id": {"type": "integer"}, "status": {"type": "string"},
-            "memory_kind": {"type": "string"}, "audience": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
+            "memory_kind": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}},
+            "reviews": {"type": "array", "items": {"type": "integer"}}, "audience": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "command": {"type": "string"}, "timeout_s": {"type": "number"},
             "rewake_after_h": {"type": ["number", "null"]}, "debounce_h": {"type": ["number", "null"]},
@@ -300,7 +301,7 @@ MUTE_CHARS = 200
 # resources and memory changes are always shown whole; the machine ledger collapses per line
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -800,6 +801,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         shas[LEDGER_SEEN_KEY] = ledger[1]
     section("prompt_delta", prompt_delta_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))
+    area = settled.digest_line(p, now)
+    section("settled_areas", [area] if area else [], area, area.split(":")[0] + " (as last turn)")
     cached, delta = recent_memory(p, now)
     section("memory_recent", cached)
     section("memory_recent_added", delta)
@@ -1552,6 +1555,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"{why}: it delivers to the push branch with `ttp push`")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
+                if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
+                    notes.append(hit)
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
@@ -1702,6 +1707,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         notes.append(f"task_update: #{task['id']} asks for PR delivery but is running as "
                                      f"`{task['kind']}` and keeps that kind mid-run, so it cannot open the PR: "
                                      f"cancel it and task_add a code task with continues={task['id']}")
+                    if hit := settled.turn_note(p, spec, f"task_update: #{task['id']}"):
+                        notes.append(hit)
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
@@ -1821,6 +1828,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 sent.append((db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity"))),
                              None, a["text"]))
+            elif t == "memory_add" and a.get("memory_kind") == settled.KIND:
+                rec = settled.from_action(p, a, key)
+                notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
+                             f"({', '.join(rec['files']) or 'no file named: it reaches no task prompt'})")
             elif t == "memory_add":
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
