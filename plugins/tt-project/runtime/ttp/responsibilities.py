@@ -441,8 +441,7 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
                                     "reason": pz.get("reason") or "", "by": pz.get("by") or "",
                                     "end": pauseends.describe(pz)})
         v["changes"] = [machine_ledger.change_line(c, now) for c in machine_ledger.changes({a})]
-        v["conditions"] = [f"{c['condition']} since {machine_ledger.ends.shown(c['first'])} (seen by "
-                           f"{', '.join(c.get('seen_by', []))}): {c.get('text') or 'no detail'}"
+        v["conditions"] = [machine_ledger.condition_line(c, now)
                            for k, c in machine_ledger.conditions().items() if c.get("alias") == a]
         v["outage"] = outs.get(a)
     return list(view.values())

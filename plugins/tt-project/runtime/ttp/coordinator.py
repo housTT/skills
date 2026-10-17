@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -1815,7 +1815,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
-                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg)
+                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg) or outagemsg.bare(a["text"])
                 if why:
                     raise ValueError(f"notify rejected: {why}")
                 sent.append((db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity"))),

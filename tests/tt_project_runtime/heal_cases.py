@@ -1410,6 +1410,10 @@ def test_heal_pages_an_untenanted_hold_past_its_ceiling_even_under_a_known_outag
         assert alerts_ == [] and len(events) == 1 and events[0]["severity"] == "high"
         text = events[0]["text"]
     assert "held with no holder" in text and "unrelated repair" in text and "box-a" in text
+    # outagemsg: when it began, how long so far, who acts now and what was tried.
+    assert "so far)" in text and "Tried: " in text and "Next: find who holds it" in text, text
+    assert ("Acting now: nobody: escalating to the user." if escalate == "user" else
+            f"Acting now: {p.name} (its coordinator).") in text, text
     # Unknown runs without the line keep the page; a run that answers without it clears it.
     heal.run(d, "svc", {**spec, "check": "exit 75"}, now + ceiling + 1000)
     assert alerts.sweep(p.db, now + ceiling + 1001) == [] and "hold_since" in heal.state(p.db, "svc")

@@ -761,14 +761,9 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             if target == USER and coordinators:
                 target = coordinators[0]   # its heal check escalates to its coordinator, not the user
             if target:
-                skipped = f" ({targets[page['stage'] - 1]} cannot act: {page.get('why') or 'no answer'})" \
-                    if page["stage"] else ""
-                # No running count in the text: a resend after a crash is the same note.
+                # The text is fixed for this step (its duration too): a resend after a crash is the same note.
                 _pending(page, target, "machine_condition", f"machine:{key}", c["alias"], float(c["first"]),
-                         f"Machine {c['alias']} {c['condition']} since {ends.shown(c['first'])}, seen by "
-                         f"{', '.join(c['seen_by'])}: {c.get('text') or 'no detail'}. "
-                         f"Recovery page {page['stage'] + 1}{skipped}: "
-                         f"check and recover it; record any live change with `ttp machines change add`.")
+                         condition_text(c, page, targets, target, now))
             claim(page)
         doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
                         if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
@@ -793,6 +788,66 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
         if changed:
             _write(LEDGER, ledger)
     return out
+
+
+def acting_now(c: dict) -> str:
+    """Who is acting on condition `c` now, from its page state (outagemsg wording)."""
+    from . import outagemsg
+    page = c.get("page") or {}
+    targets = chain(c["alias"])
+    if not targets:
+        return "nobody: no recovery owner set"
+    if page.get("held"):
+        return f"nobody: {page['held'].get('by')}'s heal check sees it healthy"
+    if page.get("quiet"):
+        return f"nobody: not escalated ({page['quiet']})"
+    if "stage" not in page:
+        return f"nobody yet: {targets[0]} is paged once its grace ends"
+    stage = int(page["stage"])
+    if stage >= len(targets):
+        return outagemsg.TO_USER
+    m = machines.load().get(c["alias"]) or {}
+    who = targets[stage]
+    return outagemsg.actor(who, "owner" if who == m.get("recovery_owner") else
+                           "fallback" if who == m.get("recovery_fallback") else "",
+                           # `why` outlives a step (the next page names it); `unable_since` is this target's
+                           f"cannot act yet: {page['why']}" if page.get("why") and page.get("unable_since") else "")
+
+
+def condition_line(c: dict, now: float, where=None, so_far: bool = True) -> str:
+    """'down since <start> (<duration> so far; seen by ...): <text>. Acting now: <who>[. Tracked task: #N]'.
+    `so_far` False leaves out the duration (the coordinator digest, which would else reword it each turn)."""
+    from . import outagemsg
+    page = c.get("page") or {}
+    lasted = f"{outagemsg.duration(now - float(c['first']))} so far; " if so_far else ""
+    tid = outagemsg._int(page.get("task") or c.get("task"))
+    return (f"{c['condition']} since {ends.shown(c['first'], where)} ({lasted}seen by "
+            f"{', '.join(c.get('seen_by') or [])}): {c.get('text') or 'no detail'}. "
+            f"{outagemsg.ACTING} {acting_now(c)}" + (f". Tracked task: #{tid}" if tid else ""))
+
+
+def condition_text(c: dict, page: dict, targets: list[str], target: str, now: float) -> str:
+    """A machine_condition page's text for this step (outagemsg.facts): since when and how long, who is
+    acting now (the target, its role, and who was passed over and why), the tracked task and due time
+    when the page or condition records one, the pages already sent, and the next step."""
+    from . import outagemsg
+    stage = int(page.get("stage") or 0)
+    m = machines.load().get(c["alias"]) or {}
+    passed = f"{targets[stage - 1]} cannot act: {page.get('why') or 'no answer'}" if 0 < stage <= len(targets) else ""
+    if target == USER:
+        acting = outagemsg.actor(None, passed=passed)
+        step = (f"the user checks and recovers {c['alias']}, or names a project that can "
+                f"(`ttp machines set {c['alias']} --owner <project>`)")
+    else:
+        role = ("owner" if target == m.get("recovery_owner") else "fallback" if target == m.get("recovery_fallback")
+                else "coordinator of the reporting project" if target in (c.get("seen_by") or []) else "")
+        acting = outagemsg.actor(target, role, passed)
+        step = f"{target} checks and recovers it; record any live change with `ttp machines change add`"
+    tried = [f"recovery page {i + 1} to {t}" for i, t in enumerate(targets[:stage])]
+    return (f"Machine {c['alias']} {c['condition']}, seen by {', '.join(c.get('seen_by') or [])}: "
+            f"{c.get('text') or 'no detail'}. Recovery page {stage + 1}. "
+            + outagemsg.facts(float(c["first"]), now, acting, task=page.get("task") or c.get("task"),
+                              due=page.get("due") or c.get("due"), tried=tried, next_step=step))
 
 
 def _settle(sent: dict, done: bool) -> bool:
@@ -987,7 +1042,8 @@ def digest_items(p, now: float | None = None) -> list[tuple[str, str]]:
                           f"{c['alias']} {c['condition']} since {ends.shown(c['first'], p)} (seen by "
                           f"{', '.join(c.get('seen_by', []))}; recovery owner: {owner or 'none set'}"
                           + (f"; page held: {held['by']}'s heal check sees it healthy" if held else "")
-                          + (f"; not escalated: {hush}" if hush else "") + ")"))
+                          + (f"; not escalated: {hush}" if hush else "")
+                          + (f"; acting now: {acting_now(c)}" if not held and not hush else "") + ")"))
     items += [(f"outage:{a}", outage_line(a, o, p)) for a, o in sorted(outages(now).items()) if a in mine]
     named = list(p.db.kv(GAP_KV) or [])
     gaps = [a for a in mine if not (known.get(a) or {}).get("recovery_owner") and a not in named]

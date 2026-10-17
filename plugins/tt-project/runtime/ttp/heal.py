@@ -170,7 +170,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import pageto, screen, timefmt
+from . import outagemsg, pageto, screen, timefmt
 from .db import DB
 from .project import command_env
 
@@ -1089,9 +1089,19 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float, cwd: str 
     if not st.get("alerted"):
         st["alerted"] = now
         host.alert(STATE_KEY + name, ("Heal check" if st.get("finding") or st.get("route_only") else "Outage: heal check")
-                   + f" {name} still fails and its {how}. Last check: {last}", "high", **({"every_s": 0} if new else {}))
+                   + f" {name} still fails. Last check: {last} "
+                   + outagemsg.facts(float(st.get("since") or now), now, outagemsg.TO_USER, host.p, task=tid,
+                                     tried=_tried(spec, st) + [how],
+                                     next_step="repair it or say how; the alert clears once the check passes"),
+                   "high", **({"every_s": 0} if new else {}))
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
+
+
+def _tried(spec: dict, st: dict) -> list[str]:
+    """What the check's own automatic fix did, for an outage message (outagemsg.facts)."""
+    return [f"its fix `{spec['fix']}` (exit {st.get('fix_rc')})"] if spec.get("fix") and st.get("fix_rc") is not None \
+        else []
 
 
 def _page(host: Any, name: str, spec: dict, st: dict, mark: str, text: str, now: float) -> str | None:
@@ -1223,12 +1233,17 @@ def _untenanted_hold(host: Any, name: str, spec: dict, st: dict, rc: int, out: s
         known = machine_ledger.outages(now).get(machine_of(spec) or "")
     except Exception:   # the ledger is shared and best effort
         known = None
+    to_coord = escalate_to(host, spec) == "coordinator"
     text = (f"Device held with no tenant: heal check {name} reports {what} held with no holder for "
             f"{(now - since) / 3600:.1f} h (ceiling {ceiling / 3600:g} h), so queued work cannot use it. "
             + (f"The known outage of {what} ({known.get('why') or 'no reason given'}) does not cover an "
                f"untenanted hold. " if known else "")
-            + f"Find who holds it and release it, or record why it must stay. Last check (exit {rc}): {out[-300:]}")
-    if escalate_to(host, spec) == "coordinator":
+            + f"Last check (exit {rc}): {out[-300:]} "
+            + outagemsg.facts(since, now, outagemsg.actor(host.p.name, "its coordinator") if to_coord
+                              else outagemsg.TO_USER, host.p,
+                              tried=_tried(spec, st),
+                              next_step="find who holds it and release it, or record why it must stay"))
+    if to_coord:
         fp = f"{HOLD_KEY}{name}:{since:.0f}"
         if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",

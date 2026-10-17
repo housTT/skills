@@ -57,7 +57,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import timefmt
+from . import outagemsg, timefmt
 
 KEY = "network:unreachable"
 STATE_KEY = "network_outage"   # kv: {since, last, alerted, tasks, hosts, tunnel, raised} of the open outage
@@ -347,7 +347,7 @@ def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = Fal
          kind: str = "offline", advise: bool = True, others: int = 0, known: list[str] | None = None) -> str:
     """The alert: what cannot be reached, since when (home zone), how many tasks wait, what to do.
     `tunnel`: every host is reached through a tunnel from the user's workstation (no VPN advice);
-    `now` (the raise to normal) adds how long it has been down. `kind` (classify): "offline" gives the
+    `now` adds how long it has been down. `kind` (classify): "offline" gives the
     VPN or network sign-in advice only with `advise` (a workstation); "hosts" says they are down and
     this machine's network is fine; "known": every host is already known down. `others`: queued tasks
     that can still run later (0: none, and none are counted). `known`: "alias (why)" of the hosts already
@@ -358,22 +358,25 @@ def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = Fal
     verb_s = "s" if len(names) == 1 else ""
     others_ = f"; {others} other task(s) wait on their own timers or checks" if others else ""
     held = f"{n_tasks} queued task(s) that need {them} are held{others_}; the rest of the project keeps running."
+    # outagemsg: how long so far and who acts now, in every variant.
+    lasted = f" ({outagemsg.duration(now - since)} so far)" if now is not None else ""
+    who = ("nobody: it reconnects by itself once the workstation is back" if tunnel else
+           "nobody here: the known outage's owner has it" if kind == "known" else outagemsg.TO_USER)
+    held += f" {outagemsg.ACTING} {who}."
     if tunnel:
-        down = f", down {(now - since) / 3600:.1f} h" if now is not None else ""
-        return (f"Tunnel: {what} be reached since {timefmt.long(since, where)}{down}: the tunnel from the "
-                f"user's workstation that reaches {them} is down. It reconnects by itself once the "
-                f"workstation is back; the held work then resumes. {held}")
+        return (f"Tunnel: {what} be reached since {timefmt.long(since, where)}{lasted}: the tunnel from the "
+                f"user's workstation that reaches {them} is down; the held work resumes once it reconnects. {held}")
     told = f" Already known down: {'; '.join(known)}." if known else ""
     if kind == "known":
-        return (f"Known down: {what} be reached since {timefmt.long(since, where)}; already known down: "
+        return (f"Known down: {what} be reached since {timefmt.long(since, where)}{lasted}; already known down: "
                 f"{'; '.join(known or [])}. The held work resumes by itself once {them} answer{verb_s}. {held}")
     if kind == "hosts":
         appear = "appears" if len(names) == 1 else "appear"
-        return (f"Hosts down: {what} be reached since {timefmt.long(since, where)}: {them} {appear} down or "
+        return (f"Hosts down: {what} be reached since {timefmt.long(since, where)}{lasted}: {them} {appear} down or "
                 f"off the network; other hosts answer, so this machine's own network is fine.{told} "
                 f"The held work resumes by itself once {them} answer{verb_s}. {held}")
     advice = (f"Check that machine's network, and its VPN or network sign-in if {need} one" if advise else
               "That machine's own network looks down")
     return (f"Network: {what} be reached from the machine running this project since "
-            f"{timefmt.long(since, where)}.{told} {advice}; the held work resumes by itself once {them} "
+            f"{timefmt.long(since, where)}{lasted}.{told} {advice}; the held work resumes by itself once {them} "
             f"answer{verb_s}. {held}")

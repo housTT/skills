@@ -70,6 +70,7 @@ from . import locks
 from . import machine_ledger
 from . import netwait
 from . import obligations
+from . import outagemsg
 from . import pageto
 from . import machines
 from . import mitigate
@@ -1330,7 +1331,9 @@ class Daemon:
         target, text = page["target"], page["text"]
         severity = page.get("severity") or "high"
         if target == machine_ledger.USER:
-            self.alert(page["key"], f"Outage: {text} Nobody else could act on it.", severity="high")
+            # A page recorded before outagemsg names no actor: say it here.
+            said = text if outagemsg.ACTOR_RE.search(text) else f"{text} {outagemsg.ACTING} {outagemsg.TO_USER}."
+            self.alert(page["key"], f"Outage: {said}", severity="high")
         elif target == self.p.name and severity == "low":   # a held page's note: a feed line, no coordinator turn
             if not self.p.db.one("SELECT id FROM messages WHERE ref=? AND text=?", (page.get("id"), text)):
                 self.p.db.post("out", text, chat=None, kind="info", severity="low", ref=page.get("id"))
@@ -4483,7 +4486,7 @@ class Daemon:
             db.set_kv(netwait.STATE_KEY, new)
         if action == "alert":
             self.alert(netwait.KEY, netwait.text(
-                self.p, float(new["since"]), len(unreachable), names, tunnel, kind=kind,
+                self.p, float(new["since"]), len(unreachable), names, tunnel, now, kind=kind,
                 advise=kind == "offline" and netwait.workstation(self.cfg), others=others,
                 known=[f"{h} ({why})" for h, why in known.items()]), severity=severity)
             log(self.p, f"network: {len(unreachable)} task(s) wait on unreachable hosts "
@@ -8604,6 +8607,7 @@ class Daemon:
         it quietly (web app and status only)."""
         now = time.time()
         db = self.p.db
+        text = outagemsg.ensure_actor(text)   # never a bare "nothing was changed" outage alert
         tracked = alerts.tracked("alert", severity, key)
         claim_key = self._machine_wide(key) if tracked else None
         with db.tx():   # marked sent only together with the message

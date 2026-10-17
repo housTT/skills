@@ -12817,3 +12817,16 @@ def test_a_malformed_ask_gate_rule_is_skipped_with_a_warning_never_failing_the_t
     assert any(x.startswith("ask_gate.refuse[0]") for x in config_problems(json.loads(p.config_path.read_text())))
     p.set_config("ask_gate.refuse", bad)
     assert _ask(p, "Approve 300 USD more for the nightly benchmark runs?", blocking="funds")[0] == []
+
+
+def test_an_outage_notify_names_who_acts_now_never_only_that_nothing_was_changed(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    bare = "box-a device held: nothing was changed; the owner is paused and the fallback was sent a note."
+    problems = coord.apply(p, [{"type": "notify", "text": bare, "severity": "normal"}])
+    assert problems and "notify rejected" in problems[0] and "who is acting now" in problems[0], problems
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text=?", (bare,)) is None
+    full = ("box-a device held since 05:10 PDT (4.0 h so far): nothing was changed here. Acting now: beta "
+            "(fallback; alpha cannot act: it is paused). Tracked task: #12, due 13:00 PDT. Tried: recovery page 1 "
+            "to alpha. Next: beta releases the hold.")
+    assert coord.apply(p, [{"type": "notify", "text": full, "severity": "normal"}]) == []

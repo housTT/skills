@@ -1533,7 +1533,7 @@ def test_network_outage_on_a_tunnel_route_is_a_low_feed_line_raised_once_after_a
     sent = check(now + 3600)
     assert len(sent) == 2, "raised once at the threshold"
     r = sent[1]
-    assert r["severity"] == "normal" and "box-a" in r["text"] and "down 1.0 h" in r["text"], r["text"]
+    assert r["severity"] == "normal" and "box-a" in r["text"] and "(1.0 h so far)" in r["text"], r["text"]
     assert "VPN" not in r["text"] and not re.search(r"127\.\d+\.\d+\.\d+", r["text"]), r["text"]
     assert [x["id"] for x in alerts.needs_you(p.db, now + 3600)] == [r["id"]]
     assert m["id"] not in [x["id"] for x in alerts.feed(p.db, now + 3600)], "the raised line replaces the low one"
@@ -2171,3 +2171,96 @@ def test_the_landed_check_on_a_blocked_hand_off_reads_local_refs_only(env, monke
     tid, _ = _blocked_on(env, p, "Re-queue me after #{t} lands", target=target)
     assert json.loads(p.db.task(tid)["result"])["retry_when"] == f"landed:#{target}"
     assert not calls, calls
+
+
+def test_outage_facts_state_the_start_duration_actor_task_and_what_was_tried(env):
+    """outagemsg.facts: one wording for every outage message, for the owner acting, the owner paused
+    with the fallback holding a tracked task, and nobody acting."""
+    from ttp import outagemsg
+    t0 = 1_790_000_000.0
+    owner = outagemsg.facts(t0, t0 + 4 * 3600, outagemsg.actor("alpha", "owner"), "UTC",
+                            tried=["recovery page 1 to alpha"], next_step="alpha recovers it")
+    assert owner.startswith(f"Since {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t0))} UTC (4.0 h so far).")
+    assert "Acting now: alpha (owner)." in owner and "Tracked task: none." in owner
+    assert "Tried: recovery page 1 to alpha." in owner and owner.endswith("Next: alpha recovers it.")
+    fallback = outagemsg.facts(t0, t0 + 1500, outagemsg.actor("beta", "fallback", "alpha cannot act: it is paused"),
+                               "UTC", task="#42", due=t0 + 3 * 3600)
+    assert "(25 min so far)" in fallback and "Acting now: beta (fallback; alpha cannot act: it is paused)." in fallback
+    assert f"Tracked task: #42, due {time.strftime('%H:%M', time.gmtime(t0 + 3 * 3600))} UTC." in fallback
+    assert "Tried: nothing yet." in fallback
+    for acting in (outagemsg.actor(None), outagemsg.actor("the user"), ""):
+        nobody = outagemsg.facts(t0, t0 + 2 * 86400, acting, "UTC", task="not a task", due="soon")
+        assert "(2.0 d so far)" in nobody and "Acting now: nobody: escalating" in nobody, nobody
+        assert "Tracked task: none." in nobody, "a task id or due time that is not one is left out"
+
+
+def test_a_bare_nothing_was_changed_outage_message_never_goes_out_without_an_actor(env):
+    from ttp import outagemsg
+    from ttp.daemon import Daemon
+    bare = ("Device held for 4 h on box-a. Nothing was changed: the owner is paused and the fallback "
+            "was sent a note.")
+    assert outagemsg.bare(bare) and outagemsg.bare("box-a down; sent the fallback a note.")
+    assert not outagemsg.bare(bare + " Acting now: beta (fallback).")
+    assert not outagemsg.bare("Deploy deferred: nothing was changed."), "not about an outage"
+    assert outagemsg.ensure_actor(bare).endswith("Acting now: nobody: escalating to the user.")
+    assert outagemsg.ensure_actor("Deploy deferred: nothing was changed.") == "Deploy deferred: nothing was changed."
+    p = make(env)
+    Daemon(p.base).alert("outage:box-a", bare, "high")
+    got = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='outage:box-a'")["text"]
+    assert got.startswith(bare) and "Acting now: nobody: escalating" in got, got
+
+
+def test_machine_pages_and_status_say_how_long_and_who_acts_now(env):
+    """A machine condition's page names its start, duration so far and the actor at each step: the owner,
+    the fallback once the owner cannot act (with a tracked task when one is recorded), then nobody."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import responsibilities
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha", fallback="beta")
+    t0 = time.time() - 6 * 3600
+    ml.report("gamma", "box-a", "held", "device held, no holder", now=t0)
+    able = {"alpha": (False, "it is paused"), "beta": (True, "")}
+    first = t0 + ml.GRACE_S
+    pages = ml.route(first, able=able.get, healthy=lambda *a: [])
+    assert [x["target"] for x in pages] == ["alpha"]
+    text = pages[0]["text"]
+    assert "Machine box-a held" in text and "(30 min so far)" in text and "Acting now: alpha (owner)." in text, text
+    assert "Tried: nothing yet." in text and "Tracked task: none." in text and "Next: alpha checks" in text, text
+    ml.delivered(pages[0])
+    # A separate step may record a fallback task on the condition: the page names it and its due time.
+    with ml._locked():
+        doc = ml._read(ml.ROUTES, {"conditions": {}})
+        doc["conditions"]["box-a:held"].update(task=77, due=first + 8 * 3600)
+        ml._write(ml.ROUTES, doc)
+    ml.report("gamma", "box-a", "held", "device held, no holder", now=first + 60)
+    ml.route(first + 60, able=able.get, healthy=lambda *a: [])
+    later = first + 60 + ml.UNAVAILABLE_S
+    pages = ml.route(later, able=able.get, healthy=lambda *a: [])
+    assert [x["target"] for x in pages] == ["beta"]
+    text = pages[0]["text"]
+    assert "Acting now: beta (fallback; alpha cannot act: it is paused)." in text, text
+    assert "Tracked task: #77, due " in text and "Tried: recovery page 1 to alpha." in text, text
+    assert "(1.0 h so far)" in text, text
+    ml.delivered(pages[0])
+    line = responsibilities.machine_lines(next(r for r in responsibilities.machine_status("box-a")
+                                               if r["alias"] == "box-a"))
+    cond = next(x for x in line if x.startswith("  condition: "))
+    assert "so far; seen by gamma" in cond and "Acting now: beta (fallback)" in cond and "#77" in cond, cond
+    able["beta"] = (False, "its daemon is stopped")
+    ml.report("gamma", "box-a", "held", now=later + 60)
+    ml.route(later + 60, able=able.get, healthy=lambda *a: [])
+    pages = ml.route(later + 60 + ml.UNAVAILABLE_S, able=able.get, healthy=lambda *a: [])
+    assert [x["target"] for x in pages] == [ml.USER]
+    text = pages[0]["text"]
+    assert "Acting now: nobody: escalating to the user (beta cannot act: its daemon is stopped)." in text, text
+    assert "recovery page 1 to alpha; recovery page 2 to beta" in text, text
+    Daemon(alpha.base)._machine_page(pages[0], later)
+    got = alpha.db.one("SELECT text FROM messages WHERE kind='alert' AND ref=?", (pages[0]["key"],))["text"]
+    assert got.startswith("Outage: Machine box-a held") and got.count("Acting now:") == 1, got
+    # A page recorded before this wording still names the actor.
+    Daemon(alpha.base)._machine_page({**pages[0], "key": "machine:old", "text": "Machine box-a held."}, later)
+    old = alpha.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='machine:old'")["text"]
+    assert old == "Outage: Machine box-a held. Acting now: nobody: escalating to the user.", old
