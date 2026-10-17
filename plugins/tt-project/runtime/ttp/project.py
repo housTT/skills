@@ -707,10 +707,31 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     return out
 
 def deep_merge(base: dict, over: dict) -> dict:
-    out = copy.deepcopy(base)
-    for k, v in (over or {}).items():
-        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    """A copy of base with over merged in, dict by dict; over's other values are put in as they are.
+    It copies base once (config() runs it on every call: copy.deepcopy made each call cost a millisecond)."""
+    out = _copy_tree(base)
+    _merge_into(out, over)
     return out
+
+
+def _merge_into(out: dict, over: dict) -> None:
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            _merge_into(out[k], v)
+        else:
+            out[k] = v
+
+
+def _copy_tree(v: Any) -> Any:
+    """copy.deepcopy for plain dicts, lists and scalars, without its memo; anything else goes to it."""
+    t = type(v)
+    if t is dict:
+        return {k: _copy_tree(x) for k, x in v.items()}
+    if t is list:
+        return [_copy_tree(x) for x in v]
+    if t in (str, int, float, bool) or v is None:
+        return v
+    return copy.deepcopy(v)
 
 
 _PROC = Path("/proc/self/stat").exists()
@@ -1568,7 +1589,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 def layered(raw: dict) -> dict:
     """A project's settings: the defaults, then the account-level ones, then its project.json.
     budget.timezone set nowhere is the project's home zone (UTC without one)."""
-    cfg = deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), raw)
+    cfg = deep_merge(DEFAULT_CONFIG, load_account_settings())
+    _merge_into(cfg, raw)
     if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
         from .timefmt import zone_name
         cfg["budget"]["timezone"] = zone_name(raw)

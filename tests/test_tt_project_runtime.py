@@ -36619,6 +36619,29 @@ def test_the_spend_push_carries_this_machines_zone(env, monkeypatch):
     assert sent and json.loads(sent[0])["tz"] == "Europe/Berlin"
 
 
+def test_layered_settings_copy_the_defaults_once_and_never_share_them():
+    """config() runs on every daemon call: the defaults are copied once per call, without
+    copy.deepcopy, and still nothing in the result is the defaults' own dict or list."""
+    import copy
+    from ttp import project
+    base = {"a": {"b": [1, {"c": 2}], "d": {"e": (3, 4)}, "f": 1.5}, "g": None, "h": {"i": True}}
+    over = {"a": {"b": [9], "d": {"x": 1}}, "h": 7, "new": {"k": [1]}}
+    keep = copy.deepcopy(base)
+    out = project.deep_merge(base, over)
+    assert out == {"a": {"b": [9], "d": {"e": (3, 4), "x": 1}, "f": 1.5}, "g": None, "h": 7, "new": {"k": [1]}}
+    assert out["new"] is over["new"]                      # over's values go in as they are, as before
+    copied = project.deep_merge(base, {})
+    assert copied == base and copied["a"]["b"] is not base["a"]["b"] and copied["a"]["b"][1] is not base["a"]["b"][1]
+    copied["a"]["b"][1]["c"] = 99
+    assert base == keep
+    cfg = project.layered({"budget": {"timezone": "UTC"}, "coordinator": {"quiet_held_max_s": 0}})
+    want = copy.deepcopy(project.DEFAULT_CONFIG)
+    want["budget"]["timezone"], want["coordinator"]["quiet_held_max_s"] = "UTC", 0
+    assert cfg == want
+    cfg["coordinator"]["quiet_held_max_s"] = 5
+    assert project.DEFAULT_CONFIG["coordinator"].get("quiet_held_max_s") != 5
+
+
 def test_the_budget_day_follows_the_home_zone_unless_budget_timezone_is_set(env):
     from datetime import datetime, timezone as dt_timezone
     from ttp import globalcap as gcap
