@@ -382,10 +382,7 @@ def _mark_lost_first(rc: Path, why: str) -> str:
     target = lost(rc)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with open(tmp, "w") as f:
-            f.write(why + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        durable_write(tmp, why + "\n")
         os.link(tmp, target)   # atomic create-if-absent: never half-written, never over another
         return why
     except FileExistsError:
