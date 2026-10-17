@@ -72,11 +72,11 @@ Other workers run other tasks of this project at the same time.
   marker only after `pytest --markers` shows the repo defines it.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
   empty). Never unset or override the masking variables to work around this.
-  Who held a machine when: `ttp machines activity <alias>`.
+  Who held it: `ttp machines activity <alias>`.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
-- An idle-machine or nothing-ran claim names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo runs; they rotate).
+- An idle or nothing-ran claim names its evidence (process list, scheduler, broker, auth log); one empty log proves nothing (auth logs show only sudo, rotate).
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
   (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the
