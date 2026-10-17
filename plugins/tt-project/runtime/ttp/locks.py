@@ -500,7 +500,12 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None) -> l
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
-    (ticket_priority), then arrival."""
+    (ticket_priority), then arrival.
+
+    Known gap: while some projects on a host still run a runtime from before fair ordering
+    (arrival-order my_turn) next to fair-order waiters, the two orders can disagree on who goes
+    first, so one slot may sit idle until another frees; this ends once every project on the host
+    is upgraded."""
     q = queued(locks_dir, resource) if q is None else q
     groups: dict[str, list[Path]] = {}
     for t in q:
