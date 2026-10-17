@@ -2201,13 +2201,37 @@ def test_a_bare_nothing_was_changed_outage_message_never_goes_out_without_an_act
             "was sent a note.")
     assert outagemsg.bare(bare) and outagemsg.bare("box-a down; sent the fallback a note.")
     assert not outagemsg.bare(bare + " Acting now: beta (fallback).")
-    assert not outagemsg.bare("Deploy deferred: nothing was changed."), "not about an outage"
     assert outagemsg.ensure_actor(bare).endswith("Acting now: nobody: escalating to the user.")
-    assert outagemsg.ensure_actor("Deploy deferred: nothing was changed.") == "Deploy deferred: nothing was changed."
     p = make(env)
-    Daemon(p.base).alert("outage:box-a", bare, "high")
-    got = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='outage:box-a'")["text"]
-    assert got.startswith(bare) and "Acting now: nobody: escalating" in got, got
+    d = Daemon(p.base)
+    for key in ("outage:box-a", "machine:box-a:held", "heal:dev", "heal-hold:dev", "network:unreachable"):
+        d.alert(key, bare, "high")
+        got = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref=?", (key,))["text"]
+        assert got.startswith(bare) and "Acting now: nobody: escalating" in got, (key, got)
+    d.alert("box-a-gone", bare, "high", outage=True)
+    assert "Acting now:" in p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='box-a-gone'")["text"]
+
+
+def test_an_alert_off_the_outage_paths_is_never_tagged_with_an_actor_by_its_words(env):
+    """Only outage paths opt in (a key prefix or outage=True): 'held', 'down', 'owner', 'recovery' in a
+    task title or a push message do not make an alert about an outage."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    texts = {
+        "root-checkout:7": ("The project root's checkout (/repo) was left with uncommitted changes to 1 tracked "
+                            "path it did not have before: a.py after run 3 of task #7 (Fix held device recovery "
+                            "when the owner is down), which worked in the project root. Nothing was changed; this "
+                            "clears once the checkout is back and those paths are clean."),
+        "push-held": "Push held: nothing was changed.",
+        "hold-stale:3": "Run 3 has held box-a for 5.0 h; nothing was changed, as a job may still use it.",
+    }
+    for key, text in texts.items():
+        d.alert(key, text, "low", every_s=0)
+        got = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref=?", (key,))["text"]
+        assert got == text, (key, got)
+    d.alert("outage:box-b", texts["push-held"], "high", outage=False)
+    assert p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='outage:box-b'")["text"] == texts["push-held"]
 
 
 def test_machine_pages_and_status_say_how_long_and_who_acts_now(env):

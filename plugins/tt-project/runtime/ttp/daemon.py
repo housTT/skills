@@ -8612,17 +8612,20 @@ class Daemon:
         return str(self.p.root), None
 
     # notifications and Slack -------------------------------------------------------------------------
-    def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600) -> None:
+    def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600,
+              outage: bool | None = None) -> None:
         """Deduplicated broadcast, across daemon restarts too (an upgrade must not re-announce a
         condition the user already has). A high alert with a key opens an episode that clears
         itself once the condition does (alerts.sweep); while it is open a repeat only updates the
         episode's `last`, with one reminder after alerts.REMIND_S. Other alerts go out at most once
         per `every_s`; `every_s=0` is for callers that alert only when the condition starts again.
         A machine-wide condition is broadcast by the one project holding its claim; the others post
-        it quietly (web app and status only)."""
+        it quietly (web app and status only). An outage alert (`outage`, or by default a key on an outage
+        path, outagemsg.OUTAGE_KEYS) never goes out bare: it names who acts now."""
         now = time.time()
         db = self.p.db
-        text = outagemsg.ensure_actor(text)   # never a bare "nothing was changed" outage alert
+        if outagemsg.outage_key(key) if outage is None else outage:
+            text = outagemsg.ensure_actor(text)   # never a bare "nothing was changed" outage alert
         tracked = alerts.tracked("alert", severity, key)
         claim_key = self._machine_wide(key) if tracked else None
         with db.tx():   # marked sent only together with the message

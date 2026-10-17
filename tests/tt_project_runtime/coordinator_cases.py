@@ -12865,10 +12865,15 @@ def test_an_outage_notify_names_who_acts_now_never_only_that_nothing_was_changed
     from ttp import coordinator as coord
     p = make(env)
     bare = "box-a device held: nothing was changed; the owner is paused and the fallback was sent a note."
-    problems = coord.apply(p, [{"type": "notify", "text": bare, "severity": "normal"}])
+    problems = coord.apply(p, [{"type": "notify", "text": bare, "severity": "normal", "outage": True}])
     assert problems and "notify rejected" in problems[0] and "who is acting now" in problems[0], problems
     assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text=?", (bare,)) is None
+    # Not marked as an outage: never guessed from words like 'held', 'down' or 'owner'.
+    for text in ("Push held: nothing was changed.",
+                 "Task #9 (owner recovery when the box is down) stopped; nothing was changed."):
+        assert coord.apply(p, [{"type": "notify", "text": text, "severity": "low"}]) == [], text
+        assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text=?", (text,)), text
     full = ("box-a device held since 05:10 PDT (4.0 h so far): nothing was changed here. Acting now: beta "
             "(fallback; alpha cannot act: it is paused). Tracked task: #12, due 13:00 PDT. Tried: recovery page 1 "
             "to alpha. Next: beta releases the hold.")
-    assert coord.apply(p, [{"type": "notify", "text": full, "severity": "normal"}]) == []
+    assert coord.apply(p, [{"type": "notify", "text": full, "severity": "normal", "outage": True}]) == []

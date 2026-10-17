@@ -8,8 +8,11 @@ step. `facts` builds that part; machine pages (machine_ledger.route), the daemon
 checks' outage and hold alerts all append it to their own first sentence.
 
 A message that only says "nothing was changed" or "a note was sent" leaves the reader guessing who has
-it. `bare` names such a text (an outage message with that phrasing and no actor): the daemon's alerts
-add the actor to it (`ensure_actor`), and a coordinator notify saying it is refused with what to say.
+it. `bare` names such a text (that phrasing and no actor). Only a message its caller marks as about an
+outage is checked, never one guessed from its words ("held", "down", "owner" are common elsewhere): a
+daemon alert whose key starts with an outage prefix (OUTAGE_KEYS) or that passes `outage=True` gets the
+actor added (`ensure_actor`), and a coordinator notify with `outage: true` saying it is refused with
+what to say.
 
 A tracked task and due time are read from the page or condition when a caller recorded them (`task`,
 `due`); absent, the line says there is none.
@@ -28,8 +31,9 @@ TO_USER = f"{NOBODY} to the user"
 BARE_RE = re.compile(r"\bnothing\s+(?:was\s+|has\s+been\s+|got\s+)?changed\b|\bno\s+changes?\s+(?:was|were)\s+made\b"
                      r"|\bnotes?\s+(?:was|were|has\s+been|have\s+been)\s+(?:sent|filed|posted)\b"
                      r"|\bsent\s+(?:\w+\s+){0,3}(?:a\s+)?note\b", re.I)
-OUTAGE_RE = re.compile(r"\b(?:outage|down|held|hold(?:s|ing)?|unreachable|offline|recovery|untenanted|"
-                       r"power[- ]?cycl\w*|fallback|owner)\b", re.I)
+# Alert keys of outage paths: an outage page, a machine condition's page, a heal check's outage or
+# untenanted hold, the network outage.
+OUTAGE_KEYS = ("outage:", "machine:", "heal:", "heal-hold:", "network:")
 ACTOR_RE = re.compile(rf"{re.escape(ACTING)}|\bnobody:\s*escalating\b", re.I)
 
 
@@ -74,11 +78,16 @@ def facts(since: float, now: float, acting: str, where: Any = None, task: Any = 
     return " ".join(out)
 
 
+def outage_key(key: Any) -> bool:
+    """Whether alert key `key` is on an outage path (OUTAGE_KEYS)."""
+    return str(key or "").startswith(OUTAGE_KEYS)
+
+
 def bare(text: str) -> str:
     """Why an outage message is bare (it says only that nothing was changed or a note was sent, and
-    names nobody acting), or ""."""
+    names nobody acting), or "". The caller decides the text is about an outage."""
     text = str(text or "")
-    if not BARE_RE.search(text) or not OUTAGE_RE.search(text) or ACTOR_RE.search(text):
+    if not BARE_RE.search(text) or ACTOR_RE.search(text):
         return ""
     return ("an outage message that says only that nothing was changed or a note was sent leaves the user "
             "guessing: say when it started (home zone) and how long it has lasted, who is acting now (\""

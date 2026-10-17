@@ -1815,7 +1815,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
-                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg) or outagemsg.bare(a["text"])
+                why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg) \
+                    or (outagemsg.bare(a["text"]) if a.get("outage") is True else "")
                 if why:
                     raise ValueError(f"notify rejected: {why}")
                 sent.append((db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity"))),
