@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, obligations, projpause, pushq, release, responsibilities, timefmt, waits
+from . import credits, heal, identity, obligations, outagetask, projpause, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
 from . import startgate, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -448,6 +448,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "health": heal.line(db, now),
         "coverage": responsibilities.line(db),
         "obligations": obligations.lines(db, now=now, where=cfg, open_only=True),
+        "outages": outagetask.lines(db, now, where=cfg),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
         "upstream": "; ".join(x for x in (upstream.status_line(db, cfg), upstream.fixes_line(p.name, cfg, now)) if x),

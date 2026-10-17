@@ -480,7 +480,9 @@ MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `
 MUTE_ESCALATE_MIN_H = 0.5
 # A device hold never stays silent long: a mute whose match (or a condition it covers) names a hold asks
 # after at most this long, whatever escalate_after_h says (0 included). A hold with no tenant blocks work.
-MUTE_HOLD_ESCALATE_H = 6.0
+# screen.hold_mute_escalate_h overrides it, within MUTE_ESCALATE_MIN_H..MUTE_HOLD_ESCALATE_MAX_H (hold_cap).
+MUTE_HOLD_ESCALATE_H = 1.0
+MUTE_HOLD_ESCALATE_MAX_H = 6.0
 MUTE_HOLD_RE = re.compile(r"\b(hold|holds|held|holder|holding)\b", re.I)
 # A muted condition not seen for this long has cleared: its next sighting starts a new clock. The
 # fallback for runs that never settle (failed or killed ones, sources other than command watchers).
@@ -492,7 +494,8 @@ MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escala
 
 
 def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
-         now: float | None = None, escalate_after_h: Any = None, end_when: Any = None) -> dict:
+         now: float | None = None, escalate_after_h: Any = None, end_when: Any = None,
+         hold_cap_h: float | None = None) -> dict:
     """Mute observations from `source` whose text contains `match` (any case) and whose severity is
     below `below` (default critical), for `hours`, or until probe `end_when` passes (`hours` is then
     optional), never past MUTE_CAP_S from its start. A matching condition still seen `escalate_after_h`
@@ -541,6 +544,7 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
         if esc == 0 and not why:
             raise ValueError("observation_mute `escalate_after_h` 0 (never escalate) needs a `why` naming who "
                              "handles the recovery")
+    cap_h = _hold_cap_h({"hold_cap_h": hold_cap_h})   # hold_cap(cfg) from the caller, else the default
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
         old = next((m for m in active if _same_mute(m, source, match)), None)
@@ -549,8 +553,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
         if esc is None:
             esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
         held = holds_mute(match, old)
-        if held and not 0 < esc <= MUTE_HOLD_ESCALATE_H:
-            esc = MUTE_HOLD_ESCALATE_H
+        if held and not 0 < esc <= cap_h:
+            esc = cap_h
         probe = probe or (old or {}).get("end_when") or None
         if probe is None and h is None:
             raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H} or an `end_when` probe")
@@ -567,6 +571,7 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
              "since": since, "until": until, "capped": until >= cap,
              "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None,
              "escalate_after_h": esc, "armed_at": now, "conds": conds}
+        m["hold_cap_h"] = cap_h
         if held:
             m["hold"] = True
         if probe:
@@ -575,6 +580,23 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
                 m["probe_broken"] = old["probe_broken"]   # reported once per probe, not again on each extension
         db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
     return m
+
+
+def hold_cap(cfg: dict | None) -> float:
+    """The hold-mute cap in hours: screen.hold_mute_escalate_h, else MUTE_HOLD_ESCALATE_H, kept within
+    MUTE_ESCALATE_MIN_H..MUTE_HOLD_ESCALATE_MAX_H."""
+    try:
+        h = float(((cfg or {}).get("screen") or {}).get("hold_mute_escalate_h") or MUTE_HOLD_ESCALATE_H)
+    except (TypeError, ValueError):
+        h = MUTE_HOLD_ESCALATE_H
+    return min(MUTE_HOLD_ESCALATE_MAX_H, max(MUTE_ESCALATE_MIN_H, h))
+
+
+def _hold_cap_h(m: dict) -> float:
+    try:
+        return min(MUTE_HOLD_ESCALATE_MAX_H, float(m.get("hold_cap_h") or MUTE_HOLD_ESCALATE_H))
+    except (TypeError, ValueError):
+        return MUTE_HOLD_ESCALATE_H
 
 
 def holds_mute(match: str, m: dict | None = None) -> bool:
@@ -647,10 +669,11 @@ def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = Fa
     conds = m.setdefault("conds", {})
     armed = float(m.get("armed_at") or m["since"])
     esc_h = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
+    cap_h = _hold_cap_h(m)
     named = bool(key and MUTE_HOLD_RE.search(key.replace("_", " ").replace("-", " ")))   # the watcher's own key
     for key, item, cleared in _mute_conditions(m, source, text, whole, key):
         held = named or MUTE_HOLD_RE.search(item)
-        esc_c = MUTE_HOLD_ESCALATE_H if held and not 0 < esc_h <= MUTE_HOLD_ESCALATE_H else esc_h
+        esc_c = cap_h if held and not 0 < esc_h <= cap_h else esc_h
         c = conds.get(key)
         if cleared:
             if c:

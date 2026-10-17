@@ -247,7 +247,7 @@ EFFORT_EVENT_TRIGGERS = {
     "review_stall": "stuck", "review_failed_unhandled": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
-    "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "change_probe_broken": "resource",
+    "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "machine_outage_overdue": "resource", "change_probe_broken": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
@@ -2056,7 +2056,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "observation_mute":
                 m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                              a.get("why") or a.get("reason") or a.get("text") or "",
-                             escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"))
+                             escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"),
+                             hold_cap_h=scr.hold_cap(cfg))
                 if scr.hold_cap_note(m, a.get("escalate_after_h")):
                     notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
             elif t == "sweep":

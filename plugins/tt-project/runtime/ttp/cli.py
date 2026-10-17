@@ -1060,6 +1060,7 @@ def status_text(p: Project) -> str:
     lines.extend(h.get("obligations") or [])
     from . import mitigate
     lines.extend(mitigate.status_lines(db, now, tz))
+    lines.extend(h.get("outages") or [])
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")

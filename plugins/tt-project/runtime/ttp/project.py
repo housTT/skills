@@ -387,6 +387,11 @@ EXTRA_KEYS = {
     "runner": {"device_timeout_max_s"},
     # forbidden_patterns, forbidden_patterns_file: text memory and charter writes refuse (forbidden.py).
     "memory": {"forbidden_patterns", "forbidden_patterns_file"},
+    # outage_owner_budget_min (60), outage_task_due_min (30), outage_escalate_min (30): when a shared
+    # machine's outage becomes a tracked task and when that task escalates (outagetask.py).
+    "heal": {"outage_owner_budget_min", "outage_task_due_min", "outage_escalate_min"},
+    # hold_mute_escalate_h: the longest a mute covering a device hold stays silent (screen.hold_cap; 1).
+    "screen": {"hold_mute_escalate_h"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}

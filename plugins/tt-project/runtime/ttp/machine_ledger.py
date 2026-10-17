@@ -79,7 +79,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import detach, ends, machines, project
+from . import detach, ends, machines, outagetask, project
 from .db import TERMINAL_TASK_STATES
 
 LEDGER = "machine-changes.json"
@@ -688,16 +688,84 @@ def _vouched(c: dict, targets: list[str], now: float,
     return None
 
 
+def _task_host(c: dict, targets: list[str], able: Callable[[str], tuple[bool, str]]) -> str:
+    """The project an outage task goes to: the fallback, else the first detecting project, that can act;
+    else the fallback (or the first detector, else the owner) anyway."""
+    owner = targets[0]
+    rest = [t for t in targets[1:] if t != owner]
+    seen = [s for s in c.get("seen_by") or [] if s != owner and s not in rest]
+    for who in rest + seen:
+        if able(who)[0]:
+            return who
+    return (rest + seen + [owner])[0]
+
+
+def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
+               able: Callable[[str], tuple[bool, str]], b: dict, acts: list[dict],
+               status: Callable[[str, str], str | None]) -> None:
+    """Advance condition `c`'s outage task (outagetask.py): queue it once its owner cannot act, or did not
+    record a recovery action within b['owner_s']; then, past its due time while open, one high page to its
+    project, and past b['escalate_s'] more, one normal-severity user page. A creating page still pending
+    is never replaced."""
+    task, owner = c.get("task"), targets[0]
+    if task is None:
+        ok, why = able(owner)
+        if ok:
+            if now - float(c["first"]) < b["owner_s"] or any(
+                    a.get("alias") == c["alias"] and float(a.get("added") or 0) >= float(c["first"]) for a in acts):
+                return
+            why = (f"recovery owner {owner} recorded no recovery action (`ttp machines change add`) within "
+                   f"{b['owner_s'] / 60:g} min of the outage's start")
+        else:
+            why = f"recovery owner {owner} cannot act: {why}"
+        host, due = _task_host(c, targets, able), now + b["due_s"]
+        paged = targets[:int(page.get("stage") or 0) + 1] if "stage" in page else []
+        tried = (f"recovery page(s) to {', '.join(paged)}" if paged else "no recovery page yet") + \
+            (f"; {page['why']}" if page.get("why") else "")
+        rec = outagetask.record(c, key, why, tried, due)
+        c["task"] = {"project": host, "at": now, "due": due, "label": rec["label"], "stage": 0,
+                     "pending": {"target": host, "kind": outagetask.KIND, "key": f"machine:{key}",
+                                 "alias": c["alias"], "stage": 0, "id": rec["label"], "outage": rec,
+                                 "text": f"Machine {c['alias']} {c['condition']} since {ends.shown(c['first'])}: "
+                                         f"{why}. A tracked outage task ({rec['label']}) is queued in {host}, "
+                                         f"due {ends.shown(due)}."}}
+        return
+    stage, due = int(task.get("stage") or 0), float(task["due"])
+    pend = task.get("pending")
+    if stage >= 2 or now < due or (pend and pend.get("kind") == outagetask.KIND):
+        return
+    if status(task["project"], task["label"]) in outagetask.DONE:
+        return
+    late = f"Outage task {task['label']} in {task['project']} for machine {c['alias']} {c['condition']} " \
+           f"(since {ends.shown(c['first'])}) is open past its due time {ends.shown(due)}"
+    if stage == 0:
+        target = next((w for w in [task["project"]] + list(c.get("seen_by") or []) if able(w)[0]), USER)
+        task["stage"] = 1
+        task["pending"] = {"target": target, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
+                           "alias": c["alias"], "stage": 1, "id": f"{task['label']}#overdue",
+                           "severity": "high" if target != USER else "normal",
+                           "text": f"{late}: check it and recover the machine now, or say who must act."}
+    elif now >= due + b["escalate_s"]:
+        task["stage"] = 2
+        task["pending"] = {"target": USER, "kind": outagetask.OVERDUE_KIND, "key": f"machine:{key}",
+                           "alias": c["alias"], "stage": 2, "id": f"{task['label']}#user", "severity": "normal",
+                           "text": f"{late} by more than {b['escalate_s'] / 60:g} min."}
+
+
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
           claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None,
-          quiet: Callable[[dict, float, dict], tuple[str, bool]] | None = None) -> list[dict]:
+          quiet: Callable[[dict, float, dict], tuple[str, bool]] | None = None,
+          budgets: dict | None = None, task_status: Callable[[str, str], str | None] | None = None) -> list[dict]:
     """The pages to deliver now, model-free: [{target, kind, key, alias, stage, id, text}]. Each due
     page is recorded as pending; the pending pages nobody holds (or whose claim lapsed after CLAIM_S)
     are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it.
-    `quiet` (default quiet_reason) stops a condition's escalation, or every page of it."""
+    `quiet` (default quiet_reason) stops a condition's escalation, or every page of it. `budgets`
+    (outagetask.budgets) times the outage task; `task_status` reads its state (outagetask.task_status)."""
     now = time.time() if now is None else now
     able = able or can_act
     quiet = quiet or quiet_reason
+    b = budgets or outagetask.budgets(None)
+    task_status = task_status or outagetask.task_status
     if healthy is None:
         from .responsibilities import healthy_checks as healthy
     out: list[dict] = []
@@ -708,9 +776,17 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             pend.update(claimed=now, claimed_by=claimer)
             out.append({k: v for k, v in pend.items() if k not in ("claimed", "claimed_by")})
 
+    def settle_task(c: dict) -> None:
+        # A held or quiet condition escalates no further; a queued task still reaches its project.
+        task = c.get("task") or {}
+        if (task.get("pending") or {}).get("kind") == outagetask.OVERDUE_KIND:
+            task.pop("pending")
+        claim(task)
+
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
         conds = doc.setdefault("conditions", {})
+        acts = _read(LEDGER, {"next": 1, "changes": []}).get("changes", [])
         for key, c in list(conds.items()):
             if now - float(c.get("last") or 0) >= CONDITION_GONE_S:
                 del conds[key]
@@ -739,6 +815,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                                 f"healthy: {why}. No recovery page "
                                 f"was sent; nothing to do unless you see otherwise."}
                 claim(page)
+                settle_task(c)
                 continue
             page.pop("held", None)
             why, silent = quiet(c, now, doc)
@@ -752,6 +829,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     "condition": c["condition"], "first": c["first"], "why": why, "at": now,
                     "seen_by": list(c.get("seen_by") or [])}
                 claim(page)
+                settle_task(c)
                 continue
             if page.pop("quiet", None) is not None and "stage" in page:
                 page.update(at=now)   # the steps resume from now, not from the page before the quiet spell
@@ -765,6 +843,9 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 _pending(page, target, "machine_condition", f"machine:{key}", c["alias"], float(c["first"]),
                          condition_text(c, page, targets, target, now))
             claim(page)
+            _task_step(c, key, targets, page, now, able, b, acts, task_status)
+            if "task" in c:
+                claim(c["task"])
         doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
                         if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
         doc["outages"] = outages(now, doc)
@@ -856,13 +937,14 @@ def _settle(sent: dict, done: bool) -> bool:
         for name, empty in ((ROUTES, {"conditions": {}}), (LEDGER, {"next": 1, "changes": []})):
             doc = _read(name, empty)
             items = doc.get("conditions", {}).values() if name == ROUTES else doc.get("changes", [])
-            for c in items:
-                pend = (c.get("page") or {}).get("pending") if isinstance(c, dict) else None
+            slots = [c.get(s) for c in items if isinstance(c, dict) for s in ("page", "task")]
+            for slot in slots:
+                pend = slot.get("pending") if isinstance(slot, dict) else None
                 if not pend or pend.get("id") != sent.get("id"):
                     continue
                 if done:
-                    c["page"].pop("pending")
-                    c["page"]["delivered"] = sent["id"]
+                    slot.pop("pending")
+                    slot["delivered"] = sent["id"]
                 else:
                     pend.pop("claimed", None)
                     pend.pop("claimed_by", None)

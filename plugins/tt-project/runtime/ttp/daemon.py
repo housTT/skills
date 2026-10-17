@@ -51,6 +51,7 @@ from . import coordlimits
 from . import detach
 from . import effort
 from . import failover
+from . import outagetask
 from . import grants
 from . import ends
 from . import harnesstree
@@ -1248,7 +1249,7 @@ class Daemon:
             log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
         try:
             self._machine_probes.tick(now)
-            pages = machine_ledger.route(now, claimer=self.p.name)
+            pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg))
         except Exception:
             log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
             return
@@ -1330,10 +1331,17 @@ class Daemon:
         """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
         target, text = page["target"], page["text"]
         severity = page.get("severity") or "high"
+        rec = page.get("outage") if page.get("kind") == outagetask.KIND else None
         if target == machine_ledger.USER:
             # A page recorded before outagemsg names no actor: say it here.
             said = text if outagemsg.ACTOR_RE.search(text) else f"{text} {outagemsg.ACTING} {outagemsg.TO_USER}."
-            self.alert(page["key"], f"Outage: {said}", severity="high")
+            if page.get("kind") == "machine_condition":
+                self.alert(page["key"], f"Outage: {said}", severity="high")
+            else:   # an outage task open past its due time
+                self.alert(page.get("id") or page["key"], f"Outage: {said}", severity=severity)
+        elif target == self.p.name and rec is not None:   # the tracked task, in this project's own database
+            if outagetask.ensure(self.p.db, rec, self.p, now) is None:
+                log(self.p, f"page for {page['key']}: not an outage record, dropped")
         elif target == self.p.name and severity == "low":   # a held page's note: a feed line, no coordinator turn
             if not self.p.db.one("SELECT id FROM messages WHERE ref=? AND text=?", (page.get("id"), text)):
                 self.p.db.post("out", text, chat=None, kind="info", severity="low", ref=page.get("id"))
@@ -1344,7 +1352,8 @@ class Daemon:
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
                                 "VALUES(?,?,?,?,?,?,?)", (now, "daemon", page["kind"], fp, "high", text, "queued"))
         else:
-            got = upstream.send(self.p.name, None, target, text, severity, now=now, sender="daemon")
+            got = upstream.send(self.p.name, None, target, text, severity, now=now, sender="daemon",
+                                extra={"outage": rec} if rec is not None else None)
             if got not in ("sent", "duplicate"):
                 log(self.p, f"page for {page['key']} to {target}: {got}; retried on a later tick")
                 return False

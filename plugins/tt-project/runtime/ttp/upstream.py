@@ -199,12 +199,14 @@ def note_id(to: str, text: str) -> str:
 
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
-         now: float | None = None, sender: str = "worker", at: str | None = None) -> str:
+         now: float | None = None, sender: str = "worker", at: str | None = None,
+         extra: dict | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
     same text to the same project is already there) or "limited" (`source` filed NOTES_PER_HOUR
     addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
     registry does not know it (`find_peer`); the forwarder sends the note there. `sender` "daemon": the source project's daemon routed it, model-free
-    (machine_ledger.py); such a page is not limited and does not count against the workers' notes."""
+    (machine_ledger.py); such a page is not limited and does not count against the workers' notes, and
+    `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files."""
     now = now or time.time()
     # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
     text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon" else text)
@@ -225,7 +227,9 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
             return "limited"
         f.write((json.dumps({"ts": now, "project": source, "host": project.hostname(), "task": task,
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
-                             else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {})},
+                             else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
+                             **({k: v for k, v in extra.items() if k == "outage"}
+                                if extra and sender == "daemon" else {})},
                             sort_keys=True) + "\n").encode())
         f.flush()
     return "sent"
@@ -539,6 +543,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                    (now, "upstream", "upstream_note", sev, text[:cap], "queued"))
             added += 1
+            if to and n.get("from") == "daemon" and n.get("outage"):
+                from . import outagetask   # a routed outage hand-off: the tracked task, in this project's own state
+                outagetask.ensure(p.db, n["outage"], p, now)
             if n.get("project") and n.get("project") != p.name:
                 from .pauseends import note_arrived
                 note_arrived(p, n["project"], now)   # a pause waiting on that project's report
