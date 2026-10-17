@@ -55,7 +55,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, mitigate, obligations, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -195,7 +195,8 @@ def planned_deferrals(db: DB, now: float | None = None) -> int:
 def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     """Everything stuck now: {key, kind, task (or None), resource (or None), title, age_s (None when
     unknown), since, reason, status, spec_sha, ends}. Kinds: blocked, setting-held, waiting (not a self-wait),
-    review, deferred, paused, user-pause (a task whose only hold is a user-pause probe). `ends` is "user"
+    review, deferred, paused, user-pause (a task whose only hold is a user-pause probe), promise, outage (an open
+    outage task, outagetask.py: its age from the outage's start, its due time; no outcome needed until due). `ends` is "user"
     or "time" for a hold no turn can lift (a user pause or user-set resource pause, a time-only deferral), else None. A task's age comes from its open stuck episode (unblock._task_episodes);
     without that history (a block the coordinator set) from when the sweep first saw it in this status
     (remember()), first seeded from its last update, so a later update (an addendum) never resets it.
@@ -280,6 +281,23 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                     "title": t["title"], "age_s": max(0.0, now - float(rec.get("filed") or t["created"])),
                     "since": rec.get("filed") or t["created"], "status": t["status"], "spec_sha": _spec_sha(t),
                     "reason": _clip(f"{t['status']}, {due}, for {rec.get('resource')}"), "ends": None if late else "due"})
+    listed = {i["key"]: i for i in out}
+    for t in outagetask.open_tasks(db):
+        o, key = t["outage"], f"task:{t['id']}"
+        late = o["due"] is not None and now >= o["due"]
+        reason = _clip(f"machine {o['alias']} {o['condition']} since {timefmt.long(o['first'], where)}"
+                       + (f", task due {timefmt.long(o['due'], where)}" if o["due"] is not None else "")
+                       + (" OVERDUE" if late else "") + f", task {t['status']}"
+                       + (f"; {listed[key]['reason']}" if key in listed and listed[key]["reason"] else ""))
+        item = {"key": key, "kind": "outage", "task": t["id"], "resource": None, "title": t["title"],
+                "age_s": max(0.0, now - o["first"]), "since": o["first"], "reason": reason, "status": t["status"],
+                "spec_sha": _spec_sha(t),
+                # Not due yet: listed, no outcome needed; overdue (or stuck): an item like any other.
+                "ends": "due" if not late and key not in listed else None}
+        if key in listed:
+            listed[key].update(item)   # a stuck outage task is one item, shown as the outage
+        else:
+            out.append(item)
     _watch(db, out, paused, now)
     return out
 
@@ -723,6 +741,7 @@ def _line(i: dict, state: dict, outs: dict, now: float) -> str:
     who = _who(i, 70)
     if i.get("ends") and _carries(i, state, outs, now):
         what = {"user": "HELD BY USER PAUSE", "due": "MITIGATION, NOT DUE YET" if i["kind"] == "mitigation"
+                else "OUTAGE TASK, NOT DUE YET" if i["kind"] == "outage"
                 else "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
         return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
     if _carries(i, state, outs, now):
