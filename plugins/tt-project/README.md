@@ -748,7 +748,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   push branch's tip moves past a commit changing a failing test's file, or after
   `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
   is one incident with one fix task and one low feed line; the daily audit lists the tasks held and
-  the wakes avoided with their estimated $. Any other runner, a cut list or one failing id not seen
+  the wakes avoided with their estimated $. A failing id whose earlier incident closed within
+  `checks.shared_repeat_h` (default 72) makes a repeat: its fix task runs at standard and must give
+  the root cause, use a fake clock or event in place of wall-time assertions, and pass 20 runs of
+  each repeated test under parallel load at the default worker count before done. Any other runner, a cut list or one failing id not seen
   elsewhere wakes the task as before. A task still lands only after its own checks pass.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each

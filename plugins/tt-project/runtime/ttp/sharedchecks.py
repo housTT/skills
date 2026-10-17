@@ -10,7 +10,12 @@ A held task's checks run again on its same head, model-free, once the push-branc
 commit touching a failing test's file, or after `checks.shared_backoff_h`; after RERUNS_MAX reruns
 it wakes. One incident per shared failure carries one fix task, one low feed line, the tasks held
 and the wakes avoided with their estimated $ (the daily audit's line). A task still lands only after
-its own checks pass: nothing here skips or weakens them."""
+its own checks pass: nothing here skips or weakens them.
+
+A new incident with an id whose earlier incident closed within `checks.shared_repeat_h` is a repeat:
+the last fix did not hold. Its fix task runs at standard and its spec asks for the root cause, a fake
+clock or event in place of wall-time assertions, and REPEAT_RUNS passing runs of each repeated test
+under parallel load before done."""
 from __future__ import annotations
 
 import json
@@ -32,6 +37,8 @@ CREATE TABLE IF NOT EXISTS checks_incidents (
 MIN_TASKS = 2          # checks.shared_min_tasks: other changes (lineages) that must have failed each id
 WINDOW_H = 6.0         # checks.shared_window_h: how far back their failures count
 BACKOFF_H = 2.0        # checks.shared_backoff_h: a held task's checks run again after this at the latest
+REPEAT_H = 72.0        # checks.shared_repeat_h: an id whose incident closed this recently is a repeat
+REPEAT_RUNS = 20       # passing runs under parallel load a repeat's fix task proves
 RERUNS_MAX = 3         # reruns on one head before the task wakes as before
 KEEP_S = 7 * 86400     # failure rows kept this long
 # A review the push queue failed on its batch checks (review_failure check_only, pushq._settle):
@@ -47,7 +54,8 @@ def settings(cfg: dict) -> dict:
     c = cfg.get("checks") if isinstance(cfg.get("checks"), dict) else {}
     return {"min_tasks": int(c.get("shared_min_tasks", MIN_TASKS)),
             "window_s": float(c.get("shared_window_h", WINDOW_H)) * 3600,
-            "backoff_s": float(c.get("shared_backoff_h", BACKOFF_H)) * 3600}
+            "backoff_s": float(c.get("shared_backoff_h", BACKOFF_H)) * 3600,
+            "repeat_s": float(c.get("shared_repeat_h", REPEAT_H)) * 3600}
 
 
 def failing_ids(output: str) -> tuple[list[str], bool]:
@@ -161,12 +169,14 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
         db.x("UPDATE checks_incidents SET ids=?, tasks=?, last=? WHERE id=?",
              (json.dumps(new_ids), json.dumps(sorted(set(tasks) | {task["id"]})), now, r["id"]))
         if (new_ids != have or task["id"] not in tasks) and fix["status"] == "queued" and not fix["attempts"]:
-            db.update_task(fix["id"], spec=_spec(new_ids, excerpt, sorted(set(tasks) | {task["id"]})))
+            db.update_task(fix["id"], spec=_spec(new_ids, excerpt, sorted(set(tasks) | {task["id"]}),
+                                                 repeats(db, new_ids, now, cfg)))
         return r["id"], False
-    tier = "standard"
+    again = repeats(db, ids, now, cfg)
+    tier = "standard"   # a repeat must run at standard, never a cheaper tier
     budget = float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier, 8.0))
     title = f"Fix shared check failure: {ids[0]}" + (f" (+{len(ids) - 1} more)" if len(ids) > 1 else "")
-    fid = db.add_task(title[:200], _spec(ids, excerpt, [task["id"]]), kind="code", tier=tier, priority=2,
+    fid = db.add_task(title[:200], _spec(ids, excerpt, [task["id"]], again), kind="code", tier=tier, priority=2,
                       origin="daemon", budget_usd=budget)
     iid = db.x("INSERT INTO checks_incidents(ids,opened,last,fix_task,tasks) VALUES(?,?,?,?,?)",
                (json.dumps(ids), now, now, fid, json.dumps([task["id"]])))
@@ -178,14 +188,40 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
     return iid, True
 
 
-def _spec(ids: list[str], excerpt: str, tasks: list[int]) -> str:
+def repeats(db: DB, ids: list[str], now: float, cfg: dict) -> list[str]:
+    """The ids among `ids` whose earlier incident closed within the repeat window, timed by its fix
+    task's last update (an incident is only marked closed when the next one is looked up)."""
+    since = now - settings(cfg)["repeat_s"]
+    out: set[str] = set()
+    for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NOT NULL AND closed>=? ORDER BY id", (since,)):
+        fix = db.task(r["fix_task"]) if r["fix_task"] else None
+        if min(float(r["closed"]), float((fix or {}).get("updated") or r["closed"])) >= since:
+            out |= set(_rows(r["ids"])) & set(ids)
+    return sorted(out)
+
+
+def _spec(ids: list[str], excerpt: str, tasks: list[int], again: list[str] = ()) -> str:
     return ("The same tests fail in the detached checks of several unrelated tasks on different heads, so the "
             "cause is shared (the push-branch tip, the environment or the tests themselves), not those tasks' "
             "changes. Those tasks sleep without model runs and rerun their checks once the push-branch tip "
             "changes these test files.\n\nFailing test ids:\n" + "\n".join(f"- {i}" for i in ids)
             + f"\n\nTasks held: {', '.join(f'#{t}' for t in tasks)}\n\nExcerpt of one failing run:\n```\n"
             + excerpt[-1500:] + "\n```\n\nReproduce on the push-branch tip, find the cause and fix it there "
-            "(test, code or environment), with a test. Never skip or weaken the required checks.")
+            "(test, code or environment), with a test. Never skip or weaken the required checks."
+            + (_repeat_text(again) if again else ""))
+
+
+def _repeat_text(again: list[str]) -> str:
+    return ("\n\nRepeat incident: these tests were already fixed for a shared failure within the last few days, "
+            "and that fix did not hold:\n" + "\n".join(f"- {i}" for i in again)
+            + "\n\nBefore handing off done:\n"
+            "1. Name the root cause in the hand-off: why the earlier fix did not hold, not only what you changed.\n"
+            "2. Replace wall-time assertions, sleeps and timing races in these tests with a fake clock or an "
+            "explicit event or condition the test waits on.\n"
+            f"3. Run each of these tests {REPEAT_RUNS} times under parallel load: at the suite's default "
+            "parallelism (where the suite reads TTP_TEST_JOBS, leave it unset) and in sessions that also collect "
+            f"enough other tests for the parallel workers to start. All {REPEAT_RUNS} runs must pass; report the "
+            "command and the pass count in the hand-off.")
 
 
 def covered(db: DB, ids: list[str], skip: set[int] | frozenset = frozenset()) -> str:

@@ -277,3 +277,41 @@ def test_a_batch_failure_without_pytest_ids_is_check_only_but_still_raises_the_t
                                        (mark,))]
     assert coord.effort_triggers(s.p.db, s.p.config(), [ev], None, [], None, time.time(), None, [])[0] == \
         ["failed review"]
+
+
+def test_a_repeat_shared_failure_gets_a_fix_task_that_must_prove_stability(env):
+    from ttp import sharedchecks
+    p = make(env)
+    now = 1_000_000.0
+    t1, t2, t3 = (p.db.add_task(f"held {k}", "x", kind="code") for k in range(3))
+    iid1, opened = sharedchecks.incident(p.db, p.db.task(t1), _IDS[:1], "boom", now, {})
+    assert opened
+    (fix1,) = p.db.q("SELECT fix_task FROM checks_incidents WHERE id=?", (iid1,))
+    first = p.db.task(fix1["fix_task"])
+    assert first["tier"] == "standard" and "Repeat incident" not in first["spec"]
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now + 3600, first["id"]))
+    # The same test fails shared again two days later: the fix did not hold.
+    later = now + 2 * 86400
+    iid2, opened = sharedchecks.incident(p.db, p.db.task(t2), _IDS, "boom again", later, {})
+    assert opened and iid2 != iid1
+    inc2 = p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid2,))
+    fix = p.db.task(inc2["fix_task"])
+    assert fix["tier"] == "standard" and fix["kind"] == "code"
+    spec = fix["spec"]
+    assert "Repeat incident" in spec and f"- {_IDS[0]}" in spec.split("Repeat incident", 1)[1]
+    assert _IDS[1] not in spec.split("Repeat incident", 1)[1]   # only the id fixed before repeats
+    assert "root cause" in spec and "fake clock" in spec
+    assert f"{sharedchecks.REPEAT_RUNS} times under parallel load" in spec and "TTP_TEST_JOBS" in spec
+    # Extending the queued fix task keeps the stricter spec.
+    sharedchecks.incident(p.db, p.db.task(t3), _IDS[1:], "boom", later + 60, {})
+    spec = p.db.task(fix["id"])["spec"]
+    assert "Repeat incident" in spec and f"#{t3}" in spec
+    # A fix that ended longer ago than the repeat window does not count, even when the incident was
+    # only marked closed later.
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (later, fix["id"]))
+    much_later = later + 4 * 86400
+    iid3, opened = sharedchecks.incident(p.db, p.db.task(t1), _IDS, "boom", much_later, {})
+    assert opened
+    fix3 = p.db.task(p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid3,))["fix_task"])
+    assert "Repeat incident" not in fix3["spec"]
+    assert sharedchecks.repeats(p.db, _IDS, much_later, {"checks": {"shared_repeat_h": 200}}) == sorted(_IDS)
