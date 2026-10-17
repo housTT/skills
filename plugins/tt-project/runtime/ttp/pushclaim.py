@@ -19,7 +19,14 @@ named an on_pass_cmd that never ran (no on_pass/ folder in its run).
 In the daemon both skip while the core provider's network is held, and share a Budget of
 NET_BUDGET_S of git network time per tick: what it leaves unchecked waits, untouched, for a later
 tick (OutOfTime), which reuses the answers read so far for up to CARRY_S. A carried answer never
-alone fails a claim: before a MISSING that rests on one, the remote is asked again."""
+alone fails a claim: before a MISSING that rests on one, the remote is asked again.
+
+A detached push's claim the remote cannot settle either way is UNVERIFIABLE, counted apart from MISSING:
+one whose target cannot be determined, or whose push ended without writing a failed outcome (exit
+null: a reboot, a killed run, a push queued and never started) while its commit is not on the target.
+Its repo is the one the marker names, else (a task worktree since pruned) the project root.
+Accepted gap: when that fallback root is another repository than the push's, a remote it lacks makes
+the claim UNVERIFIABLE rather than checked on the remote the push used."""
 from __future__ import annotations
 
 import json
@@ -34,6 +41,7 @@ KEY = "push_verify"              # tasks.result of a task in `pushing` until its
 HANDOFF = "push_claim_handoff.json"   # the hand-off waiting on the check, in its run's folder
 AUDIT_KV = "push_audit"          # the last audit: {"at", "days", "counts", "gaps"}
 CONFIRMED, MISSING, UNKNOWN = "confirmed", "missing", "unknown"
+UNVERIFIABLE = "unverifiable"     # a claim neither confirmed nor shown missing (module doc)
 BACKOFF_S = (60, 120, 300, 600, 1200, 1800)
 BOUND_S = 6 * 3600               # a claim the remote never answered for this long fails its task
 LS_TIMEOUT_S, FETCH_TIMEOUT_S = 20, 40
@@ -330,9 +338,13 @@ def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:
     if status in ("queued", "running"):
         return UNKNOWN, f"{c['source']} is still {status}"
     repo = m.get("repo") or p.root
-    to = _ref(repo, target) if target else None
+    if not Path(repo).is_dir():   # its task's worktree was pruned since
+        repo = p.root
+    remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
+    to = ((remote, f"refs/heads/{branch}") if remote and branch and remote in _remotes(repo)
+          else _ref(repo, target) if target else None)
     if not to:
-        return MISSING, f"{c['source']} names no remote branch to check ({target or 'no target'})"
+        return UNVERIFIABLE, f"{c['source']} names no remote branch to check ({target or 'no target'})"
     sha = str(m.get("sha") or "") if status == "pushed" else ""
     if sha:
         return verify(repo, to[0], to[1], sha, cache)
@@ -345,8 +357,9 @@ def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:
             return state, f"{said} (pushed another way after {c['source']} ended {status})"
         if state == UNKNOWN:
             return state, said
-    return MISSING, (f"{c['source']} ended {status or 'without an outcome'} ({why[:200]}) and "
-                     f"{(head or '?')[:12]} is not on {short_ref(*to)}")
+    return (MISSING if m.get("exit") is not None else UNVERIFIABLE), (
+        f"{c['source']} ended {status or 'without an outcome'} ({why[:200]}) and "
+        f"{(head or '?')[:12]} is not on {short_ref(*to)}")
 
 
 def check(p, c: dict, cache: dict) -> tuple[str, str]:
@@ -364,8 +377,8 @@ def check(p, c: dict, cache: dict) -> tuple[str, str]:
 
 
 def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, list[tuple[dict, str, str]]]:
-    """(overall state, why, each claim's) of claims `cs`: MISSING if any is missing, else UNKNOWN if
-    any cannot be told, else CONFIRMED. OutOfTime passes through: nothing was told."""
+    """(overall state, why, each claim's) of claims `cs`: MISSING if any is missing, else UNVERIFIABLE
+    if any is, else UNKNOWN if any cannot be told yet, else CONFIRMED. OutOfTime passes through: nothing was told."""
     cache = {} if cache is None else cache
     each = []
     for c in cs:
@@ -376,7 +389,7 @@ def check_all(p, cs: list[dict], cache: dict | None = None) -> tuple[str, str, l
         except Exception as e:   # an unreadable claim is not a verified one, nor a missing one
             state, why = UNKNOWN, f"could not check {c.get('source')}: {type(e).__name__}: {e}"
         each.append((c, state, why))
-    for want in (MISSING, UNKNOWN):
+    for want in (MISSING, UNVERIFIABLE, UNKNOWN):
         bad = [w for _, s, w in each if s == want]
         if bad:
             return want, "; ".join(bad), each
@@ -502,8 +515,8 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
                 _, state, why = check_all(p, [c], cache)[2][0]
             if state != CONFIRMED and not over and c.get("sha") and not c.get("marker"):
                 state, why = _reattribute(p, t, c, state, why, claimed, tips)
-            if state == SHARED:
-                counts[SHARED] = counts.get(SHARED, 0) + 1
+            if state in (SHARED, UNVERIFIABLE):   # counted apart, only when there are any
+                counts[state] = counts.get(state, 0) + 1
             else:
                 counts[state] += 1
             if state != CONFIRMED:
@@ -532,6 +545,8 @@ def summary_line(a: dict) -> str:
     days = a.get("days", AUDIT_DAYS)
     line = (f"{c.get(CONFIRMED, 0)} confirmed, {c.get(MISSING, 0)} missing, {c.get(UNKNOWN, 0)} unknown "
             f"across {a.get('tasks', 0)} done tasks of the last {days:g} d")
+    if c.get(UNVERIFIABLE):
+        line += f"; {c[UNVERIFIABLE]} unverifiable"
     missing = [g for g in a.get("gaps") or [] if g.get("state") == MISSING]
     if missing:
         line += "; missing: " + "; ".join(f"#{g['task']} ({g['why'][:160]})" for g in missing[:5])

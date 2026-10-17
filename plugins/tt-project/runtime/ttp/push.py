@@ -3215,7 +3215,8 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     log = marker.with_suffix(".log")
     _prune(folder, time.time())
     m = {"id": rid, "repo": str(top), "head": _git(top, "rev-parse", "HEAD").stdout.strip(),
-         "target": f"{remote}/{branch}", "log": str(log), "lock": str(_run_lock(marker)),
+         "target": f"{remote}/{branch}", "remote": remote, "branch": branch,
+         "log": str(log), "lock": str(_run_lock(marker)),
          "task": task, "run": os.environ.get("TTP_RUN_ID"), "own": own}
     try:
         m["check_run_dir"] = str(checkdirs.new(p.state, marker))

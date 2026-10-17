@@ -1210,7 +1210,7 @@ def cmd_ttr(a) -> None:
 
 def cmd_push_audit(a) -> None:
     """Done tasks of the last days whose claimed pushes are not on the remote (pushclaim.audit), with
-    counts: confirmed, missing, unknown. Read-only: it only fetches the remote's tracking refs."""
+    counts: confirmed, missing, unknown (and unverifiable, shared when any). Read-only: it only fetches the remote's tracking refs."""
     from . import pushclaim
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:

@@ -2936,8 +2936,9 @@ class Daemon:
                     why = f"the remote could not be read for {int(pushclaim.BOUND_S // 3600)} h: {why}"
                 keep = [f for f in handoff.get("followups") or [] if isinstance(f, dict)
                         and (db.task(tid)["kind"] != "review" or str(f.get("title", "")).startswith("upstream:"))]
+                gone = "could not be verified on" if state == pushclaim.UNVERIFIABLE else "is not on"
                 handoff = {"status": "failed", "followups": keep,
-                           "summary": f"claimed a push that is not on the remote: {why}. Its hand-off said: {said}"[:1500]}
+                           "summary": f"claimed a push that {gone} the remote: {why}. Its hand-off said: {said}"[:1500]}
             log(self.p, f"task {tid}: claimed push {state}: {why[:300]}")
             run = db.one("SELECT * FROM runs WHERE id=?", (pv.get("run"),)) if pv.get("run") else None
             from .providers.base import RunUsage

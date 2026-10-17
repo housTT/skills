@@ -1072,6 +1072,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         assert marker.parent == p.state / "pushes" and probe.endswith(f"ttp push --result {marker}")
         m = json.loads(marker.read_text())
         assert m["status"] == "running" and m["pid"] > 0 and m["target"] == "origin/proj" and m["log"]
+        assert (m["remote"], m["branch"]) == ("origin", "proj")   # what its claim is checked against
         deadline = time.time() + 30
         while not started.exists() and time.time() < deadline:
             time.sleep(0.05)
@@ -7712,6 +7713,70 @@ def test_detached_push_markers_are_unknown_while_running_confirmed_by_sha_and_mi
     # Another run's finished marker is not this run's claim.
     (pushes / f"t{tid}-x.json").write_text(json.dumps({"run": 8, "status": "failed", "target": "origin/proj"}))
     assert pushclaim.marker_claims(p, tid, 7) == []
+
+
+def test_a_detached_push_claim_whose_task_worktree_is_gone_is_checked_in_the_project_root(env, monkeypatch, tmp_path):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    on = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = p.db.add_task("t", "s", kind="code", origin="user")
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    pruned = str(tmp_path / "worktrees" / "gone")   # the task's worktree, removed since
+
+    def state(marker):
+        (pushes / f"t{tid}-x.json").write_text(json.dumps({"run": 7, "repo": pruned, **marker}))
+        return pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[:2]
+    got, why = state({"status": "pushed", "sha": on, "target": "origin/proj"})
+    assert got == pushclaim.CONFIRMED, why
+    # The remote and branch the push recorded win over its target text.
+    got, why = state({"status": "pushed", "sha": on, "target": "nowhere/else", "remote": "origin", "branch": "proj"})
+    assert got == pushclaim.CONFIRMED, why
+    got, why = state({"status": "pushed", "sha": on, "remote": "nowhere", "branch": "x"})
+    assert got == pushclaim.UNVERIFIABLE and "names no remote branch" in why, why
+
+
+def test_a_detached_push_claim_the_remote_cannot_settle_is_unverifiable_and_ranked_below_missing(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    on = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _commit(repo, "b.txt", "b\n")
+    off = _git_out(repo, "rev-parse", "HEAD")
+    tid = p.db.add_task("t", "s", kind="code", origin="user", branch="work")
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+
+    def write(name, marker):
+        (pushes / f"t{tid}-{name}.json").write_text(json.dumps({"run": 7, "repo": str(repo), **marker}))
+    write("x", {"status": "failed", "head": off})                                 # no target
+    assert pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[0] == pushclaim.UNVERIFIABLE
+    write("x", {"status": "failed", "head": off, "target": "origin/proj", "exit": None})   # a reboot
+    assert pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[0] == pushclaim.UNVERIFIABLE
+    write("x", {"status": "failed", "head": on, "target": "origin/proj", "exit": None})    # pushed another way
+    assert pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[0] == pushclaim.CONFIRMED
+    write("x", {"status": "failed", "head": off, "target": "origin/proj", "exit": 4})
+    assert pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[0] == pushclaim.MISSING
+    # MISSING > UNVERIFIABLE > UNKNOWN.
+    write("y", {"status": "failed", "head": off, "target": "origin/proj", "exit": None})
+    assert pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))[0] == pushclaim.MISSING
+    (pushes / f"t{tid}-x.json").unlink()
+    write("z", {"status": "running", "head": off, "target": "origin/proj"})
+    state, why, each = pushclaim.check_all(p, pushclaim.marker_claims(p, tid, 7))
+    assert state == pushclaim.UNVERIFIABLE and sorted(s for _, s, _ in each) == ["unknown", "unverifiable"], each
+    # The audit counts it apart from missing, and raises no gap issue for it.
+    (pushes / f"t{tid}-z.json").unlink()
+    run = p.db.x("INSERT INTO runs(task,role,status) VALUES(?,?,?)", (tid, "worker", "ok"))
+    write("y", {"run": run, "status": "failed", "head": off, "target": "origin/proj", "exit": None})
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "handed off"}))
+    a = pushclaim.audit(p)
+    assert a["counts"] == {"confirmed": 0, "missing": 0, "unknown": 0, "unverifiable": 1}, a
+    assert [g["state"] for g in a["gaps"]] == ["unverifiable"]
+    assert pushclaim.summary_line(a).startswith("0 confirmed, 0 missing, 0 unknown across 1 done tasks")
+    assert "; 1 unverifiable" in pushclaim.summary_line(a)
 
 
 def test_a_push_queue_landing_is_checked_by_the_commit_it_landed_as(env, monkeypatch):
