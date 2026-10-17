@@ -3960,7 +3960,8 @@ class Daemon:
         checks and builtin watchers run off the tick (schedrun), so a hung one (a gh call, ssh to a box
         that does not answer) never holds messages or dispatch; the tick waits at most SCHEDULE_WAIT_S
         for them. A run past its timeout (_schedule_timeout) has its process groups killed and is
-        recorded as a failed run."""
+        recorded as a failed run; one still going schedrun.STUCK_FACTOR x its timeout after that kill (a
+        builtin watcher stuck in Python) is observed once more, under its own key."""
         db, runs = self.p.db, self._sched_runs
         if not self._sched_swept:   # what an earlier daemon's runs left: their schedules are still due
             self._sched_swept = True
@@ -3992,8 +3993,17 @@ class Daemon:
                     log(self.p, f"schedule {name}: its run was stopped with the daemon; nothing recorded")
                 else:
                     self._schedule_ran(run.s, *run.result)
-            elif not run.timed_out and time.monotonic() >= run.deadline:
+            elif run.timed_out:
+                if not run.stuck and time.monotonic() >= run.killed_at + schedrun.STUCK_FACTOR * run.timeout:
+                    run.stuck = True
+                    self.observe(scr.error_source(f"watcher:{name}"), f"schedule {name}: its run killed at its "
+                                 f"timeout ({run.timeout:.0f} s) is still going "
+                                 f"{time.monotonic() - run.killed_at:.0f} s later, so the schedule cannot run "
+                                 f"again until its run ends or the daemon restarts", "normal",
+                                 lifecycle=scr.ERROR, key=f"schedule-stuck:{name}", whole=True)
+            elif time.monotonic() >= run.deadline:
                 run.timed_out = True   # kept in runs until its thread ends: not started again before
+                run.killed_at = time.monotonic()
                 killed = schedrun.kill(db, run)
                 why = f"error: timed out after {run.timeout:.0f} s"
                 self.observe(scr.error_source(f"watcher:{name}"), f"schedule {name} {why[7:]}: its run was "

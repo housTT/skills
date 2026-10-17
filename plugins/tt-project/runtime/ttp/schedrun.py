@@ -35,6 +35,11 @@ class Stopped(BaseException):
     `except Exception` on the way records it; the run's thread ends silently."""
 
 
+# A run killed at its timeout whose thread is still going this many times its timeout later is stuck
+# (a builtin watcher looping in pure Python ignores kills): it is observed once, as its schedule cannot run again.
+STUCK_FACTOR = 2
+
+
 class Run:
     """One schedule run in its thread. `result` is (status, run again at) once `done` is set."""
 
@@ -46,6 +51,8 @@ class Run:
         self.done = threading.Event()
         self.result: tuple[str, float | None] = ("error: run ended without a result", None)
         self.timed_out = False   # recorded failed at its timeout; its late result is dropped
+        self.killed_at: float | None = None   # when the tick's backstop killed it (monotonic)
+        self.stuck = False   # still alive STUCK_FACTOR x its timeout after that kill: observed once
         self.stopping = threading.Event()   # the daemon stopped it (a stop, its timeout): what its groups return is no result
         self.stopped = False   # it unwound on Stopped: nothing to record
         self.groups: dict[int, str | None] = {}   # pgid -> its leader's start token

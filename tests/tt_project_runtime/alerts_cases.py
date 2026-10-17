@@ -2477,6 +2477,49 @@ def test_a_run_killed_at_the_ticks_backstop_is_recorded_once_as_timed_out(env):
     assert p.db.one("SELECT last_status FROM schedules WHERE name='long'")["last_status"].startswith("error: timed out")
 
 
+def test_a_timed_out_run_whose_thread_never_ends_is_observed_once_more_as_stuck(env, monkeypatch):
+    """A builtin watcher stuck in Python ignores the backstop's kill, so its schedule cannot run again:
+    once it is still going STUCK_FACTOR x its timeout after the kill, a second, keyed issue says so, once."""
+    import threading
+    from ttp import daemon as dm, schedrun, schedule as sched, screen as scr, watchers
+    p = make(env)
+    release, calls = threading.Event(), []
+
+    def stuck(host, name, payload):
+        calls.append(name)
+        release.wait(30)
+        return "ok"
+    monkeypatch.setattr(watchers, "run_builtin", stuck)
+    sched.upsert(p.db, "spin", "watcher", "1h", payload={"deadline_s": 5})
+    _due(p, "spin")
+    d = dm.Daemon(p.base)
+    try:
+        d.run_schedules()
+        run = d._sched_runs["spin"]
+        assert _wait_for(lambda: calls, 5)
+        source = scr.error_source("watcher:spin")
+        issues = lambda: p.db.q("SELECT title, count, watch_key FROM issues WHERE source=?", (source,))
+        run.deadline = time.monotonic()
+        d.run_schedules()
+        assert run.timed_out and not run.done.is_set() and len(issues()) == 1, issues()
+        d.run_schedules()
+        assert len(issues()) == 1 and not run.stuck, "stuck reported before STUCK_FACTOR x its timeout"
+        run.killed_at -= schedrun.STUCK_FACTOR * run.timeout
+        d.run_schedules()
+        d.run_schedules()
+        stuck_rows = [r for r in issues() if r["watch_key"]]
+        assert run.stuck and len(issues()) == 2 and len(stuck_rows) == 1, issues()
+        assert stuck_rows[0]["count"] == 1 and "still going" in stuck_rows[0]["title"], stuck_rows
+        _due(p, "spin")
+        d.run_schedules()
+        assert calls == ["spin"], "a second run started while the stuck one goes on"
+    finally:
+        release.set()
+    assert run.done.wait(5)
+    d.run_schedules()
+    assert "spin" not in d._sched_runs
+
+
 def test_a_heal_fix_killed_at_the_ticks_backstop_does_not_escalate_its_kill(env):
     from ttp import daemon as dm, heal, schedrun, schedule as sched
     p = make(env)
