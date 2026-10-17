@@ -1320,6 +1320,40 @@ def test_jev_out_of_funds_alerts_and_screening_falls_back_to_rules(env):
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='observation' AND source='log:app'")["n"] == 1
 
 
+def test_jev_pause_after_out_of_funds_holds_across_config_reloads_and_schedule_runs(env, monkeypatch):
+    p = make(env)
+    import io
+    import urllib.error
+    from ttp import daemon as dm
+    from ttp.providers import jev as jevmod
+    calls = []
+
+    def broke(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 402, "Payment Required", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(jevmod, "load_secrets", lambda: {"jev": {"key": "k", "url": "http://jev.invalid"}})
+    monkeypatch.setattr(jevmod.urllib.request, "urlopen", broke)
+    d = dm.Daemon(p.base)
+    with pytest.raises(jevmod.JevOutOfFunds):
+        d.jev.decide("s", {"q": {"type": "noul", "question": "?"}})
+    assert len(calls) == 1 and not d.jev.enabled()
+    d._last_cfg = 0.0
+    d.tick()   # reloads the config and builds a new Jev: still paused
+    assert not d.jev.enabled()
+    seen = []
+
+    def watcher(self, s, payload):
+        seen.append((self.jev is not d.jev, self.jev.enabled(), self.jev.decide("s", {})))
+        return "ok"
+
+    monkeypatch.setattr(dm.Daemon, "_run_command_watcher", watcher)
+    run = d._start_schedule({"name": "w", "kind": "command"}, {"command": "true"})
+    assert run.done.wait(20), "the schedule run did not end"
+    assert seen == [(True, False, None)] and run.result[0] == "ok"
+    assert len(calls) == 1, "a schedule run started during the pause called Jev"
+
+
 def test_effort_rules_start_short_lookups_light_and_everything_else_standard(env):
     from ttp.effort import rules_tier
     assert rules_tier({"kind": "question", "title": "Which boxes run the old broker?", "spec": "List them."}) == "light"

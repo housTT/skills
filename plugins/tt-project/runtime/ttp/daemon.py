@@ -118,7 +118,7 @@ from .project import (Project, command_env, deep_merge, layered, disk_resume_gb,
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
-from .providers.jev import Jev, JevOutOfFunds
+from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
@@ -548,7 +548,8 @@ class Daemon:
         self.gates: dict[str, bud.Gate] = {}
         self.cfg_status = "ok"
         self._load_config()
-        self.jev = Jev(self.cfg, db=self.p.db)
+        self._jev_pause = JevPause()
+        self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
         self._slack = None
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
@@ -954,7 +955,7 @@ class Daemon:
         if now - self._last_cfg > 10:
             self._load_config()
             self._last_cfg = now
-            self.jev = Jev(self.cfg, db=self.p.db)
+            self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
@@ -4009,7 +4010,7 @@ class Daemon:
         host._progress = lambda: None
 
         def body() -> tuple[str, float | None]:
-            host.jev = Jev(host.cfg, db=host.p.db)
+            host.jev = Jev(host.cfg, db=host.p.db, pause=host._jev_pause)
             if s["kind"] == "command" and payload.get("heal"):
                 return host._run_heal(s, payload)
             if s["kind"] == "command":

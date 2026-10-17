@@ -34,8 +34,15 @@ class JevOutOfFunds(JevUnavailable):
     pass
 
 
+class Pause:
+    """When Jev may be called again. One per daemon, shared by every Jev it builds (each config reload
+    and each schedule run makes a new one), so a pause after an error or out-of-funds holds for all."""
+    def __init__(self):
+        self.until = 0.0
+
+
 class Jev:
-    def __init__(self, cfg: dict, db=None, secrets: dict | None = None):
+    def __init__(self, cfg: dict, db=None, secrets: dict | None = None, pause: Pause | None = None):
         self.cfg = cfg.get("jev", {}) or {}
         self.db = db
         sec = (secrets if secrets is not None else load_secrets()).get("jev") or {}
@@ -43,13 +50,13 @@ class Jev:
         self.key = sec.get("key") or ""
         self.url = self.cfg.get("url") or sec.get("url") or ENDPOINTS.get(self.via, "")
         self.model = self.cfg.get("model") or DEFAULT_MODEL.get(self.via, "jev-latest")
-        self._pause_until = 0.0
+        self.pause = pause if pause is not None else Pause()
         self.last_cost = 0.0   # what the latest decide() cost, for the use's ledger (jevuse.record)
 
     def enabled(self) -> bool:
         # "auto" (the default): on whenever the user has saved a key; a project can opt out with false.
         on = self.cfg.get("enabled", "auto") in (True, "auto")
-        return bool(on and self.key and self.url and time.time() >= self._pause_until)
+        return bool(on and self.key and self.url and time.time() >= self.pause.until)
 
     def decide(self, state: str, questions: dict[str, Any], purpose: str = "decide",
                timeout: float = 20.0) -> dict[str, Any] | None:
@@ -63,10 +70,10 @@ class Jev:
                 data = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 402 or (e.code == 403 and "credit" in (e.read() or b"").decode(errors="replace").lower()):
-                self._pause_until = time.time() + 3600
+                self.pause.until = time.time() + 3600
                 raise JevOutOfFunds("Jev account has insufficient credits") from None
             if e.code in (429, 503, 529):
-                self._pause_until = time.time() + 60
+                self.pause.until = time.time() + 60
             raise JevUnavailable(f"HTTP {e.code}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise JevUnavailable(type(e).__name__) from None
