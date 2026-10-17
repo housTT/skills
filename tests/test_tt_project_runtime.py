@@ -34021,6 +34021,8 @@ def test_svcscan_flags_every_unit_change_and_no_read_only_query(env):
                  'subprocess.run(["service", unit, "reload"])\n', "./systemctl stop x\n",
                  "systemctl -H box stop x\n", "sudo -n systemctl \\\n  --user \\\n  restart x\n"):
         assert [n for n, _, _ in svcscan.scan(text)] == [1], text
+    # a comment ending in a backslash does not swallow the next line
+    assert [n for n, _, _ in svcscan.scan("# note \\\nsystemctl stop x\n")] == [2]
     assert "relative path" in svcscan.scan("./systemctl stop x\n")[0][1]
     for text in ('subprocess.run(["systemctl", "is-active", unit])\n', 'shutil.which("systemctl")\n',
                  "echo $(systemctl is-active x)\n", "service x status\n", "systemctl \\\n  status x\n"):

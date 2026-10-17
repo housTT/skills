@@ -77,7 +77,7 @@ def _logical_lines(text: str):
     n = 0
     while n < len(lines):
         first, line = n + 1, lines[n]
-        while line.endswith("\\") and n + 1 < len(lines):
+        while not line.lstrip().startswith("#") and line.endswith("\\") and n + 1 < len(lines):
             n += 1
             line = line[:-1].rstrip() + " " + lines[n].lstrip()
         n += 1
