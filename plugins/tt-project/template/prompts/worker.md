@@ -65,8 +65,6 @@ Other workers run other tasks of this project at the same time.
   time: wrap each command that touches one in `ttp lock <resource> -- <command>` (a broker or queue
   that serializes access is enough). Exit 75 means busy or paused: hand off `waiting` naming it,
   `retry_when` `ttp lock --probe <resource>`.
-  Read-only commands take `ttp lock --shared` (`--probe --shared`), not for device locks: they run
-  together, never with an exclusive holder. A nested lock just runs; an exclusive one inside a shared one exits 2.
 <!-- ttp:if device -->
 - Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource,
   never directly, not even through a test fixture. `TTP_NO_DEVICE=1` in your environment means your

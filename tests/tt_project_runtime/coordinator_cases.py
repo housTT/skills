@@ -5354,6 +5354,28 @@ def test_a_shared_ttp_lock_of_a_device_lock_is_refused_and_runs_nothing(env, tmp
     assert ran.exists()
 
 
+def test_ttp_lock_help_carries_the_shared_and_nested_lock_rules_the_skills_point_to(capsys):
+    from ttp import cli
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["lock", "--help"])
+    assert exc.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    for rule in ("shared holders run together", "a queued exclusive waiter is not jumped",
+                 "Not for a device lock", "--shared on one exits 2 and runs nothing", "`--probe --shared`",
+                 "just runs", "an exclusive one inside a shared hold of the same lock exits 2 at once"):
+        assert rule in text, rule
+    # The worker prompt has no room for them under its size budget: the harness skill carries them and
+    # the command reference points here.
+    skills = TTP.parents[1] / "skills"
+    harness = next(line for line in (skills / "tt-project-harness" / "SKILL.md").read_text().splitlines()
+                   if line.startswith("| Resource locks |"))
+    for rule in ("`--shared`", "Never on a device lock", "A nested `ttp lock`", "exits 2 at once", "`ttp lock --help`"):
+        assert rule in harness, rule
+    operate = next(line for line in (skills / "tt-project" / "operate.md").read_text().splitlines()
+                   if line.startswith("| `ttp lock <r> -- <cmd>`"))
+    assert "`--shared`" in operate and "`ttp lock --help`" in operate, operate
+
+
 def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

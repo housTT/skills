@@ -6083,7 +6083,16 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--timeout", type=float, default=30, help="seconds per probe")
     s.set_defaults(fn=cmd_goal)
 
-    s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
+    s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs", description=(
+        "Hold a shared resource while one command runs; waiters are served in arrival order, and exit 75 "
+        "means busy or paused (retry_when `ttp lock --probe <resource>`). --shared is for read-only "
+        "commands: shared holders run together, while an exclusive holder (a plain `ttp lock`, or an "
+        "exclusive task's whole-run hold) and shared ones exclude each other; a queued exclusive waiter is "
+        "not jumped by later shared ones. Not for a device lock (one in config `device.locks` or ending in "
+        "`-device`): --shared on one exits 2 and runs nothing, and `--probe --shared` on one answers as the "
+        "plain probe does. Nested: a `ttp lock` inside one that holds the same lock in the same or a "
+        "stronger mode (or inside an exclusive task's run) just runs; an exclusive one inside a shared hold "
+        "of the same lock exits 2 at once, as it could only wait for itself."))
     s.add_argument("--probe", action="store_true",
                    help="exit 0 if the resource is free, not paused and nobody queues for it, else 75 (for retry_when)")
     s.add_argument("--shared", action="store_true",
