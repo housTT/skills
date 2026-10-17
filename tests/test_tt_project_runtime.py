@@ -19875,6 +19875,11 @@ def test_reboot_wait_classifies_probes_by_where_they_run():
     assert rw.transient("ssh box1 test -e /tmp/d/j") == ""
     assert rw.transient("test -e /tmp/d/j") == "a path a reboot clears"
     assert rw.stays_asleep({"retry_when": "ttp detach --check --host box1 /tmp/d/j"})
+    # The --mirror run folder is copied from the remote host, so a reboot does not clear it.
+    mirror = "ttp detach --check --host box1 --mirror /x/state/runs/7 /tmp/d/j"
+    assert rw.transient(mirror) == "" and rw.transient(mirror.replace("--mirror ", "--mirror=")) == ""
+    assert rw.stays_asleep({"retry_when": mirror})
+    assert rw.transient("ttp detach --check /x/state/runs/7/x.rc") != ""
     assert rw.stays_asleep({"retry_when": "test -e /tmp/x", "survives_reboot": True})
 
 

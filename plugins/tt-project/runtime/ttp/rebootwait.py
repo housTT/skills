@@ -51,6 +51,14 @@ def _local_part(cmd: list[str]) -> list[str]:
 
 def _transient_words(words: list[str], run_dirs: tuple[str, ...]) -> str:
     """Why these words, run on this host, check something a reboot ends; '' when they do not."""
+    base = [w.rsplit("/", 1)[-1] for w in words]
+    for i, b in enumerate(base):
+        if b in ("ttp", "ttp.sh"):
+            sub, rest = words[i + 1:i + 2], words[i + 2:]
+            if sub == ["detach"] and "--check" in rest and any(w == "--host" or w.startswith("--host=") for w in rest):
+                # the --mirror folder is copied in from the remote host; a reboot does not clear it
+                words = [w for j, w in enumerate(words) if not (w.startswith("--mirror=") or w == "--mirror" or (j and words[j - 1] == "--mirror"))]
+                break
     joined = " ".join(words)
     base = [w.rsplit("/", 1)[-1] for w in words]
     for i, b in enumerate(base):
