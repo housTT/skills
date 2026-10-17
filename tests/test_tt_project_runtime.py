@@ -40707,6 +40707,8 @@ def test_after_push_and_git_hooks_receive_no_managed_scratch(env, tmp_path, monk
         marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
         assert 'pushed' in _probe_until_done(p, push.result_probe(marker, p)).stdout
         assert _wait_for(lambda: push._read(marker).get('after_push', {}).get('ended'))
+        # It still releases its scratch after writing that; on a loaded host it outlives the test.
+        assert _wait_for(lambda: _pid_gone(int(push._read(marker)['pid'])), timeout=_load_scaled(30))
     for path in (seen, hook_seen):
         recorded = json.loads(path.read_text())
         assert all(recorded.get(k) == str(normal) for k in ('TMPDIR', 'TMP', 'TEMP')), recorded
