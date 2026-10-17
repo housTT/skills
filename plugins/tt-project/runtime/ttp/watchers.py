@@ -134,7 +134,7 @@ def watch_prs(daemon) -> str:
         data = None
         wrappers = any(str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip()
                        for r in pr.get("reviews") or [])
-        if key and (pr.get("state") == "OPEN" or wrappers):
+        if key and pr.get("state") == "OPEN":   # a closed PR's change is reported; no read per poll
             owner, rest = key.split("/", 1)
             name, number = rest.split("#")
             data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",

@@ -9242,6 +9242,38 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
 
 
 
+def test_pr_watch_reads_inline_comments_only_for_open_prs(env, monkeypatch):
+    """A closed or merged PR with an empty COMMENTED wrapper makes no GraphQL call and keeps its
+    recorded activity; an open one still does."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/11"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','running',?,?)",
+           (url, time.time()))
+    pr = {"url": url, "state": "OPEN", "isDraft": False, "title": "t", "comments": [], "statusCheckRollup": [],
+          "reviews": [{"id": "rv", "author": {"login": "dev"}, "state": "COMMENTED", "body": ""}]}
+    calls = []
+    graph = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                     "reviewThreads": {"nodes": []}}}}}
+
+    def gh(args, cwd):
+        calls.append(args[0])
+        return graph if args[0] == "api" else pr
+
+    monkeypatch.setattr(watchers, "_gh", gh)
+    d = Daemon(p.base)
+    watchers.watch_prs(d)
+    assert calls.count("api") == 1
+    pr["state"] = "MERGED"
+    calls.clear()
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    assert "api" not in calls and calls.count("pr") == 2
+    kinds = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='pr_changed'")]
+    assert len(kinds) == 1 and "OPEN → MERGED" in kinds[0] and "activity" not in kinds[0]
+
+
 def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branch_line(env):
     """A task_add whose spec names a done task's work branch (ttp/t<id>-...) carries it only with a
     `pr_branch:` line naming it: a mere mention (a plan or follow-up citing earlier work) carries
