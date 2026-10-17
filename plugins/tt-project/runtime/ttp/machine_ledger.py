@@ -1100,20 +1100,50 @@ class Probes:
 # digest -------------------------------------------------------------------------------------------
 
 # A clause that refuses a machine ("No authorization for <alias>", "never <alias>", "<alias> is
-# excluded") does not make it the project's: an alias counts only where a clause names it without one.
+# excluded") does not make it the project's. A negation excludes an alias only where it governs it: it
+# comes before the alias with only a list of aliases between its phrase and the alias, or the alias is
+# the subject of a prohibition. One that limits how a machine is used ("box-a, never directly", "no more
+# than 2 at a time on box-a", "use box-a without sudo", "box-a: do not modify") keeps it.
 NEGATION_RE = re.compile(r"\b(?:no|not|never|none|nor|without|excluded?|exclusions?|prohibited|forbidden|"
                          r"off[- ]limits|disallowed|unauthori[sz]ed)\b|n't\b", re.I)
+LIMIT_RE = re.compile(r"\b(?:no|not)\s+(?:more|less|fewer|longer|later|earlier|sooner|greater|higher|lower|"
+                      r"over)\s+than\b|\bnot\s+only\b|\bno\s+matter\b", re.I)
+PROHIBITED_RE = re.compile(r"\s*(?:[:\u2013\u2014-]|\b(?:is|are|stays?|remains?)\b)?\s*(?:strictly\s+|also\s+)?"
+                           r"(?:excluded|prohibited|forbidden|off[- ]limits|disallowed|unauthori[sz]ed|out of scope|"
+                           r"not\s+(?:allowed|authori[sz]ed|permitted|ours|in scope|to be used))\b", re.I)
+GLUE_RE = re.compile(r"^\s*(?:(?:and|or|nor|the|a)\b\s*)*$", re.I)
 CLAUSE_RE = re.compile(r"[.;!?](?=\s|$)|\n|\(|\)")
 
 
+def _refused(clause: str, start: int, end: int, alias_re) -> bool:
+    """Whether the alias at clause[start:end] is the one a negation in the clause refuses."""
+    after = alias_re.sub(" ", clause[end:])
+    if PROHIBITED_RE.match(re.sub(r"^(?:\s*(?:,|\band\b|\bor\b)\s*)+", "", after)):
+        return True
+    before = LIMIT_RE.sub(lambda m: "_" * len(m.group()), clause[:start])
+    neg = None
+    for neg in NEGATION_RE.finditer(before):
+        pass
+    if not neg:
+        return False
+    between = before[neg.end():]
+    if neg.group().lower() == "without":
+        return bool(GLUE_RE.match(alias_re.sub(" ", between)))
+    # The negation's own phrase ends at a comma, colon or dash; past it, only a list of aliases continues it.
+    *rest, own = re.split(r"[,:\u2013\u2014]|\s-\s", between)
+    return not rest or all(GLUE_RE.match(alias_re.sub(" ", seg)) for seg in rest[1:] + [own])
+
+
 def charter_machines(charter: str, known) -> list[str]:
-    """The machines in `known` that the charter's Resources section names outside a negating clause."""
+    """The machines in `known` that the charter's Resources section names somewhere no negation refuses."""
     from .prompts import charter_sections
     text = "\n".join("\n".join(body) for head, body in charter_sections(charter)
                      if ends.section_name(head).lower().startswith("resources"))
-    clauses = [c for c in CLAUSE_RE.split(text) if c.strip() and not NEGATION_RE.search(c)]
-    return sorted(a for a in known if any(
-        re.search(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)", c) for c in clauses))
+    clauses = [c for c in CLAUSE_RE.split(text) if c.strip()]
+    pat = {a: re.compile(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)") for a in known}
+    any_alias = re.compile("|".join(f"(?:{r.pattern})" for r in pat.values()) or r"(?!)")
+    return sorted(a for a in known if any(not _refused(c, m.start(), m.end(), any_alias)
+                                          for c in clauses for m in pat[a].finditer(c)))
 
 
 def configured_machines(cfg: dict, known) -> list[str]:

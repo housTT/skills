@@ -2688,8 +2688,17 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
     assert ml.charter_machines(charter.format("Machines: box-a, box-b (read only; never reset it)."),
                                known) == ["box-a", "box-b"]
     for line in ("No authorization for box-c or other shared nodes.", "Never use box-c.",
-                 "box-c is excluded.", "box-c: prohibited", "Don't run on box-c.", "Not box-c."):
+                 "box-c is excluded.", "box-c: prohibited", "Don't run on box-c.", "Not box-c.",
+                 "Off-limits: box-c, box-d.", "box-c and box-d are excluded.", "No access to box-c, box-d."):
         assert ml.charter_machines(charter.format(f"Machines: box-a.\n{line}"), known) == ["box-a"], line
+    # A negation that only limits how an authorized machine is used keeps it.
+    for line in ("Device boxes: box-a, box-b, each through its broker, never directly.",
+                 "Slurm nodes box-a and box-b, no more than 2 at a time.",
+                 "box-a: the project host, not shared with other teams.", "Use box-a without sudo.",
+                 "box-a and box-b: read-only, do not modify.", "No more than one job at a time on box-a.",
+                 "Never directly, use box-a.", "Run without sudo on box-a."):
+        want = ["box-a", "box-b"] if "box-b" in line else ["box-a"]
+        assert ml.charter_machines(charter.format(line), known) == want, line
     # An alias named both ways counts; one named only in another section does not.
     assert ml.charter_machines(charter.format("Machines: box-a, box-c. Never reset box-c."),
                                known) == ["box-a", "box-c"]
