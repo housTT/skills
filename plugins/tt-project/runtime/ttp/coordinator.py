@@ -29,8 +29,8 @@ from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, depl
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, task_outcome,
-                 without_deferral)
+                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, reviewed_ids,
+                 task_outcome, without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push, durable_append,
                       own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
@@ -2287,8 +2287,11 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
     if old["status"] == "done":
         return old   # the caller adds it as a follow-up instead
     if old["status"] not in ("failed", "cancelled", "blocked"):
+        rev = _failed_latest_review(db, old) if old["status"] == "review" else None
+        fix = (f": its latest review #{rev['id']} failed, so continue that review instead (task_add "
+               f"continues={rev['id']} builds on the reviewed branch), then queue a re-review") if rev else ""
         raise ValueError(f"task_add continues rejected: #{old['id']} is {old['status']}; only a failed, "
-                         f"cancelled or blocked task can be continued (a done one gets a follow-up)")
+                         f"cancelled or blocked task can be continued (a done one gets a follow-up){fix}")
     if old["id"] in deps:
         raise ValueError(f"task_add cannot depend on #{old['id']}, the task it continues")
     if any(db.dependency_cycle(t["id"], deps) for t in _open_dependents(db, old["id"])):
@@ -2296,6 +2299,14 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
                          f"waits on #{old['id']}")
     return old
 
+
+
+def _failed_latest_review(db, task: dict) -> dict | None:
+    """The latest review of `task` (one that names its branch or depends on it), when that review failed."""
+    for r in db.q("SELECT * FROM tasks WHERE kind='review' AND id>? ORDER BY id DESC", (task["id"],)):
+        if task["id"] in reviewed_ids(r, [task]) | set(dependency_ids(r)):
+            return r if r["status"] == "failed" else None
+    return None
 
 # A task's own work branch named in a spec (worktree.ensure names them ttp/t<id>-<slug>), and a
 # spec line naming the branch a task delivers onto: the marker starts the line (a list bullet aside)

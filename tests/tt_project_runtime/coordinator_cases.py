@@ -3859,6 +3859,35 @@ def test_a_task_in_review_whose_latest_review_failed_with_no_fix_is_raised_once_
     assert [r["task"] for r in raised()] == [code, code2, code4]
 
 
+def test_the_fix_the_failed_review_wake_names_passes_the_continues_check(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db, now = p.db, time.time()
+    code = db.add_task("parser change", "s", kind="code", origin="user")
+    db.update_task(code, status="review")
+    rev = db.add_task(f"Review #{code}: parser change", "s", kind="review", origin="daemon",
+                      labels=[f"auto_review:{code}"])
+    db.update_task(rev, status="failed", result=json.dumps({"status": "failed", "summary": "no"}))
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (now - 2 * 3600, f"task:{rev}", "task_failed", "normal", "review ended", "handled", rev))
+    d._raise_unhandled_failed_reviews(now)
+    text = db.one("SELECT text FROM events WHERE kind='review_failed_unhandled'")["text"]
+    named = [int(n) for n in re.findall(r"continues=(\d+)", text)]
+    assert named == [rev] and f"continues #{code}" not in text, text
+    assert coord._continued(db, named[0], [])["id"] == rev
+    # Continuing the task in review is refused, and the refusal names the review to continue.
+    with pytest.raises(ValueError, match=rf"latest review #{rev} failed.*continues={rev}"):
+        coord._continued(db, code, [])
+    # A newer review that has not failed is the latest one: the refusal names no review then.
+    rerev = db.add_task(f"Review #{code}: parser change", "s", kind="review", origin="coordinator",
+                        depends_on=[code])
+    with pytest.raises(ValueError) as e:
+        coord._continued(db, code, [])
+    assert "latest review" not in str(e.value) and f"#{rerev}" not in str(e.value)
+
+
 def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits_in_review(env):
     p = make(env)
     from ttp import coordinator as coord

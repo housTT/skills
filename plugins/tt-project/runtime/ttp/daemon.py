@@ -2183,7 +2183,9 @@ class Daemon:
                      (now, "daemon", "review_failed_unhandled", fp, "normal",
                       f"#{tid} {task['title']} is still in review: its latest review #{rev['id']} {verdict} "
                       f"{age:.1f}h ago and no fix or re-review is queued or running. Review follow-ups: "
-                      f"{named or 'none listed'}. Options: queue a fix that continues #{tid} and a re-review, "
+                      f"{named or 'none listed'}. Options: queue a code task that fixes them and continues the failed "
+                      f"review #{rev['id']} (task_add continues={rev['id']}: it builds on the reviewed branch; "
+                      f"#{tid} itself cannot be continued while in review), then a re-review, "
                       f"mark it done with task_update status done once its work is verified, requeue it, "
                       f"or cancel it.", json.dumps({"review": rev["id"], "followups": fups}), "queued", tid))
                 log(self.p, f"task {tid} in review {age:.1f}h after review {rev['id']} {verdict} with no fix "
