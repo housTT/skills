@@ -264,6 +264,61 @@ def test_heal_escalate_user_alerts_and_coordinator_observes_once_per_episode(env
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
 
 
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_suppress_is_honoured_after_the_self_fix_task_ended(env, escalate):
+    """A planned shutdown that starts while the episode is escalated: `suppress` exiting 0 tells no one;
+    once it says no, the escalation goes out as before."""
+    from ttp import heal
+    down = env["repo"] / "planned-down"
+    p, d, up = _heal_setup(env, fix=None, suppress=f"test -e {down}", escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    down.touch()
+    for dt in (10, 20):
+        assert heal.run(d, "svc", spec, now + dt) == ("unhealthy (suppressed: deliberately down)", None)
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")
+    down.unlink()
+    told = heal.run(d, "svc", spec, now + 30)[0]
+    assert ("alerted" if escalate == "user" else "coordinator told") in told
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == (escalate == "user")
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")) == (escalate == "coordinator")
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_escalated_episode_tells_a_new_finding_once(env, escalate):
+    """While escalated, a different finding (normalized: counters and times do not count) is told once
+    more under its own fingerprint; the same or an earlier finding stays quiet."""
+    from ttp import heal
+    msg = env["repo"] / "finding"
+    p, d, up = _heal_setup(env, fix=None, check=f"cat {msg}; exit 1", escalate=escalate)
+    spec, now = _heal_spec(p), time.time()
+
+    def told():
+        if escalate == "user":
+            return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='heal:svc' ORDER BY id")]
+        return [e["fingerprint"] for e in p.db.q("SELECT fingerprint FROM events WHERE fingerprint LIKE 'heal:%' ORDER BY id")]
+
+    msg.write_text("ttp-heal: not-outage chip 0 lost after 12 s")
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    heal.run(d, "svc", spec, now + 10)
+    assert len(told()) == 1
+    msg.write_text("ttp-heal: not-outage chip 0 lost after 40 s")   # the same finding, normalized
+    heal.run(d, "svc", spec, now + 20)
+    assert len(told()) == 1
+    msg.write_text("ttp-heal: not-outage chip 1 is off the bus")
+    for dt in (30, 40):
+        heal.run(d, "svc", spec, now + dt)
+    assert len(told()) == 2 and "different finding" in (told()[1] if escalate == "user" else
+                                                        p.db.q("SELECT text FROM events ORDER BY id DESC")[0]["text"])
+    if escalate == "coordinator":
+        since = heal.state(p.db, "svc")["since"]
+        assert told()[0] == f"heal:svc:{since:.0f}" and told()[1].startswith(f"heal:svc:{since:.0f}:")
+    msg.write_text("ttp-heal: not-outage chip 0 lost after 99 s")   # told before in this episode
+    heal.run(d, "svc", spec, now + 50)
+    assert len(told()) == 2
+
+
 @pytest.mark.parametrize("change", ["coordinator", "project_default", "known_fault", "finding_known_fault"])
 @pytest.mark.parametrize("run_check", [False, True])
 def test_heal_config_change_closes_an_existing_user_alert(env, change, run_check):

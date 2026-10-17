@@ -36,7 +36,9 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   `escalate` picks who gets that last step: "user" (default; the project's `heal.escalate` config
   sets it for every check) sends the alert; "coordinator" sends no alert and instead queues one high
   observation for the coordinator per unhealthy episode (fingerprint `heal:<name>:<since>`).
-  Moving escalation to the coordinator closes an earlier user alert with its reason. Adding a
+  A different finding later in the episode (normalized output, so counters and times do not count) is
+  told once more the same way (fingerprint `heal:<name>:<since>:<finding>`), up to FINDINGS_MAX per
+  episode; a finding told before stays quiet. `suppress` exiting 0 tells no one here either. Moving escalation to the coordinator closes an earlier user alert with its reason. Adding a
   known fault that covers the current confirmed failure does the same, without claiming recovery.
 
 An outage check whose `resource` this project paused (its own pause or a shared one) is not fixed,
@@ -168,7 +170,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import pageto, timefmt
+from . import pageto, screen, timefmt
 from .db import DB
 from .project import command_env
 
@@ -198,6 +200,7 @@ ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out
                       r"ssh: connect to host|connection closed by .* port", re.I)
 HOST_RE = re.compile(r"[A-Za-z0-9_.:%\[\]][A-Za-z0-9_.:%\[\]-]*")   # one host name or address, never an option
 PING_S = 3                      # how long box_silent waits for each ping reply
+FINDINGS_MAX = 5               # distinct findings told per escalated episode (_escalated); later ones stay quiet
 FRESH_UNKNOWN_S = 900          # an unknown stretch shorter than this never starts a fresh episode (module doc)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 NOTE_MAX = 2000                 # self_fix_note cap: a longer note is cut to this
@@ -727,7 +730,7 @@ def outage_explains(rec: dict, name: str, spec: dict, rc: int, out: str) -> bool
 def _fresh(st: dict, *also: str) -> None:
     """Start a new unhealthy episode: grace again, no task, nothing escalated (module doc). Keeps `fixes`."""
     for key in ("since", "task", "escalated", "observed", "why", "phase", "unknown_told", "paged", "paged_unknown",
-                *also):
+                "told_findings", *also):
         st.pop(key, None)
 
 
@@ -929,7 +932,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         # A self-fix may identify a known fault while its task is still open.
         from . import alerts
         alerts.close_key(db, STATE_KEY + name, f"known_fault applies to current failure: {kf['why']}", now)
-        for key in ("task", "escalated", "alerted", "observed", "paged"):
+        for key in ("task", "escalated", "alerted", "observed", "paged", "told_findings"):
             st.pop(key, None)
         _save(db, name, st)
         return "unhealthy (known fault: kept quiet)", None
@@ -939,7 +942,7 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         # (unlike owner lines, outages and known_fault), and the paused-quiet ask still reaches the coordinator.
         return _paused_outage(host, name, st, paused, now)
     if st.get("task") or st.get("escalated"):
-        return _escalated(host, name, spec, st, now)
+        return _escalated(host, name, spec, st, now, cwd, env)
     if pending:
         st["phase"] = None
         return _escalate(host, name, spec, st, now, f"the fix ran but the check still fails {down / 60:.0f} min on")
@@ -1036,16 +1039,33 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
     return f"unhealthy (self-fix task #{tid}: {why})", None
 
 
-def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[str, float | None]:
+def _escalated(host: Any, name: str, spec: dict, st: dict, now: float, cwd: str | None = None,
+               env: dict | None = None) -> tuple[str, float | None]:
     """Unhealthy with its self-fix task out: alert once that task failed, blocked or ended without
-    making the check pass."""
+    making the check pass, and once more per new finding in the episode. `cwd` set: the `suppress`
+    probe runs first (the unknown path that passes none has run it already)."""
     db = host.p.db
     tid = st.get("task")
     t = db.task(int(tid)) if tid else None
     if t is not None and t["status"] in OPEN:
         _save(db, name, st)
         return f"unhealthy (self-fix task #{tid} open)", None
+    if cwd is not None and spec.get("suppress") and suppressed(host, name, spec, cwd, env or {}):
+        _save(db, name, st)
+        return "unhealthy (suppressed: deliberately down)", None
     how = f"self-fix task #{tid} {t['status']}" if t else f"self-fix task #{tid} is gone"
+    # A finding not yet told in this episode (normalized, so counters and times do not count) is told
+    # once more, under its own fingerprint; one told before stays quiet. Capped, so a check whose
+    # output never repeats cannot page every run.
+    seen = screen.fingerprint(STATE_KEY + name, st.get("last_out") or "")
+    told = list(st.get("told_findings") or [])
+    new = bool(told) and seen not in told and len(told) < FINDINGS_MAX
+    if new:
+        for key in ("paged", "observed", "alerted"):
+            st.pop(key, None)
+        how += "; the check now reports a different finding"
+    if not told or new:
+        st["told_findings"] = told + [seen]
     last = (st.get("last_out") or "")[:300]
     paged = _page(host, name, spec, st, "paged", f"Heal check {name} of project {host.p.name}, unhealthy since "
                   f"{timefmt.long(float(st.get('since') or now), host.p)}, still fails and its {how}. "
@@ -1055,6 +1075,8 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
         return f"unhealthy ({how}; {paged} told)", None
     if escalate_to(host, spec) == "coordinator":
         fp = f"{STATE_KEY}{name}:{float(st.get('since') or st.get('escalated') or now):.0f}"
+        if len(st["told_findings"]) > 1:
+            fp += f":{st['told_findings'][-1][:8]}"
         if not st.get("observed") and not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "high",
@@ -1067,7 +1089,7 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
     if not st.get("alerted"):
         st["alerted"] = now
         host.alert(STATE_KEY + name, ("Heal check" if st.get("finding") or st.get("route_only") else "Outage: heal check")
-                   + f" {name} still fails and its {how}. Last check: {last}", "high")
+                   + f" {name} still fails and its {how}. Last check: {last}", "high", **({"every_s": 0} if new else {}))
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
 
