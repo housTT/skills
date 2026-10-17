@@ -11768,6 +11768,186 @@ def test_blocker_sweep_replay_of_a_day_of_unrelated_signals_over_user_paused_wor
     assert 1 <= len(sweeps) <= 4 and all(carried for _, carried in sweeps), sweeps
 
 
+def _watched_holds(p, now):
+    """A coordinator pause on board-b with an end_when probe and an end ahead, and a task deferred on a
+    start_when probe; both probes last said not yet, and a sweep judged both still_blocked with a 2h
+    next check."""
+    from ttp import sweep, startgate
+    db = p.db
+    _set_pause_row(db, "board-b", {"by": "coordinator", "reason": "fabric repair", "since": now - 3600,
+                                   "until": now + 3 * 86400, "end_when": "test -e out/board-b-ok"})
+    tid = db.add_task("bench after the repair", labels=["start_when:test -e out/repaired",
+                                                        f"deferred_since:{now - 600}"])
+    _probe_says(db, tid, 1, now)
+    eid = sweep.start(db, p.config(), "every 6h", now)
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    for a in ({"id": tid}, {"resource": "board-b"}):
+        sweep.record(db, {**a, "outcome": "still_blocked", "until": "the repair is done and its probe passes",
+                          "until_probe": "test -e out/repaired"}, now + 7200, now + 60)
+    assert all(o.get("fp") for o in sweep.outcomes(db).values()), "each outcome keeps the hold's fingerprint"
+    assert startgate.KEY in [r["key"] for r in db.q("SELECT key FROM kv")]
+    return tid
+
+
+def _probe_says(db, tid, rc, at):
+    from ttp import sweep, startgate
+    startgate.record(db, tid, "test -e out/repaired", rc, "not yet", at)
+    db.set_kv(sweep.PAUSE_PROBES_KEY, {"board-b": {"probe": "test -e out/board-b-ok", "rc": rc, "at": at}})
+
+
+def test_blocker_sweep_skips_watched_holds_whose_probe_and_fingerprint_are_unchanged(env):
+    """The upstream note's case: holds whose end a model-free probe already watches were re-judged at
+    every sweep (each a high-effort turn answering still_blocked again). While the probe still says not
+    yet and nothing about the hold changed, the outcome carries past its next check and no sweep starts,
+    not on the interval and not on an unrelated signal."""
+    from ttp import sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    tid = _watched_holds(p, now)
+    later = now + 7 * 3600            # past both next checks and the 6h interval
+    _probe_says(db, tid, 1, later - 60)
+    live = {i["key"]: i for i in sweep.items(db, later, cfg)}
+    outs = sweep.outcomes(db)
+    assert all(sweep.watched(outs[k], live[k], later) for k in (f"task:{tid}", "resource:board-b"))
+    assert sweep.due(db, cfg, later) is None
+    sweep.signal(db, "claude budget changed: plan -> api")
+    assert sweep.due(db, cfg, later) is None, "an unrelated signal brings no sweep either"
+    # A probe that says busy (75) or host unreachable (255) is still not yet.
+    _probe_says(db, tid, 75, later)
+    assert sweep.due(db, cfg, later) is not None, "a new exit code is a change"
+    # When another item does need a sweep, the watched holds are listed CARRIED with no action.
+    _probe_says(db, tid, 1, later)
+    other = db.add_task("waits on a decision")
+    db.update_task(other, status="blocked", blocked_reason="needs a decision")
+    assert sweep.due(db, cfg, later) == "every 6h"
+    eid = sweep.start(db, cfg, "every 6h", later)
+    assert set(db.kv(sweep.STATE_KEY)["carried"]) == {f"task:{tid}", "resource:board-b"}
+    assert not db.kv(sweep.STATE_KEY)["flags"]
+    text = "\n".join(sweep.digest_lines(db, [eid], later, cfg))
+    line = next(ln for ln in text.splitlines() if ln.startswith(f"- #{tid} "))
+    assert "CARRIED (no action)" in line and "probe still says not yet" in line
+    assert "board-b" in db.paused_resources(), "the sweep lifts nothing"
+
+
+@pytest.mark.parametrize("change", ["passed", "broken", "stale", "reason", "message", "until", "ledger", "never"])
+def test_blocker_sweep_re_judges_a_watched_hold_once_anything_about_it_changes(env, change):
+    from ttp import machine_ledger as ml, sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    tid = _watched_holds(p, now)
+    later = now + 7 * 3600
+    _probe_says(db, tid, 1, later - 60)
+    assert sweep.due(db, cfg, later) is None
+    row = dict(db.paused_resources()["board-b"])
+    if change == "passed":
+        _probe_says(db, tid, 0, later - 30)
+    elif change == "broken":
+        _probe_says(db, tid, 2, later - 30)
+    elif change == "stale":
+        _probe_says(db, tid, 1, later - sweep.PROBE_FRESH_S - 60)
+    elif change == "reason":
+        _set_pause_row(db, "board-b", {**row, "reason": "fabric repair; the vendor now says next week"})
+    elif change == "message":
+        db.x("INSERT INTO messages(ts, direction, chat, kind, text) VALUES(?,?,?,?,?)",
+             (later - 600, "in", "c1", "user", "board-b is fixed, try it"))
+    elif change == "until":
+        _set_pause_row(db, "board-b", {**row, "until": later - 60})
+    elif change == "ledger":
+        from ttp import machines as mm
+        mm.add("board", tags="device")
+        ml.add_change("board", "repair firmware flashed", "reflash the old image", "other", expires="6h", now=later - 600)
+    else:   # a hold with no probe is swept as before
+        _set_pause_row(db, "board-b", {k: v for k, v in row.items() if k != "end_when"})
+    live = {i["key"]: i for i in sweep.items(db, later, cfg)}
+    outs = sweep.outcomes(db)
+    gone = [k for k in ("resource:board-b", f"task:{tid}") if not sweep.watched(outs[k], live[k], later)]
+    assert gone == (["resource:board-b", f"task:{tid}"] if change in ("passed", "broken", "stale")
+                    else ["resource:board-b"]), gone
+    assert sweep.due(db, cfg, later) == "every 6h"
+    sweep.start(db, cfg, "every 6h", later)
+    assert "resource:board-b" not in db.kv(sweep.STATE_KEY)["carried"]
+
+
+def test_blocker_sweep_re_judges_an_unchanged_watched_hold_once_a_day(env):
+    from ttp import sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    tid = _watched_holds(p, now)
+    for h in (7, 13, 19, 23.5):
+        _probe_says(db, tid, 1, now + h * 3600 - 60)
+        assert sweep.due(db, cfg, now + h * 3600) is None, h
+    day = now + 60 + sweep.RECHECK_H * 3600 + 120
+    _probe_says(db, tid, 1, day - 60)
+    assert sweep.due(db, cfg, day) == "every 6h"
+    eid = sweep.start(db, cfg, "every 6h", day)
+    state = db.kv(sweep.STATE_KEY)
+    assert state["carried"] == [] and state["flags"] == {}, "a due daily re-check is an item, not a FLAG"
+    assert "CARRIED" not in "\n".join(sweep.digest_lines(db, [eid], day, cfg)).split("\n", 1)[1]
+    # A fresh judgement restarts the window.
+    db.x("UPDATE events SET status='handled'")
+    sweep.record(db, {"id": tid, "outcome": "still_blocked", "until": "the repair is done and its probe passes",
+                      "until_probe": "test -e out/repaired"}, day + 7200, day + 60)
+    sweep.record(db, {"resource": "board-b", "outcome": "still_blocked", "until": "the repair is done and its probe passes",
+                      "until_probe": "test -e out/board-b-ok"}, day + 7200, day + 60)
+    _probe_says(db, tid, 1, day + 7 * 3600)
+    assert sweep.due(db, cfg, day + 7 * 3600) is None
+
+
+def test_blocker_sweep_daily_re_check_signal_and_pause_probe_verdicts_are_kept(env):
+    """The daily re-check comes due between interval sweeps as a signal; the daemon keeps each pause
+    probe's last verdict for the sweep."""
+    from ttp import coordinator as coord, pauseends, sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    tid = _watched_holds(p, now)
+    db.set_kv(sweep.STATE_KEY, {**db.kv(sweep.STATE_KEY), "last": now + 22 * 3600})
+    other = db.add_task("waits on a decision")
+    db.update_task(other, status="blocked", blocked_reason="needs a decision")
+    sweep.record(db, {"id": other, "outcome": "still_blocked", "until": "the vendor answers the ticket",
+                      "until_probe": "test -e out/answer"}, now + 5 * 86400, now + 60)
+    day = now + 60 + sweep.RECHECK_H * 3600 + 120
+    _probe_says(db, tid, 1, day - 60)
+    assert "daily re-check due: task:" in (sweep.due(db, cfg, day) or "")
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True,
+                            "end_when": "exit 1", "reason": "flaky"}]) == []
+    pe = pauseends.PauseEnds(p)
+    pe.tick(now)
+    for proc, _, _ in list(pe._procs.values()):
+        proc.wait(10)
+    pe.tick(now + 1)
+    assert db.kv(sweep.PAUSE_PROBES_KEY)["rig"] == {"probe": "exit 1", "rc": 1, "at": now + 1}
+
+
+def test_blocker_sweep_replay_of_a_day_of_signals_over_probe_watched_holds(env):
+    """The upstream note's day: holds a probe watches (pauses with end_when, tasks with start_when),
+    their next checks every 2h, and budget changes and resolved notes every few hours. Before, each
+    next check and signal brought a high-effort sweep that answered still_blocked again; now only the
+    daily re-check does."""
+    from ttp import sweep
+    p = make(env)
+    db, cfg, t0 = p.db, p.config(), time.time()
+    tid = _watched_holds(p, t0)
+    signals = {1.5: "claude budget changed: plan -> api", 3: "upstream notes resolved: 01", 4.5: "upstream notes resolved: 02",
+               8: "codex budget changed: api -> plan", 10: "upstream notes resolved: 03", 14: "upstream notes resolved: 04",
+               20: "claude budget changed: api -> plan"}
+    sweeps = []
+    for step in range(1, 30 * 4 + 1):      # the daemon's check every 15 minutes, for 30h
+        h = step / 4
+        now = t0 + h * 3600
+        _probe_says(db, tid, 1, now - 60)
+        if h in signals:
+            sweep.signal(db, signals[h])
+        why = sweep.due(db, cfg, now)
+        if why:
+            eid = sweep.start(db, cfg, why, now)
+            db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+            sweeps.append(h)
+            for a in ({"id": tid}, {"resource": "board-b"}):
+                sweep.record(db, {**a, "outcome": "still_blocked", "until": "the repair is done and its probe passes",
+                                  "until_probe": "test -e out/repaired"}, now + 7200, now + 60)
+    assert len(sweeps) == 1 and 24 < sweeps[0] <= 30, sweeps
+
+
 
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
     from ttp import coordinator as coord, reviewreuse

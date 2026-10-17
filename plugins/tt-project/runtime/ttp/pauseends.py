@@ -223,6 +223,10 @@ class PauseEnds:
         migrate(self.p, now)
         db = self.p.db
         pauses = owned(self.p)
+        if verdicts:   # each end_when's last verdict: the blocker sweep carries a hold its probe still says not yet
+            kept = {k: v for k, v in (db.kv(sweep.PAUSE_PROBES_KEY) or {}).items() if k in pauses}
+            kept.update({k: {"probe": rc[1], "rc": rc[0], "at": now} for k, rc in verdicts.items() if k in pauses})
+            db.set_kv(sweep.PAUSE_PROBES_KEY, kept or None)
         sent = {k: v for k, v in (db.kv(DUE_KEY) or {}).items() if k in pauses}
         for name, v in sorted(pauses.items()):
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))

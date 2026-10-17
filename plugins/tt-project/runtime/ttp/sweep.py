@@ -22,6 +22,17 @@ fingerprint (`pause`); until a user message arrives or the row changes or ends, 
 that resource (its `resource:`/`exclusive:` labels, which dispatch already holds) ends with the user
 too: carried, not re-judged, and free of flags raised before that outcome.
 
+Watched holds: a hold whose end a model-free probe already watches (a deferred task's `start_when`, a
+resource pause's `end_when`, both run by the daemon, which lifts the hold once its probe passes) gets a
+fingerprint (`fp`): its status, spec and reason, the probe and its last exit code, the pause's `until`,
+its unfinished dependencies and the open machine change-ledger entries naming its resources. Its
+`still_blocked` stays carried past its next check while the probe still says not yet (a fresh 1, 75 or
+255), its `until` is ahead, the fingerprint matches the one the turn judged and no inbound message
+named it since (`#<id>` or the resource's name). A turn re-judges it at least every RECHECK_H hours
+(the daily re-check), so the interval duty still reaches it. A sweep is not started at all, not even on a
+signal, while every item is such a hold or one no turn can lift (`ends`): nothing a turn could see has
+changed. Any change, a broken or stale probe, or a hold with no probe is swept as before.
+
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
 a provider's limit or logout pause ended, a provider's account or budget kind changed (budgetkind),
@@ -54,6 +65,7 @@ STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapsh
 OUTCOMES_KEY = "blocker_sweep_outcomes"  # kv: {key: {"outcome", "ts", "until", "probe", "next", "why", "sweep"}}
 RELAYED_KEY = "blocker_sweep_user_relayed"  # kv: when the user's words last came relayed in another project's note
 SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why", "rearm"}]: signal() requests not yet swept
+PAUSE_PROBES_KEY = "pause_probes"       # kv: {resource: {"probe", "rc", "at"}}: each end_when's last verdict (pauseends)
 OUTCOMES = ("unblocked", "rerouted", "retired", "closed", "still_blocked", "human_indispensable")
 EVERY_H = 6.0
 MIN_GAP_H = 1.0
@@ -67,6 +79,8 @@ SELF_REF = re.compile(r"\b(retain|keep|keeps|remain|remains|stay|stays|leave|sti
                       r"^\s*(blocked|unchanged|n/?a|none|tbd|-)\s*\.?\s*$", re.I)
 UNTIL_MIN_CHARS = 12
 STUCK_EVENTS = tuple(unblock.STUCK)
+RECHECK_H = 24.0         # a watched hold carried on its unchanged fingerprint is re-judged by a turn this often
+PROBE_FRESH_S = 3600     # a probe verdict older than this says nothing about the hold now
 
 
 def _cfg(cfg: dict, key: str, default: float) -> float:
@@ -255,7 +269,54 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                               + (f", owner #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else ""),
                     # Not due yet: listed, no outcome needed; overdue: an item like any other.
                     "ends": None if late else "due"})
+    _watch(db, out, paused, now)
     return out
+
+
+def _watch(db: DB, live: list[dict], paused: dict[str, dict], now: float) -> None:
+    """Give each hold a model-free probe watches its `watch` ({probe, rc, until, failing}), `fp` and
+    `touched` (the last inbound message naming it within RECHECK_H): see the module doc."""
+    from . import ends, machine_ledger, startgate
+    gates, probes, held = db.kv(startgate.KEY, {}) or {}, db.kv(PAUSE_PROBES_KEY, {}) or {}, []
+    for i in live:
+        if i.get("ends") or i["kind"] not in ("deferred", "paused"):
+            continue
+        if i["kind"] == "deferred":
+            t = db.task(i["task"]) or {}
+            probe, until, v, names = deferral(t).get("when"), None, gates.get(str(i["task"])) or {}, _task_resources(t)
+            deps = sorted(d for d in dependency_ids(t) if isinstance(d, int) and (db.task(d) or {}).get("status") != "done")
+            said = v.get("when")
+        else:
+            row = paused.get(i["resource"]) or {}
+            probe, until, v, names, deps = row.get("end_when"), row.get("until"), probes.get(i["resource"]) or {}, \
+                {i["resource"]}, []
+            said = v.get("probe")
+        if not isinstance(probe, str) or not probe.strip():
+            continue
+        rc = v.get("rc") if said == probe else None
+        i["watch"] = {"probe": probe, "rc": rc, "until": until,
+                      "failing": rc in ends.NOT_YET_RCS and now - _num(v.get("at")) <= PROBE_FRESH_S
+                      and (not until or _num(until) > now)}
+        held.append((i, sorted(names), deps))
+    if not held:
+        return
+    msgs = db.q("SELECT ts, text FROM messages WHERE direction='in' AND ts>?", (now - RECHECK_H * 3600,))
+    try:
+        ledger = machine_ledger.changes()
+    except Exception:   # an unreadable ledger proves nothing unchanged
+        ledger = None
+    for i, names, deps in held:
+        pats = ([rf"#{i['task']}\b"] if i["task"] else []) + [rf"(?<![\w-]){re.escape(n)}(?![\w-])" for n in names]
+        rx = re.compile("|".join(pats), re.I)
+        i["touched"] = max((float(m["ts"]) for m in msgs if rx.search(m["text"] or "")), default=0.0)
+        led = None if ledger is None else sorted(
+            [c.get("id"), c.get("what"), c.get("expires"), c.get("until_probe")] for c in ledger
+            if any(c.get("alias") == n or n.startswith(f"{c.get('alias')}-") for n in names))
+        w = i["watch"]
+        i["fp"] = hashlib.sha256(json.dumps([_snap(i), w["probe"], w["rc"], w["until"], deps, led],
+                                            default=str).encode()).hexdigest()[:16]
+        if led is None:
+            w["failing"] = False
 
 
 def _seen(state: dict, live: list[dict]) -> dict:
@@ -355,11 +416,28 @@ def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool
             continue
         if last < until <= now:
             out.append(f"provider pause over: {r['key'].split(':', 1)[1]}")
-    keys = {i["key"] for i in live if not i.get("ends")}
-    for key, o in outcomes(db).items():
-        if key in keys and o.get("outcome") == "still_blocked" and o.get("next") and last < float(o["next"]) <= now:
-            out.append(f"next check due: {key}")
+    outs = outcomes(db)
+    for i in live:
+        o = outs.get(i["key"]) or {}
+        if i.get("ends") or o.get("outcome") != "still_blocked":
+            continue
+        if watched(o, i, now):   # its own probe watches it, unchanged: its next check is no news
+            continue
+        if _recheck_due(o, i, now) and last < _num(o.get("ts")) + RECHECK_H * 3600 <= now:
+            out.append(f"daily re-check due: {i['key']}")
+        elif o.get("next") and last < float(o["next"]) <= now:
+            out.append(f"next check due: {i['key']}")
     return out
+
+
+def _quiet(db: DB, cfg: dict, state: dict, live: list[dict], now: float) -> bool:
+    """Every item is a watched hold carried unchanged or a hold no turn can lift, at least one the
+    former: a sweep turn would only re-read them, so none starts, not even on a signal."""
+    if holdloops.flagged(db) or all(i.get("ends") for i in live):
+        return False
+    outs, prev, rethought = outcomes(db), state.get("items") or {}, rethink(db, cfg, live, now)
+    return all(_carries(i, state, outs, now) and (i.get("ends") or watched(outs.get(i["key"]), i, now))
+               and not loop(db, i, prev.get(i["key"])) and i["key"] not in rethought for i in live)
 
 
 def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
@@ -383,13 +461,13 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
                                              and i["key"] not in rethought for i in live):
             # Every item keeps a valid, not-yet-due outcome: only a pending signal calls for a sweep.
             sigs = _signals(db, state, live, now)
-            return "; ".join(sigs)[:300] if sigs else None
+            return "; ".join(sigs)[:300] if sigs and not _quiet(db, cfg, state, live, now) else None
         return f"every {every / 3600:g}h"
     if since < min(every, _cfg(cfg, "blocker_sweep_min_gap_h", MIN_GAP_H) * 3600):
         return None
     # Every item ends without a turn: only what may end one brings the sweep forward.
     sigs = _signals(db, state, live, now, rearm_only=all(i.get("ends") for i in live))
-    return "; ".join(sigs)[:300] if sigs else None
+    return "; ".join(sigs)[:300] if sigs and not _quiet(db, cfg, state, live, now) else None
 
 
 def _snap(i: dict) -> dict:
@@ -403,8 +481,26 @@ def carried(o: dict | None, i: dict, now: float) -> bool:
     a hold that ends without a turn (`ends`): a user pause or a time-only deferral."""
     if i.get("ends"):
         return True
-    return bool(o and o.get("outcome") == "still_blocked" and recheckable(o) and o.get("next")
-                and float(o["next"]) > now and o.get("item") == _snap(i))
+    if not (o and o.get("outcome") == "still_blocked" and recheckable(o) and o.get("item") == _snap(i)):
+        return False
+    return bool(o.get("next") and float(o["next"]) > now) or watched(o, i, now)
+
+
+def watched(o: dict | None, i: dict, now: float) -> bool:
+    """A still_blocked on a hold its own model-free probe watches, carried past its next check: the
+    probe still says not yet, nothing in the fingerprint changed, no message named it since, and a
+    turn judged it within RECHECK_H."""
+    w = i.get("watch") or {}
+    return bool(o and w.get("failing") and o.get("outcome") == "still_blocked" and o.get("fp")
+                and o["fp"] == i.get("fp") and o.get("item") == _snap(i)
+                and _num(i.get("touched")) <= _num(o.get("ts")) < now <= _num(o.get("ts")) + RECHECK_H * 3600)
+
+
+def _recheck_due(o: dict | None, i: dict, now: float) -> bool:
+    """A watched hold whose only change is that its daily re-check came due: an item, not a FLAG."""
+    w = i.get("watch") or {}
+    return bool(o and w.get("failing") and o.get("fp") and o["fp"] == i.get("fp") and o.get("item") == _snap(i)
+                and _num(i.get("touched")) <= _num(o.get("ts")) and now > _num(o.get("ts")) + RECHECK_H * 3600)
 
 
 def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
@@ -416,7 +512,7 @@ def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
     out = {}
     for i in live:
         o = outs.get(i["key"])
-        if carried(o, i, now):
+        if carried(o, i, now) or _recheck_due(o, i, now):
             continue
         if i["key"] in prev and (not o or float(o.get("ts") or 0) < last):
             out[i["key"]] = "no outcome at the last sweep"
@@ -476,7 +572,8 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
     with db.tx():
         db.set_kv(STATE_KEY, {"last": now, "n": n, "why": why, "flags": flagged, "loops": loops, "reviews": reviews,
                               "carried": carry, "paused": [i["resource"] for i in live if i["kind"] == "paused"],
-                              "seen": _seen(state, live), "items": {i["key"]: _snap(i) for i in live}})
+                              "seen": _seen(state, live), "items": {i["key"]: _snap(i) for i in live},
+                              "fps": {i["key"]: i["fp"] for i in live if i.get("fp")}})
         db.x("DELETE FROM kv WHERE key=?", (SIGNAL_KEY,))
         eid = db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                    (now, "daemon", SWEEP_KIND, "normal",
@@ -549,9 +646,12 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
             raise ValueError(f"{key} still_blocked needs `start_after`: when to check it next")
         o["next"] = next_at
         # The item as this sweep showed it: the outcome carries forward only while it stays so.
-        snap = ((db.kv(STATE_KEY, {}) or {}).get("items") or {}).get(key)
+        state = db.kv(STATE_KEY, {}) or {}
+        snap = (state.get("items") or {}).get(key)
         if snap:
             o["item"] = snap
+        if fp := (state.get("fps") or {}).get(key):   # a watched hold, as the turn saw it (watched())
+            o["fp"] = fp
     elif outcome == "human_indispensable":
         if not str(a.get("why") or "").strip():
             raise ValueError(f"{key} human_indispensable needs `why` only a person can do it")
@@ -614,7 +714,9 @@ def _line(i: dict, state: dict, outs: dict, now: float) -> str:
         what = {"user": "HELD BY USER PAUSE", "due": "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
         return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
     if _carries(i, state, outs, now):
-        return f"- {who} | CARRIED (no action): {_last_check(outs.get(i['key']), now)}"
+        o = outs.get(i["key"])
+        tail = "; its probe still says not yet, unchanged" if o and float(o.get("next") or 0) <= now else ""
+        return f"- {who} | CARRIED (no action): {_last_check(o, now)}{tail}"
     line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {_clip(i['reason']) or 'no reason given'} | " \
            f"{_last_check(outs.get(i['key']), now)}"
     for field, label in (("flags", "FLAG"), ("loops", "LOOP"), ("reviews", "review")):
