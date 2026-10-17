@@ -2455,6 +2455,48 @@ def test_a_heal_fix_killed_by_a_daemon_stop_does_not_escalate_and_rechecks_next_
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Self-fix%'")
 
 
+def test_a_run_killed_at_the_ticks_backstop_is_recorded_once_as_timed_out(env):
+    """The tick's backstop (past the run's own bounds) records the timeout and kills the group; the
+    command then ends -9 in its thread, which is not a second failure to record."""
+    from ttp import daemon as dm, schedrun, schedule as sched, screen as scr
+    p = make(env)
+    sched.upsert(p.db, "long", "command", "1h", payload={"command": "sleep 60", "timeout_s": 120})
+    _due(p, "long")
+    d = dm.Daemon(p.base)
+    d.run_schedules()
+    run = d._sched_runs["long"]
+    assert _wait_for(lambda: p.db.kv(schedrun.GROUPS_KEY), 10)
+    run.deadline = time.monotonic()
+    d.run_schedules()
+    assert run.done.wait(5)
+    time.sleep(0.5)
+    d.run_schedules()
+    assert "long" not in d._sched_runs
+    titles = [r["title"] for r in p.db.q("SELECT title FROM issues WHERE source=?", (scr.error_source("watcher:long"),))]
+    assert titles and not any("rc=-9" in t for t in titles), titles
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='long'")["last_status"].startswith("error: timed out")
+
+
+def test_a_heal_fix_killed_at_the_ticks_backstop_does_not_escalate_its_kill(env):
+    from ttp import daemon as dm, heal, schedrun, schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": {
+        "check": "false", "fix": "sleep 60", "grace_s": 0, "settle_s": 600}})
+    _due(p, "svc")
+    d = dm.Daemon(p.base)
+    d.run_schedules()
+    run = d._sched_runs["svc"]
+    assert _wait_for(lambda: heal.state(p.db, "svc").get("phase") == "fixing" and p.db.kv(schedrun.GROUPS_KEY), 10)
+    run.deadline = time.monotonic()
+    d.run_schedules()
+    assert run.done.wait(5)
+    d.run_schedules()
+    st = heal.state(p.db, "svc")
+    assert "fix_rc" not in st and not st.get("task"), st
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Self-fix%'"), "the backstop's kill escalated"
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='svc'")["last_status"].startswith("error: timed out")
+
+
 def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs_them_once_more(env, tmp_path):
     from ttp import daemon as dm, schedrun, schedule as sched
     p = make(env)

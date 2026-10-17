@@ -3984,11 +3984,11 @@ class Daemon:
         for name, run in list(runs.items()):
             if run.done.is_set():
                 runs.pop(name)
-                if run.stopped:
-                    log(self.p, f"schedule {name}: its run was stopped with the daemon; nothing recorded")
-                elif run.timed_out:
+                if run.timed_out:
                     log(self.p, f"schedule {name}: its run recorded failed at its timeout ended after "
                                 f"{time.monotonic() - run.started:.0f} s; its result is dropped")
+                elif run.stopped:
+                    log(self.p, f"schedule {name}: its run was stopped with the daemon; nothing recorded")
                 else:
                     self._schedule_ran(run.s, *run.result)
             elif not run.timed_out and time.monotonic() >= run.deadline:

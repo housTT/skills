@@ -11,7 +11,8 @@ stops or restarts kills the ones its runs left (kill_all); such a run recorded n
 is still due and runs once more. A run's result is recorded only when it ends, never twice. A daemon
 that stops marks its runs stopping before it kills their groups (stop): a command or fix killed that
 way raises Stopped rather than returning its exit code, so the run unwinds without recording the kill
-as a failure, escalating or saving state.
+as a failure, escalating or saving state. A run killed past its timeout is marked the same way: the
+tick records its timeout once, and the kill's -9 is no second result.
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ class Run:
         self.done = threading.Event()
         self.result: tuple[str, float | None] = ("error: run ended without a result", None)
         self.timed_out = False   # recorded failed at its timeout; its late result is dropped
-        self.stopping = threading.Event()   # the daemon is stopping: what its groups return is no result
+        self.stopping = threading.Event()   # the daemon stopped it (a stop, its timeout): what its groups return is no result
         self.stopped = False   # it unwound on Stopped: nothing to record
         self.groups: dict[int, str | None] = {}   # pgid -> its leader's start token
         self.db: Any = None
@@ -125,7 +126,9 @@ def _kill(pid: int, start_token: str | None) -> bool:
 
 
 def kill(db: Any, run: Run) -> int:
-    """Kill the process groups of `run` (past its timeout); returns how many were signalled."""
+    """Kill the process groups of `run` (past its timeout); returns how many were signalled. The run is
+    marked stopping first, so the kill unwinds it on Stopped instead of returning -9 as its result."""
+    run.stopping.set()
     groups = dict(run.groups)
     n = sum(_kill(pid, tok) for pid, tok in groups.items())
     _forget(db, list(groups))
@@ -133,8 +136,8 @@ def kill(db: Any, run: Run) -> int:
 
 
 def check_stopped() -> None:
-    """Raise Stopped when the daemon stopped the schedule run on this thread: what its group returned
-    (killed, -9) is not the command's result."""
+    """Raise Stopped when the daemon stopped the schedule run on this thread (a stop or its timeout):
+    what its group returned (killed, -9) is not the command's result."""
     run = current()
     if run is not None and run.stopping.is_set():
         raise Stopped()
