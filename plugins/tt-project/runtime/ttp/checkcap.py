@@ -122,7 +122,7 @@ def state() -> dict:
     running = locks.held_labels(paths(n)) if n else []
     priority = locks.held_labels(priority_paths()) if n else []
     queued = []
-    for t in locks.queued(slot_dir(), RESOURCE):
+    for t in locks.fair_order(slot_dir(), RESOURCE):
         try:
             queued.append(t.read_text().strip())
         except OSError:
@@ -174,8 +174,10 @@ class Slot:
 
 def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
             waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
-            since: float | None = None) -> Slot | None:
-    """Take a host-wide checks slot, waiting in arrival order while all are held. `tell` gets a line
+            since: float | None = None, project_name: str | None = None) -> Slot | None:
+    """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
+    (`project_name`; none form their own group), in arrival order within one (locks.fair_order), so
+    one project's burst cannot starve the others' checks. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
     it waited that long. `since` is the arrival time to queue at (default now). A slot directory that
@@ -187,27 +189,30 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     try:
         f = locks.try_take(ps, holder, what) if not locks.queued(slot_dir(), RESOURCE) else None
         if f:
+            locks.mark_served(slot_dir(), RESOURCE, project_name)
             return Slot(f)
-        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since)
+        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since, group=project_name)
     except OSError as e:
         raise _unavailable(e) from e
     started, told = time.time(), 0.0
     try:
         while True:
             try:
-                f = locks.take_in_turn(slot_dir(), RESOURCE, ticket, ps, holder, what)
+                f = locks.take_in_turn(slot_dir(), RESOURCE, ticket, ps, holder, what, fair=True)
             except OSError:
                 f = None
             if f:
+                locks.mark_served(slot_dir(), RESOURCE, project_name)
                 if told and tell:
                     tell(f"host-wide checks slot taken after {(time.time() - started) / 60:.1f} min")
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell:
-                    q = locks.queued(slot_dir(), RESOURCE)
+                    q = locks.fair_order(slot_dir(), RESOURCE)
                     ahead = q.index(ticket) if ticket in q else 0
-                    tell(f"queued for a host-wide checks slot: {len(locks.held_labels(ps))} of {n} running"
-                         + (f", {ahead} ahead" if ahead else ""))
+                    groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
+                    tell(f"queued for a host-wide checks slot: {len(locks.held_labels(ps))} of {n} running, "
+                         f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}")
                 if not told and waiting:
                     waiting(True)
                 told = time.time()

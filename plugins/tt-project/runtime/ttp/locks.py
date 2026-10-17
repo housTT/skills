@@ -27,6 +27,7 @@ counts, so a crashed daemon or supervisor never wedges the resource.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -355,18 +356,28 @@ _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that
 
 
 SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
+GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>.g<id>
+SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
+
+
+def group_id(group: str | None) -> str:
+    """The short id a fair queue's ticket carries for its group (a project); "" for none."""
+    return hashlib.sha256(group.encode()).hexdigest()[:12] if group else ""
 
 
 def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
-            shared: bool = False) -> Path:
+            shared: bool = False, group: str | None = None) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
     is the arrival time to queue at (default now): a waiter that hands over keeps its place.
-    A shared waiter's ticket name ends in SHARED_TICKET."""
+    A shared waiter's ticket name ends in SHARED_TICKET. `group` (a project) is what a fair queue
+    (fair_order) takes turns between; waiters without one form their own group."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
-    name = f"{time.time() if since is None else since:017.6f}-{os.getpid()}{SHARED_TICKET if shared else ''}"
+    gid = group_id(group)
+    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}"
+            f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
     f = open(tmp, "a+")
@@ -427,25 +438,93 @@ def is_shared(ticket: Path) -> bool:
     return ticket.name.endswith(SHARED_TICKET)
 
 
-def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int) -> bool:
+def ticket_group(ticket: Path) -> str:
+    """A ticket's group id ("" for none)."""
+    name = ticket.name.removesuffix(SHARED_TICKET)
+    return name.rpartition(GROUP_TICKET)[2] if GROUP_TICKET in name else ""
+
+
+def _arrival(ticket: Path) -> float:
+    try:
+        return float(ticket.name.split("-", 1)[0])
+    except ValueError:
+        return 0.0
+
+
+def served_dir(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.served"
+
+
+def mark_served(locks_dir: Path, resource: str, group: str | None) -> None:
+    """Record that `group` just got the resource, so a fair queue serves the other groups first.
+    Only a time: a stale or lost record just makes that group look longer unserved."""
+    d = served_dir(locks_dir, resource)
+    now = time.time()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / (group_id(group) or "none")
+        f.touch()
+        os.utime(f, (now, now))
+        for old in d.iterdir():
+            if now - old.stat().st_mtime > SERVED_KEEP_S:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _served(locks_dir: Path, resource: str) -> dict[str, float]:
+    out = {}
+    try:
+        for f in served_dir(locks_dir, resource).iterdir():
+            out["" if f.name == "none" else f.name] = f.stat().st_mtime
+    except OSError:
+        pass
+    return out
+
+
+def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None) -> list[Path]:
+    """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
+    of the group that has waited longest since it last got the resource (since its oldest waiter
+    arrived, if later), so one group's burst cannot starve the others. Arrival order within a group."""
+    q = queued(locks_dir, resource) if q is None else q
+    groups: dict[str, list[Path]] = {}
+    for t in q:
+        groups.setdefault(ticket_group(t), []).append(t)
+    served = _served(locks_dir, resource)
+    key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
+    out = []
+    while groups:
+        g = min(groups, key=key.__getitem__)
+        out.append(groups[g].pop(0))
+        if groups[g]:
+            key[g] = (1, len(out), "")
+        else:
+            del groups[g]
+    return out
+
+
+def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters, one per free slot, with no shared waiter ahead. A shared one: no exclusive waiter
-    ahead, so it never jumps one."""
+    ahead, so it never jumps one. `fair`: waiters are counted in fair_order, not arrival order."""
     q = queued(locks_dir, resource)
     if ticket not in q:
         return True
+    if fair:
+        q = fair_order(locks_dir, resource, q)
     ahead = q[:q.index(ticket)]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)
     return not any(is_shared(t) for t in ahead) and len(ahead) < max(int(slots or 0), 0)
 
 
-def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = ""):
+def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = "",
+                 fair: bool = False):
     """try_take (try_take_shared for a shared ticket), but only when this ticket's turn has come
     (my_turn), so a later waiter never takes the one slot an earlier one is about to."""
     if is_shared(ticket):
         return try_take_shared(paths, holder, what) if my_turn(locks_dir, resource, ticket, 0) else None
-    if not my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths))):
+    if not my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths)), fair):
         return None
     return try_take(paths, holder, what)
 

@@ -25859,13 +25859,90 @@ def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, mon
         s.close()
 
 
+def test_fair_order_takes_turns_by_project_and_keeps_arrival_order_within_one(tmp_path, monkeypatch):
+    from ttp import locks
+    d = tmp_path / "slots"
+    t = [locks.enqueue(d, "r", f"{g}{i}", since=1000.0 + n, group=g or None)
+         for n, (g, i) in enumerate([("A", 1), ("A", 2), ("A", 3), ("B", 1), ("", 1), ("B", 2)])]
+    names = lambda: [x.read_text() for x in locks.fair_order(d, "r")]
+    assert names() == ["A1", "B1", "1", "A2", "B2", "A3"], "unlabeled waiters are a group of their own"
+    resumed = locks.enqueue(d, "r", "B0", since=999.0, group="B")
+    assert names()[:3] == ["B0", "A1", "1"], "a resumed waiter keeps its arrival time and place"
+    locks.dequeue(resumed)
+    locks.mark_served(d, "r", "A")
+    assert names() == ["B1", "1", "A1", "B2", "A2", "A3"], "the project served last waits for the others"
+    assert [x.read_text() for x in locks.queued(d, "r")] == ["A1", "A2", "A3", "B1", "1", "B2"]
+    old = locks.served_dir(d, "r") / locks.group_id("B")
+    old.touch()
+    os.utime(old, (1, 1))
+    locks.mark_served(d, "r", None)
+    assert not old.exists(), "records older than a day are pruned"
+    for x in t:
+        locks.dequeue(x)
+
+
+def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    got, told = [], []
+
+    def take(label, proj):
+        s = checkcap.acquire(label, tell=told.append if label == "c1" else None, project_name=proj)
+        got.append(label)
+        s.close()
+
+    waiters = []
+    for i, (label, proj) in enumerate([("a1", "A"), ("a2", "A"), ("a3", "A"), ("b1", "B"), ("b2", "B"), ("c1", "C")]):
+        waiters.append(threading.Thread(target=take, args=(label, proj)))
+        waiters[-1].start()
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+    assert _wait_for(lambda: told)
+    assert "queued for a host-wide checks slot: 1 of 1 running, 2 ahead, 3 projects" in told[0]
+    assert checkcap.state()["queued"] == ["a1", "b1", "c1", "a2", "b2", "a3"], "status lists them in serving order"
+    assert "1 running (cap 1), 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
+    held.close()
+    for w in waiters:
+        w.join(20)
+    assert got == ["a1", "b1", "c1", "a2", "b2", "a3"], "projects take turns, each in arrival order"
+    assert checkcap.line() == ""
+
+
+_WAITER = ("import sys, time; sys.path.insert(0, sys.argv[1]); from ttp import checkcap; "
+           "s = checkcap.acquire(sys.argv[2], tell=lambda m: print(m, flush=True), project_name=sys.argv[3]); print('took', flush=True); "
+           "time.sleep(120)")
+
+
+def test_checks_host_cap_a_killed_waiter_frees_its_place(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    proc = subprocess.Popen([sys.executable, "-c", _WAITER, str(RUNTIME), "doomed", "A"], stdout=subprocess.PIPE, text=True)
+    got = []
+    try:
+        assert "queued for a host-wide checks slot" in proc.stdout.readline()
+        t = threading.Thread(target=lambda: got.append(checkcap.acquire("next", project_name="B")))
+        t.start()
+        assert _wait_for(lambda: checkcap.state()["queued"] == ["doomed", "next"])
+    finally:
+        proc.kill()
+        proc.wait()
+    assert _wait_for(lambda: checkcap.state()["queued"] == ["next"]), "a dead waiter leaves the queue"
+    held.close()
+    t.join(20)
+    assert got and got[0].f is not None, "the next waiter takes the place it left"
+    got[0].close()
+
+
 _PRIORITY_HOLDER = ("import sys, time; sys.path.insert(0, sys.argv[1]); from ttp import checkcap; "
                     "s = checkcap.acquire_priority(sys.argv[2], sys.argv[3]); print('held', flush=True); time.sleep(120)")
 
 
 def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, monkeypatch):
     import threading
-    from ttp import checkcap
+    from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
     full = [checkcap.acquire("a"), checkcap.acquire("b")]
     got = []
@@ -25880,7 +25957,10 @@ def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, 
         t.start()
         assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
     told = []
+    served = sorted(os.listdir(locks.served_dir(checkcap.slot_dir(), checkcap.RESOURCE)))
     push = checkcap.acquire_priority("git@example:org/repo#main", "proj push batch 5", "push checks", told.append)
+    assert sorted(os.listdir(locks.served_dir(checkcap.slot_dir(), checkcap.RESOURCE))) == served, \
+        "the priority slot takes no project's turn"
     assert push.f is not None and push.env() == {checkcap.HELD_ENV: "1"}, "it starts at once with every slot busy"
     assert got == [], "task checks keep their cap: the priority slot is not theirs"
     assert "push priority slot" in told[0] and "2 task checks running, 3 queued behind" in told[0]
@@ -25947,6 +26027,7 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
         assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
         assert "queued for a host-wide checks slot" in (run / "progress.md").read_text()
         assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p)
+        assert "(running: other project task #3 (run 9))" in cli.status_text(p), "it still lists the holders"
         assert f"{p.name} task #7 (run 41)" in checkcap.line()
         assert not ran.exists(), "nothing runs over the cap"
     finally:
