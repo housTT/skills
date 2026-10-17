@@ -406,6 +406,7 @@ def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = No
         return 124, f"timed out after {timeout:.0f} s"
     finally:
         schedrun.ended(proc.pid)
+        schedrun.check_stopped()   # killed by a daemon stop: no result (a fix rechecks at the next start)
     return proc.returncode, ((out or "") + (err or "")).strip()[-2000:]
 
 

@@ -2410,6 +2410,58 @@ def test_replay_a_hanging_gh_in_the_pr_watcher_does_not_stall_the_tick(env, monk
     assert p.db.one("SELECT last_status FROM schedules WHERE name='prs'")["last_status"].startswith("error: timed out")
 
 
+def _until(cond, within=10.0):
+    end = time.monotonic() + within
+    while not cond() and time.monotonic() < end:
+        time.sleep(0.05)
+    assert cond(), f"not within {within} s"
+
+
+def test_a_command_schedule_killed_by_a_daemon_stop_records_nothing_and_stays_due(env):
+    """The stop kills the run's group; the command then ends -9, which is not its result: no error
+    issue, no event to wake the coordinator, no last_run. The next daemon runs it again."""
+    from ttp import daemon as dm, schedrun, schedule as sched, screen as scr
+    p = make(env)
+    sched.upsert(p.db, "long", "command", "1h", payload={"command": "sleep 60", "timeout_s": 120})
+    _due(p, "long")
+    d = dm.Daemon(p.base)
+    d.run_schedules()
+    run = d._sched_runs["long"]
+    _until(lambda: p.db.kv(schedrun.GROUPS_KEY))
+    events = p.db.one("SELECT COUNT(*) n FROM events")["n"]
+    assert schedrun.stop(p.db, list(d._sched_runs.values())), "the stop killed its group"
+    assert run.done.wait(5)
+    time.sleep(1)
+    d.run_schedules()
+    assert "long" not in d._sched_runs
+    assert not p.db.q("SELECT id FROM issues WHERE source=?", (scr.error_source("watcher:long"),))
+    assert p.db.one("SELECT COUNT(*) n FROM events")["n"] == events, "the kill queued an event"
+    row = p.db.one("SELECT last_run, next_run FROM schedules WHERE name='long'")
+    assert row["last_run"] is None and row["next_run"] <= time.time(), "it stays due"
+
+
+def test_a_heal_fix_killed_by_a_daemon_stop_does_not_escalate_and_rechecks_next_start(env):
+    from ttp import daemon as dm, heal, schedrun, schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": {
+        "check": "false", "fix": "sleep 60", "grace_s": 0, "settle_s": 600}})
+    _due(p, "svc")
+    d1 = dm.Daemon(p.base)
+    d1.run_schedules()
+    run = d1._sched_runs["svc"]
+    _until(lambda: heal.state(p.db, "svc").get("phase") == "fixing" and p.db.kv(schedrun.GROUPS_KEY))
+    assert schedrun.stop(p.db, list(d1._sched_runs.values()))
+    assert run.done.wait(5)
+    d1.run_schedules()
+    st = heal.state(p.db, "svc")
+    assert st.get("phase") == "fixing" and "fix_rc" not in st and not st.get("task"), st
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Self-fix%'"), "the killed fix escalated"
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='svc'")["last_run"] is None
+    row = _settle(dm.Daemon(p.base), "svc")
+    assert row["last_status"] == "unhealthy (fix interrupted; rechecking)", row["last_status"]
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Self-fix%'")
+
+
 def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs_them_once_more(env, tmp_path):
     from ttp import daemon as dm, schedrun, schedule as sched
     p = make(env)

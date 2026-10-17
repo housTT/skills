@@ -701,7 +701,8 @@ class Daemon:
         except Exception:
             log(self.p, "clean stop record: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._idle.release()
-        for line in schedrun.kill_all(self.p.db):   # runs going on die with the daemon; due again at its start
+        # Runs going on die with the daemon, unrecorded (schedrun.stop): due again at its next start.
+        for line in schedrun.stop(self.p.db, list(self._sched_runs.values())):
             log(self.p, line)
         self._ends.stop()   # end-condition probes are rerun after the next start
         self._pause_ends.stop()
@@ -3983,7 +3984,9 @@ class Daemon:
         for name, run in list(runs.items()):
             if run.done.is_set():
                 runs.pop(name)
-                if run.timed_out:
+                if run.stopped:
+                    log(self.p, f"schedule {name}: its run was stopped with the daemon; nothing recorded")
+                elif run.timed_out:
                     log(self.p, f"schedule {name}: its run recorded failed at its timeout ended after "
                                 f"{time.monotonic() - run.started:.0f} s; its result is dropped")
                 else:

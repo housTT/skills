@@ -8,7 +8,10 @@ timeout has its process groups killed and is recorded as a failed run.
 
 The process groups a run starts (spawned) are kept in the database while they live, so a daemon that
 stops or restarts kills the ones its runs left (kill_all); such a run recorded nothing, so its schedule
-is still due and runs once more. A run's result is recorded only when it ends, never twice.
+is still due and runs once more. A run's result is recorded only when it ends, never twice. A daemon
+that stops marks its runs stopping before it kills their groups (stop): a command or fix killed that
+way raises Stopped rather than returning its exit code, so the run unwinds without recording the kill
+as a failure, escalating or saving state.
 """
 from __future__ import annotations
 
@@ -26,6 +29,11 @@ GROUPS_KEY = "schedule_groups"   # kv: pgid -> {schedule, start}: live process g
 _local = threading.local()
 
 
+class Stopped(BaseException):
+    """The daemon stopped while this run went on: its kill is no result. A BaseException, so that no
+    `except Exception` on the way records it; the run's thread ends silently."""
+
+
 class Run:
     """One schedule run in its thread. `result` is (status, run again at) once `done` is set."""
 
@@ -37,6 +45,8 @@ class Run:
         self.done = threading.Event()
         self.result: tuple[str, float | None] = ("error: run ended without a result", None)
         self.timed_out = False   # recorded failed at its timeout; its late result is dropped
+        self.stopping = threading.Event()   # the daemon is stopping: what its groups return is no result
+        self.stopped = False   # it unwound on Stopped: nothing to record
         self.groups: dict[int, str | None] = {}   # pgid -> its leader's start token
         self.db: Any = None
 
@@ -53,6 +63,8 @@ def start(run: Run, body: Callable[[], tuple[str, float | None]], open_db: Calla
         try:
             run.db = open_db()
             run.result = body()
+        except Stopped:
+            run.stopped = True
         except Exception as e:
             run.result = (f"error: {type(e).__name__}: {e}"[:200], None)
         finally:
@@ -74,6 +86,9 @@ def spawned(pid: int) -> None:
         return
     start_token = proc_start(pid)
     run.groups[pid] = start_token
+    if run.stopping.is_set():   # started after the stop's kill: it would outlive the daemon
+        _kill(pid, start_token)
+        return
     with run.db.tx():
         groups = run.db.kv(GROUPS_KEY, {}) or {}
         groups[str(pid)] = {"schedule": run.name, "start": start_token}
@@ -117,6 +132,22 @@ def kill(db: Any, run: Run) -> int:
     return n
 
 
+def check_stopped() -> None:
+    """Raise Stopped when the daemon stopped the schedule run on this thread: what its group returned
+    (killed, -9) is not the command's result."""
+    run = current()
+    if run is not None and run.stopping.is_set():
+        raise Stopped()
+
+
+def stop(db: Any, runs: Any) -> list[str]:
+    """A daemon's stop: mark its `runs` stopping, then kill every recorded group (kill_all). The runs
+    unwind on Stopped and record nothing; their schedules are due again at the next start."""
+    for run in runs:
+        run.stopping.set()
+    return kill_all(db)
+
+
 def kill_all(db: Any) -> list[str]:
     """Kill every recorded group: at a daemon's start (its predecessor's runs died with it) and at its
     stop. Returns one line per group killed, for the log."""
@@ -130,7 +161,8 @@ def kill_all(db: Any) -> list[str]:
 
 def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
     """subprocess.run(cmd, shell=True) in a session of its own, kept in GROUPS_KEY while it runs. A
-    timeout kills the whole group (the shell's children too) and raises TimeoutExpired."""
+    timeout kills the whole group (the shell's children too) and raises TimeoutExpired; a daemon stop
+    in the meantime raises Stopped."""
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             cwd=cwd, env=env, start_new_session=True)
     spawned(proc.pid)
@@ -149,4 +181,5 @@ def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subpro
             raise
     finally:
         ended(proc.pid)
+        check_stopped()
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
