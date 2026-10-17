@@ -12316,3 +12316,8 @@ def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_ex
     assert "is done already" in capsys.readouterr().err
     cli.main(["machines", "change", "edit", str(new), "--until-task", str(build)])
     assert f"until task #{build} ends" in capsys.readouterr().out
+    # The guidance lives in --help (not in the per-run worker prompt).
+    for sub in ("add", "edit"):
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "change", sub, "--help"])
+        assert "--until-task" in capsys.readouterr().out

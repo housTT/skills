@@ -6334,8 +6334,9 @@ def main(argv: list[str] | None = None) -> None:
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
-                     help="it ends once this open task of the project is done, failed or cancelled (a staged "
-                          "build tree a follow-up task needs); at the latest after 7 days")
+                     help="use it when a staged artifact (such as a build tree) must outlive its builder only "
+                          "while this task of the project is open: it ends once that task is done, failed "
+                          "or cancelled, at the latest after 7 days")
     end.add_argument("--power-cycle-at", dest="power_cycle_at", metavar="T",
                      help="a planned power cycle at T (a delay or a time): running workers on the machine are "
                           "told to commit and hand off shortly before; the entry closes itself after")
