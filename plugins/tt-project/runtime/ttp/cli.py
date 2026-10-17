@@ -4602,6 +4602,12 @@ def cmd_config(a) -> None:
                    else failover.to_of(val, p.config().get("providers")))
         except ValueError as e:
             die(str(e))
+    if a.key.startswith("heal.outage_") and a.key.endswith("_min"):
+        from .outagetask import minutes
+        try:
+            minutes(a.key.split(".", 1)[1], val)
+        except ValueError as e:
+            die(str(e).replace("; the default is used", ""))
     if a.key == "delivery.push_checks":
         from .push import checks_of
         try:

@@ -77,6 +77,28 @@ def test_an_owner_that_records_no_change_in_its_budget_gets_an_outage_task(env):
     assert _tasks(_route(ml, t0 + 40 * 60, able, budgets=short)) == [("box-c", "beta")]
 
 
+def test_outage_budget_settings_are_validated_and_a_bad_one_keeps_the_default(env):
+    """(3) heal.outage_*_min: generic defaults 60/30/30; a value outside 1 minute to a week (or not a number)
+    is a config problem, refused by `ttp config`, and budgets() keeps the default for it."""
+    from ttp import cli, outagetask
+    from ttp.project import config_problems, unknown_key_hint
+    p = make(env, "beta")
+    assert outagetask.budgets(None) == {"owner_s": 3600.0, "due_s": 1800.0, "escalate_s": 1800.0}
+    for name, _ in outagetask.KEYS.values():
+        assert unknown_key_hint(f"heal.{name}") is None, name
+    cli.main(["config", p.name, "heal.outage_owner_budget_min", "45"])
+    assert p.config()["heal"]["outage_owner_budget_min"] == 45
+    assert config_problems(p.raw_config()) == []
+    assert outagetask.budgets(p.config())["owner_s"] == 45 * 60
+    for bad in ("0", "soon", "true", str(outagetask.MAX_MIN + 1)):
+        with pytest.raises(SystemExit):
+            cli.main(["config", p.name, "heal.outage_task_due_min", bad])
+    assert "outage_task_due_min" not in p.config()["heal"], "a refused value is not stored"
+    raw = {"heal": {"outage_escalate_min": 0, "outage_task_due_min": "30"}}
+    assert len(config_problems(raw)) == 2 and all("heal.outage_" in x for x in config_problems(raw))
+    assert outagetask.budgets(raw) == outagetask.budgets(None), "an invalid value keeps the default"
+
+
 def test_an_overdue_outage_task_pages_its_project_high_then_the_user_normal_each_once(env):
     """(c) One high page to the task's project at its due time, one normal user alert heal.outage_escalate_min
     later; neither repeats."""

@@ -685,6 +685,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                 out.append(str(e))
     out += [f"delivery.after_push: {p}" for p in check_problems(delivery.get("after_push"))]
     out += _disk_problems(raw.get("disk"))
+    from .outagetask import config_problems as outage_problems
+    out += outage_problems(raw)
     kinds = (raw.get("worktree") or {}).get("kinds") if isinstance(raw.get("worktree"), dict) else None
     if kinds is not None and (not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds)):
         out.append(f"worktree.kinds: {kinds!r} is not a list of task kinds; only code tasks get worktrees")

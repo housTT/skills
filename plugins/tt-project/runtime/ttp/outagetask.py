@@ -46,18 +46,41 @@ CLOSED = ("done", "cancelled")   # closed(): no overdue page, not listed open; a
 FIELDS = ("alias", "condition", "first", "due", "why", "tried", "seen_by", "text", "label")
 
 
+KEYS = {"owner_s": ("outage_owner_budget_min", OWNER_BUDGET_S), "due_s": ("outage_task_due_min", TASK_DUE_S),
+        "escalate_s": ("outage_escalate_min", ESCALATE_S)}
+MAX_MIN = 7 * 24 * 60   # a week: the largest heal.outage_*_min
+
+
+def minutes(key: str, v: Any) -> float:
+    """heal.<key> (a KEYS name) as minutes, a number from 1 to MAX_MIN; ValueError otherwise."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 1 <= v <= MAX_MIN:
+        raise ValueError(f"heal.{key}: {v!r} is not a number of minutes from 1 to {MAX_MIN}; the default is used")
+    return float(v)
+
+
+def config_problems(raw: dict) -> list[str]:
+    """One line per heal.outage_*_min in a project's own settings that budgets() ignores."""
+    heal = raw.get("heal") if isinstance(raw.get("heal"), dict) else {}
+    out = []
+    for name, _ in KEYS.values():
+        if name in heal:
+            try:
+                minutes(name, heal[name])
+            except ValueError as e:
+                out.append(str(e))
+    return out
+
+
 def budgets(cfg: dict | None) -> dict[str, float]:
-    """{owner_s, due_s, escalate_s} from the project's `heal` settings (minutes), each at least a minute."""
+    """{owner_s, due_s, escalate_s} in seconds from the project's `heal` settings (minutes); the default
+    for one unset or invalid (config_problems)."""
     heal = (cfg or {}).get("heal") or {}
     out = {}
-    for key, name, default in (("owner_s", "outage_owner_budget_min", OWNER_BUDGET_S),
-                               ("due_s", "outage_task_due_min", TASK_DUE_S),
-                               ("escalate_s", "outage_escalate_min", ESCALATE_S)):
+    for key, (name, default) in KEYS.items():
         try:
-            v = float(heal.get(name)) * 60 if heal.get(name) is not None else default
-        except (TypeError, ValueError):
-            v = default
-        out[key] = max(60.0, v)
+            out[key] = minutes(name, heal[name]) * 60
+        except (KeyError, ValueError):
+            out[key] = default
     return out
 
 
