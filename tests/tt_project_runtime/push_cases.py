@@ -8232,6 +8232,32 @@ def test_the_push_audit_reports_a_second_claim_on_one_commit_as_shared_not_missi
     assert a["counts"]["shared"] == 1 and a["counts"]["missing"] == 1
 
 
+@pytest.mark.xfail(strict=True, reason="#2777: lands after #2773 (pruned worktree) with the local ancestry check")
+def test_the_push_audit_checks_an_own_branch_push_on_the_target_its_marker_names(env, monkeypatch, tmp_path):
+    """An own-branch push, its task worktree pruned since, whose commit is now below a later one on
+    that branch: confirmed on the target the marker names, not reported unpushed."""
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "b.txt", "b\n")                       # a later commit on the task's branch
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t1-own")
+    _git_out(repo, "fetch", "-q", "origin")
+    tid = _audit_done(p, "own push", "handed off", branch="ttp/t1-own")
+    run = p.db.x("INSERT INTO runs(task,role,status) VALUES(?,?,?)", (tid, "worker", "ok"))
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{tid}-x.json").write_text(json.dumps({
+        "run": run, "repo": str(tmp_path / "worktrees" / "gone"), "own": True, "status": "pushed",
+        "exit": 0, "sha": sha, "head": sha, "target": "origin/ttp/t1-own"}))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+    # The remote out of reach: the local tracking ref settles it, with no fetch.
+    _git_out(repo, "remote", "set-url", "origin", str(tmp_path / "unreachable"))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+
+
 def test_the_push_audit_does_not_flag_an_on_pass_cmd_whose_push_is_on_the_remote(env, monkeypatch, tmp_path):
     from ttp import pushclaim
     p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
