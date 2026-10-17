@@ -161,7 +161,7 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     if not what or not undo:
         raise ValueError("say what changed and give the --undo command")
     if probe and until_task:
-        raise ValueError("give one end: --until-probe or --until-task (with --expires as the latest end)")
+        raise ValueError("give one end: --until-probe or --until-task")
     if not expires and not probe and not until_task:
         raise ValueError(END_HINT)
     if probe:
