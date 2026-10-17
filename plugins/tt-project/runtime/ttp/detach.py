@@ -376,6 +376,34 @@ def _mark_lost(rc: Path, why: str) -> None:
         pass
 
 
+def _mark_lost_first(rc: Path, why: str) -> str:
+    """Record `why` in <name>.lost unless a reason is already there, and return the one that stands:
+    a guess made from the outside never replaces a verdict written meanwhile (stop, remote_verdict)."""
+    target = lost(rc)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            f.write(why + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(tmp, target)   # atomic create-if-absent: never half-written, never over another
+        return why
+    except FileExistsError:
+        try:
+            return target.read_text().strip() or why
+        except OSError:
+            return why
+    except OSError:   # no hard links here: the plain write, as before
+        if not target.exists():
+            _mark_lost(rc, why)
+        return why
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def tend(p: Project) -> None:
     """The daemon's part, each tick: start the queued jobs, and record as lost those queued too long
     ago or that cannot start. The .lost goes before the queue entry, so a probe never sees neither."""
@@ -527,8 +555,7 @@ def state(rc: Path) -> tuple[str, str]:
     else:
         why = ("it was killed after it started, before it wrote an exit code, or the host restarted: the boot "
                "id could not be read, so which is unknown")
-    _mark_lost(rc, why)
-    return "lost", why
+    return "lost", _mark_lost_first(rc, why)
 
 
 # A local job that drives a job on another host itself (`ttp detach <name> --remote-host <alias>

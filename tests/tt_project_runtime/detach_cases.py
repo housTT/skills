@@ -157,6 +157,30 @@ def _remote_mirror_job(env, tmp_path, script, name="drv"):
     return p, run_dir, rdir, _remote_probe(r.stdout), e
 
 
+def test_stop_notes_its_verdict_before_the_kill_so_a_concurrent_look_never_reports_a_plain_crash(tmp_path, monkeypatch):
+    from ttp import detach
+    rc = _remote_job(tmp_path)
+    detach.started(rc).write_text("4242\n")
+    seen = []
+    # Another reader (the daemon, a check) looks at the job the instant its process group dies.
+    monkeypatch.setattr(detach.os, "killpg", lambda pid, sig: seen.append(detach.state(rc)))
+    detach.stop(rc, 4242, "remote driver gone: pid 7 on box is dead")
+    assert seen == [("lost", "remote driver gone: pid 7 on box is dead")]
+    assert detach.state(rc) == ("lost", "remote driver gone: pid 7 on box is dead")
+
+
+def test_a_late_crash_guess_never_overwrites_a_recorded_verdict(tmp_path):
+    from ttp import detach
+    rc = _remote_job(tmp_path)
+    detach._mark_lost(rc, "remote reset: the host restarted")
+    assert detach._mark_lost_first(rc, "it was killed after it started") == "remote reset: the host restarted"
+    assert detach.lost(rc).read_text().strip() == "remote reset: the host restarted"
+    (tmp_path / "b").mkdir()
+    other = _remote_job(tmp_path / "b")
+    assert detach._mark_lost_first(other, "it was killed after it started") == "it was killed after it started"
+    assert detach.lost(other).read_text().strip() == "it was killed after it started"
+
+
 def test_detach_remote_check_mirrors_the_rc_and_reads_it_once_the_host_is_unreachable(env, tmp_path):
     """The reported failure: a remote job's .log and .rc stayed on a host that then reset, so its probe
     returned 255 forever though the job had finished. The probe now mirrors both into the run folder,
