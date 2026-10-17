@@ -8232,7 +8232,6 @@ def test_the_push_audit_reports_a_second_claim_on_one_commit_as_shared_not_missi
     assert a["counts"]["shared"] == 1 and a["counts"]["missing"] == 1
 
 
-@pytest.mark.xfail(strict=True, reason="#2777: lands after #2773 (pruned worktree) with the local ancestry check")
 def test_the_push_audit_checks_an_own_branch_push_on_the_target_its_marker_names(env, monkeypatch, tmp_path):
     """An own-branch push, its task worktree pruned since, whose commit is now below a later one on
     that branch: confirmed on the target the marker names, not reported unpushed."""
@@ -8256,6 +8255,14 @@ def test_the_push_audit_checks_an_own_branch_push_on_the_target_its_marker_names
     _git_out(repo, "remote", "set-url", "origin", str(tmp_path / "unreachable"))
     a = pushclaim.audit(p)
     assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+    # A commit the tracking ref does not hold is not confirmed from it.
+    _commit(repo, "c.txt", "c\n")
+    other = _git_out(repo, "rev-parse", "HEAD")
+    (pushes / f"t{tid}-x.json").write_text(json.dumps({
+        "run": run, "repo": str(tmp_path / "worktrees" / "gone"), "own": True, "status": "pushed",
+        "exit": 0, "sha": other, "head": other, "target": "origin/ttp/t1-own"}))
+    a = pushclaim.audit(p)
+    assert a["counts"]["confirmed"] == 0 and len(a["gaps"]) == 1, a
 
 
 def test_the_push_audit_does_not_flag_an_on_pass_cmd_whose_push_is_on_the_remote(env, monkeypatch, tmp_path):

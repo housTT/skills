@@ -26,7 +26,8 @@ one whose target cannot be determined, or whose push ended without writing a fai
 null: a reboot, a killed run, a push queued and never started) while its commit is not on the target.
 Its repo is the one the marker names, else (a task worktree since pruned) the project root.
 Accepted gap: when that fallback root is another repository than the push's, a remote it lacks makes
-the claim UNVERIFIABLE rather than checked on the remote the push used."""
+the claim UNVERIFIABLE rather than checked on the remote the push used. The audit confirms such a
+claim, or one left UNKNOWN, when its commit is an ancestor of the target's local tracking ref."""
 from __future__ import annotations
 
 import json
@@ -332,17 +333,47 @@ def _verify(repo, remote: str, ref: str, sha: str, cache: dict) -> tuple[str, st
     return UNKNOWN, f"cannot tell whether {s} is on {where} (git merge-base exit {rc})", fetched
 
 
+def _marker_target(p, m: dict) -> tuple:
+    """(repo, (remote, ref) or None) a push marker names: the remote and branch it recorded, else
+    its target ("origin/<branch>"), read in its repo or, that worktree pruned since, the project root."""
+    repo = m.get("repo") or p.root
+    if not Path(repo).is_dir():   # its task's worktree was pruned since
+        repo = p.root
+    remote, branch, target = str(m.get("remote") or ""), str(m.get("branch") or ""), str(m.get("target") or "")
+    to = ((remote, f"refs/heads/{branch}") if remote and branch and remote in _remotes(repo)
+          else _ref(repo, target) if target else None)
+    return repo, to
+
+
+def _marker_local(p, c: dict, state: str, why: str) -> tuple[str, str]:
+    """A marker claim the remote check left UNKNOWN or UNVERIFIABLE, confirmed when its commit is an
+    ancestor of the target's local tracking ref (a later commit on the branch is fine). Local refs
+    only, never a fetch; a MISSING the remote answered stands."""
+    if state not in (UNKNOWN, UNVERIFIABLE):
+        return state, why
+    try:
+        m = _read_marker(p, c["marker"])
+        if m.get("status") in ("queued", "running"):
+            return state, why
+        sha = str((m.get("sha") if m.get("status") == "pushed" else m.get("head")) or "")
+        repo, to = _marker_target(p, m)
+        if not sha or not to or not to[1].startswith("refs/heads/"):
+            return state, why
+        tracking = f"refs/remotes/{to[0]}/{to[1][len('refs/heads/'):]}"
+        full, tip = _commit(repo, sha), _commit(repo, tracking)
+        if full and tip and _git(repo, "merge-base", "--is-ancestor", full, tip).returncode == 0:
+            return CONFIRMED, f"{sha[:12]} is on {short_ref(*to)} per its local tracking ref ({why})"
+    except Exception:
+        pass
+    return state, why
+
+
 def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:
     m = _read_marker(p, c["marker"])
     status, target = m.get("status"), str(m.get("target") or "")
     if status in ("queued", "running"):
         return UNKNOWN, f"{c['source']} is still {status}"
-    repo = m.get("repo") or p.root
-    if not Path(repo).is_dir():   # its task's worktree was pruned since
-        repo = p.root
-    remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
-    to = ((remote, f"refs/heads/{branch}") if remote and branch and remote in _remotes(repo)
-          else _ref(repo, target) if target else None)
+    repo, to = _marker_target(p, m)
     if not to:
         return UNVERIFIABLE, f"{c['source']} names no remote branch to check ({target or 'no target'})"
     sha = str(m.get("sha") or "") if status == "pushed" else ""
@@ -515,6 +546,8 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
                 _, state, why = check_all(p, [c], cache)[2][0]
             if state != CONFIRMED and not over and c.get("sha") and not c.get("marker"):
                 state, why = _reattribute(p, t, c, state, why, claimed, tips)
+            elif state != CONFIRMED and not over and c.get("marker"):
+                state, why = _marker_local(p, c, state, why)
             if state in (SHARED, UNVERIFIABLE):   # counted apart, only when there are any
                 counts[state] = counts.get(state, 0) + 1
             else:
