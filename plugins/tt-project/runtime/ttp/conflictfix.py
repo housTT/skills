@@ -28,7 +28,7 @@ KEY = "conflict_fix"
 LIGHT_FAILED = "the light conflict fix ended"
 TRIMS = "trim_fixes"   # a review result's count of trim-to-fit fixes the push queue sent it
 TRIM_MAX = 2           # ... after which a cap failure fails the review as any other check
-CAP_TESTS = r"(?i)prompt\w*(?:cap|small|size)"   # delivery.push_cap_tests: a prompt size cap test's name
+CAP_TESTS = r"(?i)prompt\w*_(?:stays_small|under_its_cap|size)$"   # delivery.push_cap_tests: a prompt size cap test's name
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 # An overshoot line batch._stream keeps from a check's whole output: pytest's `assert <size> <= <cap>`.
 _OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)(?:\s+\(in (\S+)\))?\s*$", re.M)
@@ -61,13 +61,12 @@ def cap_failure(tail: str, pattern: str | None = None) -> dict | None:
         rx = re.compile(CAP_TESTS)
     if not ids or not complete or not all(rx.search(i.rpartition("::")[2]) for i in ids):
         return None
-    over, seen = [], set()
+    found: dict = {}   # (size, cap) -> entry; one line batch._stream prepends may repeat inside the tail
     for m in _OVER.finditer(tail):
         size, cap = int(m.group(1).replace("_", "")), int(m.group(2).replace("_", ""))
-        key = (m.group(3) or "", size, cap)
-        if size > cap and key not in seen:
-            seen.add(key)
-            over.append({"test": m.group(3) or "", "size": size, "cap": cap, "by": size - cap})
+        if size > cap and (found.get((size, cap)) is None or (m.group(3) and not found[(size, cap)]["test"])):
+            found[(size, cap)] = {"test": m.group(3) or "", "size": size, "cap": cap, "by": size - cap}
+    over = list(found.values())
     return {"ids": ids[:10], "over": over[:10]}
 
 

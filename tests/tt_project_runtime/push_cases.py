@@ -8517,6 +8517,26 @@ def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_
     assert conflictfix.cap_failure(bare) == {"ids": ["tests/t.py::test_prompt_size"], "over": []}
     assert "tests/t.py::test_prompt_size show it" in conflictfix.over_text(conflictfix.cap_failure(bare))
     assert conflictfix.cap_failure(bare, r"never") is None, "delivery.push_cap_tests names the cap tests"
+    dup = "E       assert 30512 <= 30300  (in test_the_coordinator_role_prompt_stays_small)\n" + _CAP_TAIL.replace(
+        "E       assert 29400", "E       assert 30512 <= 30300\nE       assert 29400", 1)
+    assert [o["size"] for o in conflictfix.cap_failure(dup)["over"]] == [30512, 29400], "listed once"
+    assert conflictfix.cap_failure(dup)["over"][0]["test"] == "test_the_coordinator_role_prompt_stays_small"
+    anon_first = "E       assert 30512 <= 30300\n" + _CAP_TAIL
+    assert [o["test"] for o in conflictfix.cap_failure(anon_first)["over"] if o["size"] == 30512] == [
+        "test_the_coordinator_role_prompt_stays_small"], "the entry with a test name wins"
+
+
+def test_the_default_cap_test_pattern_matches_exactly_the_suites_size_cap_tests():
+    import pathlib
+    import re
+    from ttp import conflictfix
+    names = {n for f in pathlib.Path(__file__).resolve().parents[1].glob("**/*.py")
+             for n in re.findall(r"^def (test_\w+)", f.read_text(), re.M)}
+    got = sorted(n for n in names if re.search(conflictfix.CAP_TESTS, n))
+    assert got == ["test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_cap",
+                   "test_coordinator_timeout_defaults_ceiling_and_prompt_size",
+                   "test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are_on_and_stays_small",
+                   "test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small"]
 
 
 def test_a_batch_check_tail_keeps_each_size_overshoot_from_anywhere_in_the_output(tmp_path):
