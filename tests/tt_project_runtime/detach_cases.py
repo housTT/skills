@@ -143,6 +143,23 @@ def test_a_keeper_ends_a_job_whose_remote_driver_died_and_lets_its_hold_go(env, 
             driver.kill()
 
 
+def test_a_stopped_job_reads_its_verdict_the_moment_it_dies(env, tmp_path, monkeypatch):
+    # The keeper reads its jobs' state while its probe thread ends one: a job seen dead before its
+    # verdict was written got a generic "killed" reason, and the keeper then exited with the thread.
+    from ttp import detach, locks
+    rc = _remote_job(tmp_path, host="box", boot="", pid="", marker="")
+    job = locks.try_take([locks.job_lock(rc)], "job")
+    seen = []
+
+    def killpg(pid, sig):
+        job.close()
+        seen.append(detach.state(rc))
+    monkeypatch.setattr(detach.os, "killpg", killpg)
+    detach.stop(rc, 12345, "remote driver gone: pid 7 on box is dead")
+    assert seen == [("lost", "remote driver gone: pid 7 on box is dead")]
+    assert detach.state(rc) == seen[0]
+
+
 def _remote_mirror_job(env, tmp_path, script, name="drv"):
     """A `ttp detach --remote` job started from run 61 through the ssh stub: (project, run dir, remote
     folder, probe argv, ssh env)."""
