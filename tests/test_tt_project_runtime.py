@@ -40758,6 +40758,7 @@ def test_detached_check_stop_during_start_still_ends_the_command(monkeypatch, wh
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)   # the stop must not outlast this test
     old = signal.signal(signal.SIGTERM, cli._checks_stop)
     try:
         with pytest.raises(SystemExit) as e:
@@ -40767,6 +40768,59 @@ def test_detached_check_stop_during_start_still_ends_the_command(monkeypatch, wh
     assert e.value.code == 143
     assert len(started) == 1 and started[0].returncode is not None, "the started check kept running"
     assert cli._CHECK_STOP["defer"] is False
+
+
+def test_detached_checks_stop_even_when_the_launcher_blocks_sigterm(env, tmp_path, monkeypatch, capsys):
+    """A SIGTERM mask the launcher had passes to the detached checks and their commands: a stop must
+    still end them as stopped (143), never let the command finish and record its exit code."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        pid = _detached_checks(run, capsys, "sleep 300")
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    try:
+        assert _wait_for(lambda: (run / "checks.log").exists())
+        os.killpg(pid, signal.SIGTERM)
+        assert _wait_precheck(run) == "143"
+        assert "stopped by signal 15" in (run / "checks.log").read_text()
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_detached_checks_record_a_stop_whose_exit_was_lost(env, tmp_path, monkeypatch):
+    """A stop whose SystemExit something swallowed still records 128+signal, and no further check starts."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+    handlers = {sig: signal.getsignal(sig) for sig in cli._CHECK_STOP_SIGNALS}
+    started = []
+
+    def checks(_a):
+        try:
+            cli._checks_stop(signal.SIGTERM, None)
+        except SystemExit:
+            pass   # e.g. a broad except on the way out of a check
+        with pytest.raises(SystemExit) as e:
+            cli._run_check(["sh", "-c", f"touch {tmp_path / 'ran'}"], True)
+        started.append(e.value.code)
+
+    monkeypatch.setattr(cli, "cmd_checks", checks)
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"go\n")))
+    monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(run))
+    monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+    try:
+        code = cli._checks_child(types.SimpleNamespace(rc=str(run / cli.CHECKS_RC)))
+    finally:
+        for sig, h in handlers.items():
+            signal.signal(sig, h)
+    assert code == 143 and (run / cli.CHECKS_RC).read_text().strip() == "143"
+    assert "stopped by signal 15" in (run / "checks.log").read_text()
+    assert started == [143] and not (tmp_path / "ran").exists(), "a check started after the stop"
 
 
 def test_detached_checks_recovery_leaves_legacy_scratch(env, tmp_path, monkeypatch):

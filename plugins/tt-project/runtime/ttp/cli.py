@@ -2326,11 +2326,14 @@ def _checks_tmp_cleanup(run_dir: Path) -> None:
 
 
 # A stop signal that lands while a check command starts or is being ended waits for that to finish.
-_CHECK_STOP: dict = {"defer": False, "pending": None}
+# `stopped` keeps the first stop for the rest of the run, even if its SystemExit is lost on the way.
+_CHECK_STOP: dict = {"defer": False, "pending": None, "stopped": None}
+_CHECK_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
 def _checks_stop(sig, _frame):
     """The detached checks' stop handler: exit 128+sig, deferred while a check starts or is ended."""
+    _CHECK_STOP["stopped"] = _CHECK_STOP["stopped"] or 128 + sig
     if _CHECK_STOP["defer"]:
         _CHECK_STOP["pending"] = 128 + sig
         return
@@ -2343,6 +2346,8 @@ def _run_check(argv: list, group: bool, **kw) -> int:
     proc = None
     _CHECK_STOP.update(defer=True, pending=None)
     try:
+        if _CHECK_STOP["stopped"]:   # stopped checks start no further command
+            raise SystemExit(_CHECK_STOP["stopped"])
         proc = subprocess.Popen(argv, start_new_session=group, **kw)
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
@@ -2581,9 +2586,13 @@ def _checks_child(a) -> int:
     released = False
     code: int | str = 1
 
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    _CHECK_STOP["stopped"] = None
+    for sig in _CHECK_STOP_SIGNALS:
         signal.signal(sig, _checks_stop)
     try:
+        # A stop signal blocked in the launcher stays blocked here and in the check commands: the
+        # checks could then never be stopped, and a stop would record their exit code instead.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, _CHECK_STOP_SIGNALS)
         released = _checks_released(sys.stdin.buffer.read(), rc_file.parent)
         if not released:
             # A newer launch may own checks.rc: this unrecorded child leaves it alone.
@@ -2603,6 +2612,12 @@ def _checks_child(a) -> int:
             with open(rc_file.parent / "checks.log", "a") as log:
                 log.write(f"ttp checks: stopped by signal {code - 128}\n")
     finally:
+        stopped = _CHECK_STOP["stopped"]
+        if released and stopped and code != stopped:
+            # A stop whose SystemExit something caught on the way still ends the checks as stopped.
+            code = stopped
+            with open(rc_file.parent / "checks.log", "a") as log:
+                log.write(f"ttp checks: stopped by signal {code - 128}\n")
         if tmp_fd is not None:
             os.close(tmp_fd)
             from . import checkdirs
