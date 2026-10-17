@@ -2624,7 +2624,6 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
 def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Callable[[str, list, list], str]) -> str:
     """What `reuse` says of a recorded pass of `todo` on `head`'s tree under the environment they
     would run in here, or "" (none, or it could not be told)."""
-    from . import pushpass
     tree = _git(repo, "rev-parse", f"{head}^{{tree}}").stdout.strip()
     try:
         return reuse(tree, todo, pushpass.check_envs(repo, todo, check_env("own", "", run_dir))) if tree else ""
@@ -2955,8 +2954,7 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
 def _own_pass(p: Project, tree: str, cmds: list, envs: list) -> str:
     """Where and when `ttp checks` recorded passing exactly `cmds` (or more starting with them) on
     `tree` under `envs`, for `ttp push --own` to reuse, or ""."""
-    from .cli import _recorded_pass
-    hit = _recorded_pass(p, tree, cmds, "candidate", envs)
+    hit = cli._recorded_pass(p, tree, cmds, "candidate", envs)
     return f"`ttp checks` recorded in run {hit.get('run') or '?'} at {timefmt.long(float(hit.get('ts') or 0), p)}" \
         if hit else ""
 
@@ -3565,5 +3563,6 @@ def running(p: Project) -> list[dict]:
 
 # Last, not at the top: batch imports push and reads its constants at import time. Loaded with push,
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
-# that calls into this older push (after_push would fail on a missing attribute).
-from . import batch  # noqa: E402
+# that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
+# (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
+from . import batch, cli, pushpass  # noqa: E402

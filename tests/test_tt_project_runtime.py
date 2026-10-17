@@ -25633,7 +25633,8 @@ def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
         assert "_recorded_pass" not in src or name == "push.py", name
     tree = ast.parse((RUNTIME / "ttp" / "push.py").read_text())
     readers = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
-               and any(isinstance(n, ast.Name) and n.id in ("_recorded_pass", "_own_pass") for n in ast.walk(f))}
+               and any(isinstance(n, ast.Name) and n.id in ("_recorded_pass", "_own_pass")
+                       or isinstance(n, ast.Attribute) and n.attr == "_recorded_pass" for n in ast.walk(f))}
     assert readers == {"_own_pass", "_run"}, readers
     run = next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_run")
     calls = [c for c in ast.walk(run) if isinstance(c, ast.Call) and getattr(c.func, "id", "") in ("publish", "push")]
