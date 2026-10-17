@@ -5334,6 +5334,13 @@ def test_a_nested_ttp_lock_runs_under_its_outer_one_unless_it_upgrades_a_shared_
     out = nested(["--shared"], [])
     assert out.returncode == 2 and "exclusively inside a shared" in out.stderr, out
     assert time.time() - start < 8, "the refused upgrade waited instead of exiting at once"
+    # Under an exclusive task's whole-run hold even a shared lock holds it exclusively: the upgrade runs.
+    run_dir = tmp_path / "own"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"exclusive": [{"resource": "board"}]}))
+    run_env["TTP_RUN_DIR"] = str(run_dir)
+    out = nested(["--shared"], [])
+    assert out.returncode == 0 and "held already by an enclosing ttp lock (exclusive)" in out.stderr, out
 
 
 

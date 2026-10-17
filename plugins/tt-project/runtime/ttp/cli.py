@@ -2924,8 +2924,11 @@ def cmd_lock(a) -> None:
             activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
 
     if res in {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}:
-        # This run's task holds the resource for its whole run already.
+        # This run's task holds the resource for its whole run already, exclusively even for a --shared
+        # command: a nested plain `ttp lock` of it inside the command just runs too.
         _refuse_paused()
+        if a.shared:
+            child_env.update(TTP_LOCKS_SHARED=",".join(shared_locks), TTP_LOCKS_HELD=",".join(held_locks + [res]))
         print(f"ttp lock: {a.resource} is held already by this task's whole run; running the command under it",
               file=sys.stderr, flush=True)
         sys.exit(_logged("exclusive", lambda: subprocess.call(cmd, env=child_env)))
