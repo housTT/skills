@@ -240,12 +240,13 @@ def relaunch_started(rc: Path) -> bool:
 
 def stop(rc: Path, pid: int, why: str) -> None:
     """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
-    own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended."""
+    own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended.
+    The why goes first: a reader that sees its lock go free before it would record a guess instead."""
+    _mark_lost(Path(rc), why)
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
         pass   # already gone
-    _mark_lost(Path(rc), why)
 
 
 def running_pid(rc: Path, this_boot) -> int:

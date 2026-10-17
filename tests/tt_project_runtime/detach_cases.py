@@ -92,6 +92,17 @@ def test_remote_pid_and_marker_need_remote_host(env, tmp_path):
     assert r.returncode != 0 and "go with --remote-host" in r.stderr
 
 
+def test_stop_records_its_reason_before_a_reader_can_see_the_job_gone(tmp_path, monkeypatch):
+    from ttp import detach
+    rc = _remote_job(tmp_path)
+    seen = []
+    # A reader that looks the moment the kill lands (its lock is free) must find the stop's reason.
+    monkeypatch.setattr(detach.os, "killpg", lambda pid, sig: seen.append(detach.state(rc)))
+    detach.stop(rc, 12345, "remote driver gone: test")
+    assert seen == [("lost", "remote driver gone: test")]
+    assert detach.state(rc) == ("lost", "remote driver gone: test")
+
+
 def test_a_keeper_ends_a_job_whose_remote_driver_died_and_lets_its_hold_go(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import detach, hold, locks
