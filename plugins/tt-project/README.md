@@ -932,7 +932,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   starts at once; 0 = off), `push_solo_paths` (default `["plugins/tt-project/template/prompts/*.md"]`:
   git pathspecs a batch takes at most one approved change touching, as two prompt changes that
   each fit a size cap may not fit together; the others wait for a later batch; `[]` = off),
-  `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*(?:cap|small|size)`:
+  `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*_(?:stays_small|under_its_cap|size)$`; the `$` anchor means a
+  parametrized cap test id (`name[param]`) needs a custom `push_cap_tests`:
   when only such tests fail on a change merged in a batch, its review runs again as a light
   trim-to-fit fix told each measured overshoot, at no review attempt, at most twice per change,
   instead of failing), `push_landing_alert_h` (default 4:
