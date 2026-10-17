@@ -112,3 +112,47 @@ def test_an_overdue_mitigation_wakes_the_coordinator_and_a_done_fix_lists_its_me
     ev = p.db.one("SELECT * FROM events WHERE kind=?", (mitigate.UNDO,))
     assert ev["status"] == "queued" and f"Fix #{real} " in ev["text"] and "Once it is deployed" in ev["text"]
     assert "manual escalation timer (undo: remove the timer)" in ev["text"]
+
+
+def test_an_overdue_mitigation_whose_fix_is_already_done_raises_no_overdue_event(env):
+    from ttp import mitigate
+    p = make(env)
+    tid, _, _ = _hand_off(env, p, {"status": "done", "summary": "fixed", "live_impact": "svc jobs stall"}, kind="code")
+    (m,) = _mitigations(p)
+    rec = p.db.kv(mitigate.KEY)[str(m["id"])]
+    assert rec["fix"] == tid and p.db.task(tid)["status"] == "done"
+    assert mitigate.tend(p.db, p.name, now=rec["due"] + 1) == []
+    assert not p.db.q("SELECT 1 FROM events WHERE kind=?", (mitigate.OVERDUE,))
+    # A fix still in flight: the overdue mitigation is raised.
+    fix, _, _ = _hand_off(env, p, {"status": "blocked", "summary": "s", "question": "q",
+                                   "live_impact": "other-svc slow"}, kind="code")
+    (m2,) = [t for t in _mitigations(p) if t["id"] != m["id"]]
+    rec2 = p.db.kv(mitigate.KEY)[str(m2["id"])]
+    assert mitigate.tend(p.db, p.name, now=rec2["due"] + 1) == [f"mitigation #{m2['id']} overdue"]
+
+
+def test_tend_reads_and_writes_the_mitigations_in_one_transaction(env, monkeypatch):
+    from ttp import mitigate
+    p = make(env)
+    _hand_off(env, p, {"status": "blocked", "summary": "s", "question": "q", "live_impact": "svc down"}, kind="code")
+    (m,) = _mitigations(p)
+    due = p.db.kv(mitigate.KEY)[str(m["id"])]["due"]
+    seen = []
+    real_records, real_set = mitigate.records, p.db.set_kv
+    monkeypatch.setattr(mitigate, "records", lambda db: seen.append(("read", db.conn.in_transaction)) or real_records(db))
+    monkeypatch.setattr(p.db, "set_kv", lambda *a, **k: seen.append(("write", p.db.conn.in_transaction)) or real_set(*a, **k))
+    assert mitigate.tend(p.db, p.name, now=due + 1) == [f"mitigation #{m['id']} overdue"]
+    assert seen == [("read", True), ("write", True)]
+
+
+def test_a_live_impact_with_no_fix_queued_tells_the_coordinator_to_queue_one(env):
+    from ttp import mitigate
+    p = make(env)
+    tid, _, queued = _hand_off(env, p, {"status": "done", "summary": "saw it", "live_impact": "svc holds stay"})
+    (m,) = _mitigations(p)
+    ev = p.db.one("SELECT * FROM events WHERE kind=? AND task=?", (mitigate.QUEUED, m["id"]))
+    assert ev["status"] == "queued" and "none queued yet" in ev["text"] and ev["text"].endswith("Queue the fix task.")
+    # A code task stating it is the fix itself: nothing for the coordinator to do.
+    _hand_off(env, p, {"status": "done", "summary": "s", "live_impact": "other-svc slow"}, kind="code")
+    (m2,) = [t for t in _mitigations(p) if t["id"] != m["id"]]
+    assert p.db.one("SELECT status FROM events WHERE kind=? AND task=?", (mitigate.QUEUED, m2["id"]))["status"] == "handled"
