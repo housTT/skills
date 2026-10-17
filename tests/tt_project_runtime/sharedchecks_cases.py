@@ -387,3 +387,15 @@ def test_a_shared_failure_after_a_missing_fix_task_is_no_repeat(env):
     p.db.x("INSERT INTO checks_incidents(ids,opened,last,fix_task,tasks,closed) VALUES(?,?,?,?,?,?)",
            (json.dumps(_IDS[:1]), now, now, 999_999, json.dumps([t1]), now + 60))
     assert sharedchecks.repeats(p.db, _IDS, now + 3600, {}) == []
+
+
+def test_covered_matches_test_ids_on_identifier_boundaries(env):
+    from ttp import sharedchecks
+    p = make(env)
+    p.db.add_task("code: fix", "Fix tests/x.py::test_ab and tests/y.py::test_p[1]", kind="code")
+    assert sharedchecks.covered(p.db, ["tests/x.py::test_ab"])
+    assert sharedchecks.covered(p.db, ["tests/x.py::test_ab"]) == sharedchecks.covered(p.db, ["tests/y.py::test_p[1]"])
+    assert not sharedchecks.covered(p.db, ["tests/x.py::test_a"])      # prefix of another id
+    assert not sharedchecks.covered(p.db, ["tests/y.py::test_p"])      # prefix of a parametrized id
+    p.db.add_task("code: more", "Also tests/x.py::test_a.", kind="code")
+    assert sharedchecks.covered(p.db, ["tests/x.py::test_a"])          # punctuation ends the id

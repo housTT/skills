@@ -269,7 +269,8 @@ def covered(db: DB, ids: list[str], skip: set[int] | frozenset = frozenset()) ->
         live = [t for t in db.q("SELECT id, title, spec FROM tasks WHERE kind='code' AND status NOT IN "
                                 f"({','.join('?' * len(done))}) ORDER BY id", done) if t["id"] not in skip]
         for i in sorted(left):
-            t = next((t for t in live if i in f"{t['title'] or ''}\n{t['spec'] or ''}"), None)
+            t = next((t for t in live if re.search(re.escape(i) + r"(?![\w\[])",
+                                                 f"{t['title'] or ''}\n{t['spec'] or ''}")), None)
             if t is None:
                 return ""
             owners.append(f"#{t['id']}")
