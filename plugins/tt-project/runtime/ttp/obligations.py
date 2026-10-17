@@ -54,6 +54,12 @@ Delivery: a coordinator `reply` whose `delivers` names an obligation (`o1`) or a
 open obligation it owns) marks it delivered by that reply (deliver). It closes once every owner task finished
 as well, at once or on the check() after the last one finishes. A promise is delivered only by a reply to its
 own chat. The link is explicit: no reply text is matched.
+
+Specs naming one (spec_check): a coordinator task_add or task_update spec that names an obligation key
+(`o6` on a line that says "obligation") must name one that exists. A new task is attached as an owner of
+each open one it names; an updated task must already own it, or an `obligation` action of the same batch
+attach it, else the action is refused, so no worker is told it owns an obligation its records refuse.
+Keys of closed obligations (receipt or dropped) are history and pass.
 """
 from __future__ import annotations
 
@@ -78,6 +84,45 @@ PROMISE_DEFAULT_H = 6.0       # coordinator.promise_default_h: when a promise na
 PROMISE_KIND = "promise_overdue"
 PROMISE_TEXT_MAX = 300
 PROMISE_FINISH_SLACK_S = 60   # a reply this close before an owner's last update still counts as after it
+
+
+SPEC_KEY = re.compile(r"(?<![\w./-])o(\d+)(?![\w-]|\.\d)")
+
+
+def named(text: str) -> list[str]:
+    """The obligation keys a spec names: `o<N>` on a line that says "obligation", so a model name such as
+    o3 in other text is not read as one. In order, without repeats."""
+    keys: list[str] = []
+    for line in (text or "").splitlines():
+        if "obligation" in line.lower():
+            for m in SPEC_KEY.finditer(line):
+                if f"o{int(m.group(1))}" not in keys:
+                    keys.append(f"o{int(m.group(1))}")
+    return keys
+
+
+def spec_check(db, text: str, tid: int | None = None, attaching=()) -> list[str]:
+    """For a coordinator task_add (`tid` None) or task_update spec: the open obligations it names that a new
+    task is to be attached to. Raises ValueError for a key that does not exist, or one an updated task does
+    not own and no `(key, tid)` in `attaching` (the same batch's obligation actions) attaches."""
+    st, attach, unknown, unowned = _load(db), [], [], []
+    for oid in named(text):
+        o = st["items"].get(oid)
+        if not o:
+            unknown.append(oid)
+        elif o["receipt"] or o.get("dropped"):
+            continue
+        elif tid is None:
+            attach.append(oid)
+        elif str(tid) not in o["owners"] and (oid, int(tid)) not in attaching:
+            unowned.append(oid)
+    if unknown:
+        raise ValueError(f"its spec names obligation {', '.join(unknown)}, which does not exist: record it first "
+                         f"(an `obligation` action with `text`, then name the key it gets), or drop the key")
+    if unowned:
+        raise ValueError(f"its spec names obligation {', '.join(unowned)}, which #{tid} does not own: attach it in "
+                         f"the same batch (an `obligation` action with `key` and `owners`: [{tid}]), or drop the key")
+    return attach
 
 
 def _load(db) -> dict:

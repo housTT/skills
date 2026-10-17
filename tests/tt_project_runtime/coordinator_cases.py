@@ -10994,6 +10994,44 @@ def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkey
 
 
 
+def test_task_spec_naming_an_obligation_needs_it_to_exist_and_be_owned(env, monkeypatch):
+    """A spec telling its worker it owns obligation o<N> while the records disagree made the worker's
+    `progress` fail: unknown keys are refused, a new task is attached, an updated one must own it."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    count = lambda: p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    before = count()
+    out = coord.apply(p, [{"type": "task_add", "title": "make the report", "kind": "work",
+                           "spec": "You own obligation o6: record progress with `ttp obligation progress o6`."}])
+    assert len(out) == 1 and "o6" in out[0] and "does not exist" in out[0] and count() == before
+    oid = ob.add(p, "the urgent report", now=now)
+    assert coord.apply(p, [{"type": "task_add", "title": "make the report", "kind": "work",
+                            "spec": f"You own obligation {oid}: record progress on it."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='make the report'")["id"]
+    assert str(new) in ob.get(p.db, oid)["owners"] and f"## Obligation {oid} " in p.db.task(new)["spec"]
+    assert "progress" in ob.record(p, oid, "progress", "commit abc123", new)
+
+    spec = p.db.task(tid)["spec"]
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also record obligation {oid} progress."}])
+    assert len(out) == 1 and "does not own" in out[0] and p.db.task(tid)["spec"] == spec
+    assert str(tid) not in ob.get(p.db, oid)["owners"]
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also record obligation {oid} progress."},
+                           {"type": "obligation", "key": oid, "owners": [tid]}]) == [], "the batch attaches it"
+    assert str(tid) in ob.get(p.db, oid)["owners"] and "Also record obligation" in p.db.task(tid)["spec"]
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Obligation {oid}: hurry."}]) == []
+
+    gone = ob.add(p, "no longer wanted", now=now)
+    ob.drop(p, gone, "withdrawn")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="coordinator")
+    assert coord.apply(p, [{"type": "task_update", "id": other, "spec": f"Obligation {gone} was dropped."},
+                           {"type": "task_add", "title": "compare models", "kind": "work",
+                            "spec": "Compare against the o3 and o9 models.\nNo obligation applies."}]) == []
+    assert ob.get(p.db, gone)["owners"] == {}, "a closed obligation is history: nothing is attached"
+    assert ob.named("obligation o3-mini o3.5 path/o4 (o5), o07; see o8") == ["o5", "o7", "o8"]
+
+
+
 def test_obligation_milestone_validation_atomic_and_receipt_scoped(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob

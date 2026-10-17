@@ -1333,6 +1333,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
     new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
     cfg_refused: dict[str, str] = {}   # config_set key -> why it was rejected (sorted first, so memory_add sees it)
+    # (key, task) pairs this batch's obligation actions attach: a task_update spec may name those (spec_check).
+    attaching = set()
+    for a in actions:
+        try:
+            if (a or {}).get("type") == "obligation" and str(a.get("key") or "").strip():
+                attaching |= {(str(a["key"]).strip(), int(x)) for x in a.get("owners") or []}
+        except (TypeError, ValueError):
+            pass   # the action itself is refused with its reason when it is applied
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
@@ -1492,6 +1500,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
                     raise ValueError(f"task_add rejected: {why}")
+                try:
+                    owes = obligations.spec_check(db, a.get("spec") or "")
+                except ValueError as e:
+                    raise ValueError(f"task_add rejected: {e}") from None
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
@@ -1511,6 +1523,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         _take_over_dependents(db, old["id"], new_id)
                         if old["status"] == "blocked":   # superseded: never requeued into duplicate work
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
+                    for oid in owes:   # its spec names it: it owns it, as the spec tells its worker
+                        obligations.attach(p, oid, [new_id])
+                        batch_obls.append(oid)
+                        notes.append(f"task_add: #{new_id} attached as an owner of obligation {oid}, which its spec names")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 notes.extend(_relay_pin_note(p, cfg, a, new_id, messages))
@@ -1668,6 +1684,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     why = prguard.spec_problem(db, spec)
                     if why:
                         raise ValueError(f"#{task['id']} rejected: {why}")
+                    try:
+                        obligations.spec_check(db, spec, task["id"], attaching)
+                    except ValueError as e:
+                        raise ValueError(f"#{task['id']} rejected: {e}") from None
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
                     prev = load_result(upd.get("result") or task["result"])
                     if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:
@@ -1994,7 +2014,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                           + ", ".join(f"#{m}" for m in said),
                           json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
             elif t == "obligation":
-                from . import obligations
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
                 if not oid:
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
@@ -2063,7 +2082,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             f"turn went through")
     if user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
-    from . import obligations
     try:   # a reply already went out: marking what it delivered never undoes or rejects it
         notes += obligations.deliver(p, delivered)
     except Exception as e:
