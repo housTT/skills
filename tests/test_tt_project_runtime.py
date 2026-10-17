@@ -44435,3 +44435,72 @@ def test_task_show_json_prints_the_record(env, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["task", p.name, "show", str(tid + 99), "--json"])
     assert e.value.code not in (0, None)
+
+
+def _filed_long_ago(title, now):
+    """File the note as a fixture so it predates its resolution."""
+    from ttp import upstream
+    fp = upstream.fingerprint(title, "y")
+    with open(upstream.path(), "a") as fh:
+        fh.write(json.dumps({"title": title, "spec": "y", "fp": fp, "project": "demo", "host": "h", "task": 4,
+                             "ts": now - 90 * 86400}) + "\n")
+    upstream.resolve(fp, "1.0.0", now=now - 30 * 3600)
+    return fp
+
+
+def _quiet_run(p, fp, now, version="1.5.0", cfg=None):
+    from ttp import upstream
+    upstream.follow_up_unconfirmed(p, version, cfg, now)   # first sight starts the clock
+    return upstream.follow_up_unconfirmed(p, version, cfg, now + 4 * 86400)
+
+
+def test_upstream_quiet_confirm_closes_after_the_window_and_lists_it_separately(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _filed_long_ago("upstream: calm", now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []   # first sight starts the window
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 2 * 86400) == []   # inside the window
+    assert upstream.unconfirmed("demo", now + 2 * 86400) == [fp]
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 3 * 86400 + 7200) == [fp]
+    ev = upstream.acked(fp)["evidence"]
+    assert ev.startswith("confirmed by quiet: ran 1.5.0 for 3 days") and "no regression or re-filed note" in ev
+    assert upstream.state(fp) == "closed" and upstream.unconfirmed("demo", now + 9 * 86400) == []
+    assert upstream.quiet_confirmed("demo") == 1
+
+
+def test_upstream_quiet_confirm_is_blocked_by_regression_refile_unknown_filer_and_off_switch(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    a = _filed_long_ago("upstream: reg", now)
+    b = _filed_long_ago("upstream: Again!", now)
+    upstream.regress(a, "still broken", "demo", now=now + 100)
+    upstream.append("demo", 5, [{"title": "Upstream: again", "spec": "other spec"}])   # same normalized title
+    got = _quiet_run(p, a, now)
+    assert got == [], (got, a, b)
+    assert upstream.state(b) == upstream.SHIPPED
+    assert upstream.follow_up_unconfirmed(p, "", None, now + 9 * 86400) == []   # unknown filer version
+    c = _filed_long_ago("upstream: off", now)
+    p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", {"upstream": {"quiet_confirm_days": 0}}, now + 5 * 86400) == []
+    assert upstream.state(c) == upstream.SHIPPED and upstream.quiet_confirmed("demo") == 0
+
+
+def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_the_forwarder(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _shipped(p, "upstream: fwd", 30, now)
+    upstream.follow_up_unconfirmed(p, "1.5.0", None, now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10) == []
+    # the note came from a peer: its ack is in what the forwarder sends back
+    with open(upstream.path(), "a") as fh:
+        fh.write(json.dumps({"title": "upstream: rxq", "spec": "z", "fp": (rx := upstream.fingerprint("upstream: rxq", "z")),
+                             "host": __import__("ttp.project", fromlist=["x"]).hostname(), "ts": now - 40 * 86400, "project": "far"}) + "\n")
+    assert upstream._take_resolved("peer", [{"kind": "resolve", "fp": rx, "fixed_in": "1.0.0", "ts": 5.0}]) == 1
+    upstream._record({"kind": "ack", "fp": rx, "project": "far", "ts": now, "closed_by": upstream.QUIET,
+                      "evidence": "confirmed by quiet: ran 1.5.0 for 3 days, no regression or re-filed note"})
+    lines, _ = upstream._acks_to_send("peer", 0, 10 ** 6)
+    sent = [json.loads(x) for x in lines]
+    assert len(sent) == 1 and sent[0]["fp"] == rx and sent[0]["evidence"].startswith("confirmed by quiet")

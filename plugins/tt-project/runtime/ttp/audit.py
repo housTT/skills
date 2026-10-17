@@ -365,6 +365,12 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             n, oldest = 0, 0.0
         if n:
             out.append(f"upstream fixes shipped, not confirmed: {n}, oldest {_dur(oldest)} since resolved")
+        try:
+            q = upstream.quiet_confirmed(p.name, now)
+        except OSError:
+            q = 0
+        if q:
+            out.append(f"upstream fixes confirmed by quiet: {q}")
     return out or [NOTHING]
 
 

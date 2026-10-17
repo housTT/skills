@@ -908,6 +908,27 @@ KV_REMINDED = "upstream_reminded"   # "<fp>@<fixed_in>" this project's coordinat
 REMIND_AFTER_H = 72
 CLOSE_AFTER_DAYS = 14
 SILENCE = "silence"
+QUIET = "quiet"
+QUIET_CONFIRM_DAYS = 3
+KV_QUIET_CHECKED = "upstream_quiet_checked"
+QUIET_EVERY_S = 3600
+
+
+def _norm_title(t: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(t).lower()).split())
+
+
+def _refiled(fp: str, title: str, since: float) -> bool:
+    """True when a note with fingerprint `fp` or the same normalized `title` was filed after `since`."""
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return False
+    want = _norm_title(title)
+    return any(float(n.get("ts") or 0) > since and (n.get("fp") == fp or _norm_title(n.get("title", "")) == want)
+               for n in notes)
 
 
 def reached(p: project.Project, key: str, now: float) -> float:
@@ -970,12 +991,22 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
     mine = filed(p.name)
     reminded = list(p.db.kv(KV_REMINDED, []) or [])
     closed, changed = [], False
+    quiet_s = float(conf.get("quiet_confirm_days", QUIET_CONFIRM_DAYS)) * 86400
+    quiet_due = quiet_s > 0 and now - float(p.db.kv(KV_QUIET_CHECKED, 0) or 0) >= QUIET_EVERY_S
+    if quiet_due:
+        p.db.set_kv(KV_QUIET_CHECKED, now)
     for fp in mine:
         res = resolution(fp, recs)
         if not res or wontfixed(fp, recs) or acked(fp, recs) or not at_least(version, res["fixed_in"]):
             continue
         key = f"{fp}@{res['fixed_in']}"
         age = now - reached(p, key, now)
+        if (quiet_due and age >= quiet_s and now - float(res["ts"]) >= CONFIRM_S and not regressed(fp, recs)
+                and not _refiled(fp, mine[fp].get("title", ""), float(res["ts"]))):
+            _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": QUIET,
+                     "evidence": f"confirmed by quiet: ran {version} for {age / 86400:.0f} days, no regression or re-filed note"})
+            closed.append(fp)
+            continue
         if age >= close_s and not regressed(fp, recs):
             _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": SILENCE,
                      "evidence": f"confirmed by silence: no ack and no regression note {close_s / 86400:g} days after the fix "
@@ -1003,6 +1034,14 @@ def unconfirmed_summary(name: str | None, now: float | None = None) -> tuple[int
     recs = _records()
     ages = [now - float(resolution(fp, recs)["ts"]) for fp in unconfirmed(name, now)]
     return len(ages), max(ages, default=0.0)
+
+
+def quiet_confirmed(name: str | None, now: float | None = None) -> int:
+    """How many resolutions were closed as 'confirmed by quiet' (of project `name`'s notes, or all)."""
+    recs = _records()
+    mine = filed(name) if name else None
+    return sum(1 for r in recs if r.get("kind") == "ack" and r.get("closed_by") == QUIET
+               and (mine is None or r.get("fp") in mine) and acked(r["fp"], recs) is r)
 
 
 def unconfirmed(name: str | None, now: float | None = None) -> list[str]:
