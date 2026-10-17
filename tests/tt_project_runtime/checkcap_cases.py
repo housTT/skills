@@ -396,7 +396,7 @@ def test_push_checks_slot_carries_the_obligation_boost_outside_the_push_priority
         "own push checks queue boosted; push-branch checks (batches) keep their slot beyond the cap"
 
 
-def _serve(d, n, urgent_max):
+def _serve_turns(d, n, urgent_max):
     """Serve the fair queue's next `n` waiters the way checkcap.acquire does; their labels in order."""
     from ttp import locks
     got = []
@@ -423,17 +423,17 @@ def test_checks_queue_serves_priority_1_first_by_project_for_a_bounded_run_of_tu
     assert names(3) == ["a1", "c1", "a2", "b2", "c2", "a3", "b1", "a4"], \
         "p1 first, one project rotation for both, the next other waiter after 3 p1 turns in a row"
     assert names(9) == ["a1", "c1", "a2", "c2", "a3", "b2", "a4", "b1"]
-    assert _serve(d, 2, 3) == ["a1", "c1"]
+    assert _serve_turns(d, 2, 3) == ["a1", "c1"]
     assert locks._streak(d, "r") == 2 and names(3)[:2] == ["a2", "b2"], "served p1 turns count toward the run"
-    assert _serve(d, 2, 3) == ["a2", "b2"]
+    assert _serve_turns(d, 2, 3) == ["a2", "b2"]
     assert locks._streak(d, "r") == 0, "another waiter's turn ends the run"
-    assert _serve(d, 4, 3) == ["c2", "a3", "b1", "a4"]
+    assert _serve_turns(d, 4, 3) == ["c2", "a3", "b1", "a4"]
     locks.enqueue(d, "r", "a5", group="A", priority=1)
     b9 = locks.enqueue(d, "r", "b9", group="B")
-    assert _serve(d, 1, 3) == ["a5"] and locks._streak(d, "r") == 1
+    assert _serve_turns(d, 1, 3) == ["a5"] and locks._streak(d, "r") == 1
     locks.dequeue(b9)
     locks.enqueue(d, "r", "a6", group="A", priority=1)
-    assert _serve(d, 1, 3) == ["a6"] and locks._streak(d, "r") == 0, "no run counts while nobody else waits"
+    assert _serve_turns(d, 1, 3) == ["a6"] and locks._streak(d, "r") == 0, "no run counts while nobody else waits"
 
 
 def test_one_project_s_many_priority_1_checks_never_lock_out_other_projects(tmp_path):
@@ -443,7 +443,7 @@ def test_one_project_s_many_priority_1_checks_never_lock_out_other_projects(tmp_
         locks.enqueue(d, "r", f"a{n}", since=1000.0 + n, group="A", priority=1)
     locks.enqueue(d, "r", "b0", since=1100.0, group="B")
     locks.enqueue(d, "r", "c0", since=1101.0, group="C", priority=4)
-    got = _serve(d, 14, 3)
+    got = _serve_turns(d, 14, 3)
     assert got.index("b0") <= 3 and got.index("c0") <= 7, got
     assert [g for g in got if g[0] == "a"] == [f"a{n}" for n in range(12)]
     locks.mark_turn(d, "r", None)
