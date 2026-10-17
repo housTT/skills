@@ -75,7 +75,7 @@ Other workers run other tasks of this project at the same time.
   Who held a machine when: `ttp machines activity <alias>`.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
-  task says to. Check a driver with `ttp svcscan <script>`; exercise it with `ttp svcscan --shim <dir>`.
+  task says to.
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
   (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the

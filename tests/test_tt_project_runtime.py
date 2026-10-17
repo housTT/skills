@@ -34036,6 +34036,12 @@ def test_ttp_svcscan_exits_1_on_a_hit_and_its_shims_change_no_unit(env, tmp_path
 
     def ttp(*args):
         return subprocess.run([sys.executable, str(TTP), "svcscan", *args], capture_output=True, text=True)
+    # The worker prompt has no room for it: --help carries the guidance (and the harness skill reference).
+    r = ttp("--help")
+    text = " ".join(r.stdout.split())
+    for part in ("before running it on a shared machine", "unless your task says to", "`ttp svcscan --shim <dir>`",
+                 "`PATH=<dir>:\"$PATH\" <script>`", "a local shim does not stop it"):
+        assert part in text, part
     r = ttp(str(script))
     assert r.returncode == 1 and "driver.sh:3: systemctl changes a unit" in r.stdout and \
         "8 service unit change(s)" in r.stdout, r.stdout

@@ -792,10 +792,17 @@ def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
         assert part in text, part
 
 
-def test_worker_prompt_points_at_svcscan_for_service_changes_in_drivers():
-    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    for part in ("restart a shared service", "`ttp svcscan <script>`", "`ttp svcscan --shim <dir>`"):
+def test_svcscan_guidance_lives_in_the_harness_skill_reference():
+    # The worker prompt has no room under its size caps, so the guidance lives where it costs no run
+    # anything: `ttp svcscan --help` (runtime test) and this reference, indexed in SKILL.md.
+    skill = SKILLS / "tt-project-harness"
+    assert "](references/service-changes.md)" in (skill / "SKILL.md").read_text(encoding="utf-8")
+    text = " ".join((skill / "references" / "service-changes.md").read_text(encoding="utf-8").split())
+    for part in ("unless its task says to", "`ttp svcscan <script>`", "`ttp svcscan --shim <dir>`",
+                 "`PATH=<dir>:\"$PATH\" <script>`", "a local shim does not stop it"):
         assert part in text, part
+    worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    assert "or restart a shared service, unless your task says to" in worker
 
 
 def test_suite_keeps_pytest_temp_dirs_small(pytestconfig):

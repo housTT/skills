@@ -6087,7 +6087,15 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("svcscan", help="flag service unit changes (systemctl stop/disable/mask/start/restart/"
                                        "enable/unmask, also under sudo) in scripts before running them; "
-                                       "--shim writes stand-ins that only log")
+                                       "--shim writes stand-ins that only log", description=(
+        "Check a driver with `ttp svcscan <script>` before running it on a shared machine: never stop, "
+        "restart, disable or mask a shared service unless your task says to. It flags any systemctl verb but "
+        "a read-only query (also under sudo -n, in Python argv lists and across backslash-continued lines) "
+        "and `service <unit> stop|restart|...`. To exercise the driver without changing a real unit, run "
+        "`ttp svcscan --shim <dir>`, then `PATH=<dir>:\"$PATH\" <script>`: the stand-ins log each change to "
+        "<dir>/svcscan.log and pass only read-only queries to the real systemctl. A call by path "
+        "(/usr/bin/systemctl, ./systemctl) or over ssh is flagged as such: a local shim does not stop it, so "
+        "edit it out. Exit codes: 0 none found, 1 a unit change found, 2 a script cannot be read."))
     s.add_argument("files", nargs="*", help="scripts to check; exits 1 if one changes a unit, 2 if one cannot be read")
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for systemctl, service and sudo "
                                                  "into DIR (put DIR first on PATH)")
