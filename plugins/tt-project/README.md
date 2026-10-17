@@ -83,8 +83,8 @@ tt-project skill, not two. Every `ttp setup` refreshes it. If you already have y
 
 tt-project is not on `main` yet, so adding the marketplace from `main` does not find it. Install
 a release ref instead: a tag or branch of `tenstorrent/skills` that your team publishes for tt-project.
-Set `TT_PROJECT_REF` to it (the commands below use `$TT_PROJECT_REF`; `install.sh` reads the same
-variable, and empty means the default branch). You need Python 3.9+, `git` with `user.name` and `user.email`
+Set `TT_PROJECT_REF` to it (the commands below use `$TT_PROJECT_REF`; the one-line install above reads the same
+variable, set at its front, and empty means the default branch). You need Python 3.9+, `git` with `user.name` and `user.email`
 set, and a logged-in agent CLI to run the project's workers.
 
 Claude Code (a branch or tag goes after `#`):
