@@ -2410,13 +2410,6 @@ def test_replay_a_hanging_gh_in_the_pr_watcher_does_not_stall_the_tick(env, monk
     assert p.db.one("SELECT last_status FROM schedules WHERE name='prs'")["last_status"].startswith("error: timed out")
 
 
-def _until(cond, within=10.0):
-    end = time.monotonic() + within
-    while not cond() and time.monotonic() < end:
-        time.sleep(0.05)
-    assert cond(), f"not within {within} s"
-
-
 def test_a_command_schedule_killed_by_a_daemon_stop_records_nothing_and_stays_due(env):
     """The stop kills the run's group; the command then ends -9, which is not its result: no error
     issue, no event to wake the coordinator, no last_run. The next daemon runs it again."""
@@ -2427,7 +2420,7 @@ def test_a_command_schedule_killed_by_a_daemon_stop_records_nothing_and_stays_du
     d = dm.Daemon(p.base)
     d.run_schedules()
     run = d._sched_runs["long"]
-    _until(lambda: p.db.kv(schedrun.GROUPS_KEY))
+    assert _wait_for(lambda: p.db.kv(schedrun.GROUPS_KEY), 10)
     events = p.db.one("SELECT COUNT(*) n FROM events")["n"]
     assert schedrun.stop(p.db, list(d._sched_runs.values())), "the stop killed its group"
     assert run.done.wait(5)
@@ -2449,7 +2442,7 @@ def test_a_heal_fix_killed_by_a_daemon_stop_does_not_escalate_and_rechecks_next_
     d1 = dm.Daemon(p.base)
     d1.run_schedules()
     run = d1._sched_runs["svc"]
-    _until(lambda: heal.state(p.db, "svc").get("phase") == "fixing" and p.db.kv(schedrun.GROUPS_KEY))
+    assert _wait_for(lambda: heal.state(p.db, "svc").get("phase") == "fixing" and p.db.kv(schedrun.GROUPS_KEY), 10)
     assert schedrun.stop(p.db, list(d1._sched_runs.values()))
     assert run.done.wait(5)
     d1.run_schedules()
