@@ -2007,8 +2007,20 @@ def cmd_checks(a) -> None:
                 passed, failed, todo = False, c, []
                 break
         arrived = _checks_arrived()
-        slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived)
+        fresh_ok = not a.fresh
+        slot = (_checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
+                             _checks_key(p, tree, todo, purpose) if fresh_ok else "",
+                             (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None)
                 if todo and not hit else None)
+        # Checks of the same tree may have passed while these waited (the same checks running beside
+        # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
+        if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
+            slot.close()
+            hit, slot = again, None
+            said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
+                    f"at {timefmt.long(float(hit.get('ts') or 0), p)} (recorded while these waited for a "
+                    f"checks slot); --fresh runs them again (full output: {hit.get('log') or 'not kept'})")
+            out.write(f"{said}\n")
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -2022,12 +2034,12 @@ def cmd_checks(a) -> None:
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
             env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
-            rc = _run_check(push.check_argv(c, top, env), group, cwd=top, stdout=out, stderr=subprocess.STDOUT,
+            rc = _run_check(_low_priority(push.check_argv(c, top, env)), group, cwd=top, stdout=out, stderr=subprocess.STDOUT,
                             env=env, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
             if rc != 0:
                 passed, failed = False, c
                 break
-        if slot:
+        if slot and not passed:
             slot.close()
     if handover:
         try:
@@ -2099,6 +2111,8 @@ def cmd_checks(a) -> None:
         extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
         if extras:
             _record_pass(p, tree, extras, purpose, run_dir)
+        if slot:
+            slot.close()
         print(f"ttp checks: FAST-PATH pass on {head[:12]} (whitespace and CRLF checks"
               + (f" and {len(extras)} command(s) after `--`" if extras else "")
               + f"); the project's checks did NOT run, so this is not a full pass and does not count for a PR "
@@ -2111,6 +2125,9 @@ def cmd_checks(a) -> None:
         return
     if todo:
         _record_pass(p, tree, todo, purpose, run_dir)
+    # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
+    if slot:
+        slot.close()
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
@@ -2230,6 +2247,9 @@ CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run
                    "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
                    "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
+# The daemon's request that the run's checks stop waiting for a slot ({pid, started}): their task ended
+# (Daemon.reap_waiting_checks). Only a waiter with that pid and start time honours it, and only while it waits.
+CHECKS_SLOT_CANCEL = "checks-slot.cancel"
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
 
@@ -2245,14 +2265,45 @@ def _checks_arrived() -> float:
     return t if math.isfinite(t) and 0 < t <= now else now
 
 
+def _checks_key(p: Project | None, tree: str, cmds: list, purpose: str) -> str:
+    """What makes two `ttp checks` the same run (checkcap.acquire's `same`): project, tree, commands
+    and purpose, as _recorded_pass matches them; "" without a project or tree."""
+    if not p or not tree:
+        return ""
+    return hashlib.sha256(f"{p.name}\0{tree}\0{_commands_hash(cmds)}\0{purpose}".encode()).hexdigest()[:24]
+
+
+def _low_priority(argv: list) -> list:
+    """A check command's argv under `nice -n 19` and `ionice -c3` where they exist, so a host's
+    interactive and build work goes first; checks.nice false (account setting) runs it as it is."""
+    if (load_account_settings().get("checks") or {}).get("nice") is False:
+        return argv
+    return ((["nice", "-n", "19"] if shutil.which("nice") else [])
+            + (["ionice", "-c3"] if shutil.which("ionice") else []) + list(argv))
+
+
+def _checks_cancelled(run_dir: Path) -> str:
+    """Why this process should stop waiting for a checks slot (CHECKS_SLOT_CANCEL names it), or ""."""
+    from .runner import proc_start
+    try:
+        req = json.loads((run_dir / CHECKS_SLOT_CANCEL).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(req, dict) or req.get("pid") != os.getpid() or req.get("started") != proc_start(os.getpid()):
+        return ""
+    return str(req.get("why") or "the task ended")
+
+
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
-                 arrived: float | None = None):
+                 arrived: float | None = None, same: str = "", done=None):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
     clock, and it ends after checkcap.FOREGROUND_WAIT_S: None then means the caller hands over to
     detached checks. With no project there is nobody to start them detached, so it waits on. `arrived`
-    is the place in the queue (default now). Slots it cannot write end the run (exit 2), never uncapped."""
+    is the place in the queue (default now); `same` and `done` as for checkcap.acquire. A cancel request
+    for this process (CHECKS_SLOT_CANCEL) ends the wait and the run (exit 1). Slots it cannot write end
+    the run (exit 2), never uncapped."""
     from . import checkcap, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -2282,7 +2333,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     try:
         return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
-                                p.name if p else None, checkcap.task_priority(p))
+                                p.name if p else None, checkcap.task_priority(p), same, done, lambda: _checks_cancelled(run_dir))
+    except checkcap.Cancelled as e:
+        said = f"not run: stopped waiting for a host-wide checks slot: {e}"
+        out.write(f"ttp checks: {said}\n")
+        out.flush()
+        die(f"ttp checks: {said}", 1)
     except checkcap.Unavailable as e:
         out.write(f"ttp checks: {e}\n")
         out.flush()
@@ -2487,17 +2543,43 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
           "(done or needs_review) in the waiting hand-off's on_pass; a pass records it without a model run")
 
 
+def _checks_place(run_dir: Path, old: dict, env: dict) -> float:
+    """The arrival time a launch queues at for a host-wide checks slot: the earlier of the handed-over
+    one (checkcap.ARRIVED_ENV in `env`) and, when the checks it restarts or replaces were still waiting
+    for a slot (CHECKS_SLOT_WAIT names their pid), theirs (checks.pid's arrived); else now."""
+    from . import checkcap
+    now = time.time()
+    seen = []
+    try:
+        seen.append(float(env.get(checkcap.ARRIVED_ENV, "")))
+    except ValueError:
+        pass
+    try:
+        wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
+    except (OSError, ValueError):
+        wait = {}
+    if isinstance(wait, dict) and isinstance(old.get("pid"), int) and wait.get("pid") == old.get("pid"):
+        try:
+            seen.append(float(old.get("arrived") or old.get("ts") or ""))
+        except (TypeError, ValueError):
+            pass
+    seen = [t for t in seen if math.isfinite(t) and 0 < t <= now]
+    return min(seen) if seen else now
+
+
 def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "") -> int:
     """Launch outside the tool sandbox, cancelling the earlier host process before replacing its
     metadata. The child runs the checks only on this launcher's `go`, sent once checks.pid durably
     names it (or, if the launcher died after that write, once it finds itself named there): a
     launcher that dies before the write leaves a child that starts nothing. `req` is the queued
-    request this launch serves (detach.tend)."""
+    request this launch serves (detach.tend). Checks it restarts or replaces while they still wait for a
+    host-wide slot hand their place in the queue to this launch (_checks_place)."""
     from .push import pid_ns
     from .runner import boot_id, proc_start
-    from . import checkdirs
+    from . import checkcap, checkdirs
     checkdirs.writable(str(run_dir))
     old = _read_checks_pid(run_dir)
+    arrived = _checks_place(run_dir, old, env)
     if _checks_alive(old):
         try:
             os.killpg(old["pid"], signal.SIGTERM)
@@ -2533,8 +2615,10 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         # The supervisor records checks.log/rc in the original run; commands get the report dir.
         env['TTP_RUN_DIR'] = str(run_dir)
         env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
+        env[checkcap.ARRIVED_ENV] = repr(arrived)
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
+        (run_dir / CHECKS_SLOT_CANCEL).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
@@ -2545,7 +2629,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
             write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
                                               "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
                                               "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
-                                              **_harness_purpose(a), "req": req, "pidns": pid_ns(),
+                                              **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
             try:

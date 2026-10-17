@@ -60,9 +60,9 @@ def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
     return [Path(locks_dir) / f"{resource}.{i}.lock" for i in range(max(int(slots or 1), 1))]
 
 
-def try_take(paths: list[Path], holder: str, what: str = ""):
-    """The open file of the first free slot, now held and labelled with its holder; None if all
-    are taken."""
+def try_take(paths: list[Path], holder: str, what: str = "", key: str = ""):
+    """The open file of the first free slot, now held and labelled with its holder (and `key`, what
+    the holder runs, when given); None if all are taken."""
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         f = open(path, "a+")
@@ -73,7 +73,7 @@ def try_take(paths: list[Path], holder: str, what: str = ""):
             continue
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300]}))
+        f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {})}))
         f.flush()
         return f
     return None

@@ -944,7 +944,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
-        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -1944,6 +1944,43 @@ class Daemon:
         if not seen:
             return now
         return min(now, max(max(seen), r["started"] or 0))
+
+    def reap_waiting_checks(self, every_s: float = 60.0) -> None:
+        """Stop the detached checks of an ended task's runs (done, failed or changes_needed, cancelled)
+        that still wait for a host-wide checks slot: nobody reads their result any more, and each holds
+        a place other tasks' checks wait behind. A cancel request (cli.CHECKS_SLOT_CANCEL) names the
+        waiter by pid and start time, and only that process honours it, only while it waits: checks
+        that hold a slot already run on to their end. Tasks that ended within the last day only."""
+        now = time.time()
+        if now - getattr(self, "_reaped_checks", 0.0) < every_s:
+            return
+        self._reaped_checks = now
+        from .cli import CHECKS_SLOT_CANCEL, CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs JOIN tasks ON tasks.id=runs.task "
+                             f"WHERE tasks.status IN ({marks}) AND tasks.updated > ?",
+                             (*TERMINAL_TASK_STATES, now - 86400)):
+            run_dir = self._run_dir(r)
+            try:
+                wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
+            except (OSError, ValueError):
+                continue
+            info = _read_checks_pid(run_dir)
+            if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
+                continue
+            req = {"pid": info["pid"], "started": info["started"], "why": f"task #{r['task']} ended ({r['status']})"}
+            try:
+                if json.loads((run_dir / CHECKS_SLOT_CANCEL).read_text()) == req:
+                    continue
+            except (OSError, ValueError):
+                pass
+            try:
+                durable_write(run_dir / CHECKS_SLOT_CANCEL, json.dumps(req))
+            except OSError as e:
+                log(self.p, f"run {r['id']}: waiting checks of ended task #{r['task']} not stopped: {e}")
+                continue
+            log(self.p, f"run {r['id']}: asked the checks of ended task #{r['task']} (pid {info['pid']}) to stop "
+                        "waiting for a host-wide checks slot")
 
     def reap_runs(self) -> None:
         up = self._awake.tick()

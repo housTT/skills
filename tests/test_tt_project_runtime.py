@@ -479,6 +479,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH",
                 "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
         monkeypatch.delenv(var, raising=False)
@@ -25994,6 +25995,8 @@ def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
     assert "queued for a host-wide checks slot: 1 of 1 running, 2 ahead, 3 projects" in told[0]
     assert checkcap.state()["queued"] == ["a1", "b1", "c1", "a2", "b2", "a3"], "status lists them in serving order"
     assert "1 running (cap 1), 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
+    assert checkcap.line().endswith("; next per project: a1 0 ahead, b1 1 ahead, c1 2 ahead"), \
+        "each project's next waiter shows how many are served before it"
     held.close()
     for w in waiters:
         w.join(20)
