@@ -34,6 +34,9 @@ WINDOW_H = 6.0         # checks.shared_window_h: how far back their failures cou
 BACKOFF_H = 2.0        # checks.shared_backoff_h: a held task's checks run again after this at the latest
 RERUNS_MAX = 3         # reruns on one head before the task wakes as before
 KEEP_S = 7 * 86400     # failure rows kept this long
+# A review the push queue failed on its batch checks (review_failure check_only, pushq._settle):
+# the failing ids, and whether they are all of them (failing_ids).
+FAILING_KEY, COMPLETE_KEY = "failing_tests", "failing_tests_complete"
 
 _ID = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?)(?=\s|$)", re.M)
 # pytest's last summary line: bare under -q, wrapped in '=' at the default verbosity.
@@ -183,6 +186,31 @@ def _spec(ids: list[str], excerpt: str, tasks: list[int]) -> str:
             + f"\n\nTasks held: {', '.join(f'#{t}' for t in tasks)}\n\nExcerpt of one failing run:\n```\n"
             + excerpt[-1500:] + "\n```\n\nReproduce on the push-branch tip, find the cause and fix it there "
             "(test, code or environment), with a test. Never skip or weaken the required checks.")
+
+
+def covered(db: DB, ids: list[str], skip: set[int] | frozenset = frozenset()) -> str:
+    """What already owns every id ("" when one is not owned): an open incident whose fix task is
+    live, or a live code task (not in `skip`) whose title or spec names the id."""
+    if not ids:
+        return ""
+    ensure(db)
+    owners: list[str] = []
+    left = set(ids)
+    for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NULL ORDER BY id"):
+        fix = db.task(r["fix_task"]) if r["fix_task"] else None
+        if fix and fix["status"] not in TERMINAL_TASK_STATES and left & set(_rows(r["ids"])):
+            owners.append(f"incident {r['id']} (fix #{fix['id']})")
+            left -= set(_rows(r["ids"]))
+    if left:
+        done = sorted(TERMINAL_TASK_STATES)
+        live = [t for t in db.q("SELECT id, title, spec FROM tasks WHERE kind='code' AND status NOT IN "
+                                f"({','.join('?' * len(done))}) ORDER BY id", done) if t["id"] not in skip]
+        for i in sorted(left):
+            t = next((t for t in live if i in f"{t['title'] or ''}\n{t['spec'] or ''}"), None)
+            if t is None:
+                return ""
+            owners.append(f"#{t['id']}")
+    return ", ".join(dict.fromkeys(owners))
 
 
 def avoided(db: DB, iid: int, tid: int, usd: float) -> None:

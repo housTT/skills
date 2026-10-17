@@ -25,11 +25,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, obligations, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, reviewed_ids,
+                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, review_subject,
+                 reviewed_ids,
                  task_outcome, without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push, durable_append,
                       own_push, own_push_mode,
@@ -262,6 +263,7 @@ EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is no
 LOWERED_REVIEW = "task_review: plain hand-off, daemon reviews"
 LOWERED_KNOWN = "high severity event: known case"
 LOWERED_FAILED_REVIEW = "counted as failed review"
+LOWERED_CHECK_ONLY = "failed review: push checks only, already owned"
 RESOURCE_WAITS_ONLY = "waits only"   # a resource_trouble line that only counts waits is not trouble
 # A user message naming a change of plan may contradict the charter or memory.
 CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w*|scrap (that|this|it)|"
@@ -2459,7 +2461,10 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             continue
         # A failed or changes-needed review is one trigger, "failed review", not two from one hand-off.
         if r["kind"] in ("task_failed", "task_changes_needed") and r["task"] \
-                and (db.task(r["task"]) or {}).get("kind") == "review":
+                and (review := db.task(r["task"]) or {}).get("kind") == "review":
+            if r["kind"] == "task_failed" and (why := _owned_check_failure(db, review)):
+                low.append(f"{LOWERED_CHECK_ONLY}: event {r['id']} ({why})")
+                continue
             add("failed review")
             low.append(f"{r['kind']}: {LOWERED_FAILED_REVIEW}: event {r['id']}")
             continue
@@ -2587,6 +2592,20 @@ def _routine_review(db, cfg: dict, r) -> str:
     if rules.get("auto", True) and (d.get("review_before_pr", True) or d.get("push_branch")) and after > 0:
         return "the daemon's review sweep queues its review"
     return ""
+
+
+def _owned_check_failure(db, review: dict) -> str:
+    """Why a failed review is routine ("" when it is not): the push queue failed it on its batch
+    checks alone (review_failure check_only, with every failing test id known), and a shared-check
+    incident or a live fix task already owns each of those tests."""
+    res = load_result(review.get("result"))
+    ids = res.get(sharedchecks.FAILING_KEY)
+    if res.get("review_failure") != "check_only" or not isinstance(ids, list) or not ids \
+            or not res.get(sharedchecks.COMPLETE_KEY):
+        return ""
+    skip = {int(review["id"])} | ({s} if (s := review_subject(review)) is not None else set())
+    got = sharedchecks.covered(db, [str(i) for i in ids], skip)
+    return f"{len(ids)} failing test(s) owned by {got}" if got else ""
 
 
 def _known_case(db, r, last: float, now: float) -> str:

@@ -217,3 +217,63 @@ def test_touches_finds_commits_changing_the_failing_test_files(env):
     assert pushq.touches(p, old, new, ["tests/test_a.py"])
     assert not pushq.touches(p, old, new, ["tests/test_b.py"])
     assert pushq.touches(p, "0" * 40, new, ["tests/test_b.py"])   # git cannot tell: rerun
+
+
+def test_a_review_failed_only_by_batch_push_checks_is_check_only_and_routine_once_owned(env, monkeypatch):
+    """A recorded batch failure: the push queue fails the review with review_failure check_only and
+    the failing test ids, so the review-area cap skips it; the coordinator's effort rules keep it
+    routine only while a shared-check incident or a live fix task owns every failing test."""
+    from ttp import coordinator as coord, reviewcap, sharedchecks
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", row="check_failed", detail={"cmd": "pytest -q", "tail": _pytest_out(_IDS)})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    db, cfg = s.p.db, s.p.config()
+    t = db.task(s.review)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["review_failure"] == "check_only" and res["push_failed"]["cmd"] == "pytest -q"
+    assert res[sharedchecks.FAILING_KEY] == sorted(_IDS) and res[sharedchecks.COMPLETE_KEY] is True
+    assert s.review not in reviewcap.failed_reviews(db, 0) and reviewcap.area(s.p, cfg, t) is None
+    [ev] = [e["id"] for e in s.p.db.q("SELECT id FROM events WHERE id>? AND kind='task_failed' AND status='queued'",
+                                       (mark,))]
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+
+    def trig():
+        low: list = []
+        return coord.effort_triggers(db, cfg, [ev], None, [], None, time.time(), None, low)[0], low
+    assert trig()[0] == ["failed review"], "nothing owns the failing tests yet"
+    # A live fix task naming one test is not enough; naming both is.
+    fix = db.add_task("Fix flaky test", f"fix {_IDS[0]}", kind="code", origin="coordinator")
+    assert trig()[0] == ["failed review"]
+    db.update_task(fix, spec=f"fix {_IDS[0]} and {_IDS[1]}")
+    out, low = trig()
+    assert out == [] and low == [f"{coord.LOWERED_CHECK_ONLY}: event {ev} (2 failing test(s) owned by #{fix})"], low
+    db.update_task(fix, status="done")
+    assert trig()[0] == ["failed review"], "a finished fix task owns nothing"
+    # An open shared-check incident owns them while its fix task is live.
+    iid, opened = sharedchecks.incident(db, {"id": s.code}, list(_IDS), "boom", time.time(), cfg)
+    out, low = trig()
+    fid = db.one("SELECT fix_task FROM checks_incidents WHERE id=?", (iid,))["fix_task"]
+    assert opened and out == [] and f"owned by incident {iid} (fix #{fid})" in low[0], low
+    # Ids that may not be all of them (no complete pytest summary) still raise the turn.
+    db.update_task(s.review, result=json.dumps({**res, sharedchecks.COMPLETE_KEY: False}))
+    assert trig()[0] == ["failed review"]
+
+
+def test_a_batch_failure_without_pytest_ids_is_check_only_but_still_raises_the_turn(env, monkeypatch):
+    from ttp import coordinator as coord, sharedchecks
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", row="check_failed", detail={"cmd": "make lint", "tail": "lint: 3 errors"})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    res = json.loads(s.p.db.task(s.review)["result"])
+    assert res["review_failure"] == "check_only" and res[sharedchecks.FAILING_KEY] == []
+    [ev] = [e["id"] for e in s.p.db.q("SELECT id FROM events WHERE id>? AND kind='task_failed' AND status='queued'",
+                                       (mark,))]
+    assert coord.effort_triggers(s.p.db, s.p.config(), [ev], None, [], None, time.time(), None, [])[0] == \
+        ["failed review"]

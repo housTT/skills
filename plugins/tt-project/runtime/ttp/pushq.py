@@ -1060,8 +1060,12 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         cmd, tail = str(d.get("cmd") or "the push checks"), _tail_of(m, d)
         text = (f"the push checks failed on {r['branch'] or '?'} at {_short(r['head'])} in batch {b['id']}: "
                 f"`{cmd}`\n{tail}")
+        # The review found no code fault: only the checks failed (reviewcap's area cap and the
+        # coordinator's effort rules read review_failure and the failing ids).
+        ids, complete = sharedchecks.failing_ids(str(d.get("tail") or ""))
         db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
             {**prev, "status": "failed", "summary": f"{text}\n(review: {summary})"[:1500],
+             "review_failure": "check_only", sharedchecks.FAILING_KEY: ids, sharedchecks.COMPLETE_KEY: complete,
              "push_failed": {"branch": r["branch"], "head": r["head"], "cmd": cmd, "tail": tail[-1500:],
                              "batch": b["id"]}}))
         _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=True)
