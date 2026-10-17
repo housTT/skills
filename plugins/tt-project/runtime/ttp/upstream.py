@@ -1036,11 +1036,13 @@ def unconfirmed_summary(name: str | None, now: float | None = None) -> tuple[int
     return len(ages), max(ages, default=0.0)
 
 
-def quiet_confirmed(name: str | None, now: float | None = None) -> int:
-    """How many resolutions were closed as 'confirmed by quiet' (of project `name`'s notes, or all)."""
+def quiet_confirmed(name: str | None, since: float = 0.0) -> int:
+    """How many resolutions were closed as 'confirmed by quiet' at or after `since` (of project `name`'s
+    notes, or all); only acks that are still their note's current one."""
     recs = _records()
     mine = filed(name) if name else None
     return sum(1 for r in recs if r.get("kind") == "ack" and r.get("closed_by") == QUIET
+               and float(r.get("ts") or 0) >= since
                and (mine is None or r.get("fp") in mine) and acked(r["fp"], recs) is r)
 
 

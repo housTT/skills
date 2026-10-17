@@ -44466,7 +44466,12 @@ def test_upstream_quiet_confirm_closes_after_the_window_and_lists_it_separately(
     ev = upstream.acked(fp)["evidence"]
     assert ev.startswith("confirmed by quiet: ran 1.5.0 for 3 days") and "no regression or re-filed note" in ev
     assert upstream.state(fp) == "closed" and upstream.unconfirmed("demo", now + 9 * 86400) == []
-    assert upstream.quiet_confirmed("demo") == 1
+    closed_at = upstream.acked(fp)["ts"]
+    assert upstream.quiet_confirmed("demo", closed_at - 86400) == 1
+    assert upstream.quiet_confirmed("demo", closed_at + 1) == 0   # a window that starts after the ack
+    from ttp import audit
+    assert "upstream fixes confirmed by quiet: 1" in audit.lines(p.db, closed_at + 3600, p=p)
+    assert audit.lines(p.db, closed_at + 2 * 86400, p=p) == [audit.NOTHING]   # the next day: nothing
 
 
 def test_upstream_quiet_confirm_is_blocked_by_regression_refile_unknown_filer_and_off_switch(env):
@@ -44480,27 +44485,41 @@ def test_upstream_quiet_confirm_is_blocked_by_regression_refile_unknown_filer_an
     got = _quiet_run(p, a, now)
     assert got == [], (got, a, b)
     assert upstream.state(b) == upstream.SHIPPED
-    assert upstream.follow_up_unconfirmed(p, "", None, now + 9 * 86400) == []   # unknown filer version
+    off = {"upstream": {"quiet_confirm_days": 0}}
     c = _filed_long_ago("upstream: off", now)
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", off, now + 5 * 86400) == []   # starts c's window
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", off, now + 9 * 86400) == []   # past it, but off
+    assert upstream.state(c) == upstream.SHIPPED
+    d = _filed_long_ago("upstream: unknown", now)
     p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", {"upstream": {"quiet_confirm_days": 0}}, now + 5 * 86400) == []
-    assert upstream.state(c) == upstream.SHIPPED and upstream.quiet_confirmed("demo") == 0
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 6 * 86400) == []   # starts d's window
+    p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
+    assert upstream.follow_up_unconfirmed(p, "", None, now + 10 * 86400) == []   # unknown filer version
+    assert upstream.state(d) == upstream.SHIPPED and upstream.quiet_confirmed("demo") == 0
+    # with the switch on and the version known, both would have closed
+    assert sorted(upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10 * 86400)) == sorted([c, d])
 
 
 def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_the_forwarder(env):
     from ttp import upstream
     p = make(env)
     now = time.time()
-    fp = _shipped(p, "upstream: fwd", 30, now)
-    upstream.follow_up_unconfirmed(p, "1.5.0", None, now)
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10) == []
-    # the note came from a peer: its ack is in what the forwarder sends back
+    fp = _filed_long_ago("upstream: fwd", now)
+    # a note this project filed whose resolution came back from a peer
     with open(upstream.path(), "a") as fh:
         fh.write(json.dumps({"title": "upstream: rxq", "spec": "z", "fp": (rx := upstream.fingerprint("upstream: rxq", "z")),
-                             "host": __import__("ttp.project", fromlist=["x"]).hostname(), "ts": now - 40 * 86400, "project": "far"}) + "\n")
+                             "host": __import__("ttp.project", fromlist=["x"]).hostname(), "ts": now - 40 * 86400,
+                             "project": "demo", "task": 4}) + "\n")
     assert upstream._take_resolved("peer", [{"kind": "resolve", "fp": rx, "fixed_in": "1.0.0", "ts": 5.0}]) == 1
-    upstream._record({"kind": "ack", "fp": rx, "project": "far", "ts": now, "closed_by": upstream.QUIET,
-                      "evidence": "confirmed by quiet: ran 1.5.0 for 3 days, no regression or re-filed note"})
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []   # first sight starts both windows
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10) == []
+    later = now + 4 * 86400
+    p.db.set_kv(upstream.KV_QUIET_CHECKED, later - 10)   # a pass ran just before
+    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, later) == []   # past the window, within QUIET_EVERY_S
+    assert upstream.unconfirmed("demo", later) == [fp, rx]
+    got = upstream.follow_up_unconfirmed(p, "1.5.0", None, later - 10 + upstream.QUIET_EVERY_S)
+    assert sorted(got) == sorted([fp, rx])
+    assert upstream.acked(rx)["closed_by"] == upstream.QUIET
     lines, _ = upstream._acks_to_send("peer", 0, 10 ** 6)
     sent = [json.loads(x) for x in lines]
     assert len(sent) == 1 and sent[0]["fp"] == rx and sent[0]["evidence"].startswith("confirmed by quiet")

@@ -21,7 +21,9 @@ the project could have saved. Model-free; the review grades it.
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
 - overrides held longer than `blocked_h`: resource pauses and active mutes, and temporary instructions
   whose end only a model can judge that were listed as possibly over a day or more ago; and at any
-  age, a resource pause with no end or whose `until` has passed.
+  age, a resource pause with no end or whose `until` has passed;
+- upstream fixes shipped but not confirmed yet (how many, the oldest's age), and resolutions closed
+  as 'confirmed by quiet' in the window.
 
 An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
 only the project's own database and harness files."""
@@ -366,7 +368,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         if n:
             out.append(f"upstream fixes shipped, not confirmed: {n}, oldest {_dur(oldest)} since resolved")
         try:
-            q = upstream.quiet_confirmed(p.name, now)
+            q = upstream.quiet_confirmed(p.name, since)
         except OSError:
             q = 0
         if q:
