@@ -110,7 +110,7 @@ check out the tag with `git` and copy the plugin into Cursor's local plugin fold
 follow Cursor's plugin documentation and have not been tested end to end yet:
 
 ```bash
-git clone --depth 1 --branch $TT_PROJECT_REF https://github.com/tenstorrent/skills.git tt-skills-dogfood
+git init -q tt-skills-dogfood && git -C tt-skills-dogfood fetch -q --depth 1 https://github.com/tenstorrent/skills.git "$TT_PROJECT_REF" && git -C tt-skills-dogfood -c advice.detachedHead=false checkout -q FETCH_HEAD
 mkdir -p ~/.cursor/plugins/local
 cp -R tt-skills-dogfood/plugins/tt-project ~/.cursor/plugins/local/tt-project
 ~/.cursor/plugins/local/tt-project/bin/ttp setup

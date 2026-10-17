@@ -156,7 +156,8 @@ def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
     assert not any(ref in section for ref in PUBLISHED_REFS)
     assert f'claude plugin marketplace add "https://github.com/tenstorrent/skills.git#{tag}"' in section
     assert f"codex plugin marketplace add tenstorrent/skills --ref {tag}" in section
-    assert f"git clone --depth 1 --branch {tag} " in section
+    assert "git clone" not in section  # clone --branch <annotated tag> warns "is not a commit" on Apple git
+    assert f'fetch -q --depth 1 https://github.com/tenstorrent/skills.git "{tag}"' in section
     for cmd in (f"claude plugin install {plugin}@{market}", f"codex plugin add {plugin}@{market}",
                 f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
                 "bin/ttp\" setup", "ttp new ", "ttp stop <name> --kill"):
