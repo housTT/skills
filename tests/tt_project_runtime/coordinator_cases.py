@@ -715,6 +715,47 @@ def test_mute_replay_of_a_held_box_wakes_the_coordinator_an_hour_in(env, monkeyp
     assert "persisting 5.5 h" in coord.digest(p, {}, [], [])
 
 
+@pytest.mark.parametrize("cap,cap_h,ask_h", [(None, 1.0, 1.0), (1.5, 1.5, 1.5), (10, 6.0, 2.0)])
+def test_a_muted_hold_asks_within_its_cap_and_never_stops_the_outage_task(env, monkeypatch, cap, cap_h, ask_h):
+    """screen.hold_mute_escalate_h (screen.hold_cap: default 1 h, at most 6) caps how long a mute covering a
+    device hold stays silent (under the cap, the mute's own 2 h applies); the machine ledger still routes the held box to an outage task at the owner's
+    budget (heal.outage_owner_budget_min, 60) whatever the mute says."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import screen as scr
+    p = make(env, "alpha")
+    if cap is not None:
+        p.set_config("screen.hold_mute_escalate_h", cap)
+    assert scr.hold_cap(p.config()) == cap_h
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha", fallback="beta")
+    clock = {"t": time.time() - 8 * 3600}
+    t0 = clock["t"]
+    monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
+    held = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True,
+                       "machine": "box-a", "condition": "held"})
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, held, ""))
+    d = dm.Daemon(p.base)
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held",
+                            "hours": 24, "why": "known"}]) == []
+    tasks = []
+    for m in range(10, 7 * 60 + 1, 10):
+        clock["t"] = t0 + m * 60
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+        for x in ml.route(clock["t"], able=lambda n: (True, ""), healthy=lambda *a: [],
+                          quiet=lambda c, now, doc: ("", False)):
+            ml.delivered(x)
+            if x["kind"] == "machine_outage_task":
+                tasks.append((m, x["target"]))
+    asks = [(e["ts"] - t0) / 3600 for e in p.db.q("SELECT ts FROM events WHERE text LIKE ?",
+                                                  (f"%{scr.MUTE_PERSISTS}%",))]
+    assert asks == [ask_h], asks
+    assert tasks == [(60, "beta")], tasks
+
+
 
 @pytest.mark.parametrize("var", ["TTP_RUN_ID", "TTP_RUN_DIR"])
 def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, var):
