@@ -4050,6 +4050,29 @@ def test_the_tx_guard_refuses_a_git_network_command_inside_a_write_transaction(t
         subprocess.run(remote, capture_output=True)   # guard off: only recorded for the slow-tx log
 
 
+def test_the_tx_guard_adds_one_audit_hook_per_process_however_often_ttp_is_imported(tmp_path, monkeypatch):
+    """An audit hook cannot be removed and runs on every audit event (id() raises one, so deepcopy pays
+    per object): a hook per fresh import of ttp (as each test's env fixture does) made the suite
+    quadratic. One hook serves every import; the newest import's guard raises and an older import's
+    open transaction still records its subprocesses."""
+    real, added = sys.addaudithook, []
+    monkeypatch.setattr(sys, "addaudithook", lambda f: added.append(f) or real(f))
+    monkeypatch.setenv("TTP_TX_GUARD", "1")
+    dbs = []
+    for i in range(3):
+        for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
+            monkeypatch.delitem(sys.modules, mod)
+        from ttp import db as dbm
+        dbs.append(dbm)
+        with dbm.DB(tmp_path / f"{i}.db").tx():
+            subprocess.run(["true"], check=True)
+    assert len({id(m) for m in dbs}) == 3 and len(added) <= 1, added
+    assert dbs[0].TxNetworkError is dbs[-1].TxNetworkError
+    with pytest.raises(dbs[-1].TxNetworkError):
+        with dbs[0].DB(tmp_path / "old.db").tx():
+            subprocess.run(["git", "fetch", "origin"], capture_output=True)
+
+
 def test_run_end_reads_the_root_checkout_after_its_transaction_commits(env, monkeypatch):
     """git status of the project root (_note_dirty_main) can take long in a large repository; it runs
     after the run-end transaction commits, never while every other process waits for its lock."""

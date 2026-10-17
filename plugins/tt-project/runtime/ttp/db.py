@@ -187,12 +187,24 @@ SLOW_TX_S = 5.0
 # as long as the network takes). Ask before the transaction, or read a cached answer inside it.
 GIT_NETWORK = frozenset({"ls-remote", "fetch", "push", "pull", "clone"})
 _GIT_OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
-_tx_local = threading.local()   # .spawns: [(seconds into the transaction, argv)] while one is open
-_hooked = False
+# sys.addaudithook cannot remove a hook, and every hook runs on every audit event (id() raises one,
+# so deepcopy pays per object). One hook per process however often ttp is imported afresh: it, the
+# per-thread state and TxNetworkError live in sys.modules under a name outside ttp; it calls the
+# _audit of the latest import to open a transaction.
+_SHARED = "_ttp_db_audit"
+_shared = sys.modules.get(_SHARED)
+if _shared is None:
+    _shared = sys.modules[_SHARED] = type(sys)(_SHARED)
+    _shared.local = threading.local()
+    _shared.audit = None
+_tx_local = _shared.local   # .spawns: [(seconds into the transaction, argv)] while one is open
 
 
 class TxNetworkError(RuntimeError):
     """A git network command started inside a write transaction while the guard is on (TTP_TX_GUARD=1)."""
+
+
+TxNetworkError = _shared.__dict__.setdefault("TxNetworkError", TxNetworkError)   # one class for every import
 
 
 def git_network(argv: Any) -> str:
@@ -230,10 +242,15 @@ def _argv_text(argv: Any) -> str:
 
 
 def _hook() -> None:
-    global _hooked
-    if not _hooked:
-        _hooked = True
-        sys.addaudithook(_audit)
+    first = _shared.audit is None
+    _shared.audit = _audit
+    if first:
+        shared = _shared
+
+        def hook(event: str, args: tuple) -> None:
+            if event == "subprocess.Popen":
+                shared.audit(event, args)
+        sys.addaudithook(hook)
 
 
 def _slowest(spawns: list, ended: float) -> str:
