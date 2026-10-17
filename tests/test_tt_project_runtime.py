@@ -6022,20 +6022,21 @@ def test_tried_work_ledger_match_is_linear_in_spec_length_and_ledger_size(env):
     for i in range(tried.LEDGER_ROWS):
         t = p.db.add_task(f"stage {i}: {rng.choice(vocab)} {rng.choice(vocab)} lever", long_spec(i), origin="user")
         p.db.update_task(t, status="done", attempts=1)
+    # CPU time, not wall time: host load must not fail the bounds.
     new_spec = long_spec(9999)
     assert len(new_spec) >= 7900
     for f in (tried.params, tried.words, tried.content):
         getattr(f, "cache_clear", lambda: None)()   # from cold
-    start = time.monotonic()
+    start = time.process_time()
     tried.match(p.db, "stage 9999: fabing vaeer lever", new_spec, p)
-    assert time.monotonic() - start < 10, "tried.match scales with the square of spec length or ledger size"
+    assert time.process_time() - start < 10, "tried.match scales with the square of spec length or ledger size"
     # The daemon keeps each entry's words and parameters: the next task_add reads only its own spec.
-    start = time.monotonic()
+    start = time.process_time()
     tried.match(p.db, "stage 10000: tileer cacheode lever", long_spec(10000), p)
-    assert time.monotonic() - start < 1, "tried.match recomputes every ledger entry per check"
-    start = time.monotonic()
+    assert time.process_time() - start < 1, "tried.match recomputes every ledger entry per check"
+    start = time.process_time()
     big = tried.params(" ".join(new_spec for _ in range(8)))
-    assert big and time.monotonic() - start < 2, "params rescans the text before each number"
+    assert big and time.process_time() - start < 2, "params rescans the text before each number"
     # The window before a number keeps the bound and name checks' results.
     assert tried.params(("filler words " * 50) + "at most 600 and Llama 3.1 and 7 items") == {"600"}
 
