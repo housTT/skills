@@ -3544,3 +3544,13 @@ def test_setup_box_ssh_workflow_scripts_resolve_own_dir():
     text = (SKILLS / "setup-box" / "ssh-workflow.md").read_text(encoding="utf-8")
     assert "finds its location from its own directory" in text
     assert "never from a hard-coded absolute path" in text
+
+
+def test_worker_prompt_keeps_idleness_evidence_and_shared_script_rules():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("concurrently only under `ttp lock <name>` or git", "`journalctl` over boots: tt-project-harness watchers reference"):
+        assert part in text, part
+    # The idleness-evidence line renders for a device-only project, not only for clusters.
+    dev = text.split("<!-- ttp:if device -->")[1].split("<!-- /ttp:if device -->")[0]
+    assert "names its evidence" in dev and "auth log" in dev
+    assert "names its evidence" not in text.split("<!-- ttp:if clusters -->")[1].split("<!-- /ttp:if clusters -->")[0]

@@ -73,6 +73,7 @@ Other workers run other tasks of this project at the same time.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
   empty). Never unset or override the masking variables to work around this.
   Who held a machine when: `ttp machines activity <alias>`.
+  A claim that a machine was idle or nothing ran names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo runs and rotate).
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
@@ -92,23 +93,21 @@ Other workers run other tasks of this project at the same time.
 
 ## Shared clusters (Slurm and other shared machines)
 
-Others share these nodes: hold one only while work runs on it.
+Others share these nodes: hold one only while work runs.
 
-- Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or
-  limits, stay within them; beyond them needs the user's word: hand off `blocked` asking, never
-  widen your own scope. All busy: hand off `waiting`.
-- A claim that a machine was idle or nothing ran names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo invocations; they rotate).
-- Never take a node that is allocated, drained, reserved for others or down. Never cancel,
-  preempt, join or share another user's allocation.
+- Get nodes only through the cluster's scheduler. Stay within the nodes, partitions and limits the
+  charter names; beyond them needs the user's word: hand off `blocked` asking. All busy: hand off `waiting`.
+- Never take a node that is allocated, drained, reserved or down. Never cancel,
+  preempt or join another user's allocation.
 - Submit the whole test as one batch job (`sbatch`, or `srun` for one command) that exits when the
-  test ends, limited to the expected run time plus a small margin, never the partition maximum. No
-  interactive or no-shell allocation (`salloc --no-shell`) kept for later steps, and no job
+  test ends, limited to the expected run time plus a margin, never the partition maximum. No
+  interactive or no-shell allocation (`salloc --no-shell`) kept for later steps, no job
   waiting on another task, a review, a tunnel, a laptop or a human.
 - The job script starts every process it needs and kills them all before it exits; never start
-  any by `ssh` into an allocation. Releasing must depend on nothing outside the cluster.
-- An editor, `tmux` or agent session on a node is not using it; do not leave one open.
-- Release the allocation as soon as the work ends. Record every allocation (cluster, job id, node,
-  start, end, purpose) with `ttp note` and in the hand-off, then check nothing of yours still runs
+  any by `ssh`. Release must depend on nothing outside the cluster.
+- An editor, `tmux` or agent session on a node is not using it; leave none open.
+- Release the allocation when the work ends. Record every allocation (cluster, job id, node,
+  start, end, purpose) with `ttp note` and in the hand-off; check nothing of yours still runs
   on the node (or say you could not).
 <!-- /ttp:if clusters -->
 
@@ -264,7 +263,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 <!-- /ttp:if wait -->
 - Write large results incrementally, flushing before any host reset.
 <!-- ttp:if wait -->
-- A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot launched executables). Edit shared scripts via a temp file plus `mv`, never in place.
+- A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot launched executables; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temp file plus `mv`, never in place; concurrently only under `ttp lock <name>` or git.
 <!-- /ttp:if wait -->
 - A follow-up implying a device or machine experiment names, first, the resource the charter permits.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
