@@ -3657,8 +3657,8 @@ def cmd_task(a) -> None:
         die("--start-when, --start-after and --why go with add; for a queued task use set-when")
     if a.action != "set-when" and a.on_pass_cmd is not None:
         die("--on-pass-cmd goes with set-when")
-    if a.action != "superseded" and a.ref is not None:
-        die("--ref goes with superseded")
+    if a.action != "superseded" and (a.ref is not None or a.repo is not None):
+        die("--ref and --repo go with superseded")
     if a.action == "add":
         try:
             tid, note = add_task(p, a)
@@ -3706,7 +3706,7 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit() or not a.probe:
             die("superseded needs a task id and the commit that carries its work (on the push branch, or --ref)")
         try:
-            print(record_superseded(p, int(a.title), a.probe.strip(), a.ref))
+            print(record_superseded(p, int(a.title), a.probe.strip(), a.ref, a.repo))
         except ValueError as e:
             die(str(e))
 
@@ -6181,6 +6181,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on")
+    s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
+                   "(default: the repositories the task's runs worked in, then the project root)")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")

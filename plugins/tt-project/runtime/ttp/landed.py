@@ -330,7 +330,7 @@ def _run_dir_repos(p, tid: int) -> list[Path]:
     return list(dict.fromkeys(r for r in map(_repo_of, dirs) if r is not None and r.resolve() != root))
 
 
-def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
+def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str | None = None) -> str:
     """Record that done task `tid`'s work landed as `sha` (re-landed under another commit, e.g. after
     a push conflict), so the local-only check stops flagging its branch at the head it has now. The
     branch and `sha` are read in the repository the task worked in (its runs' working directories),
@@ -339,7 +339,8 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
     (not the branch's base or an older commit) and changes a file the branch changes; ValueError says
     why. A task with no branch on record needs `ref`: when it names a branch (looked up also in the
     repositories of its runs' worktrees) that does not hold `sha`, that branch is the task's work in a
-    second repository; else only `sha` on `ref` is needed (_record_branchless)."""
+    second repository; else only `sha` on `ref` is needed (_record_branchless). `repo`, a path, is searched
+    first, before the task's own repositories and the project root."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
@@ -347,6 +348,11 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
         raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not done")
     branch = task.get("branch") or ""
     repos = _task_repos(p, tid)
+    if repo:
+        rp = Path(repo).expanduser()
+        if not (rp / ".git").exists() and _git(rp, "rev-parse", "--git-dir").returncode != 0:
+            raise ValueError(f"--repo {repo} is not a git repository")
+        repos = [rp, *repos]
     if not branch:
         # A task whose work sits in a worktree of a second repository it made itself has no branch
         # on record: --ref names that branch, then read in each repository its runs touched. A task
@@ -370,7 +376,8 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None) -> str:
         raise ValueError(f"task #{tid} has no branch {branch} to record (checked {', '.join(checked)})")
     full = _commit(repo, sha)
     if not full:
-        raise ValueError(f"no commit {sha} in {repo}, the repository with branch {branch}")
+        raise ValueError(f"no commit {sha} in {repo}, the repository with branch {branch} "
+                         f"(searched {', '.join(map(str, dict.fromkeys([*repos, p.root])))})")
     if repo == p.root or ref:
         onto = ref or _push_ref(p, repo)
         rc, words = check(p, repo, full, onto=onto)

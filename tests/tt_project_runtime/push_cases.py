@@ -8214,3 +8214,40 @@ def test_upgrade_refreshes_the_digests_its_pre_merge_commit_changes(env, monkeyp
     else:
         assert "checks/harness.json" in files and "refreshed the digests of watch.py" in out, out
         assert checkplan.stale(h, cmd) == "" and checkplan.run(h, None, "checks/harness.json", "harness") == 0
+
+
+def test_superseded_repo_override_finds_a_commit_only_a_separate_clone_has(env, monkeypatch, tmp_path, capsys):
+    """The commit and the task's branch sit in a clone no run record points at: without --repo the error
+    names every path searched; --repo <path> searches that clone first and records; a path that is not a
+    repository, or a commit nowhere, is refused."""
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    clone = tmp_path / "clone"
+    _git_out(tmp_path, "init", "-q", "-b", "main", str(clone))
+    _commit(clone, "lib.txt", "one\n")
+    tid2 = p.db.add_task("work in a clone", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid2, status="done", branch=f"ttp/t{tid2}-x")
+    _git_out(clone, "checkout", "-q", "-b", f"ttp/t{tid2}-x")
+    _commit(clone, "lib.txt", "one\ntwo\n")
+    feat = _git_out(clone, "rev-parse", "HEAD")
+    _git_out(clone, "checkout", "-q", "-b", "pr-head", "main")
+    _commit(clone, "lib.txt", "one\ntwo, settled\n")
+    relanded = _git_out(clone, "rev-parse", "HEAD")
+    _git_out(clone, "checkout", "-q", "main")
+
+    assert ttp_task("superseded", str(tid2), relanded, "--ref", "pr-head") not in (0, None)
+    assert str(p.root) in capsys.readouterr().err
+    assert ttp_task("superseded", str(tid2), relanded, "--ref", "pr-head", "--repo", str(tmp_path / "nope")) not in (0, None)
+    assert "not a git repository" in capsys.readouterr().err
+    assert ttp_task("superseded", str(tid2), "0" * 40, "--ref", "pr-head", "--repo", str(clone)) not in (0, None)
+    err = capsys.readouterr().err
+    assert str(clone) in err and str(p.root) in err
+    assert ttp_task("superseded", str(tid2), relanded, "--ref", "pr-head", "--repo", str(clone)) == 0
+    assert landed.superseded(p.db, [tid2]) == {tid2: [(feat, relanded)]}
