@@ -8541,3 +8541,21 @@ def test_a_batch_failing_only_on_prompt_caps_sends_its_change_a_light_trim_to_fi
         if n <= conflictfix.TRIM_MAX:
             assert t["status"] == "queued" and json.loads(t["result"])[conflictfix.TRIMS] == n
     assert t["status"] == "failed" and "pytest -q" in json.loads(t["result"])["summary"], t
+
+
+def test_a_fix_of_a_failed_review_runs_at_least_standard(env, monkeypatch):
+    """The daemon's fix of a failed review, and a queued task that continues a failed review, never run light."""
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _, _, _, (rev,) = _finish_code(env, p, "lt", {"lt.py": 3})
+    code = p.db.task(json.loads(rev["labels"]) and rev["depends_on"] and json.loads(rev["depends_on"])[0])
+    p.db.update_task(code["id"], tier="light")
+    p.db.update_task(rev["id"], status="failed")
+    fid, _, _ = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug")
+    assert p.db.task(fid)["tier"] == "standard"
+    queued = p.db.add_task("by hand", "x", kind="code", tier="light", labels=[f"continues:{rev['id']}"])
+    assert p.db.task(queued)["tier"] == "standard"
+    deep = p.db.add_task("deep", "x", kind="code", tier="deep", labels=[f"continues:{rev['id']}"])
+    assert p.db.task(deep)["tier"] == "deep"
+    plain = p.db.add_task("plain", "x", kind="code", tier="light")
+    assert p.db.task(plain)["tier"] == "light"

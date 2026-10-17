@@ -648,6 +648,17 @@ class DB:
                 or (SEVERITY_RANK.get(r["severity"], 1) >= floor and r["channel"] != "quiet")]
 
     # tasks ---------------------------------------------------------------------------------
+    def _continues_failed_review(self, labels: Any) -> bool:
+        """Whether labels mark a fix of a failed review: review_fix:<id>, or continues:<id> of a failed review."""
+        for lb in labels or []:
+            if str(lb).startswith("review_fix:"):
+                return True
+            if str(lb).startswith("continues:") and str(lb)[10:].isdigit():
+                t = self.task(int(str(lb)[10:]))
+                if t and t["kind"] == "review" and t["status"] == "failed":
+                    return True
+        return False
+
     def add_task(self, title: str, spec: str = "", **kw: Any) -> int:
         now = time.time()
         cols = {"created": now, "updated": now, "title": title.strip()[:200], "spec": spec}
@@ -658,6 +669,8 @@ class DB:
         for k in ("depends_on", "labels"):
             if kw.get(k) is not None:
                 cols[k] = json.dumps(list(kw[k]))
+        if cols.get("tier") == "light" and kw.get("kind", "code") == "code" and self._continues_failed_review(kw.get("labels")):
+            cols["tier"] = "standard"   # a fix of a failed review runs at least standard
         keys = ",".join(cols)
         return self.x(f"INSERT INTO tasks({keys}) VALUES({','.join('?' * len(cols))})", cols.values())
 

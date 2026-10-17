@@ -8080,7 +8080,7 @@ class Daemon:
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         # A stack kept off the push branch stays review only through its fix and re-review.
         only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
-        tier = code["tier"] if code["tier"] in bud.TIER_ORDER else "standard"
+        tier = code["tier"] if code["tier"] in bud.TIER_ORDER and code["tier"] != "light" else "standard"   # a fix never runs light
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
