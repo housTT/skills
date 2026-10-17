@@ -12997,7 +12997,7 @@ def test_memory_settle_moves_area_entries_whole_into_the_register_and_archives_t
     with contextlib.redirect_stdout(io.StringIO()) as out:
         cli.main(["memory", "demo", "--settle"])
     assert "0 entries moved" in out.getvalue() and len(settled.load(p)) == 2
-    for f, why in ((standing, "standing decision"), (pref, "preference"), (area[0], "archived already")):
+    for f, why in ((standing, "standing preference"), (pref, "preference"), (area[0], "archived already")):
         with pytest.raises(SystemExit) as ex, contextlib.redirect_stdout(io.StringIO()):
             cli.main(["memory", "demo", "--settle", f.stem])
         assert why in str(ex.value), ex.value
