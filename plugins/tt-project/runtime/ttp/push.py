@@ -524,12 +524,14 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
     one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable."""
     base = os.environ.get("TTP_PROJECT")
-    name = Project(base).name if base else None
+    proj = Project(base) if base else None
+    name = proj.name if proj else None
     if not who:
         who = checkcap.label(name, "ttp push")
     if priority:
         return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say)
-    return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name)
+    return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
+                            priority=checkcap.task_priority(proj))
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:

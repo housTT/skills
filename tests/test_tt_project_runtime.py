@@ -25913,6 +25913,66 @@ def test_fair_order_takes_turns_by_project_and_keeps_arrival_order_within_one(tm
         locks.dequeue(x)
 
 
+def test_fair_order_serves_a_project_s_waiters_by_task_priority_then_arrival(tmp_path):
+    import math
+    from ttp import locks
+    d = tmp_path / "slots"
+    spec = [("A", "a3", 3), ("A", "a3b", 3), ("B", "b", None), ("A", "a1", 1), ("A", "a-", None),
+            ("B", "b2", 2), ("A", "a-b", None), ("A", "a1b", 1)]
+    t = [locks.enqueue(d, "r", label, since=1000.0 + n, group=g, priority=pr) for n, (g, label, pr) in enumerate(spec)]
+    names = lambda: [x.read_text() for x in locks.fair_order(d, "r")]
+    assert names() == ["a1", "b2", "a1b", "b", "a3", "a3b", "a-", "a-b"], \
+        "a later p1 goes before earlier p3s, projects still take turns, no priority last in arrival order"
+    locks.mark_served(d, "r", "A")
+    assert names()[:2] == ["b2", "a1"], "the project served last still waits for the others"
+    assert [x.read_text() for x in locks.queued(d, "r")] == [label for _, label, _ in spec]
+    for x in t:
+        locks.dequeue(x)
+    # Tickets of older runtimes (no group, no priority) and new ones read by the old group parse.
+    tk = lambda n: tmp_path / n
+    assert [(locks.ticket_group(tk(n)), locks.ticket_priority(tk(n))) for n in (
+        "1000.000000-12", "1000.000000-12-shared", "1000.000000-12.gabc123", "1000.000000-12.p2.gabc123-shared",
+        "1000.000000-12.p1", "1000.000000-12.px.gabc123")] == [
+        ("", math.inf), ("", math.inf), ("abc123", math.inf), ("abc123", 2), ("", 1), ("abc123", math.inf)]
+    new = locks.enqueue(d, "r", "x", group="A", priority=2, shared=True)
+    assert locks.is_shared(new) and locks.ticket_group(new) == locks.group_id("A") and locks.ticket_priority(new) == 2
+    assert new.name.removesuffix(locks.SHARED_TICKET).rpartition(locks.GROUP_TICKET)[2] == locks.group_id("A")
+    locks.dequeue(new)
+
+
+def test_checks_slot_waiters_carry_the_running_task_s_priority(env, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from ttp import checkcap
+    tasks = {7: {"priority": 1}, 8: {"priority": None}}
+    p = SimpleNamespace(db=SimpleNamespace(task=tasks.get))
+    for task, want in (("7", 1), ("8", None), ("9", None), ("", None)):
+        monkeypatch.setenv("TTP_TASK", task)
+        assert checkcap.task_priority(p) == want
+    assert checkcap.task_priority(None) is None
+    monkeypatch.setenv("TTP_TASK", "7")
+    assert checkcap.task_priority(SimpleNamespace(db=SimpleNamespace(task=lambda i: 1 / 0))) is None
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    got = []
+
+    def take(label, proj, prio):
+        s = checkcap.acquire(label, project_name=proj, priority=prio)
+        got.append(label)
+        s.close()
+
+    waiters = []
+    for i, args in enumerate([("a3", "A", 3), ("a-", "A", None), ("b", "B", 2), ("a1", "A", 1)]):
+        waiters.append(threading.Thread(target=take, args=args))
+        waiters[-1].start()
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+    assert checkcap.state()["queued"] == ["a1", "b", "a3", "a-"]
+    held.close()
+    for w in waiters:
+        w.join(20)
+    assert got == ["a1", "b", "a3", "a-"]
+
+
 def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
     import threading
     from ttp import checkcap

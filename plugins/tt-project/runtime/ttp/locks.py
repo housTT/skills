@@ -29,6 +29,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -356,7 +357,8 @@ _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that
 
 
 SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
-GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>.g<id>
+GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>[.p<priority>].g<id>
+PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (1 is served first)
 SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
 
 
@@ -366,17 +368,20 @@ def group_id(group: str | None) -> str:
 
 
 def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
-            shared: bool = False, group: str | None = None) -> Path:
+            shared: bool = False, group: str | None = None, priority: int | None = None) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
     is the arrival time to queue at (default now): a waiter that hands over keeps its place.
     A shared waiter's ticket name ends in SHARED_TICKET. `group` (a project) is what a fair queue
-    (fair_order) takes turns between; waiters without one form their own group."""
+    (fair_order) takes turns between; waiters without one form their own group. `priority` (the task's;
+    lower first) orders the waiters within a group; it goes before the group id, so older runtimes
+    still read the group."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
     gid = group_id(group)
-    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}"
+    prio = f"{PRIORITY_TICKET}{int(priority)}" if priority is not None else ""
+    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{prio}"
             f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
@@ -444,6 +449,15 @@ def ticket_group(ticket: Path) -> str:
     return name.rpartition(GROUP_TICKET)[2] if GROUP_TICKET in name else ""
 
 
+def ticket_priority(ticket: Path) -> float:
+    """A ticket's task priority; one without (older runtimes, no task) sorts after every priority."""
+    name = ticket.name.removesuffix(SHARED_TICKET).partition(GROUP_TICKET)[0]
+    try:
+        return float(int(name.rpartition(PRIORITY_TICKET)[2])) if PRIORITY_TICKET in name else math.inf
+    except ValueError:
+        return math.inf
+
+
 def _arrival(ticket: Path) -> float:
     try:
         return float(ticket.name.split("-", 1)[0])
@@ -485,13 +499,16 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
 def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
-    arrived, if later), so one group's burst cannot starve the others. Arrival order within a group."""
+    arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
+    (ticket_priority), then arrival."""
     q = queued(locks_dir, resource) if q is None else q
     groups: dict[str, list[Path]] = {}
     for t in q:
         groups.setdefault(ticket_group(t), []).append(t)
     served = _served(locks_dir, resource)
     key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
+    for ts in groups.values():
+        ts.sort(key=ticket_priority)   # stable: arrival order within a priority
     out = []
     while groups:
         g = min(groups, key=key.__getitem__)

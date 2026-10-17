@@ -99,6 +99,18 @@ def label(project_name: str | None, what: str = "") -> str:
     return who + (f" {what}" if what else "")
 
 
+def task_priority(p) -> int | None:
+    """The priority of the task this process runs for (TTP_TASK) in project `p`; None without one."""
+    task = os.environ.get("TTP_TASK") or ""
+    if p is None or not task.isdigit():
+        return None
+    try:
+        t = p.db.task(int(task))
+        return int(t["priority"]) if t and t.get("priority") is not None else None
+    except Exception:   # an unreadable database only loses the ordering, never the slot
+        return None
+
+
 def paths(n: int | None = None) -> list[Path]:
     return locks.slot_paths(slot_dir(), RESOURCE, limit() if n is None else n)
 
@@ -174,10 +186,11 @@ class Slot:
 
 def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
             waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
-            since: float | None = None, project_name: str | None = None) -> Slot | None:
+            since: float | None = None, project_name: str | None = None,
+            priority: int | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
-    (`project_name`; none form their own group), in arrival order within one (locks.fair_order), so
-    one project's burst cannot starve the others' checks. `tell` gets a line
+    (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
+    none last), then arrival (locks.fair_order), so one project's burst cannot starve the others' checks. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
     it waited that long. `since` is the arrival time to queue at (default now). A slot directory that
@@ -191,7 +204,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             return Slot(f)
-        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since, group=project_name)
+        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since, group=project_name, priority=priority)
     except OSError as e:
         raise _unavailable(e) from e
     started, told = time.time(), 0.0

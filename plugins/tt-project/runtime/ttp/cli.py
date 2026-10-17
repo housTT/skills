@@ -2282,7 +2282,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     try:
         return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
-                                p.name if p else None)
+                                p.name if p else None, checkcap.task_priority(p))
     except checkcap.Unavailable as e:
         out.write(f"ttp checks: {e}\n")
         out.flush()
