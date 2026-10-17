@@ -60,11 +60,17 @@ TTP_MARKER = "<!-- ttp -->"
 
 def _own(c: dict, pr: dict) -> bool:
     """A comment or review a tt-project run posted: it carries the hidden marker, whatever the author
-    (the runs' gh account may not be the one that opened the PR). Unmarked comments always count."""
-    return TTP_MARKER in str(c.get("body") or "")
+    (the runs' gh account may not be the one that opened the PR). One the PR's own author wrote is
+    the author answering, not someone waiting on an answer. Other unmarked comments count."""
+    return TTP_MARKER in str(c.get("body") or "") or _by_author(c, pr)
 
 
-def _reply_wrapper(r: dict) -> bool:
+def _by_author(c: dict, pr: dict) -> bool:
+    login = str(((pr.get("author") or {}).get("login")) or "")
+    return bool(login) and str((c.get("author") or {}).get("login") or "") == login
+
+
+def _reply_wrapper(r: dict, pr: dict | None = None) -> bool:
     """An empty COMMENTED review GitHub adds around inline comments that are all the runs' own replies
     (marked) or a bot's: no activity. A review whose inline comments are unknown (gh pr view carries
     none; _with_review_comments adds them) or include a person's unmarked one is a review and counts."""
@@ -74,7 +80,8 @@ def _reply_wrapper(r: dict) -> bool:
     nodes = (cs.get("nodes") or []) if isinstance(cs, dict) else []
     if not nodes or int(cs.get("totalCount") or 0) > len(nodes):
         return False
-    return all(_is_bot(c.get("author")) or TTP_MARKER in str(c.get("body") or "") for c in nodes)
+    return all(_is_bot(c.get("author")) or TTP_MARKER in str(c.get("body") or "") or _by_author(c, pr or {})
+               for c in nodes)
 
 
 def _with_review_comments(pr: dict, data: dict | None) -> dict:
@@ -96,7 +103,7 @@ def pr_signature(pr: dict) -> dict:
                                                                                  "CANCELLED", "ACTION_REQUIRED"))
     pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
                   for c in checks)
-    reviews = [r for r in pr.get("reviews") or [] if not _reply_wrapper(r)]
+    reviews = [r for r in pr.get("reviews") or [] if not _reply_wrapper(r, pr)]
     human = [c for c in (pr.get("comments") or []) + reviews
              if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
     activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]

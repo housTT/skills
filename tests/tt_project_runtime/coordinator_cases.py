@@ -12477,3 +12477,16 @@ def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_ex
         with pytest.raises(SystemExit):
             cli.main(["machines", "change", sub, "--help"])
         assert "--until-task" in capsys.readouterr().out
+
+
+def test_pr_signature_skips_the_authors_own_items():
+    from ttp import watchers
+    def wrap(login):
+        return {"id": "r", "state": "COMMENTED", "body": "", "author": {"login": login},
+                "comments": {"totalCount": 1, "nodes": [{"author": {"login": login}, "body": "Fixed."}]}}
+    pr = {"author": {"login": "owner"}, "comments": [{"author": {"login": "owner"}, "body": "Done."}],
+          "reviews": [wrap("owner")]}
+    assert watchers.pr_signature(pr)["n_human"] == 0
+    pr["reviews"].append(wrap("other"))
+    pr["comments"].append({"author": {"login": "other"}, "body": "Why?"})
+    assert watchers.pr_signature(pr)["n_human"] == 2
