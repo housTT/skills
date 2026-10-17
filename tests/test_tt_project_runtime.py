@@ -573,13 +573,13 @@ def _stop_left_checks(root: pathlib.Path, grace: float = 10.0) -> list[pathlib.P
     stopped = []
     for f in (root / "tt-project" / "state").glob(f"*/*/{cli.CHECKS_PID}"):
         info = cli._read_checks_pid(f.parent)
-        if not cli._checks_alive(info):
-            continue
+        if not cli._checks_alive(info) or not _own_group_leader(info["pid"]):
+            continue   # a pid a test wrote (its own, a helper's) is no detached checks: never wait on it
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(info["pid"], sig)
             except OSError:
-                pass
+                break
             end = time.time() + grace
             while cli._checks_alive(info) and time.time() < end:
                 time.sleep(0.05)
@@ -587,6 +587,15 @@ def _stop_left_checks(root: pathlib.Path, grace: float = 10.0) -> list[pathlib.P
                 break
         stopped.append(f.parent)
     return stopped
+
+
+def _own_group_leader(pid: int) -> bool:
+    """`pid` leads a process group of its own, as detached checks do (their own session), and that
+    group is not this process's: signalling it can stop nothing of the test session."""
+    try:
+        return os.getpgid(pid) == pid and pid != os.getpgrp()
+    except OSError:
+        return False
 
 
 @pytest.fixture
@@ -28443,6 +28452,19 @@ def test_checks_a_queued_review_started_are_stopped_before_the_test_folder_goes(
     assert _stop_left_checks(env["repo"]) == [out]
     assert not cli._checks_alive(info)
     assert _stop_left_checks(env["repo"]) == [], "nothing left to stop"
+
+
+def test_the_left_checks_teardown_never_signals_or_waits_on_a_pid_a_test_wrote(env):
+    """A test that records its own pid (or a helper's, in the test session's group) as checks.pid is
+    no detached checks: teardown neither signals that group nor waits out its grace on it."""
+    from ttp import cli
+    from ttp.runner import proc_start
+    out = env["repo"] / "tt-project" / "state" / "prechecks" / "t1-abc"
+    out.mkdir(parents=True)
+    (out / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid())}))
+    started = time.monotonic()
+    assert _stop_left_checks(env["repo"], grace=5.0) == []
+    assert time.monotonic() - started < 2.0, "teardown waited on a pid that is not detached checks"
 
 
 def test_a_pass_of_more_commands_answers_for_the_commands_they_start_with(env):
