@@ -25844,7 +25844,8 @@ def _cap_holder(label):
 def test_checks_host_cap_default_follows_cores_and_the_account_setting_overrides_it(env, monkeypatch):
     from ttp import checkcap, project
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
-    assert checkcap.limit() == 4
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (60.0, 0.0, 0.0))
+    assert checkcap.limit() == 4, "a busy host gets the floor"
     monkeypatch.setattr(checkcap, "cores", lambda: 8)
     assert checkcap.limit() == 1, "a small host still runs one at a time"
     project.set_account_setting("checks.host_max", 3)

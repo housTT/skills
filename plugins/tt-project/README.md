@@ -750,8 +750,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   their `retry_when` and exits 75 (with no project it waits on in the foreground).
   Slots are OS file locks, so a crash or reboot frees them. Workers' sandboxes may write the slot
   directory; where it cannot be written, the checks stop with an error naming it (exit 2; a push
-  does not go) instead of running uncapped. The default is one slot per 16 cores (at least one); set it with
-  `ttp config --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
+  does not go) instead of running uncapped. Unset, the cap follows the load: as many checks as the
+  cores left over the 1-minute load average hold at an assumed load of 4 each, at least one slot
+  per 16 cores (and at least one), at most one per 8. Running checks count in that load, so the cap
+  shrinks as they load the host; a running check keeps its slot. A set cap wins: `ttp config
+  --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
   0 turns them off); check commands run under `nice`/`ionice` unless `checks.nice` is false. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that

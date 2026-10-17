@@ -273,3 +273,59 @@ def test_check_commands_run_niced_where_nice_and_ionice_exist_unless_turned_off(
     cli.main(["config", "--account", "checks.nice", "false"])
     assert project.load_account_settings()["checks"]["nice"] is False
     assert cli._low_priority(["pytest"]) == ["pytest"]
+
+
+def test_checks_default_cap_scales_with_load_headroom_between_floor_and_ceiling(env, monkeypatch):
+    from ttp import checkcap, project
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    load = [0.0]
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    assert checkcap.default_range() == (4, 8)
+    assert checkcap.limit() == 8, "an idle host gets the ceiling"
+    load[0] = 14.0
+    assert checkcap.limit() == 8, "headroom for more than the ceiling still stops at it"
+    load[0] = 36.0
+    assert checkcap.limit() == 7, "(64 - 36) / 4 checks fit"
+    load[0] = 43.0
+    assert checkcap.limit() == 5, "(64 - 43) / 4 rounds down"
+    load[0] = 50.0
+    assert checkcap.limit() == 4, "never below the floor of one slot per 16 cores"
+    load[0] = 200.0
+    assert checkcap.limit() == 4
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
+    assert checkcap.limit() == 4, "an unreadable load average gives the floor"
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "cores", lambda: 8)
+    load[0] = 0.0
+    assert checkcap.default_range() == (1, 1) and checkcap.limit() == 1, "a small host runs one at a time"
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    project.set_account_setting("checks.host_max", 2)
+    assert checkcap.limit() == 2, "a set cap wins over an idle host's ceiling"
+    load[0] = 200.0
+    project.set_account_setting("checks.host_max", 6)
+    assert checkcap.limit() == 6, "and over a busy host's floor"
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    assert checkcap.limit() == 3, "the environment wins over the setting"
+
+
+def test_checks_default_cap_shrinking_with_the_load_counts_checks_above_it(env, monkeypatch):
+    from ttp import checkcap, locks
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setattr(checkcap, "cores", lambda: 32)   # floor 2, ceiling 4
+    load = [0.0]
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    held = [checkcap.acquire(f"t{i}", max_wait_s=1) for i in range(4)]
+    assert all(s is not None and s.f for s in held)
+    assert checkcap.acquire("over", max_wait_s=1) is None, "the ceiling holds"
+    load[0] = 30.0   # the floor now: two checks on slots above it still count
+    for s in held[:2]:
+        s.close()
+    assert len(locks.held_labels(checkcap.all_paths())) == 2
+    assert checkcap.acquire("late", max_wait_s=1) is None, "two running fill a cap of two"
+    held[2].close()
+    s = checkcap.acquire("next", max_wait_s=5)
+    assert s is not None and s.f is not None
+    s.close()
+    held[3].close()

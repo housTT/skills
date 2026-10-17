@@ -16,9 +16,12 @@ or file permissions) never runs the checks uncapped: acquire raises Unavailable,
 fix. Workers get the directory as a writable root (daemon.start_run).
 
 The cap is the account setting `checks.host_max` (`ttp config --account checks.host_max N`), or the
-environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it is one slot per CORES_PER_SLOT cores,
-at least one. Check commands run with HELD_ENV set, so a `ttp checks` nested in them runs at once
-instead of waiting for the slot its parent holds.
+environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it follows the load (default_limit()):
+as many checks as the cores left over the 1-minute load average hold at CHECK_LOAD each, at least one
+slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT_MAX cores. Our own
+running checks count in that load, so the cap shrinks as they load the host; a check keeps its slot
+until it ends, and a waiter reads the cap again on every try. Check commands run with HELD_ENV
+set, so a `ttp checks` nested in them runs at once instead of waiting for the slot its parent holds.
 
 Push checks (the push queue's batches and `ttp push` to the push branch) hold the push lock, so every
 approved change waits on them: they never queue behind task checks. Each push branch has one priority
@@ -29,6 +32,7 @@ takes one of theirs. It is an OS file lock like the others, so a killed push fre
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
+They open beyond a default cap's ceiling too.
 
 A waiter whose checks match ones running now (`same`: the project, tree, commands and purpose) waits
 for their result outside the queue, keeping its arrival time; `done` ends any wait once a recorded
@@ -47,7 +51,9 @@ from . import locks, poll_s, project
 
 RESOURCE = "checks"
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
-CORES_PER_SLOT = 16
+CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
+CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
+CHECK_LOAD = 4.0          # the 1-minute load one running check is assumed to add (default_limit())
 HELD_ENV = "TTP_CHECKS_SLOT"
 POLL_S = 5.0
 TELL_S = 300.0
@@ -81,8 +87,19 @@ def cores() -> int:
         return os.cpu_count() or 1
 
 
+def default_range() -> tuple[int, int]:
+    """The default cap's floor and ceiling on this host's cores."""
+    c = cores()
+    floor = max(1, c // CORES_PER_SLOT)
+    return floor, max(floor, c // CORES_PER_SLOT_MAX)
+
+
 def default_limit() -> int:
-    return max(1, cores() // CORES_PER_SLOT)
+    """The cap with no checks.host_max: the checks the cores left over the 1-minute load average hold
+    at CHECK_LOAD each, within default_range(). An unreadable load average gives the floor."""
+    floor, top = default_range()
+    fit = int(max(0.0, cores() - _load()) // CHECK_LOAD)
+    return min(top, max(floor, fit))
 
 
 def _number(v) -> int | None:
@@ -93,13 +110,26 @@ def _number(v) -> int | None:
     return n if n >= 0 else None
 
 
-def limit() -> int:
-    """Slots on this host: TTP_CHECKS_HOST_MAX, else the account's checks.host_max, else the
-    default from the core count. 0 means no cap; an unreadable value is the default."""
+def _set_limit() -> int | None:
+    """TTP_CHECKS_HOST_MAX, else the account's checks.host_max; None when neither is readable."""
     for v in (os.environ.get("TTP_CHECKS_HOST_MAX"), (project.load_account_settings().get("checks") or {}).get("host_max")):
         if v not in (None, "") and (n := _number(v)) is not None:
             return n
-    return default_limit()
+    return None
+
+
+def limit() -> int:
+    """Slots on this host: TTP_CHECKS_HOST_MAX, else the account's checks.host_max, else the
+    default from the core count and load (default_limit()). 0 means no cap; an unreadable value is the default."""
+    n = _set_limit()
+    return default_limit() if n is None else n
+
+
+def _span() -> int:
+    """The most cap slots any taker may use: the set cap, else the default's ceiling. A default cap
+    that shrank with the load still counts the checks on slots above it."""
+    n = _set_limit()
+    return default_range()[1] if n is None else n
 
 
 def extra_max() -> int:
@@ -158,7 +188,7 @@ def paths(n: int | None = None) -> list[Path]:
 def all_paths(n: int | None = None) -> list[Path]:
     """The cap's slots and then the ones load may open beyond it (extra()), held or not."""
     n = limit() if n is None else n
-    return paths(n + extra_max()) if n else []
+    return paths(max(n, _span()) + extra_max()) if n else []
 
 
 def priority_path(key: str) -> Path:
@@ -300,6 +330,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     return Slot(served=True)
             f = None
             if ticket is not None:
+                n = limit() or n   # a default cap follows the load (default_limit())
+                ps = paths(n)
                 try:
                     f = _take_in_turn(n, ticket, ps, every, holder, what, same)
                 except OSError:
