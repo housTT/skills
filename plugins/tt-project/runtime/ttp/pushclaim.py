@@ -207,13 +207,34 @@ def queue_claims(p, tid: int) -> list[dict]:
     return out
 
 
+def _self_stopped(p, c: dict) -> bool:
+    """A detached push that ended on a stop signal (push._stop wrote its reason) before pushing."""
+    m = _read_marker(p, c["marker"])
+    return m.get("status") == "failed" and str(m.get("reason") or "").startswith("stopped by SIG")
+
+
+def _splits(result: dict) -> bool:
+    """A hand-off that leaves its work to a `continue:` follow-up (chaincap.CONT_TITLE)."""
+    from .chaincap import CONT_TITLE
+    fups = result.get("followups")
+    return isinstance(fups, list) and any(isinstance(f, dict) and CONT_TITLE.match(str(f.get("title") or ""))
+                                          for f in fups)
+
+
 def claims(p, task: dict, result: dict, run: dict | None) -> list[dict]:
     """What a done hand-off claims was pushed: its summary's lines, its `pushed` list and its run's
-    detached pushes. Local reads only (no network): it runs inside the run's finishing transaction."""
+    detached pushes. Local reads only (no network): it runs inside the run's finishing transaction.
+    A split hand-off (a `continue:` follow-up) that claims no push itself does not claim a detached
+    push its run stopped: the continuing task delivers the work. Accepted gap: a push cannot learn who
+    sent its stop signal (Python handlers get no siginfo), so such a hand-off is trusted to have sent
+    it; a hand-off that claims a push, or a push that ended any other way, stays a claim."""
     if not isinstance(result, dict):
         return []
-    found = marker_claims(p, task["id"], (run or {}).get("id")) + _structured(p, result)
-    found += text_claims(p, str(result.get("summary") or ""))
+    found = marker_claims(p, task["id"], (run or {}).get("id"))
+    own = _structured(p, result) + text_claims(p, str(result.get("summary") or ""))
+    if not own and _splits(result):
+        found = [c for c in found if not _self_stopped(p, c)]
+    found += own
     seen, out = set(), []
     for c in found:
         k = c.get("marker") or (c["sha"], c["remote"], c["ref"])

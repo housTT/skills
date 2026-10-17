@@ -7625,6 +7625,69 @@ def test_a_done_hand_off_that_claims_no_push_goes_straight_to_done(env, monkeypa
     assert "push_verify" not in task["result"]
 
 
+_SPLIT = {"status": "done", "summary": "split at the context line: the fix is local commit {head} in the "
+          "worktree, still unpublished; a push runs checks first and they would fail on the tests left, so "
+          "I stopped my own queued detached push (its pid); the continue task delivers the work",
+          "followups": [{"title": "continue: finish the tests and deliver the fix", "spec": "branch and head..."}]}
+
+
+def _own_push_marker(p, tid, head, **ended):
+    """A detached push marker of task `tid`'s run for `head` on origin/proj, ended as `ended` says."""
+    run = p.db.one("SELECT id FROM runs WHERE task=? ORDER BY id DESC", (tid,))["id"]
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{tid}-wip.json").write_text(json.dumps({"run": run, "head": head, "target": "origin/proj",
+                                                         "pid": 4242, "status": "failed", **ended}))
+
+
+@pytest.mark.parametrize("ended, claims_it", [
+    ({"exit": 1, "reason": "stopped by SIGTERM"}, False),   # the replay: stopped by its own run
+    ({"exit": 4}, True),                                     # its checks failed: it ended on its own
+    ({"exit": None}, True),                                  # killed with no outcome written
+])
+def test_a_split_hand_off_that_stopped_its_own_unpublished_push_keeps_its_outcome(
+        env, monkeypatch, tmp_path, ended, claims_it):
+    """Replay: a run splits at the context line, its work unpublished, and stops its own queued detached
+    push (SIGTERM from its pid). Its push is no claim: no 'claimed a push' failure, no alert, done with
+    its continue follow-up. A push that ended any other way stays a claim and fails as before."""
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path, _SPLIT)
+    _own_push_marker(p, tid, head, **ended)
+    _settle_probe(d, tid)
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    if claims_it:
+        assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+        assert f"{head[:12]} is not on origin/proj" in res["summary"]
+        return
+    assert task["status"] == "done" and res["status"] == "done", (task["status"], res)
+    assert "push_verify" not in task["result"] and "claimed a push" not in task["result"]
+    assert res["followups"][0]["title"].startswith("continue:")
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind IN ('push_verifying','task_failed')", (tid,))
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND severity IN ('high','critical')", (tid,))
+
+
+@pytest.mark.parametrize("hand", [
+    {"summary": "pushed {head} to origin/proj; continuing the tests"},          # its summary claims it
+    {"summary": "fix committed", "pushed": [{"sha": "{head}", "branch": "proj"}]},  # its pushed list does
+    {"summary": "fix committed and unpublished", "followups": []},              # no split
+])
+def test_a_hand_off_that_claims_a_push_or_does_not_split_still_fails_on_a_stopped_push(
+        env, monkeypatch, tmp_path, hand):
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path, {**_SPLIT, **hand})
+    if "pushed" in hand:   # _claim_setup fills in only the on_pass strings
+        p.db.update_task(tid, result=p.db.task(tid)["result"].replace("{head}", head))
+        rj = tmp_path / f"run-{tid}" / "result.json"
+        rj.write_text(rj.read_text().replace("{head}", head))
+    _own_push_marker(p, tid, head, exit=1, reason="stopped by SIGTERM")
+    _settle_probe(d, tid)
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] != "done" and res["status"] == "failed", (task["status"], res)
+    assert "claimed a push that is not on the remote" in res["summary"] and head[:12] in res["summary"]
+
+
 def test_an_unreadable_remote_keeps_a_claimed_push_waiting_with_backoff_and_fails_it_past_the_bound(
         env, monkeypatch, tmp_path):
     from ttp import daemon as dmod, pushclaim
