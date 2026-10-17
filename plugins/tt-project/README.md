@@ -916,12 +916,15 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   both sides added at one spot, and changes of different lines that git calls a conflict only
   because they are adjacent. A change that really overlaps another goes back to its review to
   resolve the conflict; a failed check fails the
-  review and wakes the coordinator. Keys, all under `delivery`: `push_batch_s` (default 900: a
+  review and wakes the coordinator. The batch finds the first change that fails by checking
+  prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
+  them too when they pass. Keys, all under `delivery`: `push_batch_s` (default 900: a
   batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
   (default 1800: a batch starts only once the last one ended at least this long ago, measured
-  from its recorded end so a restart or a failed batch never stretches the wait; a full batch or
-  a priority-1 review's approval starts at once; 0 = off), `push_landing_alert_h` (default 4:
+  from its recorded end so a restart or a failed batch never stretches the wait; a full batch, a
+  priority-1 review's approval, or one the last batch requeued unchecked after a failing change
+  starts at once; 0 = off), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
   reboot cut short; it clears when a batch lands; 0 = off), `after_push`

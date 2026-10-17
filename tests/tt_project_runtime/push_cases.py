@@ -1675,6 +1675,71 @@ def test_a_push_batch_names_each_entrys_own_rebased_commit_and_the_queue_records
     assert [r["landed_sha"] for r in p.db.q("SELECT landed_sha FROM push_queue ORDER BY id")] == [shas[0], tip, on]
 
 
+def test_a_push_batch_pushes_the_entries_after_a_blamed_first_one_once_they_pass_without_it(env, monkeypatch, capsys):
+    """Entry 1 fails the checks and entries 2..5 pass: the batch blames entry 1, replays 2..5 onto the
+    tip, checks that head once more and pushes it, instead of requeueing them untested."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    tip = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 1 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 6)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 4, m
+    assert "checking the 4 entries after 1 without it" in capsys.readouterr().out
+    names = _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split()
+    assert [n for n in names if n.endswith(".txt")] == [f"plugins/p/f{n}.txt" for n in range(2, 6)]
+    shas = [r.get("sha") for r in m["results"]]
+    assert shas[0] is None and _git_out(origin, "rev-parse", f"{shas[1]}^") == tip, "replayed onto the tip"
+    assert _git_out(origin, "rev-parse", f"{m['pushed_sha']}^") == shas[4] and _bump_commits(origin) == [
+        "p: 0.1.1 (e2: edit plugins/p/f2.txt; +3 more)"]
+    assert "e1:" not in _git_out(origin, "show", "proj:.changeset/p-b1.md")
+
+
+def test_a_push_batch_checks_the_entries_after_a_blamed_one_once_only(env, monkeypatch, capsys):
+    """Entries 2 and 4 of five both fail: entry 2 is blamed, 3..5 are checked once without it and fail
+    (entry 4); the batch tries no further round, pushes entry 1 and requeues 3..5 as tested."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}",
+                                                            "test -z \"$(ls plugins/p | grep bad)\""])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n in (2, 4) else 'f'}{n}.txt": f"{n}\n"})
+             for n in range(1, 6)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["pushed", "check_failed", "requeued", "requeued", "requeued"], m
+    out = capsys.readouterr().out
+    assert out.count("without it") == 1 and "they fail too; requeued" in out
+    # full head, prefixes 2 and 1, then the one extra round
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 4
+    assert all("untested" not in r["detail"] for r in m["results"][2:]), "they were checked without entry 2"
+
+
+def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round(env, monkeypatch):
+    """With no extra round left, the entries after a blamed one are requeued "untested"; the queue
+    records that on their rows, and the next batch takes them without waiting push_min_gap_s."""
+    from ttp import batch
+    monkeypatch.setattr(batch, "RESCUES", 0)
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 2 else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed", "check_failed", "requeued"] and m["results"][2]["detail"] == {"untested": True}, m
+    assert m["results"][0]["detail"] == {}
+
+
+def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    rid = _pq_review(s)[1]
+    now = time.time()
+    s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
+    s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id=?", (rid,))
+    m = {"outcome": "pushed", "ended": now, "results": [{"id": rid, "status": "requeued", "detail": {"untested": True}}]}
+    pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
+    s.p.db.x("UPDATE push_batches SET after_finalized=? WHERE id='b1'", (now,))
+    got, why = pushq.due(s.p, now + 1)
+    assert [r["id"] for r in got] == [rid] and "1 approval b1 requeued untested" in why, why
+    s.p.db.x("UPDATE push_queue SET detail=NULL WHERE id=?", (rid,))
+    got, why = pushq.due(s.p, now + 1)
+    assert got == [] and "s left of the 1800 s gap" in why, "a row the last batch checked waits for the gap"
+
+
 def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts(env):
     from ttp.batch import merge3
     assert merge3("a\nX\n", "a\n", "a\nY\n") == "a\nX\nY\n"
@@ -1867,7 +1932,7 @@ def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
 @pytest.mark.parametrize("names, fresh, want, runs, tried", [
     (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4, None),   # fixing prefix passes; search above
     (["fix", "e2", "bad"], 3, ["pushed", "pushed", "check_failed"], 4, None),   # all untried: search the whole batch
-    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "requeued"], 3, None),  # the breaker is in the untried prefix
+    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "pushed"], 4, None),    # the breaker is in the untried prefix
     (["e1", "fix", "bad"], 3, ["requeued"] * 3, 2, [1]),    # prefix 1 fails: only entry 1 is shown not to fix it
     (["e1", "e2"], 2, ["requeued", "requeued"], 2, [1]),                       # all untried, none fixes it
     (["e1", "fix"], 2, ["pushed", "pushed"], 1, None),                         # tip with the batch passes: it goes
@@ -2571,7 +2636,7 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
 def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_the_next_batch(env, monkeypatch):
     """On a known-bad tip, a batch [e1, fix, bad] fails at prefix 1 and ends tip_failed. Only e1 is then
     tried on that tip: fix and bad stay untried, go first in the next batch at once (not held), and that
-    batch pushes fix and blames bad. e1 then lands on the fixed tip."""
+    batch pushes fix, blames bad, and pushes e1 too once it passes on the fixed tip without bad."""
     from ttp import pushq
     s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=3,
                  push_checks=["test ! -e broken.txt || test -e fix.txt", "test ! -e bad.txt"])
@@ -2601,12 +2666,10 @@ def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_th
     assert [r["task"] for r in rows] == [tasks["fix"], tasks["bad"], s.review], why
     bid = _pq_batch(s)
     m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "requeued"], log(bid)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], log(bid)
     _pq_tend(s)
     assert _git_out(s.origin, "show", "proj:fix.txt") == "fix" and "bad_tip" not in db.kv("push_queue")
     assert db.task(tasks["fix"])["status"] == "done" and db.task(tasks["bad"])["status"] != "done"
-    bid = _pq_batch(s)
-    _pq_tend(s)
     assert db.task(s.review)["status"] == "done", log(bid)
 
 

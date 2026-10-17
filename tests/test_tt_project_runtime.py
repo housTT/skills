@@ -17409,25 +17409,25 @@ def _reused(capsys, cmd):
 @pytest.mark.parametrize("bad", [1, 3, 4])
 def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, capsys, bad):
     """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
-    three more check runs (ceil(log2 4) + 1). The entries before it go, the later ones are requeued."""
+    three more check runs (ceil(log2 4) + 1). The entries before it go, and the later ones too after
+    one more check of them replayed without it."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["pushed"] * (bad - 1) + ["check_failed"] + ["requeued"] * (4 - bad), m
+    good = [n for n in (1, 2, 3, 4) if n != bad]
+    assert _statuses(m) == ["check_failed" if n == bad else "pushed" for n in (1, 2, 3, 4)], m
     assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
     runs = len(log.read_text().split()) + _reused(capsys, f"echo run >> {log}")   # a recheck of a tree reuses its passes
-    assert runs == m["checks"]["runs"] and runs - 1 <= 3, runs
+    assert runs == m["checks"]["runs"] and runs - 1 <= 3 + (bad < 4), runs
     if bad == 1:
-        assert rc == 0 and m["outcome"] == "nothing" and m["pushed_sha"] is None and _bump_commits(origin) == []
         assert m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
-        return
     assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
-    more = f"; +{bad - 2} more" if bad > 2 else ""
-    assert _bump_commits(origin) == [f"p: 0.1.1 (e1: edit plugins/p/f1.txt{more})"]
+    more = f"; +{len(good) - 1} more" if len(good) > 1 else ""
+    assert _bump_commits(origin) == [f"p: 0.1.1 (e{good[0]}: edit plugins/p/f{good[0]}.txt{more})"]
     names = _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split()
-    assert [n for n in names if n.endswith(".txt")] == [f"plugins/p/f{n}.txt" for n in range(1, bad)]
-    assert f"e{bad - 1}: edit" in _git_out(origin, "show", "proj:.changeset/p-b1.md")
+    assert [n for n in names if n.endswith(".txt")] == [f"plugins/p/f{n}.txt" for n in good]
+    assert f"e{good[-1]}: edit" in _git_out(origin, "show", "proj:.changeset/p-b1.md")
     assert f"e{bad}:" not in _git_out(origin, "show", "proj:.changeset/p-b1.md")
 
 

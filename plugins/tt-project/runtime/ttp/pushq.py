@@ -578,7 +578,8 @@ def _gap_left(db, now: float, gap: float) -> float:
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
     """The approved rows a batch should take now (at most delivery.push_batch_max, best priority
     first) and why; or ([], why not). Only local state is read: no fetch, no checks. Unless the batch
-    is full or holds a priority-1 approval, it waits for delivery.push_min_gap_s since the last one."""
+    is full or holds a priority-1 approval or one the last batch requeued untested, it waits for
+    delivery.push_min_gap_s since the last one."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -616,13 +617,18 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
     gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
+    last = db.one("SELECT id, outcome FROM push_batches ORDER BY started DESC LIMIT 1")
+    # Approvals the last batch requeued after a blamed entry without checking them: no gap, as it
+    # spent its checks on the others (batch._close marks them "untested").
+    untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
     if len(rows) >= cap:
         why = f"{len(rows)} approvals"
-    elif (last := db.one("SELECT id, outcome FROM push_batches ORDER BY started DESC LIMIT 1")) and \
-            last["outcome"] == "rebooted":
+    elif last and last["outcome"] == "rebooted":
         why = f"a rerun of {last['id']}, cut short by a reboot"
     elif any(r["priority"] == 1 for r in rows):
         why = "a priority-1 review"
+    elif untested:
+        why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
     elif (left := _gap_left(db, now, gap)) > 0:
         return [], f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
     elif now - min(r["created"] for r in rows) >= window:
@@ -740,7 +746,8 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         write_json(marker, m)
         ids = [r["id"] for r in rows]
         with db.tx():
-            took = db.conn.execute(f"UPDATE push_queue SET status='batched', batch=?, updated=? WHERE status='approved' "
+            took = db.conn.execute(f"UPDATE push_queue SET status='batched', batch=?, detail=NULL, updated=? "
+                                   f"WHERE status='approved' "
                                    f"AND id IN ({','.join('?' * len(ids))})", (bid, now, *ids)).rowcount
             if took != len(ids):
                 raise _Changed()
@@ -1249,8 +1256,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             elif status in ("conflict", "check_failed", "refused"):
                 db.x("UPDATE push_queue SET status=?, detail=?, updated=? WHERE id=?", (status, text, now, r["id"]))
             else:   # requeued, or the batch did not get to it (busy, moved, rejected, tip_failed)
-                db.x("UPDATE push_queue SET status='approved', tries=tries+?, updated=? WHERE id=?",
-                     (1 if outcome == "moved" else 0, now, r["id"]))
+                db.x("UPDATE push_queue SET status='approved', tries=tries+?, detail=?, updated=? WHERE id=?",
+                     (1 if outcome == "moved" else 0, text, now, r["id"]))
         st = _state(db)
         st["deaths"] = 0
         back = [r["id"] for r in db.q("SELECT id FROM push_queue WHERE batch=? AND status='approved'", (b["id"],))]

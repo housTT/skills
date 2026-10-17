@@ -49,6 +49,7 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
 MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
+RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
@@ -615,6 +616,9 @@ class Batch:
         self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set] = ([], set())   # files and kinds of the replay running
+        self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
+        self.retried = False                   # this round checked the entries after a blamed one (_rescue)
+        self.rescues = 0                       # such checks in the batch: at most RESCUES
 
     # results
 
@@ -730,6 +734,7 @@ class Batch:
         """One round on `tip`: replay, bump, check, push. "moved" when the tip moved meanwhile."""
         self.tip_passed = False
         self.tip_tried = 0
+        self.rescued, self.retried = {}, False
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -742,6 +747,8 @@ class Batch:
             say(str(e))
             return self._close(0, "refused")
         k, head, failed = self._judge(tip, carried, heads, checks)
+        if failed is not None and (more := self._rescue(tip, carried, k, checks)):
+            head = more
         if head is None:
             return self._close(0, "tip_failed" if failed is None else "nothing", carried, failed)
         if push._fetch(self.repo, self.remote, self.branch) != tip:
@@ -786,7 +793,8 @@ class Batch:
 
     def _close(self, k: int, outcome: str, carried: list | None = None, failed: tuple | None = None) -> str:
         """Settle every entry once the first `k` carried entries are pushed: the one after them is
-        check_failed when `failed` names its failure, and later ones are requeued; one whose replay
+        check_failed when `failed` names its failure, and later ones are pushed when _rescue passed them
+        without it, else requeued ("untested" when no check ran without it); one whose replay
         settled a conflict by keeping both sides' changes (MERGED_KINDS) is sent back as a conflict
         instead, as that merge may be what fails: such a settlement is kept only when the checks pass. An entry that added nothing on top of carried entries (a
         rider), or conflicted with them, follows them: if they did not go, it is requeued, as it may
@@ -802,6 +810,11 @@ class Batch:
                 self._set(i, "conflict", files=self.settled[i]["settled"], cmd=failed[0], tail=failed[1])
             elif n == k + 1 and failed:
                 self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
+            elif i in self.rescued and outcome == "pushed":
+                self._set(i, "pushed")
+                self.landed_at[i] = self.rescued[i]
+            elif failed and not self.retried:
+                self._set(i, "requeued", untested=True)    # after the blamed entry, never checked without it
             else:
                 self._set(i, "requeued")
         for i, st in list(self.status.items()):
@@ -849,7 +862,7 @@ class Batch:
                                         f"{base}..{top}").stdout.splitlines() if s.strip()]
             brings = bool(csdir) and any(f.endswith(".md") for f in _git(
                 self.repo, "diff", "--name-only", "--diff-filter=A", base, top, "--", csdir).stdout.split())
-            self.info[i] = {"subjects": subjects, "changeset": brings}
+            self.info[i] = {"subjects": subjects, "changeset": brings, "top": top}
             if not checks and (code := push.code_paths(self.repo, base, top)):
                 more = f" and {len(code) - 3} more" if len(code) > 3 else ""
                 self._set(i, "refused", message=f"no checks configured, and this change touches more than "
@@ -1127,6 +1140,44 @@ class Batch:
                 return m, heads[m], None
             fails[m] = f
         return hi - 1, heads[hi - 1], fails[hi]
+
+    def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
+        """After _judge blamed carried entry k+1: replay the later carried entries onto the first k
+        (the tip when k is 0) and check that head once, in this batch. Returns the head that pushes the
+        first k entries and the replayed ones (self.rescued), or None (nothing after the blamed entry,
+        a replay that conflicts or adds nothing, or a failing check: those entries are requeued). A
+        batch makes at most RESCUES such checks, whatever their outcome."""
+        later = carried[k + 1:]
+        if not later or self.detail_tip is not None or self.rescues >= RESCUES:
+            return None
+        h = carried[k - 1][1] if k else tip
+        replayed: list[tuple[int, str]] = []
+        for i, _ in later:
+            self._settling = ([], set())
+            new, files = self._rebase(h, self.info[i]["top"])
+            if files is not None or new == h:
+                break
+            self.settled.pop(i, None)
+            if self._settling[0]:
+                self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
+            replayed.append((i, new))
+            h = new
+        if len(replayed) < len(later):
+            say(f"the entries after {self.entries[carried[k][0]].get('id')} do not replay without it; requeued")
+            return None
+        say(f"checking the {len(replayed)} entr{'y' if len(replayed) == 1 else 'ies'} after "
+            f"{self.entries[carried[k][0]].get('id')} without it")
+        try:
+            head = self._head(tip, carried[:k] + replayed, k + len(replayed))
+        except Refused:
+            return None
+        self.rescues += 1
+        self.retried = True
+        if self._check(head, checks) is not None:
+            say("they fail too; requeued")
+            return None
+        self.rescued = dict(replayed)
+        return head
 
     def _tip_red(self, tip: str, known: dict) -> tuple[int, None, None]:
         """tip_failed for a tip known to fail on its own, without checking it alone again."""
