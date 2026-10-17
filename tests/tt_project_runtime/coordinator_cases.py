@@ -981,6 +981,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 1300) for i in range(10)]
               + [("fact", "OLD-FACT")])
     coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
+    from ttp import settled
+    settled.add(p, ["landwait.py"], "narrowed; no more edge-case fixes")
     from ttp import machine_ledger as ml
     from ttp import machines as mm
     mm.add("box-c", tags="device")
@@ -12877,3 +12879,148 @@ def test_an_outage_notify_names_who_acts_now_never_only_that_nothing_was_changed
             "(fallback; alpha cannot act: it is paused). Tracked task: #12, due 13:00 PDT. Tried: recovery page 1 "
             "to alpha. Next: beta releases the hold.")
     assert coord.apply(p, [{"type": "notify", "text": full, "severity": "normal", "outage": True}]) == []
+
+
+def _settled_gates():
+    return {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
+                       "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
+
+
+def test_memory_add_settled_area_writes_a_register_record_and_one_collapsible_digest_line(env):
+    """memory_kind settled_area adds a record to harness/settled_areas.json, not a memory entry: files,
+    rule, decision and failed reviews, expiring after 30 days by default. A replayed turn adds it once.
+    The digest shows the register as one line, collapsed when unchanged."""
+    from ttp import coordinator as coord, settled
+    p = make(env)
+    before = {e["name"] for e in p._memory_entries()}
+    act = {"type": "memory_add", "memory_kind": "settled_area", "title": "Narrowed; no more edge-case fixes",
+           "text": "review_area_cap on landwait.py: wait_landed() is narrowed and its gaps documented; "
+                   "failed reviews #101, #102.", "files": ["runtime/ttp/landwait.py"], "reviews": [101, 102]}
+    t0 = time.time()
+    assert coord.apply(p, [act], turn=7) == []
+    assert coord.apply(p, [act], turn=7) == [], "a replayed turn"
+    recs = settled.load(p)
+    assert len(recs) == 1, recs
+    r = recs[0]
+    assert r["files"] == ["runtime/ttp/landwait.py"] and r["reviews"] == [101, 102]
+    assert r["rule"] == "Narrowed; no more edge-case fixes" and "wait_landed() is narrowed" in r["decision"]
+    assert r["functions"] == ["wait_landed"]
+    assert abs(r["expires"] - r["created"] - 30 * 86400) < 1 and r["created"] >= t0 - 1
+    assert {e["name"] for e in p._memory_entries()} == before, "it went to memory too"
+    assert any("settled area sa1 added" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    # Files and reviews come from the text when not given; an explicit expiry is kept.
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "settled_area", "expires": "3d",
+                            "text": "Settled sweep.py after failed reviews #7 and #8: keep it."}], turn=8) == []
+    r2 = settled.load(p)[1]
+    assert r2["id"] == "sa2" and r2["files"] == ["sweep.py"] and r2["reviews"] == [7, 8]
+    assert abs(r2["expires"] - time.time() - 3 * 86400) < 60
+    full, seen = coord.digest_parts(p, _settled_gates(), [], [])
+    line = dict(full)["settled_areas"]
+    assert "\n" not in line and "2 live" in line and "landwait.py" in line and "sweep.py" in line, line
+    short, again = coord.digest_parts(p, _settled_gates(), [], [], seen)
+    assert again["settled_areas"] == seen["settled_areas"]
+    assert dict(short)["settled_areas"] == "## Settled areas (settled_areas.json) (as last turn)"
+    # A new record changes the section; an expired register drops it.
+    settled.add(p, ["other.py"], "keep it")
+    assert "(as last turn)" not in dict(coord.digest_parts(p, _settled_gates(), [], [], seen)[0])["settled_areas"]
+    assert settled.digest_line(p, time.time() + 31 * 86400) == ""
+
+
+def test_settled_area_rule_reaches_a_task_only_when_its_spec_or_review_diff_names_the_file(env, monkeypatch):
+    """task_add and task_update get a turn note (never a refusal) when the spec names a settled file
+    by base name; a worker's or reviewer's prompt gets the rule when its spec or reviewed diff
+    touches one. Other files and expired records reach nothing."""
+    from ttp import coordinator as coord, settled, worktree
+    from ttp.prompts import worker_task
+    p = make(env)
+    settled.add(p, ["landwait.py"], "Narrowed; no more edge-case fixes", reviews=[11, 12])
+    settled.add(p, ["gone.py"], "An expired settlement", created=time.time() - 31 * 86400)
+    notes = lambda: p.db.kv(coord.NOTES_KEY, []) or []
+    assert coord.apply(p, [{"type": "task_add", "title": "fix wait", "kind": "code",
+                            "spec": "Edit plugins/tt-project/runtime/ttp/landwait.py to retry."}]) == []
+    tid = p.db.q("SELECT id FROM tasks WHERE title='fix wait'")[0]["id"]
+    hit = [n for n in notes() if "settled area" in n]
+    assert len(hit) == 1 and hit[0].startswith(f"task_add: #{tid}") and "Narrowed" in hit[0] and "#11, #12" in hit[0]
+    assert coord.apply(p, [{"type": "task_add", "title": "other", "kind": "code",
+                            "spec": "Edit landwait_extra.py and gone.py."}]) == []
+    assert not any("settled area" in n for n in notes()), notes()
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "Now in landwait.py only."}]) == []
+    assert any(n.startswith(f"task_update: #{tid}") and "settled area" in n for n in notes()), notes()
+    assert "## Settled areas this task touches" in worker_task(p, p.db.task(tid), str(p.root), None)
+    other = p.db.q("SELECT id FROM tasks WHERE title='other'")[0]["id"]
+    assert "Settled areas" not in worker_task(p, p.db.task(other), str(p.root), None)
+    # A review whose diff touches the file gets the rule though its spec does not name it.
+    rev = p.db.add_task("review it", "Review the change.", kind="review", origin="user")
+    monkeypatch.setattr(worktree, "reviewed_refs", lambda p, t: ("a", "b"))
+    monkeypatch.setattr(worktree, "diff_lines", lambda p, refs: {"plugins/x/landwait.py": 3})
+    block = settled.prompt_block(p, dict(p.db.task(rev)))
+    assert "Narrowed" in block and "An expired" not in block
+    monkeypatch.setattr(worktree, "diff_lines", lambda p, refs: {"plugins/x/gone.py": 3, "README.md": 1})
+    assert settled.prompt_block(p, dict(p.db.task(rev))) == ""
+    # After expiry the rule reaches no prompt and no note.
+    later = time.time() + 31 * 86400
+    assert settled.turn_note(p, "landwait.py", "x", now=later) == ""
+    assert settled.prompt_block(p, dict(p.db.task(tid)), now=later) == ""
+
+
+def test_memory_settle_moves_area_entries_whole_into_the_register_and_archives_them(env):
+    from ttp import cli, settled
+    p = make(env)
+    texts = ["(review_area_cap, #900): landwait.py narrowed; queue no more edge-case fixes. Failed reviews "
+             "#901, #902.\nGaps: a slow mirror is not retried.",
+             "(review area cap): sweep.py and runtime/ttp/push.py settled after review #903."]
+    area = [p.add_memory(t, kind="decision") for t in texts]
+    plain = p.add_memory("Builds run on the large runner.", kind="decision")
+    standing = p.add_memory("Whenever a review_area_cap fires, settle it.", kind="decision", standing=True)
+    pref = p.add_memory("Prefer short specs.", kind="preference")
+    head = lambda: subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD"], capture_output=True,
+                                  text=True).stdout
+    h0 = head()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--settle", "--dry-run"])
+    assert "2 entries would move" in out.getvalue() and "[None]" not in out.getvalue(), out.getvalue()
+    assert head() == h0 and not settled.path(p).exists() and all(f.exists() for f in area), "a dry run wrote"
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--settle"])
+    assert "2 entries moved" in out.getvalue()
+    recs = settled.load(p)
+    assert [r["source"] for r in recs] == [f.stem for f in area]
+    assert [r["decision"] for r in recs] == [" ".join(t.split()) for t in texts], "an entry's text was cut"
+    assert recs[0]["files"] == ["landwait.py"] and recs[0]["reviews"] == [901, 902]
+    assert recs[1]["files"] == ["sweep.py", "runtime/ttp/push.py"] and recs[1]["reviews"] == [903]
+    assert recs[0]["rule"].startswith("landwait.py narrowed")
+    assert not any(f.exists() for f in area) and all((p.memory_dir / "archive" / f.name).exists() for f in area)
+    assert plain.exists() and standing.exists() and pref.exists()
+    assert subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True,
+                          text=True).stdout.strip() == "", "the move is not committed"
+    # Again: nothing left to move; a standing or non-decision entry named outright is refused.
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "--settle"])
+    assert "0 entries moved" in out.getvalue() and len(settled.load(p)) == 2
+    for f, why in ((standing, "standing decision"), (pref, "preference"), (area[0], "archived already")):
+        with pytest.raises(SystemExit) as ex, contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["memory", "demo", "--settle", f.stem])
+        assert why in str(ex.value), ex.value
+        assert f is area[0] or f.exists()
+    assert len(settled.load(p)) == 2
+
+
+def test_archive_keeps_a_hidden_user_decision_while_a_non_user_one_of_its_age_stays_live(env):
+    p = make(env)
+    day = 86400
+    user = p.add_memory("Keep the soak on one board (user msg #42).", kind="decision")
+    other = p.add_memory("Routine: the nightly build moved to the large runner.", kind="decision")
+    live = p.add_memory("Routine: review loops cap at three rounds.", kind="decision")
+    for f in (user, other, live):
+        f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
+    t0 = time.time()
+    p.note_memory_shown([], now=t0 - 30 * day)
+    p.note_memory_shown([live.stem], now=t0)
+    assert set(p.hidden_memory(7)) == {user.stem, other.stem}
+    assert p.archive_hidden_memory(7) == [other.stem]
+    assert user.exists() and live.exists() and not other.exists()
+    # A newer live non-user entry does not hold it: only one created up to a day after it.
+    p.forget_memory(live.stem)
+    newer = p.add_memory("Routine: a newer fact.", kind="fact")
+    p.note_memory_shown([newer.stem], now=time.time())
+    assert p.archive_hidden_memory(7) == [user.stem] and not user.exists()

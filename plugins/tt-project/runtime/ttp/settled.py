@@ -150,7 +150,7 @@ def _when(ts: float) -> str:
 def record_text(r: dict, decision: bool = True) -> str:
     funcs = f" ({', '.join(r['functions'])})" if r.get("functions") else ""
     revs = f"; failed reviews {', '.join(f'#{i}' for i in r['reviews'])}" if r.get("reviews") else ""
-    head = (f"[{r.get('id')}] {', '.join(r.get('files') or []) or 'no file'}{funcs}: {r.get('rule')} "
+    head = (f"{'[' + r['id'] + '] ' if r.get('id') else ''}{', '.join(r.get('files') or []) or 'no file'}{funcs}: {r.get('rule')} "
             f"(settled {_when(r.get('created') or 0)}, until {_when(r.get('expires') or 0)}{revs})")
     dec = one_line(r.get("decision") or "", DECISION_CHARS)
     return head + (f" Decision: {dec}" if decision and dec and dec != r.get("rule") else "")
