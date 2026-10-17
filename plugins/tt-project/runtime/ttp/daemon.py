@@ -168,6 +168,12 @@ REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps t
 INHERITED_COMMITS_MAX = 10   # commits per task an auto review's spec lists, as the queue's refusal does
 
 
+def task_env(tid) -> dict[str, str]:
+    """The task id every run, check and model-free command sees: TTP_TASK, and TTP_TASK_ID as
+    specs and scripts also spell it (empty for the coordinator, never an inherited value)."""
+    return {"TTP_TASK": str(tid), "TTP_TASK_ID": str(tid)}
+
+
 def inherited_line(carried: dict[int, list[str]]) -> str:
     """The review spec's line on the commits its head carries from tasks whose latest review failed
     (pushq.carried), with kind-review.md's choice, so the approval is not refused for them later."""
@@ -1787,7 +1793,7 @@ class Daemon:
             venv = worktree.project_venv(self.p, cwd) if role in ("worker", "reviewer") and not read_only else None
             venv_vars = worktree.venv_env(venv, path) if venv else {}
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
-                   "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
+                   "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which
                    # ends with the command: `ttp push --detach` and `ttp detach` compare and have the
@@ -6723,7 +6729,7 @@ class Daemon:
         venv = worktree.project_venv(self.p, path)
         venv_vars = worktree.venv_env(venv, bin_path) if venv else {}
         env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
-               "TTP_RUN_ID": run_id, "TTP_TASK": str(tid), "PYTHONPATH": runtime_dir,
+               "TTP_RUN_ID": run_id, **task_env(tid), "PYTHONPATH": runtime_dir,
                "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
         env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
         level = nice_level(self.cfg.get("runner"))[0]
@@ -7350,7 +7356,7 @@ class Daemon:
         # even when the daemon inherited a run's environment. Keep deferred notes in the original
         # run, where _finish_worker files them, rather than the disposable on_pass output folder.
         env = {k: v for k, v in self._probe_env().items() if k not in ("TTP_RUN_DIR", "TTP_RUN_ID")}
-        env.update(TTP_TASK=str(tid), TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
+        env.update(task_env(tid), TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
         with open(out / ON_PASS_LOG, "wb") as f:
             proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
                                     stderr=subprocess.STDOUT, start_new_session=True,

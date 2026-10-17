@@ -725,7 +725,7 @@ def batch_argv(marker: Path) -> list[str]:
 
 
 def _child_env(p: Project, output: str) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PIDNS", "TTP_CGROUP")}
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PIDNS", "TTP_CGROUP")}
     env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base),
                TTP_RUN_DIR=output, TTP_CHECK_OUTPUT_DIR=output)
     return checkdirs.environment(Path(output), env)

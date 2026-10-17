@@ -170,7 +170,7 @@ def launch_takeover(p, name: str, task: int | None) -> subprocess.Popen:
     ttp = installed() / "bin" / "ttp"
     if not ttp.is_file():
         raise FileNotFoundError(f"no installed release at {ttp}")
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PROJECT", "TTP_TASK", "TTP_RUN_DIR")}
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TTP_PROJECT", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_DIR")}
     argv = [sys.executable, str(ttp), "upgrade", name] + (["--take-over-from", str(task)] if task else [])
     path = takeover_log(p, name)
     path.parent.mkdir(parents=True, exist_ok=True)

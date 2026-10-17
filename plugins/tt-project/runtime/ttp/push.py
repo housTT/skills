@@ -3065,7 +3065,7 @@ LOG_TAIL = 20
 KEEP_S = 30 * 86400        # finished markers and logs older than this go when the next push starts
 QUEUED_S = 900             # a queued push the daemon has not started by then is recorded as failed
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.
-QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES",
+QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES",
              OWN_BRANCH_ENV, LAND_ENV)
 
 

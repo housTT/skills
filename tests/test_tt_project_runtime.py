@@ -41504,6 +41504,50 @@ def test_a_task_run_without_a_device_gets_ttp_no_device(env, monkeypatch):
     assert run_env(labels=["resource:build-dir"])["TTP_NO_DEVICE"] == "1"
 
 
+def test_every_launch_path_exports_the_task_id(env, monkeypatch, tmp_path):
+    """Every way a task's commands run sees its id as TTP_TASK and TTP_TASK_ID: a fresh, resumed or
+    review run on each provider, relaunched checks and a model-free on_pass_cmd. The coordinator gets
+    both empty, never an inherited id."""
+    from ttp import daemon as dmod
+    from ttp.providers import base
+    monkeypatch.setattr(base.Provider, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setenv("TTP_TASK", "999")
+    monkeypatch.setenv("TTP_TASK_ID", "999")
+    p = make(env)
+    d = dmod.Daemon(p.base)
+
+    def run_env(role, provider, **kw):
+        task = None
+        if role != "coordinator":
+            task = p.db.task(p.db.add_task("t", "s", kind="review" if role == "reviewer" else "work",
+                                           tier="light", origin="user"))
+        rid = d.start_run(role, "go", provider, "light", str(p.root), task=task, **kw)
+        (p.runs / str(rid) / "STOP").touch()
+        return task and str(task["id"]), json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    for provider in ("claude", "codex", "cursor"):
+        for role, kw in (("worker", {}), ("worker", {"resume": "session-1"}), ("reviewer", {})):
+            tid, e = run_env(role, provider, **kw)
+            assert e["TTP_TASK"] == e["TTP_TASK_ID"] == tid, (provider, role, kw, e.get("TTP_TASK_ID"))
+    _, e = run_env("coordinator", "claude")
+    assert e["TTP_TASK"] == e["TTP_TASK_ID"] == ""
+    # Checks the daemon relaunches for a task.
+    seen = {}
+    monkeypatch.setattr(dmod.subprocess, "run", lambda argv, **kw: seen.update(kw["env"]) or
+                        subprocess.CompletedProcess(argv, 0, "", ""))
+    assert d._start_checks(p.root, tmp_path / "checks", "c1", 41, [])
+    assert seen["TTP_TASK"] == seen["TTP_TASK_ID"] == "41"
+    monkeypatch.undo()
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    # A model-free on_pass_cmd.
+    out = tmp_path / "on-pass-seen"
+    tid, _ = _on_pass_cmd_task(p, tmp_path, f"echo \"$TTP_TASK_ID\" > {out}; "
+                               "printf '{\"status\":\"done\",\"summary\":\"ok\"}' > \"$TTP_RESULT\"")
+    _settle_on_pass(d, tid)
+    assert out.read_text().strip() == str(tid)
+
+
 def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, monkeypatch):
     """On the machine whose entry is tagged `device`, every run the daemon starts (device task or not),
     its probes and the checks it relaunches get TT_VISIBLE_DEVICES empty (tt-umd then enumerates no
