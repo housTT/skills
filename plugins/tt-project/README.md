@@ -762,6 +762,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   they never queue behind task checks: each push branch has one priority slot of its own beyond the
   cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
   and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  Waiters take turns by project, within one by task priority. Checks of priority-1 tasks (live-impact
+  work: heal self-fixes and interim mitigations are filed at priority 1) go ahead of other projects'
+  waiters, taking turns by project among themselves, but at most `checks.priority_turns` turns in a
+  row (default 3; 0 turns this off) while other checks wait, so the rest still progress. There is no
+  separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
+  before this, their waiters may disagree on who is next and a slot can sit idle until another frees.
   `ttp push --own` publishes a task's branch and queues like task checks.
   Waiters take turns by project, and within a project by task priority, then arrival; a task that
   is a required owner of an open obligation goes first in its project (its queue entry in `ttp status`

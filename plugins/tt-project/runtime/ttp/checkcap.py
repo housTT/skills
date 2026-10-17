@@ -29,6 +29,11 @@ slot of its own beyond the cap (`acquire_priority`), keyed by the remote and bra
 branch host-wide, across projects. Task checks keep their cap and their order: the priority slot never
 takes one of theirs. It is an OS file lock like the others, so a killed push frees it too.
 
+Checks of priority-1 tasks (the daemon files live-impact work, heal self-fixes and interim mitigations,
+at priority 1) go next: ahead of other waiters in the queue, taking turns by project among themselves,
+but at most `checks.priority_turns` (TTP_CHECKS_PRIORITY_TURNS, default PRIORITY_TURNS; 0 turns it off)
+turns in a row while other checks wait, so those still progress (locks.fair_order's `urgent_max`).
+
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
@@ -37,8 +42,8 @@ They open beyond a default cap's ceiling too.
 Waiters take turns by project (locks.fair_order); within one, by task priority (1 first), then arrival.
 The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
 deliverable owed to the user) queue at OBLIGATION_PRIORITY, ahead of every task priority, until it has its
-receipt or is dropped; the ticket and the status line mark them (OBLIGATION_MARK). That changes the order
-within the project only: the turns between projects stay as they are.
+receipt or is dropped; the ticket and the status line mark them (OBLIGATION_MARK). Within the project
+they go first; between projects they count as urgent like priority 1 (above: bounded turns).
 
 A waiter whose checks match ones running now (`same`: the project, tree, commands and purpose) waits
 for their result outside the queue, keeping its arrival time; `done` ends any wait once a recorded
@@ -71,6 +76,7 @@ FOREGROUND_WAIT_S = 60.0
 # The arrival time a foreground run hands to its detached checks, so they keep its place in the queue.
 ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
+PRIORITY_TURNS = 3   # at most this many priority-1 turns in a row while other checks wait (priority_turns())
 
 
 def slot_dir() -> Path:
@@ -149,6 +155,16 @@ def extra_max() -> int:
     return EXTRA_SLOTS
 
 
+def priority_turns() -> int:
+    """Priority-1 checks' turns in a row at most while other checks wait: TTP_CHECKS_PRIORITY_TURNS, else
+    the account's checks.priority_turns, else PRIORITY_TURNS; 0 serves them in the fair order only."""
+    for v in (os.environ.get("TTP_CHECKS_PRIORITY_TURNS"),
+              (project.load_account_settings().get("checks") or {}).get("priority_turns")):
+        if v not in (None, "") and (n := _number(v)) is not None:
+            return n
+    return PRIORITY_TURNS
+
+
 def _load() -> float:
     try:
         return os.getloadavg()[0]
@@ -223,7 +239,7 @@ def state() -> dict:
     running = locks.held_labels(all_paths(n)) if n else []
     priority = locks.held_labels(priority_paths()) if n else []
     queued, ahead, groups = [], {}, set()
-    for t in locks.fair_order(slot_dir(), RESOURCE):
+    for t in locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns()):
         try:
             queued.append(t.read_text().strip())
         except OSError:
@@ -294,7 +310,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             stop: Callable[[], str] | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
-    OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order), so one project's burst cannot starve the others' checks. `tell` gets a line
+    OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
+    priority 1 or better ahead of the others for a bounded run of turns (priority_turns()), so one
+    project's burst cannot starve the others' checks. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
     it waited that long. `since` is the arrival time to queue at (default now). A slot directory that
@@ -314,6 +332,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         f = None if locks.queued(slot_dir(), RESOURCE) or _running(every, same) else _take(n, ps, every, holder, what, same)
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
+            locks.mark_turn(slot_dir(), RESOURCE, None)
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
@@ -352,12 +371,13 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     f = None
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
+                locks.mark_turn(slot_dir(), RESOURCE, ticket)
                 if told and tell:
                     tell(f"host-wide checks slot taken after {(time.time() - started) / 60:.1f} min")
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
-                    q = locks.fair_order(slot_dir(), RESOURCE)
+                    q = locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns())
                     ahead = q.index(ticket) if ticket in q else 0
                     groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
@@ -413,7 +433,7 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
 def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holder: str, what: str, same: str):
     """locks.take_in_turn over the cap and the slots load opened beyond it."""
     room = _room(n, every)
-    if room <= 0 or not locks.my_turn(slot_dir(), RESOURCE, ticket, room, fair=True):
+    if room <= 0 or not locks.my_turn(slot_dir(), RESOURCE, ticket, room, fair=True, urgent_max=priority_turns()):
         return None
     return _take(n, ps, every, holder, what, same, room)
 

@@ -496,16 +496,21 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
     return out
 
 
-def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None) -> list[Path]:
+def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
     (ticket_priority), then arrival.
 
+    `urgent_max` > 0: urgent waiters (task priority URGENT_PRIORITY or better) go first, taking turns
+    by group among themselves, but at most `urgent_max` turns in a row (counting the ones already
+    served, mark_turn) while other waiters wait; then the next other waiter goes. Tickets without a
+    priority (older runtimes) are never urgent, so a queue without urgent waiters keeps this order.
+
     Known gap: while some projects on a host still run a runtime from before fair ordering
-    (arrival-order my_turn) next to fair-order waiters, the two orders can disagree on who goes
-    first, so one slot may sit idle until another frees; this ends once every project on the host
-    is upgraded."""
+    (arrival-order my_turn) or before urgent turns next to newer waiters, the orders can disagree on
+    who goes first, so one slot may sit idle until another frees; this ends once every project on the
+    host is upgraded."""
     q = queued(locks_dir, resource) if q is None else q
     groups: dict[str, list[Path]] = {}
     for t in q:
@@ -514,26 +519,77 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None) -> l
     key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
     for ts in groups.values():
         ts.sort(key=ticket_priority)   # stable: arrival order within a priority
+    hot = sum(map(_urgent, q)) if urgent_max > 0 else 0
+    cold = len(q) - hot
+    run = _streak(locks_dir, resource) if hot and cold else 0
     out = []
     while groups:
-        g = min(groups, key=key.__getitem__)
-        out.append(groups[g].pop(0))
-        if groups[g]:
+        want = run < urgent_max if hot and cold else None   # urgent or not; None: either
+        g = min((g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)),
+                key=key.__getitem__)
+        ts = groups[g]
+        t = ts.pop(0 if want is None else next(i for i, t in enumerate(ts) if _urgent(t) == want))
+        out.append(t)
+        if hot and _urgent(t):
+            hot, run = hot - 1, run + 1
+        else:
+            cold, run = cold - 1, 0
+        if ts:
             key[g] = (1, len(out), "")
         else:
             del groups[g]
     return out
 
 
-def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False) -> bool:
+URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
+
+
+def _urgent(ticket: Path) -> bool:
+    return ticket_priority(ticket) <= URGENT_PRIORITY
+
+
+def streak_path(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.urgent"
+
+
+def _streak(locks_dir: Path, resource: str) -> int:
+    try:
+        return max(int(streak_path(locks_dir, resource).read_text().strip() or 0), 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
+    """Record a turn for fair_order's `urgent_max`: one more urgent turn in a row when `ticket` is
+    urgent and another waiter that is not still waits, else none. Call it once the ticket took the
+    resource, before dequeue; None for a take with nobody queued. Only a count: a lost or raced write
+    shifts the bound by a turn, never stops the queue."""
+    n = 0
+    if ticket is not None and _urgent(ticket):
+        if any(not _urgent(t) for t in queued(locks_dir, resource) if t != ticket):
+            n = _streak(locks_dir, resource) + 1
+    if n == _streak(locks_dir, resource):
+        return
+    path = streak_path(locks_dir, resource)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(str(n))
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
+            urgent_max: int = 0) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters, one per free slot, with no shared waiter ahead. A shared one: no exclusive waiter
-    ahead, so it never jumps one. `fair`: waiters are counted in fair_order, not arrival order."""
+    ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
+    arrival order."""
     q = queued(locks_dir, resource)
     if ticket not in q:
         return True
     if fair:
-        q = fair_order(locks_dir, resource, q)
+        q = fair_order(locks_dir, resource, q, urgent_max)
     ahead = q[:q.index(ticket)]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)

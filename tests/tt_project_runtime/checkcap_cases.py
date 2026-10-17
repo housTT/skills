@@ -394,3 +394,114 @@ def test_push_checks_slot_carries_the_obligation_boost_outside_the_push_priority
     push.check_slot("abc", lambda s: None, priority="branch-key")
     assert seen == [checkcap.OBLIGATION_PRIORITY, "push slot"], \
         "own push checks queue boosted; push-branch checks (batches) keep their slot beyond the cap"
+
+
+def _serve(d, n, urgent_max):
+    """Serve the fair queue's next `n` waiters the way checkcap.acquire does; their labels in order."""
+    from ttp import locks
+    got = []
+    for _ in range(n):
+        q = locks.fair_order(d, "r", urgent_max=urgent_max)
+        if not q:
+            break
+        locks.mark_served(d, "r", q[0].read_text()[0].upper())
+        locks.mark_turn(d, "r", q[0])
+        got.append(q[0].read_text())
+        locks.dequeue(q[0])
+    return got
+
+
+def test_checks_queue_serves_priority_1_first_by_project_for_a_bounded_run_of_turns(tmp_path):
+    from ttp import locks
+    d = tmp_path / "slots"
+    spec = [("b1", "B", None), ("b2", "B", 2), ("a1", "A", 1), ("c1", "C", 1), ("a2", "A", 1), ("c2", "C", 1),
+            ("a3", "A", 1), ("a4", "A", 3)]
+    for n, (label, g, pr) in enumerate(spec):
+        locks.enqueue(d, "r", label, since=1000.0 + n, group=g, priority=pr)
+    names = lambda m: [x.read_text() for x in locks.fair_order(d, "r", urgent_max=m)]
+    assert names(0) == ["b2", "a1", "c1", "b1", "a2", "c2", "a3", "a4"], "0: today's fair order"
+    assert names(3) == ["a1", "c1", "a2", "b2", "c2", "a3", "b1", "a4"], \
+        "p1 first, one project rotation for both, the next other waiter after 3 p1 turns in a row"
+    assert names(9) == ["a1", "c1", "a2", "c2", "a3", "b2", "a4", "b1"]
+    assert _serve(d, 2, 3) == ["a1", "c1"]
+    assert locks._streak(d, "r") == 2 and names(3)[:2] == ["a2", "b2"], "served p1 turns count toward the run"
+    assert _serve(d, 2, 3) == ["a2", "b2"]
+    assert locks._streak(d, "r") == 0, "another waiter's turn ends the run"
+    assert _serve(d, 4, 3) == ["c2", "a3", "b1", "a4"]
+    locks.enqueue(d, "r", "a5", group="A", priority=1)
+    b9 = locks.enqueue(d, "r", "b9", group="B")
+    assert _serve(d, 1, 3) == ["a5"] and locks._streak(d, "r") == 1
+    locks.dequeue(b9)
+    locks.enqueue(d, "r", "a6", group="A", priority=1)
+    assert _serve(d, 1, 3) == ["a6"] and locks._streak(d, "r") == 0, "no run counts while nobody else waits"
+
+
+def test_one_project_s_many_priority_1_checks_never_lock_out_other_projects(tmp_path):
+    from ttp import locks
+    d = tmp_path / "slots"
+    for n in range(12):
+        locks.enqueue(d, "r", f"a{n}", since=1000.0 + n, group="A", priority=1)
+    locks.enqueue(d, "r", "b0", since=1100.0, group="B")
+    locks.enqueue(d, "r", "c0", since=1101.0, group="C", priority=4)
+    got = _serve(d, 14, 3)
+    assert got.index("b0") <= 3 and got.index("c0") <= 7, got
+    assert [g for g in got if g[0] == "a"] == [f"a{n}" for n in range(12)]
+    locks.mark_turn(d, "r", None)
+    assert locks._streak(d, "r") == 0
+
+
+def test_checks_queue_with_older_runtimes_tickets_keeps_today_s_order(tmp_path):
+    # Older runtimes' tickets carry no priority (or no group): never urgent, so without a p1 waiter the
+    # order is the fair order, and their waiters still get the other turns once one is.
+    import fcntl
+    from ttp import locks
+    d = tmp_path / "slots"
+    q = locks.queue_dir(d, "r")
+    q.mkdir(parents=True)
+    held = []
+    for n, name in enumerate(["1000.000000-11", "1001.000000-12.gabc", "1002.000000-13.gabc"]):
+        f = open(q / name, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(f"old{n}")
+        f.flush()
+        held.append(f)
+    locks.enqueue(d, "r", "new2", since=1003.0, group="B", priority=2)
+    names = lambda m: [x.read_text() for x in locks.fair_order(d, "r", urgent_max=m)]
+    assert names(3) == names(0) == ["old0", "old1", "new2", "old2"]
+    locks.enqueue(d, "r", "new1", since=1004.0, group="B", priority=1)
+    assert names(1) == ["new1", "old0", "old1", "new2", "old2"]
+    for f in held:
+        f.close()
+
+
+def test_priority_1_checks_take_a_freed_slot_ahead_of_other_projects_unless_turned_off(env, monkeypatch):
+    import threading
+    from ttp import checkcap, project
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    assert checkcap.priority_turns() == checkcap.PRIORITY_TURNS
+    real = project.load_account_settings
+    monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"priority_turns": 0}})
+    assert checkcap.priority_turns() == 0
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "2")
+    assert checkcap.priority_turns() == 2
+    monkeypatch.setattr(project, "load_account_settings", real)
+    for turns, want in (("0", ["b", "a1"]), ("2", ["a1", "b"])):
+        monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", turns)
+        held = checkcap.acquire("h")
+        got = []
+
+        def take(label, proj, prio):
+            s = checkcap.acquire(label, project_name=proj, priority=prio)
+            got.append(label)
+            s.close()
+
+        waiters = []
+        for i, args in enumerate([("b", "B", None), ("a1", "A", 1)]):
+            waiters.append(threading.Thread(target=take, args=args))
+            waiters[-1].start()
+            assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+        assert checkcap.state()["queued"] == want
+        held.close()
+        for w in waiters:
+            w.join(20)
+        assert got == want
