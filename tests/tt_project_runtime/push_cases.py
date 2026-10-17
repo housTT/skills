@@ -7894,14 +7894,29 @@ def test_push_claim_checks_stay_within_the_tick_budget_and_the_rest_carry_over_u
     monkeypatch.setattr(pushclaim, "LS_TIMEOUT_S", 0.15)
     monkeypatch.setattr(pushclaim, "PER_TICK", 10)
     p, d, tids, calls = _slow_claims(env, monkeypatch, 6)
+    took, slow = [], pushclaim._git
+
+    def timed(r, *args, timeout=30):   # each git network call's own duration, as the Budget charges it
+        began = time.monotonic()
+        try:
+            return slow(r, *args, timeout=timeout)
+        finally:
+            if args[0] in ("ls-remote", "fetch"):
+                took.append(time.monotonic() - began)
+    monkeypatch.setattr(pushclaim, "_git", timed)
+    # Work between the calls (recording a hand-off) is not network time: a loaded host slows it, the
+    # Budget does not charge it. Without this a wall-clock bound flakes under load.
+    finish = d._finish_worker
+    monkeypatch.setattr(d, "_finish_worker", lambda *a, **k: (time.sleep(0.25), finish(*a, **k))[1])
     status = lambda: [p.db.task(t)["status"] for t in tids]
     d._tick_began = time.monotonic()
-    began = time.monotonic()
     d.verify_pushes()
-    took = time.monotonic() - began
     checked = len(calls)
-    # A call starts only when its timeout fits in what is left: at most 3 of 0.1 s fit in 0.35 s.
-    assert 1 <= checked <= 3 and took < 0.35 + 0.25, (checked, took)
+    # A later call starts only with min(timeout, 1 s) = 0.15 s of the 0.35 s left: at most 3 of 0.1 s fit,
+    # and the tick stops at the first that does not (0.05 s for the Budget's own timing around each call).
+    spent = [sum(took[:i]) for i in range(checked + 1)]
+    assert 1 <= checked <= 3 and all(0.35 - s >= 0.15 for s in spent[1:checked]), (checked, took)
+    assert 0.35 - spent[checked] < 0.15 + 0.05, (checked, took)
     assert status() == ["done"] * checked + ["pushing"] * (6 - checked)
     for t in tids[checked:]:   # not tried, not backed off, not failed
         pv = json.loads(p.db.task(t)["result"])[pushclaim.KEY]
