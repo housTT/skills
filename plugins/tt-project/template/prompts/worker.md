@@ -73,10 +73,10 @@ Other workers run other tasks of this project at the same time.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
   empty). Never unset or override the masking variables to work around this.
   Who held a machine when: `ttp machines activity <alias>`.
-  An idle-machine or nothing-ran claim names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo runs; they rotate).
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
+- An idle-machine or nothing-ran claim names its evidence (process list, scheduler, broker or auth log); one empty log is no proof (auth logs show only sudo runs; they rotate).
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
   (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the
@@ -98,13 +98,13 @@ Others share these nodes: hold one only while work runs.
 - Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or limits, stay within them;
   beyond them needs the user's word: hand off `blocked` asking, never widen your own scope. All busy: hand off `waiting`.
 - Never take a node that is allocated, drained, reserved for others or down. Never cancel,
-  preempt or join another user's allocation.
+  preempt, join or share another user's allocation.
 - Submit the whole test as one batch job (`sbatch`, or `srun` for one command) that exits when the
   test ends, limited to the expected run time plus a small margin, never the partition maximum. No
   interactive or no-shell allocation (`salloc --no-shell`) kept for later steps, no job
   waiting on another task, a review, a tunnel, a laptop or a human.
 - The job script starts every process it needs and kills them all before it exits; never start
-  any by `ssh`. Release must depend on nothing outside the cluster.
+  any by `ssh` into an allocation. Release must depend on nothing outside the cluster.
 - An editor, `tmux` or agent session on a node is not using it; leave none open.
 - Release the allocation as soon as the work ends. Record every allocation (cluster, job id, node,
   start, end, purpose) with `ttp note` and in the hand-off; check nothing of yours still runs

@@ -3550,7 +3550,13 @@ def test_worker_prompt_keeps_idleness_evidence_and_shared_script_rules():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("concurrently only under `ttp lock <name>` or git", "`journalctl` over boots: tt-project-harness watchers reference"):
         assert part in text, part
-    # The idleness-evidence line renders for a device-only project, not only for clusters.
-    dev = text.split("<!-- ttp:if device -->")[1].split("<!-- /ttp:if device -->")[0]
-    assert "names its evidence" in dev and "auth log" in dev
-    assert "names its evidence" not in text.split("<!-- ttp:if clusters -->")[1].split("<!-- /ttp:if clusters -->")[0]
+    raw = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import prompts
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    for on in ({"device"}, {"remote"}, {"clusters"}, {"device", "wait"}, {"remote", "wait"}, {"clusters", "wait"}):
+        out = prompts.feature_blocks(raw, on)
+        assert "names its evidence" in out and "auth log" in out, on
+    assert prompts.feature_blocks(raw, {"device", "remote", "clusters", "wait"}).count("names its evidence") == 1
