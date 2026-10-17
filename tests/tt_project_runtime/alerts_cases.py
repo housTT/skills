@@ -1217,6 +1217,78 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
 
 
 
+def test_pr_watch_stops_at_its_deadline_keeps_what_it_read_and_resumes_there(env, monkeypatch):
+    """Slow gh calls: a builtin run stops at its total deadline, keeps the PRs it read, reports one error
+    that it was cut short (one issue however many runs are cut), and the next run starts at the PR it
+    did not reach. A whole run closes the error."""
+    from ttp import screen as scr, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    urls = [f"https://github.com/acme/widgets/pull/{n}" for n in range(1, 6)]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    clock, step, viewed = [1000.0], [30.0], []
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+
+    def slow_gh(args, cwd):
+        clock[0] += step[0]   # each call takes `step` seconds
+        if args[0] == "api":
+            return None
+        viewed.append(args[2])
+        return {"url": args[2], "state": "OPEN", "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", slow_gh)
+    d = Daemon(p.base)
+    errors = lambda: p.db.q("SELECT status, count FROM issues WHERE source=?",
+                            (scr.error_source("watcher:prs"),))
+    status = watchers.run_builtin(d, "prs", {"deadline_s": 90})
+    # Two PRs (a view and a GraphQL read each) take 120 s: the third is not started.
+    assert status.startswith("cut short (2 of 5 PRs read"), status
+    assert viewed == urls[:2] and set(p.db.kv("pr_signatures")) == set(urls[:2])
+    assert [e["status"] for e in errors()] == ["open"]
+    status = watchers.run_builtin(d, "prs", {"deadline_s": 90})
+    assert status.startswith("cut short") and viewed[2:] == urls[2:4]
+    assert [e["status"] for e in errors()] == ["open"], "a second cut run is the same error"
+    step[0] = 0.0
+    assert watchers.run_builtin(d, "prs", {"deadline_s": 90}).startswith("ok (5 PRs")
+    assert viewed[4:] == [urls[4], *urls[:4]], "it starts at the PR the cut run did not reach"
+    assert [e["status"] for e in errors()] == ["fixed"]
+    assert p.db.kv(watchers.PR_CURSOR_KEY) is None
+
+
+def test_a_hanging_gh_call_is_killed_at_the_watchers_deadline(env, monkeypatch, tmp_path):
+    """A gh that never answers holds a builtin run no longer than its deadline, whatever its per-call
+    timeout, and the run reports itself cut short."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    for n in (1, 2, 3):
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", f"https://github.com/acme/widgets/pull/{n}", time.time()))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "gh").write_text("#!/bin/sh\nexec sleep 30\n")
+    (bindir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    d = Daemon(p.base)
+    t0 = time.monotonic()
+    status = watchers.run_builtin(d, "prs", {"deadline_s": 1.5, "gh_timeout_s": 20})
+    assert time.monotonic() - t0 < 6, "the tick stays bounded by the deadline"
+    assert status.startswith("cut short (0 of 3 PRs read"), status
+
+
+def test_builtin_watcher_bounds_come_from_the_payload_then_the_config_and_are_capped(env):
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    assert watchers.bounds(d, {}) == (watchers.DEADLINE_S, watchers.GH_TIMEOUT_S)
+    d.cfg = {**d.cfg, "watchers": {"deadline_s": 50, "gh_timeout_s": 10}}
+    assert watchers.bounds(d, {}) == (50, 10)
+    assert watchers.bounds(d, {"deadline_s": 5}) == (5, 5), "a call never outlasts the deadline"
+    assert watchers.bounds(d, {"deadline_s": 10_000, "gh_timeout_s": "x"}) == (watchers.DEADLINE_MAX_S, 10)
+
+
+
 def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, monkeypatch):
     p, other = _global_cap_setup(env, tmp_path)
     from ttp import alerts

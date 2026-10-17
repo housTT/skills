@@ -15,6 +15,10 @@
   finding, not new work, and an empty COMMENTED review that only wraps the runs' own or a bot's inline
   comments is no activity (a person's inline-only review, or one whose comments are unknown, counts; a failed read keeps the last known activity). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
+
+Each run has a total deadline (`watchers.deadline_s`, a payload's `deadline_s` wins) and each gh call a
+timeout (`watchers.gh_timeout_s`, or the payload's), cut to the time left: a run past its deadline stops,
+keeps what it read, and reports one error saying it was cut short. The next run starts where it stopped.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import contextvars
 import subprocess
 import time
 from pathlib import Path
@@ -31,20 +36,82 @@ from . import screen as scr
 
 DAY = 86400.0
 GH_LOG_MARGIN_S = 3600.0   # runs' gh calls this long before a PR was last seen in draft still count
+GH_TIMEOUT_S = 20.0        # one gh call's default timeout
+DEADLINE_S = 90.0          # one builtin run's default total bound, well below the daemon's tick watchdog
+DEADLINE_MAX_S = 240.0     # a configured deadline is capped here (the daemon's WATCHER_MAX_S)
+PR_CURSOR_KEY = "pr_watch_next"   # kv: the PR a run cut short did not reach; the next run starts there
+
+_now = time.monotonic
+# (deadline on the _now clock, per-call gh timeout) of the builtin run in progress
+_BOUND: contextvars.ContextVar[tuple[float, float] | None] = contextvars.ContextVar("watcher_bound", default=None)
+
+
+def _seconds(*values, default: float) -> float:
+    """The first of `values` that is a positive number of seconds, else `default`."""
+    for v in values:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        if x > 0:
+            return x
+    return default
+
+
+def bounds(daemon, payload: dict) -> tuple[float, float]:
+    """(deadline_s, gh_timeout_s) of one run: the payload's, else the config's `watchers`, else the
+    defaults. The deadline is capped at DEADLINE_MAX_S and a gh call never outlasts it."""
+    cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
+    deadline = min(_seconds(payload.get("deadline_s"), cfg.get("deadline_s"), default=DEADLINE_S), DEADLINE_MAX_S)
+    return deadline, min(_seconds(payload.get("gh_timeout_s"), cfg.get("gh_timeout_s"), default=GH_TIMEOUT_S),
+                         deadline)
+
+
+def _left() -> float | None:
+    """Seconds left before the running builtin's deadline (None: unbounded)."""
+    b = _BOUND.get()
+    return None if b is None else b[0] - _now()
+
+
+def _over() -> bool:
+    left = _left()
+    return left is not None and left <= 0
 
 
 def run_builtin(daemon, name: str, payload: dict) -> str:
     kind = payload.get("builtin") or name
-    if kind == "prs":
-        return watch_prs(daemon)
-    if kind == "logfile":
-        return watch_logs(daemon, payload)
-    return f"unknown builtin {kind}"
+    deadline, per_call = bounds(daemon, payload)
+    source = f"watcher:{name}"
+    started = time.time()
+    token = _BOUND.set((_now() + deadline, per_call))
+    try:
+        if kind == "prs":
+            status = watch_prs(daemon)
+        elif kind == "logfile":
+            status = watch_logs(daemon, payload)
+        else:
+            return f"unknown builtin {kind}"
+    finally:
+        _BOUND.reset(token)
+    if status.startswith("cut short"):   # one error per stint: its key holds while runs keep being cut
+        daemon.observe(scr.error_source(source), f"builtin watcher {name} was cut short at its {deadline:g} s "
+                       f"deadline: {status}; the next run continues where it stopped", "normal",
+                       lifecycle=scr.ERROR, key=f"{source}:cut-short")
+    else:   # a whole run: an earlier cut-short error is over
+        scr.settle_receipts(daemon.p.db, source, started, ())
+    return status
 
 
 def _gh(args: list[str], cwd: str) -> dict | None:
+    """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
+    left before its deadline; past the deadline it is not called."""
+    left, b = _left(), _BOUND.get()
+    timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
+    if timeout <= 0:
+        return None
     try:
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, cwd=cwd)
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                             stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -129,10 +196,20 @@ def watch_prs(daemon) -> str:
     heads = dict(db.kv(prguard.HEADS_KEY, {}) or {})
     drafts = dict(db.kv(prguard.DRAFT_SEEN_KEY, {}) or {})
     changed = 0
-    for t in rows:
+    # A run cut short starts the next one at the PR it did not reach, so each PR gets its turn.
+    cursor = db.kv(PR_CURSOR_KEY)
+    start = next((i for i, t in enumerate(rows) if t["pr_url"] == cursor), 0)
+    order, stopped = rows[start:] + rows[:start], None
+    for i, t in enumerate(order):
+        if _over():
+            stopped = i
+            break
         pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
                   "comments,reviews,url,title,author,headRefOid,headRefName"], root)
         if pr is None:
+            if _over():
+                stopped = i   # cut off mid-read: this PR goes first next time
+                break
             continue
         key = prguard.pr_key(pr.get("url") or t["pr_url"])
         if key and pr.get("headRefOid") and (heads.get(key) or {}).get("sha") != pr["headRefOid"]:
@@ -189,7 +266,10 @@ def watch_prs(daemon) -> str:
     db.set_kv(prguard.HEADS_KEY, heads)
     keys = {prguard.pr_key(t["pr_url"]) for t in rows}
     db.set_kv(prguard.DRAFT_SEEN_KEY, {k: v for k, v in drafts.items() if k in keys})
+    db.set_kv(PR_CURSOR_KEY, order[stopped]["pr_url"] if stopped is not None else None)
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
+    if stopped is not None:
+        return f"cut short ({stopped} of {len(rows)} PRs read, {changed} changed{unapproved})"
     return f"ok ({len(rows)} PRs, {changed} changed{unapproved})"
 
 
@@ -385,9 +465,12 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
 def watch_logs(daemon, payload: dict) -> str:
     db = daemon.p.db
     offsets = db.kv("log_offsets", {})
-    n = 0
+    n, cut = 0, False
     for pattern in payload.get("files", []):
         for path in sorted(Path(daemon.p.root).glob(pattern)) if not os.path.isabs(pattern) else [Path(pattern)]:
+            if _over():   # a file not reached keeps its offset: the next run reads it
+                cut = True
+                break
             if not path.is_file():
                 continue
             key = str(path)
@@ -408,7 +491,7 @@ def watch_logs(daemon, payload: dict) -> str:
             else:
                 offsets[key] = size
     db.set_kv("log_offsets", offsets)
-    return f"ok ({n} lines screened)"
+    return f"cut short ({n} lines screened)" if cut else f"ok ({n} lines screened)"
 
 
 def daemon_rule(line: str) -> str:
