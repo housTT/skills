@@ -97,6 +97,7 @@ Others share these nodes: hold one only while work runs on it.
 - Get nodes only through the cluster's scheduler. Where the charter names nodes, partitions or
   limits, stay within them; beyond them needs the user's word: hand off `blocked` asking, never
   widen your own scope. All busy: hand off `waiting`.
+- A claim that a machine was idle or nothing ran must name its evidence (process list, scheduler, broker log, auth log); one empty log class is no proof (auth logs show only the sudo invocation and rotate).
 - Never take a node that is allocated, drained, reserved for others or down. Never cancel,
   preempt, join or share another user's allocation.
 - Submit the whole test as one batch job (`sbatch`, or `srun` for one command) that exits when the
