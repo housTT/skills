@@ -15301,7 +15301,7 @@ def test_memory_every_prompt_leaves_out_is_archived_daily_after_the_set_days(env
         f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
     t0 = time.time()
     p.note_memory_shown([], now=t0 - 30 * day)   # recording began a month ago
-    coord.recent_memory_lines(p)
+    coord.recent_memory(p)
     worker_system(p)
     shown = p.db.kv("memory_shown")["entries"]
     assert old[-1].stem in shown and old[0].stem not in shown, "the coordinator's budget cut the oldest"

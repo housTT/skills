@@ -69,7 +69,6 @@ class Claude(Provider):
     # was tried and measured: coordinator cost per turn rose and the hit rate barely moved. So all
     # four stay reserved and the stable part ends the system prompt.
     own_cache_breakpoints = 4
-    partial_prefix_cache = False
     login_hint = "run `claude` there and use /login"
     efforts = ("low", "medium", "high", "xhigh", "max")
     steer_hook = True   # worker_settings() routes PostToolUse through ttp.hook

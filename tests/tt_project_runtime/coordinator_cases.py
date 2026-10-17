@@ -1183,53 +1183,72 @@ def _coordinator_turns(env, monkeypatch, provider):
     return p, turn
 
 
-def test_slow_sections_end_the_cached_context_block_byte_identical_while_unchanged(env, monkeypatch):
-    # A provider whose cache reuses any matching prefix (codex): the slow sections end the block.
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_a_release_or_memory_edit_keeps_the_cached_prompt_bytes_and_shows_in_the_digest(env, monkeypatch, provider):
+    # Claude's cache matches only at a breakpoint and the whole context block joins its system prompt:
+    # a release line or a memory change in the block rewrote all of it. Only the snapshot's own
+    # recent memory ends the block; every change since waits in the per-turn digest.
     from ttp import coordinator as coord
-    p, turn = _coordinator_turns(env, monkeypatch, "codex")
+    p, turn = _coordinator_turns(env, monkeypatch, provider)
     first, k1 = turn("one")
     second, k2 = turn("two")
-    assert k1["context"] == k2["context"], "the cached block changed with nothing slow changing"
-    assert k1["system"] == k2["system"]
+    assert (k1["system"], k1["context"]) == (k2["system"], k2["context"])
     ctx = k1["context"]
-    assert ctx.index("# MEMORY\n") < ctx.index(coord.RECENT_MEMORY_HEADER), "slow sections end the block"
+    assert ctx.index("# MEMORY\n") < ctx.index(coord.RECENT_MEMORY_HEADER), "the snapshot's recent memory ends the block"
     assert "Picked the cheaper runner." in ctx.split(coord.RECENT_MEMORY_HEADER, 1)[1]
     for prompt in (first, second):
         assert coord.RECENT_MEMORY_HEADER not in prompt and "Picked the cheaper runner." not in prompt
+        assert coord.RECENT_ADDED_HEADER not in prompt
     assert "one" in first and "two" in second   # the per-turn digest still differs
     assert k2["note"]["digest"]["cached_chars"] > 0 and "memory_recent" not in k2["note"]["digest"]["sections"]
-    p.add_memory("The build takes 40 minutes.", kind="fact")
-    _, k3 = turn("three")
-    assert k3["context"] != k2["context"] and "The build takes 40 minutes." in k3["context"]
-    assert k3["context"].startswith(k2["context"].split(coord.RECENT_MEMORY_HEADER, 1)[0]), \
-        "a slow change moved the snapshot part of the block"
+    fact = p.add_memory("The build takes 40 minutes.", kind="fact")
+    p.add_memory("Box C joined the pool.", kind="resource")
+    _deploy(p, "9.9.9")
+    picked = next(f for f in p.memory_dir.glob("decision-*.md") if "cheaper runner" in f.read_text())
+    picked.write_text(picked.read_text().replace("Picked the cheaper runner.", "Picked the faster runner."))
+    third, k3 = turn("three")
+    assert (k3["system"], k3["context"]) == (k1["system"], k1["context"]), "a release or memory edit missed the cache"
+    assert coord.join_prompt(k3["system"], k3["context"]) == coord.join_prompt(k1["system"], k1["context"])
+    assert "Release 9.9.9 installed" in third and "Release 9.9.9" not in k3["context"]
+    added = third.split(coord.RECENT_ADDED_HEADER, 1)[1]
+    assert "The build takes 40 minutes." in added and "Picked the faster runner." in added
+    assert "Box C joined the pool." in third.split(coord.MEMORY_DIGEST_HEADER, 1)[1]
+    p.forget_memory(fact.stem)
+    fourth, k4 = turn("four")
+    assert k4["context"] == k1["context"] and f"[{fact.stem}]" not in fourth
+    p.forget_memory(picked.stem)
+    fifth, k5 = turn("five")
+    assert k5["context"] == k1["context"] and f"[{picked.stem}] retired, ignore" in fifth
+    # The next refresh renders the changes into the block and empties the digest's deltas.
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    sixth, k6 = turn("six")
+    assert k6["context"] != k1["context"] and "Box C joined the pool." in k6["context"]
+    assert "Picked the" not in k6["context"] and "Release 9.9.9" not in sixth
+    assert coord.RECENT_ADDED_HEADER not in sixth and coord.MEMORY_DIGEST_HEADER not in sixth
 
 
 
-def test_claude_turns_keep_slow_sections_in_the_digest_so_a_memory_add_keeps_the_system_prompt(env, monkeypatch):
-    # Claude's cache matches only at a breakpoint, and the whole context block joins the system
-    # prompt: a slow section there would rewrite all of it on every memory change.
+def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_digest(env):
+    p = make(env)
     from ttp import coordinator as coord
-    from ttp.providers import get_provider
-    assert get_provider("claude").partial_prefix_cache is False and get_provider("codex").partial_prefix_cache
-    p, turn = _coordinator_turns(env, monkeypatch, "claude")
-    first, k1 = turn("one")
-    assert coord.RECENT_MEMORY_HEADER not in k1["context"] and "Picked the cheaper runner." not in k1["context"]
-    assert "Picked the cheaper runner." in first.split(coord.RECENT_MEMORY_HEADER, 1)[1]
-    assert k1["note"]["digest"]["cached_chars"] == 0
-    p.add_memory("The build takes 40 minutes.", kind="fact")
-    second, k2 = turn("two")
-    assert (k2["system"], k2["context"]) == (k1["system"], k1["context"]), "a memory add missed the prompt cache"
-    assert coord.join_prompt(k2["system"], k2["context"]) == coord.join_prompt(k1["system"], k1["context"])
-    assert "The build takes 40 minutes." in second and "The build takes 40 minutes." not in first
+    p.add_memory("Picked the cheaper runner.", kind="decision")
+    coord.system_prompt(p)
+    snap = p.db.kv(coord.PROMPT_SNAPSHOT_KEY)
+    p.db.set_kv(coord.PROMPT_SNAPSHOT_KEY, {k: v for k, v in snap.items() if k != "recent"})
+    cached, delta = coord.recent_memory(p)
+    assert cached == [] and delta[0] == coord.RECENT_ADDED_HEADER and "Picked the cheaper runner." in delta[1]
+    assert "recent" not in p.db.kv(coord.PROMPT_SNAPSHOT_KEY), "an old snapshot is kept, not re-rendered"
 
 
 
 def test_split_cached_keeps_a_fixed_order_and_the_rest_of_the_digest():
     from ttp import coordinator as coord
-    parts = [("budget", "B"), ("memory_recent", "R"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A")]
+    assert coord.CACHED_SECTIONS == ("memory_recent",)
+    parts = [("budget", "B"), ("memory_recent", "R"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A"),
+             ("memory_recent_added", "D")]
     cached, rest = coord.split_cached(parts)
-    assert cached == "P\nA\nR" and rest == [("budget", "B"), ("tasks", "T")]
+    assert cached == "R" and rest == [("budget", "B"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A"),
+                                      ("memory_recent_added", "D")]
     assert coord.split_cached([("tasks", "T")]) == ("", [("tasks", "T")])
     assert coord.with_cached("CTX\n", "") == "CTX\n" and coord.with_cached("CTX\n", "R") == "CTX\n\nR\n"
 
@@ -5913,7 +5932,7 @@ def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_pro
     assert coord.system_prompt(p) == before, "a memory change missed the prompt cache"
     added = _memory_section(digest)
     assert len(added) == 1 and added[0].startswith("[resource-") and "Box B is shared." in added[0]
-    recent = digest.split(coord.RECENT_MEMORY_HEADER, 1)[1]
+    recent = digest.split(coord.RECENT_ADDED_HEADER, 1)[1]
     assert "[fact-" in recent and "Builds need a quiet window." in recent and "Builds need" not in before
 
 

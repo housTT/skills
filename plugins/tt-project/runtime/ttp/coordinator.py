@@ -308,10 +308,12 @@ COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried")
 LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"lines": {key: hash}}
 LEDGER_WHOLE_CHANGES = 10   # change lines in a whole view (overdue, then the project's own); the rest counted
 LEDGER_HEAD = "## Shared machines in your Resources"
-# Sections that change only when memory, the charter or the release does: they end the cached
-# context block (with_cached) instead of the digest, which a timestamp leads and so misses the cache
-# whole every turn. Their order is fixed, so the block is byte-identical while they are unchanged.
-CACHED_SECTIONS = ("prompt_delta", "memory_added", "memory_recent")
+# Sections rendered from the prompt snapshot alone: they end the cached context block (with_cached)
+# instead of the digest, which a timestamp leads and so misses the cache whole every turn. They change
+# only when the snapshot does, so the block is byte-identical between refreshes on every provider.
+# What changes between refreshes (prompt_delta, memory_added, memory_recent_added) stays in the digest:
+# where the cache matches only at a breakpoint, one such line in the block rewrote all of it.
+CACHED_SECTIONS = ("memory_recent",)
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
@@ -355,14 +357,15 @@ _RETIRE_RE = re.compile(r"\bstale restriction|\bretir(e|es|ing)\b|\bno longer ap
 # The coordinator's system prompt (restrictions, role, charter, STANDING and standing memory) is a
 # snapshot, re-rendered only when the provider's cache is cold anyway, when it is older than
 # coordinator.prompt_max_age_s, or at once for a restrictions change or a charter edit on the user's
-# word. Every other change waits as a delta (prompt_delta_lines) at the end of the context block
-# (CACHED_SECTIONS), so deploys, memory and charter edits between refreshes leave the prefix before
-# it byte-identical.
+# word. Every other change waits as a delta in the digest (prompt_delta_lines, memory_digest_lines,
+# recent_memory), so deploys, memory and charter edits between refreshes leave the prompt byte-identical.
 PROMPT_SNAPSHOT_KEY = "prompt_snapshot"   # kv: the rendered prompt and what it was rendered from
 MEMORY_SNAPSHOT_KEY = PROMPT_SNAPSHOT_KEY
 PROMPT_REFRESH_KEY = "prompt_refresh"     # kv: a charter edit on the user's word: the next turn re-renders
 MEMORY_DIGEST_HEADER = "## Memory added since the snapshot"
 RECENT_MEMORY_HEADER = "## Recent decisions and facts (newest last; older ones stay in memory/)"
+RECENT_ADDED_HEADER = ("## Decisions and facts recorded or changed since the cached prompt (newest last; "
+                       "a changed one replaces its line in the recent list)")
 PROMPT_MAX_AGE_S = 4 * 3600
 
 
@@ -432,11 +435,13 @@ def prompt_state(p: Project, now: float | None = None) -> tuple[dict, dict]:
         from .release import runtime_version
         standing = f"# STANDING\n{live['standing']}\n\n" if live["standing"] else ""
         memory = "\n".join(e["line"] for e in entries) or "(no standing memories yet)"
+        recent = [e for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0] if not _standing_entry(e)]
         snap = {"at": now, "why": why, "head": f"{rules}{role}",
                 "context": f"# CHARTER\n{charter}\n\n{standing}# MEMORY\n{memory}\n",
                 "rules": live["rules"], "restrictions": restrictions, "role": live["role"],
                 "version": runtime_version(p.harness / "runtime"), "charter": charter,
-                "standing": live["standing"], "entries": live["shas"]}
+                "standing": live["standing"], "entries": live["shas"],
+                "recent": {"lines": [e["line"] for e in recent], "entries": {e["name"]: _sha(e["line"]) for e in recent}}}
         p.db.set_kv(PROMPT_SNAPSHOT_KEY, snap)
         p.db.x("DELETE FROM kv WHERE key IN (?, 'memory_snapshot')", (PROMPT_REFRESH_KEY,))
     return snap, live
@@ -453,14 +458,23 @@ def memory_view(p: Project, now: float | None = None) -> dict:
             "retired": [n for n in taken if n not in live["shas"]]}
 
 
-def recent_memory_lines(p: Project) -> list[str]:
-    """The newest decisions and facts the coordinator's memory budget leaves room for after the
-    standing entries, shown live after the snapshot (CACHED_SECTIONS) so a new one never changes it.
-    Records every entry the turn sees as shown (Project.note_memory_shown)."""
+def recent_memory(p: Project, now: float | None = None) -> tuple[list[str], list[str]]:
+    """(cached, delta): the newest decisions and facts the coordinator's memory budget left room for
+    after the standing entries when the snapshot was taken, as the snapshot holds them (CACHED_SECTIONS:
+    byte-identical until the next refresh), and the ones recorded, changed or retired since, for the
+    digest. Records every entry the turn sees as shown (Project.note_memory_shown)."""
+    snap = prompt_state(p, now)[0]
+    took = snap.get("recent") or {}
+    taken = took.get("entries") or {}
+    live = {e["name"]: e for e in p._memory_entries()}
     shown = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
-    p.note_memory_shown([e["name"] for e in shown])
-    rest = [e["line"] for e in shown if not _standing_entry(e)]
-    return [RECENT_MEMORY_HEADER] + rest if rest else []
+    new = [e for e in shown if not _standing_entry(e) and e["name"] not in taken]
+    changed = [live[n] for n in taken if n in live and _sha(live[n]["line"]) != taken[n]]
+    retired = [n for n in taken if n not in live]
+    p.note_memory_shown([e["name"] for e in shown] + [n for n in taken if n in live])
+    cached = [RECENT_MEMORY_HEADER, *took["lines"]] if took.get("lines") else []
+    delta = [e["line"] for e in changed + new] + [f"[{n}] retired, ignore" for n in retired]
+    return cached, [RECENT_ADDED_HEADER, *delta] if delta else []
 
 
 def _charter_delta(old: str, new: str) -> list[str]:
@@ -786,7 +800,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         shas[LEDGER_SEEN_KEY] = ledger[1]
     section("prompt_delta", prompt_delta_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))
-    section("memory_recent", recent_memory_lines(p))
+    cached, delta = recent_memory(p, now)
+    section("memory_recent", cached)
+    section("memory_recent_added", delta)
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
