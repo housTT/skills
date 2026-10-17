@@ -446,7 +446,7 @@ def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, m
     from ttp import screen as scr
     from ttp.cli import status_text
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def wakes():
@@ -694,7 +694,7 @@ def test_mute_replay_of_a_held_box_wakes_the_coordinator_an_hour_in(env, monkeyp
     clock = {"t": 1_800_000_000.0}
     monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
     out["stdout"] = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True})
     d._run_command_watcher({"name": "hw"}, {"command": "x"})   # 10:01, wakes; the coordinator mutes it

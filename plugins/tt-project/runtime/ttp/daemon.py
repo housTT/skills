@@ -13,6 +13,7 @@ Invariants:
 from __future__ import annotations
 
 import contextlib
+import copy
 import faulthandler
 import hashlib
 import json
@@ -105,6 +106,7 @@ from . import userpause
 from . import verified
 from . import waitheal
 from . import watchdup
+from . import schedrun
 from . import screen as scr
 from . import shared
 from . import shorttmp
@@ -138,6 +140,10 @@ TICK_OVERRUN_S = 900
 # (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
 TICK_STALL_S = HEARTBEAT_STALE_S
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
+# Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
+# in the tick that started them and a slow one never holds it.
+SCHEDULE_WAIT_S = 2.0
+SCHEDULE_GRACE_S = 30   # past its own bounds (command timeout, builtin deadline), a run is killed and failed
 # Under state/: every thread's stack, on SIGUSR1 or SIGUSR2 (register_stack_dump) and on a tick overrun
 # or stall (check_overrun). ttp.watchdog copies each new dump to state/incidents/.
 STACKS_FILE = "daemon-stacks.log"
@@ -568,6 +574,8 @@ class Daemon:
         self._moved = 0.0        # when the running tick last made progress, monotonic
         self._push_budget: tuple[float, pushclaim.Budget] | None = None   # this tick's git time for push checks
         self._push_carry: dict[str, tuple[float, dict]] = {}   # push checks' remote answers kept for later ticks
+        self._sched_runs: dict[str, schedrun.Run] = {}   # schedule name -> its run going on off the tick
+        self._sched_swept = False   # process groups an earlier daemon's schedule runs left are killed
         self._step_name = ""     # the tick step running now
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
@@ -693,6 +701,8 @@ class Daemon:
         except Exception:
             log(self.p, "clean stop record: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._idle.release()
+        for line in schedrun.kill_all(self.p.db):   # runs going on die with the daemon; due again at its start
+            log(self.p, line)
         self._ends.stop()   # end-condition probes are rerun after the next start
         self._pause_ends.stop()
         self._mute_ends.stop()
@@ -3944,31 +3954,98 @@ class Daemon:
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:
-        db = self.p.db
+        """Start each due schedule whose last run ended and record the runs that ended. Commands, heal
+        checks and builtin watchers run off the tick (schedrun), so a hung one (a gh call, ssh to a box
+        that does not answer) never holds messages or dispatch; the tick waits at most SCHEDULE_WAIT_S
+        for them. A run past its timeout (_schedule_timeout) has its process groups killed and is
+        recorded as a failed run."""
+        db, runs = self.p.db, self._sched_runs
+        if not self._sched_swept:   # what an earlier daemon's runs left: their schedules are still due
+            self._sched_swept = True
+            for line in schedrun.kill_all(db):
+                log(self.p, line)
         for s in sched.due(db):
+            if s["name"] in runs:
+                continue   # its run is still going: never two at once
             payload = json.loads(s["payload"] or "{}")
-            again = None
+            if s["kind"] in ("command", "watcher"):
+                runs[s["name"]] = self._start_schedule(s, payload)
+                continue
             try:
-                if s["kind"] == "command" and payload.get("heal"):
-                    status, again = self._run_heal(s, payload)
-                elif s["kind"] == "command":
-                    status = self._run_command_watcher(s, payload)
-                elif s["kind"] == "watcher":
-                    from .watchers import run_builtin
-                    status = run_builtin(self, s["name"], payload)
-                else:
-                    status = self._schedule_llm(s, payload)
+                status = self._schedule_llm(s, payload)
             except Exception as e:
                 status = f"error: {type(e).__name__}: {e}"[:200]
-            sched.mark_ran(db, s, status, home=timefmt.home(self.p))
-            if again is not None:   # a heal check's grace end or settle recheck comes before its period
-                db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, s["name"]))
-            if (sched.failing(status) and sched.failing(s["last_status"])
-                    and not (s["kind"] == "command" and payload.get("heal") and heal.owns(db, s["name"]))):
-                self._schedule_broken(s, status)
-            elif not sched.failing(status):
-                self._schedule_mended(s["name"])
-            self._progress()
+            self._schedule_ran(s, status, None)
+        until = time.monotonic() + SCHEDULE_WAIT_S
+        for run in list(runs.values()):
+            if not run.timed_out:
+                run.done.wait(max(0.0, until - time.monotonic()))
+        for name, run in list(runs.items()):
+            if run.done.is_set():
+                runs.pop(name)
+                if run.timed_out:
+                    log(self.p, f"schedule {name}: its run recorded failed at its timeout ended after "
+                                f"{time.monotonic() - run.started:.0f} s; its result is dropped")
+                else:
+                    self._schedule_ran(run.s, *run.result)
+            elif not run.timed_out and time.monotonic() >= run.deadline:
+                run.timed_out = True   # kept in runs until its thread ends: not started again before
+                killed = schedrun.kill(db, run)
+                why = f"error: timed out after {run.timeout:.0f} s"
+                self.observe(scr.error_source(f"watcher:{name}"), f"schedule {name} {why[7:]}: its run was "
+                             f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
+                             lifecycle=scr.ERROR)
+                self._schedule_ran(run.s, why, None)
+
+    def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
+        """Start one command, heal or builtin watcher run in its own thread. It works on a copy of the
+        daemon with its own database connection; its watchdog pings are the tick's own business."""
+        host = copy.copy(self)
+        host.p = copy.copy(self.p)
+        host.p._db = None
+        host._progress = lambda: None
+
+        def body() -> tuple[str, float | None]:
+            host.jev = Jev(host.cfg, db=host.p.db)
+            if s["kind"] == "command" and payload.get("heal"):
+                return host._run_heal(s, payload)
+            if s["kind"] == "command":
+                return host._run_command_watcher(s, payload), None
+            from .watchers import run_builtin
+            return run_builtin(host, s["name"], payload), None
+        return schedrun.start(schedrun.Run(s, payload, self._schedule_timeout(s, payload)), body,
+                              lambda: host.p.db)
+
+    def _schedule_timeout(self, s: dict, payload: dict) -> float:
+        """How long one run may go on: its own bounds plus SCHEDULE_GRACE_S, so they normally end it."""
+        if s["kind"] == "watcher":
+            from .watchers import bounds
+            return bounds(self, payload)[0] + SCHEDULE_GRACE_S
+        t = _watcher_timeout(payload) if str(payload.get("command") or "").strip() else 0
+        if payload.get("heal"):
+            try:
+                step = heal.validate(payload["heal"])["timeout_s"]
+            except (ValueError, TypeError, KeyError):
+                step = heal.MAX_TIMEOUT_S
+            t += 3 * step + heal.LOCK_WAIT_S + 10   # check, suppress probe, fix after its lock wait
+        return max(t, 1) + SCHEDULE_GRACE_S
+
+    def _schedule_ran(self, s: dict, status: str, again: float | None) -> None:
+        """Record one run of schedule `s` (its row when the run started) and its failure handling."""
+        db = self.p.db
+        row = db.one("SELECT * FROM schedules WHERE name=?", (s["name"],))
+        if row is None:
+            return   # removed while it ran
+        payload = json.loads(row["payload"] or "{}")
+        sched.mark_ran(db, row, status, home=timefmt.home(self.p))
+        if again is not None:   # a heal check's grace end or settle recheck comes before its period
+            db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, row["name"]))
+        if (sched.failing(status) and sched.failing(row["last_status"])
+                and not (row["kind"] == "command" and payload.get("heal") and heal.owns(db, row["name"]))):
+            self._schedule_broken(row, status)
+        elif not sched.failing(status):
+            self._schedule_mended(row["name"])
+        self._progress()
 
     def _run_heal(self, s: dict, payload: dict) -> tuple[str, float | None]:
         """A command schedule with a heal block: its check, fix and escalation (heal.run), then its
@@ -4067,13 +4144,13 @@ class Daemon:
         except (TypeError, ValueError):
             rewake = 6 * 3600
         started = time.time()
+        timeout = _watcher_timeout(payload)
         try:
-            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
-                                 timeout=_watcher_timeout(payload), env=command_env(self.p))
-        except subprocess.TimeoutExpired:
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
+        except subprocess.TimeoutExpired:   # its whole process group is killed: a failed run
             self.observe(errors, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
                          lifecycle=scr.ERROR)
-            return "timeout"
+            return f"error: timed out after {timeout} s"
         text = (out.stdout or "").strip()
         ok = out.returncode in (0, 1)
         failed = not ok and not text   # the daemon reports the failure itself

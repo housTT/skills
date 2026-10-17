@@ -170,7 +170,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import outagemsg, pageto, screen, timefmt
+from . import outagemsg, pageto, schedrun, screen, timefmt
 from .db import DB
 from .project import command_env
 
@@ -391,6 +391,7 @@ def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = No
                                 text=True, cwd=cwd, env=env or _env(), start_new_session=True)
     except OSError as e:
         return 127, str(e)
+    schedrun.spawned(proc.pid)   # a daemon that stops or restarts meanwhile kills the group
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -403,6 +404,8 @@ def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = No
         except subprocess.TimeoutExpired:   # a child that left the group still holds the pipes
             pass
         return 124, f"timed out after {timeout:.0f} s"
+    finally:
+        schedrun.ended(proc.pid)
     return proc.returncode, ((out or "") + (err or "")).strip()[-2000:]
 
 

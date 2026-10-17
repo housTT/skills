@@ -2358,7 +2358,7 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def wakes():
@@ -2386,7 +2386,7 @@ def _json_watcher(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def run(name, *lines):
@@ -2582,7 +2582,7 @@ def test_command_watcher_multi_line_observations_key_by_first_line_or_explicit_k
     p = make(env)
     from ttp import daemon as dm
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def run(name):
@@ -2709,7 +2709,7 @@ def test_watcher_issues_close_when_quiet_for_a_day_or_after_a_clean_run(env, mon
     from ttp import daemon as dm
     from ttp import screen as scr
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
     cfg = p.config()
 
@@ -2746,7 +2746,7 @@ def test_keyed_issue_a_quiet_run_closed_only_counts_when_resent_within_the_windo
     from ttp import daemon as dm
     from ttp import screen as scr
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def line(text, severity, key="gate"):
@@ -2818,7 +2818,7 @@ def test_keyed_issue_new_episode_supersedes_the_old_issue_and_wakes_once(env, mo
     from ttp import daemon as dm
     from ttp import screen as scr
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def line(text, episode=None, key="gate", severity="high"):
@@ -2978,7 +2978,7 @@ def _muted_watcher(env, monkeypatch, first):
     t0 = clock["t"]
     monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
     out = {"stdout": ""}
-    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
 
     def run(at_h, stdout):
@@ -21977,7 +21977,7 @@ def test_a_command_watcher_cannot_outlast_the_watchdog(env, monkeypatch):
         seen.update(kw)
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(dm.subprocess, "run", run)
+    monkeypatch.setattr(dm.schedrun, "run_group", run)
     d = dm.Daemon(p.base)
     assert d._run_command_watcher({"name": "slow"}, {"command": "true", "timeout_s": 7200}).startswith("ok")
     assert seen["timeout"] == dm.WATCHER_MAX_S
