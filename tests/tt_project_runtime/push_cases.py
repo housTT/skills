@@ -8410,3 +8410,134 @@ def test_superseded_reads_the_cwd_repository_and_accepts_a_commit_already_on_the
     assert "changes none of the files" in err and "compared:" in err and "--ref <branch>" in err
     assert ttp_task("superseded", str(tid), unrelated, "--ref", "origin/proj") == 0
     assert "recorded as superseded" in capsys.readouterr().out
+
+
+# prompt-touching changes and prompt size caps ---------------------------------------------------------
+_CAP_TAIL = """E       assert 30512 <= 30300  (in test_the_coordinator_role_prompt_stays_small)
+E       assert 29400 <= 29000  (in test_a_heavy_project_keeps_the_worker_prompt_under_its_cap)
+FAILED tests/test_a.py::test_the_coordinator_role_prompt_stays_small - AssertionError: 30512
+FAILED tests/test_a.py::test_a_heavy_project_keeps_the_worker_prompt_under_its_cap - AssertionError: ('code', 29400)
+2 failed, 900 passed in 61.20s"""
+
+
+def _pq_change(s, name, files):
+    """A review whose approval is a commit on its own branch off the reviewed head, changing `files`."""
+    from ttp import pushq
+    _git_out(s.path, "checkout", "-q", "-b", name, s.head)
+    for f in files:
+        (s.path / f).parent.mkdir(parents=True, exist_ok=True)
+        _commit(s.path, f, f"{name}\n")
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    rid = s.p.db.add_task(f"review {name}", "r", kind="review", origin="coordinator")
+    s.p.db.update_task(rid, status="pushing")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": name, "head": head}], "target": "origin/proj"})
+    return row
+
+
+def test_a_push_batch_takes_at_most_one_change_touching_the_prompt_files(env, monkeypatch):
+    """Two prompt changes that each fit a size cap may not fit together: a batch takes at most one
+    approval touching delivery.push_solo_paths (default the plugin's prompt templates); the others
+    stay approved for a later batch, and the rest of the batch fills up as before."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_max=3)
+    _git_out(s.repo, "fetch", "-q", "origin")
+    prompt = "plugins/tt-project/template/prompts/worker.md"
+    a = _pq_change(s, "a", [prompt])
+    b = _pq_change(s, "b", ["plain.txt"])
+    c = _pq_change(s, "c", ["x.txt", "plugins/tt-project/template/prompts/coordinator.md"])
+    d = _pq_change(s, "d", ["other.txt"])
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [a, b, d], why
+    assert "1 more approval touching delivery.push_solo_paths waits for a later batch" in why
+    assert pushq.start(s.p, rows, "origin/proj")
+    assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (c,))["status"] == "approved"
+    # Another prompt file, the same rule; a text file of the prompt folder that is no .md is not one.
+    s.p.db.x("DELETE FROM push_queue")
+    s.p.db.x("DELETE FROM push_batches")
+    e = _pq_change(s, "e", ["plugins/tt-project/template/prompts/notes.txt"])
+    f = _pq_change(s, "f", [prompt])
+    g = _pq_change(s, "g", ["plugins/tt-project/template/prompts/kind-code.md"])
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f]
+    # Configurable: other paths, or off.
+    s.p.set_config("delivery.push_solo_paths", ["*/notes.txt", "*/worker.md"])
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, g]
+    s.p.set_config("delivery.push_solo_paths", [])
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, g]
+
+
+def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_their_overshoots():
+    from ttp import conflictfix
+    got = conflictfix.cap_failure(_CAP_TAIL)
+    assert got["ids"] == ["tests/test_a.py::test_a_heavy_project_keeps_the_worker_prompt_under_its_cap",
+                          "tests/test_a.py::test_the_coordinator_role_prompt_stays_small"]
+    assert got["over"] == [{"test": "test_the_coordinator_role_prompt_stays_small", "size": 30512, "cap": 30300,
+                            "by": 212},
+                           {"test": "test_a_heavy_project_keeps_the_worker_prompt_under_its_cap", "size": 29400,
+                            "cap": 29000, "by": 400}]
+    assert "test_the_coordinator_role_prompt_stays_small: 30512 > 30300 (over by 212)" in conflictfix.over_text(got)
+    other = _CAP_TAIL.replace("2 failed", "3 failed") + "\nFAILED tests/test_a.py::test_push_lands - assert 1 == 2"
+    assert conflictfix.cap_failure(other) is None, "a failure of another test is no cap failure"
+    assert conflictfix.cap_failure(_CAP_TAIL.replace("2 failed", "5 failed")) is None, "an incomplete list"
+    assert conflictfix.cap_failure("make: *** [test] Error 1") is None, "not pytest"
+    bare = "FAILED tests/t.py::test_prompt_size - AssertionError\n1 failed, 3 passed in 1.00s"
+    assert conflictfix.cap_failure(bare) == {"ids": ["tests/t.py::test_prompt_size"], "over": []}
+    assert "tests/t.py::test_prompt_size show it" in conflictfix.over_text(conflictfix.cap_failure(bare))
+    assert conflictfix.cap_failure(bare, r"never") is None, "delivery.push_cap_tests names the cap tests"
+
+
+def test_a_batch_check_tail_keeps_each_size_overshoot_from_anywhere_in_the_output(tmp_path):
+    """The tail is the last lines only; the `assert <size> <= <cap>` line sits above them in pytest's
+    failure section. The tail starts with each one over its cap, naming its test."""
+    from ttp import batch
+    out = tmp_path / "out.txt"
+    out.write_text("\n".join(["_____ test_role_prompt_stays_small _____", "E       AssertionError: 30512",
+                              "E       assert 30512 <= 30300", "_____ test_other _____", "E       assert 3 <= 9",
+                              *[f"line {i}" for i in range(40)], "1 failed, 2 passed in 1.00s"]) + "\n")
+    rc, tail, _ = batch._stream(["cat", str(out)], tmp_path)
+    lines = tail.splitlines()
+    assert rc == 0 and lines[0] == "E       assert 30512 <= 30300  (in test_role_prompt_stays_small)", lines[:3]
+    assert "assert 3 <= 9" not in tail and lines[-1] == "1 failed, 2 passed in 1.00s"
+    assert len(lines) == 1 + batch.push.LOG_TAIL
+
+
+def test_a_batch_failing_only_on_prompt_caps_sends_its_change_a_light_trim_to_fit_fix(env, monkeypatch):
+    """The blamed change fit its caps alone but not merged onto what landed before it: instead of a
+    failed review (and a shared-check incident), its review runs again at once as a light trim-to-fit
+    fix told each measured overshoot, at no attempt and with no coordinator turn. After TRIM_MAX of
+    them a cap failure fails the review as before."""
+    from ttp import conflictfix
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_task
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", row="check_failed", tip="ab" * 20, detail={"cmd": "pytest -q", "tail": _CAP_TAIL})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    res = json.loads(t["result"])
+    cf = res["conflict_fix"]
+    assert t["status"] == "queued" and res[conflictfix.TRIMS] == 1, t
+    assert (cf["head"], cf["branch"], cf["onto"]) == (s.head, s.branch, "ab" * 20) and "escalate" not in cf
+    assert [o["by"] for o in cf["trim"]["over"]] == [212, 400]
+    evs = _pq_events(s.p, mark, task=s.review)
+    assert not [e for e in evs if e["status"] == "queued"], "no coordinator turn"
+    [ev] = [e for e in evs if e["kind"] == "task_requeued"]
+    assert "trim-to-fit" in ev["text"] and "over by 212" in ev["text"]
+    task, pick = Daemon(s.p.base)._size_review(t)
+    assert task["tier"] == "light" and pick["conflict_fix"]["tier"] == "light", pick
+    short = worker_task(s.p, t, str(s.p.root), None, conflict=pick["conflict_fix"])
+    assert "trim-to-fit fix" in short and "over by 400" in short and "never raise a cap" in short
+    assert "review the feature" not in short and f'"push": [{{"branch": "{s.branch}"' in short
+    full = worker_task(s.p, t, str(s.p.root), None, conflict={"tier": "standard", "why": "escalated"})
+    assert "trims the change to fit its prompt size caps at standard" in full and "over by 212" in full
+    # Each trim that still overshoots gets one more, up to TRIM_MAX; then the review fails.
+    for n in range(2, conflictfix.TRIM_MAX + 2):
+        _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}})
+        _pq_batch(s)
+        _pq_tend(s)
+        t = s.p.db.task(s.review)
+        if n <= conflictfix.TRIM_MAX:
+            assert t["status"] == "queued" and json.loads(t["result"])[conflictfix.TRIMS] == n
+    assert t["status"] == "failed" and "pytest -q" in json.loads(t["result"])["summary"], t

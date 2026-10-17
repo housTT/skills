@@ -30,6 +30,10 @@ KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"t
 DEFAULT_BATCH_S = 900           # delivery.push_batch_s: the oldest approval waits at most this long
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: the least time from a batch's end to the next start
+# delivery.push_solo_paths: git pathspecs; a batch takes at most one approval whose change touches them.
+# Two prompt changes that each fit a size cap may not fit together, which fails the whole batch.
+TRIM_EVENT = "its review runs again as a light trim-to-fit fix"   # counts them per review
+SOLO_PATHS = ("plugins/tt-project/template/prompts/*.md",)
 HOLD_S = 1800                   # after tip_failed, approvals already tried on that tip wait this long unless it changes
 TIP_FAILS = 2                   # tip_failed batches in a row on one tip before it is known bad: alerted, never checked alone
 BAD_TIP_RETRY_S = 6 * 3600      # a known-bad tip with nothing new to try: the tried approvals run again after this
@@ -638,7 +642,46 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = "no review is running or ready"
     else:
         return [], "waiting for more approvals"
-    return rows[:cap], why
+    taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch))
+    if held:
+        why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
+                f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
+    return taken, why
+
+
+def _solo_paths(d: dict) -> list[str]:
+    v = d.get("push_solo_paths", SOLO_PATHS)
+    v = [v] if isinstance(v, str) else v if isinstance(v, (list, tuple)) else []
+    return [str(x) for x in v if str(x).strip()]
+
+
+def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str) -> tuple[list[dict], list[dict]]:
+    """Up to `cap` of `rows` in order, at most one of them a change touching `paths` since it left
+    `tip`: (taken, the touching ones left for a later batch). A row git cannot tell about counts as
+    touching (one per batch is the safe side)."""
+    if not paths or len(rows) < 2:
+        return rows[:cap], []
+    taken, held, solo = [], [], False
+    for r in rows:
+        if len(taken) >= cap:
+            break
+        if _touches_paths(p, tip, f"{REF_PREFIX}{r['id']}", paths):
+            if solo:
+                held.append(r)
+                continue
+            solo = True
+        taken.append(r)
+    return taken, held
+
+
+def _touches_paths(p: Project, tip: str, ref: str, paths: list[str]) -> bool:
+    if not tip:
+        return True
+    try:
+        r = _git(p, "diff", "--name-only", f"{tip}...{ref}", "--", *paths, timeout=INHERIT_GIT_S)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode != 0 or bool(r.stdout.strip())
 
 
 def _bad_until(bad: dict) -> float:
@@ -993,7 +1036,25 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
     prev = load_result(task["result"])
     summary = str(prev.get("summary") or "")
     target = b["target"]
-    if "check_failed" in states:
+    # Counted from its events: each hand-off replaces the review's result.
+    trims = db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_requeued' AND text LIKE ?",
+                   (tid, f"%{TRIM_EVENT}%"))["n"]
+    trim = None
+    if "check_failed" in states and trims < conflictfix.TRIM_MAX:
+        r = next(r for r in current if r["status"] == "check_failed")
+        trim = conflictfix.cap_failure(str(_detail(r).get("tail") or ""), _delivery(p).get("push_cap_tests"))
+    if trim:
+        # Only prompt size caps failed: the change fit alone, not with what landed before it. A light
+        # run trims it to fit and approves again, instead of a failed review (and a shared-check incident).
+        d = _detail(r)
+        woke = (f"the push checks `{d.get('cmd') or 'the push checks'}` failed in batch {b['id']} only on prompt "
+                f"size caps, on {r['branch'] or '?'} at {_short(r['head'])} merged onto {target}: "
+                f"{conflictfix.over_text(trim)}")
+        cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target, str(m.get("tip") or ""), [], True,
+                              trims + 1, trim=trim)
+        _requeue(db, task, woke, {conflictfix.KEY: cf, conflictfix.TRIMS: trims + 1})
+        _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; {TRIM_EVENT}", queued=False)
+    elif "check_failed" in states:
         r = next(r for r in current if r["status"] == "check_failed")
         d = _detail(r)
         cmd, tail = str(d.get("cmd") or "the push checks"), _tail_of(m, d)

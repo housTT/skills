@@ -50,6 +50,9 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
 MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
+OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
+SECTION = re.compile(r"^_{3,} (\S.*?) _{3,}$")                     # pytest's per-test failure header
+OVER_KEPT = 10                     # overshoot lines a check's tail keeps from its whole output
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
@@ -163,17 +166,26 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
             group: bool = False, pass_fds: tuple = ()) -> tuple[int | None, str, bool]:
     """Run `cmd` (a shell string, or an argv run without a shell), copying its output into this
     process's output (the batch log): (exit code, the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
-    process group of its own, which a timeout kills whole."""
+    process group of its own, which a timeout kills whole. The tail starts with up to OVER_KEPT
+    pytest `assert <size> <= <cap>` lines where the size is over, each naming its test, from
+    anywhere in the output: a prompt size cap's measured overshoot (conflictfix.cap_failure)."""
     sys.stdout.flush()
     sys.stderr.flush()
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
+    over: list[str] = []
+    section = [""]
 
     def pump() -> None:
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode(errors="replace")
             tail.append(line.rstrip("\n"))
+            if (sm := SECTION.match(line.strip())):
+                section[0] = sm.group(1).split()[0]
+            elif (om := OVER.match(line.rstrip())) and len(over) < OVER_KEPT \
+                    and int(om.group(1).replace("_", "")) > int(om.group(2).replace("_", "")):
+                over.append(f"E       assert {om.group(1)} <= {om.group(2)}" + (f"  (in {section[0]})" if section[0] else ""))
             try:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -189,7 +201,7 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
         timed_out = True
         _kill(proc)
     reader.join(timeout=10)      # a child that left the group may keep the pipe open; do not wait on it
-    return proc.returncode, "\n".join(tail), timed_out
+    return proc.returncode, "\n".join([*over, *tail]), timed_out
 
 
 def _registered(repo: Path, wt: Path) -> bool:

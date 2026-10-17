@@ -924,7 +924,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   (default 1800: a batch starts only once the last one ended at least this long ago, measured
   from its recorded end so a restart or a failed batch never stretches the wait; a full batch, a
   priority-1 review's approval, or one the last batch requeued unchecked after a failing change
-  starts at once; 0 = off), `push_landing_alert_h` (default 4:
+  starts at once; 0 = off), `push_solo_paths` (default `["plugins/tt-project/template/prompts/*.md"]`:
+  git pathspecs a batch takes at most one approved change touching, as two prompt changes that
+  each fit a size cap may not fit together; the others wait for a later batch; `[]` = off),
+  `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*(?:cap|small|size)`:
+  when only such tests fail on a change merged in a batch, its review runs again as a light
+  trim-to-fit fix told each measured overshoot, at no review attempt, at most twice per change,
+  instead of failing), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
   reboot cut short; it clears when a batch lands; 0 = off), `after_push`

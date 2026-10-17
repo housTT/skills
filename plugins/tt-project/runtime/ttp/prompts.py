@@ -529,7 +529,12 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
             history += f"Woken because: {prev['woke']}.\n"
-        if conflict and cmark:
+        if conflict and cmark and cmark.get("trim"):
+            history += (f"This run trims the change to fit its prompt size caps at {conflict.get('tier')} "
+                        f"({conflict.get('why')}); it costs no review attempt. Rebase onto the tip, trim the "
+                        f"change's own prompt text by at least the overshoot ({conflictfix.over_text(cmark['trim'])}) "
+                        "without dropping a rule or raising a cap, run the failing cap tests and approve the new head.\n")
+        elif conflict and cmark:
             history += (f"This run settles that push conflict at {conflict.get('tier')} ({conflict.get('why')}); it "
                         "costs no review attempt. Rebase, resolve keeping both sides' intents, run focused tests "
                         "of what the resolution touched and approve the new head.\n")
@@ -633,6 +638,8 @@ def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: 
     review's own rules and spec stay out: the change was already reviewed."""
     head, onto, target = str(cf.get("head") or "?"), str(cf.get("onto") or "the tip"), str(cf.get("target") or "?")
     cb = str(cf.get("branch") or "")
+    if isinstance(cf.get("trim"), dict):
+        return _trim_fix_task(p, task, cwd, branch, cf, head, onto, target, cb)
     files = ", ".join(str(f) for f in cf.get("files") or []) or "?"
     return "\n\n".join([
         f"# YOUR TASK #{task['id']}: push-conflict fix for {task['title']}\n"
@@ -656,6 +663,39 @@ def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: 
         "If both sides changed the same function or test, the resolution needs a decision about either "
         "change's intent, or the tests fail for a reason you cannot settle in the resolution: stop and hand off "
         "`failed` saying what it is. The task then runs again at once at standard, at no attempt.\n"
+        "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
+        restrictions_block(p)])
+
+
+def _trim_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dict, head: str, onto: str,
+                   target: str, cb: str) -> str:
+    """conflict_fix_task for a trim-to-fit fix (conflictfix.cap_failure): the merged push checks failed
+    only on prompt size caps, so the run trims this change's own prompt text by the overshoot."""
+    trim = cf["trim"]
+    tests = " ".join(str(i) for i in trim.get("ids") or []) or "the failing cap tests"
+    return "\n\n".join([
+        f"# YOUR TASK #{task['id']}: trim-to-fit fix for {task['title']}\n"
+        f"kind: review · this run: light trim-to-fit fix (no review attempt) · budget ${task['budget_usd'] or 0:.2f} "
+        f"(spent ${task['spent_usd'] or 0:.2f})\n"
+        f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
+        f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json\n"
+        f"project root: {p.root}\n" + _zone_line(p),
+        f"This review already approved branch {cb or '(none)'} at {head}, but the push queue could not land it: "
+        f"merged onto {target} at {onto}, the push checks failed only on prompt size caps. The change fit alone; "
+        f"with what landed before it, the prompt text is over: {conflictfix.over_text(trim)}.\n\n"
+        "Do only this:\n"
+        f"1. Fetch, then rebase {head} onto the current tip of {target} here, resolving any conflict keeping both "
+        "sides' intents.\n"
+        f"2. Run the failing cap tests ({tests}) and note each size against its cap at the new tip.\n"
+        "3. Trim this change's own added or edited prompt text until each passes, by at least the overshoot: "
+        "tighter wording, no repetition. Never drop or weaken a rule or restriction, never trim text the change "
+        "did not add, never raise a cap. That trim is the one edit you may make.\n"
+        "4. Run those tests again plus the validator of the package they belong to where the repository documents "
+        "one. The push queue runs the full push checks on the head you hand back.\n"
+        "5. Say in the summary what you trimmed and each size against its cap now. Commit and hand off `done` with "
+        f'"push": [{{"branch": "{cb}", "head": "<the new head, full hash>"}}].\n\n'
+        "If the change cannot fit without dropping a rule, stop and hand off `failed` saying so. The task then "
+        "runs again at once at standard, at no attempt.\n"
         "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
         restrictions_block(p)])
 

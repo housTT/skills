@@ -8,7 +8,13 @@ no coordinator turn.
 
 pushq._settle marks the review's result with `conflict_fix` (mark); the daemon's dispatch picks the
 tier (tier_for) and records `conflict_fix` in the run's note; the run's end reads that note
-(escalation) to keep the attempt and requeue a failed light fix at standard."""
+(escalation) to keep the attempt and requeue a failed light fix at standard.
+
+A trim-to-fit fix is the same run for a change whose merged push checks failed only on prompt size
+caps (cap_failure): each change fit alone, but together with what landed before it the prompt text
+is over a cap. Its mark carries `trim` (the failing tests and each measured overshoot); the run
+rebases, trims the change's own prompt text by at least the overshoot, and approves again. A review
+gets at most TRIM_MAX of them per change before a cap failure fails it as any other check."""
 from __future__ import annotations
 
 import ast
@@ -20,17 +26,57 @@ import time
 
 KEY = "conflict_fix"
 LIGHT_FAILED = "the light conflict fix ended"
+TRIMS = "trim_fixes"   # a review result's count of trim-to-fit fixes the push queue sent it
+TRIM_MAX = 2           # ... after which a cap failure fails the review as any other check
+CAP_TESTS = r"(?i)prompt\w*(?:cap|small|size)"   # delivery.push_cap_tests: a prompt size cap test's name
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+# An overshoot line batch._stream keeps from a check's whole output: pytest's `assert <size> <= <cap>`.
+_OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)(?:\s+\(in (\S+)\))?\s*$", re.M)
 
 
-def mark(head: str, branch: str, target: str, onto: str, files: list, textual: bool, n: int) -> dict:
+def mark(head: str, branch: str, target: str, onto: str, files: list, textual: bool, n: int,
+         trim: dict | None = None) -> dict:
     """The `conflict_fix` entry of a review's result when the push queue sent `head` back. `textual`:
-    the rebase stopped on conflicting files and the batch ran no checks on a merge of both sides."""
+    the rebase stopped on conflicting files and the batch ran no checks on a merge of both sides.
+    `trim` (cap_failure) makes it a trim-to-fit fix."""
     out = {"head": head, "branch": branch, "target": target, "onto": onto,
            "files": [str(f) for f in files[:20]], "n": n, "at": time.time()}
-    if not textual:
+    if trim:
+        out["trim"] = trim
+    elif not textual:
         out["escalate"] = "the conflict is no plain textual one (the rebase stopped or the merged checks failed)"
     return out
+
+
+def cap_failure(tail: str, pattern: str | None = None) -> dict | None:
+    """{"ids", "over"} when a failed check's output shows it failed only on prompt size cap tests:
+    pytest's complete list of failing ids (sharedchecks.failing_ids), each named like one (`pattern`,
+    default CAP_TESTS). `over` lists each measured overshoot ({"test", "size", "cap", "by"}) the output
+    kept, possibly none. None for any other failure."""
+    from .sharedchecks import failing_ids
+    ids, complete = failing_ids(tail or "")
+    try:
+        rx = re.compile(pattern or CAP_TESTS)
+    except (re.error, TypeError):
+        rx = re.compile(CAP_TESTS)
+    if not ids or not complete or not all(rx.search(i.rpartition("::")[2]) for i in ids):
+        return None
+    over, seen = [], set()
+    for m in _OVER.finditer(tail):
+        size, cap = int(m.group(1).replace("_", "")), int(m.group(2).replace("_", ""))
+        key = (m.group(3) or "", size, cap)
+        if size > cap and key not in seen:
+            seen.add(key)
+            over.append({"test": m.group(3) or "", "size": size, "cap": cap, "by": size - cap})
+    return {"ids": ids[:10], "over": over[:10]}
+
+
+def over_text(trim: dict) -> str:
+    """The overshoots of a cap_failure for a prompt or a feed line."""
+    over = trim.get("over") or []
+    if not over:
+        return "overshoot not in the output; " + ", ".join(str(i) for i in trim.get("ids") or []) + " show it"
+    return "; ".join(f"{o.get('test') or 'a cap test'}: {o['size']} > {o['cap']} (over by {o['by']})" for o in over)
 
 
 def of(task: dict) -> dict | None:
@@ -127,6 +173,8 @@ def same_body(root: str, head: str, onto: str, files: list) -> str:
 def tier_for(root: str, cf: dict) -> tuple[str, str]:
     """The tier of a conflict-fix run and why: light for a plain textual conflict, standard when the
     mark says to escalate or both sides changed the same function or test."""
+    if cf.get("trim") and not cf.get("escalate"):
+        return "light", "prompt size cap overshoot: trim to fit"
     why = str(cf.get("escalate") or "") or same_body(root, str(cf.get("head") or ""), str(cf.get("onto") or ""),
                                                      list(cf.get("files") or []))
     return ("standard", why) if why else ("light", "textual push conflict")

@@ -362,8 +362,11 @@ EXTRA_KEYS = {
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
+    # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
+    # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
+                 "push_solo_paths", "push_cap_tests",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude"},   # the last two: `ttp checks` fast path (push.FAST_GLOBS),
