@@ -76,6 +76,19 @@ def env_id(wt: Path, cmd: str, env: dict, tip: str) -> str:
     return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 
+# Beyond env_id, what changes the tests a check runs or how: so a `ttp checks` pass serves
+# `ttp push --own` only where these match too.
+CHECK_ENV_VARS = ("PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD")
+
+
+def check_envs(wt: Path, cmds: list, env: dict) -> list[str]:
+    """Per command, the environment a `ttp checks` pass records and `ttp push --own` compares
+    before it reuses that pass: env_id without a tip (`ttp checks` checks against none), plus
+    CHECK_ENV_VARS as `env` sets them."""
+    own = {k: env.get(k, "") for k in CHECK_ENV_VARS}
+    return [hashlib.sha256(json.dumps([env_id(wt, str(c), env, ""), own]).encode()).hexdigest() for c in cmds]
+
+
 def key(tree: str, cmd: str, eid: str) -> str:
     return hashlib.sha256(json.dumps([tree, cmd, eid]).encode()).hexdigest()
 

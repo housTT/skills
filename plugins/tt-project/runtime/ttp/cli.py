@@ -1671,11 +1671,14 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
-def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate") -> dict | None:
+def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate",
+                   envs: list[str] | None = None) -> dict | None:
     """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
     None. A pass of more commands that start with these is one of these too: they ran first, in order,
     and passed (the daemon's pre-started checks run the project's checks alone; a worker ran them with
-    its own after `--`). A pass for the other purpose never counts (a record without one is candidate)."""
+    its own after `--`). A pass for the other purpose never counts (a record without one is candidate).
+    With `envs` (pushpass.check_envs of the commands), only a pass recorded under the same
+    environment for each of them counts; one recorded without it never does."""
     if not p or not tree:
         return None
     try:
@@ -1685,13 +1688,16 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
     key = _commands_hash(cmds)
     for e in reversed(passes if isinstance(passes, list) else []):
         if isinstance(e, dict) and e.get("tree") == tree and e.get("purpose", "candidate") == purpose and (
-                e.get("commands") == key or key in (e.get("prefixes") or ())):
+                e.get("commands") == key or key in (e.get("prefixes") or ())) and (
+                envs is None or (isinstance(e.get("envs"), list) and e["envs"][:len(envs)] == list(envs))):
             return e
     return None
 
 
-def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "") -> None:
-    """Only passes are recorded. A failed write is said and never fails the checks."""
+def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "",
+                 envs: list[str] | None = None) -> None:
+    """Only passes are recorded, with `envs` (pushpass.check_envs) when given. A failed write is said
+    and never fails the checks."""
     if not p or not tree:
         return
     import fcntl
@@ -1709,6 +1715,7 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
                            "prefixes": [_commands_hash(cmds[:n]) for n in range(1, len(cmds))],
                            "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time(),
                            **({"log": str(Path(run_dir) / "checks.log")} if run_dir else {}),
+                           **({"envs": list(envs)} if envs is not None and len(envs) == len(cmds) else {}),
                            **({"purpose": purpose} if purpose != "candidate" else {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
@@ -1810,8 +1817,10 @@ def cmd_checks(a) -> None:
     nothing), that pass is reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
     failure is never served as a pass. `ttp push` and the push queue never read this record and
     run their own checks on the exact commit they push (the queue skips only a check it recorded
-    passing itself on the same tree, pushpass): a forged record here can at most skip a local re-run,
-    never let a change onto the branch. Where every project check is skipped on a commit,
+    passing itself on the same tree, pushpass): a forged record here can at most skip a local re-run
+    or an own-branch push's checks, never let a change onto the push branch. A pass also records the
+    environment of each command (pushpass.check_envs); `ttp push --own` runs nothing again that
+    passed here on exactly HEAD's tree with the same commands and environment. Where every project check is skipped on a commit,
     `ttp push --own` takes the commands given after `--` that this run recorded passing on exactly that
     commit and runs them itself before it pushes.
 
@@ -1826,7 +1835,7 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkcap, checkdirs, prguard, push
+    from . import checkcap, checkdirs, prguard, push, pushpass
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -1918,6 +1927,7 @@ def cmd_checks(a) -> None:
     passed, failed, failure, rc, scope_error = True, None, None, None, None
     fast_skipped, fast_cmds = [], []
     executed, selected = [], []
+    run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     start = log.stat().st_size if log.exists() else 0
@@ -2029,6 +2039,7 @@ def cmd_checks(a) -> None:
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
+        run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
         for c in [] if hit or handover else todo:
             executed.append(c)
             # A progress line per check: the commands' own output goes only to checks.log.
@@ -2115,7 +2126,7 @@ def cmd_checks(a) -> None:
     if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
         extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
         if extras:
-            _record_pass(p, tree, extras, purpose, run_dir)
+            _record_pass(p, tree, extras, purpose, run_dir, pushpass.check_envs(Path(top), extras, run_env) if run_env else None)
         if slot:
             slot.close()
         print(f"ttp checks: FAST-PATH pass on {head[:12]} (whitespace and CRLF checks"
@@ -2129,7 +2140,7 @@ def cmd_checks(a) -> None:
         print(said)
         return
     if todo:
-        _record_pass(p, tree, todo, purpose, run_dir)
+        _record_pass(p, tree, todo, purpose, run_dir, pushpass.check_envs(Path(top), todo, run_env) if run_env else None)
     # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
     if slot:
         slot.close()

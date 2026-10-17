@@ -25248,13 +25248,15 @@ def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project
     err = capsys.readouterr().err
     assert "every check was skipped as not applicable" in err and "ttp checks -- <cmd>" in err, err
     assert "delivery.push_checks" in err and _git_out(origin, "branch", "--list", "ttp/t60-exp") == ""
-    # A passing extra on this head counts, and the push runs it again itself on that exact commit.
+    # A passing extra on this head counts; its pass on this tree, with the same command and environment,
+    # serves the push (it runs again otherwise, as below).
     cli.main(["checks", "--", f"git rev-parse HEAD >> {log}"])
     capsys.readouterr()
     assert _ttp("push", "--own") == 0
-    assert "every project check was skipped; running the 1 command(s)" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "reused the pass of 1 check(s)" in err and "these are the commands after `--`" in err, err
     assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
-    assert log.read_text().split() == [head, head], "the recorded check must also run on the pushed commit"
+    assert log.read_text().split() == [head], "a pass on exactly this tree and environment runs no more"
     # A record of another head does not count.
     _commit(repo, "more.dat", "more\n")
     capsys.readouterr()
@@ -25622,9 +25624,20 @@ def test_ttp_checks_keeps_a_bounded_record_of_passes(env, tmp_path, monkeypatch)
 
 
 def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
+    """Only `ttp push --own` (the task's own branch) may reuse a `ttp checks` pass: the push to the
+    push branch and the push queue never read one."""
+    import ast
     for name in ("push.py", "batch.py"):
         src = (RUNTIME / "ttp" / name).read_text()
-        assert "CHECK_PASSES" not in src.replace("(cli.CHECK_PASSES)", "") and "_recorded_pass" not in src, name
+        assert "CHECK_PASSES" not in src.replace("(cli.CHECK_PASSES)", ""), name
+        assert "_recorded_pass" not in src or name == "push.py", name
+    tree = ast.parse((RUNTIME / "ttp" / "push.py").read_text())
+    readers = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+               and any(isinstance(n, ast.Name) and n.id in ("_recorded_pass", "_own_pass") for n in ast.walk(f))}
+    assert readers == {"_own_pass", "_run"}, readers
+    run = next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_run")
+    calls = [c for c in ast.walk(run) if isinstance(c, ast.Call) and getattr(c.func, "id", "") in ("publish", "push")]
+    assert {c.func.id: any(k.arg == "reuse" for k in c.keywords) for c in calls} == {"publish": True, "push": False}
     assert "never reads the passes `ttp checks` records" in " ".join((RUNTIME / "ttp" / "push.py").read_text().split())
     prompts = RUNTIME.parent / "template" / "prompts"
     for name in ("kind-code.md", "kind-review.md"):

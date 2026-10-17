@@ -8799,3 +8799,60 @@ def test_own_push_existing_only_refusal_of_another_tasks_branch_names_the_own_br
     assert _ttp("push", "--own-branch") == 0, capsys.readouterr().err
     assert heads() == ["proj", mine]
     assert _git_out(origin, "rev-parse", mine) == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_push_own_reuses_a_ttp_checks_pass_only_on_the_same_tree_commands_and_env(env, monkeypatch, tmp_path, capsys):
+    """`ttp push --own` runs again no check `ttp checks` recorded passing on exactly HEAD's tree with the
+    same commands (or more that start with them) and environment, and says it reused that pass. A
+    changed tree, command or environment, or a pass recorded without its environment, runs them."""
+    from ttp import cli, push
+    log = tmp_path / "ran"
+    check = f"echo x >> {log}"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    run = tmp_path / "run"
+    run.mkdir()
+    for var, val in (("TTP_RUN_DIR", str(run)), ("TTP_RUN_ID", "41"), ("TTP_TASK", "40")):
+        monkeypatch.setenv(var, val)
+    for var in ("PYTEST_ADDOPTS", "PYTHONPATH"):
+        monkeypatch.delenv(var, raising=False)
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t40-feature")
+    ran = lambda: len(log.read_text().splitlines()) if log.exists() else 0
+    n = iter(range(100))
+
+    def push_own(*extra, change=lambda: None):
+        _commit(repo, f"m{next(n)}.py", "x = 1\n")
+        cli.main(["checks", *(["--", *extra] if extra else [])])
+        change()
+        before = ran()
+        capsys.readouterr()
+        assert push.run(p, repo, own=True) == 0
+        err = capsys.readouterr().err
+        assert _git_out(origin, "rev-parse", "ttp/t40-feature").strip() == _git_out(repo, "rev-parse", "HEAD").strip()
+        return ran() - before, err
+
+    runs, err = push_own()
+    assert runs == 0 and "reused the pass of 1 check(s) `ttp checks` recorded in run 41" in err, err
+    runs, err = push_own("true")   # the project's checks ran first, then the extra: a pass of them too
+    assert runs == 0 and "reused the pass" in err, err
+    # The tree changed after the checks (a new commit): they run again.
+    runs, err = push_own(change=lambda: _commit(repo, "late.py", "y = 2\n"))
+    assert runs == 1 and "reused" not in err, err
+    # Another command than the one that passed.
+    other_check = f"echo y >> {log}"
+    runs, err = push_own(change=lambda: p.set_config("delivery.push_checks", [other_check]))
+    assert runs == 1 and "reused" not in err, err
+    p.set_config("delivery.push_checks", [check])
+    # Another environment: a variable that changes what pytest runs, or another active venv.
+    runs, err = push_own(change=lambda: monkeypatch.setenv("PYTEST_ADDOPTS", "-x"))
+    assert runs == 1 and "reused" not in err, err
+    monkeypatch.delenv("PYTEST_ADDOPTS")
+    runs, err = push_own(change=lambda: monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "other-venv")))
+    assert runs == 1 and "reused" not in err, err
+    monkeypatch.delenv("VIRTUAL_ENV")
+    # A pass recorded without its environment (an older runtime's) never serves.
+    _commit(repo, "old.py", "z = 3\n")
+    tree = _git_out(repo, "rev-parse", "HEAD^{tree}").strip()
+    cli._record_pass(p, tree, push.check_list([check]))
+    before = ran()
+    assert push.run(p, repo, own=True) == 0
+    assert ran() - before == 1 and "reused" not in capsys.readouterr().err

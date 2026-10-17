@@ -3,7 +3,9 @@
 """Guarded push: publish the current commit onto the project's target branch only after the
 project's checks passed on exactly the commit being pushed, and never with force. The push runs
 those checks itself every time: it never reads the passes `ttp checks` records (cli.CHECK_PASSES),
-so a forged record can at most skip a local re-run, never put a change on the branch.
+so a forged record can at most skip a local re-run, never put a change on the branch. Only
+`ttp push --own` (publish), which pushes the task's own branch, reuses such a pass on exactly HEAD's
+tree with the same commands and environment (_own_pass).
 
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
@@ -2619,11 +2621,22 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
     return ""
 
 
+def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Callable[[str, list, list], str]) -> str:
+    """What `reuse` says of a recorded pass of `todo` on `head`'s tree under the environment they
+    would run in here, or "" (none, or it could not be told)."""
+    from . import pushpass
+    tree = _git(repo, "rev-parse", f"{head}^{{tree}}").stdout.strip()
+    try:
+        return reuse(tree, todo, pushpass.check_envs(repo, todo, check_env("own", "", run_dir))) if tree else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
-            check_run_dir: str | None = None) -> int:
+            check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -2631,8 +2644,10 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     not this task's own `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
     A HEAD the remote branch already has as its tip is reported as pushed, with no checks or push.
     When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
-    exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused,
-    unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`)."""
+    exactly HEAD run instead, and must pass again (or be reused); with none, nothing checked it and it is refused,
+    unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`).
+    `reuse(tree, commands, envs)` names a pass `ttp checks` recorded of exactly those commands on HEAD's
+    tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -2663,16 +2678,22 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         except ScopeError as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
+        extras = False
         if checks and not todo:
-            todo = recorded_extras(recorded, head, checks)
+            todo = extras = recorded_extras(recorded, head, checks)
             if not todo and outside_scope(checks, skipped):
                 say(f"{head[:10]}: {OUT_OF_SCOPE}")
             elif not todo:
                 say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_OWN_FIX}")
                 return CHECKS_FAILED
-            else:
-                say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
-                    f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
+        if todo and reuse and (hit := _reused(repo, head, todo, check_run_dir, reuse)):
+            say(f"{head[:10]}: reused the pass of {len(todo)} check(s) {hit} on this tree with the same "
+                f"commands and environment; not running them again"
+                + (" (every project check was skipped; these are the commands after `--`)" if extras else ""))
+            todo = []
+        elif extras:
+            say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
+                f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
         try:
             slot = check_slot(head, say) if todo else checkcap.Slot()
@@ -2931,6 +2952,15 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
             checkdirs.finish(output)
 
 
+def _own_pass(p: Project, tree: str, cmds: list, envs: list) -> str:
+    """Where and when `ttp checks` recorded passing exactly `cmds` (or more starting with them) on
+    `tree` under `envs`, for `ttp push --own` to reuse, or ""."""
+    from .cli import _recorded_pass
+    hit = _recorded_pass(p, tree, cmds, "candidate", envs)
+    return f"`ttp checks` recorded in run {hit.get('run') or '?'} at {timefmt.long(float(hit.get('ts') or 0), p)}" \
+        if hit else ""
+
+
 def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
     """`ttp push` for a project: target, checks and rounds come from its `delivery` config. `own`
     publishes the task's own branch instead (own_target, publish), with the checks `recorded` (by
@@ -2972,7 +3002,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch),
-                     recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output)
+                     recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
+                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs))
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
