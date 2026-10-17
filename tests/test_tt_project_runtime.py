@@ -37100,6 +37100,70 @@ def test_network_outage_while_other_hosts_answer_says_these_hosts_are_down_witho
     assert p.db.kv("network_outage")["kind"] == "hosts"
 
 
+def _net_heal(p, host="other.example", name="box-up"):
+    """A heal check on `host`, every 5 min; returns (name, spec) for heal.run."""
+    from ttp import heal
+    block = {"check": "true", "machine": host}
+    p.db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,payload,next_run) VALUES(?,?,?,?,?,?,?)",
+           (name, "command", 300, None, 1, json.dumps({"command": "true", "heal": block}), 0))
+    return name, heal.validate(block)
+
+
+def test_network_outage_never_takes_a_heal_check_or_probe_that_could_not_reach_its_host_for_one_that_answers(
+        env, monkeypatch):
+    from ttp import heal
+    from ttp import coordinator as coord
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    d.cfg.setdefault("waiting", {})["unreachable_alert_s"] = 300   # a short grace: older evidence still looks recent
+    name, spec = _net_heal(p)
+    assert heal.run(d, name, spec, now - 100)[0] == "ok (healthy)"   # healthy before the outage
+    old, old_spec = _net_heal(p, "fifth.example", "box-old")
+    assert heal.run(d, old, old_spec, now - 100)[0] == "ok (healthy)"   # and never ran since: no proof now
+    check(now)
+    # After the outage began its ssh failed: status stays healthy, but the box never answered.
+    heal.run(d, name, dict(spec, check="exit 255"), now + 100)
+    st = heal.state(p.db, name)
+    assert st["status"] == "healthy" and st["last_rc"] == 255 and "unknown_since" in st, st
+    # Another task's probe: one that mapped ssh's failure to 1, one dated before the outage.
+    for host, rc, at, out in (("third.example", 1, now + 10 ** 6,
+                               "ssh: connect to host third.example port 22: Connection timed out"),
+                              ("fourth.example", 1, now - 60, "")):
+        probe = f"ssh {host} test -e /tmp/marker"
+        assert coord.apply(p, [{"type": "task_add", "title": host, "spec": "s", "start_when": probe}]) == []
+        tid = p.db.one("SELECT MAX(id) id FROM tasks")["id"]
+        d._start_rc[tid] = (rc, at, probe)
+        d._probe_out[tid] = (out, at, probe)
+    sent = check(now + 300)
+    assert len(sent) == 1 and p.db.kv("network_outage")["kind"] == "offline", sent
+    assert sent[0]["text"].startswith("Network: jump.example") and "VPN or network sign-in" in sent[0]["text"]
+
+
+def test_network_outage_counts_a_heal_check_that_passed_after_the_outage_began_as_a_host_that_answers(
+        env, monkeypatch):
+    from ttp import heal
+    p, d, tids, now, check = _net_setup(env, monkeypatch,
+                                        out="ssh: connect to host jump.example port 22: No route to host")
+    name, spec = _net_heal(p)
+    check(now)
+    assert heal.run(d, name, spec, now + 600)[0] == "ok (healthy)"
+    sent = check(now + 900)
+    assert len(sent) == 1 and p.db.kv("network_outage")["kind"] == "hosts", sent
+    assert sent[0]["text"].startswith("Hosts down: jump.example") and "VPN" not in sent[0]["text"]
+
+
+def test_network_outage_on_a_host_with_an_open_incident_is_a_known_down_feed_line(env, monkeypatch):
+    from ttp import alerts
+    p, d, tids, now, check = _net_setup(env, monkeypatch)
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started) VALUES('jump.example','down','power',?)",
+           (now - 3600,))
+    check(now)
+    sent = check(now + 900)
+    assert len(sent) == 1 and sent[0]["severity"] == "low", sent
+    assert sent[0]["text"].startswith("Known down: jump.example") and "VPN" not in sent[0]["text"], sent[0]["text"]
+    assert p.db.kv("network_outage")["kind"] == "known"
+    assert not alerts.needs_you(p.db, now + 900)
+
+
 @pytest.mark.parametrize("how", ["outage", "condition", "pause", "mute", "task"])
 def test_network_outage_on_hosts_already_known_down_raises_no_new_needs_you(env, monkeypatch, how):
     from ttp import alerts, machine_ledger, machines, screen

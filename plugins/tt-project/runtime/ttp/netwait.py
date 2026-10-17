@@ -75,6 +75,10 @@ CONFIRM_TIMEOUT_S = 10         # ConnectTimeout of the check that a probe's host
 # ssh's own errors: a name that does not resolve, or no route out at all, means this machine is offline
 _OFFLINE = re.compile(r"[Cc]ould not resolve hostname|Name or service not known|nodename nor servname|"
                       r"Temporary failure in name resolution|Network is unreachable")
+# ssh's own errors before any session: the probe never reached its host, whatever exit code it mapped this to
+_SSH_FAIL = re.compile(r"ssh: connect to host|ssh: [Cc]ould not resolve hostname|kex_exchange_identification|"
+                       r"Connection (?:timed out|refused) during banner exchange|"
+                       r"ssh_exchange_identification|Connection closed by \S+ port \d+")
 # SMBIOS chassis types of a laptop or desktop (desktop, low profile, mini tower, portable, laptop,
 # notebook, hand held, all in one, sub notebook, space-saving, lunch box, tablet, convertible,
 # detachable, mini PC, stick PC); servers (main server chassis, rack mount, blade, ...) are not.
@@ -292,6 +296,11 @@ def classify(outputs: list[str], failing: list[str], answering: list[str]) -> st
     if any(_OFFLINE.search(o or "") for o in outputs):
         return "offline"
     return "hosts" if set(answering) - set(failing) else "offline"
+
+
+def ssh_failed(output: str) -> bool:
+    """A probe's output shows ssh failing to connect or resolve its host (so it proves no host answers)."""
+    return bool(_SSH_FAIL.search(output or "") or _OFFLINE.search(output or ""))
 
 
 def names_host(host: str, text: str, hostname: str = "") -> bool:

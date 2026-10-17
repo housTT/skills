@@ -4464,7 +4464,8 @@ class Daemon:
         if action == "alert":
             raw = list(dict.fromkeys(h for _, hs in unreachable for h in hs))
             names, tunnel = netwait.describe(raw)
-            kind, known = self._net_kind(unreachable, raw, now) if not tunnel else ("offline", {})
+            kind, known = self._net_kind(unreachable, raw, now, float(new["since"])) \
+                if not tunnel else ("offline", {})
             new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel, kind=kind)
             if tunnel and now - float(new["since"]) < page_after:
                 severity = "low"   # a tunnel that reconnects by itself: a feed line until page_after
@@ -4523,10 +4524,12 @@ class Daemon:
         return unreachable, False
 
     def _net_kind(self, unreachable: list[tuple[int, list[str]]], raw: list[str],
-                  now: float) -> tuple[str, dict[str, str]]:
+                  now: float, since: float) -> tuple[str, dict[str, str]]:
         """(netwait.classify's "offline" or "hosts", or "known" when every failing host is already known
-        down; {alias: why} of the known-down ones). Hosts that answer: another queued task's recent
-        probe that reached its ssh host (any exit but 255), a healthy heal check on a machine."""
+        down; {alias: why} of the known-down ones). Hosts that answer, only from evidence dated at or after
+        the outage's start (`since`): another queued task's probe that reached its ssh host (any exit but
+        255, no ssh connect or resolve error in its output), a heal check on a machine whose last run
+        passed or failed on the box itself (exit 0 or 1, not an unknown or known-state run)."""
         hosts_ = [h for h in raw if not netwait.loopback(h)]
         try:
             known = netwait.known_down(self.p, hosts_, now)
@@ -4544,15 +4547,18 @@ class Daemon:
             when = deferral(t).get("when")
             probe = when or load_result(t["result"]).get("retry_when")
             got = (self._start_rc if when else self._probe_rc).get(t["id"])
+            out = self._probe_out.get(t["id"])
             if probe and got and isinstance(got[0], int) and got[0] != netwait.UNREACHABLE_RC \
-                    and got[2] == probe and now - got[1] <= 3 * PROBE_EVERY_S:
+                    and got[2] == probe and got[1] >= since and now - got[1] <= 3 * PROBE_EVERY_S \
+                    and not (out and out[2] == probe and netwait.ssh_failed(out[0])):
                 answering += netwait.hosts(probe)
         try:
             for r, spec in heal.checks(self.p.db):
                 s = heal.state(self.p.db, r["name"])
                 alias = heal.machine_of(spec)
-                if alias and s.get("status") == "healthy" and \
-                        now - float(s.get("last_check") or 0) <= 3 * float(r["every_s"] or 0) + 300:
+                at = float(s.get("last_check") or 0)
+                if alias and s.get("last_rc") in (0, 1) and not ({"unknown_since", "known_run"} & set(s)) \
+                        and at >= since and now - at <= 3 * float(r["every_s"] or 0) + 300:
                     answering.append(alias)
         except Exception:
             log(self.p, "network: heal checks unreadable\n" + traceback.format_exc())
