@@ -22,8 +22,8 @@ state. The task is labeled `outage:<alias>:<condition>@<start>` (one per episode
 `due:<epoch>` (`heal.outage_task_due_min`, default 30, after it was queued); its spec names the
 machine, the outage start, who was paged and why the owner was passed over.
 
-Escalation, from the same route: past its due time with the task still open (or unreadable), one high
-`machine_outage_overdue` page to the task's project (an event at high effort when that is the routing daemon's
+Escalation, from the same route: past its due time with the task still open (not closed(), so a failed
+task counts; or unreadable), one high `machine_outage_overdue` page to the task's project (an event at high effort when that is the routing daemon's
 own project, else a high note), and after a second budget (`heal.outage_escalate_min`, default 30) one
 normal-severity user alert. The task shows in `ttp status`, the web app and the blocker sweep as an
 outage item with its age and due time (lines, sweep.items). Observation mutes never touch any of this:
@@ -42,7 +42,7 @@ OVERDUE_KIND = "machine_outage_overdue"   # the page (and event) for an open tas
 OWNER_BUDGET_S = 3600.0   # heal.outage_owner_budget_min: an owner that can act has this long to record an action
 TASK_DUE_S = 1800.0       # heal.outage_task_due_min: a fallback task is due this long after it was queued
 ESCALATE_S = 1800.0       # heal.outage_escalate_min: past due by this much, the user is alerted
-DONE = ("done",)          # a task in this status is not overdue
+CLOSED = ("done", "cancelled")   # closed(): no overdue page, not listed open; a failed task stays open
 FIELDS = ("alias", "condition", "first", "due", "why", "tried", "seen_by", "text", "label")
 
 
@@ -59,6 +59,12 @@ def budgets(cfg: dict | None) -> dict[str, float]:
             v = default
         out[key] = max(60.0, v)
     return out
+
+
+def closed(status: str | None) -> bool:
+    """Whether an outage task in `status` is over: the one predicate for escalation (machine_ledger) and
+    open_tasks (status, web, sweep). A failed task stays open, as nobody recovered the machine."""
+    return status in CLOSED
 
 
 def label(key: str, first: float) -> str:
@@ -144,10 +150,9 @@ def info(t: dict) -> dict | None:
 def open_tasks(db) -> list[dict]:
     """This project's open outage tasks, each a task row with its `outage` info."""
     out = []
-    for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') AND labels LIKE ? "
-                  "ORDER BY id", (f'%"{LABEL}%',)):
+    for t in db.q("SELECT * FROM tasks WHERE labels LIKE ? ORDER BY id", (f'%"{LABEL}%',)):
         i = info(t)
-        if i:
+        if i and not closed(t["status"]):
             out.append({**t, "outage": i})
     return out
 

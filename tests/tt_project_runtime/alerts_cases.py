@@ -2212,7 +2212,7 @@ def test_a_bare_nothing_was_changed_outage_message_never_goes_out_without_an_act
 
 def test_machine_pages_and_status_say_how_long_and_who_acts_now(env):
     """A machine condition's page names its start, duration so far and the actor at each step: the owner,
-    the fallback once the owner cannot act (with a tracked task when one is recorded), then nobody."""
+    the fallback once the owner cannot act (naming the outage task queued in it), then nobody."""
     from ttp import machine_ledger as ml
     from ttp import machines as mm
     from ttp import responsibilities
@@ -2224,35 +2224,36 @@ def test_machine_pages_and_status_say_how_long_and_who_acts_now(env):
     ml.report("gamma", "box-a", "held", "device held, no holder", now=t0)
     able = {"alpha": (False, "it is paused"), "beta": (True, "")}
     first = t0 + ml.GRACE_S
-    pages = ml.route(first, able=able.get, healthy=lambda *a: [])
+
+    def recovery(at):   # every page goes out; the recovery pages are returned
+        got = ml.route(at, able=able.get, healthy=lambda *a: [])
+        for x in got:
+            ml.delivered(x)
+        return [x for x in got if x["kind"] == "machine_condition"]
+    pages = recovery(first)
     assert [x["target"] for x in pages] == ["alpha"]
     text = pages[0]["text"]
     assert "Machine box-a held" in text and "(30 min so far)" in text and "Acting now: alpha (owner)." in text, text
     assert "Tried: nothing yet." in text and "Tracked task: none." in text and "Next: alpha checks" in text, text
-    ml.delivered(pages[0])
-    # A separate step may record a fallback task on the condition: the page names it and its due time.
-    with ml._locked():
-        doc = ml._read(ml.ROUTES, {"conditions": {}})
-        doc["conditions"]["box-a:held"].update(task=77, due=first + 8 * 3600)
-        ml._write(ml.ROUTES, doc)
+    # The owner cannot act: the outage task (outagetask.py) is queued in the fallback; later pages name it.
     ml.report("gamma", "box-a", "held", "device held, no holder", now=first + 60)
-    ml.route(first + 60, able=able.get, healthy=lambda *a: [])
+    recovery(first + 60)
     later = first + 60 + ml.UNAVAILABLE_S
-    pages = ml.route(later, able=able.get, healthy=lambda *a: [])
+    pages = recovery(later)
     assert [x["target"] for x in pages] == ["beta"]
     text = pages[0]["text"]
     assert "Acting now: beta (fallback; alpha cannot act: it is paused)." in text, text
-    assert "Tracked task: #77, due " in text and "Tried: recovery page 1 to alpha." in text, text
-    assert "(1.0 h so far)" in text, text
-    ml.delivered(pages[0])
+    assert f"Tracked task: outage:box-a:held@{int(t0)} in beta, due " in text, text
+    assert "Tried: recovery page 1 to alpha." in text and "(1.0 h so far)" in text, text
     line = responsibilities.machine_lines(next(r for r in responsibilities.machine_status("box-a")
                                                if r["alias"] == "box-a"))
     cond = next(x for x in line if x.startswith("  condition: "))
-    assert "so far; seen by gamma" in cond and "Acting now: beta (fallback)" in cond and "#77" in cond, cond
+    assert "so far; seen by gamma" in cond and "Acting now: beta (fallback)" in cond, cond
+    assert f"Tracked task: outage:box-a:held@{int(t0)} in beta" in cond, cond
     able["beta"] = (False, "its daemon is stopped")
     ml.report("gamma", "box-a", "held", now=later + 60)
-    ml.route(later + 60, able=able.get, healthy=lambda *a: [])
-    pages = ml.route(later + 60 + ml.UNAVAILABLE_S, able=able.get, healthy=lambda *a: [])
+    recovery(later + 60)
+    pages = recovery(later + 60 + ml.UNAVAILABLE_S)
     assert [x["target"] for x in pages] == [ml.USER]
     text = pages[0]["text"]
     assert "Acting now: nobody: escalating to the user (beta cannot act: its daemon is stopped)." in text, text

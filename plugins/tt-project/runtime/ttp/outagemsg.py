@@ -54,14 +54,17 @@ def facts(since: float, now: float, acting: str, where: Any = None, task: Any = 
           tried: Iterable[str] = (), next_step: str = "") -> str:
     """'Since <start> (<duration> so far). Acting now: <who>. Tracked task: #N, due <time>. Tried: ....
     Next: ....' Times in the home zone of `where` (a Project, settings or zone name; None: the ambient
-    zone). `acting` empty is "nobody: escalating". A `task` or `due` that is not a number is left out."""
+    zone). `acting` empty is "nobody: escalating". `task`: a task id, or an outage task's
+    '<label> in <project>' (machine_ledger.tracked); any other `task`, or a `due` that is not a number, is left out."""
     where = where if where is not None else timefmt.ambient()
     out = [f"Since {timefmt.long(float(since), where)} ({duration(now - float(since))} so far).",
            f"{ACTING} {acting or NOBODY}."]
     tid = _int(task)
     when = _num(due)
-    if tid is not None:
-        out.append(f"Tracked task: #{tid}" + (f", due {timefmt.short(when, where, now)}" if when else "") + ".")
+    from .outagetask import LABEL
+    name = f"#{tid}" if tid is not None else task if isinstance(task, str) and task.startswith(LABEL) else None
+    if name:
+        out.append(f"Tracked task: {name}" + (f", due {timefmt.short(when, where, now)}" if when else "") + ".")
     else:
         out.append("Tracked task: none" + (f" (due {timefmt.short(when, where, now)})" if when else "") + ".")
     done = [str(t).strip().rstrip(".") for t in tried if str(t or "").strip()]

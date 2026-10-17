@@ -744,7 +744,7 @@ def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
     pend = task.get("pending")
     if stage >= 2 or now < due or (pend and pend.get("kind") == outagetask.KIND):
         return
-    if status(task["project"], task["label"]) in outagetask.DONE:
+    if outagetask.closed(status(task["project"], task["label"])):
         return
     late = f"Outage task {task['label']} in {task['project']} for machine {c['alias']} {c['condition']} " \
            f"(since {ends.shown(c['first'])}) is open past its due time {ends.shown(due)}"
@@ -919,10 +919,21 @@ def condition_line(c: dict, now: float, where=None, so_far: bool = True) -> str:
     from . import outagemsg
     page = c.get("page") or {}
     lasted = f"{outagemsg.duration(now - float(c['first']))} so far; " if so_far else ""
-    tid = outagemsg._int(page.get("task") or c.get("task"))
+    task = tracked(c)[0]
+    tid = outagemsg._int(task)
+    name = f"#{tid}" if tid else task if isinstance(task, str) else ""
     return (f"{c['condition']} since {ends.shown(c['first'], where)} ({lasted}seen by "
             f"{', '.join(c.get('seen_by') or [])}): {c.get('text') or 'no detail'}. "
-            f"{outagemsg.ACTING} {acting_now(c)}" + (f". Tracked task: #{tid}" if tid else ""))
+            f"{outagemsg.ACTING} {acting_now(c)}" + (f". Tracked task: {name}" if name else ""))
+
+
+def tracked(c: dict) -> tuple[Any, Any]:
+    """(task, due) a condition's messages name: its outage task (outagetask.py) as '<label> in <project>',
+    else a task id and due time a page or the condition records."""
+    t, page = c.get("task"), c.get("page") or {}
+    if isinstance(t, dict):
+        return f"{t.get('label')} in {t.get('project')}", t.get("due")
+    return page.get("task") or t, page.get("due") or c.get("due")
 
 
 def condition_text(c: dict, page: dict, targets: list[str], target: str, now: float) -> str:
@@ -943,10 +954,11 @@ def condition_text(c: dict, page: dict, targets: list[str], target: str, now: fl
         acting = outagemsg.actor(target, role, passed)
         step = f"{target} checks and recovers it; record any live change with `ttp machines change add`"
     tried = [f"recovery page {i + 1} to {t}" for i, t in enumerate(targets[:stage])]
+    task, due = tracked(c)
     return (f"Machine {c['alias']} {c['condition']}, seen by {', '.join(c.get('seen_by') or [])}: "
             f"{c.get('text') or 'no detail'}. Recovery page {stage + 1}. "
-            + outagemsg.facts(float(c["first"]), now, acting, task=page.get("task") or c.get("task"),
-                              due=page.get("due") or c.get("due"), tried=tried, next_step=step))
+            + outagemsg.facts(float(c["first"]), now, acting, task=task, due=due, tried=tried,
+                              next_step=step))
 
 
 def _settle(sent: dict, done: bool) -> bool:
