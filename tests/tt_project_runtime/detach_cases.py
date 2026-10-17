@@ -227,3 +227,21 @@ def test_detach_remote_mirror_unreachable_before_the_end_stays_255_and_the_keepe
     detach.mirror_refresh(run_dir)   # an ended mirror is not asked again; an unreachable host changes nothing
     down = _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"})
     assert down.returncode == 4 and "job finished rc=5, as mirrored" in down.stdout, down.stdout
+
+
+def test_detach_mirror_probe_reads_the_verdict_before_the_tail(env, tmp_path, monkeypatch):
+    """A job that writes its last lines after the verdict was read must still have them in the mirrored
+    tail, and the verdict stays the answer's last line."""
+    from ttp import cli, detach
+    e = _ssh_stub(tmp_path)
+    for k, v in e.items():
+        monkeypatch.setenv(k, v)
+    job = tmp_path / "job"
+    (tmp_path / "job.log").write_text("early\n")
+    # The fake check reports the job running, then the job writes its last line (as if between steps).
+    monkeypatch.setattr(cli, "_REMOTE_CHECK", f'echo "running 1"\necho late >>{tmp_path}/job.log\n')
+    d = tmp_path / "mirror"
+    d.mkdir()
+    r, lines = detach.mirror_probe("box-m", str(job), d)
+    assert r.returncode == 0 and lines[-1] == "running 1", lines
+    assert (d / "job.remote.log").read_text() == "early\nlate\n", "the tail was taken before the verdict"

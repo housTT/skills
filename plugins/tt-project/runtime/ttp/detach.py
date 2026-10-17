@@ -713,7 +713,11 @@ def mirror_probe(host: str, pre: str, d=None, rows: str | None = None):
     from .cli import _REMOTE_CHECK, _REMOTE_ROWS, _ssh_sh
     name = mirror_name(pre)
     seen = (mirror_read(d, name, host, pre) or {}).get("size", "") if d else ""
-    script = (_REMOTE_ROWS if rows is not None else "") + (_REMOTE_TAIL % MIRROR_TAIL_BYTES if d else "") + _REMOTE_CHECK
+    # With a mirror the verdict is read before the tail and printed after it, so a job that ends between
+    # the two cannot leave a tail missing its last lines; the verdict stays the last line.
+    check = f'v=$(\n{_REMOTE_CHECK}\n)\n' if d else _REMOTE_CHECK
+    script = ((_REMOTE_ROWS if rows is not None else "") + check
+              + (_REMOTE_TAIL % MIRROR_TAIL_BYTES + 'printf "%s\\n" "$v"\n' if d else ""))
     r = _ssh_sh(host, script, [pre, rows or "", seen] if d else [pre, rows] if rows is not None else [pre])
     if r is None or r.returncode == 255:
         return r, []
