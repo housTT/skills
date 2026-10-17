@@ -2675,3 +2675,39 @@ def test_heal_unknown_past_the_outage_window_honours_suppress(env):
     heal.run(d2, "svc", spec2, now)
     heal.run(d2, "svc", spec2, now + heal.OUTAGE_S)
     assert heal.state(p2.db, "svc").get("escalated") or p2.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+
+
+def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env, capsys):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp.cli import main
+    known = {"box-a": {}, "box-b": {}, "box-c": {}, "box-d": {}}
+    charter = "# P\n\n## Resources\n{}\n\n## Restrictions\n- never box-c\n"
+    # Positive mentions still count; a read-only note or a negating parenthesis keeps the alias itself.
+    assert ml.charter_machines(charter.format("Machines: box-a, box-b (read only; never reset it)."),
+                               known) == ["box-a", "box-b"]
+    for line in ("No authorization for box-c or other shared nodes.", "Never use box-c.",
+                 "box-c is excluded.", "box-c: prohibited", "Don't run on box-c.", "Not box-c."):
+        assert ml.charter_machines(charter.format(f"Machines: box-a.\n{line}"), known) == ["box-a"], line
+    # An alias named both ways counts; one named only in another section does not.
+    assert ml.charter_machines(charter.format("Machines: box-a, box-c. Never reset box-c."),
+                               known) == ["box-a", "box-c"]
+    # An explicit allowlist in the config wins over the charter text.
+    text = charter.format("Machines: box-a, box-b.")
+    assert ml.project_machines(text, {"shared_resources": ["box-d-device"]}, known) == ["box-d"]
+    assert ml.project_machines(text, {"resources": {"box-b-device": 1}}, known) == ["box-b"]
+    assert ml.project_machines(text, {"resources": {"device": 1}, "shared_resources": "box-d"}, known) == ["box-a", "box-b"]
+    # End to end: health coverage and `machines status` leave out the project that only prohibits it.
+    mm.add("box-a", tags="device")
+    mm.add("box-c", tags="device")
+    me, other = make(env), _second_project(env, "gamma")
+    _resources(me, "Machines: box-a.\nNo authorization for box-c or other shared nodes.")
+    _resources(other, "Machines: box-c.")
+    assert [i["name"] for i in rs.inventory(me) if i["kind"] == "machine"] == ["box-a"]
+    main(["machines", "status", "box-c", "--json"])
+    assert json.loads(capsys.readouterr().out)[0]["projects"] == ["gamma"]
+    me.set_config("shared_resources", ["box-c-device"])
+    assert ml.resource_machines(me) == ["box-c"]
+    main(["machines", "status", "box-c", "--json"])
+    assert sorted(json.loads(capsys.readouterr().out)[0]["projects"]) == sorted([me.name, "gamma"])

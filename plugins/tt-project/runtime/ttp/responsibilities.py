@@ -389,12 +389,16 @@ def _projects(here: str) -> list[tuple[str, Path]]:
     return out
 
 
-def _resource_aliases(charter: str, known: dict) -> list[str]:
-    from . import ends
-    from .prompts import charter_sections
-    text = "\n".join("\n".join(body) for head, body in charter_sections(charter)
-                     if ends.section_name(head).lower().startswith("resources"))
-    return sorted(a for a in known if _word(a, text))
+def _project_aliases(harness: Path, known: dict) -> list[str]:
+    """The machines of the project whose harness folder is `harness` (machine_ledger.project_machines),
+    read without touching its state."""
+    from . import machine_ledger
+    charter = (harness / "CHARTER.md").read_text()
+    try:
+        cfg = json.loads((harness / "project.json").read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    return machine_ledger.project_machines(charter, cfg if isinstance(cfg, dict) else {}, known)
 
 
 def machine_status(alias: str | None = None, now: float | None = None) -> list[dict]:
@@ -408,7 +412,7 @@ def machine_status(alias: str | None = None, now: float | None = None) -> list[d
                 "conditions": [], "outage": None, "checks": [], "problems": [], "unread": []} for a in aliases}
     for name, base in _projects(project.hostname()):
         try:
-            mine = _resource_aliases((base / "harness" / "CHARTER.md").read_text(), known)
+            mine = _project_aliases(base / "harness", known)
         except OSError:
             mine = []
         for a in mine:

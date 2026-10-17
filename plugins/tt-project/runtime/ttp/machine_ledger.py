@@ -1099,15 +1099,50 @@ class Probes:
 
 # digest -------------------------------------------------------------------------------------------
 
-def resource_machines(p) -> list[str]:
-    """The machines in the user's list that the charter's Resources section names."""
+# A clause that refuses a machine ("No authorization for <alias>", "never <alias>", "<alias> is
+# excluded") does not make it the project's: an alias counts only where a clause names it without one.
+NEGATION_RE = re.compile(r"\b(?:no|not|never|none|nor|without|excluded?|exclusions?|prohibited|forbidden|"
+                         r"off[- ]limits|disallowed|unauthori[sz]ed)\b|n't\b", re.I)
+CLAUSE_RE = re.compile(r"[.;!?](?=\s|$)|\n|\(|\)")
+
+
+def charter_machines(charter: str, known) -> list[str]:
+    """The machines in `known` that the charter's Resources section names outside a negating clause."""
     from .prompts import charter_sections
+    text = "\n".join("\n".join(body) for head, body in charter_sections(charter)
+                     if ends.section_name(head).lower().startswith("resources"))
+    clauses = [c for c in CLAUSE_RE.split(text) if c.strip() and not NEGATION_RE.search(c)]
+    return sorted(a for a in known if any(
+        re.search(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)", c) for c in clauses))
+
+
+def configured_machines(cfg: dict, known) -> list[str]:
+    """The machines in `known` the project's config authorizes explicitly: a `resources` limit or a
+    `shared_resources` entry that is the alias or a resource on it (`<alias>-device`)."""
+    res = cfg.get("resources")
+    shared = cfg.get("shared_resources")
+    names = [str(x) for x in (res if isinstance(res, dict) else {})]
+    names += [x for x in (shared if isinstance(shared, list) else []) if isinstance(x, str)]
+    return sorted(a for a in known if any(n == a or n.startswith((a + "-", a + ":")) for n in names))
+
+
+def project_machines(charter: str, cfg: dict, known) -> list[str]:
+    """A project's machines: those its config authorizes explicitly when it names any, else those its
+    charter's Resources section names outside a prohibition."""
+    return configured_machines(cfg, known) or charter_machines(charter, known)
+
+
+def resource_machines(p) -> list[str]:
+    """The machines in the user's list that are the project's (project_machines)."""
     try:
-        text = "\n".join("\n".join(body) for head, body in charter_sections(p.charter_path.read_text())
-                         if ends.section_name(head).lower().startswith("resources"))
+        charter = p.charter_path.read_text()
     except OSError:
-        return []
-    return sorted(a for a in machines.load() if re.search(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)", text))
+        charter = ""
+    try:
+        cfg = p.raw_config()
+    except Exception:
+        cfg = {}
+    return project_machines(charter, cfg if isinstance(cfg, dict) else {}, machines.load())
 
 
 def digest_lines(p, now: float | None = None) -> list[str]:
