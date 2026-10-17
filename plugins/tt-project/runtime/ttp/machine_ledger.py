@@ -1111,6 +1111,10 @@ LIMIT_RE = re.compile(r"\b(?:no|not)\s+(?:more|less|fewer|longer|later|earlier|s
 PROHIBITED_RE = re.compile(r"\s*(?:[:\u2013\u2014-]|\b(?:is|are|stays?|remains?)\b)?\s*(?:strictly\s+|also\s+)?"
                            r"(?:excluded|prohibited|forbidden|off[- ]limits|disallowed|unauthori[sz]ed|out of scope|"
                            r"not\s+(?:allowed|authori[sz]ed|permitted|ours|in scope|to be used))\b", re.I)
+# A negation followed only by a maintenance verb ("Do not reboot box-a") limits an action; it does not
+# refuse the machine. Access verbs (use, run on, access, touch, take) still do.
+MAINT_RE = re.compile(r"^\s*(?:(?:allowed|permitted|authori[sz]ed)\s+)?(?:to\s+)?(?:(?:(?:re)?boot|reset|restart|"
+                      r"modify|upgrade|power[- ]cycle)\b\s*(?:,|\band\b|\bor\b)?\s*)+$", re.I)
 GLUE_RE = re.compile(r"^\s*(?:(?:and|or|nor|the|a)\b\s*)*$", re.I)
 CLAUSE_RE = re.compile(r"[.;!?](?=\s|$)|\n|\(|\)")
 
@@ -1129,6 +1133,8 @@ def _refused(clause: str, start: int, end: int, alias_re) -> bool:
     between = before[neg.end():]
     if neg.group().lower() == "without":
         return bool(GLUE_RE.match(alias_re.sub(" ", between)))
+    if MAINT_RE.match(between):
+        return False
     # The negation's own phrase ends at a comma, colon or dash; past it, only a list of aliases continues it.
     *rest, own = re.split(r"[,:\u2013\u2014]|\s-\s", between)
     return not rest or all(GLUE_RE.match(alias_re.sub(" ", seg)) for seg in rest[1:] + [own])

@@ -2696,7 +2696,9 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
                  "Slurm nodes box-a and box-b, no more than 2 at a time.",
                  "box-a: the project host, not shared with other teams.", "Use box-a without sudo.",
                  "box-a and box-b: read-only, do not modify.", "No more than one job at a time on box-a.",
-                 "Never directly, use box-a.", "Run without sudo on box-a."):
+                 "Never directly, use box-a.", "Run without sudo on box-a.",
+                 "Do not reboot box-a.", "Never reset box-a; use it for builds.",
+                 "Not allowed to reboot box-a.", "Do not reboot or upgrade box-a."):
         want = ["box-a", "box-b"] if "box-b" in line else ["box-a"]
         assert ml.charter_machines(charter.format(line), known) == want, line
     # An alias named both ways counts; one named only in another section does not.
