@@ -329,3 +329,68 @@ def test_checks_default_cap_shrinking_with_the_load_counts_checks_above_it(env, 
     assert s is not None and s.f is not None
     s.close()
     held[3].close()
+
+
+def test_an_open_obligations_owner_waits_first_in_its_project_and_only_while_it_is_open(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    from ttp import obligations as ob
+    p = make(env)
+    owner, plain, plain2 = (p.db.add_task(t, "s", kind="code", tier="light", origin="coordinator", priority=1)
+                            for t in ("owner", "plain", "plain2"))
+    oid = ob.add(p, "the urgent report", [owner])
+    prio = {}
+    for tid in (owner, plain, plain2):
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        prio[tid] = checkcap.task_priority(p)
+    assert prio == {owner: checkcap.OBLIGATION_PRIORITY, plain: 1, plain2: 1} and checkcap.OBLIGATION_PRIORITY < 1
+
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    got, told = [], []
+
+    def take(label, proj, pr):
+        s = checkcap.acquire(label, tell=told.append if label == "owner" else None, project_name=proj, priority=pr)
+        got.append(label)
+        s.close()
+
+    waiters = []
+    for i, args in enumerate([("a1", "A", prio[plain]), ("b1", "B", 1), ("a2", "A", prio[plain2]),
+                              ("owner", "A", prio[owner])]):
+        waiters.append(threading.Thread(target=take, args=args))
+        waiters[-1].start()
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+    mark = "owner" + checkcap.OBLIGATION_MARK
+    assert checkcap.state()["queued"] == [mark, "b1", "a1", "a2"], \
+        "the owner goes ahead of its project's earlier p1 waiters; project B keeps its turn"
+    assert mark in checkcap.line()
+    assert _wait_for(lambda: any("open obligation's owner" in t for t in told))
+    held.close()
+    for w in waiters:
+        w.join(20)
+    assert got == ["owner", "b1", "a1", "a2"]
+
+    monkeypatch.setenv("TTP_TASK", str(owner))
+    ob.record(p, oid, "receipt", "report sent", None)
+    assert checkcap.task_priority(p) == 1, "the boost ends with the obligation's receipt"
+    o2 = ob.add(p, "another urgent report", [owner])
+    assert checkcap.task_priority(p) == checkcap.OBLIGATION_PRIORITY
+    ob.drop(p, o2, "no longer wanted")
+    assert checkcap.task_priority(p) == 1, "and once it is dropped"
+
+
+def test_push_checks_slot_carries_the_obligation_boost_outside_the_push_priority_slot(env, monkeypatch):
+    from ttp import checkcap, push
+    from ttp import obligations as ob
+    p = make(env)
+    owner = p.db.add_task("owner", "s", kind="code", tier="light", origin="coordinator", priority=1)
+    ob.add(p, "the urgent report", [owner])
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", str(owner))
+    seen = []
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: seen.append(k.get("priority")) or checkcap.Slot())
+    monkeypatch.setattr(checkcap, "acquire_priority", lambda *a, **k: seen.append("push slot") or checkcap.Slot())
+    push.check_slot("abc", lambda s: None)
+    push.check_slot("abc", lambda s: None, priority="branch-key")
+    assert seen == [checkcap.OBLIGATION_PRIORITY, "push slot"], \
+        "own push checks queue boosted; push-branch checks (batches) keep their slot beyond the cap"

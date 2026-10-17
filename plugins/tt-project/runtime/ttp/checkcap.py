@@ -5,8 +5,8 @@
 Many tasks of many projects may each start a full test suite at the same time; together they can
 load the host so far that load-sensitive tests time out and every run fails. Each `ttp checks` that
 has commands to run first takes one of `limit()` slots under ~/.tt-project/check-slots, shared by
-every project of this account on this host. A run over the cap waits its turn in arrival order
-(locks.enqueue), sleeping between tries: no failure, no model run.
+every project of this account on this host. A run over the cap waits its turn in the queue
+(locks.enqueue, below), sleeping between tries: no failure, no model run.
 
 Slots and queue tickets are OS file locks (locks.py), so they end with the process that holds them:
 a crash, a kill or a reboot never leaves a stale holder.
@@ -34,6 +34,12 @@ slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond t
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
 They open beyond a default cap's ceiling too.
 
+Waiters take turns by project (locks.fair_order); within one, by task priority (1 first), then arrival.
+The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
+deliverable owed to the user) queue at OBLIGATION_PRIORITY, ahead of every task priority, until it has its
+receipt or is dropped; the ticket and the status line mark them (OBLIGATION_MARK). That changes the order
+within the project only: the turns between projects stay as they are.
+
 A waiter whose checks match ones running now (`same`: the project, tree, commands and purpose) waits
 for their result outside the queue, keeping its arrival time; `done` ends any wait once a recorded
 pass makes the run needless, and `stop` ends it when the task the checks belong to ended.
@@ -47,9 +53,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import locks, poll_s, project
+from . import locks, obligations, poll_s, project
 
 RESOURCE = "checks"
+OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
+OBLIGATION_MARK = " [owns an open obligation: first in its project]"   # on its queue ticket
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
 CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
@@ -170,15 +178,20 @@ def label(project_name: str | None, what: str = "") -> str:
 
 
 def task_priority(p) -> int | None:
-    """The priority of the task this process runs for (TTP_TASK) in project `p`; None without one."""
+    """The priority of the task this process runs for (TTP_TASK) in project `p`; None without one.
+    OBLIGATION_PRIORITY while the task is a required owner of an open obligation."""
     task = os.environ.get("TTP_TASK") or ""
     if p is None or not task.isdigit():
         return None
     try:
         t = p.db.task(int(task))
-        return int(t["priority"]) if t and t.get("priority") is not None else None
+        prio = int(t["priority"]) if t and t.get("priority") is not None else None
     except Exception:   # an unreadable database only loses the ordering, never the slot
         return None
+    try:
+        return OBLIGATION_PRIORITY if t and obligations.owned_open(p.db, int(task)) else prio
+    except Exception:   # unreadable obligations only lose the boost
+        return prio
 
 
 def paths(n: int | None = None) -> list[Path]:
@@ -281,7 +294,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             stop: Callable[[], str] | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
-    none last), then arrival (locks.fair_order), so one project's burst cannot starve the others' checks. `tell` gets a line
+    OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order), so one project's burst cannot starve the others' checks. `tell` gets a line
     when the wait starts and every TELL_S while it lasts; `waiting(True)` once it starts and
     `waiting(False)` once it ends. With `max_wait_s` it gives its place back and returns None once
     it waited that long. `since` is the arrival time to queue at (default now). A slot directory that
@@ -296,12 +309,13 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         return Slot()
     since = time.time() if since is None else since
     ps, every = paths(n), all_paths(n)
+    queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
     try:
         f = None if locks.queued(slot_dir(), RESOURCE) or _running(every, same) else _take(n, ps, every, holder, what, same)
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             return Slot(f)
-        ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since, group=project_name, priority=priority)
+        ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
         raise _unavailable(e) from e
     started, told, checked = time.time(), 0.0, time.time()
@@ -322,7 +336,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     tell(f"the same checks run now ({twin}); waiting for their result, keeping this place in the queue")
             elif not twin and ticket is None:
                 try:
-                    ticket = locks.enqueue(slot_dir(), RESOURCE, holder, since, group=project_name,
+                    ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                            priority=priority)
                 except OSError as e:
                     raise _unavailable(e) from e
@@ -347,7 +361,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     ahead = q.index(ticket) if ticket in q else 0
                     groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
-                         f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}")
+                         f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}"
+                         + (", first in its project as an open obligation's owner" if queued_as != holder else ""))
                 if not told and waiting:
                     waiting(True)
                 told = time.time()

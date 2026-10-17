@@ -701,6 +701,12 @@ def _open(o: dict) -> bool:
     return not (o["receipt"] or o.get("dropped"))
 
 
+def owned_open(db, tid: int) -> list[str]:
+    """The open obligations task `tid` is a required owner of: its checks go ahead of its project's other
+    waiters for a host-wide checks slot (checkcap.task_priority) until each has its receipt or is dropped."""
+    return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
+
+
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
                     obligations: list[str] = (), now: float | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's

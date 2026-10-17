@@ -358,7 +358,7 @@ _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that
 
 SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
 GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>[.p<priority>].g<id>
-PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (1 is served first)
+PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (lowest first; checkcap uses 0 for obligation owners)
 SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
 
 

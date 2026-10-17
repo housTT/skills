@@ -763,6 +763,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
   and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
   `ttp push --own` publishes a task's branch and queues like task checks.
+  Waiters take turns by project, and within a project by task priority, then arrival; a task that
+  is a required owner of an open obligation goes first in its project (its queue entry in `ttp status`
+  says so) until the obligation has its receipt or is dropped. Turns between projects do not change.
 - Shared check failures: a task waiting on its own detached `ttp checks` that failed only on pytest
   ids (the failing command's `FAILED`/`ERROR path::name` lines, complete against pytest's summary)
   that also failed in at least `checks.shared_min_tasks` (default 2) other changes' checks on other
