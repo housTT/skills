@@ -3397,11 +3397,15 @@ def _head(repo: pathlib.Path, ref: str = "HEAD") -> str:
                           capture_output=True, text=True, check=True).stdout.strip()
 
 
-def test_fresh_one_line_install_keeps_an_origin_on_the_kept_clone(install_env):
+def test_install_from_a_source_without_origin_keeps_the_public_origin_on_the_kept_clone(install_env):
     import subprocess
-    assert install_env().returncode == 0
+    env = {"HOME": str(install_env.home), "PATH": str(install_env.home.parent / "bin"), "TMPDIR": str(install_env.tmp),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C"}
+    script = install_env.repo / "plugins" / "tt-project" / "install.sh"
+    done = subprocess.run(["sh", str(script)], env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
     out = subprocess.run(["git", "-C", str(install_env.home / ".local/share/tt-project/skills"), "remote",
-                          "get-url", "origin"], capture_output=True, text=True, check=True).stdout.strip()
+                          "get-url", "origin"], env=env, capture_output=True, text=True, check=True).stdout.strip()
     assert out == INSTALL_URL
 
 
