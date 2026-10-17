@@ -3397,6 +3397,14 @@ def _head(repo: pathlib.Path, ref: str = "HEAD") -> str:
                           capture_output=True, text=True, check=True).stdout.strip()
 
 
+def test_fresh_one_line_install_keeps_an_origin_on_the_kept_clone(install_env):
+    import subprocess
+    assert install_env().returncode == 0
+    out = subprocess.run(["git", "-C", str(install_env.home / ".local/share/tt-project/skills"), "remote",
+                          "get-url", "origin"], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == INSTALL_URL
+
+
 def test_readme_one_line_install_is_the_installers_documented_usage():
     """The README's line is the one install.sh documents; it clones with git (the reader's own
     credentials), never a raw download, and names the ref in one variable at its front."""

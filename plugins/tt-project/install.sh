@@ -45,10 +45,10 @@ if [ "$dest_real" != "$src" ]; then
     fi
     git -C "$dest" fetch -q --depth 1 "$src" HEAD
     git -C "$dest" checkout -q -f --detach FETCH_HEAD
+    # a one-line install's temporary checkout has no origin: fall back to the public repository
     url=$(git -C "$src" remote get-url origin 2>/dev/null || true)
-    if [ -n "$url" ]; then
-        git -C "$dest" remote set-url origin "$url" 2>/dev/null || git -C "$dest" remote add origin "$url"
-    fi
+    url=${url:-https://github.com/tenstorrent/skills.git}
+    git -C "$dest" remote set-url origin "$url" 2>/dev/null || git -C "$dest" remote add origin "$url"
 fi
 plugin=$dest/plugins/$PLUGIN
 [ -f "$plugin/bin/ttp" ] || die "$dest has no plugins/$PLUGIN after the update"
