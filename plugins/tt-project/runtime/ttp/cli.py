@@ -262,9 +262,25 @@ def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = Fals
     r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
     if r.returncode == 2 and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
         r = _ssh(entry, argv, capture)
+    if r.returncode == 2 and "--broadcast" in (r.stderr or "") and "--broadcast" in argv:
+        return _send_say(entry, _fold_broadcast(argv), client_id, capture)
     if r.returncode == 2 and "--context" in (r.stderr or "") and "--context" in argv:
         return _send_say(entry, _fold_context(argv), client_id, capture)
     return r
+
+
+def _fold_broadcast(argv: list[str]) -> list[str]:
+    """The `ttp say` argv for a runtime without `--broadcast`: the broadcast id goes into the
+    relayer's context, so that project still learns it and never relays the words on."""
+    i = argv.index("--broadcast")
+    bid, rest = argv[i + 1], argv[:i] + argv[i + 2:]
+    note = f"broadcast {bid}: the user sent these words to every project. Do not relay them to other projects."
+    if "--context" in rest:
+        j = rest.index("--context") + 1
+        rest[j] = f"{rest[j]}\n{note}"
+        return rest
+    j = rest.index("--")
+    return rest[:j] + ["--context", note] + rest[j:]
 
 
 def _fold_context(argv: list[str]) -> list[str]:
@@ -306,21 +322,29 @@ def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.Comp
     return failed
 
 
-def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "") -> int:
+def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "",
+               broadcast: str | None = None) -> int:
     """Send a message to a project on another machine. If that machine cannot be reached, or older
     messages are still queued for it, queue this one here: it is never dropped, and goes out in order."""
+    return _say_remote(name, entry, text, chat, context, broadcast)[0]
+
+
+def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "",
+                broadcast: str | None = None) -> tuple[int, str]:
+    """say_remote's exit code and where the message went: `client:<id>` (delivered) or
+    `queued:<host>`. A broadcast's client id is its broadcast id: a resend is a no-op there."""
     argv = ["say", name, *(["--chat", chat] if chat else []), *(["--context", context] if context else []),
-            "--", text]
-    cid = outbox.new_id()
+            *(["--broadcast", broadcast] if broadcast else []), "--", text]
+    cid = broadcast or outbox.new_id()
     if flush_outbox(name, entry) is None and not outbox.entries(name):
         r = _send_say(entry, argv, cid)
         if r.returncode != 255:
             if r.stderr:
                 sys.stderr.write(r.stderr)
-            return r.returncode
+            return r.returncode, f"client:{cid}"
     outbox.add(name, argv, cid, chat)
     print(f"queued on this machine; delivered once {name} is reachable (#{cid})")
-    return 0
+    return 0, f"queued:{entry.get('host')}"
 
 
 def search_transcripts(name: str) -> list[dict]:
@@ -791,38 +815,117 @@ def cmd_say(a) -> None:
         # A message posted here counts as the user's (pr_approve reads approvals from it), so a run
         # must not post one. Runs report through `ttp note` and their hand-off.
         die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
-    from . import relay
+    from . import broadcast, relay
+    if getattr(a, "all", False):
+        return _say_all(a)
+    if getattr(a, "except_", None):
+        die("--except goes with --all")
     p, entry = resolve(a.name)
     # Only the user's verbatim words are the message; what a relayer adds is kept apart (relay.py).
     text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
     if not text:
         die("empty message" if not context else "no user's words: --context alone is not a message")
+    bid = getattr(a, "broadcast", None)
     if entry:
-        sys.exit(say_remote(a.name, entry, text, a.chat, context))
+        rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid)
+        if rc == 0:
+            broadcast.note_delivery(text, a.name, ref, bid)
+        sys.exit(rc)
     p = p or need(a.name, sys.argv[1:])
-    import sqlite3
-    from .db import is_busy
-    try:
-        seen, mid = _say_local(p, a, text, context)
-    except sqlite3.OperationalError as e:   # db.tx already waited and retried
-        if not is_busy(e):
-            raise
-        die(f"the database stayed busy ({e}); the message was not saved. Send it again"
-            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), 75)
+    seen, mid = _say_local_or_die(p, a, text, context, bid)
+    # A plain say is recorded too: telling the projects one at a time builds the same record.
+    broadcast.note_delivery(text, a.name, f"#{mid}", bid)
     if seen:
         print(f"already received (#{mid})")
     else:
         print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
 
 
-def _say_local(p: Project, a, text: str, context: str) -> tuple[dict | None, int]:
+def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = None) -> tuple[dict | None, int]:
+    import sqlite3
+    from .db import is_busy
+    try:
+        return _say_local(p, a, text, context, bid)
+    except sqlite3.OperationalError as e:   # db.tx already waited and retried
+        if not is_busy(e):
+            raise
+        die(f"the database stayed busy ({e}); the message was not saved. Send it again"
+            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), 75)
+
+
+SAY_ALL = "*all*"   # the project slot of `ttp say --all <text>` (no project name can be this)
+
+
+def _say_all_argv(argv: list[str]) -> list[str]:
+    """`ttp say --all <text>` names no project: put SAY_ALL in the project slot, so `say` keeps both
+    positionals required (an optional one would swallow the text of `say <p> --chat c -- <text>`)."""
+    if argv[:1] != ["say"] or "--all" not in argv[:argv.index("--") if "--" in argv else len(argv)]:
+        return argv
+    return ["say", SAY_ALL, *argv[1:]]
+
+
+def _say_all(a) -> None:
+    """`ttp say --all`: the user's words to every project `ttp list` shows, once each. The words'
+    broadcast (broadcast.py) skips the projects that already got them within its reuse window, and
+    each project gets the broadcast id, so none relays them on."""
+    from . import broadcast, relay
+    if a.chat or a.client_id:
+        die("--all goes to every project without a chat: --chat names one project's chat")
+    if a.name != SAY_ALL:
+        die("ttp say --all takes only the message: ttp say --all [--except p,q] [--context ..] <text>")
+    text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
+    if not text:
+        die("empty message" if not context else "no user's words: --context alone is not a message")
+    reg = load_registry().get("projects", {})
+    skip = {n.strip() for n in (a.except_ or "").split(",") if n.strip()}
+    for n in sorted(skip - set(reg)):
+        print(f"ttp: --except {n}: no such project in `ttp list`", file=sys.stderr)
+    b = broadcast.claim(text)
+    bid, sent, had, failed = b["id"], 0, 0, []
+    for name, entry in sorted(reg.items()):
+        if name in skip or not isinstance(entry, dict):
+            continue
+        if name in b["delivered"]:
+            print(f"{name}: already has it ({b['delivered'][name]})")
+            had += 1
+            continue
+        try:
+            if entry.get("host") and entry["host"] != hostname():
+                rc, ref = _say_remote(name, entry, text, None, context, bid)
+                if rc:
+                    failed.append(f"{name} (exit {rc})")
+                    continue
+                print(f"{name}: {'queued' if ref.startswith('queued:') else 'sent'} ({ref})")
+            else:
+                if not Project(entry["dir"]).exists():
+                    failed.append(f"{name} (no project at {entry['dir']})")
+                    continue
+                seen, mid = _say_local(Project(entry["dir"]), argparse.Namespace(chat=None, client_id=bid),
+                                       text, context, bid)
+                ref = f"#{mid}"
+                print(f"{name}: {'already received' if seen else 'sent'} ({ref})")
+        except Exception as e:   # one project's failure must not stop the others
+            failed.append(f"{name} ({type(e).__name__}: {e})")
+            continue
+        sent += 1
+        try:
+            broadcast.record(bid, name, ref)
+        except OSError as e:   # delivered all the same; a resend within the window may repeat it
+            print(f"ttp: could not record {name} in {broadcast.path()} ({e})", file=sys.stderr)
+    print(f"broadcast {bid}: sent to {sent} project(s), {had} already had it"
+          + (f", {len(skip & set(reg))} left out" if skip & set(reg) else "")
+          + (f"; not delivered: {', '.join(failed)}" if failed else ""))
+    sys.exit(1 if failed else 0)
+
+
+def _say_local(p: Project, a, text: str, context: str, bid: str | None = None) -> tuple[dict | None, int]:
     seen = None
     with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
         if a.client_id:
             seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
         mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
                                                  kind="user", ref=f"client:{a.client_id}" if a.client_id else None,
-                                                 provenance="cli-legacy", context=context)
+                                                 provenance="cli-legacy", context=context, broadcast=bid)
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
     return seen, mid
@@ -6125,11 +6228,15 @@ def main(argv: list[str] | None = None) -> None:
         s.set_defaults(fn=fn)
 
     s = sub.add_parser("say", help="send a message to the coordinator")
-    s.add_argument("name")
+    s.add_argument("name", help="the project (none with --all)")
     s.add_argument("text", help="the user's words, verbatim, or '-' for stdin")
     s.add_argument("--chat")
     s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
                    "kept apart from the user's words")
+    s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
+                   "a resend within 24 h reaches only those that did not get it yet")
+    s.add_argument("--except", dest="except_", metavar="P,Q", help="with --all: projects to leave out")
+    s.add_argument("--broadcast", help=argparse.SUPPRESS)   # set by `ttp say --all` on another machine
     s.add_argument("--client-id", help=argparse.SUPPRESS)   # set by a forwarding machine; resends are skipped
     s.set_defaults(fn=cmd_say)
 
@@ -6815,7 +6922,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(argv)
+    a = ap.parse_args(_say_all_argv(sys.argv[1:] if argv is None else list(argv)))
     a.fn(a)
 
 

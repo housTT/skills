@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -936,6 +936,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                                                          "user's word for every other decision)")
             head = (f"- [user message #{m['id']} via {m['channel']}, provenance={prov}, can approve a PR: {ok}, "
                     f"chat={m['chat'] or '-'}]")
+            if m["broadcast"]:   # `ttp say --all`: every project got these words; none relays them on
+                head += f" [{broadcast.label(m['broadcast'])}]"
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
                 lines.append(f"{head} {relay.VERBATIM}: {m['text']}")
                 lines.append(f"  {relay.CONTEXT}: {m['context']}")
