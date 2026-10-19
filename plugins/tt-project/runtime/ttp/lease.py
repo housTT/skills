@@ -336,10 +336,9 @@ class Lease:
     def _save(self) -> None:
         if not self.state_file:
             return
+        from .project import durable_write
         try:
-            tmp = self.state_file.with_name(self.state_file.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(self.snapshot(), indent=1))
-            os.replace(tmp, self.state_file)
+            durable_write(self.state_file, json.dumps(self.snapshot(), indent=1))
         except OSError:
             pass
 
