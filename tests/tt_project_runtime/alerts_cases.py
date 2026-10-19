@@ -2557,3 +2557,65 @@ def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs
     row = _settle(d2, "long")
     assert not _alive(pid), "the earlier daemon's command was killed"
     assert row["last_status"] == "ok (0 observations)", "the schedule ran once more, recorded once"
+
+
+def test_the_desktop_notifier_alarms_once_when_a_remote_host_stays_unreachable_and_once_on_recovery(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import notifier, timefmt
+    monkeypatch.setattr(notifier, "load_registry", lambda: {"projects": {
+        "a1": {"dir": "/w/a1", "host": "host-a"}, "a2": {"dir": "/w/a2", "host": "host-a"},
+        "b1": {"dir": "/w/b1", "host": "host-b"}}})
+    up = {"host-a": True, "host-b": True}
+    monkeypatch.setattr(notifier, "_remote_alerts",
+                        lambda entry, name, after, floor: ([], True) if up[entry["host"]] else (None, False))
+    monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    t0, state = 1_800_000_000, {}
+
+    def poll(t, st=None):
+        return notifier.run_once(json.loads(json.dumps(st if st is not None else state)), "high", 1200, now=t0 + t)
+
+    state = poll(0)
+    up["host-a"] = False
+    state = poll(60)
+    state = poll(60 + 1199)
+    assert shown == [], "a failure under the threshold alarmed"
+    up["host-a"] = True
+    state = poll(1300)
+    assert shown == [], "a short blip alarmed or announced a recovery"
+    up["host-a"] = False
+    state = poll(1400)
+    state = poll(1400 + 1200)
+    since = datetime.fromtimestamp(t0 + 1400, ZoneInfo("Europe/Berlin")).strftime("%H:%M %Z")
+    assert shown == [f"host-a unreachable since {since}; its projects cannot page"], shown
+    for t in (2700, 2800, 5000):
+        state = poll(t)
+    # A restart reloads the state file: still one alarm.
+    state = poll(5100, json.loads(json.dumps(state)))
+    assert len(shown) == 1, shown
+    up["host-a"] = True
+    state = poll(5200)
+    state = poll(5300)
+    assert shown[1:] == ["host-a answers again; its projects can page again"], shown
+    # Hosts are tracked apart: host-b going down does not touch host-a, and back.
+    up["host-b"] = False
+    state = poll(6000)
+    state = poll(7200)
+    assert len(shown) == 3 and shown[2].startswith("host-b unreachable since"), shown
+    assert state["_hosts"]["host-a"].get("alarmed") is None and state["_hosts"]["host-b"]["alarmed"]
+
+
+def test_the_desktop_notifier_counts_only_an_ssh_connect_failure_as_a_host_down(monkeypatch):
+    from types import SimpleNamespace
+    from ttp import notifier
+    rc = {"code": 255}
+    monkeypatch.setattr(notifier.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=rc["code"], stdout="", stderr=""))
+    entry = {"dir": "/w/a1", "host": "host-a"}
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, False)
+    rc["code"] = 1   # the host answered; the remote command failed
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, True)
+    rc["code"] = 0
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True)

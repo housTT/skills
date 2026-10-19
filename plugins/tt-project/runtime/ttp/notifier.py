@@ -6,6 +6,8 @@ One small agent per workstation watches every project in this machine's registry
 reading their database, remote ones with one ssh call per minute — and shows each new alert at
 or above the severity floor as a native notification (macOS Notification Center, or notify-send
 on a Linux desktop). It never marks anything read; chats and the web app keep their own cursors.
+A remote host whose ssh polls keep failing gets one notification once it has been down for
+HOST_DOWN_AFTER_S, and one more when it answers again: while it is down its projects cannot page.
 """
 from __future__ import annotations
 
@@ -18,12 +20,14 @@ import sys
 import time
 from pathlib import Path
 
-from . import headline
+from . import headline, timefmt
 from .db import DB, SEVERITY_RANK
 from .project import FOLDER, HOME_DIR, Project, durable_write, hostname, load_registry, write_json
 
 STATE = HOME_DIR / "notifier-state.json"
 CONF = HOME_DIR / "notifier.json"
+HOSTS = "_hosts"   # state key for remote host reachability; no project name starts with '_'
+HOST_DOWN_AFTER_S = 20 * 60   # notifier.json `host_down_after_s` overrides
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
@@ -49,19 +53,46 @@ def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
     return rows
 
 
-def _remote_alerts(entry: dict, name: str, after: int, floor: str) -> list[dict] | None:
+def _remote_alerts(entry: dict, name: str, after: int, floor: str) -> tuple[list[dict] | None, bool]:
+    """(the alerts, or None when the poll failed; whether ssh reached the host). ssh exits 255 when
+    it cannot connect; any other failure is the remote command's, on a host that answers."""
     cmd = f"{entry['dir']}/{FOLDER}/harness/bin/ttp alerts {shlex.quote(name)} --after {after} --floor {floor} --json"
     try:
-        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", entry.get("ssh") or entry["host"],
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", _host(entry),
                               cmd], capture_output=True, text=True, timeout=40)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None, False
     if out.returncode != 0:
-        return None
+        return None, out.returncode != 255
     try:
-        return json.loads(out.stdout or "[]")
+        return json.loads(out.stdout or "[]"), True
     except ValueError:
-        return None
+        return None, True
+
+
+def _host(entry: dict) -> str:
+    return entry.get("ssh") or entry["host"]
+
+
+def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s: float) -> None:
+    """One notification once a host has failed every poll for `down_after_s`, one when it answers
+    again, nothing in between. Kept in the notifier's state, so a restart neither forgets nor re-alarms."""
+    hosts = state.setdefault(HOSTS, {})
+    for host in [h for h in hosts if h not in reached]:   # no project on it any more
+        del hosts[host]
+    for host, ok in sorted(reached.items()):
+        h = hosts.setdefault(host, {})
+        if ok:
+            if h.get("alarmed"):
+                show(f"tt-project · {host}", f"{host} answers again; its projects can page again")
+            hosts[host] = {"ok": now}
+            continue
+        since = h.setdefault("failing_since", now)
+        if not h.get("alarmed") and now - since >= down_after_s:
+            zone = timefmt.ambient()
+            show(f"tt-project · {host}",
+                 f"{host} unreachable since {timefmt.short(since, zone, now)}; its projects cannot page")
+            h["alarmed"] = True
 
 
 def show(title: str, body: str, url: str | None = None) -> None:
@@ -80,7 +111,8 @@ def show(title: str, body: str, url: str | None = None) -> None:
         subprocess.run(["notify-send", "-a", "tt-project", title, body], capture_output=True, timeout=10)
 
 
-def run_once(state: dict, floor: str) -> dict:
+def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, now: float | None = None) -> dict:
+    reached: dict[str, bool] = {}
     for name, entry in sorted(load_registry().get("projects", {}).items()):
         after = int(state.get(name, -1))
         local = entry.get("host") in (None, hostname())
@@ -95,7 +127,8 @@ def run_once(state: dict, floor: str) -> dict:
                 continue
             rows = alerts_since(p, after, floor)
         else:
-            rows = _remote_alerts(entry, name, max(after, 0), floor)
+            rows, ok = _remote_alerts(entry, name, max(after, 0), floor)
+            reached[_host(entry)] = reached.get(_host(entry), False) or ok
             if rows is None:
                 continue
             if after < 0:
@@ -105,11 +138,12 @@ def run_once(state: dict, floor: str) -> dict:
             if not r.get("cleared"):
                 show(f"tt-project · {name}", r["text"])
             state[name] = max(int(state.get(name, 0)), int(r["id"]))
+    _track_hosts(state, reached, time.time() if now is None else now, down_after_s)
     return state
 
 
 def main() -> int:
-    conf = {"min_severity": "high", "interval_s": 60}
+    conf = {"min_severity": "high", "interval_s": 60, "host_down_after_s": HOST_DOWN_AFTER_S}
     try:
         conf.update(json.loads(CONF.read_text()))
     except (OSError, ValueError):
@@ -120,7 +154,7 @@ def main() -> int:
         state = {}
     while True:
         try:
-            state = run_once(state, conf["min_severity"])
+            state = run_once(state, conf["min_severity"], float(conf["host_down_after_s"]))
             write_json(STATE, state)
         except Exception as e:  # keep notifying other projects even if one fails
             print(f"notifier: {type(e).__name__}: {e}", file=sys.stderr, flush=True)

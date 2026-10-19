@@ -9,6 +9,8 @@ Default channels need no accounts or setup.
 | Desktop notifier | `ttp notifier install` (run it on the user's workstation, say so) | native notification on this machine, all projects |
 
 - The notifier polls local projects directly and remote ones over the user's ssh.
+- A remote host ssh cannot reach for 20 min (`host_down_after_s` in `notifier.json`) gets one
+  notification, since its projects cannot page, and one more when it answers again.
 - `ttp notifier test` shows a sample notification.
 - Only `high` severity notifies by default: decisions, reviews, merges, funds, outages.
 - The user can ask the coordinator for more or fewer alerts.
