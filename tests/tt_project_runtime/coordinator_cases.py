@@ -4960,9 +4960,10 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     assert b["own_consumers"][0][0] == "run worktrees", "the biggest consumer comes first"
     dm.Daemon(p.base).check_disk()
     text = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='disk'")["text"]
-    mb = b["own_bytes"] / 1e6
-    assert (f"This project's own data (state/ and worktrees/) is {mb:.1f} MB of the 960.0 GB used on "
-            f"{env['tmp']} (run worktrees: 1, ") in text, text
+    # The alert measures again, after the state grew a little: either reading may cross a 0.1 MB step.
+    mbs = {f"{x / 1e6:.1f}" for x in (b["own_bytes"], dm.disk_breakdown(p, p.base)["own_bytes"])}
+    assert any(f"This project's own data (state/ and worktrees/) is {mb} MB of the 960.0 GB used on "
+               f"{env['tmp']} (run worktrees: 1, " in text for mb in mbs), text
     assert "0.0 GB of" not in text and "or more" not in text, text
     assert f"biggest top-level directories: {other} 0.0 GB" in text, text
     assert "--min-free-gb" in text
