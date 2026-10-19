@@ -110,10 +110,18 @@ def test_lease_store_unreachable_lapses_the_holder_and_nobody_takes_it(env, tmp_
     assert b.step() == "unreachable" and not b.held()
 
 
-def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys):
+def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys, tmp_path, monkeypatch):
     """Lease refs never go to the plugin's own repository (any URL form or remote name), nor to the
-    project's delivery remote unless failover.allow_delivery_remote; `ttp lease check` says why."""
+    project's delivery remote unless failover.allow_delivery_remote, whether named by an ssh alias of
+    its host or reached through pushInsteadOf; `ttp lease check` says why."""
     from ttp import cli, lease
+    # ssh aliases as `ssh -G` reports them: codehost -> example.com, elsewhere -> other.example.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text('#!/bin/sh\n[ "$1" = -G ] || exit 255\ncase "$2" in codehost) h=example.com;; '
+                                 'elsewhere) h=other.example;; *) h="$2";; esac\necho "user git"\necho "hostname $h"\n')
+    (bin_dir / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     p = make(env)
     subprocess.run(["git", "-C", str(p.root), "remote", "add", "origin", "git@example.com:org/code.git"], check=True)
     subprocess.run(["git", "-C", str(p.root), "remote", "add", "upstream",
@@ -127,12 +135,22 @@ def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys)
         cfg = {"id": "x", "failover": {"lease_remote": own, "allow_delivery_remote": True}}
         with pytest.raises(lease.Refused, match="plugin's own repository"):
             lease.resolve_remote(p, cfg)
-    for code in ("origin", "ssh://git@example.com/org/code", "example.com:org/code", "example.com:org/code.git"):
+    # A push to `web` goes to example.com over ssh (pushInsteadOf); `push:` and `ttp:` rewrite only pushes.
+    subprocess.run(["git", "-C", str(p.root), "remote", "add", "web", "https://example.com/org/web.git"], check=True)
+    for base, prefix in (("git@example.com:org/", "https://example.com/org/"), ("git@example.com:org/", "push:"),
+                         ("https://github.com/tenstorrent/", "ttp:")):
+        subprocess.run(["git", "-C", str(p.root), "config", "--add", f"url.{base}.pushInsteadOf", prefix], check=True)
+    for own in ("ttp:skills", "codehost:tenstorrent/skills"):
+        with pytest.raises(lease.Refused, match="plugin's own repository"):
+            lease.resolve_remote(p, {"failover": {"lease_remote": own, "allow_delivery_remote": True}})
+    for code in ("origin", "ssh://git@example.com/org/code", "example.com:org/code", "example.com:org/code.git",
+                 "codehost:org/code", "git@codehost:org/code.git", "ssh://codehost:22/org/code", "push:code",
+                 "git@example.com:org/web.git", "codehost:org/web", "web"):
         with pytest.raises(lease.Refused, match="delivery remote"):
             lease.resolve_remote(p, {"failover": {"lease_remote": code}})
         assert lease.resolve_remote(p, {"failover": {"lease_remote": code, "allow_delivery_remote": True}})
-    assert lease.resolve_remote(p, {"failover": {"lease_remote": "git@example.com:org/leases.git"}}) \
-        == "git@example.com:org/leases.git"
+    for other in ("git@example.com:org/leases.git", "elsewhere:org/code", "https://other.example/org/web"):
+        assert lease.resolve_remote(p, {"failover": {"lease_remote": other}}) == other
     cfg = json.loads(p.config_path.read_text())
     cfg["failover"] = {"lease_remote": "https://github.com/tenstorrent/skills"}
     p.config_path.write_text(json.dumps(cfg))
@@ -149,6 +167,35 @@ def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys)
     line = cli.status_text(p)
     assert "lease: refused (failover.lease_remote https://github.com/tenstorrent/skills is the" in line
     assert ": no dispatch" in line and "not checked yet" not in line
+
+
+def test_lease_ref_lock_race_on_the_server_is_a_lost_race(env, tmp_path, monkeypatch):
+    """receive-pack answering 'failed to update ref' or 'cannot lock ref' means another writer held or
+    moved the ref under its lock: cas returns False (a lost race), never Rejected, and the lease
+    raises no 'store rejected' error. A hook's own rejection stays Rejected."""
+    from ttp import lease
+    real, said = lease._git, {}
+
+    def fake(args, *a, **kw):
+        if "push" not in args:
+            return real(args, *a, **kw)
+        return subprocess.CompletedProcess(args, 1, f"To store\n!\tabc:refs/ttp/lease/demo\t{said['out']}\nDone\n",
+                                           "error: failed to push some refs to 'store'\n")
+    monkeypatch.setattr(lease, "_git", fake)
+    store = lease.GitStore(str(_lease_remote(tmp_path)), "demo", tmp_path / "probe.git")
+    for out in ("[remote rejected] (failed to update ref)",
+                "[remote rejected] (cannot lock ref 'refs/ttp/lease/demo': is at 1111 but expected 2222)",
+                "[remote rejected] (cannot lock ref 'refs/ttp/lease/demo': Unable to create '/s/refs/ttp/lease/"
+                "demo.lock': File exists.)"):
+        said["out"] = out
+        assert store.cas("", {"epoch": 1, "holder_host": "h"}) is False, out
+    t = [0.0]
+    a = lease.Lease(store, "demo", host="host-a", base="/projects/demo", ttl=100.0, clock=lambda: t[0],
+                    state_file=tmp_path / "a.json")
+    assert a.step() != "rejected" and not a.held() and a.error_kind != "rejected"
+    said["out"] = "[remote rejected] (pre-receive hook declined)"
+    with pytest.raises(lease.Rejected, match="pre-receive hook declined"):
+        store.cas("", {"epoch": 1, "holder_host": "h"})
 
 
 def test_lease_store_rejecting_the_lease_ref_is_an_error_not_a_lost_race(env, tmp_path, monkeypatch):

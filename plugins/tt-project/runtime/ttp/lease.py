@@ -97,6 +97,60 @@ def git_url(url: str, cwd: Path | str | None) -> str:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else url
 
 
+def push_url(url: str, cwd: Path | str | None) -> str:
+    """`url` after git's url.<base>.pushInsteadOf rewriting (longest base wins), which a push uses
+    before insteadOf; `url` itself when none matches."""
+    try:
+        r = _git(["config", "--get-regexp", r"^url\..*\.pushinsteadof$"], cwd, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return url
+    best = ("", "")
+    for line in r.stdout.splitlines() if r.returncode == 0 else []:
+        key, _, prefix = line.partition(" ")
+        base = key[len("url."):-len(".pushinsteadof")]
+        if prefix and url.startswith(prefix) and len(prefix) > len(best[0]):
+            best = (prefix, base)
+    return best[1] + url[len(best[0]):] if best[0] else url
+
+
+def ssh_hostname(host: str) -> str:
+    """The host an ssh alias stands for, as `ssh -G` reports it (no connection); `host` if unknown."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+        return host
+    try:
+        r = subprocess.run(["ssh", "-G", host], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return host
+    m = re.search(r"^hostname\s+(\S+)\s*$", r.stdout, re.M | re.I) if r.returncode == 0 else None
+    return m.group(1).lower() if m else host
+
+
+def canon_url(url: str) -> str:
+    """norm_url, with the host of an ssh URL (scp form or ssh://) replaced by the one its ssh alias
+    stands for, so `alias:org/repo` and `git@real.host:org/repo` compare equal."""
+    n, u = norm_url(url), url.strip()
+    ssh = re.match(r"^(?:git\+ssh|ssh\+git|ssh)://", u, re.I) or (
+        "://" not in u and not u.startswith(("/", ".", "~")) and re.match(r"^(?:[^/:@]+@)?[^/:@]+:", u))
+    host = n.split("/", 1)[0]
+    if not ssh or not host:
+        return n
+    real = ssh_hostname(host)
+    return real + n[len(host):] if real != host else n
+
+
+def url_forms(url: str, cwd: Path | str | None, name: str | None = None) -> set[str]:
+    """Every host/path a fetch or push of `url` (or the remote `name`) may reach: as written, after
+    insteadOf and after pushInsteadOf (and the remote's own push URLs), each with ssh aliases resolved."""
+    urls = {url, git_url(name or url, cwd), push_url(url, cwd)}
+    if name:
+        try:
+            r = _git(["remote", "get-url", "--push", "--all", name], cwd, timeout=10)
+            urls |= set(r.stdout.split()) if r.returncode == 0 else set()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return {canon_url(u) for u in urls}
+
+
 def _owner_repo(n: str) -> str:
     return "/".join(n.split("/")[-2:])
 
@@ -146,14 +200,14 @@ def resolve_remote(p, cfg: dict) -> str:
     remotes = delivery_remotes(p.root)
     url = remotes.get(raw, raw)
     cwd = p.root if Path(p.root).is_dir() else None
-    forms = {norm_url(url), norm_url(git_url(url, cwd))}     # as written and after insteadOf
+    forms = url_forms(url, cwd, raw if raw in remotes else None)
     own = {_owner_repo(o) for o in own_repos()}
     if any(_owner_repo(n) in own for n in forms):          # any host or alias: by its owner/repo path
         raise Refused(f"failover.lease_remote {raw} is the tt-project plugin's own repository: lease refs "
                       f"may not be pushed there; configure a separate remote")
     if not settings(cfg).get("allow_delivery_remote"):
         for name, other in remotes.items():
-            if {norm_url(other), norm_url(git_url(name, cwd))} & forms:
+            if url_forms(other, cwd, name) & forms:
                 raise Refused(f"failover.lease_remote {raw} is the project's delivery remote ({name}): refs "
                               f"under {REF_PREFIX} may break its branch rules; configure a separate remote, or "
                               f"set failover.allow_delivery_remote if its charter allows such refs")
@@ -221,6 +275,9 @@ class GitStore:
             return True
         out = r.stdout + r.stderr
         if re.search(r"^!.*\[rejected\] \((stale info|fetch first)\)", r.stdout, re.M):
+            return False
+        # Another writer held or moved the ref under receive-pack's lock: also a lost race.
+        if re.search(r"^!.*\[remote rejected\] \((failed to update ref|cannot lock ref)", r.stdout, re.M):
             return False
         if bang := re.search(r"^!\s.*?(\[.*)$", r.stdout, re.M):    # the remote's reason first: status cuts it
             said = "; ".join(ln[7:].strip() for ln in r.stderr.splitlines() if ln.startswith("remote:") and ln[7:].strip())
