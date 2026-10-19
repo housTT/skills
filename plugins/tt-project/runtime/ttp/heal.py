@@ -183,7 +183,7 @@ from typing import Any, Callable
 
 from . import outagemsg, pageto, schedrun, screen, timefmt
 from .db import DB
-from .project import command_env
+from .project import command_env, durable_write
 
 STATE_KEY = "heal:"             # kv per check: its state (see run)
 FIXED_KEY = "heal_fixed"        # kv: [{"at", "name"}] successful fixes, last 7 days
@@ -687,7 +687,7 @@ def start_fix(p: Any, name: str, spec: dict, cwd: str, env: dict, now: float) ->
     finally:
         lock.close()
     try:   # detach.state reads the boot from it, to tell a reboot from a crash
-        (d / "detached.json").write_text(json.dumps([{"rc": str(rc), "pid": pid, "boot": boot_id(), "start": now}]))
+        durable_write(d / "detached.json", json.dumps([{"rc": str(rc), "pid": pid, "boot": boot_id(), "start": now}]))
     except OSError:
         pass
     return {"rc": str(rc), "pid": pid, "started": now}, ""
