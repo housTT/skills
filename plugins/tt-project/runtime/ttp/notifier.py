@@ -76,10 +76,12 @@ def _host(entry: dict) -> str:
 
 
 def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s: float,
-                 max_gap_s: float = HOST_POLL_GAP_S) -> None:
+                 max_gap_s: float = HOST_POLL_GAP_S, started: float | None = None) -> None:
     """One notification once a host has failed every poll for `down_after_s`, one when it answers
     again, nothing in between. Kept in the notifier's state, so a restart neither forgets nor re-alarms.
-    A gap over `max_gap_s` since the last failed poll (a sleeping laptop) starts the streak anew."""
+    A gap over `max_gap_s` from the last failed poll's end to this poll's start (a sleeping laptop)
+    starts the streak anew; the poll's own time (slow ssh to many hosts) is no gap."""
+    started = now if started is None else started
     hosts = state.setdefault(HOSTS, {})
     if reached:   # an empty registry read must not drop an alarmed host (it would alarm twice)
         for host in [h for h in hosts if h not in reached]:   # no project on it any more
@@ -91,7 +93,7 @@ def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s
                 show(f"tt-project · {host}", f"{host} answers again; its projects can page again")
             hosts[host] = {"ok": now}
             continue
-        if not h.get("alarmed") and now - h.get("last_fail", now) > max_gap_s:
+        if not h.get("alarmed") and started - h.get("last_fail", started) > max_gap_s:
             h.pop("failing_since", None)
         since = h.setdefault("failing_since", now)
         h["last_fail"] = now
@@ -120,6 +122,7 @@ def show(title: str, body: str, url: str | None = None) -> None:
 
 def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, now: float | None = None,
              max_gap_s: float = HOST_POLL_GAP_S) -> dict:
+    started = time.time() if now is None else now
     reached: dict[str, bool] = {}
     for name, entry in sorted(load_registry().get("projects", {}).items()):
         after = int(state.get(name, -1))
@@ -146,7 +149,7 @@ def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, n
             if not r.get("cleared"):
                 show(f"tt-project · {name}", r["text"])
             state[name] = max(int(state.get(name, 0)), int(r["id"]))
-    _track_hosts(state, reached, time.time() if now is None else now, down_after_s, max_gap_s)
+    _track_hosts(state, reached, time.time() if now is None else now, down_after_s, max_gap_s, started)
     return state
 
 

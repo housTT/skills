@@ -2642,6 +2642,64 @@ def test_the_desktop_notifier_starts_a_host_down_streak_anew_after_a_gap_between
     assert shown[1:] == ["h answers again; its projects can page again"], shown
 
 
+def _slow_ssh_notifier(monkeypatch, n_projects=9, ssh_s=40):
+    """A notifier whose every remote poll takes `ssh_s` of a fake clock, with `n_projects` on one
+    down host: one run takes longer than HOST_POLL_GAP_S. Returns (clock, poll, shown)."""
+    from ttp import notifier, timefmt
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr(notifier.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(notifier, "load_registry", lambda: {"projects": {
+        f"p{i}": {"dir": f"/w/p{i}", "host": "host-a"} for i in range(n_projects)}})
+    up = {"host-a": True}
+
+    def remote(entry, name, after, floor):
+        clock["t"] += ssh_s
+        return ([], True) if up["host-a"] else (None, False)
+    monkeypatch.setattr(notifier, "_remote_alerts", remote)
+    monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    state = {}
+
+    def poll(sleep_s=60):   # one run, then the notifier's sleep
+        nonlocal state
+        state = notifier.run_once(json.loads(json.dumps(state)), "high", 1200)
+        clock["t"] += sleep_s
+        return state
+    poll()
+    up["host-a"] = False
+    return clock, poll, shown
+
+
+def test_the_desktop_notifier_alarms_a_down_host_when_slow_ssh_makes_each_poll_outlast_the_gap(monkeypatch):
+    from ttp import notifier
+    clock, poll, shown = _slow_ssh_notifier(monkeypatch)
+    first = clock["t"]
+    while clock["t"] - first < 1200 + 2 * 420:
+        poll()
+    run_s = 9 * 40 + 60
+    assert run_s > notifier.HOST_POLL_GAP_S, "the case must have runs land further apart than the gap"
+    assert len(shown) == 1 and shown[0].startswith("host-a unreachable since"), shown
+    for _ in range(5):
+        poll()
+    assert len(shown) == 1, shown
+
+
+def test_the_desktop_notifier_still_restarts_a_down_streak_after_a_sleep_with_slow_ssh(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    clock, poll, shown = _slow_ssh_notifier(monkeypatch)
+    poll(sleep_s=6 * 3600)   # one failed run, then the laptop sleeps for hours
+    since = clock["t"] + 9 * 40   # the end of the first run after the sleep starts the new streak
+    for _ in range(3):
+        poll()
+    assert shown == [], "the streak counted the sleep"
+    while not shown and clock["t"] < since + 3 * 3600:
+        poll()
+    expect = datetime.fromtimestamp(since, ZoneInfo("Europe/Berlin")).strftime("%H:%M %Z")
+    assert shown == [f"host-a unreachable since {expect}; its projects cannot page"], shown
+
+
 def test_the_desktop_notifier_counts_only_an_ssh_connect_failure_as_a_host_down(monkeypatch):
     from types import SimpleNamespace
     from ttp import notifier
