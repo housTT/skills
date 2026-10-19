@@ -5,7 +5,9 @@ A failure is shared when every failing pytest id (the failing command's `FAILED`
 lines, complete against pytest's summary counts) also failed in the checks of at least
 `checks.shared_min_tasks` other changes (lineages: one change's code, review, review-fix and
 `continue:` tasks are one, and its own never count) on other heads within
-`checks.shared_window_h`, or the push queue's known-bad tip lists it. Any other runner, an incomplete list or one id not shared wakes the task as before.
+`checks.shared_window_h` the same way (failure_sigs: the same assertion text, numbers aside), or the
+push queue's known-bad tip lists it. A whole-tree guard test that each change fails on its own new
+code (a lint over the source naming the offending line) is so not shared. Any other runner, an incomplete list or one id not shared wakes the task as before.
 A held task's checks run again on its same head, model-free, once the push-branch tip moves past a
 commit touching a failing test's file, or after `checks.shared_backoff_h`; after RERUNS_MAX reruns
 it wakes. One incident per shared failure carries one fix task, one low feed line, the tasks held
@@ -18,6 +20,7 @@ clock or event in place of wall-time assertions, and REPEAT_RUNS passing runs of
 under parallel load before done."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -27,7 +30,7 @@ from .db import TERMINAL_TASK_STATES, DB, review_subject
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks_failures (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task INTEGER NOT NULL, head TEXT NOT NULL, ts REAL NOT NULL,
-  ids TEXT NOT NULL, root INTEGER);
+  ids TEXT NOT NULL, root INTEGER, sigs TEXT);
 CREATE INDEX IF NOT EXISTS checks_failures_ts ON checks_failures(ts);
 CREATE TABLE IF NOT EXISTS checks_incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ids TEXT NOT NULL, opened REAL NOT NULL, last REAL,
@@ -73,12 +76,46 @@ def failing_ids(output: str) -> tuple[list[str], bool]:
     return ids, n == len(lines)
 
 
+_HEADER = re.compile(r"^_{3,} (?:ERROR at (?:setup|teardown) of )?(\S.*?) _{3,}$", re.M)
+_BLOCK_END = re.compile(r"^(?:_{3,} \S.*? _{3,}|={3,}.*)$", re.M)
+_SUMMARY_MSG = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?) - (.*)$", re.M)
+
+
+def _norm(text: str) -> str:
+    text = re.sub(r"\btmp[\w-]+", "tmp", text)
+    return re.sub(r"\s+", " ", re.sub(r"\d+", "N", text)).strip()
+
+
+def failure_sigs(output: str, ids: list[str]) -> dict[str, str]:
+    """Each failing id's failure signature: a hash of its traceback's `E` lines (pytest's FAILURES
+    section), else of its summary line's message, with numbers and temp names left out, so a flaky
+    timing assertion matches itself while a guard naming another change's file and line does not.
+    '' when the output shows neither (cut)."""
+    out, blocks = output or "", {}
+    for m in _HEADER.finditer(out):
+        end = _BLOCK_END.search(out, m.end())
+        blocks.setdefault(m.group(1), []).append(out[m.end():end.start() if end else len(out)])
+    msgs = {m.group(1): m.group(2) for m in _SUMMARY_MSG.finditer(out)}
+    sigs = {}
+    for i in ids:
+        path, _, name = i.partition("::")
+        found = blocks.get(name.replace("::", "."), [])
+        if len(found) > 1:
+            found = [b for b in found if path in b] or found
+        text = "\n".join(ln[1:] for ln in found[0].splitlines() if ln.startswith("E ")) if found else ""
+        text = _norm(text or msgs.get(i, ""))
+        sigs[i] = hashlib.sha256(text.encode()).hexdigest()[:16] if text else ""
+    return sigs
+
+
 def ensure(db: DB) -> None:
     for stmt in SCHEMA.split(";"):
         if stmt.strip():
             db.x(stmt)
     if "root" not in {r["name"] for r in db.q("PRAGMA table_info(checks_failures)")}:
         db.x("ALTER TABLE checks_failures ADD COLUMN root INTEGER")
+    if "sigs" not in {r["name"] for r in db.q("PRAGMA table_info(checks_failures)")}:
+        db.x("ALTER TABLE checks_failures ADD COLUMN sigs TEXT")
 
 
 def root(db: DB, task: int) -> int:
@@ -109,32 +146,35 @@ def root(db: DB, task: int) -> int:
     return cur
 
 
-def record(db: DB, task: int, head: str, ids: list[str], now: float) -> None:
-    """One task's failing ids on one head (each head once), with its lineage's root."""
+def record(db: DB, task: int, head: str, ids: list[str], now: float, sigs: dict[str, str] | None = None) -> None:
+    """One task's failing ids on one head (each head once), with its lineage's root and the ids'
+    failure_sigs."""
     ensure(db)
     db.x("DELETE FROM checks_failures WHERE ts<?", (now - KEEP_S,))
     if not db.one("SELECT id FROM checks_failures WHERE task=? AND head=? AND ids=?", (task, head, json.dumps(ids))):
-        db.x("INSERT INTO checks_failures(task,head,ts,ids,root) VALUES(?,?,?,?,?)",
-             (task, head, now, json.dumps(ids), root(db, task)))
+        db.x("INSERT INTO checks_failures(task,head,ts,ids,root,sigs) VALUES(?,?,?,?,?,?)",
+             (task, head, now, json.dumps(ids), root(db, task), json.dumps(sigs) if sigs is not None else None))
 
 
 def shared(db: DB, task: int, head: str, ids: list[str], now: float, cfg: dict,
-           tip_ids: list[str] | None = None) -> bool:
+           tip_ids: list[str] | None = None, sigs: dict[str, str] | None = None) -> bool:
     """Every id failed in `min_tasks` other lineages (other changes), on other heads within the
-    window, or on the tip."""
+    window, or on the tip. With `sigs` (failure_sigs) another lineage counts for an id only when it
+    failed it the same way; a row recorded without them counts for none."""
     if not ids:
         return False
     s = settings(cfg)
     ensure(db)
     seen: dict[str, set[int]] = {}   # id -> the other lineages (roots) it failed in
-    for r in db.q("SELECT COALESCE(root, task) AS lineage, ids FROM checks_failures WHERE ts>=? AND task!=? AND head!=? "
-                  "AND COALESCE(root, task)!=?", (now - s["window_s"], task, head, root(db, task))):
+    for r in db.q("SELECT COALESCE(root, task) AS lineage, ids, sigs FROM checks_failures WHERE ts>=? AND task!=? "
+                  "AND head!=? AND COALESCE(root, task)!=?", (now - s["window_s"], task, head, root(db, task))):
         try:
-            got = json.loads(r["ids"])
+            got, theirs = json.loads(r["ids"]), json.loads(r["sigs"] or "null")
         except ValueError:
             continue
         for i in got if isinstance(got, list) else []:
-            seen.setdefault(i, set()).add(r["lineage"])
+            if sigs is None or (isinstance(theirs, dict) and theirs.get(i) == sigs.get(i, "")):
+                seen.setdefault(i, set()).add(r["lineage"])
     on_tip = set(tip_ids or [])
     return all(i in on_tip or len(seen.get(i, ())) >= s["min_tasks"] for i in ids)
 

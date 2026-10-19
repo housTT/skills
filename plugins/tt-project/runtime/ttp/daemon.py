@@ -7599,10 +7599,11 @@ class Daemon:
             log(self.p, f"task {tid}: shared checks failure, " + ("the push-branch tip changed its failing tests"
                         if moved else "backoff over") + f"; its checks run again on {head[:12]}, no model run")
             return True
-        sharedchecks.record(db, tid, head, ids, now)
+        sigs = sharedchecks.failure_sigs(out, ids)
+        sharedchecks.record(db, tid, head, ids, now, sigs)
         if int(hold.get("reruns") or 0) >= sharedchecks.RERUNS_MAX:
             return False
-        if not sharedchecks.shared(db, tid, head, ids, now, self.cfg, pushq.bad_tip_ids(db)):
+        if not sharedchecks.shared(db, tid, head, ids, now, self.cfg, pushq.bad_tip_ids(db), sigs):
             return False
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
         with db.tx():

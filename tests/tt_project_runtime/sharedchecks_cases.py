@@ -30,10 +30,11 @@ def _shared_fail_task(p, tmp_path, output, started=1000.0):
 _IDS = ["tests/test_a.py::test_one", "tests/test_b.py::test_two[x - y]"]
 
 
-def _seed_other_failures(p, ids, n=2):
+def _seed_other_failures(p, ids, n=2, output=None):
     from ttp import sharedchecks
+    sigs = sharedchecks.failure_sigs(_pytest_out(ids) if output is None else output, ids)
     for k in range(n):
-        sharedchecks.record(p.db, 9000 + k, f"{k:040x}", ids, time.time() - 600)
+        sharedchecks.record(p.db, 9000 + k, f"{k:040x}", ids, time.time() - 600, sigs)
 
 
 def _shared_daemon(p, monkeypatch):
@@ -161,6 +162,66 @@ def test_a_checks_failure_not_fully_shared_wakes_the_task_as_before(env, monkeyp
     assert res.get("escalated_wake") and "its checks failed" in res["woke"] and "shared_hold" not in res
     assert _ready(p, tid)
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix shared check failure%'")
+
+
+_GUARD = "tests/test_r.py::test_every_write_is_durable"
+
+
+def _guard_out(*loose):
+    """A whole-tree guard test's failure as `ttp checks` keeps it: its traceback names the
+    change's own offending lines."""
+    lines = ["...F.", "=" * 20 + " FAILURES " + "=" * 20, "_" * 10 + " test_every_write_is_durable " + "_" * 10, "",
+             "    def test_every_write_is_durable():", ">       assert not loose, 'write these durably'",
+             "E       AssertionError: write these durably"]
+    lines += [f"E         {x}" for x in loose]
+    lines += [f"E       assert not {list(loose)!r}", "", "tests/test_r.py:25007: AssertionError",
+              "=" * 20 + " short test summary info " + "=" * 20, f"FAILED {_GUARD}",
+              "1 failed, 3924 passed, 6 skipped in 400.39s (0:06:40)"]
+    return "\n".join(lines) + "\n"
+
+
+def test_a_guard_test_each_change_fails_on_its_own_code_is_not_shared(env, monkeypatch, tmp_path):
+    # Two other changes failed the same source-wide guard, each on its own new write: the id
+    # matches, the failure does not, so the task wakes to fix its own code and no fix task opens.
+    from ttp import sharedchecks
+    p = make(env)
+    d, _ = _shared_daemon(p, monkeypatch)
+    now = time.time()
+    for k, line in enumerate(['lease.py:88: open(dst, "wb")', 'replica.py:301: open(out, "wb")']):
+        sharedchecks.record(p.db, 9000 + k, f"{k:040x}", [_GUARD], now - 600,
+                            sharedchecks.failure_sigs(_guard_out(line), [_GUARD]))
+    tid, _ = _shared_fail_task(p, tmp_path, _guard_out('heal.py:690: (d / "detached.json").write_text(x)'))
+    d._probe_passed(p.db.task(tid), now)
+    res = json.loads(p.db.task(tid)["result"])
+    assert "shared_hold" not in res and res.get("escalated_wake") and _ready(p, tid)
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix shared check failure%'")
+
+
+def test_the_same_failure_on_other_heads_is_shared_whatever_its_numbers(env, monkeypatch, tmp_path):
+    from ttp import sharedchecks
+    p = make(env)
+    d, _ = _shared_daemon(p, monkeypatch)
+    _seed_other_failures(p, [_GUARD], output=_guard_out("heal.py:690: x.write_text(y)"))
+    tid, _ = _shared_fail_task(p, tmp_path, _guard_out("heal.py:702: x.write_text(y)"))
+    d._probe_passed(p.db.task(tid), time.time())
+    assert "shared_hold" in json.loads(p.db.task(tid)["result"])
+    # A row recorded before signatures (none stored) counts for no signed failure.
+    sharedchecks.record(p.db, 9100, "e" * 40, ["tests/test_q.py::test_x"], time.time() - 600)
+    assert not sharedchecks.shared(p.db, tid, "d" * 40, ["tests/test_q.py::test_x"], time.time(), {"checks": {
+        "shared_min_tasks": 1}}, sigs={"tests/test_q.py::test_x": ""})
+
+
+def test_failure_sigs_read_real_pytest_tracebacks(tmp_path):
+    from ttp import sharedchecks
+    (tmp_path / "test_g.py").write_text("import os\nclass TestK:\n    def test_bad(self):\n"
+                                        "        assert os.environ.get('W', 'a.py:1') == '', 'loose'\n")
+    def run(w):
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_g.py"],
+                              cwd=tmp_path, capture_output=True, text=True, timeout=120,
+                              env={**{k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}, "W": w}).stdout
+    i = ["test_g.py::TestK::test_bad"]
+    a, b, c = (sharedchecks.failure_sigs(run(w), i)[i[0]] for w in ("a.py:12", "a.py:345", "b.py:12"))
+    assert a and a == b != c
 
 
 def test_a_held_task_reruns_its_checks_once_the_tip_moves_past_its_tests_or_the_backoff(env, monkeypatch, tmp_path):
