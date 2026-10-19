@@ -25058,6 +25058,9 @@ DURABLE_EXEMPT = {
     ("db.py", 'with log.open("a") as fh'): "logs/slow-tx.log, a diagnostic report line",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
     ("svcscan.py", "path.write_text(body)"): "a worker's throwaway shim scripts, re-written by each `ttp svcscan --shim`",
+    ("replica.py", "with open(dst,'wb') as f:"): "the standby receiver, a command string run there: it syncs each file, its folders and the parent itself before renaming <seq>.partial into place",
+    ("replica.py", 'open(out, "wb") as g'): "the gzipped database copy in state/replica-stage, a scratch folder removed after each snapshot and never read after a crash",
+    ("replica.py", 'open(state / "project.db", "wb")'): "restore writes into a new, empty project folder; one cut off leaves the folder non-empty, which a rerun refuses, saying to remove it",
 }
 
 

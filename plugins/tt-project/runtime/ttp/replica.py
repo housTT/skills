@@ -9,8 +9,9 @@ A snapshot holds:
 - project.db.gz: the database through the sqlite3 backup API on its own connection (consistent with
   writers active, WAL included), secrets dropped from kv, `PRAGMA integrity_check` passed, gzipped;
 - harness.bundle: the harness repo (charter, memory, project.json) as a git bundle: a full one at
-  least daily, otherwise only what is new since the previous snapshot (`chain_from` names the full
-  one it builds on; retention never breaks a kept snapshot's chain);
+  least daily, otherwise what is new since that full one (`chain_from` names it, so a snapshot needs
+  only itself and its full one; retention keeps the newest `snapshot_keep` and the full ones they
+  name);
 - branches.bundle: open tasks' branches, refs/ttp/push/* and branches still queued for
   delivery.backup_remote, without what any remote already has;
 - runs/<task>/: result.json, prompt.md and run.json of the latest run of each open task;
@@ -109,6 +110,7 @@ def _save_state(p: project.Project, st: dict) -> None:
 # `verify <base> <identity>`: checks every snapshot there. `receive <base> <identity> <seq> <keep>
 # <chain_from>`: reads a tar stream into <seq>.partial, checks it against its manifest (the last
 # member, so a cut stream never passes), syncs it, renames it into place and applies retention.
+# It writes each received file itself and syncs it, its folders and the parent before the rename.
 RECEIVER = r'''
 import fcntl,hashlib,json,os,shutil,sys,tarfile
 mode,base,ident=sys.argv[1],os.path.expanduser(sys.argv[2]),sys.argv[3]
@@ -154,8 +156,8 @@ if mode=='verify':
     for s in seqs():
         why=check(at(s),s)
         if not why:
-            c=chain_from(s);miss=[x for x in range(c,s) if x not in ok]
-            if miss: why='its chain from #%s lacks #%s'%(c,miss[0])
+            c=chain_from(s)
+            if c!=s and c not in ok: why='its chain lacks #%s, the full snapshot it builds on'%c
         if not why: ok.add(s)
         out.append({'seq':s,'ok':not why,'why':why})
     done({'dir':d,'snapshots':out})
@@ -165,8 +167,7 @@ for n in os.listdir(d):
     if n.endswith(('.partial','.del')): shutil.rmtree(os.path.join(d,n),ignore_errors=True)
 have=seqs()
 if have and seq<=have[-1]: done({'error':'snapshot #%s or a newer one is already there'%have[-1],'next':have[-1]+1},3)
-miss=[x for x in range(cf,seq) if x not in have]
-if miss: done({'error':'its chain lacks #%s there'%miss[0],'need_full':True},4)
+if cf!=seq and cf not in have: done({'error':'its chain lacks #%s there'%cf,'need_full':True},4)
 part=at(seq)+'.partial'
 os.mkdir(part,0o700)
 try:
@@ -185,11 +186,11 @@ for r,ds,_ in os.walk(part,topdown=False):
     for n in ds: fsync(os.path.join(r,n),True)
 fsync(part,True)
 os.rename(part,at(seq));fsync(d,True)
-have=seqs();floor=min(chain_from(s) for s in have[-keep:])
-gone=[s for s in have if s<floor]
+have=seqs();kept=set(have[-keep:]);kept|={chain_from(s) for s in kept}
+gone=[s for s in have if s not in kept]
 for s in gone: os.rename(at(s),at(s)+'.del');shutil.rmtree(at(s)+'.del',ignore_errors=True)
 if gone: fsync(d,True)
-done({'seq':seq,'kept':[s for s in have if s>=floor],'removed':gone})
+done({'seq':seq,'kept':sorted(s for s in have if s in kept),'removed':gone})
 '''
 
 
@@ -262,6 +263,7 @@ def _db_copy(src: Path, out: Path) -> dict:
         s.close()
     try:
         d.execute("PRAGMA journal_mode=DELETE")
+        d.execute("PRAGMA secure_delete=ON")   # deleted secrets are zeroed, whatever sqlite's build default
         if d.execute("SELECT 1 FROM sqlite_master WHERE name='kv'").fetchone():
             d.execute("DELETE FROM kv WHERE " + " OR ".join(["lower(key) LIKE ?"] * len(DENY_KV)), DENY_KV)
             d.commit()
@@ -359,7 +361,8 @@ def build(p: project.Project, cfg: dict, stage: Path, st: dict, seq: int, now: f
     full = bool(st.get("need_full")) or not last or now - float(last.get("full_at") or 0) >= FULL_EVERY_S
     if not full and fp == last.get("fingerprint"):
         return None
-    base = [] if full else sorted({v for v in (last.get("harness_refs") or {}).values()
+    # differential against the last full snapshot, so a snapshot needs only itself and that one
+    base = [] if full else sorted({v for v in (last.get("full_refs") or {}).values()
                                    if _git(p.harness, "cat-file", "-e", f"{v}^{{commit}}", check=False).returncode == 0})
     if not full and not base:
         full = True
@@ -427,6 +430,8 @@ def snapshot(p: project.Project, cfg: dict | None = None, now: float | None = No
             man = build(p, cfg, stage, st, seq, now)
             if man is None:
                 res["outcome"] = "unchanged"
+                if st.get("last"):
+                    st["last"]["current_at"] = now   # the standby still holds the current state
             else:
                 size = sum(v["size"] for v in man["files"].values())
                 ans = ship(cfg, s, ident, stage, man)
@@ -442,6 +447,8 @@ def snapshot(p: project.Project, cfg: dict | None = None, now: float | None = No
                                   "secs": round(time.monotonic() - t0, 1), "fingerprint": man["fingerprint"],
                                   "harness_refs": man["harness"]["refs"], "chain_from": man["chain_from"],
                                   "full_at": now if man["harness"]["full"] else prev.get("full_at", now),
+                                  "full_refs": man["harness"]["refs"] if man["harness"]["full"] else prev.get("full_refs"),
+                                  "current_at": now,
                                   "kept": ans.get("kept")}
                     st["seq"], st["need_full"] = seq, False
                     res.update(outcome="ok", size=size, kept=ans.get("kept"), full=man["harness"]["full"])
@@ -474,16 +481,23 @@ def _ago(s: float) -> str:
     return f"{s} s" if s < 90 else f"{s // 60} min" if s < 5400 else f"{s / 3600:.1f} h"
 
 
+def _current_at(st: dict) -> float:
+    """When the standby was last known to hold the current state: a shipped snapshot, or a check that
+    found nothing new since it; else when failover.standby was set."""
+    last = st.get("last") or {}
+    return float(last.get("current_at") or last.get("at") or st.get("since") or 0)
+
+
 def stale_text(p: project.Project, cfg: dict, now: float) -> str:
     """What a stale snapshot looks like to the user ('' while fresh or off)."""
     s = settings(cfg)
     if not s:
         return ""
     st = load_state(p)
-    ref = float((st.get("last") or {}).get("at") or st.get("since") or 0)
+    ref = _current_at(st)
     if not ref or now - ref < s["stale_s"]:
         return ""
-    what = f"the newest snapshot is {_ago(now - ref)} old" if st.get("last") else \
+    what = f"the standby was last known to hold the current state {_ago(now - ref)} ago" if st.get("last") else \
         f"no snapshot has been shipped in the {_ago(now - ref)} since failover.standby was set"
     why = f"; last attempt: {st.get('error')}" if st.get("outcome") == "failed" and st.get("error") else ""
     return (f"standby {s['dest']}: {what} (limit {_ago(s['stale_s'])}){why}. A stand-in would start from "
@@ -499,8 +513,10 @@ def status_line(p: project.Project, cfg: dict, now: float) -> str:
     if last:
         line = (f"standby {s['dest']}: snapshot #{last['seq']} {_ago(now - float(last['at']))} old "
                 f"({float(last.get('size') or 0) / 1e6:.1f} MB)")
-        if now - float(last["at"]) >= s["stale_s"]:
+        if now - _current_at(st) >= s["stale_s"]:
             line += ", STALE"
+        elif _current_at(st) - float(last["at"]) >= 90:
+            line += f", nothing new since (checked {_ago(now - _current_at(st))} ago)"
     else:
         line = f"standby {s['dest']}: no snapshot yet"
     if st.get("outcome") == "failed":
@@ -545,7 +561,8 @@ def restore(src: str | Path, into: str | Path, seq: int | None = None) -> dict:
     man = json.loads((snap / "manifest.json").read_text())
     base = Path(into).expanduser() / project.FOLDER
     if base.exists() and any(base.iterdir()):
-        raise SnapshotError(f"{base} exists and is not empty")
+        raise SnapshotError(f"{base} exists and is not empty (a restore that was cut off leaves it so: "
+                            "remove it and run the restore again)")
     state, harness = base / "state", base / "harness"
     state.mkdir(parents=True, exist_ok=True)
     with gzip.open(snap / "project.db.gz", "rb") as z, open(state / "project.db", "wb") as f:
@@ -562,7 +579,7 @@ def restore(src: str | Path, into: str | Path, seq: int | None = None) -> dict:
     h = man["harness"]
     harness.mkdir()
     _git(harness, "init", "-q")
-    for k in range(int(man["chain_from"]), seq + 1):
+    for k in sorted({int(man["chain_from"]), seq}):
         b = src / f"{k:06d}" / "harness.bundle"
         if b.is_file():
             _git(harness, "fetch", "-q", "--update-head-ok", str(b), "+refs/heads/*:refs/heads/*")

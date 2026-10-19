@@ -1142,6 +1142,38 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   login method or credentials store is kept, since runs need it.
   Codex has no per-run MCP list, so isolated Codex workers get no MCP servers of yours.
 
+## Standby snapshots
+
+Off by default: with `failover.standby` unset, nothing is written or shipped and `ttp status` shows
+no standby line. Set it to keep a copy of the project's state on another machine:
+
+- `failover.standby`: an ssh machine alias (snapshots go to `~/.tt-project/standby/<identity>/`
+  there) or an absolute directory, such as a mounted share. `<identity>` is `failover.fleet` when
+  set, else the project's id.
+- `failover.snapshot_every_s` (900, at least 60): how often the daemon takes one; it also takes
+  one soon after a task finishes. A check that finds nothing changed ships nothing.
+- `failover.snapshot_keep` (3): how many of the newest snapshots stay.
+
+A snapshot holds a consistent copy of the database (secrets in its key-value table removed and
+zeroed), the harness repo as a git bundle, open tasks' branches, the latest run's result, prompt and
+run record of each open task, and this project's open machine-ledger changes and pauses. Run
+folders, logs, worktrees, `web.token` and credentials stay behind.
+
+Each one arrives in a temporary folder, is checked file by file against its manifest's checksums,
+synced, then renamed into place, so a reader never sees a half-written snapshot. The harness bundle
+is full at least daily; the others carry only what is new since that full one, so retention keeps
+the newest `snapshot_keep` plus the full one they build on.
+
+`ttp status` shows the newest snapshot's age. When the standby has not been known to hold the
+current state for `max(1 h, 3 x snapshot_every_s)`, the line says STALE and the daemon raises one
+`replica-stale` observation, closed by the next snapshot or check that finds the standby current.
+
+`ttp replicate [--now | --verify | --restore DIR --into PATH [--seq N]]`: without a flag, the
+status; `--now` takes and ships one; `--verify` checks every snapshot at the standby (checksums and
+chains); `--restore`, run on the standby, makes `PATH/tt-project` from the newest complete snapshot
+in `DIR` (or snapshot N). A restore refuses a non-empty target: if one is cut off, remove its folder
+and run it again.
+
 ## Where things live
 
 | Path | Holds |

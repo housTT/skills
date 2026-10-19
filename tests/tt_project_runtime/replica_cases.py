@@ -104,23 +104,79 @@ def test_replica_skips_an_unchanged_state_and_chains_harness_bundles(env, tmp_pa
 
 def test_replica_retention_keeps_the_newest_and_their_chains(env, tmp_path):
     p, replica, ident_dir = _replica_project(env, tmp_path, keep=2)
-    for i in range(4):
+
+    def have():
+        return sorted(int(x.name) for x in ident_dir.iterdir() if x.name.isdigit())
+
+    for i in range(6):
         _replica_harness_commit(p, f"f{i}.md", str(i))
-        assert replica.snapshot(p)["outcome"] == "ok"
-    have = sorted(int(x.name) for x in ident_dir.iterdir() if x.name.isdigit())
-    assert have == [1, 2, 3, 4], "the newest two chain back to the full #1, so it all stays"
+        r = replica.snapshot(p)
+        assert r["outcome"] == "ok" and (r["full"] or i > 0), r
+        assert len(have()) <= 2 + 1, f"the newest two and the full one they build on, not {have()}"
+    assert have() == [1, 5, 6], "each snapshot builds on the full #1 only, so the ones between go"
+    m = json.loads((ident_dir / "000006" / "manifest.json").read_text())
+    assert m["chain_from"] == 1 and not m["harness"]["full"]
+    head = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    out = replica.restore(ident_dir, tmp_path / "standin")
+    assert out["seq"] == 6 and out["harness_head"] == head
+    assert all((pathlib.Path(out["project_dir"]) / "harness" / f"f{i}.md").read_text() == str(i) for i in range(6))
     st = replica.load_state(p)
     st["need_full"] = True
     replica._save_state(p, st)
     _replica_harness_commit(p, "g.md", "g")
     r = replica.snapshot(p)
-    assert r["outcome"] == "ok" and r["full"] and r["kept"] == [1, 2, 3, 4, 5]   # #4 still needs #1..#3
+    assert r["outcome"] == "ok" and r["full"] and r["kept"] == [1, 6, 7]   # #6 still needs #1
     _replica_harness_commit(p, "h.md", "h")
     r = replica.snapshot(p)
-    assert r["kept"] == [5, 6]
-    assert sorted(x.name for x in ident_dir.iterdir() if not x.name.startswith(".")) == ["000005", "000006"]
+    assert r["kept"] == [7, 8]
+    assert sorted(x.name for x in ident_dir.iterdir() if not x.name.startswith(".")) == ["000007", "000008"]
     v = replica.verify(p.config(), replica.identity(p, p.config()))
-    assert [(x["seq"], x["ok"]) for x in v["snapshots"]] == [(5, True), (6, True)]
+    assert [(x["seq"], x["ok"]) for x in v["snapshots"]] == [(7, True), (8, True)]
+
+
+def test_replica_scrubs_kv_secrets_whatever_sqlites_secure_delete_default(env, tmp_path, monkeypatch):
+    import types
+    p, replica, ident_dir = _replica_project(env, tmp_path)
+    token = "tok-" + "s3cr3t" * 40
+    p.db.set_kv("slack_bot_token", token)
+
+    class Insecure(sqlite3.Connection):   # a build whose default leaves deleted bytes in free pages
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.execute("PRAGMA secure_delete=OFF")
+
+    monkeypatch.setattr(replica, "sqlite3", types.SimpleNamespace(
+        connect=lambda *a, **k: sqlite3.connect(*a, factory=Insecure, **k)))
+    assert replica.snapshot(p)["outcome"] == "ok"
+    raw = gzip.decompress((ident_dir / "000001" / "project.db.gz").read_bytes())
+    assert b"s3cr3ts3cr3t" not in raw
+
+
+def test_replica_an_idle_project_with_a_current_standby_is_not_stale(env, tmp_path, monkeypatch):
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    p, replica, ident_dir = _replica_project(env, tmp_path)
+    t0 = time.time()
+    assert replica.snapshot(p, now=t0)["outcome"] == "ok"
+    s = replica.settings(p.config())
+    later = t0 + s["stale_s"] + 600
+    assert replica.stale_text(p, p.config(), later), "with no check since, it is stale"
+    assert replica.snapshot(p, now=later)["outcome"] == "unchanged"
+    assert replica.stale_text(p, p.config(), later + 60) == ""
+    line = replica.status_line(p, p.config(), later + 60)
+    assert "snapshot #1" in line and "STALE" not in line and "nothing new since" in line
+    assert f"#1 {replica._ago(later + 60 - t0)} old" in line, "status still shows the snapshot's own age"
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    seen = []
+    monkeypatch.setattr(d, "observe", lambda *a, **k: seen.append((a, k)))
+    monkeypatch.setattr(replica, "snapshot", lambda *a, **k: {"outcome": "unchanged"})
+    monkeypatch.setattr(time, "time", lambda: later + 60)
+    d.replicate_state()
+    if d._replica_job:
+        d._replica_job.join(10)
+    assert not seen, "no replica-stale observation while the standby holds the current state"
+    assert "STALE" not in status_text(p)
 
 
 def test_replica_a_crash_mid_write_never_leaves_a_visible_snapshot(env, tmp_path):
@@ -211,7 +267,7 @@ def test_replica_status_line_and_one_stale_observation(env, tmp_path, monkeypatc
     assert replica.snapshot(p)["outcome"] == "ok"
     assert "snapshot #1" in status_text(p) and "STALE" not in status_text(p)
     st = replica.load_state(p)
-    st["last"]["at"] = st["at"] = time.time() - 3 * 3600
+    st["last"]["at"] = st["last"]["current_at"] = st["at"] = time.time() - 3 * 3600
     replica._save_state(p, st)
     assert "STALE" in status_text(p)
     d = Daemon(p.base)
@@ -229,7 +285,7 @@ def test_replica_status_line_and_one_stale_observation(env, tmp_path, monkeypatc
     closed = []
     monkeypatch.setattr(scr, "close_watcher_issues", lambda db, source, **k: closed.append(source) or 0)
     st = replica.load_state(p)
-    st["last"]["at"] = st["at"] = time.time()
+    st["last"]["at"] = st["last"]["current_at"] = st["at"] = time.time()
     replica._save_state(p, st)
     d._replica_checked = 0.0
     d.replicate_state()
