@@ -505,3 +505,82 @@ def test_priority_1_checks_take_a_freed_slot_ahead_of_other_projects_unless_turn
         for w in waiters:
             w.join(20)
         assert got == want
+
+
+def test_each_checks_slot_taken_logs_its_wait_durably_in_the_takers_project_state(env, monkeypatch):
+    # One JSON line per slot taken, at once or after queueing: project, task, priority and both times.
+    import threading
+    from ttp import checkcap, project
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TASK", "7")
+    synced = []
+    real = project.durable_append
+    monkeypatch.setattr(project, "durable_append", lambda path, text: synced.append(path) or real(path, text))
+    log = p.state / checkcap.WAITS_LOG
+    first = checkcap.acquire("A task #7", since=time.time() - 30, project_name=p.name, priority=2, state=p.state)
+    got = []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire("A task #7 again", project_name=p.name,
+                                                                    priority=None, state=p.state)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.line() and "queued" in checkcap.line())
+        time.sleep(0.3)
+    finally:
+        first.close()
+    t.join(30)
+    assert not t.is_alive() and got and got[0]
+    got[0].close()
+    rows = [json.loads(x) for x in log.read_text().splitlines()]
+    assert [(r["project"], r["task"], r["priority"], r["slot"]) for r in rows] == [(p.name, 7, 2, "queue"), (p.name, 7, None, "queue")]
+    assert 29 <= rows[0]["granted_at"] - rows[0]["queued_at"] < 60, "the wait counts from the place in the queue"
+    assert rows[1]["granted_at"] - rows[1]["queued_at"] >= 0.3
+    assert synced == [log, log], "each line is appended with a sync"
+    # No project state (or the cap off): nothing logged; an unwritable state never costs the slot.
+    checkcap.acquire("no project").close()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")
+    checkcap.acquire("cap off", project_name=p.name, state=p.state).close()
+    assert len(log.read_text().splitlines()) == 2
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    checkcap.acquire("gone", project_name=p.name, state=p.state / "missing").close()
+
+
+def test_push_checks_log_their_slot_wait_in_the_pushing_project_including_the_priority_slot(env, monkeypatch):
+    from ttp import checkcap, push
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    push.check_slot("abc", lambda s: None, proj=p).close()
+    push.check_slot("abc", lambda s: None, priority="branch-key", proj=p).close()
+    rows = [json.loads(x) for x in (p.state / checkcap.WAITS_LOG).read_text().splitlines()]
+    assert [(r["project"], r["slot"]) for r in rows] == [(p.name, "queue"), (p.name, "push")]
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    push.check_slot("abc", lambda s: None).close()
+    assert len((p.state / checkcap.WAITS_LOG).read_text().splitlines()) == 3, "default: TTP_PROJECT's project"
+
+
+def test_status_shows_the_last_24h_checks_slot_wait_median_and_p90_across_rotations(env, monkeypatch):
+    from ttp import checkcap, cli
+    p = make(env)
+    now = time.time()
+    assert checkcap.wait_line(p.state, now) == "" and "checks slot waits" not in cli.status_text(p)
+    monkeypatch.setattr(checkcap, "WAITS_MAX_BYTES", 400)   # rotates every few lines; one old generation kept
+    for wait in (5, 0, 10, 20, 30, 40, 50, 60, 70, 600):
+        checkcap.record_wait(p.state, p.name, 1, now - 100 - wait, now - 100)
+    assert (p.state / checkcap.WAITS_OLD).exists()
+    assert sorted(checkcap.waits(p.state, now))[-1] == 600
+    w = checkcap.waits(p.state, now)
+    st = checkcap.wait_stats(p.state, now)
+    assert st["n"] == len(w) and st["n"] >= 4, "both generations are read"
+    monkeypatch.setattr(checkcap, "WAITS_MAX_BYTES", 256 * 1024)
+    for name in (checkcap.WAITS_LOG, checkcap.WAITS_OLD):
+        (p.state / name).unlink(missing_ok=True)
+    for wait in (5, 0, 10, 20, 30, 40, 50, 60, 70, 600):
+        checkcap.record_wait(p.state, p.name, 1, now - 100 - wait, now - 100)
+    checkcap.record_wait(p.state, p.name, 1, now - 90000 - 9999, now - 90000)   # older than 24 h
+    with open(p.state / checkcap.WAITS_LOG, "a") as f:
+        f.write("not json\n{\"queued_at\": 1}\n")
+    assert checkcap.wait_stats(p.state, now) == {"n": 10, "median_s": 35.0, "p90_s": 70.0}
+    line = "checks slot waits (24 h): 10 taken, median 35s, p90 1.2 min"
+    assert checkcap.wait_line(p.state, now) == line
+    assert line in cli.status_text(p)

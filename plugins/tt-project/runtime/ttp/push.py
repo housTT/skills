@@ -519,21 +519,23 @@ def _in_repo(name: str, top: str | Path) -> bool:
     return False
 
 
-def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = ""):
+def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = "", proj: Project | None = None):
     """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
     push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
     priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
-    one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable."""
-    base = os.environ.get("TTP_PROJECT")
-    proj = Project(base) if base else None
+    one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable.
+    The slot's wait is logged in the state of `proj` (default: TTP_PROJECT's project)."""
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
     name = proj.name if proj else None
+    state = proj.state if proj else None
     if not who:
         who = checkcap.label(name, "ttp push")
     if priority:
-        return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say)
+        return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state)
     return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
-                            priority=checkcap.task_priority(proj))
+                            priority=checkcap.task_priority(proj), state=state)
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:

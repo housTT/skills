@@ -1066,7 +1066,7 @@ class Batch:
             return None
         suite_out: list[str] = []
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch))
+                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
         started = time.time()   # a wait for the host-wide slot is not check time
         try:
             for cmd, eid in run:
@@ -1132,7 +1132,7 @@ class Batch:
                 else:
                     if slot is None:
                         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                                               priority=push.priority_key(self.repo, self.remote, self.branch))
+                                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
                         started = time.time()
                     say(f"cap probe of {head[:10]}: {cmd}")
                     rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,

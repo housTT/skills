@@ -1141,6 +1141,8 @@ def status_text(p: Project) -> str:
     from . import checkcap, locks, shared
     if host := checkcap.line():
         lines.append(host)
+    if slot_waits := checkcap.wait_line(p.state, now):
+        lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res, p)
         lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
@@ -2517,7 +2519,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     try:
         return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
-                                p.name if p else None, checkcap.task_priority(p), same, done, lambda: _checks_cancelled(run_dir))
+                                p.name if p else None, checkcap.task_priority(p), same, done, lambda: _checks_cancelled(run_dir),
+                                p.state if p else None)
     except checkcap.Cancelled as e:
         said = f"not run: stopped waiting for a host-wide checks slot: {e}"
         out.write(f"ttp checks: {said}\n")

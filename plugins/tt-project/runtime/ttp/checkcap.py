@@ -48,9 +48,14 @@ they go first; between projects they count as urgent like priority 1 (above: bou
 A waiter whose checks match ones running now (`same`: the project, tree, commands and purpose) waits
 for their result outside the queue, keeping its arrival time; `done` ends any wait once a recorded
 pass makes the run needless, and `stop` ends it when the task the checks belong to ended.
+
+Each slot taken is logged in the taker's project state (record_wait: WAITS_LOG, one synced JSON line
+with the project, task, priority, queued_at and granted_at); `ttp status` shows that project's median
+and p90 wait over the last 24 h (wait_line).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -307,7 +312,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
             since: float | None = None, project_name: str | None = None,
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
-            stop: Callable[[], str] | None = None) -> Slot | None:
+            stop: Callable[[], str] | None = None, state: Path | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -321,7 +326,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     `same` keys these checks (project, tree, commands, purpose): while checks with the same key hold a
     slot it waits for them outside the queue, keeping `since`, and queues again once they end. `done()`
     true (their pass was recorded) ends any wait with no slot held, Slot(served=True); a reason from `stop()`
-    ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra())."""
+    ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra()).
+    With `state` (a project's state directory) each slot taken is logged there (record_wait)."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -333,6 +339,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
+            record_wait(state, project_name, priority, since, time.time())
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
@@ -372,6 +379,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
+                record_wait(state, project_name, priority, since, time.time())
                 if told and tell:
                     tell(f"host-wide checks slot taken after {(time.time() - started) / 60:.1f} min")
                 return Slot(f)
@@ -438,11 +446,12 @@ def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holde
     return _take(n, ps, every, holder, what, same, room)
 
 
-def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None) -> Slot:
+def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None,
+                     project_name: str | None = None, state: Path | None = None) -> Slot:
     """Take the priority slot of the push branch `key` (beyond the cap, ahead of every task waiting in
     the queue), saying so through `tell`. Only another push to the same branch can hold it; then this
     waits for that one alone. Cap off or nested: no slot, run at once. An unwritable slot directory
-    raises Unavailable."""
+    raises Unavailable. With `state` the slot taken is logged there as for acquire."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -460,9 +469,90 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
                      f"{len(locks.held_labels(all_paths(n)))} task checks running"
                      + (f", {q} queued behind" if q else "") + ")"
                      + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
+            record_wait(state, project_name, None, started, time.time(), "push")
             return Slot(f)
         if tell and time.time() - told >= TELL_S:
             tell(f"waiting for the push priority slot, held by another push to the same branch: "
                  f"{_some(locks.held_labels([path])) or 'unknown'}")
             told = time.time()
         time.sleep(poll_s(POLL_S))
+
+
+# Each slot taken, logged in the taker's project state as one JSON line: {"project", "task", "run",
+# "priority", "slot": "queue" | "push", "queued_at", "granted_at"} (times in epoch seconds). A slot
+# taken at once logs a wait of zero, so the median and p90 describe every checks run, not only the
+# ones that queued. The log is bounded like activity.jsonl: past WAITS_MAX_BYTES it rotates to one
+# old generation, read as well.
+WAITS_LOG, WAITS_OLD, WAITS_LOCK = "checks-slot-waits.jsonl", "checks-slot-waits.1.jsonl", "checks-slot-waits.lock"
+WAITS_MAX_BYTES = 256 * 1024
+WAITS_WINDOW_S = 24 * 3600
+
+
+def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
+                granted_at: float, slot: str = "queue") -> None:
+    """Append one slot wait to `state`/WAITS_LOG and sync it. Never raises: a log that cannot be
+    written must not cost the checks their slot. No `state`: nothing is logged."""
+    if state is None:
+        return
+    state = Path(state)
+    task = os.environ.get("TTP_TASK") or ""
+    rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
+           "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
+           "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
+    line = json.dumps(rec, sort_keys=True) + "\n"
+    try:
+        with open(state / WAITS_LOCK, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            log = state / WAITS_LOG
+            try:
+                size = log.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            if size and size + len(line) > WAITS_MAX_BYTES:
+                os.replace(log, state / WAITS_OLD)
+            project.durable_append(log, line)
+    except OSError:
+        pass
+
+
+def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[float]:
+    """The slot waits in seconds that `state`'s log holds for slots taken in the last `window_s`."""
+    now = time.time() if now is None else now
+    out = []
+    for name in (WAITS_OLD, WAITS_LOG):
+        try:
+            text = (Path(state) / name).read_text()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            try:
+                r = json.loads(raw)
+                q, g = float(r["queued_at"]), float(r["granted_at"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if now - window_s <= g <= now:
+                out.append(max(0.0, g - q))
+    return out
+
+
+def wait_stats(state: Path, now: float | None = None) -> dict | None:
+    """{"n", "median_s", "p90_s"} of the last 24 h's slot waits in `state`'s log (p90 by nearest
+    rank); None with none logged."""
+    w = sorted(waits(state, now))
+    if not w:
+        return None
+    mid = len(w) // 2
+    median = w[mid] if len(w) % 2 else (w[mid - 1] + w[mid]) / 2
+    return {"n": len(w), "median_s": median, "p90_s": w[-(-9 * len(w) // 10) - 1]}
+
+
+def _dur(s: float) -> str:
+    return f"{s:.0f}s" if s < 60 else f"{s / 60:.1f} min"
+
+
+def wait_line(state: Path, now: float | None = None) -> str:
+    """The status line of the project's checks slot waits over the last 24 h, "" with none."""
+    st = wait_stats(state, now)
+    if not st:
+        return ""
+    return f"checks slot waits (24 h): {st['n']} taken, median {_dur(st['median_s'])}, p90 {_dur(st['p90_s'])}"
