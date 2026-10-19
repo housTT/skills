@@ -306,8 +306,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. A schedule's payload may set either for itself.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20},
-    # The project lease across hosts (lease.py; keys in EXTRA_KEYS): empty is off, a single host.
-    "failover": {},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
     # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
@@ -351,6 +349,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Standby snapshots (replica.py), off until failover.standby names a machine alias or an absolute
     # directory: every snapshot_every_s seconds (and soon after a task finishes) the daemon ships a
     # consistent copy of the database, harness and open tasks' branches there, keeping snapshot_keep.
+    # The project lease across hosts (lease.py; keys in EXTRA_KEYS) is off, a single host, while
+    # failover.lease_remote is unset.
     "failover": {"snapshot_every_s": 900, "snapshot_keep": 3},
 }
 
