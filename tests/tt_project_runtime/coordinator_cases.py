@@ -13132,3 +13132,41 @@ def test_stuck_age_is_the_episode_start_not_the_last_update(env):
     w = waits.blocked(db, time.time())[1][0]["wait"]
     assert w["since"] is None and w["age"] == "unknown"
     assert w["age_text"].startswith("waiting since an unknown time")
+
+
+def test_stale_duplicates_flag_a_second_hop_of_one_task_and_a_queued_review_of_a_landed_change(env, monkeypatch):
+    """Two open tasks continuing the same task (one not depending on the other) raise one stale_duplicate
+    event for the later one; a queued review whose subject already landed raises one too. Nothing is
+    cancelled, and each task is named once."""
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    base = p.db.add_task("land the gate", "s", kind="code", status="done")
+    first = p.db.add_task("continue: land the gate", "s", kind="code", labels=[f"continues:{base}"])
+    dup = p.db.add_task("deploy the gate", "s", kind="code", labels=[f"continues:{base}"], status="waiting")
+    after = p.db.add_task("then e2e", "s", kind="code", labels=[f"continues:{base}"], depends_on=[first])
+    p.db.add_task("other work", "s", kind="code", labels=[f"continues:{after}"])
+
+    def check():
+        d._stale_checked = 0.0
+        d.check_stale_duplicates()
+        return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (dm.STALE_DUPLICATE,))
+    (ev,) = check()
+    assert ev["task"] == dup and ev["status"] == "queued" and ev["severity"] == "normal"
+    assert f"#{dup} likely duplicates #{first}" in ev["text"] and f"continue #{base}" in ev["text"]
+    assert len(check()) == 1, "raised twice for one task"
+    assert p.db.task(dup)["status"] == "waiting" and p.db.task(first)["status"] == "queued"
+    # A queued review of a change already on the push branch; not one whose change has not landed.
+    landed_ids = {base}
+    monkeypatch.setattr(dm.landed, "check", lambda p_, repo, tid=None, fetch=True, **kw:
+                        (0, f"#{tid} is on origin/work") if tid in landed_ids else (1, "not yet"))
+    other = p.db.add_task("unlanded", "s", kind="code", status="done")
+    stale = p.db.add_task(f"Review #{base}", "s", kind="review", labels=[f"auto_review:{base}"])
+    p.db.add_task(f"Review #{other}", "s", kind="review", labels=[f"auto_review:{other}"])
+    assert [e["task"] for e in check()] == [dup], "no push branch: reviews are not looked up"
+    p.set_config("delivery.push_branch", "work")
+    d = dm.Daemon(p.base)
+    evs = check()
+    assert [e["task"] for e in evs] == [dup, stale]
+    assert "already landed (#%d is on origin/work)" % base in evs[1]["text"]
+    assert len(check()) == 2 and p.db.task(stale)["status"] == "queued"

@@ -2722,3 +2722,39 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
     assert ml.resource_machines(me) == ["box-c"]
     main(["machines", "status", "box-c", "--json"])
     assert sorted(json.loads(capsys.readouterr().out)[0]["projects"]) == sorted([me.name, "gamma"])
+
+
+def test_health_coverage_counts_report_only_checks_named_by_schedule_and_known_outages(env):
+    """A command watcher without a heal block covers the machine its schedule name, command or fields
+    name, and the line names it report-only; a machine no check covers is covered by a recorded known
+    outage until that outage ends."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    me = make(env)
+    _resources(me, "Machines: box-a, box-b")
+    n = len(rs.inventory(me))
+    assert rs.refresh(me, now=1000.0)["line"] == f"health coverage: {n - 2}/{n} (missing: machine box-a, machine box-b)"
+    # A report-only command schedule named after the machine, whose command does not name it.
+    sched.upsert(me.db, "box-a", "command", "5m", payload={"command": "bin/watch_fleet.sh"})
+    rec = rs.refresh(me, now=2000.0)
+    n = len(rec["items"])   # the schedule itself is an item now
+    assert [i for i in rec["items"] if i["kind"] == "machine" and i["name"] == "box-a"] == [
+        {"kind": "machine", "name": "box-a", "covered_by": ["box-a"], "report_only": True}]
+    assert rec["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-b; report-only: machine box-a)"
+    # A heal check naming it as well: no longer report-only.
+    sched.upsert(me.db, "box-a-up", "command", "5m", payload={"heal": {"check": "true", "resource": "box-a"}})
+    assert "report_only" not in rs.inventory(me, now=2000.0)[0]
+    # A known outage covers the other machine until it ends.
+    now = time.time()
+    ml.set_outage("box-b", "hardware repair", "user", "2h", now=now)
+    rec = rs.refresh(me, now=now)
+    assert [i for i in rec["items"] if i["kind"] == "machine" and i["name"] == "box-b"] == [
+        {"kind": "machine", "name": "box-b", "covered_by": ["known outage"], "via": rs.OUTAGE_VIA}]
+    assert rec["line"] == f"health coverage: {n}/{n} (machine box-b covered by a known outage)"
+    advice = rs.review_advice(me.db)
+    assert "before that outage ends" in advice and "another project's heal check" not in advice
+    assert rs.refresh(me, now=now + 3 * 3600)["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-b)"

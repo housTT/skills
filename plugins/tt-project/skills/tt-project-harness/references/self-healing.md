@@ -28,3 +28,7 @@ Known gap: a check named after a covered part stays quiet under that outage even
 A check back from an unknown stretch (75 or 255) longer than its grace (at least 15 min) with no open self-fix task starts a fresh episode too; it keeps the fix history, so `max_fixes` per `window_h` still holds.
 Known gap: a reboot does not start a fresh heal episode; the fix cap and any open self-fix task carry across reboots.
 `ttp heal list|test <check>` shows the checks and runs one dry (no fix); `ttp status` and the web app show `health: N ok, M fixed today, K failing`.
+
+## Health coverage
+
+`ttp status` shows `health coverage: n/m`. Each machine named in the charter's Resources, device runner and kept web tunnel needs a check; schedules, the push queue, open PRs and remote jobs are covered by the daemon itself. A machine, runner or tunnel counts as covered when an enabled command schedule names it: in its schedule name, `resource` or `machine` (the alias, or `<alias>-...`), or as a word of its command, check, fix, status command, unit, host or URL. A schedule without a `heal` block counts too, and the line names what only such checks cover (`report-only: ...`). A shared machine is also covered by its recovery owner's heal check, or by a co-tenant's heal check that ran healthy recently. A machine nothing checks but that has a known outage (`ttp machines outage`) counts as covered until the outage ends (`covered by a known outage`). Give it a heal check before then.

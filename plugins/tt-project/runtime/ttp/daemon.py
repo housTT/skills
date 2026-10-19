@@ -114,7 +114,8 @@ from . import shared
 from . import shorttmp
 from . import worktree
 from .db import (CHANGES_NEEDED, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
-                 dependency_ids, pin_of, dump_result, load_result, reviewed_ids, task_outcome, unplanned_abrupt, without_deferral)
+                 dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
+                 without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
@@ -287,6 +288,9 @@ CONTINUE_UNQUEUED = "continue_unqueued"   # event: a done task's `continue:` fol
 CONTINUE_UNQUEUED_AFTER_S = 1800   # how long after task_done before it is raised
 CONTINUE_UNQUEUED_WINDOW_S = 86400   # task_done events older than this are not checked
 CONTINUE_CHECK_EVERY_S = 300
+STALE_DUPLICATE = "stale_duplicate"   # event: open work the plan no longer needs (check_stale_duplicates)
+STALE_OPEN = ("queued", "waiting", "blocked")   # a hop not under way, that a later one may duplicate
+STALE_REVIEWS_PER_PASS = 20   # queued reviews whose subject is looked up on the push branch per pass
 KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code tasks left in review with no review
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
@@ -597,6 +601,7 @@ class Daemon:
         self._review_swept = 0.0     # when sweep_reviews last ran
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
+        self._stale_checked = 0.0   # when check_stale_duplicates last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
@@ -1001,7 +1006,7 @@ class Daemon:
         core_held = self.net_held(core) and not self._net_may_probe(core)
         cycle = self.host_cycle_held(now)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -8046,6 +8051,59 @@ class Daemon:
                   f"task_add continues #{task['id']}, or drop it on purpose.",
                   json.dumps({"followups": conts}), "queued", task["id"]))
             log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")
+
+    def check_stale_duplicates(self) -> None:
+        """Model-free, every CONTINUE_CHECK_EVERY_S: open work the plan no longer needs, surfaced once per
+        task as a STALE_DUPLICATE event for the next digest (nothing is cancelled here; the coordinator
+        cancels it or lets it run):
+        - a duplicate hop: two or more open tasks (STALE_OPEN, reviews aside) that continue the same task
+          (chaincap.prev_of: a `continue:` follow-up, `continues:`, a daemon fix), neither depending on the
+          other; each later one is named as a likely duplicate of the first;
+        - a review of a landed change: a queued review that has pushed nothing itself (no push-queue row or
+          landing) whose subject's change is already on the push branch (landed.check, local refs only)."""
+        now = time.time()
+        if now - self._stale_checked < CONTINUE_CHECK_EVERY_S:
+            return
+        self._stale_checked = now
+        db = self.p.db
+        told = {r["task"] for r in db.q("SELECT DISTINCT task FROM events WHERE kind=? AND task IS NOT NULL",
+                                        (STALE_DUPLICATE,))}
+        found: list[tuple[dict, str]] = []
+        hops: dict[int, list[dict]] = {}
+        for t in db.q("SELECT * FROM tasks WHERE status IN (%s) AND kind!='review' ORDER BY id"
+                      % ",".join("?" * len(STALE_OPEN)), STALE_OPEN):
+            if (prev := chaincap.prev_of(t)) is not None:
+                hops.setdefault(prev, []).append(t)
+        for prev, group in hops.items():
+            first = group[0]
+            for t in group[1:]:
+                if t["id"] in told or first["id"] in dependency_ids(t) or t["id"] in dependency_ids(first):
+                    continue
+                found.append((t, f"#{t['id']} {headline.clip(t['title'], 120)} ({t['status']}) and #{first['id']} "
+                                 f"{headline.clip(first['title'], 120)} ({first['status']}) both continue #{prev}: "
+                                 f"#{t['id']} likely duplicates #{first['id']}. Cancel one (task_update cancelled), "
+                                 f"or make one depend on the other if both are needed."))
+        if (self.cfg.get("delivery") or {}).get("push_branch"):
+            reviews = db.q("SELECT * FROM tasks t WHERE kind='review' AND status='queued' AND NOT EXISTS "
+                           "(SELECT 1 FROM push_queue q WHERE q.task=t.id) AND NOT EXISTS "
+                           "(SELECT 1 FROM task_landings l WHERE l.task=t.id) ORDER BY id")
+            for r in [r for r in reviews if r["id"] not in told][:STALE_REVIEWS_PER_PASS]:
+                subject = review_subject(r)
+                if subject is None or not db.task(subject):
+                    continue
+                try:
+                    rc, words = landed.check(self.p, self.p.root, tid=subject, fetch=False)
+                except Exception as e:
+                    log(self.p, f"task {r['id']}: could not look up its subject's landing: {e}")
+                    continue
+                if rc == 0:
+                    found.append((r, f"#{r['id']} {headline.clip(r['title'], 160)} is queued, but the change it "
+                                     f"reviews is already landed ({words}). Cancel it (task_update cancelled) unless "
+                                     f"its spec has steps still to run after the push."))
+        for t, text in found:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, f"task:{t['id']}", STALE_DUPLICATE, "normal", text, "queued", t["id"]))
+            log(self.p, f"task {t['id']}: {STALE_DUPLICATE} raised")
 
     def tend_mitigations(self) -> None:
         """Model-free: an overdue mitigation wakes the coordinator, a done fix lists its measures for undo."""

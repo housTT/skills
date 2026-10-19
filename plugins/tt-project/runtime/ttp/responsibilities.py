@@ -9,14 +9,18 @@ Responsibility inventory. The daemon lists, model-free, what the project is resp
 - command and watcher schedules, the push queue, open PRs and remote detached jobs (a waiting task's
   `retry_when` is `ttp detach --check --host ...`).
 A machine, runner or tunnel is covered when an enabled heal check or command watcher names it: in its
-`resource` or `machine` (the alias itself, or `<alias>-...`), or as a word of its command, check, fix,
-status command, unit, host or URL. A shared machine this project has no such check for is covered when
+schedule name, `resource` or `machine` (the alias itself, or `<alias>-...`), or as a word of its command,
+check, fix, status command, unit, host or URL. A command watcher without a `heal` block (report-only: it
+reports, and two failed runs queue its fix task, but nothing heals) counts too, and the line names what
+only such checks cover ('report-only: machine <alias>'). A shared machine this project has no such check for is covered when
 its recovery owner (else its fallback) runs an enabled heal check naming it, and the line says
 'machine <alias> covered by owner <project>'. Failing that (no owner set, or the owner has no such
 check), it is covered when another project on this machine (a co-tenant) has an enabled heal check
 naming it that ran healthy within FRESH_INTERVALS of its interval: 'machine <alias> covered by <project>
 heal check'. A stale or unhealthy co-tenant check does not cover it. Other projects' databases are only
-read, read-only. A machine is missing only when no project checks it. The rest the daemon
+read, read-only. Failing all of these, a machine with a known outage recorded (`ttp machines outage`)
+counts as covered until that outage ends: 'machine <alias> covered by a known outage'. A machine is
+missing only when no project checks it and no outage covers it. The rest the daemon
 already watches by itself (a schedule failing twice queues its fix task, the push queue recovers dead
 batches, the PR watcher reads open PRs, a wait probe wakes its task when the remote job ends or its host
 is gone), so they are covered by `builtin`; open PRs need the built-in PR watcher schedule to be on.
@@ -55,6 +59,7 @@ REMOTE_JOB_RE = re.compile(r"detach\s+--check\s+--host\s+(['\"]?)([^\s'\"]+)\1")
 HEAL_TEXT = ("check", "fix", "status_command", "unit", "host", "url")
 KINDS = ("machine", "runner", "tunnel", "schedule", "push queue", "pr", "remote job")
 NEEDS_CHECK = ("machine", "runner", "tunnel")
+OUTAGE_VIA = "a known outage"      # the `via` of a machine only its recorded outage covers
 
 
 def _word(needle: str, text: str) -> bool:
@@ -105,7 +110,16 @@ def watchers(db) -> list[dict]:
 def covering(needles: list[str], found: list[dict]) -> list[str]:
     """The checks that name one of `needles`."""
     return [w["name"] for w in found
-            if any(_names(n, f) for n in needles for f in w["fields"]) or any(_named(n, w["text"]) for n in needles)]
+            if any(_names(n, f) for n in needles for f in [w["name"], *w["fields"]])
+            or any(_named(n, w["text"]) for n in needles)]
+
+
+def _mark_report_only(item: dict, found: list[dict]) -> dict:
+    """`item` with report_only set when only command watchers without a heal block cover it."""
+    heals = {w["name"] for w in found if w["heal"]}
+    if item["covered_by"] and not heals & set(item["covered_by"]):
+        item["report_only"] = True
+    return item
 
 
 # The inventory ------------------------------------------------------------------------------------
@@ -118,27 +132,35 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
     found = watchers(db)
     items: list[dict] = []
     known = machines.load()
+    try:
+        down = machine_ledger.outages(now)
+    except Exception:
+        down = {}
     for alias in machine_ledger.resource_machines(p):
         needles = [alias] + ([str(known[alias]["hostname"])] if (known.get(alias) or {}).get("hostname") else [])
-        item = {"kind": "machine", "name": alias, "covered_by": covering(needles, found)}
+        item = _mark_report_only({"kind": "machine", "name": alias, "covered_by": covering(needles, found)}, found)
         if not item["covered_by"]:
             via, checks = _owner_checks(p, known.get(alias) or {}, needles)
             if not checks:
                 via, checks = _cotenant_checks(p, needles, now)
             if checks:
                 item.update(covered_by=checks, via=via)
+            elif alias in down:
+                item.update(covered_by=["known outage"], via=OUTAGE_VIA)
         items.append(item)
     runners = ((cfg.get("device") or {}).get("runners") or {})
     for name in sorted(runners if isinstance(runners, dict) else {}):
         host = str((runners[name] or {}).get("host") or "") if isinstance(runners[name], dict) else ""
-        items.append({"kind": "runner", "name": name, "covered_by": covering([name] + ([host] if host else []), found)})
+        items.append(_mark_report_only({"kind": "runner", "name": name,
+                                        "covered_by": covering([name] + ([host] if host else []), found)}, found))
     try:
         kept = tunnel.installed(p.name)
     except Exception:
         kept = None
     if kept:
-        items.append({"kind": "tunnel", "name": p.name, "covered_by": covering(
-            [tunnel.label(p.name)] + [tunnel.service_file(p.name, plat).name for plat in ("linux", "darwin")], found)})
+        items.append(_mark_report_only({"kind": "tunnel", "name": p.name, "covered_by": covering(
+            [tunnel.label(p.name)] + [tunnel.service_file(p.name, plat).name for plat in ("linux", "darwin")], found)},
+            found))
     prs_on = []
     for r in db.q("SELECT name, kind, payload FROM schedules WHERE enabled=1 AND kind IN ('command','watcher') "
                   "ORDER BY name"):
@@ -290,12 +312,19 @@ def missing(items: list[dict]) -> list[str]:
     return [f"{i['kind']} {i['name']}" for i in items if not i["covered_by"]]
 
 
+def report_only(items: list[dict]) -> list[str]:
+    """The items only report-only command watchers (no heal block) cover: counted, and named apart."""
+    return [f"{i['kind']} {i['name']}" for i in items if i.get("report_only") and i["covered_by"]]
+
+
 def line_of(items: list[dict]) -> str:
     """'health coverage: n/m (missing: ...)'; "" with nothing to cover."""
     if not items:
         return ""
     gaps = missing(items)
-    notes = ([f"missing: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''}"] if gaps else []) + by_owner(items)
+    plain = report_only(items)
+    notes = (([f"missing: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''}"] if gaps else []) + by_owner(items)
+             + ([f"report-only: {', '.join(plain[:8])}{', …' if len(plain) > 8 else ''}"] if plain else []))
     return f"health coverage: {len(items) - len(gaps)}/{len(items)}" + (f" ({'; '.join(notes)})" if notes else "")
 
 
@@ -342,8 +371,10 @@ def review_advice(db) -> str:
     if missing(items):
         out.append("Give each missing one a heal check naming it (`ttp machines status` shows the shared "
                    "machines).")
-    if by_owner(items):
+    if any(i.get("via") and i["via"] != OUTAGE_VIA and i["covered_by"] for i in items):
         out.append("A machine covered by another project's heal check needs no duplicate check here.")
+    if any(i.get("via") == OUTAGE_VIA for i in items):
+        out.append("A machine a known outage covers needs a heal check before that outage ends.")
     return "".join(" " + x for x in out)
 
 
