@@ -44821,6 +44821,6 @@ def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_t
 
 
 def test_readme_says_own_push_may_reuse_checks_pass():
-    text = (Path(__file__).resolve().parents[1] / "plugins/tt-project/README.md").read_text()
+    text = (pathlib.Path(__file__).resolve().parents[1] / "plugins/tt-project/README.md").read_text()
     bullet = text.split("- Checks run with `TTP_PUSH_MODE`", 1)[1].split("\n- ", 1)[0]
     assert "may instead reuse" in bullet and "cannot count on running" in bullet
