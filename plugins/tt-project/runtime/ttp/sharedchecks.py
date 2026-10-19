@@ -82,14 +82,14 @@ _SUMMARY_MSG = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?) - (.*)
 
 
 def _norm(text: str) -> str:
-    text = re.sub(r"\btmp[\w-]+", "tmp", text)
+    text = re.sub(r"0x[0-9a-fA-F]+", "N", re.sub(r"\btmp[\w-]+", "tmp", text))
     return re.sub(r"\s+", " ", re.sub(r"\d+", "N", text)).strip()
 
 
 def failure_sigs(output: str, ids: list[str]) -> dict[str, str]:
     """Each failing id's failure signature: a hash of its traceback's `E` lines (pytest's FAILURES
-    section), else of its summary line's message, with numbers and temp names left out, so a flaky
-    timing assertion matches itself while a guard naming another change's file and line does not.
+    section), else of its summary line's message, with numbers, addresses and temp names left out, so a
+    flaky timing assertion matches itself while a guard naming another change's file and line does not.
     '' when the output shows neither (cut)."""
     out, blocks = output or "", {}
     for m in _HEADER.finditer(out):

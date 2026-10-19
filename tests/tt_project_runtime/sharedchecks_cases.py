@@ -69,6 +69,99 @@ def test_failing_ids_reads_real_pytest_q_output(tmp_path):
     assert sharedchecks.failing_ids(r.stdout) == (["test_tiny.py::test_bad"], True), r.stdout
 
 
+def _pytest_out_with(errors: dict, passed=40):
+    """pytest -q output whose FAILURES part shows each id's `E` lines (errors: id -> lines)."""
+    lines = ["..F.", "=" * 20 + " FAILURES " + "=" * 20]
+    for i, es in errors.items():
+        name = i.split("::", 1)[1].replace("::", ".")
+        lines += [f"{'_' * 10} {name} {'_' * 10}", "", "    def test():", ">       assert x", *[f"E       {e}" for e in es],
+                  "", f"{i.split('::')[0]}:12: AssertionError"]
+    lines += ["=" * 20 + " short test summary info " + "=" * 20, *[f"FAILED {i}" for i in errors],
+              f"{len(errors)} failed, {passed} passed in 3.21s"]
+    return "\n".join(lines) + "\n"
+
+
+_LINT = "tests/test_r.py::test_every_state_write_is_durable"
+
+
+def test_failure_signatures_tell_one_cause_from_another(tmp_path):
+    from ttp import sharedchecks
+    ids = [_LINT, "tests/test_r.py::TestX::test_y[a-1]"]
+    def sigs(e0, e1=("assert 0.52 < 0.5",)):
+        return sharedchecks.failure_sigs(_pytest_out_with({ids[0]: e0, ids[1]: list(e1)}), ids)
+    a = sigs(["AssertionError: write these:", "checkcap.py:504: with open(state / LOCK, 'a') as lf:"])
+    b = sigs(["AssertionError: write these:", "activity.py:56: with open(state / LOCK, 'a') as lf:"])
+    assert set(a) == set(ids) and a[ids[0]] != b[ids[0]] and a[ids[1]] == b[ids[1]]
+    # Line numbers, timings, addresses and temporary paths do not change a signature.
+    c = sigs(["AssertionError: write these:", "checkcap.py:517: with open(state / LOCK, 'a') as lf:"],
+             ["assert 0.73 < 0.5"])
+    assert c == a
+    d = sigs(["FileNotFoundError: /tmp/pytest-of-u/pytest-7/test_x0/a.json at 0x7f3a"])
+    e = sigs(["FileNotFoundError: /tmp/pytest-of-u/pytest-9/test_x1/a.json at 0x7f9b"])
+    assert d[ids[0]] == e[ids[0]]
+    # Cut output (no FAILURES part): the summary line's message; neither it nor `E` lines: no signature.
+    cut = sharedchecks.failure_sigs(_pytest_out(ids), ids)
+    assert cut[ids[0]] and cut[ids[0]] == cut[ids[1]] != a[ids[0]]
+    assert sharedchecks.failure_sigs(_pytest_out_with({ids[0]: []}), ids)[ids[0]] == ""
+
+
+def test_failure_signatures_read_real_pytest_q_output(tmp_path):
+    from ttp import sharedchecks
+    outs = []
+    for k, why in enumerate(["checkcap.py", "activity.py", "checkcap.py"]):
+        (run := tmp_path / f"r{k}").mkdir()   # one dir each: a same-size rewrite would reuse stale bytecode
+        (run / "test_tiny.py").write_text(
+            "import pytest\n\nclass TestX:\n    @pytest.mark.parametrize('n', [1])\n"
+            f"    def test_bad(self, n):\n        assert not ['{why}:{k}: open(x, \"a\")']\n")
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_tiny.py"],
+                           cwd=run, capture_output=True, text=True, timeout=120,
+                           env={k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")})
+        assert r.returncode == 1, r.stdout + r.stderr
+        ids, complete = sharedchecks.failing_ids(r.stdout)
+        assert ids == ["test_tiny.py::TestX::test_bad[1]"] and complete, r.stdout
+        outs.append(sharedchecks.failure_sigs(r.stdout, ids).get(ids[0]))
+    assert outs[0] and outs[1] and outs[0] != outs[1] and outs[0] == outs[2]
+
+
+def test_one_id_failing_elsewhere_for_another_reason_is_not_shared(env):
+    """The same lint test failed in other changes on lines those changes added: each change's own
+    failure, so the task wakes, not held. The same cause elsewhere is shared; a row without signatures
+    counts for no signed failure."""
+    from ttp import sharedchecks
+    p = make(env)
+    now = time.time()
+    other = lambda line: sharedchecks.failure_sigs(_pytest_out_with({_LINT: ["write these:", line]}), [_LINT])
+    for k, line in enumerate(["activity.py:56: os.replace(log, OLD)", "lease.py:341: tmp.write_text(x)"]):
+        sharedchecks.record(p.db, 9000 + k, f"{k:040x}", [_LINT], now - 600, other(line))
+    mine = other("checkcap.py:512: os.replace(log, WAITS_OLD)")
+    assert not sharedchecks.shared(p.db, 9100, f"{9:040x}", [_LINT], now, {}, sigs=mine)
+    assert sharedchecks.shared(p.db, 9100, f"{9:040x}", [_LINT], now, {})   # no signature: by id as before
+    sharedchecks.record(p.db, 9002, f"{2:040x}", [_LINT], now - 600, other("checkcap.py:9: os.replace(log, WAITS_OLD)"))
+    sharedchecks.record(p.db, 9003, f"{3:040x}", [_LINT], now - 600)   # an older row without signatures
+    assert not sharedchecks.shared(p.db, 9100, f"{9:040x}", [_LINT], now, {}, sigs=mine)
+    sharedchecks.record(p.db, 9004, f"{4:040x}", [_LINT], now - 600, other("checkcap.py:77: os.replace(log, WAITS_OLD)"))
+    assert sharedchecks.shared(p.db, 9100, f"{9:040x}", [_LINT], now, {}, sigs=mine)
+
+
+def test_a_daemon_task_failing_a_shared_id_for_its_own_reason_wakes(env, monkeypatch, tmp_path):
+    from ttp import sharedchecks
+    p = make(env)
+    d, _ = _shared_daemon(p, monkeypatch)
+    out = lambda line: _pytest_out_with({_LINT: ["write these:", line]})
+    for k in range(2):
+        o = out(f"activity.py:{k}: os.replace(log, OLD)")
+        sharedchecks.record(p.db, 9000 + k, f"{k:040x}", [_LINT], time.time() - 600, sharedchecks.failure_sigs(o, [_LINT]))
+    tid, _ = _shared_fail_task(p, tmp_path, out("checkcap.py:512: os.replace(log, WAITS_OLD)"))
+    d._probe_passed(p.db.task(tid), time.time())
+    res = json.loads(p.db.task(tid)["result"])
+    assert res.get("escalated_wake") and "shared_hold" not in res and _ready(p, tid)
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix shared check failure%'")
+    (row,) = p.db.q("SELECT sigs FROM checks_failures WHERE task=?", (tid,))
+    assert set(json.loads(row["sigs"])) == {_LINT}
+    tid2, _ = _shared_fail_task(p, tmp_path, out("activity.py:7: os.replace(log, OLD)"))   # the same cause: held
+    d._probe_passed(p.db.task(tid2), time.time())
+    assert "shared_hold" in json.loads(p.db.task(tid2)["result"])
+
 def test_a_shared_checks_failure_holds_tasks_in_one_incident_with_one_fix_task(env, monkeypatch, tmp_path):
     from ttp import audit, sharedchecks
     p = make(env)
