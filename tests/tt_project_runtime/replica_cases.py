@@ -283,10 +283,10 @@ def test_replica_status_line_and_one_stale_observation(env, tmp_path, monkeypatc
     assert taken, "an old snapshot makes the next one due at once"
     assert len(seen) == 1 and seen[0][1]["key"] == replica.OBS_KEY and "standby" in seen[0][0][1]
     closed = []
-    monkeypatch.setattr(scr, "close_watcher_issues", lambda db, source, **k: closed.append(source) or 0)
+    monkeypatch.setattr(scr, "close_watcher_issues", lambda db, source, **k: closed.append((source, k.get('why'))) or 0)
     st = replica.load_state(p)
     st["last"]["at"] = st["last"]["current_at"] = st["at"] = time.time()
     replica._save_state(p, st)
     d._replica_checked = 0.0
     d.replicate_state()
-    assert closed == [replica.OBS_SOURCE] and len(seen) == 1, "a fresh snapshot closes it, raising nothing new"
+    assert closed == [(replica.OBS_SOURCE, "the standby holds the current state")] and len(seen) == 1, "a current standby closes it, raising nothing new"

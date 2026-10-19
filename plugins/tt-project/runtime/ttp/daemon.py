@@ -5942,7 +5942,8 @@ class Daemon:
         if stale and not self._replica_stale:
             self.observe(replica.OBS_SOURCE, stale, "normal", key=replica.OBS_KEY, whole=True)
         elif not stale and self._replica_stale is not False:
-            scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="a fresh snapshot reached the standby")
+            # an unchanged check (nothing new, standby still current) also lands here; it does not contact the standby
+            scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="the standby holds the current state")
         self._replica_stale = bool(stale)
         if self._replica_job is not None:
             return
