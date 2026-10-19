@@ -166,6 +166,7 @@ def test_a_run_cannot_say_all(env, monkeypatch, capsys):
 def test_a_full_ledger_keeps_the_open_line_a_claim_writes_and_compacts_only_what_can_go(env, monkeypatch):
     from ttp import broadcast, project
     now = time.time()
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)   # fill() appends outside the lock that creates it
 
     def fill(age, n):
         broadcast._append(*({"event": "open", "id": f"b-old{age}-{i}", "key": f"k{i}", "norm": "x " * 40,
