@@ -919,6 +919,9 @@ QUIET = "quiet"
 QUIET_CONFIRM_DAYS = 3
 KV_QUIET_CHECKED = "upstream_quiet_checked"
 QUIET_EVERY_S = 3600
+KV_RAN = "upstream_ran"   # {"ran": seconds this project's daemon ran these checks, "seen": the last check}
+KV_REACHED_RAN = "upstream_reached_ran"   # {"<fp>@<fixed_in>": the "ran" total when the daemon first ran the fix}
+RAN_GAP_S = 900   # a longer gap between two checks is the host or daemon down: only this much of it counts
 
 
 def _norm_title(t: str) -> str:
@@ -944,6 +947,27 @@ def reached(p: project.Project, key: str, now: float) -> float:
     if key not in got:
         got[key] = now
         p.db.set_kv(KV_REACHED, dict(list(got.items())[-FIXED_KEPT:]))
+    return float(got[key])
+
+
+def ran(p: project.Project, now: float) -> float:
+    """Seconds this project's daemon has run the upstream checks (one a minute), counted check to check:
+    a gap over RAN_GAP_S (host down, daemon stopped) adds only RAN_GAP_S. Wall time would count downtime."""
+    got = dict(p.db.kv(KV_RAN, {}) or {})
+    total, seen = float(got.get("ran") or 0), got.get("seen")
+    if seen is None or now > float(seen):
+        if seen is not None:
+            total += min(now - float(seen), RAN_GAP_S)
+        p.db.set_kv(KV_RAN, {"ran": total, "seen": now})
+    return total
+
+
+def reached_ran(p: project.Project, key: str, total: float) -> float:
+    """The daemon's running total (`ran`) when it first ran the fix `key`: `total`, on first sight."""
+    got = dict(p.db.kv(KV_REACHED_RAN, {}) or {})
+    if key not in got:
+        got[key] = total
+        p.db.set_kv(KV_REACHED_RAN, dict(list(got.items())[-FIXED_KEPT:]))
     return float(got[key])
 
 
@@ -987,8 +1011,11 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
     """For notes this project filed that its daemon (running `version`) has the fix for and nobody acked:
     after upstream.remind_after_h (72) one more normal event to its own coordinator, once per note; after
     upstream.unconfirmed_close_days (14) with no regression, close it as 'confirmed by silence' (an ack
-    with that reason, so the note stays listed). Only this project's own notes. Returns the closed fps."""
+    with that reason, so the note stays listed). After upstream.quiet_confirm_days (3) of the daemon's own
+    running time with the fix (not wall time: downtime ran nothing) and no regression or re-filed note,
+    close it as 'confirmed by quiet'. Only this project's own notes. Returns the closed fps."""
     now = now or time.time()
+    total = ran(p, now)
     conf = (cfg or {}).get("upstream") or {}
     remind_s = float(conf.get("remind_after_h", REMIND_AFTER_H)) * 3600
     close_s = float(conf.get("unconfirmed_close_days", CLOSE_AFTER_DAYS)) * 86400
@@ -1008,10 +1035,11 @@ def follow_up_unconfirmed(p: project.Project, version: str, cfg: dict | None = N
             continue
         key = f"{fp}@{res['fixed_in']}"
         age = now - reached(p, key, now)
-        if (quiet_due and age >= quiet_s and now - float(res["ts"]) >= CONFIRM_S and not regressed(fp, recs)
+        up = total - reached_ran(p, key, total)
+        if (quiet_due and up >= quiet_s and now - float(res["ts"]) >= CONFIRM_S and not regressed(fp, recs)
                 and not _refiled(fp, mine[fp].get("title", ""), float(res["ts"]))):
             _record({"kind": "ack", "fp": fp, "project": p.name, "ts": now, "closed_by": QUIET,
-                     "evidence": f"confirmed by quiet: ran {version} for {age / 86400:.0f} days, no regression or re-filed note"})
+                     "evidence": f"confirmed by quiet: ran {version} for {up / 86400:.0f} days, no regression or re-filed note"})
             closed.append(fp)
             continue
         if age >= close_s and not regressed(fp, recs):

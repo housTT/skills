@@ -44717,10 +44717,19 @@ def _filed_long_ago(title, now):
     return fp
 
 
-def _quiet_run(p, fp, now, version="1.5.0", cfg=None):
+def _running(p, start, end, version="1.5.0", cfg=None):
+    """The daemon running from `start` to `end`, checking every RAN_GAP_S: the fps it closed."""
     from ttp import upstream
-    upstream.follow_up_unconfirmed(p, version, cfg, now)   # first sight starts the clock
-    return upstream.follow_up_unconfirmed(p, version, cfg, now + 4 * 86400)
+    out, t = [], start
+    while True:
+        out += upstream.follow_up_unconfirmed(p, version, cfg, t)
+        if t >= end:
+            return out
+        t = min(end, t + upstream.RAN_GAP_S)
+
+
+def _quiet_run(p, fp, now, version="1.5.0", cfg=None):
+    return _running(p, now, now + 4 * 86400, version, cfg)   # first sight starts the clock
 
 
 def test_upstream_quiet_confirm_closes_after_the_window_and_lists_it_separately(env):
@@ -44728,10 +44737,9 @@ def test_upstream_quiet_confirm_closes_after_the_window_and_lists_it_separately(
     p = make(env)
     now = time.time()
     fp = _filed_long_ago("upstream: calm", now)
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []   # first sight starts the window
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 2 * 86400) == []   # inside the window
+    assert _running(p, now, now + 2 * 86400) == []   # first sight starts the window; inside it
     assert upstream.unconfirmed("demo", now + 2 * 86400) == [fp]
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 3 * 86400 + 7200) == [fp]
+    assert _running(p, now + 2 * 86400, now + 3 * 86400 + 7200) == [fp]
     ev = upstream.acked(fp)["evidence"]
     assert ev.startswith("confirmed by quiet: ran 1.5.0 for 3 days") and "no regression or re-filed note" in ev
     assert upstream.state(fp) == "closed" and upstream.unconfirmed("demo", now + 9 * 86400) == []
@@ -44741,6 +44749,23 @@ def test_upstream_quiet_confirm_closes_after_the_window_and_lists_it_separately(
     from ttp import audit
     assert "upstream fixes confirmed by quiet: 1" in audit.lines(p.db, closed_at + 3600, p=p)
     assert audit.lines(p.db, closed_at + 2 * 86400, p=p) == [audit.NOTHING]   # the next day: nothing
+
+
+def test_upstream_quiet_confirm_counts_only_the_daemons_running_time(env):
+    from ttp import upstream
+    p = make(env)
+    now = time.time()
+    fp = _filed_long_ago("upstream: down", now)
+    assert _running(p, now, now + 86400) == []   # first sight, then a day running
+    # host down two days: three days of wall time since the fix reached the project, one of running
+    assert _running(p, now + 3 * 86400, now + 3 * 86400 + 7200) == []
+    assert upstream.state(fp) == upstream.SHIPPED
+    assert upstream.ran(p, now + 3 * 86400 + 7200) < 1.1 * 86400
+    assert _running(p, now + 3 * 86400 + 7200, now + 5 * 86400 + 7200) == [fp]
+    assert upstream.acked(fp)["evidence"].startswith("confirmed by quiet: ran 1.5.0 for 3 days")
+    # a check with an older clock adds nothing and keeps the last one seen
+    t = upstream.ran(p, now + 5 * 86400 + 7200)
+    assert upstream.ran(p, now) == t and upstream.ran(p, now + 5 * 86400 + 7260) == t + 60
 
 
 def test_upstream_quiet_confirm_is_blocked_by_regression_refile_unknown_filer_and_off_switch(env):
@@ -44756,17 +44781,15 @@ def test_upstream_quiet_confirm_is_blocked_by_regression_refile_unknown_filer_an
     assert upstream.state(b) == upstream.SHIPPED
     off = {"upstream": {"quiet_confirm_days": 0}}
     c = _filed_long_ago("upstream: off", now)
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", off, now + 5 * 86400) == []   # starts c's window
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", off, now + 9 * 86400) == []   # past it, but off
+    assert _running(p, now + 5 * 86400, now + 8 * 86400, cfg=off) == []   # starts c's window
     assert upstream.state(c) == upstream.SHIPPED
     d = _filed_long_ago("upstream: unknown", now)
-    p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 6 * 86400) == []   # starts d's window
-    p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
-    assert upstream.follow_up_unconfirmed(p, "", None, now + 10 * 86400) == []   # unknown filer version
+    assert _running(p, now + 8 * 86400, now + 9 * 86400, cfg=off) == []   # c past it but off; starts d's window
+    assert _running(p, now + 9 * 86400, now + 12 * 86400, "") == []   # unknown filer version
     assert upstream.state(d) == upstream.SHIPPED and upstream.quiet_confirmed("demo") == 0
     # with the switch on and the version known, both would have closed
-    assert sorted(upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10 * 86400)) == sorted([c, d])
+    p.db.set_kv(upstream.KV_QUIET_CHECKED, 0)
+    assert sorted(upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 12 * 86400 + 60)) == sorted([c, d])
 
 
 def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_the_forwarder(env):
@@ -44780,9 +44803,9 @@ def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_t
                              "host": __import__("ttp.project", fromlist=["x"]).hostname(), "ts": now - 40 * 86400,
                              "project": "demo", "task": 4}) + "\n")
     assert upstream._take_resolved("peer", [{"kind": "resolve", "fp": rx, "fixed_in": "1.0.0", "ts": 5.0}]) == 1
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now) == []   # first sight starts both windows
-    assert upstream.follow_up_unconfirmed(p, "1.5.0", None, now + 10) == []
     later = now + 4 * 86400
+    p.db.set_kv(upstream.KV_QUIET_CHECKED, later)   # no quiet pass while the daemon runs up to `later`
+    assert _running(p, now, later - 10) == []   # first sight starts both windows
     p.db.set_kv(upstream.KV_QUIET_CHECKED, later - 10)   # a pass ran just before
     assert upstream.follow_up_unconfirmed(p, "1.5.0", None, later) == []   # past the window, within QUIET_EVERY_S
     assert upstream.unconfirmed("demo", later) == [fp, rx]
