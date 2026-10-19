@@ -540,6 +540,85 @@ def test_heal_lock_busy_past_window_escalates(env, monkeypatch):
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
 
 
+
+def _lock_free(p, res):
+    from ttp.project import command_env
+    return subprocess.run([sys.executable, "-m", "ttp", "lock", "--probe", res], env=command_env(p),
+                          capture_output=True).returncode == 0
+
+
+def test_heal_detached_fix_holds_its_lock_and_reads_busy_until_it_ends(env):
+    """fix_detached: the fix runs as a tracked job past timeout_s, under its resource lock the whole time;
+    the check reads 75 (busy) and is not run while it runs, a daemon restart keeps it, and its end settles."""
+    from ttp import heal
+    from ttp.daemon import Daemon
+    held, go, runs = (env["repo"] / n for n in ("held", "go", "runs"))
+    p, d, up = _heal_setup(env, resource="dev-x", fix_detached=True, check=f"echo x >> {runs}; test -e {env['repo'] / 'up'}",
+                           fix=f'echo "$TTP_LOCKS_HELD" > {held}; while [ ! -e {go} ]; do sleep 0.1; done; '
+                               f'touch {env["repo"] / "up"}')
+    spec, now = _heal_spec(p), time.time()
+    assert spec["fix_timeout_s"] == heal.FIX_TIMEOUT_S > heal.MAX_TIMEOUT_S
+    assert heal.run(d, "svc", spec, now) == ("unhealthy (detached fix started; rechecking when it ends)",
+                                             now + heal.FIX_POLL_S)
+    assert _wait_for(held.exists) and "dev-x" in held.read_text()
+    assert not _lock_free(p, "dev-x"), "the detached fix runs under its lock"
+    st = heal.state(p.db, "svc")
+    assert st["phase"] == "fixing" and st["fixes"] == [now] and d._healing()
+    assert heal.check(spec, st, str(p.root))[0] == 75
+    checks = runs.read_text().count("x")
+    d2 = Daemon(p.base)   # a daemon restart keeps tracking it
+    status, again = heal.run(d2, "svc", spec, now + 600)
+    assert status.startswith("unhealthy (detached fix running 600 s") and again == now + 600 + heal.FIX_POLL_S
+    assert runs.read_text().count("x") == checks, "the check never runs under its fix"
+    go.touch()
+    assert _wait_for(lambda: pathlib.Path(heal.state(p.db, "svc")["fix_job"]["rc"]).exists())
+    assert _wait_for(lambda: _lock_free(p, "dev-x")), "the lock goes with the fix"
+    assert heal.run(d2, "svc", spec, now + 700) == ("unhealthy (fixed; rechecking)", now + 700)
+    st = heal.state(p.db, "svc")
+    assert "fix_job" not in st and st["fix_rc"] == 0 and st["fixes"] == [now]
+    assert heal.run(d2, "svc", spec, now + 701)[0] == "fixed (1 today)"
+
+
+def test_heal_detached_fix_past_its_timeout_is_killed_and_escalates(env):
+    from ttp import detach, heal
+    p, d, up = _heal_setup(env, fix_detached=True, fix_timeout_s=5, fix="sleep 120")
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now)[0].startswith("unhealthy (detached fix started")
+    rc = pathlib.Path(heal.state(p.db, "svc")["fix_job"]["rc"])
+    assert heal.run(d, "svc", spec, now + 2)[1] == now + 5   # comes back at its deadline
+    status = heal.run(d, "svc", spec, now + 6)[0]
+    assert "the fix exited 124" in status and "self-fix task" in status, status
+    assert _wait_for(lambda: detach.state(rc)[0] != "running"), "its process group was killed"
+    st = heal.state(p.db, "svc")
+    assert "fix_job" not in st and st["fix_rc"] == 124 and "fix_timeout_s" in st["fix_out"]
+
+
+def test_heal_detached_fix_gone_without_an_exit_code_is_a_failed_fix(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix_detached=True)
+    spec, now = _heal_spec(p), time.time()
+    job = heal.fix_dir(p, "svc") / "fix.rc"
+    job.parent.mkdir(parents=True)
+    (job.parent / "fix.started").write_text("1\n")   # it started, then a reboot or a kill ended it
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 60, "phase": "fixing",
+                                         "fixes": [now - 30], "fix_job": {"rc": str(job), "pid": 0,
+                                                                          "started": now - 30, "fixes": []}})
+    status = heal.run(d, "svc", spec, now)[0]
+    assert "the fix exited 1" in status, status
+    st = heal.state(p.db, "svc")
+    assert "without an exit code" in st["fix_out"] and "fix_job" not in st and st["fixes"] == [now - 30]   # it counts
+
+
+def test_heal_fix_timeout_s_needs_fix_detached_and_is_capped():
+    from ttp import heal
+    with pytest.raises(ValueError, match="fix_detached"):
+        heal.validate({"check": "true", "fix": "true", "fix_timeout_s": 600})
+    assert heal.validate({"check": "true", "fix_detached": True, "fix_timeout_s": 10 ** 6})["fix_timeout_s"] \
+        == heal.FIX_MAX_TIMEOUT_S
+    assert "fix_timeout_s" not in heal.validate({"check": "true", "fix": "true"})
+    with pytest.raises(ValueError, match="fix_detached"):
+        heal.validate({"check": "true", "fix_detached": "yes"})
+
 def _heal_told(p):
     """What a heal check has told anyone: user alerts and lines, asks, and coordinator observations."""
     return (p.db.q("SELECT kind, severity, ref, text FROM messages WHERE kind IN ('alert','info','ask') ORDER BY id"),

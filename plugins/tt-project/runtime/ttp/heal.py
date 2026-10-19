@@ -151,12 +151,23 @@ failed (above); a single known fault never does. An outage check's report carrie
 which keeps the page from escalating past the owner (machine_ledger: Quiet outages). The next healthy
 result reports it cleared.
 
+Long fixes: `fix_detached: true` runs the fix as a detached job (detach.start) the daemon tracks, for at
+most `fix_timeout_s` (FIX_TIMEOUT_S, capped at FIX_MAX_TIMEOUT_S) instead of `timeout_s`: a redeploy that
+takes minutes. Its job lives under state/heal-fix/<check>/ (fix.rc, fix.log). The job is `ttp lock <resource>`
+around the fix (as above), so the lock is held for the fix's whole run and released when it ends: the fix
+must run in the foreground, never detach itself. While it runs, each run of the schedule skips the check
+(check() reads 75, busy, for `ttp heal test` too) and comes back every FIX_POLL_S; a daemon restart keeps
+it. Its end is a fix's end: exit 0 settles and rechecks, the lock's 75 defers it, any other exit escalates.
+Past `fix_timeout_s` the daemon kills its process group (exit 124); a job gone without an exit code (a host
+reboot) is a failed fix with the reason.
+
 State lives in the database (kv `heal:<name>`), so a daemon restart, even in the middle of a fix,
 picks up where it was: a fix that started counts toward the cap, and the next run is its recheck,
 no earlier than `settle_s` after the fix started.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -202,6 +213,10 @@ HOST_RE = re.compile(r"[A-Za-z0-9_.:%\[\]][A-Za-z0-9_.:%\[\]-]*")   # one host n
 PING_S = 3                      # how long box_silent waits for each ping reply
 FINDINGS_MAX = 5               # distinct findings told per escalated episode (_escalated); later ones stay quiet
 FRESH_UNKNOWN_S = 900          # an unknown stretch shorter than this never starts a fresh episode (module doc)
+FIX_TIMEOUT_S = 1800            # fix_timeout_s default: a detached fix's longest run (module doc)
+FIX_MAX_TIMEOUT_S = 14400       # fix_timeout_s cap
+FIX_POLL_S = 60                 # a detached fix's end is looked for this often
+FIX_DIR = "heal-fix"            # state/heal-fix/<check>/: a detached fix's job
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 NOTE_MAX = 2000                 # self_fix_note cap: a longer note is cut to this
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
@@ -215,7 +230,8 @@ COMMON_FIELDS: dict[str, dict] = {
                      "ping_host", "ping_peer", "to", "self_fix_note"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
-    "outage": _FLAG, **dict.fromkeys(DEFAULTS, {"type": "number"})}
+    "outage": _FLAG, "fix_detached": _FLAG, "fix_timeout_s": {"type": "number"},
+    **dict.fromkeys(DEFAULTS, {"type": "number"})}
 PRESET_FIELDS: dict[str, dict[str, dict]] = {
     "systemd": {"unit": _TEXT, "user": _FLAG, "host": _TEXT},
     "http": {"url": _TEXT, "expect": {"type": "array", "items": {"type": "integer"}}},
@@ -262,6 +278,15 @@ def validate(block: Any, where: str = "heal") -> dict:
         raise ValueError(f"{where}: `to` is a project name or {pageto.OWNER}")
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
+    if not isinstance(out.get("fix_detached", False), bool):
+        raise ValueError(f"{where}: `fix_detached` is true or false")
+    if out.get("fix_detached"):
+        v = out.setdefault("fix_timeout_s", FIX_TIMEOUT_S)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            raise ValueError(f"{where}: `fix_timeout_s` is a number of seconds, above 0")
+        out["fix_timeout_s"] = min(v, FIX_MAX_TIMEOUT_S)
+    elif "fix_timeout_s" in out:
+        raise ValueError(f"{where}: `fix_timeout_s` is for a detached fix: set `fix_detached` true too")
     for k in ("ping_host", "ping_peer"):
         v = out.get(k)
         if v is not None and not (isinstance(v, str) and HOST_RE.fullmatch(v)):
@@ -514,6 +539,9 @@ _PRESET_CHECKS: dict[str, Callable[[dict, dict, str], tuple[int, str]]] = {
 def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[int, str]:
     """Run the check: (0 healthy | 1 unhealthy | other: unknown, its output). May update `state`.
     `env` is its project's (project.command_env), so a check calling `ttp lock` finds the project."""
+    job = state.get("fix_job")
+    if job and fix_running(job):   # its detached fix holds the resource: nothing to tell until it ends
+        return 75, f"busy: its detached fix is running ({time.time() - float(job.get('started') or 0):.0f} s)"
     fn = _PRESET_CHECKS.get(spec.get("preset") or "")
     if fn and not spec.get("check"):
         return fn(spec, state, cwd)
@@ -616,10 +644,58 @@ def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
     so a fix's own 75 comes back as FIX_OWN_75."""
     if not spec.get("resource"):
         return _shell(spec["fix"], cwd, spec["timeout_s"], env)
+    return _exec(_fix_argv(spec), cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env)
+
+
+def _fix_argv(spec: dict) -> list[str]:
+    if not spec.get("resource"):
+        return ["sh", "-c", spec["fix"]]
     wrap = f'sh -c "$1"; rc=$?; [ "$rc" -eq 75 ] && exit {FIX_OWN_75}; exit "$rc"'
-    argv = [sys.executable, "-m", "ttp", "lock", "--timeout", str(LOCK_WAIT_S), spec["resource"],
+    return [sys.executable, "-m", "ttp", "lock", "--timeout", str(LOCK_WAIT_S), spec["resource"],
             "--", "sh", "-c", wrap, "heal-fix", spec["fix"]]
-    return _exec(argv, cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env)
+
+
+def fix_dir(p: Any, name: str) -> Path:
+    """The folder of check `name`'s detached fix job (fix_detached, module doc)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:60]
+    return Path(p.state) / FIX_DIR / f"{safe}-{hashlib.sha1(name.encode()).hexdigest()[:8]}"
+
+
+def start_fix(p: Any, name: str, spec: dict, cwd: str, env: dict, now: float) -> tuple[dict | None, str]:
+    """Start the fix as a detached job (under `ttp lock <resource>` when it names one, so the lock is held
+    while it runs): its record {rc, pid, started}, or None and why it could not start. Not registered with
+    schedrun: a daemon stop or restart leaves it running."""
+    from . import detach, locks
+    from .runner import boot_id
+    d = fix_dir(p, name)
+    rc = d / "fix.rc"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        lock = locks.try_take([locks.job_lock(rc)], f"heal fix {name}", spec["fix"])
+    except OSError as e:
+        return None, str(e)
+    if lock is None:
+        return None, f"an earlier detached fix of {name} still runs ({d})"
+    try:
+        for f in (rc, rc.with_suffix(".log"), detach.lost(rc), detach.started(rc)):
+            f.unlink(missing_ok=True)
+        # The lock is the job's own, never one an outer `ttp lock` passed down to the daemon.
+        env = {k: v for k, v in env.items() if k not in ("TTP_LOCKS_HELD", "TTP_LOCKS_SHARED")}
+        pid = detach.start(rc, rc.with_suffix(".log"), _fix_argv(spec), cwd, env, lock)
+    except OSError as e:
+        return None, str(e)
+    finally:
+        lock.close()
+    try:   # detach.state reads the boot from it, to tell a reboot from a crash
+        (d / "detached.json").write_text(json.dumps([{"rc": str(rc), "pid": pid, "boot": boot_id(), "start": now}]))
+    except OSError:
+        pass
+    return {"rc": str(rc), "pid": pid, "started": now}, ""
+
+
+def fix_running(job: dict) -> bool:
+    from . import detach
+    return detach.state(Path(job["rc"]))[0] in ("running", "queued")
 
 
 # State --------------------------------------------------------------------------------------------
@@ -801,6 +877,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         from . import alerts
         alerts.close_key(db, STATE_KEY + name, "escalation moved to coordinator", now)
         st.pop("alerted", None)
+    if st.get("fix_job"):
+        ran = _fix_job(host, name, spec, st, now)
+        if ran is not None:
+            return ran
     cwd, env = str(p.root), command_env(p)
     if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
         # A restart cut the fix short: its recheck still waits for settle_s.
@@ -968,8 +1048,63 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     # Recorded before the fix runs: a restart in the middle still counts it, and rechecks next.
     deferred, deferred_on, told = (st.pop(k, None) for k in ("deferred_since", "deferred_on", "deferred_told"))
     st.update(fixes=fixes + [now], phase="fixing", fix_started=now)
-    _save(db, name, st)
-    frc, fout = run_fix(spec, cwd, env)
+    if spec.get("fix_detached"):
+        job, err = start_fix(p, name, spec, cwd, env, now)
+        if job:
+            st["fix_job"] = {**job, "fixes": fixes, "deferred": [deferred, deferred_on, told]}
+            _save(db, name, st)
+            return "unhealthy (detached fix started; rechecking when it ends)", now + FIX_POLL_S
+        frc, fout = 127, f"the detached fix could not start: {err}"
+    else:
+        _save(db, name, st)
+        frc, fout = run_fix(spec, cwd, env)
+    return _fix_ended(host, name, spec, st, now, frc, fout, fixes, deferred, deferred_on, told)
+
+
+def _fix_job(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[str, float | None] | None:
+    """A run while the check has a detached fix (module doc): busy while it runs, its end handled like a
+    fix's, or None once its record is stale (the check then runs as usual)."""
+    from . import detach
+    job = st["fix_job"]
+    rc = Path(str(job.get("rc") or ""))
+    if not job.get("rc"):
+        st.pop("fix_job", None)
+        return None
+    started = float(job.get("started") or now)
+    where, val = detach.state(rc)
+    if where in ("running", "queued"):
+        limit = float(spec.get("fix_timeout_s") or FIX_TIMEOUT_S)
+        if now - started < limit:
+            _save(host.p.db, name, st)
+            return (f"unhealthy (detached fix running {now - started:.0f} s; rechecking when it ends)",
+                    min(now + FIX_POLL_S, started + limit))
+        pid = int(job.get("pid") or 0)
+        if pid > 1:
+            detach.stop(rc, pid, f"ran past fix_timeout_s ({limit:.0f} s): killed by the daemon")
+        frc, fout = 124, f"the detached fix ran past fix_timeout_s ({limit:.0f} s): killed"
+    elif where == "ended":
+        try:
+            frc = int(val)
+        except ValueError:
+            frc = 1
+        try:
+            fout = rc.with_suffix(".log").read_text(errors="replace").strip()[-2000:]
+        except OSError:
+            fout = ""
+    else:
+        frc, fout = 1, f"the detached fix ended without an exit code: {val}"
+    st.pop("fix_job", None)
+    deferred, deferred_on, told = (list(job.get("deferred") or []) + [None] * 3)[:3]
+    fixes = [float(t) for t in job.get("fixes") or []]
+    return _fix_ended(host, name, spec, st, now, frc, fout, fixes, deferred, deferred_on, told)
+
+
+def _fix_ended(host: Any, name: str, spec: dict, st: dict, now: float, frc: int, fout: str, fixes: list,
+               deferred: Any, deferred_on: Any, told: Any) -> tuple[str, float | None]:
+    """The fix's result (it ran in the run, or as a detached job that ended): settle and recheck, defer
+    on a busy or paused lock, or escalate."""
+    db = host.p.db
+    window = spec["window_h"] * 3600
     st.update(fix_rc=frc, fix_out=fout[-1000:])
     if frc == 75 and spec.get("resource"):
         # Only the lock exits 75 here (run_fix): the fix never started. Not counted; try again next run.
