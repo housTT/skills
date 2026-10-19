@@ -238,3 +238,88 @@ def test_open_outage_tasks_show_in_status_web_and_the_sweep(env):
     p.db.update_task(tid, status="blocked")
     stuck = [i for i in sweep.items(p.db, now) if i["task"] == tid]
     assert len(stuck) == 1 and stuck[0]["kind"] == "outage" and "OVERDUE" in stuck[0]["reason"], stuck
+
+
+def test_known_outages_keep_one_entry_per_project_on_a_machine(env, capsys):
+    """[note 5c3a02eaf81d7794] Two projects' outages on one machine both stay: setting one again changes only
+    that project's entry, clearing one leaves the other in force, and the list, status and paging name each."""
+    import json as _json
+    from ttp.cli import main
+    alpha, ml, able = _quiet_box(env)
+    main(["machines", "outage", "box-a", "tray swap", "--expires", "1d", "--by", "alpha", "--covers", "tray"])
+    main(["machines", "outage", "box-a", "fan repair", "--expires", "3d", "--by", "gamma", "--owner", "a ticket"])
+    out = capsys.readouterr().out.splitlines()[-1]
+    assert "known outages from 2 projects" in out and "by alpha; covers: tray): tray swap" in out
+    assert "by gamma; owner: a ticket): fan repair" in out
+    main(["machines", "outage", "box-a", "tray swap, second try", "--expires", "2d", "--by", "alpha"])
+    assert "by gamma; owner: a ticket): fan repair" in capsys.readouterr().out
+    got = ml.outage_entries()["box-a"]
+    assert sorted(got) == ["alpha", "gamma"] and got["alpha"]["why"] == "tray swap, second try"
+    assert got["gamma"]["why"] == "fan repair" and "covers" not in got["alpha"]
+    o = ml.outages()["box-a"]
+    assert o["until"] == got["gamma"]["until"] and o["owner"] == "a ticket" and "covers" not in o
+    main(["machines", "outage", "box-a", "--json"])
+    assert [e["by"] for e in _json.loads(capsys.readouterr().out)["box-a"]["entries"]] == ["gamma", "alpha"]
+    main(["machines", "status", "box-a"])
+    out = capsys.readouterr().out
+    assert "tray swap, second try" in out and "fan repair" in out and "owner: a ticket" in out
+    t0 = time.time()
+    ml.report("delta", "box-a", "down", now=t0)
+    assert _walk(ml, able, t0 + 3600) == []
+    assert "gamma: fan repair; alpha: tray swap, second try" in ml.conditions()["box-a:down"]["page"]["quiet"]
+    # Clearing is per project too: another project's entry is not touched without --by.
+    main(["machines", "outage", "box-a", "--clear", "--by", "delta"])
+    assert "no known outage from delta; open from alpha, gamma" in capsys.readouterr().out
+    main(["machines", "outage", "box-a", "--clear", "--by", "alpha"])
+    assert "alpha's known outage cleared; still out" in capsys.readouterr().out
+    assert sorted(ml.outage_entries()["box-a"]) == ["gamma"]
+    assert ml.outage_line("box-a", ml.outages()["box-a"]).startswith("box-a: known outage until")
+
+
+def test_one_projects_outage_expiring_leaves_the_others_in_force(env):
+    alpha, ml, able = _quiet_box(env)
+    t0 = time.time()
+    ml.set_outage("box-a", "short repair", "alpha", "2h", now=t0)
+    ml.set_outage("box-a", "long repair", "gamma", "2d", now=t0, covers="fabric")
+    later = t0 + 3 * 3600
+    assert sorted(ml.outage_entries(later)["box-a"]) == ["gamma"]
+    o = ml.outages(later)["box-a"]
+    assert o["why"] == "long repair" and o["covers"] == ["fabric"]
+    ml.report("delta", "box-a", "down", now=later)
+    assert ml.quiet_reason(ml.conditions()["box-a:down"], later)[1], "still a known outage"
+    assert "box-a" not in ml.outages(t0 + 3 * 86400), "out only while an entry is open"
+    # Expired entries leave the file at the next write, and a new entry starts from the open ones only.
+    ml.set_outage("box-a", "next repair", "alpha", "1d", now=later)
+    assert sorted(ml._read(ml.ROUTES, {})[ml.OUTAGE_ENTRIES]["box-a"]) == ["alpha", "gamma"]
+
+
+def test_a_single_outage_record_from_an_older_runtime_migrates_without_loss(env):
+    """An older runtime (or state from before entries) keeps one record per machine under "outages": it is
+    read as its project's entry, kept when another project adds its own, and an older runtime overwriting or
+    clearing the machine's record still counts."""
+    alpha, ml, able = _quiet_box(env)
+    mm = __import__("ttp.machines", fromlist=["add"])
+    mm.add("box-b", tags="device")
+    t0 = time.time()
+    old = {"why": "board swap", "owner": "", "by": "gamma", "since": t0, "until": t0 + 86400}
+    with ml._locked():
+        ml._write(ml.ROUTES, {"conditions": {}, "outages": {"box-a": dict(old), "box-b": dict(old, by="")}})
+    assert ml.outage_entries(t0)["box-a"] == {"gamma": old} and list(ml.outage_entries(t0)["box-b"]) == ["user"]
+    assert ml.outages(t0)["box-a"]["why"] == "board swap"
+    ml.set_outage("box-a", "fan repair", "alpha", "2d", now=t0 + 60)
+    doc = ml._read(ml.ROUTES, {})
+    assert sorted(doc[ml.OUTAGE_ENTRIES]["box-a"]) == ["alpha", "gamma"]
+    assert doc["outages"]["box-a"]["until"] == t0 + 60 + 2 * 86400, "older readers see the merged record"
+    # An older runtime overwrites the machine's record: that becomes its project's entry, the others stay.
+    with ml._locked():
+        doc = ml._read(ml.ROUTES, {})
+        doc["outages"]["box-a"] = dict(old, why="board swap, part two", since=t0 + 120)
+        ml._write(ml.ROUTES, doc)
+    got = ml.outage_entries(t0 + 180)["box-a"]
+    assert got["gamma"]["why"] == "board swap, part two" and got["alpha"]["why"] == "fan repair"
+    # An older runtime clears the machine: every entry of it ends, as it meant.
+    with ml._locked():
+        doc = ml._read(ml.ROUTES, {})
+        doc["outages"].pop("box-a")
+        ml._write(ml.ROUTES, doc)
+    assert "box-a" not in ml.outages(t0 + 180) and "box-b" in ml.outages(t0 + 180)

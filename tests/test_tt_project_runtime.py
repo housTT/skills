@@ -42184,7 +42184,7 @@ def test_a_known_outage_pages_nobody_and_shows_in_the_daily_review(env, capsys):
     main(["machines", "outage"])
     assert "tray swap in progress" in capsys.readouterr().out
     # Once it is cleared, an outage nobody explained escalates again, from the owner.
-    main(["machines", "outage", "box-a", "--clear"])
+    main(["machines", "outage", "box-a", "--clear", "--by", "alpha"])
     t1 = t0 + 5 * ml.UNAVAILABLE_S
     ml.report("gamma", "box-a", "down", now=t1)
     # Nobody can act on it: the fallback gets the outage task at once, and the user hears once it is overdue.

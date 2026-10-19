@@ -24,6 +24,9 @@ recorded with `ttp machines outage <alias> "<why>" [--owner <who>] [--covers <pa
 hardware repair, often owned by a human or an external ticket; `covers`, optional, lists the parts it explains
 from OUTAGE_COVERS, or services on the machine by name, for co-tenant watchers and the harness's own heal checks,
 which it then quiets only for results it explains (heal.outage_explains)), or an open change that expects the condition (`--expect down`).
+Known outages are kept per machine and project: each project's entry is set again, expires and is cleared
+on its own (`--clear` ends only the caller's, or `--by <project>`'s), and the machine counts as out while
+any entry is open; status, the daily review and paging list every entry with its project, owner and end.
 The owner's first page still goes, but nothing escalates to the fallback or the user, while: the user paused
 a resource on the machine, a reporting heal check carries a `known_fault`, or no open task of any project on
 this machine uses it (a task's resource on it that its project paused does not count). A reporter this
@@ -98,6 +101,7 @@ CONDITIONS = ("down", "held")
 # the whole machine
 OUTAGE_COVERS = ("host", "power", "network", "tray", "chip", "fabric")
 COVER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # a service a known outage names
+OUTAGE_ENTRIES = "outage_entries"   # routes-file key: {alias: {project: known outage entry}}
 QUIET_KEPT_S = 2 * 86400     # a quiet outage's daily-review record is kept this long after it was last seen
 REVIEW_S = 86400             # the daily review lists the quiet outages seen within this
 GAP_KV = "machine_owner_gap_named"
@@ -469,9 +473,10 @@ def conditions() -> dict[str, dict]:
 def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None,
                covers: Any = None) -> dict:
     """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
-    about it meanwhile. `owner`: who has the repair, often a human or an external ticket. `covers`: the
-    parts it explains (OUTAGE_COVERS, or a service by name), stored for co-tenant watchers and heal
-    checks; none: the whole machine."""
+    about it meanwhile. `by`: the project recording it; each project keeps its own entry per machine (module
+    doc: Known outages), so this replaces only `by`'s. `owner`: who has the repair, often a human or an
+    external ticket. `covers`: the parts it explains (OUTAGE_COVERS, or a service by name), stored for
+    co-tenant watchers and heal checks; none: the whole machine. Returns the entry."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -481,13 +486,16 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
     if not expires:
         raise ValueError("give an end: --expires <delay or time>")
     parts = outage_covers(covers)
+    by = _one_line(by, 120) or "user"
     rec = {"why": why, "owner": _one_line(owner, 120), "by": by, "since": now,
            "until": ends.parse_expires(expires, now)}
     if parts:
         rec["covers"] = parts
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
-        doc.setdefault("outages", {})[alias] = rec
+        got = outage_entries(now, doc)
+        got.setdefault(alias, {})[by] = rec
+        _store_outages(doc, got)
         _write(ROUTES, doc)
     return rec
 
@@ -504,26 +512,91 @@ def outage_covers(covers: Any) -> list[str]:
     return [c for c in OUTAGE_COVERS if c in words] + sorted(words - set(OUTAGE_COVERS))
 
 
-def clear_outage(alias: str) -> bool:
+def clear_outage(alias: str, by: str | None = None, now: float | None = None) -> bool:
+    """End `by`'s outage entry on `alias` (None: every project's). Whether one was open."""
+    now = time.time() if now is None else now
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
-        if (doc.get("outages") or {}).pop(alias, None) is None:
+        got = outage_entries(now, doc)
+        mine = got.get(alias) or {}
+        if not mine or (by is not None and by not in mine):
             return False
+        if by is None:
+            got.pop(alias)
+        else:
+            mine.pop(by)
+            if not mine:
+                got.pop(alias)
+        _store_outages(doc, got)
         _write(ROUTES, doc)
     return True
 
 
-def outages(now: float | None = None, doc: dict | None = None) -> dict[str, dict]:
-    """{alias: record} of the known outages not yet past their end."""
+def outage_entries(now: float | None = None, doc: dict | None = None) -> dict[str, dict[str, dict]]:
+    """{alias: {project: entry}} of the known outages not yet past their end, each project's on its own.
+    The routes file keeps them in OUTAGE_ENTRIES and, for co-tenants on an older runtime, one merged record
+    per machine in "outages" (merged_outage, marked by its "entries"). A record there without that mark was
+    written by an older runtime (or before entries existed): it is that project's entry, so a single old
+    record migrates without loss. A machine missing from "outages" was cleared by an older runtime."""
     now = time.time() if now is None else now
-    got = (doc if doc is not None else _read(ROUTES, {"conditions": {}})).get("outages") or {}
-    return {a: o for a, o in got.items() if isinstance(o, dict) and float(o.get("until") or 0) > now}
+    doc = doc if doc is not None else _read(ROUTES, {"conditions": {}})
+    legacy = doc.get("outages") or {}
+    stored = doc.get(OUTAGE_ENTRIES) or {}
+    out: dict[str, dict[str, dict]] = {}
+    for alias, o in legacy.items():
+        if not isinstance(o, dict):
+            continue
+        mine = {by: dict(e) for by, e in (stored.get(alias) or {}).items() if isinstance(e, dict)}
+        if "entries" not in o and o.get("why"):
+            mine[str(o.get("by") or "user")] = {k: v for k, v in o.items() if k != "entries"}
+        mine = {by: e for by, e in mine.items() if float(e.get("until") or 0) > now}
+        if mine:
+            out[alias] = mine
+    return out
+
+
+def merged_outage(entries: dict[str, dict]) -> dict:
+    """One machine's open entries as one record, for readers of a single outage: out until the last ends,
+    since the first began; the reason and recording projects of each; the first owner given; covers only
+    what every entry explains together (an entry without covers: the whole machine). "entries": each entry
+    with its project, earliest first."""
+    es = sorted(entries.values(), key=lambda e: (float(e.get("since") or 0), str(e.get("by") or "")))
+    if len(es) == 1:
+        rec = dict(es[0])
+    else:
+        rec = {"why": "; ".join(f"{e.get('by') or '?'}: {e.get('why') or ''}" for e in es),
+               "owner": next((e["owner"] for e in es if e.get("owner")), ""),
+               "by": ", ".join(str(e.get("by") or "?") for e in es),
+               "since": min(float(e.get("since") or 0) for e in es),
+               "until": max(float(e.get("until") or 0) for e in es)}
+        if all(e.get("covers") for e in es):
+            rec["covers"] = outage_covers([c for e in es for c in e["covers"]])
+    rec["entries"] = [dict(e) for e in es]
+    return rec
+
+
+def _store_outages(doc: dict, got: dict[str, dict[str, dict]]) -> None:
+    doc[OUTAGE_ENTRIES] = got
+    doc["outages"] = {a: merged_outage(es) for a, es in got.items()}
+
+
+def outages(now: float | None = None, doc: dict | None = None) -> dict[str, dict]:
+    """{alias: merged record (merged_outage)} of the machines with a known outage not yet past its end: out
+    while any project's entry is open."""
+    return {a: merged_outage(es) for a, es in outage_entries(now, doc).items()}
 
 
 def outage_line(alias: str, o: dict, where=None) -> str:
-    owner = f"; owner: {o['owner']}" if o.get("owner") else ""
-    owner += f"; covers: {', '.join(o['covers'])}" if o.get("covers") else ""
-    return f"{alias}: known outage until {ends.shown(o['until'], where)} (by {o.get('by') or '?'}{owner}): {o['why']}"
+    """One machine's known outage on one line; with entries from several projects, each with its project,
+    owner, covers and end."""
+    def one(e: dict) -> str:
+        owner = f"; owner: {e['owner']}" if e.get("owner") else ""
+        owner += f"; covers: {', '.join(e['covers'])}" if e.get("covers") else ""
+        return f"until {ends.shown(e['until'], where)} (by {e.get('by') or '?'}{owner}): {e['why']}"
+    es = o.get("entries") or []
+    if len(es) > 1:
+        return f"{alias}: known outages from {len(es)} projects: " + "; ".join(one(e) for e in es)
+    return f"{alias}: known outage {one(es[0] if es else o)}"
 
 
 def on_machine(alias: str) -> Callable[[str], bool]:
@@ -866,7 +939,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             claim(c.get("task") or {})
         doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
                         if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
-        doc["outages"] = outages(now, doc)
+        _store_outages(doc, outage_entries(now, doc))
         _write(ROUTES, doc)
         ledger = _read(LEDGER, {"next": 1, "changes": []})
         changed = False

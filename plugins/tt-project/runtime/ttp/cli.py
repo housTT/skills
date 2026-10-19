@@ -4409,10 +4409,19 @@ def _machine_activity(a) -> None:
 def _machine_outage(a) -> None:
     """`ttp machines outage`: a known outage (hardware repair, an external ticket) that pages nobody."""
     from . import machine_ledger as ml
+    p = here()
+    by = a.by or (p.name if p else "user")
     if a.clear:
         if not a.alias:
             die("name the machine whose outage is over")
-        print(f"{a.alias}: known outage cleared" if ml.clear_outage(a.alias) else f"{a.alias}: no known outage")
+        if ml.clear_outage(a.alias, by):
+            left = ml.outages().get(a.alias)
+            print(f"{a.alias}: {by}'s known outage cleared"
+                  + (f"; still out: {ml.outage_line(a.alias, left)}" if left else ""))
+            return
+        others = sorted((ml.outage_entries().get(a.alias) or {}))
+        print(f"{a.alias}: no known outage from {by}"
+              + (f"; open from {', '.join(others)} (clear one with --by <project>)" if others else ""))
         return
     if not a.why:
         got = ml.outages()
@@ -4425,13 +4434,11 @@ def _machine_outage(a) -> None:
         if not got:
             print("no known outages")
         return
-    p = here()
     try:
-        rec = ml.set_outage(a.alias, a.why, a.by or (p.name if p else "user"), a.expires, owner=a.owner or "",
-                            covers=a.covers)
+        rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers)
     except ValueError as e:
         die(str(e))
-    print(ml.outage_line(a.alias, rec))
+    print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec))
 
 
 def _machine_change(a) -> None:
@@ -6614,7 +6621,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("why", nargs="?", help="why it is out, one line (none: show it)")
     m.add_argument("--owner", help="who has the repair: a person's role or a ticket, not a project")
     m.add_argument("--expires", help="when it ends: a delay (3d) or a time (required to record one)")
-    m.add_argument("--by", help="the project recording it (default: the project you are in)")
+    m.add_argument("--by", help="the project recording or clearing it (default: the project you are in); "
+                                "each project keeps its own entry per machine")
     m.add_argument("--covers", action="append",
                    help="what it explains, comma-separated: host, power, network, tray, chip, fabric or "
                         "a service's name (none: the whole machine). A heal check stays quiet only when "
@@ -6623,7 +6631,8 @@ def main(argv: list[str] | None = None) -> None:
                         "part stays quiet even when it fails for another reason; co-tenant watchers read "
                         "it from --json")
     m.add_argument("--json", action="store_true", help="list the known outages as JSON")
-    m.add_argument("--clear", action="store_true", help="the outage is over")
+    m.add_argument("--clear", action="store_true", help="the outage is over: ends only this project's (or --by's) "
+                                                         "entry; the machine stays out while another's is open")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
     cs = m.add_subparsers(dest="change", required=True)
     c = cs.add_parser("add", help="record a live change: what, how to undo it and when it ends")
