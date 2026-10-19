@@ -167,9 +167,8 @@ Each field's rules are in the section named; the table only lists them.
   its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
   a replacement without `continues` leaves its dependents blocked. On a done task it adds a
   follow-up (no dependents move; code starts from the base branch). A `continue:` follow-up
-  "NOT queued by the daemon" is yours to add. A `continue_cap` event refuses more hops:
-  re-plan, or give a `reason` naming what changed. `stale_duplicate`: cancel the task it names
-  unless it has work of its own.
+  "NOT queued by the daemon" is yours to add. `continue_cap` refuses more hops: re-plan or give
+  a `reason` naming what changed. `stale_duplicate`: cancel its task unless it has work of its own.
 - A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
   `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
   without it `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put "rebase" in its title.
