@@ -123,7 +123,7 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
                                        "files_version", "restart_pending")})
         row["asks"] = conn.execute("SELECT COUNT(*) FROM messages WHERE kind='ask' AND handled=0").fetchone()[0]
         from . import waits
-        row["waiting_on_user"] = len(waits.blocked(_ReadOnly(conn), now)[0])
+        row["waiting_on_user"] = len(waits.blocked(_ReadOnly(conn), now, ages=False)[0])
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
         from . import billing
         from .db import counted_spend

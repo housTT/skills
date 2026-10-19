@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from . import billing
 
 SCHEMA_VERSION = 1
+STUCK_STATUSES = "('blocked','waiting','review')"   # task statuses a stuck episode spans (tasks.stuck_since)
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
@@ -318,6 +319,7 @@ class DB:
         self._migrate_task_pin()
         self._migrate_message_context()
         self._migrate_issue_watch_key()
+        self._migrate_stuck_since()
 
     def _migrate_message_context(self) -> None:
         # A relayer's context, kept apart from the user's verbatim words. Older messages have none.
@@ -393,6 +395,22 @@ class DB:
             for col in ("model", "effort", "pin_verify"):
                 if col not in have:
                     self.x(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+
+    def _migrate_stuck_since(self) -> None:
+        # When a task last entered a stuck status (blocked, waiting, review) from any other, by a trigger
+        # on every status write, raw SQL included; NULL while not stuck. A write that keeps it stuck (a new
+        # reason, a hold, a spec addendum) never moves it. Older stuck tasks keep NULL: their entry is unknown.
+        if "stuck_since" not in {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
+            with self.tx():
+                if "stuck_since" not in {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
+                    self.x("ALTER TABLE tasks ADD COLUMN stuck_since REAL")
+        self.x(f"""CREATE TRIGGER IF NOT EXISTS tasks_stuck_since AFTER UPDATE OF status ON tasks
+WHEN (NEW.status IN {STUCK_STATUSES}) != (OLD.status IN {STUCK_STATUSES})
+BEGIN
+  UPDATE tasks SET stuck_since = CASE WHEN NEW.status IN {STUCK_STATUSES}
+    THEN COALESCE(NULLIF(NEW.updated, OLD.updated), (julianday('now') - 2440587.5) * 86400.0) END
+  WHERE id = NEW.id;
+END""")
 
     def _migrate_issue_opened(self) -> None:
         # When each issue's current open stretch began (screen._issue sets it on insert and on each

@@ -990,7 +990,7 @@ def status_text(p: Project) -> str:
     from . import waits
     you, stuck = waits.blocked(db, now, tz)
     for t in you[:6]:
-        lines.append(f"  needs you (#{t['id']}, {t['wait']['age']}): {t['title']} — {t['wait']['text']}")
+        lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]
     coord = "coordinator: no turn yet"
@@ -1048,7 +1048,7 @@ def status_text(p: Project) -> str:
     if stuck:
         lines.append("stuck, the project is on it:")
     for t in stuck[:8]:
-        lines.append(f"  #{t['id']} {t['wait']['age']}: {t['title']} — {t['wait']['text']}")
+        lines.append(f"  #{t['id']} {t['wait']['age_text']}: {t['title']} — {t['wait']['text']}")
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('review','pushing') "
                   "ORDER BY status, id LIMIT 8"):
         age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""

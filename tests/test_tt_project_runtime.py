@@ -35148,7 +35148,7 @@ def test_status_and_web_say_what_a_blocked_task_waits_on(env, reason, kind, text
     w = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)["wait"]
     assert (w["kind"], w["text"]) == (kind, text) and w["age"] == "0.0h" and w["asks"] == [], w
     out = status_text(p)
-    assert "stuck, the project is on it:" in out and f"  #{tid} 0.0h: cache layout — {text}" in out, out
+    assert "stuck, the project is on it:" in out and f"  #{tid} waiting 0.0h: cache layout — {text}" in out, out
     assert f"needs you (#{tid}" not in out, out
 
 
@@ -35167,8 +35167,8 @@ def test_a_task_an_open_ask_names_waits_on_the_user(env):
     assert w["kind"] == "user" and w["text"] == f"waits on you: ask {ask}" and w["asks"] == [ask], w
     assert next(t for t in st["tasks"] if t["id"] == other)["wait"]["kind"] == "coordinator"
     out = status_text(p)
-    assert f"  needs you (#{tid}, 0.0h): pick a vendor — waits on you: ask {ask}" in out, out
-    assert f"  #{other} 0.0h: other — waits on the coordinator" in out, out
+    assert f"  needs you (#{tid}, waiting 0.0h): pick a vendor — waits on you: ask {ask}" in out, out
+    assert f"  #{other} waiting 0.0h: other — waits on the coordinator" in out, out
     # Answered, it is the coordinator's again.
     p.db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
     assert f"needs you (#{tid}" not in status_text(p)
@@ -35203,10 +35203,10 @@ def test_status_and_web_read_a_hold_anchor_by_its_kind(env, anchor, kind, text):
     assert "free text" not in w["text"] and "test -f" not in w["text"], w
     out = status_text(p)
     if kind == "user":
-        assert f"  needs you (#{tid}, 0.0h): cache layout — {text}" in out, out
+        assert f"  needs you (#{tid}, waiting 0.0h): cache layout — {text}" in out, out
         assert "stuck, the project is on it:" not in out, out
     else:
-        assert f"  #{tid} 0.0h: cache layout — {text}" in out and f"needs you (#{tid}" not in out, out
+        assert f"  #{tid} waiting 0.0h: cache layout — {text}" in out and f"needs you (#{tid}" not in out, out
 
 
 def test_wait_kind_label_wins_and_queued_holds_read_plainly():
@@ -35292,7 +35292,7 @@ def test_waiting_on_you_counts_only_blocked_tasks_that_truly_wait_on_the_user(en
     # `ttp overview` counts through the same classifier over a read-only connection.
     conn = connect_ro(p.db.path)
     try:
-        assert len(waits.blocked(_ReadOnly(conn), now)[0]) == 3
+        assert len(waits.blocked(_ReadOnly(conn), now, ages=False)[0]) == 3
     finally:
         conn.close()
 
@@ -37628,6 +37628,8 @@ def test_reviews_fixes_and_re_reviews_of_a_pinned_task_keep_its_pin(env, monkeyp
 def _sweep_ev(db, tid, kind, text, ts):
     db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
          (ts, "t", kind, text, "handled", tid))
+    if kind in ("task_blocked", "task_waiting", "task_review"):   # a stuck hand-off updates its task with it
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (ts, tid))
 
 
 def test_blocker_sweep_is_due_every_interval_only_while_something_is_stuck(env):
@@ -37755,15 +37757,15 @@ def test_blocker_sweep_ages_a_reblocked_task_from_its_second_block(env):
     _sweep_ev(db, b, "task_blocked", f"#{b} run then re-blocked: second", now - 3 * 3600)
     c = db.add_task("coordinator re-block")
     db.update_task(c, status="blocked", blocked_reason="first")
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 10 * 3600, c))
+    db.x("UPDATE tasks SET updated=?, stuck_since=? WHERE id=?", (now - 10 * 3600, now - 10 * 3600, c))
     sweep.remember(db, sweep.items(db, now - 9 * 3600))               # first seen blocked 10 h ago
     _sweep_ev(db, c, "task_requeued", f"#{c} requeued", now - 5 * 3600)
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 1 * 3600, c))  # blocked again by the coordinator
+    db.x("UPDATE tasks SET updated=?, stuck_since=? WHERE id=?", (now - 3600, now - 3600, c))  # blocked again by the coordinator
     d = db.add_task("event block, then coordinator re-block")
     db.update_task(d, status="blocked", blocked_reason="first")
     _sweep_ev(db, d, "task_blocked", f"#{d} event block: first", now - 10 * 3600)
     _sweep_ev(db, d, "task_requeued", f"#{d} requeued", now - 5 * 3600)
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 1 * 3600, d))  # blocked again, no task_blocked event
+    db.x("UPDATE tasks SET updated=?, stuck_since=? WHERE id=?", (now - 3600, now - 3600, d))  # blocked again, no event
     ages = {i["task"]: round(i["age_s"] / 3600, 1) for i in sweep.items(db, now)}
     assert ages == {a: 2.0, b: 3.0, c: 1.0, d: 1.0}
 
@@ -37776,10 +37778,11 @@ def test_blocker_sweep_refreshes_a_first_seen_time_stale_from_an_unobserved_requ
     db, now = p.db, time.time()
     t = db.add_task("coordinator re-block, unobserved")
     db.update_task(t, status="blocked", blocked_reason="first")
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 10 * 3600, t))
+    db.x("UPDATE tasks SET updated=?, stuck_since=NULL WHERE id=?", (now - 10 * 3600, t))   # from before stuck_since
+    db.set_kv(sweep.STATE_KEY, {"seen": {f"task:{t}": {"status": "blocked", "since": now - 10 * 3600}}})
     sweep.remember(db, sweep.items(db, now - 9 * 3600))               # first seen blocked 10 h ago
     _sweep_ev(db, t, "task_requeued", f"#{t} requeued", now - 5 * 3600)
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 3 * 3600, t))  # blocked again, never seen queued
+    db.x("UPDATE tasks SET updated=?, stuck_since=? WHERE id=?", (now - 3 * 3600, now - 3 * 3600, t))  # blocked again, never seen queued
     sweep.remember(db, sweep.items(db, now - 2 * 3600))
     db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 60, t))        # a later spec addendum
     [i] = sweep.items(db, now)

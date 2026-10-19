@@ -11033,7 +11033,7 @@ def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
     assert db.task(t)["status"] == "blocked"
     assert not db.q("SELECT id FROM events WHERE task=? AND kind='task_blocked'", (t,))
     then = time.time() - 20 * 3600
-    db.x("UPDATE tasks SET updated=? WHERE id=?", (then, t))
+    db.x("UPDATE tasks SET updated=?, stuck_since=? WHERE id=?", (then, then, t))
     assert sweep.due(db, p.config(), then + 60) == "every 6h"       # the daemon's minute check sees it
     now = time.time()
     db.update_task(t, spec="do the thing\n\nAddendum: accepted evidence only; retain blocked status")
@@ -11043,8 +11043,8 @@ def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
     sweep.start(db, p.config(), "every 6h", now)                    # a sweep keeps it too
     db.update_task(t, blocked_reason="still no rig")
     assert round(sweep.items(db, now + 3600)[0]["age_s"] / 3600) == 21
-    db.x("UPDATE tasks SET updated=NULL WHERE id=?", (t,))
-    db.set_kv(sweep.STATE_KEY, {})                                   # no source at all: unknown, not 0
+    db.x("UPDATE tasks SET stuck_since=NULL WHERE id=?", (t,))
+    db.set_kv(sweep.STATE_KEY, {})               # no entry time at all: unknown, never its last update
     [i] = sweep.items(db, now)
     assert i["age_s"] is None and sweep._dur(i["age_s"]) == "unknown"
 
@@ -13100,3 +13100,35 @@ def test_archive_keeps_a_hidden_user_decision_while_a_non_user_one_of_its_age_st
     newer = p.add_memory("Routine: a newer fact.", kind="fact")
     p.note_memory_shown([newer.stem], now=time.time())
     assert p.archive_hidden_memory(7) == [user.stem] and not user.exists()
+
+
+def test_stuck_age_is_the_episode_start_not_the_last_update(env):
+    """A reason or hold update keeps a stuck task's episode start; leaving the stuck statuses and
+    coming back starts a new one; with no entry time the age is unknown, never the last update."""
+    p = make(env)
+    from ttp import sweep, waits
+    db = p.db
+    t = db.add_task("held thing", spec="x")
+    db.update_task(t, status="blocked", blocked_reason="first reason")
+    start = db.task(t)["stuck_since"]
+    assert start is not None
+    then = time.time() - 50 * 3600
+    db.x("UPDATE tasks SET stuck_since=?, updated=? WHERE id=?", (then, then, t))
+    db.update_task(t, blocked_reason="a new reason")                  # reason-only update
+    db.update_task(t, status="waiting")                               # still stuck: same episode
+    db.update_task(t, status="blocked")
+    assert db.task(t)["stuck_since"] == then
+    now = time.time()
+    w = waits.blocked(db, now)[1][0]["wait"]
+    assert w["since"] == then and w["age"] == "50.0h"
+    assert w["age_text"] == "waiting 50.0h, last update 0.0h ago"
+    assert [i for i in sweep.items(db, now) if i.get("task") == t][0]["since"] == then
+    db.update_task(t, status="queued")                                # a real transition ends it
+    assert db.task(t)["stuck_since"] is None
+    db.update_task(t, status="blocked", blocked_reason="again")
+    assert db.task(t)["stuck_since"] > then + 49 * 3600               # a new episode
+    db.x("UPDATE tasks SET stuck_since=NULL WHERE id=?", (t,))
+    db.set_kv(sweep.STATE_KEY, {})
+    w = waits.blocked(db, time.time())[1][0]["wait"]
+    assert w["since"] is None and w["age"] == "unknown"
+    assert w["age_text"].startswith("waiting since an unknown time")

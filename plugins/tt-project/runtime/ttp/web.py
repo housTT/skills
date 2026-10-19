@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, obligations, outagetask, projpause, pushq, release, responsibilities, timefmt, waits
+from . import credits, heal, identity, obligations, outagetask, projpause, pushq, release, responsibilities, sweep, timefmt, waits
 from . import schedule as sched
 from . import startgate, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -317,7 +317,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                 and t["id"] not in held_ids)
     # Only a blocked task that truly waits on the user counts as waiting on you (waits.split);
     # the rest wait on the coordinator, a resource or a time and get a neutral 'held' line.
-    on_you, held_tasks = waits.blocked(db, now, tz)
+    on_you, held_tasks = waits.blocked(db, now, tz, ages=False)
     blocked = len(on_you)
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
@@ -551,7 +551,7 @@ def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
-                 "origin,branch,pr_url,blocked_reason,not_before,created,updated,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
+                 "origin,branch,pr_url,blocked_reason,not_before,created,updated,stuck_since,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'pushing' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
@@ -562,6 +562,7 @@ def state_payload(p: Project, db: DB) -> dict:
     asks = waits.open_asks(db)
     job_use = db.kv("job_use", {}) or {}
     paused = db.paused_resources()
+    entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
     for t in tasks:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
@@ -574,7 +575,7 @@ def state_payload(p: Project, db: DB) -> dict:
         # Plain words for the board; the probe itself stays in start_when, the task's detail.
         t["starts"] = coord.starts_text(t, now, plain=True, where=tz, db=db) if t["status"] == "queued" else ""
         t["gate"] = startgate.view(db, t, now, warn_s, start_gates) if t["status"] == "queued" else None
-        t["wait"] = waits.wait_kind(t, asks, now, tz, paused) if t["status"] == "blocked" else None
+        t["wait"] = waits.wait_kind(t, asks, now, tz, paused, entered.get(t["id"])) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
                  start_after=d.get("after"), start_when=d.get("when"), start_why=d.get("why"),

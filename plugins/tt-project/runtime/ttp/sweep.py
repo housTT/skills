@@ -95,6 +95,15 @@ def _dur(s: float | None) -> str:
     return "unknown" if s is None else f"{max(0.0, s) / 3600:.1f}h"
 
 
+def _updated(i: dict, now: float) -> str:
+    """', last update 2.0h ago' for a stuck task updated (a reason, hold or addendum) after it got stuck:
+    the item's age stays its episode's; '' when there is no later update."""
+    upd, since = i.get("updated"), i.get("since")
+    if not isinstance(upd, (int, float)) or (isinstance(since, (int, float)) and upd - since < 60):
+        return ""
+    return f", last update {_dur(now - upd)} ago"
+
+
 def _clip(text: Any, n: int = REASON_CHARS) -> str:
     s = " ".join(str(text or "").split())
     return s if len(s) <= n else s[:n - 1] + "…"
@@ -186,6 +195,33 @@ def _moved_at(db: DB, tid: int) -> float:
     return max(float((ev or {}).get("ts") or 0), float((run or {}).get("ts") or 0))
 
 
+def _seen_since(db: DB, t: dict, seen: dict) -> float | None:
+    """When the sweep first saw task `t` in its status (remember()), unless it moved on since: None if never."""
+    prev = seen.get(f"task:{t['id']}") or {}
+    start = prev.get("since") if prev.get("status") == t["status"] else None
+    return float(start) if isinstance(start, (int, float)) and start >= _moved_at(db, t["id"]) else None
+
+
+def entered(db: DB, t: dict, now: float, seen: dict | None = None) -> float | None:
+    """When task `t` entered the stuck episode it is in (blocked, waiting or review): the start of its
+    open stuck episode (unblock._task_episodes, the audit's), else when its status last turned stuck
+    (tasks.stuck_since), else when the sweep first saw it so (`seen`, the STATE_KEY map; read when None),
+    else None: unknown. Never its last update: a new reason, hold or addendum is not a new episode."""
+    eps = unblock._task_episodes(db, t, now)
+    if eps and eps[-1]["open"]:
+        return eps[-1]["start"]
+    if isinstance(t.get("stuck_since"), (int, float)):
+        return float(t["stuck_since"])
+    seen = (db.kv(STATE_KEY, {}) or {}).get("seen") or {} if seen is None else seen
+    return _seen_since(db, t, seen)
+
+
+def entered_map(db: DB, tasks: list[dict], now: float) -> dict[int, float | None]:
+    """entered() of each task, reading the sweep's first-seen map once."""
+    seen = (db.kv(STATE_KEY, {}) or {}).get("seen") or {}
+    return {t["id"]: entered(db, t, now, seen) for t in tasks}
+
+
 def planned_deferrals(db: DB, now: float | None = None) -> int:
     """Queued tasks deliberately deferred, their start_after still ahead: not stuck, so left out of items()."""
     now = time.time() if now is None else now
@@ -198,8 +234,8 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
     review, deferred, paused, user-pause (a task whose only hold is a user-pause probe), promise, outage (an open
     outage task, outagetask.py: its age from the outage's start, its due time; no outcome needed until due). `ends` is "user"
     or "time" for a hold no turn can lift (a user pause or user-set resource pause, a time-only deferral), else None. A task's age comes from its open stuck episode (unblock._task_episodes);
-    without that history (a block the coordinator set) from when the sweep first saw it in this status
-    (remember()), first seeded from its last update, so a later update (an addendum) never resets it.
+    without that history (a block the coordinator set) from when its status turned stuck (entered()), never
+    from its last update (`updated`, shown apart), so a later update (an addendum) never resets it.
     Times in reasons are in the home zone of `where` (a Project, its settings or a zone name; None is UTC)."""
     now = time.time() if now is None else now
     out: list[dict] = []
@@ -226,12 +262,7 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
             last = _last_stuck_events(db, t["id"], 1)
             if kind == "waiting" and last and last[0]["kind"] == "task_waiting" and unblock.is_self_wait(last[0]["data"]):
                 continue
-            if kind == "review":
-                start = since_review.get(t["id"])
-            else:
-                eps = unblock._task_episodes(db, t, now)
-                if eps and eps[-1]["open"]:
-                    start = eps[-1]["start"]
+            start = since_review.get(t["id"]) if kind == "review" else entered(db, t, now, seen)
             if kind == "waiting" and last:
                 reason = _clip(unblock.wait_reason(last[0])) or reason
             if kind == "blocked" and settinghold.held_key(t):
@@ -244,13 +275,10 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
             ends, cover = "user", min(covers[n] for n in names)
             reason = _clip(f"held by user pause on {', '.join(names)}" + (f"; {reason}" if reason else ""))
         if not isinstance(start, (int, float)):
-            prev = seen.get(f"task:{t['id']}") or {}
-            start = prev.get("since") if prev.get("status") == t["status"] else None
-            if not isinstance(start, (int, float)) or start < _moved_at(db, t["id"]):
-                start = float(t["updated"]) if t["updated"] else None
+            start = _seen_since(db, t, seen)
         out.append({"key": f"task:{t['id']}", "kind": kind, "task": t["id"], "resource": None,
                     "title": t["title"], "age_s": None if start is None else max(0.0, now - float(start)),
-                    "since": start, "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t),
+                    "since": start, "updated": t["updated"], "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t),
                     "ends": ends, **({"cover": cover} if cover is not None else {})})
     for name, v in sorted(paused.items()):
         since = v.get("since") if isinstance(v.get("since"), (int, float)) else None
@@ -748,7 +776,7 @@ def _line(i: dict, state: dict, outs: dict, now: float) -> str:
         o = outs.get(i["key"])
         tail = "; its probe still says not yet, unchanged" if o and float(o.get("next") or 0) <= now else ""
         return f"- {who} | CARRIED (no action): {_last_check(o, now)}{tail}"
-    line = f"- {who} | {i['kind']} {_dur(i['age_s'])} | {_clip(i['reason']) or 'no reason given'} | " \
+    line = f"- {who} | {i['kind']} {_dur(i['age_s'])}{_updated(i, now)} | {_clip(i['reason']) or 'no reason given'} | " \
            f"{_last_check(outs.get(i['key']), now)}"
     for field, label in (("flags", "FLAG"), ("loops", "LOOP"), ("reviews", "review")):
         value = (state.get(field) or {}).get(i["key"])
@@ -864,7 +892,7 @@ def review_lines(db: DB, now: float | None = None, hours: float = REVIEW_LONG_H,
     for i in sorted(rows, key=lambda x: -x["age_s"]):
         who = _who(i, 60)
         o = outs.get(i["key"])
-        out.append(f"{who}: {i['kind']} {_dur(i['age_s'])}: {i['reason'] or 'no reason given'}; sweep: "
+        out.append(f"{who}: {i['kind']} {_dur(i['age_s'])}{_updated(i, now)}: {i['reason'] or 'no reason given'}; sweep: "
                    + (f"{o['outcome']} {_dur(now - float(o['ts']))} ago" if o
                       else f"none needed (ends by {i['ends']})" if i.get("ends") else "no outcome yet")
                    + (" (LOOP)" if i["key"] in loops else ""))

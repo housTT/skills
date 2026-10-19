@@ -109,15 +109,19 @@ def _user_paused(detail: str, paused: dict | None) -> str:
 
 
 def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where=None,
-              paused: dict | None = None) -> dict:
-    """What `task` waits on: {"kind": one of KINDS, "text": "waits on ...", "since": epoch,
-    "age": "3.2h", "asks": [ask ids]}. The `waits:` label wins, then open asks that name the
-    task, then the blocked_reason's prefix. A hold on an ask that is no longer open waits on the
-    coordinator; a resource wait is the user's only when `paused` (DB.paused_resources) says the user
-    paused it. A time is shown in the home zone `where` (UTC without one)."""
+              paused: dict | None = None, entered: float | None = None) -> dict:
+    """What `task` waits on: {"kind": one of KINDS, "text": "waits on ...", "since": epoch or None,
+    "age": "3.2h" or "unknown", "updated": epoch or None, "age_text": "waiting 3.2h, last update 0.5h ago",
+    "asks": [ask ids]}. The `waits:` label wins, then open asks that name the task, then the
+    blocked_reason's prefix. A hold on an ask that is no longer open waits on the coordinator; a resource
+    wait is the user's only when `paused` (DB.paused_resources) says the user paused it. A time is shown
+    in the home zone `where` (UTC without one).
+    `since` is when the wait began: the oldest open ask it waits on, else `entered` (sweep.entered, when
+    the stuck episode began), else unknown. The last update (a new reason or hold) is `updated`, apart:
+    it never stands in for the start."""
     from .anchors import anchor
     now = time.time() if now is None else now
-    since = float(task.get("updated") or task.get("created") or now)
+    since = float(entered) if isinstance(entered, (int, float)) else None
     linked = asks_for(task["id"], open_asks)
     lab = _label(task)
     held = _held_ask(task)
@@ -130,10 +134,10 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
             # The ask was answered or withdrawn (or never sent): acting on it is the coordinator's.
             kind, detail = "coordinator", (f"the answer to ask {held}" if held is not None else "an ask not sent")
         elif held is not None and linked:
-            since = min(float(a.get("ts") or since) for a in linked)
+            since = _asked(linked, since)
     elif linked:
         kind, detail = "user", ", ".join(f"ask {a['id']}" for a in linked)
-        since = min(float(a.get("ts") or since) for a in linked)
+        since = _asked(linked, since)
     elif task.get("status") == "review":
         kind, detail = "review", ""
     else:
@@ -146,29 +150,47 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
         text = f"waits on {_clip(detail)}"
     else:
         text = f"waits on {_WHO[kind]}" + (f": {_clip(detail)}" if detail else "")
-    age_s = max(0.0, now - since)
-    return {"kind": kind, "text": text, "since": since, "age": f"{age_s / 3600:.1f}h",
+    age = "unknown" if since is None else _hours(now - since)
+    upd = float(task["updated"]) if isinstance(task.get("updated"), (int, float)) else None
+    age_text = f"waiting {age}" if since is not None else "waiting since an unknown time"
+    if upd is not None and (since is None or upd - since >= 60):
+        age_text += f", last update {_hours(now - upd)} ago"
+    return {"kind": kind, "text": text, "since": since, "age": age, "updated": upd, "age_text": age_text,
             "asks": [a["id"] for a in linked]}
 
 
+def _hours(s: float) -> str:
+    return f"{max(0.0, s) / 3600:.1f}h"
+
+
+def _asked(linked: list[dict], since: float | None) -> float | None:
+    """When the oldest of these asks was sent, else `since`."""
+    sent = [float(a["ts"]) for a in linked if a.get("ts")]
+    return min(sent) if sent else since
+
+
 def split(tasks: list[dict], open_asks: list[dict], now: float | None = None, where=None,
-          paused: dict | None = None) -> tuple[list[dict], list[dict]]:
+          paused: dict | None = None, entered: dict | None = None) -> tuple[list[dict], list[dict]]:
     """Blocked tasks as (waiting on the user, stuck with the project on it), each task with its
-    `wait` (see wait_kind)."""
+    `wait` (see wait_kind); `entered` is {task id: when its stuck episode began} (unknown if absent)."""
     you, stuck = [], []
     for t in tasks:
         if t.get("status") != "blocked":
             continue
-        w = wait_kind(t, open_asks, now, where, paused)
+        w = wait_kind(t, open_asks, now, where, paused, (entered or {}).get(t["id"]))
         (you if w["kind"] == "user" else stuck).append({**t, "wait": w})
     return you, stuck
 
 
-def blocked(db, now: float | None = None, where=None) -> tuple[list[dict], list[dict]]:
+def blocked(db, now: float | None = None, where=None, ages: bool = True) -> tuple[list[dict], list[dict]]:
     """`split` of the project's blocked tasks against its open asks and resource pauses: the one
-    count of what waits on the user, for `ttp status`, the web app and `ttp overview`."""
-    return split(db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id"), open_asks(db),
-                 now, where, db.paused_resources())
+    count of what waits on the user, for `ttp status`, the web app and `ttp overview` (which only
+    counts: `ages` False leaves each wait's start unknown)."""
+    from .sweep import entered_map
+    tasks = db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id")
+    now = time.time() if now is None else now
+    return split(tasks, open_asks(db), now, where, db.paused_resources(),
+                 entered_map(db, tasks, now) if ages else None)
 
 
 def held_line(stuck: list[dict]) -> str:
