@@ -717,7 +717,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self._send(409, {"error": str(e)})
                 if "enabled" in body:
-                    db.x("UPDATE schedules SET enabled=? WHERE name=?", (int(bool(body["enabled"])), name))
+                    sched.set_enabled(db, name, bool(body["enabled"]), home=timefmt.home(own))
                 if "budget_usd_day" in body:
                     v = body["budget_usd_day"]
                     db.x("UPDATE schedules SET budget_usd_day=? WHERE name=?", (None if v in (None, "") else float(v), name))

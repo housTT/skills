@@ -83,3 +83,56 @@ def test_a_schedule_missed_while_the_host_slept_is_no_gap(env):
     d._started = now - 10 * 3600
     d.run_schedules()
     assert not _gap_events(p)
+
+
+def test_overlapping_sleep_and_pause_windows_are_taken_off_once(env):
+    from ttp import schedule as sched
+    now = time.time()
+    row = {"next_run": now - 5 * 3600, "every_s": 1800, "last_run": now - 86400}
+    both = [[now - 3 * 3600, now - 3600], [now - 2 * 3600, now - 1800]]   # 2.5 h off, not 3 h
+    assert sched.missed(row, now, both) == 5
+
+
+def test_a_project_pause_while_the_daemon_ran_is_no_gap(env):
+    """Nothing runs while the project is paused (Daemon.tick returns before run_schedules), by design:
+    after the resume every schedule is hours late, which is no held-up tick."""
+    from ttp import projpause
+    from ttp.daemon import Daemon
+    p = make(env)
+    _late_schedule(p, 3 * 3600)
+    now = time.time()
+    projpause.pause(p.db, "user", "maintenance", now=now - 3 * 3600 - 60)   # as db.set_paused does
+    p.db.set_kv("paused", True)
+    projpause.resume(p.db, "user", now=now - 30)
+    p.db.set_kv("paused", False)
+    d = Daemon(p.base)
+    d.gates = {}
+    d._started = now - 10 * 3600
+    d.run_schedules()
+    assert not _gap_events(p)
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='watch'")["last_run"] >= now - 5   # it ran
+
+
+def test_a_schedule_disabled_then_re_enabled_is_no_gap(env):
+    """Re-enabling (the web app, sched.set_enabled; or the schedules file, upsert) starts from the next
+    slot from now, so the hours it was off are no missed runs."""
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    for how in ("web", "file"):
+        _late_schedule(p, 3 * 3600)
+        p.db.x("UPDATE schedules SET enabled=0 WHERE name='watch'")
+        now = time.time()
+        if how == "web":
+            sched.set_enabled(p.db, "watch", True)
+        else:
+            sched.upsert(p.db, "watch", "command", "30m", payload={"command": "true", "timeout_s": 30})
+        row = p.db.one("SELECT enabled, next_run FROM schedules WHERE name='watch'")
+        assert row["enabled"] == 1 and now < row["next_run"] <= time.time() + 1800, how
+        d = Daemon(p.base)
+        d.gates = {}
+        d._started = now - 10 * 3600
+        d.run_schedules()
+        assert not _gap_events(p), how
+    sched.set_enabled(p.db, "watch", False)   # turning one off keeps its next run
+    assert p.db.one("SELECT enabled FROM schedules WHERE name='watch'")["enabled"] == 0

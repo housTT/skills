@@ -98,13 +98,29 @@ def upsert(db: DB, name: str, kind: str, every: str | int, at: str | None = None
     existing = db.one("SELECT * FROM schedules WHERE name=?", (name,))
     same_at = bool(existing) and (existing["at"] or None) == at
     tz = existing.get("tz") if same_at else None
-    nxt = existing["next_run"] if existing and existing["next_run"] and same_at else \
-        next_run(every_s, at, time.time(), zone_of({"tz": tz}, home))
+    keep = existing and existing["next_run"] and same_at and not reenabled(existing, enabled)
+    nxt = existing["next_run"] if keep else next_run(every_s, at, time.time(), zone_of({"tz": tz}, home))
     db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,budget_usd_day,description,payload,next_run,tz) "
          "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, every_s=excluded.every_s, "
          "at=excluded.at, enabled=excluded.enabled, budget_usd_day=excluded.budget_usd_day, "
          "description=excluded.description, payload=excluded.payload, next_run=excluded.next_run, tz=excluded.tz",
          (name, kind, every_s, at, int(enabled), budget_usd_day, description, json.dumps(payload or {}), nxt, tz))
+
+
+def reenabled(row: dict, enabled: bool, now: float | None = None) -> bool:
+    """A disabled schedule turned on again with its next run in the past: it starts from its next
+    slot from now, so the time it was off is no missed runs (missed) and no burst of catch-up."""
+    return bool(enabled) and not row["enabled"] and float(row["next_run"] or 0) <= (now or time.time())
+
+
+def set_enabled(db: DB, name: str, enabled: bool, home: str | None = None) -> None:
+    """Turn schedule `name` on or off (see reenabled)."""
+    row = db.one("SELECT * FROM schedules WHERE name=?", (name,))
+    if row is None:
+        return
+    nxt = next_run(int(row["every_s"]), row["at"], time.time(), zone_of(row, home)) \
+        if reenabled(row, enabled) else row["next_run"]
+    db.x("UPDATE schedules SET enabled=?, next_run=? WHERE name=?", (int(bool(enabled)), nxt, name))
 
 
 def due(db: DB, now: float | None = None) -> list[dict]:
@@ -118,14 +134,17 @@ GAP_MIN_S = 3600   # a schedule starting this late, and at least one whole perio
 
 def missed(row: dict, now: float, sleeps: list | None = None) -> int:
     """How many whole periods a due schedule's run starts late: 0 when it is less than a period or
-    GAP_MIN_S late, or never ran. Time the host slept (`sleeps`, [start, end] pairs) is no gap: a
-    schedule missed while the machine slept runs once on wake, by design. Anything else that long
-    (the host or the daemon down, a tick held up) left a hole in what the schedule records."""
+    GAP_MIN_S late, or never ran. Time the host slept or the project was paused (`sleeps`, [start,
+    end] pairs, may overlap) is no gap: a schedule missed then runs once after, by design. Anything
+    else that long (the host or the daemon down, a tick held up) left a hole in what it records."""
     nxt, every = row.get("next_run"), int(row.get("every_s") or 0)
     if nxt is None or every <= 0 or not row.get("last_run"):
         return 0
-    late = now - float(nxt) - sum(max(0.0, min(float(b), now) - max(float(a), float(nxt)))
-                                  for a, b in sleeps or [])
+    off, end = 0.0, float(nxt)
+    for a, b in sorted((max(float(a), float(nxt)), min(float(b), now)) for a, b in sleeps or []):
+        if b > max(a, end):
+            off, end = off + b - max(a, end), b
+    late = now - float(nxt) - off
     return int(late // every) if late >= max(every, GAP_MIN_S) else 0
 
 

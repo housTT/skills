@@ -4024,6 +4024,8 @@ class Daemon:
         any other is a normal observation, so a crash, an outage or a stuck tick is never silent."""
         db, now = self.p.db, time.time()
         sleeps = db.kv("host_sleeps", []) or []
+        if due:   # a project pause is no gap either: nothing runs while paused, by design
+            sleeps = sleeps + projpause.windows(db, min(float(s["next_run"]) for s in due), now)
         gaps = [(s, n) for s in due if (n := sched.missed(s, now, sleeps))]
         if not gaps:
             return

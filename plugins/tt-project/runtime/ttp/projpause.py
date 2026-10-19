@@ -105,6 +105,23 @@ def current(db, now: float | None = None) -> dict | None:
             "since": float(row["ts"] if row and row["ts"] else (now or time.time()))}
 
 
+def windows(db, since: float, now: float | None = None) -> list[list[float]]:
+    """[start, end] of each project pause that ended after `since` (from its resume event), plus
+    the current one up to now: time nothing ran by design, like host sleep (schedule.missed)."""
+    now = time.time() if now is None else now
+    out = []
+    for r in db.q("SELECT ts, data FROM events WHERE source='harness' AND kind='project_pause' AND ts>? "
+                  "ORDER BY ts, id", (since,)):
+        d = json.loads(r["data"] or "{}")
+        start = (d.get("paused") or {}).get("since") if d.get("action") == "resume" else None
+        if start is not None:
+            out.append([float(start), float(r["ts"])])
+    cur = current(db, now)
+    if cur:
+        out.append([float(cur["since"]), now])
+    return out
+
+
 def adopt_unknown(db, now: float | None = None) -> dict | None:
     """A pause found with no record (daemon start, a raw write) is recorded as by unknown, once."""
     info = current(db, now)
