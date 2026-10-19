@@ -37,6 +37,7 @@ from . import alerts
 from . import anchors
 from . import askrethink
 from . import audit
+from . import replica
 from . import awake
 from . import budget as bud
 from . import budgetkind
@@ -593,6 +594,9 @@ class Daemon:
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
+        self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
+        self._replica_checked = 0.0
+        self._replica_stale: bool | None = None   # None: not looked since start
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -960,7 +964,7 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
-                     self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
+                     self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
@@ -5829,6 +5833,47 @@ class Daemon:
             job["done"].set()
         self._backup_job = job
         threading.Thread(target=work, daemon=True).start()
+
+    def replicate_state(self, check_every_s: float = 60) -> None:
+        """Ship a state snapshot to failover.standby when one is due (replica.py): in a thread, one at
+        a time, with a project of its own (the database connection stays in this thread). While the
+        newest snapshot is stale, one keyed observation; closed once a fresh one ships. Nothing is read
+        while failover.standby is unset. Seam for the project lease: only its holder should snapshot."""
+        if self._replica_job is not None and not self._replica_job.is_alive():
+            self._replica_job = None
+        s = replica.settings(self.cfg)
+        now = time.time()
+        if not s or now - self._replica_checked < check_every_s:
+            return
+        self._replica_checked = now
+        st = replica.load_state(self.p)
+        if self._replica_job is None and not st.get("since"):
+            st["since"] = now   # when it was turned on: a snapshot that never ships goes stale from here
+            replica._save_state(self.p, st)
+        stale = replica.stale_text(self.p, self.cfg, now)
+        if stale and not self._replica_stale:
+            self.observe(replica.OBS_SOURCE, stale, "normal", key=replica.OBS_KEY, whole=True)
+        elif not stale and self._replica_stale is not False:
+            scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="a fresh snapshot reached the standby")
+        self._replica_stale = bool(stale)
+        if self._replica_job is not None:
+            return
+        mark = (self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='done'") or {}).get("n")
+        if not replica.due(st, s, now, mark):
+            return
+        cfg, base = copy.deepcopy(self.cfg), self.p.base
+
+        def work() -> None:
+            try:
+                r = replica.snapshot(Project(base), cfg, mark=mark)
+            except Exception:
+                r = {"outcome": "failed", "error": traceback.format_exc().replace("\n", " | ")[-300:]}
+            if r.get("outcome") in ("ok", "failed"):
+                log(self.p, f"standby snapshot #{r.get('seq')}: {r['outcome']}"
+                            + (f" ({r.get('size', 0) / 1e6:.1f} MB, kept {r.get('kept')})" if r["outcome"] == "ok"
+                               else f": {r.get('error')}"))
+        self._replica_job = threading.Thread(target=work, daemon=True, name="replica")
+        self._replica_job.start()
 
     def _apply_backup(self, job: dict) -> None:
         """Record what a finished backup_branches pass did: drop pushed, skipped and refused branches

@@ -1014,6 +1014,10 @@ def status_text(p: Project) -> str:
     pq = pushq.status_line(p, now)
     if pq:
         lines.append(pq)
+    from . import replica
+    rl = replica.status_line(p, p.config(), now)
+    if rl:
+        lines.append(rl)
     for b in h.get("breakers") or []:
         lines.append(b["line"])
     for pp in h["providers_paused"]:
@@ -1181,6 +1185,46 @@ def _stats_time(v: str | None, tz: str, flag: str) -> float | None:
     except ValueError:
         die(f"{flag}: {v!r} is not a time; give epoch seconds or an ISO date, e.g. 2026-10-12 14:00")
     return (d if d.tzinfo else d.replace(tzinfo=timefmt.tzinfo(tz))).timestamp()
+
+
+def cmd_replicate(a) -> None:
+    """Standby state snapshots (replica.py)."""
+    from . import replica
+    if a.restore:
+        if not a.into:
+            die("--restore needs --into PATH: where the project folder is made")
+        try:
+            r = replica.restore(a.restore, a.into, a.seq)
+        except replica.SnapshotError as e:
+            die(f"not restored: {e}")
+        print(json.dumps(r, indent=1) if a.json else
+              f"restored snapshot #{r['seq']} into {r['project_dir']} (harness at {r['harness_head'][:10]}; "
+              f"to apply next: {r['import']})")
+        return
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp replicate <name>`")
+    cfg = p.config()
+    if not replica.settings(cfg):
+        print("standby snapshots are off: set failover.standby to a machine alias or an absolute directory")
+        return
+    if a.verify:
+        v = replica.verify(cfg, replica.identity(p, cfg))
+        if a.json:
+            print(json.dumps(v, indent=1))
+        elif "error" in v:
+            print(f"could not verify: {v['error']}")
+        else:
+            for x in v["snapshots"] or [{"seq": None}]:
+                print("no snapshots" if x["seq"] is None else f"#{x['seq']}: " + ("ok" if x["ok"] else f"BAD: {x['why']}"))
+        snaps = v.get("snapshots") or []
+        sys.exit(0 if snaps and snaps[-1]["ok"] else 1)
+    if a.now:
+        r = replica.snapshot(p, cfg)
+        print(json.dumps(r, indent=1) if a.json else f"snapshot: {r['outcome']}" + (
+            f" ({r.get('error')})" if r.get("error") else f" #{r['seq']}" if r["outcome"] == "ok" else ""))
+        sys.exit(1 if r["outcome"] == "failed" else 0)
+    print(json.dumps(replica.load_state(p), indent=1) if a.json else replica.status_line(p, cfg, time.time()))
 
 
 def cmd_audit(a) -> None:
@@ -6182,6 +6226,21 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("replicate", help="standby state snapshots (failover.standby): status, take one now, "
+                                         "verify them, or restore one into a project folder", description=(
+        "Without flags: the snapshot status. --now: take and ship one now. --verify: check every snapshot at "
+        "the standby (checksums and chains). --restore DIR --into PATH: on the standby, make PATH/tt-project "
+        "from the newest complete snapshot in DIR (or --seq N)."))
+    s.add_argument("name", nargs="?")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--now", action="store_true")
+    g.add_argument("--verify", action="store_true")
+    g.add_argument("--restore", metavar="DIR")
+    s.add_argument("--into", metavar="PATH")
+    s.add_argument("--seq", type=int)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_replicate)
 
     s = sub.add_parser("push-audit", help="done tasks whose claimed pushes are not on the remote, with counts")
     s.add_argument("name", nargs="?")

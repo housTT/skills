@@ -346,6 +346,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
     "memory": {"archive_hidden_days": 7},
+    # Standby snapshots (replica.py), off until failover.standby names a machine alias or an absolute
+    # directory: every snapshot_every_s seconds (and soon after a task finishes) the daemon ships a
+    # consistent copy of the database, harness and open tasks' branches there, keeping snapshot_keep.
+    "failover": {"snapshot_every_s": 900, "snapshot_keep": 3},
 }
 
 
@@ -392,6 +396,8 @@ EXTRA_KEYS = {
     "heal": {"outage_owner_budget_min", "outage_task_due_min", "outage_escalate_min"},
     # hold_mute_escalate_h: the longest a mute covering a device hold stays silent (screen.hold_cap; 1).
     "screen": {"hold_mute_escalate_h"},
+    # standby: where state snapshots go (off: unset); fleet: the identity projects driving one fleet share.
+    "failover": {"standby", "fleet"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}
