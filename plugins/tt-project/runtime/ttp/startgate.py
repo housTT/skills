@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """A deferred task's start_when gate as status and the web app show it: its last result (exit code
 and a short reason), when it last ran and how long it has said not yet. The daemon records each
-verdict (probe_deferred); past `waiting.start_gate_warn_s` still false it is a warning in the feed
-(state 'status', clears itself once the gate passes), never a 'needs you' item. Model-free."""
+verdict (probe_deferred); past `waiting.start_gate_warn_s` still false while the daemon ran (a host
+down for hours is no staleness) it is a warning in the feed (state 'status', clears itself once the
+gate passes), never a 'needs you' item. A `landed:#<id>` gate whose producer is approved or in a
+batch in the push queue names that instead: it is waiting, not stale. Model-free."""
 from __future__ import annotations
 
 from . import landed
 from .db import deferral
 
-KEY = "start_gates"   # kv: task id -> {when, rc, reason, at, since} of its start_when's last verdict
+KEY = "start_gates"   # kv: task id -> {when, rc, reason, at, since, run_s} of its start_when's last verdict
 WARN_S = 1800         # default of waiting.start_gate_warn_s
+GAP_S = 900           # verdicts come every few minutes; a longer gap was the daemon down: only this much counts
 _STATES = {"review": "in review", "pushing": "being pushed", "done": "done, not on the branch yet"}
 
 
@@ -32,11 +35,14 @@ def reason(db, when: str, rc, out: str = "") -> str:
 
 
 def record(db, tid: int, when: str, rc, why: str, now: float) -> None:
-    """Keeps a not-yet or broken verdict; `since` is when this probe first said so."""
+    """Keeps a not-yet or broken verdict; `since` is when this probe first said so, `run_s` how long
+    the daemon has run since then (each gap between verdicts, at most GAP_S)."""
     gates = db.kv(KEY, {}) or {}
     prev = gates.get(str(tid)) or {}
-    since = prev.get("since") if prev.get("when") == when and prev.get("since") else now
-    gates[str(tid)] = {"when": when, "rc": rc, "reason": why, "at": now, "since": since}
+    same = prev.get("when") == when and prev.get("since")
+    since = prev.get("since") if same else now
+    run_s = float(prev.get("run_s") or 0) + _gap(now - float(prev.get("at") or now)) if same else 0.0
+    gates[str(tid)] = {"when": when, "rc": rc, "reason": why, "at": now, "since": since, "run_s": run_s}
     db.set_kv(KEY, gates)
 
 
@@ -57,14 +63,34 @@ def view(db, task: dict, now: float, warn_s: float, gates: dict | None = None) -
         return None
     rc = g.get("rc")
     false_s = now - float(g.get("since") or now)
-    warn = bool(warn_s) and false_s >= warn_s
+    run_s = float(g.get("run_s") or 0) + _gap(now - float(g.get("at") or now))   # none recorded: from its next verdict
+    warn = bool(warn_s) and run_s >= warn_s
     text = (f"gate {'not yet' if rc in (1, 75, 255) else 'broken'} "
             f"({rc if isinstance(rc, str) else f'exit {rc}'}: {g.get('reason') or '?'}), "
             f"checked {_ago(now - float(g.get('at') or now))} ago, false for {_ago(false_s)}")
-    if warn:
-        text += f"; warning: still false after {_ago(warn_s)}, check the gate is not stale"
+    if false_s - run_s >= GAP_S:
+        text += f" ({_ago(run_s)} of it with the daemon running)"
+    if warn and (queued := push_state(db, when)):
+        warn, text = False, f"{text}; {queued}"
+    elif warn:
+        text += f"; warning: still false after {_ago(warn_s)} of daemon time, check the gate is not stale"
     return {"text": text, "warn": warn, "rc": rc, "reason": g.get("reason"), "at": g.get("at"),
             "since": g.get("since")}
+
+
+def push_state(db, when: str) -> str | None:
+    """'waiting on push batch <id>' (or on the next batch) while a producer the gate waits on, or a
+    task carrying its change (its review), has an approved or batched push queue row; else None."""
+    ids = set()
+    for ref in landed.task_refs(when):
+        if ref.isdigit():
+            ids |= set(landed.carriers(db, int(ref)))
+    if not ids:
+        return None
+    rows = db.q(f"SELECT status, batch FROM push_queue WHERE status IN ('approved','batched') "
+                f"AND task IN ({','.join('?' * len(ids))}) ORDER BY id", tuple(sorted(ids)))
+    batch = next((r["batch"] for r in rows if r["status"] == "batched" and r["batch"]), None)
+    return f"waiting on push batch {batch}" if batch else "approved, waiting on the next push batch" if rows else None
 
 
 def feed(db, warn_s: float, now: float) -> list[dict]:
@@ -79,6 +105,10 @@ def feed(db, warn_s: float, now: float) -> list[dict]:
             out.append({"id": None, "ts": v["since"], "kind": "gate", "severity": "low", "state": "status",
                         "text": f"#{t['id']} {t['title']} waits to start: {v['text']}"})
     return out
+
+
+def _gap(s: float) -> float:
+    return min(max(0.0, s), GAP_S)
 
 
 def _ago(s: float) -> str:

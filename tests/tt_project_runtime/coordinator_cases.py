@@ -10468,7 +10468,7 @@ def test_a_false_start_when_shows_its_last_result_and_age_and_warns_only_past_th
     assert not [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "gate"]
     # Past the threshold (first false 40 min ago): a warning, in the feed as a status row.
     gates = p.db.kv(startgate.KEY)
-    gates[str(tid)]["since"] = now - 40 * 60
+    gates[str(tid)]["since"], gates[str(tid)]["run_s"] = now - 40 * 60, 38 * 60   # the daemon ran throughout
     p.db.set_kv(startgate.KEY, gates)
     line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
     assert "false for 40 min; warning: still false after 30 min" in line, line
@@ -10512,6 +10512,82 @@ def test_a_landed_start_gate_names_its_producers_state(env):
     p.db.update_task(tid, labels=["start_when:false", f"deferred_since:{time.time()}"])
     d._drop_stale_probe(tid, "false")
     assert str(tid) not in (p.db.kv(startgate.KEY) or {})
+
+
+def test_a_start_gate_warns_on_daemon_running_time_not_wall_time(env):
+    """The stale-gate warning counts only time the daemon ran: a host down for 40 h between two
+    verdicts adds at most startgate.GAP_S, so a gate set before the outage is not called stale
+    on the daemon's first verdicts back; it warns once 30 min of daemon time have passed."""
+    from ttp import startgate
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user",
+                        labels=["start_when:test -e /nonexistent/marker", f"deferred_since:{time.time()}"])
+    now = time.time()
+    d._start_verdict(p.db.task(tid), 1, now - 40 * 3600 - 300)   # set, then the host went down
+    d._start_verdict(p.db.task(tid), 1, now - 120)               # back up
+    v = startgate.view(p.db, p.db.task(tid), now, 1800)
+    assert not v["warn"] and "warning" not in v["text"], v
+    assert "false for 40.1 h (17 min of it with the daemon running)" in v["text"], v["text"]
+    assert not startgate.feed(p.db, 1800, now)
+    for k in range(1, 6):   # the daemon keeps running: 3-min verdicts until 32 min of daemon time
+        d._start_verdict(p.db.task(tid), 1, now - 120 + k * 180)
+    later = now - 120 + 5 * 180
+    v = startgate.view(p.db, p.db.task(tid), later, 1800)
+    assert v["warn"] and "warning: still false after 30 min of daemon time" in v["text"], v["text"]
+    assert len(startgate.feed(p.db, 1800, later)) == 1
+
+
+def _stale_landed_gate(p, prod):
+    """A consumer deferred on landed:#<prod> whose gate has said not yet for 40 min of daemon time."""
+    from ttp import startgate
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("consumer", "s", kind="work", tier="light", origin="user",
+                        labels=[f"start_when:landed:#{prod}", f"deferred_since:{time.time()}"])
+    d, now = Daemon(p.base), time.time()
+    for k in range(15):
+        d._start_verdict(p.db.task(tid), 1, now - 42 * 60 + k * 180)
+    return tid, now
+
+
+def test_a_landed_start_gate_names_the_push_queue_instead_of_warning(env):
+    """While the producer's change (its review's approval) is approved or batched in the push queue,
+    a long-false landed:#<id> gate names the queue state, not a staleness warning, and has no feed row."""
+    from ttp import startgate
+    from ttp.cli import status_text
+    p = make(env)
+    prod = p.db.add_task("producer", "s", kind="code", origin="user")
+    p.db.update_task(prod, status="done")
+    rev = p.db.add_task(f"Review #{prod}", "s", kind="review", origin="daemon", labels=[f"auto_review:{prod}"])
+    p.db.update_task(rev, status="pushing")
+    tid, now = _stale_landed_gate(p, prod)
+    row = p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) "
+                 "VALUES(?,?,?,?,'approved',?,?)", (rev, "ttp/t1", "abc123", "origin/main", now, now))
+    v = startgate.view(p.db, p.db.task(tid), now, 1800)
+    assert not v["warn"] and v["text"].endswith("; approved, waiting on the next push batch"), v["text"]
+    p.db.x("UPDATE push_queue SET status='batched', batch='b20261019' WHERE id=?", (row,))
+    v = startgate.view(p.db, p.db.task(tid), now, 1800)
+    assert not v["warn"] and v["text"].endswith("; waiting on push batch b20261019"), v["text"]
+    assert "warning" not in v["text"] and not startgate.feed(p.db, 1800, now)
+    line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    assert "waiting on push batch b20261019" in line and "warning" not in line, line
+    # Pushed and settled but still not on the branch: the warning is back.
+    p.db.x("UPDATE push_queue SET status='pushed' WHERE id=?", (row,))
+    assert startgate.view(p.db, p.db.task(tid), now, 1800)["warn"]
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled", "done"])
+def test_a_landed_start_gate_still_warns_for_a_producer_out_of_the_push_queue(env, state):
+    """A producer that failed, was cancelled or is done with no push queue entry keeps the warning."""
+    from ttp import startgate
+    p = make(env)
+    prod = p.db.add_task("producer", "s", kind="code", origin="user")
+    p.db.update_task(prod, status=state)
+    tid, now = _stale_landed_gate(p, prod)
+    v = startgate.view(p.db, p.db.task(tid), now, 1800)
+    assert v["warn"] and "check the gate is not stale" in v["text"], v["text"]
+    assert len(startgate.feed(p.db, 1800, now)) == 1
 
 
 @pytest.mark.parametrize("probe", ["landed:abc", "landed:#12 && true", "landed: #", " landed:#1x"])
