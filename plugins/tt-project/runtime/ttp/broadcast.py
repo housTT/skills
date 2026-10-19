@@ -79,7 +79,9 @@ def _append(*lines: dict) -> None:
 
 
 def _compact(lines: list[dict], now: float) -> None:
-    """Drop broadcasts last touched more than KEEP_S ago, once the file has grown past COMPACT_BYTES."""
+    """Once the file has grown past COMPACT_BYTES, drop broadcasts last touched more than KEEP_S ago,
+    else (all that recent) those more than REUSE_S ago. `lines` must be the whole file, read under the
+    lock: call this before appending. No rewrite when nothing can go, so a busy day costs no rewrites."""
     try:
         if path().stat().st_size < COMPACT_BYTES:
             return
@@ -88,8 +90,11 @@ def _compact(lines: list[dict], now: float) -> None:
     last: dict[str, float] = {}
     for e in lines:
         last[e["id"]] = max(last.get(e["id"], 0.0), float(e.get("ts") or 0))
-    keep = [e for e in lines if now - last[e["id"]] < KEEP_S]
-    project.durable_write(path(), "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep), mode=0o600)
+    for age in (KEEP_S, REUSE_S):
+        keep = [e for e in lines if now - last[e["id"]] < age]
+        if len(keep) < len(lines):
+            project.durable_write(path(), "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep), mode=0o600)
+            return
 
 
 def _fold(lines: list[dict]) -> dict[str, dict]:
@@ -124,8 +129,8 @@ def claim(text: str, now: float | None = None, bid: str | None = None) -> dict:
             return cur
         b = {"id": bid or f"b-{secrets.token_hex(6)}", "key": k, "norm": normalize(text), "ts": now,
              "delivered": {}}
+        _compact(lines, now)    # before the append: it rewrites the file from `lines`
         _append({"event": "open", "id": b["id"], "key": k, "norm": b["norm"], "ts": now})
-        _compact(lines, now)
         b["shingles"] = relay._shingles(b["norm"].split())
         return b
 

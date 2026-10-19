@@ -161,3 +161,36 @@ def test_a_run_cannot_say_all(env, monkeypatch, capsys):
     assert _say(cli, "demo") == 2
     assert _say(cli, "demo", "--except", "x", "--", "hi") == 2
     assert _say_all(cli, "--chat", "c1", "hi") == 2
+
+
+def test_a_full_ledger_keeps_the_open_line_a_claim_writes_and_compacts_only_what_can_go(env, monkeypatch):
+    from ttp import broadcast, project
+    now = time.time()
+
+    def fill(age, n):
+        broadcast._append(*({"event": "open", "id": f"b-old{age}-{i}", "key": f"k{i}", "norm": "x " * 40,
+                             "ts": now - age} for i in range(n)))
+
+    fill(3600, 2000)    # an hour old: inside the reuse window, nothing can go
+    assert broadcast.path().stat().st_size >= broadcast.COMPACT_BYTES
+    writes = []
+    real = project.durable_write
+    monkeypatch.setattr(project, "durable_write", lambda *a, **k: (writes.append(a[0]), real(*a, **k)))
+    b = broadcast.claim("Hold all merges.", now)
+    broadcast.record(b["id"], "alpha", "7", now)
+    again = broadcast.claim("hold all merges", now + 10)
+    assert again["id"] == b["id"] and again["delivered"] == {"alpha": "7"}, "the open line survived"
+    assert writes == [], "no rewrite while every line is recent"
+    # Older lines go: first those past KEEP_S, else (all within it) those past the reuse window.
+    fill(broadcast.KEEP_S + 60, 10)
+    c = broadcast.claim("Resume merges.", now + 20)
+    ids = {e["id"] for e in broadcast._read()}
+    assert len(writes) == 1 and not any(i.startswith(f"b-old{broadcast.KEEP_S + 60}-") for i in ids)
+    assert {b["id"], c["id"], "b-old3600-0"} <= ids
+    fill(broadcast.REUSE_S + 60, 10)
+    d = broadcast.claim("Pause merges.", now + 30)
+    ids = {e["id"] for e in broadcast._read()}
+    assert len(writes) == 2 and not any(i.startswith(f"b-old{broadcast.REUSE_S + 60}-") for i in ids)
+    assert {b["id"], c["id"], d["id"]} <= ids
+    assert broadcast.claim("hold all merges!", now + 40)["delivered"] == {"alpha": "7"}
+    assert stat.S_IMODE(broadcast.path().stat().st_mode) == 0o600
