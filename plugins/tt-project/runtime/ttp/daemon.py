@@ -8301,7 +8301,10 @@ class Daemon:
         re-review of the branch the task's fix branch builds on: worktree.fix_branches), or one that
         already approved its head, is that review: one head gets one review. None
         when delivery has no review step, `add` is off and none is open, the branch changes nothing,
-        the review cap is reached or the diff cannot be read: the coordinator then decides."""
+        the review cap is reached or the diff cannot be read: the coordinator then decides. A task with
+        no branch on record that published its change as an open PR (pr_url, or the PR its hand-off
+        names: it worked in a clone of another repository) is reviewed at that PR's head, its diff read
+        from the hosting service (push.pr_change), review only: the PR is its delivery."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
         rules = cfg.get("review") or {}
@@ -8320,10 +8323,13 @@ class Daemon:
                         branch and t["status"] == "queued" and branch in worktree.fix_branches(self.p, t, named)):
                     self._precheck_open(task, t)
                     return t["id"], False
+            # No branch on record: the change is the PR it published, read from the hosting service.
+            pr_url = "" if branch else prguard.task_pr(task)
+            published = push.pr_change(self.p, pr_url) if pr_url else None
             # A review that already approved this exact head (it ran while the task waited on its own
             # checks) passed it: a second review of the same head is a wasted run.
-            tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}",
-                                check=False) if branch else ""
+            tip = published["sha"] if published else (worktree._git(
+                self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False) if branch else "")
             passed = db.one("SELECT q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.head=? AND "
                             "t.kind='review' AND q.status!='cancelled' ORDER BY q.id DESC LIMIT 1",
                             (tip,)) if tip else None
@@ -8337,8 +8343,11 @@ class Daemon:
                 return prior["id"], False
             if not add:
                 return None
-            changes = worktree.diff_lines(self.p, [branch]) if branch else None
-            full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
+            if published:
+                changes, full = published["changes"], published["sha"]
+            else:
+                changes = worktree.diff_lines(self.p, [branch]) if branch else None
+                full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
             head = full[:12]
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
@@ -8358,11 +8367,15 @@ class Daemon:
         prior = next((r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
                       if r["id"] in chain or chain & set(dependency_ids(r))), None)
         tier = "standard" if prior else bud.review_tier(changes, cfg)
-        pr = task.get("pr_url")
-        lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): branch {branch}, "
-                 f"head {head}" + (f", PR {pr}" if pr else "") + ".",
-                 f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
-                 f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]
+        pr = pr_url or task.get("pr_url")
+        lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): branch "
+                 f"{published['ref'] if published else branch}, head {head}" + (f", PR {pr}" if pr else "") + "."]
+        if published:
+            lines.append(f"No branch of it is on record in this project, so its diff is not in the project root's "
+                         f"git: read it with `gh pr diff {pr}`, or check out head {full} in a clone of the PR's "
+                         f"repository of your own.")
+        lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
+                  f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]
         fups = load_result(task.get("result")).get("followups")
         fups = [str(f["title"])[:120] for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
@@ -8372,7 +8385,7 @@ class Daemon:
         if prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
-        if line := self._verified_review_line(task, full):
+        if not published and (line := self._verified_review_line(task, full)):
             lines.append(line)
         lines.append(REVIEW_CHECK_LINE)
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
@@ -8381,7 +8394,7 @@ class Daemon:
                      "`ttp lock` on a device resource, never directly.")
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
-        delivered = push.delivered_pr(self.p, task, full)
+        delivered = pr if published else push.delivered_pr(self.p, task, full)
         # A task that delivers onto a pr_branch other than the push branch goes to that PR with
         # `ttp push --own`: a plain push or a push-queue approval would rebase it onto the push branch.
         elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)

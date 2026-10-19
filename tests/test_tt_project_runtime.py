@@ -29028,6 +29028,58 @@ def test_the_review_sweep_only_queues_reviews_and_changes_no_task(env):
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review' AND status='queued'")) == 2, "queued twice"
 
 
+def test_the_review_sweep_reviews_a_branchless_code_task_at_its_prs_head(env, monkeypatch):
+    """A code task that worked in another repository's clone has no branch on record: its review is
+    queued at the head of the PR it published (pr_url or its hand-off's `pr`), the diff read from the
+    hosting service, review only. With no PR known the blocker sweep's diagnosis says the daemon cannot
+    read its diff; a branch task never asks the hosting service."""
+    from ttp import push, sweep
+    from ttp.daemon import Daemon
+    p = make(env)
+    sha = "ab" * 20
+    url = "https://example.com/acme/widgets/pull/7"
+    views = []
+
+    def view(proj, u):
+        views.append(u)
+        return {"headRefName": "feature/fix", "headRefOid": sha, "state": "OPEN",
+                "files": [{"path": "src/a.py", "additions": 3, "deletions": 1}]} if u == url else None
+
+    monkeypatch.setattr(push, "_pr_view", view)
+    now = time.time()
+    with_pr = p.db.add_task("fix elsewhere", "spec of fix elsewhere", kind="code", origin="coordinator")
+    p.db.update_task(with_pr, status="review", pr_url=url, result=json.dumps({"status": "done", "summary": "fixed it"}))
+    via_handoff = p.db.add_task("handoff pr", "spec", kind="code", origin="coordinator")
+    p.db.update_task(via_handoff, status="review", result=json.dumps({"status": "done", "summary": "ok", "pr": url}))
+    bare = p.db.add_task("no pr", "spec", kind="code", origin="coordinator")
+    p.db.update_task(bare, status="review", result=json.dumps({"status": "done", "summary": "ok"}))
+    for t in (with_pr, via_handoff, bare):
+        _ran(p, t, now - 1900)
+    d = Daemon(p.base)
+    _sweep(d)
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on LIKE ?", (f"%{with_pr}%",))
+    assert rev["title"] == f"Review #{with_pr}: fix elsewhere" and rev["origin"] == "daemon"
+    assert f"branch feature/fix, head {sha[:12]}, PR {url}" in rev["spec"], rev["spec"]
+    assert f"gh pr diff {url}" in rev["spec"] and f"already delivered as PR {url}: review only" in rev["spec"]
+    assert "ttp push` from" not in rev["spec"] and "fixed it" in rev["spec"]
+    assert p.db.q("SELECT id FROM tasks WHERE kind='review' AND title=?", (f"Review #{via_handoff}: handoff pr",))
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review' AND title LIKE ?", (f"Review #{bare}:%",))
+    assert sweep.review_diagnosis(p.db, bare, now) == \
+        "no review queued (no branch on record: the daemon cannot read this task's diff)"
+    # A PR that cannot be read (closed, gone, no access) queues none, and the diagnosis names the PR.
+    gone = "https://example.com/acme/widgets/pull/8"
+    closed = p.db.add_task("closed pr", "spec", kind="code", origin="coordinator")
+    p.db.update_task(closed, status="review", pr_url=gone)
+    assert d._auto_review(p.db.task(closed), "ok") is None
+    assert f"its PR {gone} is open and readable" in sweep.review_diagnosis(p.db, closed, now)
+    # One head gets one review: the same task again is the review already queued.
+    assert d._auto_review(p.db.task(with_pr), "fixed it") == (rev["id"], False)
+    # A task with a branch reads its diff from the project root's git as before, never the PR.
+    views.clear()
+    tid, branch, _, (brev,) = _finish_code(env, p, "branch fix", {"b.py": 5})
+    assert branch in brev["spec"] and "gh pr diff" not in brev["spec"] and not views
+
+
 def _unreviewed(env, p, title, result=None, status="done", age=600, labels=None, spec=None, edit=None):
     """A code task in the state #2800 was left in: committed on its branch, handed off and recorded
     `status` `age` seconds ago, with no review of it queued; `edit(worktree)` replaces its one file.

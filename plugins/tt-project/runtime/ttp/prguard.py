@@ -146,6 +146,15 @@ def pr_key(text: str) -> str | None:
     return f"{m.group(1)}/{m.group(2)}#{int(m.group(3))}".lower() if m else None
 
 
+def task_pr(task: dict) -> str:
+    """The URL of the PR a code task published its change as: its pr_url, else the `pr` its hand-off names."""
+    from .db import load_result
+    for url in (task.get("pr_url"), load_result(task.get("result")).get("pr")):
+        if isinstance(url, str) and (m := PR_URL_RE.search(url)):
+            return m.group(0)
+    return ""
+
+
 def pr_keys(text: str) -> set[str]:
     out = set()
     for rx in (PR_URL_RE, PR_REF_RE):

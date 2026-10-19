@@ -1997,6 +1997,46 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
     return None
 
 
+PR_VIEW_TIMEOUT_S = 60
+
+
+def _pr_view(p: Project, url: str) -> dict | None:
+    """gh's view of the PR at `url` (head ref and commit, state, changed files), or None."""
+    try:
+        out = subprocess.run(["gh", "pr", "view", url, "--json", "headRefName,headRefOid,state,files"],
+                             capture_output=True, text=True, timeout=PR_VIEW_TIMEOUT_S, cwd=p.root,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def pr_change(p: Project, url: str) -> dict | None:
+    """A change published as a PR, read from the hosting service rather than the project root's git
+    (it may live in another repository): {"ref": head branch, "sha": head commit, "changes": lines
+    changed per file, as worktree.diff_lines}. None when it cannot be read, is no longer open or
+    changes nothing."""
+    pr = _pr_view(p, url)
+    if not pr or str(pr.get("state") or "OPEN") != "OPEN" or not pr.get("headRefOid"):
+        return None
+    changes: dict[str, int | None] = {}
+    for f in pr.get("files") or []:
+        if isinstance(f, dict) and f.get("path"):
+            try:
+                changes[str(f["path"])] = int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+            except (TypeError, ValueError):
+                changes[str(f["path"])] = None
+    if not changes:
+        return None
+    return {"ref": str(pr.get("headRefName") or ""), "sha": str(pr["headRefOid"]), "changes": changes}
+
+
 REVIEW_ONLY_LABEL = "review_only"   # a review whose change must not reach the push branch (kept_off)
 # A spec keeps its change off the push branch only with an explicit marker line, never by its prose:
 # free text cannot tell a ban from a sentence that reports, quotes or conditions one.

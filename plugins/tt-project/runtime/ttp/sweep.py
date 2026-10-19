@@ -55,7 +55,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, settinghold, timefmt, unblock, userpause
 from .db import DB, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -419,8 +419,14 @@ def review_diagnosis(db: DB, tid: int, now: float, hold_of: Callable[[dict], str
     revs = [r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND id>? ORDER BY id DESC", (tid,))
             if tid in dependency_ids(r) or f"auto_review:{tid}" in (r["labels"] or "")]
     if not revs:
-        why = "the daemon queues one only for a code task with a diff and review.auto on" \
-            if task and task["kind"] != "code" else "check review.auto, the review task cap and the branch's diff"
+        if task and task["kind"] != "code":
+            why = "the daemon queues one only for a code task with a diff and review.auto on"
+        elif task and not task.get("branch") and not (pr := prguard.task_pr(task)):
+            why = "no branch on record: the daemon cannot read this task's diff"
+        elif task and not task.get("branch"):
+            why = f"check review.auto, the review task cap and that its PR {pr} is open and readable"
+        else:
+            why = "check review.auto, the review task cap and the branch's diff"
         return f"no review queued ({why})"
     r = revs[0]
     runs = db.q("SELECT status, started, ended FROM runs WHERE task=? ORDER BY id", (r["id"],))
