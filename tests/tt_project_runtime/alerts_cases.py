@@ -2577,17 +2577,21 @@ def test_the_desktop_notifier_alarms_once_when_a_remote_host_stays_unreachable_a
     def poll(t, st=None):
         return notifier.run_once(json.loads(json.dumps(st if st is not None else state)), "high", 1200, now=t0 + t)
 
+    def polls(a, b):   # one poll a minute, as the notifier does
+        st = state
+        for t in [*range(a, b, 60), b]:
+            st = poll(t, st)
+        return st
+
     state = poll(0)
     up["host-a"] = False
-    state = poll(60)
-    state = poll(60 + 1199)
+    state = polls(60, 60 + 1199)
     assert shown == [], "a failure under the threshold alarmed"
     up["host-a"] = True
     state = poll(1300)
     assert shown == [], "a short blip alarmed or announced a recovery"
     up["host-a"] = False
-    state = poll(1400)
-    state = poll(1400 + 1200)
+    state = polls(1400, 1400 + 1200)
     since = datetime.fromtimestamp(t0 + 1400, ZoneInfo("Europe/Berlin")).strftime("%H:%M %Z")
     assert shown == [f"host-a unreachable since {since}; its projects cannot page"], shown
     for t in (2700, 2800, 5000):
@@ -2601,10 +2605,41 @@ def test_the_desktop_notifier_alarms_once_when_a_remote_host_stays_unreachable_a
     assert shown[1:] == ["host-a answers again; its projects can page again"], shown
     # Hosts are tracked apart: host-b going down does not touch host-a, and back.
     up["host-b"] = False
-    state = poll(6000)
-    state = poll(7200)
+    state = polls(6000, 7200)
     assert len(shown) == 3 and shown[2].startswith("host-b unreachable since"), shown
     assert state["_hosts"]["host-a"].get("alarmed") is None and state["_hosts"]["host-b"]["alarmed"]
+
+
+def test_the_desktop_notifier_starts_a_host_down_streak_anew_after_a_gap_between_polls(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import notifier, timefmt
+    monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    t0, st = 1_800_000_000, {}
+    notifier._track_hosts(st, {"h": True}, t0, 1200)
+    notifier._track_hosts(st, {"h": False}, t0 + 60, 1200)
+    # The laptop sleeps for hours; on wake the network is not up yet for one poll.
+    wake = t0 + 60 + 15 * 3600
+    notifier._track_hosts(st, {"h": False}, wake, 1200)
+    assert shown == [], "a failure before and after a long gap alarmed at once"
+    notifier._track_hosts(st, {"h": True}, wake + 60, 1200)
+    assert shown == [], "a recovery was announced with no alarm before it"
+    # Down again after a gap, then failing every minute for the threshold: one alarm, since after the gap.
+    notifier._track_hosts(st, {"h": False}, wake + 120, 1200)
+    later = wake + 120 + 6 * 3600
+    for t in range(later, later + 1201, 60):
+        notifier._track_hosts(st, {"h": False}, t, 1200)
+    since = datetime.fromtimestamp(later, ZoneInfo("Europe/Berlin")).strftime("%H:%M %Z")
+    assert shown == [f"h unreachable since {since}; its projects cannot page"], shown
+    # An alarmed host stays alarmed across a gap (no second alarm), and an empty registry read keeps it.
+    notifier._track_hosts(st, {"h": False}, later + 9 * 3600, 1200)
+    notifier._track_hosts(st, {}, later + 9 * 3600 + 60, 1200)
+    notifier._track_hosts(st, {"h": False}, later + 9 * 3600 + 120, 1200)
+    assert len(shown) == 1, shown
+    notifier._track_hosts(st, {"h": True}, later + 9 * 3600 + 180, 1200)
+    assert shown[1:] == ["h answers again; its projects can page again"], shown
 
 
 def test_the_desktop_notifier_counts_only_an_ssh_connect_failure_as_a_host_down(monkeypatch):

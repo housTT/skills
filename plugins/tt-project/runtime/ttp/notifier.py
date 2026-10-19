@@ -28,6 +28,7 @@ STATE = HOME_DIR / "notifier-state.json"
 CONF = HOME_DIR / "notifier.json"
 HOSTS = "_hosts"   # state key for remote host reachability; no project name starts with '_'
 HOST_DOWN_AFTER_S = 20 * 60   # notifier.json `host_down_after_s` overrides
+HOST_POLL_GAP_S = 5 * 60   # polls further apart (sleep, notifier stopped) do not continue a failing streak
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
@@ -74,12 +75,15 @@ def _host(entry: dict) -> str:
     return entry.get("ssh") or entry["host"]
 
 
-def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s: float) -> None:
+def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s: float,
+                 max_gap_s: float = HOST_POLL_GAP_S) -> None:
     """One notification once a host has failed every poll for `down_after_s`, one when it answers
-    again, nothing in between. Kept in the notifier's state, so a restart neither forgets nor re-alarms."""
+    again, nothing in between. Kept in the notifier's state, so a restart neither forgets nor re-alarms.
+    A gap over `max_gap_s` since the last failed poll (a sleeping laptop) starts the streak anew."""
     hosts = state.setdefault(HOSTS, {})
-    for host in [h for h in hosts if h not in reached]:   # no project on it any more
-        del hosts[host]
+    if reached:   # an empty registry read must not drop an alarmed host (it would alarm twice)
+        for host in [h for h in hosts if h not in reached]:   # no project on it any more
+            del hosts[host]
     for host, ok in sorted(reached.items()):
         h = hosts.setdefault(host, {})
         if ok:
@@ -87,7 +91,10 @@ def _track_hosts(state: dict, reached: dict[str, bool], now: float, down_after_s
                 show(f"tt-project · {host}", f"{host} answers again; its projects can page again")
             hosts[host] = {"ok": now}
             continue
+        if not h.get("alarmed") and now - h.get("last_fail", now) > max_gap_s:
+            h.pop("failing_since", None)
         since = h.setdefault("failing_since", now)
+        h["last_fail"] = now
         if not h.get("alarmed") and now - since >= down_after_s:
             zone = timefmt.ambient()
             show(f"tt-project · {host}",
@@ -111,7 +118,8 @@ def show(title: str, body: str, url: str | None = None) -> None:
         subprocess.run(["notify-send", "-a", "tt-project", title, body], capture_output=True, timeout=10)
 
 
-def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, now: float | None = None) -> dict:
+def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, now: float | None = None,
+             max_gap_s: float = HOST_POLL_GAP_S) -> dict:
     reached: dict[str, bool] = {}
     for name, entry in sorted(load_registry().get("projects", {}).items()):
         after = int(state.get(name, -1))
@@ -138,7 +146,7 @@ def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, n
             if not r.get("cleared"):
                 show(f"tt-project · {name}", r["text"])
             state[name] = max(int(state.get(name, 0)), int(r["id"]))
-    _track_hosts(state, reached, time.time() if now is None else now, down_after_s)
+    _track_hosts(state, reached, time.time() if now is None else now, down_after_s, max_gap_s)
     return state
 
 
@@ -154,7 +162,8 @@ def main() -> int:
         state = {}
     while True:
         try:
-            state = run_once(state, conf["min_severity"], float(conf["host_down_after_s"]))
+            state = run_once(state, conf["min_severity"], float(conf["host_down_after_s"]),
+                             max_gap_s=max(HOST_POLL_GAP_S, 3 * int(conf["interval_s"])))
             write_json(STATE, state)
         except Exception as e:  # keep notifying other projects even if one fails
             print(f"notifier: {type(e).__name__}: {e}", file=sys.stderr, flush=True)

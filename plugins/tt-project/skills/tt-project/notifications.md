@@ -10,7 +10,8 @@ Default channels need no accounts or setup.
 
 - The notifier polls local projects directly and remote ones over the user's ssh.
 - A remote host ssh cannot reach for 20 min (`host_down_after_s` in `notifier.json`) gets one
-  notification, since its projects cannot page, and one more when it answers again.
+  notification, since its projects cannot page, and one more when it answers again. The 20 min
+  count only polls in a row: after a sleep or a stopped notifier it starts again.
 - `ttp notifier test` shows a sample notification.
 - Only `high` severity notifies by default: decisions, reviews, merges, funds, outages.
 - The user can ask the coordinator for more or fewer alerts.
