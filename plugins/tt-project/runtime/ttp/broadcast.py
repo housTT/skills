@@ -72,11 +72,10 @@ def _read() -> list[dict]:
 
 
 def _append(*lines: dict) -> None:
-    fd = os.open(path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a") as f:
-        f.write("".join(json.dumps(e, sort_keys=True) + "\n" for e in lines))
-        f.flush()
-        os.fsync(f.fileno())
+    if not path().exists():     # private to this user: create it 0600 before the first append
+        os.close(os.open(path(), os.O_WRONLY | os.O_CREAT, 0o600))
+        project.fsync_dir(path().parent)
+    project.durable_append(path(), "".join(json.dumps(e, sort_keys=True) + "\n" for e in lines))
 
 
 def _compact(lines: list[dict], now: float) -> None:
@@ -90,10 +89,7 @@ def _compact(lines: list[dict], now: float) -> None:
     for e in lines:
         last[e["id"]] = max(last.get(e["id"], 0.0), float(e.get("ts") or 0))
     keep = [e for e in lines if now - last[e["id"]] < KEEP_S]
-    tmp = path().with_name(f"{path().name}.{os.getpid()}.tmp")
-    tmp.write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in keep))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path())
+    project.durable_write(path(), "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep), mode=0o600)
 
 
 def _fold(lines: list[dict]) -> dict[str, dict]:
