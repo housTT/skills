@@ -960,7 +960,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   parametrized cap test id (`name[param]`) needs a custom `push_cap_tests`:
   when only such tests fail on a change merged in a batch, its review runs again as a light
   trim-to-fit fix told each measured overshoot, at no review attempt, at most twice per change,
-  instead of failing), `push_landing_alert_h` (default 4:
+  instead of failing; a batch of several changes first runs only these tests of each check that is
+  one plain pytest run, and when they fail it finds the change that breaks the cap on them alone,
+  then runs the full checks once on the changes before it; these probes are kept per merged tree,
+  so a batch rerun after a reboot does not run them again), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
   reboot cut short; it clears when a batch lands; 0 = off), `after_push`

@@ -38,7 +38,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, locks, push, pushpass, runner, suitecost, worktree
+from . import checkcap, checkdirs, conflictfix, locks, push, pushpass, runner, suitecost, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -50,6 +50,7 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
 MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
+NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
 SECTION = re.compile(r"^_{3,} (\S.*?) _{3,}$")                     # pytest's per-test failure header
 OVER_KEPT = 10                     # overshoot lines a check's tail keeps from its whole output
@@ -1093,6 +1094,62 @@ class Batch:
             say(f"suite cost not recorded: {e}")
         return None
 
+    def _caps(self, head: str, checks: list[str], plain: str) -> tuple[str, str] | bool | None:
+        """A cap probe of `head`: only the prompt size cap tests (delivery.push_cap_tests) of each check
+        that is one plain pytest run (pushpass.resumable), seconds instead of the whole suite. None when
+        they pass, (command, output tail) when they fail only on cap tests (conflictfix.cap_failure),
+        False when it cannot tell (no such check, a stale version, another failure): the full checks
+        decide then. Each probe is recorded on the tree of `plain`, the replayed entries before their
+        bump, and one known there is not run again (pushpass.probe_known), also after a reboot."""
+        rx = self.d.get("push_cap_tests") or conflictfix.CAP_TESTS
+        try:
+            re.compile(rx)
+        except (re.error, TypeError):
+            rx = conflictfix.CAP_TESTS
+        if not checks:
+            return False
+        self._checkout(head)
+        if push.version_guard(self.d) and push.stale_versions(self.wt, self.tip):
+            return False
+        try:
+            todo, _ = push.applicable(self.wt, head, checks, lambda _m: None, self.tip or "")
+        except push.ScopeError:
+            return False
+        todo = [c for c in todo if pushpass.resumable(str(c))]
+        if not todo:
+            return False
+        env = push.check_env("target", self.tip, self.check_run_dir)
+        tree, slot, started = pushpass.tree_of(self.wt, plain), None, time.time()
+        try:
+            for cmd in todo:
+                label = f"caps {rx}: {cmd}"
+                eid = pushpass.env_id(self.wt, str(cmd), env, self.tip or "")
+                if hit := pushpass.probe_known(self.p, tree, label, eid):
+                    ok, tail = bool(hit.get("ok")), str(hit.get("tail") or "")
+                    say(f"cap probe of {head[:10]} {'passed' if ok else 'failed'} in {hit.get('batch') or '?'} "
+                        f"(tree {tree[:10]}); not run again: {cmd}")
+                    self.checks["cap_reused"] = self.checks.get("cap_reused", 0) + 1
+                else:
+                    if slot is None:
+                        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                                               priority=push.priority_key(self.repo, self.remote, self.branch))
+                        started = time.time()
+                    say(f"cap probe of {head[:10]}: {cmd}")
+                    rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
+                                          env={**env, **pushpass.select_env(rx, env), **slot.env()},
+                                          pass_fds=checkdirs.inherited())
+                    ok = rc in (0, NO_TESTS)
+                    self.checks["cap_probes"] = self.checks.get("cap_probes", 0) + 1
+                    if why := pushpass.probe_record(self.p, tree, label, eid, ok, tail, self.id):
+                        say(f"could not record the cap probe of {cmd}: {why}")
+                if not ok:
+                    return (str(cmd), tail) if conflictfix.cap_failure(tail, rx) else False
+        finally:
+            if slot is not None:
+                slot.close()
+                self.checks["cap_seconds"] = round(self.checks.get("cap_seconds", 0.0) + time.time() - started, 1)
+        return None
+
     def _judge(self, tip: str, carried: list, heads: dict, checks: list[str]):
         """Check the full head; when it fails, find the first failing entry by a binary search over
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
@@ -1106,16 +1163,44 @@ class Batch:
         runs above it, else inside it, as a fix may come before an entry that breaks the checks. A
         search that ends at prefix 1 failing shows only that entry 1 does not fix the tip: the batch
         ends tip_failed and names the entries up to it ("tip_tried"), so the later ones stay untried
-        and go first in the next batch. A batch with none untried ends at once and names none."""
+        and go first in the next batch. A batch with none untried ends at once and names none.
+
+        A combined head gets a cap probe first (_caps). When it fails only on prompt size cap tests,
+        the search runs on cap probes alone, then one full check of the longest prefix that passed
+        them: the entry that breaks a cap goes back to be trimmed (pushq's trim requeue) without a full
+        check of any head that breaks one. A full failure of that prefix searches below it in full."""
         m = len(carried)
-        fail = self._check(heads[m], checks)
-        if fail is None:
-            return m, heads[m], None
-        fails = {m: fail}
-        lo, hi = 0, m
         known = self.m.get("bad_tip") if isinstance(self.m.get("bad_tip"), dict) else {}
         bad = known.get("tip") == tip
-        if bad and fail[0] != STALE:
+        lo, hi = 0, m
+        capped = not bad and m > 1 and isinstance(cap := self._caps(heads[m], checks, carried[m - 1][1]), tuple)
+        if capped:
+            fails = {m: cap}
+            say(f"{heads[m][:10]} breaks a prompt size cap; searching on the cap tests alone")
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                heads[mid] = self._head(tip, carried, mid)
+                f = self._caps(heads[mid], checks, carried[mid - 1][1])
+                if f is None:
+                    lo = mid
+                elif isinstance(f, tuple):
+                    hi, fails[mid] = mid, f
+                else:
+                    break
+            # A cap probe that passed is no full pass: below hi the full checks decide.
+            if hi - lo == 1 and lo:
+                say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} before the one that breaks the cap in full")
+                f = self._check(heads[lo], checks)
+                if f is None:
+                    return lo, heads[lo], fails[hi]
+                hi, fails[lo] = lo, f
+            lo = 0
+        else:
+            fail = self._check(heads[m], checks)
+            if fail is None:
+                return m, heads[m], None
+            fails = {m: fail}
+        if bad and fails[m][0] != STALE:
             fresh = sum(1 for i, _ in carried if i < int(known.get("fresh") or 0))
             if not fresh:
                 return self._tip_red(tip, known)
@@ -1140,6 +1225,10 @@ class Batch:
             self.tip_tried = carried[0][0] + 1   # entry 1, and those before it that carried nothing
         if hi == 1 and bad:
             return self._tip_red(tip, known)
+        if hi == 1 and fails[1][0] != STALE and conflictfix.cap_failure(fails[1][1], self.d.get("push_cap_tests")) \
+                and self._caps(tip, checks, tip) is None:
+            say(f"entry 1 breaks a prompt size cap the tip {tip[:10]} keeps (its cap tests alone)")
+            return 0, None, fails[1]
         if hi == 1:
             say(f"checking the tip {tip[:10]} alone")
             if (tf := self._check(tip, checks)) is not None:
@@ -1191,6 +1280,9 @@ class Batch:
             return None
         self.rescues += 1
         self.retried = True
+        if len(carried[:k] + replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
+            say("they break a prompt size cap too; requeued")
+            return None
         if self._check(head, checks) is not None:
             say("they fail too; requeued")
             return None

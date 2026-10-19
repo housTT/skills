@@ -8856,3 +8856,95 @@ def test_push_own_reuses_a_ttp_checks_pass_only_on_the_same_tree_commands_and_en
     before = ran()
     assert push.run(p, repo, own=True) == 0
     assert ran() - before == 1 and "reused" not in capsys.readouterr().err
+
+
+_CAP_SUITE = '''import glob
+import os
+
+
+def _log(word):
+    with open(os.environ["CAP_SUITE_LOG"], "a") as f:
+        f.write(word + "\\n")
+
+
+def test_the_role_prompt_stays_small():
+    _log("cap")
+    assert sum(os.path.getsize(f) for f in glob.glob("plugins/p/*.txt")) <= 7
+
+
+def test_everything_else():
+    _log("full")
+'''
+
+
+def _cap_suite_batch(env, monkeypatch):
+    """_bump_setup whose push check is one plain pytest run of a fake suite: a cap test that keeps the
+    plugin's .txt files to 7 bytes, and a test standing for the rest. Each test logs a line when run.
+    Five entries of 2 bytes each: entry 4 breaks the cap, and so does entry 5 without it."""
+    log = env["tmp"] / "suite.log"
+    monkeypatch.setenv("CAP_SUITE_LOG", str(log))
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["python3 -m pytest -q -p no:cacheprovider suite"])
+    (repo / "suite").mkdir()
+    (repo / "suite/test_suite.py").write_text(_CAP_SUITE)
+    _git_out(repo, "add", "suite")
+    _git_out(repo, "commit", "-qm", "the suite")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in range(1, 6)]
+    return p, origin, heads, log
+
+
+def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_one_full_suite(env, monkeypatch, capsys):
+    """A 5-entry batch that fails only a prompt size cap test: cap probes (only the cap tests) of the
+    full head and each prefix find entry 4, one full suite runs on entries 1..3, which push; entry 4
+    is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5, which breaks
+    the cap without it too, is requeued after one more probe. Before, each of those heads ran the full
+    suite: five full runs."""
+    from ttp import conflictfix, pushpass
+    p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
+    ran = log.read_text().split()
+    assert ran.count("full") == m["checks"]["runs"] == 1, ran
+    assert m["checks"]["cap_probes"] == 5 and ran.count("cap") == 6, (m["checks"], ran)   # 5 probes + the full run
+    trim = conflictfix.cap_failure(m["results"][3]["detail"]["tail"])
+    assert trim and trim["over"][0]["size"] == 8 and trim["over"][0]["cap"] == 7, m["results"][3]
+    out = capsys.readouterr().out
+    assert "searching on the cap tests alone" in out and "they break a prompt size cap too" in out
+    assert len(json.loads((p.state / pushpass.CAPS).read_text())["probes"]) == 5
+
+
+def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, monkeypatch, capsys):
+    """A batch dies in its full suite after the cap probes found the entry that breaks the cap (a
+    reboot); the rerun, a new batch of the same entries on the same tip, reads the probes of those
+    prefixes back, failing ones included, and runs only the full suite and the one probe it never got to."""
+    from ttp import batch
+    p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
+
+    class Reboot(Exception):
+        pass
+
+    real = batch.Batch._check
+
+    def dies(self, head, checks):
+        raise Reboot("the host rebooted")
+    monkeypatch.setattr(batch.Batch, "_check", dies)
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b1"), monkeypatch)
+    assert m["outcome"] == "error" and m["checks"]["cap_probes"] == 4, m
+    log.write_text("")
+    monkeypatch.setattr(batch.Batch, "_check", real)
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
+    assert m["checks"]["cap_reused"] == 4 and m["checks"]["cap_probes"] == 1, m["checks"]
+    assert log.read_text().split().count("full") == 1
+    assert "failed in b1" in capsys.readouterr().out
+
+
+def test_a_single_entry_that_breaks_only_a_cap_probes_the_tip_instead_of_a_full_suite(env, monkeypatch):
+    """One entry whose full suite fails only a cap test: the tip gets a cap probe, not a full suite."""
+    p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
+    big = _entry(p.root, "e9", {"plugins/p/big.txt": "12345678\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [big]), monkeypatch)
+    assert _statuses(m) == ["check_failed"] and m["outcome"] == "nothing", m
+    ran = log.read_text().split()
+    assert ran.count("full") == m["checks"]["runs"] == 1 and m["checks"]["cap_probes"] == 1, (ran, m["checks"])

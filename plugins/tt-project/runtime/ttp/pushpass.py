@@ -14,7 +14,12 @@ A check that is one plain pytest run also resumes (resumable): the ttp_pytest_re
 each test file whose every selected test passed to a file keyed the same way, and the next run of
 that check under the same key deselects those files and runs the rest. Files are skipped whole,
 never single tests. A whole pass removes the file; the newest RESUME_MAX younger than
-RESUME_MAX_AGE_S are kept."""
+RESUME_MAX_AGE_S are kept.
+
+A cap probe (batch.Batch._caps: only a check's prompt size cap tests, through the ttp_pytest_select
+plugin) is recorded passed or failed, with its output tail, keyed the same way on the tree of the
+replayed entries before their version bump, so a batch rerun after a reboot skips the prefixes it
+already knows."""
 from __future__ import annotations
 
 import fcntl
@@ -34,8 +39,10 @@ STORE = "push_check_passes.json"     # under the project's state: {"passes": [{"
 MAX, MAX_AGE_S = 200, 14 * 86400
 RESUME_DIR = "push_check_resume"     # under the project's state: <key>.txt, one passed test file per line
 RESUME_MAX, RESUME_MAX_AGE_S = 20, 3 * 86400
+CAPS = "push_cap_probes.json"        # under the project's state: {"probes": [{"key", "tree", "cmd", "ok", "tail", "batch", "ts"}]}
 PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_resume"
 PLUGIN = "ttp_pytest_resume"
+SELECT_PLUGIN = "ttp_pytest_select"  # runs only the tests whose name matches TTP_PYTEST_SELECT (a cap probe)
 # A check that sets these itself would drop the plugin or the path it loads from.
 _OWN_ENV = ("PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "env -i")
 
@@ -93,9 +100,9 @@ def key(tree: str, cmd: str, eid: str) -> str:
     return hashlib.sha256(json.dumps([tree, cmd, eid]).encode()).hexdigest()
 
 
-def _load(path: Path) -> list[dict]:
+def _load(path: Path, field: str = "passes") -> list[dict]:
     try:
-        passes = json.loads(path.read_text()).get("passes")
+        passes = json.loads(path.read_text()).get(field)
     except (OSError, ValueError, AttributeError):
         return []
     return [e for e in passes if isinstance(e, dict)] if isinstance(passes, list) else []
@@ -131,6 +138,43 @@ def record(p: Project, tree: str, cmd: str, eid: str, batch: str) -> str:
     except OSError as e:
         return str(e)
     return ""
+
+
+def probe_known(p: Project, tree: str, cmd: str, eid: str) -> dict | None:
+    """The recorded cap probe ({"ok", "tail", "batch"}) of `cmd` on `tree` under `eid`, or None."""
+    if not tree:
+        return None
+    k, now = key(tree, cmd, eid), time.time()
+    for e in reversed(_fresh(_load(p.state / CAPS, "probes"), now)):
+        if e.get("key") == k:
+            return e
+    return None
+
+
+def probe_record(p: Project, tree: str, cmd: str, eid: str, ok: bool, tail: str, batch: str) -> str:
+    """Record a cap probe, passed or failed, so a batch rerun after a reboot skips it; prune the
+    store. Returns why it could not, or ""."""
+    if not tree:
+        return "no tree"
+    path = p.state / CAPS
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path.with_name(path.name + ".lock"), "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            now = time.time()
+            entries = _load(path, "probes") + [{"key": key(tree, cmd, eid), "tree": tree, "cmd": cmd, "ok": bool(ok),
+                                                "tail": tail, "batch": batch, "ts": now}]
+            write_json(path, {"probes": _fresh(entries, now)})
+    except OSError as e:
+        return str(e)
+    return ""
+
+
+def select_env(pattern: str, env: dict) -> dict:
+    """The variables that load the select plugin to run only the tests whose name matches `pattern`."""
+    pp = os.pathsep.join(filter(None, (str(PLUGIN_DIR), env.get("PYTHONPATH", ""))))
+    opts = " ".join(filter(None, (env.get("PYTEST_ADDOPTS", ""), f"-p {SELECT_PLUGIN}")))
+    return {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_SELECT": pattern}
 
 
 def resumable(cmd: str) -> bool:
