@@ -44818,3 +44818,9 @@ def test_upstream_quiet_confirm_runs_at_most_hourly_and_the_ack_goes_back_over_t
     lines, _ = upstream._acks_to_send("peer", 0, 10 ** 6)
     sent = [json.loads(x) for x in lines]
     assert len(sent) == 1 and sent[0]["fp"] == rx and sent[0]["evidence"].startswith("confirmed by quiet")
+
+
+def test_readme_says_own_push_may_reuse_checks_pass():
+    text = (Path(__file__).resolve().parents[1] / "plugins/tt-project/README.md").read_text()
+    bullet = text.split("- Checks run with `TTP_PUSH_MODE`", 1)[1].split("\n- ", 1)[0]
+    assert "may instead reuse" in bullet and "cannot count on running" in bullet

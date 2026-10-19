@@ -740,7 +740,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
   for `ttp checks`). A check that should only gate the push branch tests
-  `[ "$TTP_PUSH_MODE" != target ] || ...`.
+  `[ "$TTP_PUSH_MODE" != target ] || ...`. `ttp push --own` may instead reuse a
+  `ttp checks` pass recorded on exactly HEAD's tree (run with mode `checks` and an empty tip), so
+  logic that only runs in mode `own`, or that depends on `TTP_PUSH_TIP`, cannot count on running
+  there; the push queue (`target`) always runs its checks.
 - `ttp checks` runs, and the checks of `ttp push` and the push queue, share a host-wide cap, across
   every project on the machine: each takes one of
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap
