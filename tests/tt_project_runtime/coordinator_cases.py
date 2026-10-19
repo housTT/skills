@@ -13269,6 +13269,31 @@ def test_a_coordinators_fleet_hold_is_lifted_by_any_coordinator_and_needs_a_know
     assert not fleethold.active()
 
 
+def test_a_users_pause_under_a_coordinators_fleet_hold_outlives_the_holds_lift(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp import fleethold, pauseends
+    a, b, _ = _fleet(env, tmp_path)
+    coord.pause_machine(a, "box1", True, by="coordinator", end=pauseends.from_action({"until": "1d"}))
+    msg = b.db.post("in", "Pause box1-device until I say so")
+    assert coord.apply(b, [{"type": "resource_pause", "resource": "box1-device", "paused": True, "until": "7d"}],
+                       user_turn=True, messages=[msg]) == []
+    assert b.db.paused_resources(shared=False)["box1-device"]["by"] == "user"
+    assert coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": False}]) == []
+    assert not fleethold.active()
+    coord.sync_shared_pauses(b)
+    got = b.db.paused_resources()["box1-device"]
+    assert got["by"] == "user" and not got.get("fleet"), got
+    # A coordinator pause that ends after a coordinator's hold is recorded too; one inside it is a no-op,
+    # and its line reaches the next digest instead of reading as a new pause.
+    coord.pause_machine(a, "box1", True, by="coordinator", end=pauseends.from_action({"until": "1d"}))
+    assert coord.apply(a, [{"type": "resource_pause", "resource": "box1-chip0", "paused": True, "until": "3h"}]) == []
+    assert "box1-chip0" not in a.db.paused_resources(shared=False)
+    assert any("box1-chip0" in x and "already held machine-wide" in x for x in a.db.kv(coord.NOTES_KEY)), \
+        a.db.kv(coord.NOTES_KEY)
+    assert coord.apply(a, [{"type": "resource_pause", "resource": "box1-chip0", "paused": True, "until": "3d"}]) == []
+    assert a.db.paused_resources(shared=False)["box1-chip0"]["by"] == "coordinator"
+
+
 def test_ttp_pause_machine_from_the_shell_is_the_users_hold(env, tmp_path):
     from ttp import fleethold
     a, b, _ = _fleet(env, tmp_path)

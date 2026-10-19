@@ -2081,8 +2081,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 by = "user" if a["paused"] and _users_pause(db, a, user_turn, messages) else "coordinator"
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
                 owner = "user" if "user" in (by, (held or {}).get("by")) else by
-                pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
-                               by=by, key=key, end=pauseends.from_action(a, p=p, by=owner) if a["paused"] else None)
+                line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
+                                      by=by, key=key, end=pauseends.from_action(a, p=p, by=owner) if a["paused"] else None)
+                if "machine-wide" in line:   # a no-op under a fleet hold: never told to the user as a new pause
+                    notes.append(f"resource_pause {name}: {line}")
             elif t == "observation_mute":
                 m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                              a.get("why") or a.get("reason") or a.get("text") or "",
@@ -2926,7 +2928,12 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     db, woken = db or p.db, 0
     from . import fleethold
     hold = fleethold.covering(name)
-    if hold and paused and not (db.paused_resources(shared=False).get(name) or shared.read_pause(name)):
+    # A pause under a hold is a no-op unless it would outlive the hold: the user's own pause under a
+    # hold not theirs (any coordinator may lift that hold), or an end later than the hold's.
+    outlives = hold and (by == "user" and hold.get("by") != "user" or hold.get("by") != "user" and end is not None
+                         and float(end.get("until") or 0) > float(hold.get("until") or float("inf")))
+    if hold and paused and not outlives and not (db.paused_resources(shared=False).get(name)
+                                                 or shared.read_pause(name)):
         return (f"{name} is already held machine-wide by hold {hold['id']} ({hold.get('alias')}, set by "
                 f"{hold.get('project')}): nothing to do; resource_pause `machine` lifts it")
     sync_shared_pauses(p, db)   # first keep a pause of a resource no longer shared as the project's own
