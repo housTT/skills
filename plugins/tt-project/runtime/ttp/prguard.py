@@ -428,6 +428,23 @@ READY_INSTR_RE = re.compile(
 # A sentence that refuses or forbids it is about the rule, not an instruction to break it.
 DISCUSSES_RE = re.compile(r"\b(never|not|refuse\w*|reject\w*|den(?:y|ies|ied)|guard|only the user|"
                           r"pr_approve|undo)\b|n't\b", re.I)
+# A negation before it in its own clause forbids it: "No gh pr ready, no reviewers", "Review only: no
+# push, no merge, no gh pr ready", "keep it in draft, without marking it ready". The clause ends at
+# punctuation or "then", so "No reviewers, then run gh pr ready" still orders it.
+CLAUSE_END_RE = re.compile(r"[,:;()\n]|\bthen\b", re.I)
+FORBIDS_RE = re.compile(r"\b(?:no|never|not|without)\b|n't\b|\bkeep\w*\b[^.;\n]*\bdraft\b", re.I)
+
+
+def _orders_ready(sentence: str) -> bool:
+    """`sentence` tells a worker to take a PR out of draft: a mention not forbidden in its clause."""
+    if DISCUSSES_RE.search(sentence):
+        return False
+    for m in READY_INSTR_RE.finditer(sentence):
+        before = sentence[:m.start()]
+        ends = [e.end() for e in CLAUSE_END_RE.finditer(before)]
+        if not FORBIDS_RE.search(before[ends[-1] if ends else 0:]):
+            return True
+    return False
 
 
 # A PR as the thing acted on, not a modifier ("a PR status digest", "the PR thread"): what follows
@@ -502,7 +519,7 @@ def spec_problem(db, spec: str) -> str | None:
     PR has no unspent approval. None when it may."""
     for sentence in re.split(r"(?<=[.!?])\s+|\n|;", spec or ""):
         bare = PR_URL_RE.sub("the PR", sentence)   # a URL's dots are not the sentence's end
-        if not READY_INSTR_RE.search(bare) or DISCUSSES_RE.search(bare):
+        if not _orders_ready(bare):
             continue
         prs = pr_keys(sentence) or pr_keys(spec)
         missing = sorted(k for k in prs if not may_ready(db, k))

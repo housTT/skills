@@ -9198,6 +9198,47 @@ def test_task_specs_that_take_a_pr_out_of_draft_need_the_users_approval(env):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]) == []
 
 
+def test_task_specs_that_forbid_leaving_draft_pass_the_gate_and_orders_still_do_not(env):
+    # A spec line that only forbids taking a PR out of draft is a rule, not an order: a negation
+    # before the mention in its clause. An order elsewhere in the sentence is still refused.
+    p = make(env)
+    from ttp import coordinator as coord
+    for n, spec in enumerate(("- No gh pr ready, no reviewers, no merge.",
+                              "Review only: no push, no merge, no gh pr ready.",
+                              "Fix CI on acme/widgets#7; no gh pr ready, no reviewers.",
+                              "Keep acme/widgets#7 in draft and leave gh pr ready to the user.",
+                              "Request no reviewers and no gh pr ready on acme/widgets#7.",
+                              "Push fixes without marking it ready.")):
+        assert coord.apply(p, [{"type": "task_add", "title": f"ok {n}", "kind": "code", "spec": spec}]) == [], spec
+    for spec in ("Run gh pr ready on acme/widgets#7.", "No reviewers, then run gh pr ready on acme/widgets#7.",
+                 "Fix the lint, no merge, mark acme/widgets#7 ready.", "No push: gh pr ready 7 in acme/widgets#7."):
+        out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
+        assert "approval is not on record" in out, spec
+    assert not p.db.q("SELECT id FROM tasks WHERE title='ready it'")
+
+
+def test_a_draft_gate_rejection_keeps_the_whole_action_for_the_next_turn(env):
+    # A false hit must not lose the task: the record the next turn reads carries the action as sent.
+    p = make(env)
+    from ttp import coordinator as coord
+    spec = "Fix CI on acme/widgets#7. " + "Long context. " * 60 + "Then run gh pr ready on acme/widgets#7."
+    action = {"type": "task_add", "title": "fix CI", "kind": "code", "spec": spec, "depends_on": []}
+    out = coord.apply(p, [action])
+    assert len(out) == 1 and coord.GATE_MARK in out[0] and json.dumps(action) in out[0]
+    assert coord.apply(p, [{"type": "task_add", "title": "other", "kind": "code", "spec": "Fix lint."}]) == []
+    tid = p.db.one("SELECT id FROM tasks WHERE title='other'")["id"]
+    upd = {"type": "task_update", "id": tid, "spec": "Then gh pr ready acme/widgets#7."}
+    out = coord.apply(p, [upd])
+    assert json.dumps(upd) in out[0]
+    p.db.set_kv(coord.REJECTED_KEY, out)
+    assert json.dumps(upd) in coord.digest(p, {}, [], [])
+    p.db.set_kv(coord.REJECTED_KEY, [out[0].replace("task_update", "task_add", 1) + " " + spec])
+    assert spec in coord.digest(p, {}, [], [])
+    # other rejections keep their short form
+    out = coord.apply(p, [{"type": "task_add", "title": "", "kind": "code", "spec": "x"}])
+    assert out and coord.GATE_MARK not in out[0]
+
+
 
 def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
     """A `work` task whose spec asked for a draft PR was refused by its worker (only code tasks open

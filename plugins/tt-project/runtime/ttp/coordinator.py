@@ -323,6 +323,7 @@ EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_
 # up to this much of it in the digest and the charter_retry event: a clipped copy gets reworded.
 RESEND_CHARS = 6000
 RESEND_MARK = "send that text exactly"
+GATE_MARK = "the rejected action, as sent (fix and resend it whole, or drop it)"
 HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
@@ -960,7 +961,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for x in rejected:
         tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
             else "your previous turn's action was rejected; fix or drop it"
-        lines.append(f"- [{tag}] {x[:RESEND_CHARS if RESEND_MARK in x else 500]}{told}")
+        lines.append(f"- [{tag}] {x[:RESEND_CHARS if RESEND_MARK in x or GATE_MARK in x else 500]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     for x in chaincap.notices(db):
@@ -1126,6 +1127,11 @@ _GIT_LOG = re.compile(rf"\bgit(?:\s+-[^\s|;&]+(?:\s+[^\s|;&-][^\s|;&]*)??)*\s+lo
 
 class MissingTaskRef(ValueError):
     """A start_when, retry_when, hold probe or depends_on that names a task this project does not have."""
+
+
+class DraftGateRejection(ValueError):
+    """A task spec the draft gate (prguard.spec_problem) refused: the rejection keeps the whole action
+    (GATE_MARK), so a false hit costs one resend, not the task."""
 
 
 def check_task_refs(db, probe: str, what: str = "start_when") -> None:
@@ -1510,7 +1516,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 stale = marker_only_probe(when)
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
-                    raise ValueError(f"task_add rejected: {why}")
+                    raise DraftGateRejection(f"task_add rejected: {why}")
                 try:
                     owes = obligations.spec_check(db, a.get("spec") or "")
                 except ValueError as e:
@@ -1696,7 +1702,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if spec:
                     why = prguard.spec_problem(db, spec)
                     if why:
-                        raise ValueError(f"#{task['id']} rejected: {why}")
+                        raise DraftGateRejection(f"#{task['id']} rejected: {why}")
                     try:
                         obligations.spec_check(db, spec, task["id"], attaching)
                     except ValueError as e:
@@ -2099,7 +2105,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             else:
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
-            problems.append(f"{t}: {e}")
+            sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
+                if isinstance(e, DraftGateRejection) else ""
+            problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
             if t == "charter_update":
                 _charter_retry_now(p, a, str(e), key)
             if t == "config_set" and a.get("key"):
