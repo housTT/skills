@@ -2928,7 +2928,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     hold = fleethold.covering(name)
     if hold and paused and not (db.paused_resources(shared=False).get(name) or shared.read_pause(name)):
         return (f"{name} is already held machine-wide by hold {hold['id']} ({hold.get('alias')}, set by "
-                f"{hold.get('project')}): nothing to do")
+                f"{hold.get('project')}): nothing to do; resource_pause `machine` lifts it")
     sync_shared_pauses(p, db)   # first keep a pause of a resource no longer shared as the project's own
     is_shared = shared.is_shared(p, name)
     reason = " ".join(str(reason or "").split())[:300]
