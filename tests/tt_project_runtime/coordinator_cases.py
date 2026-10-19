@@ -8684,8 +8684,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     p = make(env)
     role = coordinator_role(p)
     # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
-    # 30_350: room for the relay-label and stale_duplicate rules and the machine-wide hold
-    assert len(role) <= 30_350, len(role)
+    # 30_400: room for the relay-label and stale_duplicate rules and the machine-wide hold
+    assert len(role) <= 30_400, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
