@@ -10,6 +10,9 @@
   governor says optional work must wait.
 
 A schedule that was missed while the machine slept runs once on wake, never once per missed slot.
+One that starts a whole period (and at least GAP_MIN_S) late for any other reason, such as the host
+or the daemon being down or a tick being held up, also runs once, and the daemon reports the missed
+runs and their likely cause (Daemon._schedule_gaps), so a stop never goes unnoticed.
 An llm schedule skipped because the budget gate holds optional work keeps its period open and
 retries every half hour (or its own period, if shorter) until the gate allows it.
 
@@ -108,6 +111,22 @@ def due(db: DB, now: float | None = None) -> list[dict]:
     now = now or time.time()
     return db.q("SELECT * FROM schedules WHERE enabled=1 AND next_run IS NOT NULL AND next_run<=? ORDER BY next_run",
                 (now,))
+
+
+GAP_MIN_S = 3600   # a schedule starting this late, and at least one whole period late, missed runs
+
+
+def missed(row: dict, now: float, sleeps: list | None = None) -> int:
+    """How many whole periods a due schedule's run starts late: 0 when it is less than a period or
+    GAP_MIN_S late, or never ran. Time the host slept (`sleeps`, [start, end] pairs) is no gap: a
+    schedule missed while the machine slept runs once on wake, by design. Anything else that long
+    (the host or the daemon down, a tick held up) left a hole in what the schedule records."""
+    nxt, every = row.get("next_run"), int(row.get("every_s") or 0)
+    if nxt is None or every <= 0 or not row.get("last_run"):
+        return 0
+    late = now - float(nxt) - sum(max(0.0, min(float(b), now) - max(float(a), float(nxt)))
+                                  for a, b in sleeps or [])
+    return int(late // every) if late >= max(every, GAP_MIN_S) else 0
 
 
 BUDGET_RETRY_S = 1800

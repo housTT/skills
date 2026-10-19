@@ -620,6 +620,7 @@ class Daemon:
         self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
+        self._last_stop: dict = {}   # the clean-stop record this daemon found at start
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
@@ -647,6 +648,7 @@ class Daemon:
         pidfile.write_text(str(os.getpid()))
         # The last stop's record was read when this boot was noted (_note_boot); from here on a
         # reboot that finds none of this boot's was abrupt.
+        self._last_stop = self.p.db.kv(CLEAN_STOP_KEY) or {}   # for schedules' gap causes (_schedule_gaps)
         self.p.db.x("DELETE FROM kv WHERE key=?", (CLEAN_STOP_KEY,))
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
@@ -3967,9 +3969,12 @@ class Daemon:
             self._sched_swept = True
             for line in schedrun.kill_all(db):
                 log(self.p, line)
-        for s in sched.due(db):
-            if s["name"] in runs:
-                continue   # its run is still going: never two at once
+        due = [s for s in sched.due(db) if s["name"] not in runs]   # a running one: never two at once
+        try:
+            self._schedule_gaps(due)
+        except Exception:
+            log(self.p, "schedule gaps: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        for s in due:
             payload = json.loads(s["payload"] or "{}")
             if s["kind"] in ("command", "watcher"):
                 runs[s["name"]] = self._start_schedule(s, payload)
@@ -4010,6 +4015,47 @@ class Daemon:
                              f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
                              lifecycle=scr.ERROR)
                 self._schedule_ran(run.s, why, None)
+
+    def _schedule_gaps(self, due: list[dict]) -> None:
+        """Due schedules that start whole periods late (sched.missed) left a hole in what they record:
+        log each and tell the coordinator once, with the window and its likely cause (the host down,
+        the daemon down, or a tick or the schedule held up while the daemon ran). An orderly cause (a
+        clean daemon stop, an orderly or planned reboot) is a record in the digest that wakes nobody;
+        any other is a normal observation, so a crash, an outage or a stuck tick is never silent."""
+        db, now = self.p.db, time.time()
+        sleeps = db.kv("host_sleeps", []) or []
+        gaps = [(s, n) for s in due if (n := sched.missed(s, now, sleeps))]
+        if not gaps:
+            return
+        t = lambda ts: timefmt.short(float(ts), self.p, now)
+        since = min(float(s["next_run"]) for s, _ in gaps)
+        prev, stop = db.kv("boot_prev") or {}, self._last_stop
+        if self._started <= since:
+            cause, orderly = "the daemon was running: its tick or the schedule was held up", False
+        elif self._this_boot(prev.get("boot")) and (self.boot_at or 0) > since:
+            how = prev.get("shutdown") or "abrupt"
+            if prev.get("prev_boot") and self._planned_cycle(prev["prev_boot"]):
+                how = "planned"
+            hb = prev.get("last_heartbeat")
+            cause = (f"the host went down ({how}{f'; last heartbeat {t(hb)}' if hb else ''}) and booted "
+                     f"again at {t(self.boot_at)}")
+            orderly = how != "abrupt"
+        else:
+            clean = stop.get("ts") if self._this_boot(stop.get("boot")) else None
+            cause = (f"the daemon was stopped at {t(clean)}" if clean else
+                     "the daemon was not running (it ended without a clean stop)") + f" until {t(self._started)}"
+            orderly = bool(clean)
+        each = "; ".join(f"{s['name']} {n} (every {sched._every_text(int(s['every_s']))}, last ran "
+                         f"{t(s['last_run'])})" for s, n in gaps)
+        text = (f"Schedules missed runs since {t(since)}: {each}. Likely cause: {cause}. Each runs once now; "
+                f"what they record has a hole for that window.")
+        log(self.p, f"schedule gap: {text}")
+        if orderly:
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon:schedule-gap", "schedule_gap", f"schedule-gap:{int(since)}", "low", text[:4000],
+                  "record"))
+        else:
+            self.observe("daemon:schedule-gap", text, "normal", whole=True, key=f"schedule-gap:{int(since)}")
 
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
         """Start one command, heal or builtin watcher run in its own thread. It works on a copy of the
