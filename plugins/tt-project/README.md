@@ -1046,6 +1046,23 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
+- Project lease (`failover.lease_remote`, off by default): one live coordinator per project across
+  hosts, so a project restored on a second host while the first is down cannot double-dispatch once
+  the first comes back. The lease is the ref `refs/ttp/lease/<identity>` on that git remote (a URL or
+  a remote name of the code repository); `<identity>` is `failover.fleet` when set (projects driving
+  one fleet share one lease), else the project id. Each write is a compare-and-swap push. Its epoch
+  goes up by one per change of holder and reaches runs as `TTP_LEASE_EPOCH`. The daemon takes or
+  renews it every `lease_ttl_s`/5 (300 s ttl) before coordinator turns and dispatch; a host that does
+  not hold it starts no coordinator turn, worker run, schedule or push, polls and posts nothing to
+  chat, and says so in one event, while maintenance and running workers go on. No wall clocks are
+  compared: the holder stops at 0.8 ttl after its last renewal, another host takes the lease only
+  after seeing it unchanged for 1.25 ttl on its own clock, a restarted daemon on the holder's host
+  renews at once, and after a sleep the lease counts as lapsed until renewed. A store that does not
+  answer stops dispatch (fail-closed). The remote must be a separate one: the plugin's own
+  repository is always refused, and the project's delivery remote unless
+  `failover.allow_delivery_remote` is set (only where its rules allow such refs). `ttp lease check`
+  says whether the store may be used and answers; `ttp status` shows one `lease:` line. Not to be
+  confused with provider failover (`coordinator.provider_failover_*`).
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). `on`, set explicitly: the task's own or carried branch, created
