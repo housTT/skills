@@ -101,6 +101,16 @@ def files_of(root: Path, rels: list[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def tracked_files(root: Path) -> set[str]:
+    """The files git tracks in the checkout `root`, relative to it (empty when it is no checkout).
+    They are on the branch or in the tracked patch, so never archived or taken out of the worktree."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {f for f in r.stdout.decode(errors="surrogateescape").split("\0") if f} if r.returncode == 0 else set()
+
+
 def tracked_patch(root: Path) -> bytes:
     """A binary patch of the worktree's uncommitted tracked changes against HEAD, checked to apply to
     HEAD in a scratch index (`git apply --check --cached`). Raises when there is none or it does not
@@ -430,9 +440,11 @@ def _entries(root: Path, files: list[str], sizes: dict, named: set, dropped: set
 
 
 def _split(root: Path, named: list[str], others: list[str], cap_mb: float):
-    """(the named files, the files to archive, the files to drop, size of each); see store."""
-    named_files = files_of(root, named)
-    seen = set(named_files)
+    """(the named files, the files to archive, the files to drop, size of each); see store. A file git
+    tracks is left out: archiving would delete it from the worktree, which then never looks clean."""
+    tracked = tracked_files(root)
+    named_files = [f for f in files_of(root, named) if f not in tracked]
+    seen = set(named_files) | tracked
     other_files = [f for f in files_of(root, others) if f not in seen]
     sizes = {f: (root / f).lstat().st_size for f in named_files + other_files}
     keep, left, dropped = list(named_files), cap_mb * 1e6, []

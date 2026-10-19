@@ -1224,7 +1224,9 @@ def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | 
     """Hand-off artifacts (any task's result.json `artifacts`, see handoff_paths) that still exist
     inside this task's worktree and that git ignores, relative to the worktree. An entry is read
     relative to its own task's worktree or the project. `git worktree remove` deletes ignored files,
-    and only those: tracked ones are on the branch, other untracked ones keep the worktree."""
+    and only those: tracked ones are on the branch, other untracked ones keep the worktree. A named
+    directory git does not ignore wholly gives only the ignored entries inside it, never itself, so
+    its tracked files are never archived (and so never taken out of the worktree)."""
     ignored = _ignored(path) if ignored is None else ignored
     if not ignored:
         return []
@@ -1236,9 +1238,13 @@ def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | 
                 rel = full.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 continue
-            if rel != "." and rel not in found and any(
-                    rel == e or rel.startswith(e + "/") or e.startswith(rel + "/") for e in ignored):
-                found.append(rel)
+            if rel == ".":
+                continue
+            if any(rel == e or rel.startswith(e + "/") for e in ignored):
+                hits = [rel]
+            else:
+                hits = sorted(e for e in ignored if e.startswith(rel + "/"))
+            found += [h for h in hits if h not in found]
     return found
 
 

@@ -11150,6 +11150,41 @@ def test_ignored_hand_off_artifacts_are_archived_and_other_ignored_files_are_not
     assert not hidden.exists() and _archived(p, t3) == {"new.py": (False, "tar")}
 
 
+def test_a_named_directory_with_tracked_files_archives_only_its_ignored_entries(env, monkeypatch):
+    # A hand-off naming a directory that holds tracked files and an ignored cache once archived the
+    # whole directory: its tracked files were deleted, and the worktree never looked clean again.
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    tid, path, _ = _code_task(p, "skill")
+    (path / "skills" / "box").mkdir(parents=True)
+    (path / "skills" / "box" / "SKILL.md").write_text("skill\n")
+    (path / "skills" / "box" / "run.py").write_text("print(1)\n")
+    (path / ".gitignore").write_text("__pycache__/\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", "skill")
+    (path / "skills" / "box" / "__pycache__").mkdir()
+    (path / "skills" / "box" / "__pycache__" / "run.pyc").write_bytes(b"pyc")
+    _handoff(p, tid, ["skills/box"])
+    assert worktree.handoff_artifacts(p, tid, path) == ["skills/box/__pycache__"]
+    (res,) = worktree.sweep(p)
+    assert res["why"] is None and not path.exists(), "the worktree was kept"
+    assert _archived(p, tid) == {"skills/box/__pycache__/run.pyc": (True, "tar")}
+
+
+def test_archive_store_never_takes_a_tracked_file_out_of_the_worktree(env):
+    p = make(env)
+    from ttp import archive
+    tid, path, _ = _code_task(p, "tracked")
+    _commit_file(path, "kept")
+    (path / "new.txt").write_text("untracked\n")
+    out = archive.store(p, p.db.task(tid), path, ["kept.txt", "new.txt"], ["kept.txt"], 200)
+    assert out["files"] == 1 and (path / "kept.txt").read_text() == "kept"
+    assert not (path / "new.txt").exists()
+    assert _git_out(path, "status", "--porcelain").strip() == ""
+    assert _archived(p, tid) == {"new.txt": (True, "tar")}
+
+
 def _archived(p, tid):
     from ttp import archive
     return {e["path"]: (e["named"], e["stored"]) for e in (archive.manifest(p, tid) or {}).get("files", [])}
