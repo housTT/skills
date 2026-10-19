@@ -982,6 +982,9 @@ def status_text(p: Project) -> str:
     from . import hostcycle
     if cyc := hostcycle.hold(p, now):
         lines.append(hostcycle.hold_line(cyc, p, now))
+    from . import lease
+    if lease_line := lease.status_line(p, p.config(), now):
+        lines.append(lease_line)
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
@@ -4578,6 +4581,22 @@ def _draining_runs(p: Project) -> list[dict]:
                    for t in p.db.q("SELECT id FROM tasks WHERE status='pushing' AND COALESCE(result,'') NOT LIKE '%\"push_verify\"%' ORDER BY id")]
 
 
+def cmd_lease(a) -> None:
+    """`ttp lease check`: whether the configured lease store may be used and answers (lease.py).
+    `ttp lease show`: this host's last view of the lease (state/lease.json)."""
+    from . import lease
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp lease check <name>`")
+    if a.action == "show":
+        print(lease.status_line(p, p.config()) or "no lease configured (failover.lease_remote unset)")
+        return
+    ok, text = lease.check(p, p.config())
+    print(f"ttp lease check: {text}")
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_drain(a) -> None:
     """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept.
     Its `ttp detach` jobs still running here are listed (a reboot ends them); with --jobs it waits for
@@ -6712,6 +6731,10 @@ def main(argv: list[str] | None = None) -> None:
                            help="the whole project until this host reboots: the daemon lifts it on its first tick "
                                 "on a new boot")
         s.set_defaults(fn=cmd_pause)
+    s = sub.add_parser("lease", help="the project lease across hosts: check its store, or show this host's view")
+    s.add_argument("action", choices=["check", "show"])
+    s.add_argument("name", nargs="?")
+    s.set_defaults(fn=cmd_lease)
     s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
     s.add_argument("name")
     s.add_argument("--wait", type=float, default=0, metavar="S",

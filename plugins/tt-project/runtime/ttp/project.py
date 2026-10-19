@@ -306,6 +306,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. A schedule's payload may set either for itself.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20},
+    # The project lease across hosts (lease.py; keys in EXTRA_KEYS): empty is off, a single host.
+    "failover": {},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
     # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
@@ -396,8 +398,11 @@ EXTRA_KEYS = {
     "heal": {"outage_owner_budget_min", "outage_task_due_min", "outage_escalate_min"},
     # hold_mute_escalate_h: the longest a mute covering a device hold stays silent (screen.hold_cap; 1).
     "screen": {"hold_mute_escalate_h"},
-    # standby: where state snapshots go (off: unset); fleet: the identity projects driving one fleet share.
-    "failover": {"standby", "fleet"},
+    # standby: where state snapshots go (off: unset); fleet: the identity projects driving one fleet share
+    # (also the shared lease identity). The project lease (lease.py), off while lease_remote is unset:
+    # lease_remote, a git remote (URL or a code-repo remote name) for refs/ttp/lease/<identity>, never the
+    # plugin's own repository and not the delivery remote unless allow_delivery_remote; lease_ttl_s (300).
+    "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}

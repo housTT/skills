@@ -1,0 +1,405 @@
+"""Project lease: one live coordinator per project across hosts (failover step L1).
+
+The lease is a record in a store that sits off every host running the project, written only by
+compare-and-swap (`read() -> (record, version)`, `cas(version, record)`). Its `epoch` goes up by one
+on every change of holder and never on a renewal: runs get it as TTP_LEASE_EPOCH, the fencing
+token later steps check. Not to be confused with provider failover (failover.py).
+
+Timing never compares wall clocks across hosts. The holder counts itself the holder only until
+`monotonic(start of its last successful renewal) + 0.8 * ttl`, renewing every ttl/5. Another host
+counts a lease free only after it saw the same version unchanged for 1.25 * ttl on its own
+monotonic clock. After a sleep the lease counts as lapsed until a renewal succeeds.
+
+Backends: `git` (the ref refs/ttp/lease/<identity> on `failover.lease_remote`, CAS by
+`git push --force-with-lease`). With no `failover.lease_remote` there is no lease: the daemon
+behaves as on a single host (always the holder). The store interface is the seam for the ssh-file
+backend (L2) and the stand-in's forced lease (S1)."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+import uuid
+from pathlib import Path
+
+DEFAULT_TTL_S = 300
+HOLD_FRACTION = 0.8        # the holder stops counting itself the holder this far into a ttl
+TAKE_FRACTION = 1.25       # another host takes a lease seen unchanged this long
+RENEW_FRACTION = 0.2       # the holder renews this often
+STATE_FILE = "lease.json"  # under state/: what this host last saw, for status and runs
+REF_PREFIX = "refs/ttp/lease/"
+GIT_TIMEOUT_S = 30
+# Lease refs must never land on the plugin's own repository: its charter allows no such refs.
+OWN_REPOS = ("github.com/tenstorrent/skills",)
+
+
+class Unreachable(Exception):
+    """The store did not answer: the holder lets its lease lapse, nobody takes it."""
+
+
+class Refused(ValueError):
+    """The configured store may not hold lease refs."""
+
+
+# Configuration -----------------------------------------------------------------------------------
+
+def settings(cfg: dict) -> dict:
+    f = cfg.get("failover") or {}
+    return f if isinstance(f, dict) else {}
+
+
+def configured(cfg: dict) -> bool:
+    """A lease is in force only with a store configured: none is today's single-host behaviour."""
+    return bool(str(settings(cfg).get("lease_remote") or "").strip())
+
+
+def ttl_s(cfg: dict) -> float:
+    try:
+        v = float(settings(cfg).get("lease_ttl_s") or DEFAULT_TTL_S)
+    except (TypeError, ValueError):
+        v = DEFAULT_TTL_S
+    return max(v, 30.0)
+
+
+def identity(p, cfg: dict) -> str:
+    """failover.fleet when set (projects that drive one fleet share one lease), else the project id."""
+    raw = str(settings(cfg).get("fleet") or "").strip() or str(cfg.get("id") or "") or p.name
+    return re.sub(r"[^A-Za-z0-9._-]", "-", raw).strip(".-") or "project"
+
+
+def norm_url(url: str) -> str:
+    """A remote URL reduced to host/path for comparison: no scheme, user, port, `.git` or slash."""
+    u = url.strip()
+    if "://" not in u and re.match(r"^[^/]+@[^/:]+:", u):     # scp form user@host:path
+        u = u.split("@", 1)[1].replace(":", "/", 1)
+    u = re.sub(r"^[a-z+]+://", "", u, flags=re.I)
+    u = re.sub(r"^[^/@]+@", "", u)
+    u = re.sub(r"^([^/:]+):\d+/", r"\1/", u)
+    if u.startswith("/") or u.startswith("."):
+        u = str(Path(u).expanduser().resolve())
+    return re.sub(r"(\.git)?/*$", "", u).lower()
+
+
+def _git(args: list[str], cwd: Path | str | None = None, *, input: str | None = None,
+         timeout: float = GIT_TIMEOUT_S, env: dict | None = None) -> subprocess.CompletedProcess:
+    e = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+    e.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+    return subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
+                          timeout=timeout, env=e)
+
+
+def own_repos() -> set[str]:
+    """This plugin's repository (its manifest's `repository`) and the built-in list."""
+    out = {norm_url(u) for u in OWN_REPOS}
+    manifest = Path(__file__).resolve().parents[2] / ".claude-plugin" / "plugin.json"
+    try:
+        repo = json.loads(manifest.read_text()).get("repository")
+        if isinstance(repo, str) and repo:
+            out.add(norm_url(repo))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return out
+
+
+def delivery_remotes(root: Path) -> dict[str, str]:
+    """name -> URL of the project's code repository remotes (its delivery remotes)."""
+    try:
+        r = _git(["remote", "-v"], root, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines() if r.returncode == 0 else []:
+        parts = line.split()
+        if len(parts) >= 2:
+            out.setdefault(parts[0], parts[1])
+    return out
+
+
+def resolve_remote(p, cfg: dict) -> str:
+    """failover.lease_remote as a URL (a remote name of the code repository is looked up), or raise
+    Refused saying why it may not hold lease refs: the plugin's own repository never; the project's
+    delivery remotes only with failover.allow_delivery_remote."""
+    raw = str(settings(cfg).get("lease_remote") or "").strip()
+    if not raw:
+        raise Refused("failover.lease_remote is not set")
+    remotes = delivery_remotes(p.root)
+    url = remotes.get(raw, raw)
+    n = norm_url(url)
+    if any(n == o or n.endswith("/" + "/".join(o.split("/")[-2:])) for o in own_repos()):   # any host alias
+        raise Refused(f"failover.lease_remote {raw} is the tt-project plugin's own repository: lease refs "
+                      f"may not be pushed there; configure a separate remote")
+    if not settings(cfg).get("allow_delivery_remote"):
+        for name, other in remotes.items():
+            if norm_url(other) == n:
+                raise Refused(f"failover.lease_remote {raw} is the project's delivery remote ({name}): refs "
+                              f"under {REF_PREFIX} may break its branch rules; configure a separate remote, or "
+                              f"set failover.allow_delivery_remote if its charter allows such refs")
+    return url
+
+
+# Store -------------------------------------------------------------------------------------------
+
+class GitStore:
+    """The lease as the ref refs/ttp/lease/<identity> on a remote: each write is a fresh orphan
+    commit holding lease.json, pushed with --force-with-lease=<ref>:<old oid> (empty: must not
+    exist), which receive-pack checks under the ref lock, so a write is atomic. `version` is the
+    commit id ("" while no record exists). Objects live in a private bare repo under state/."""
+
+    def __init__(self, remote: str, ident: str, gitdir: Path):
+        self.remote, self.ref, self.gitdir = remote, REF_PREFIX + ident, Path(gitdir)
+
+    def _repo(self) -> Path:
+        if not (self.gitdir / "HEAD").exists():
+            self.gitdir.mkdir(parents=True, exist_ok=True)
+            r = _git(["init", "-q", "--bare", str(self.gitdir)])
+            if r.returncode:
+                raise Unreachable(f"cannot create {self.gitdir}: {r.stderr.strip()[:200]}")
+        return self.gitdir
+
+    def _call(self, args: list[str], **kw) -> subprocess.CompletedProcess:
+        try:
+            return _git(["--git-dir", str(self._repo()), *args], **kw)
+        except subprocess.TimeoutExpired as e:
+            raise Unreachable(f"git {args[0]} timed out after {e.timeout:.0f} s") from e
+        except OSError as e:
+            raise Unreachable(f"git {args[0]}: {e}") from e
+
+    def read(self) -> tuple[dict | None, str]:
+        r = self._call(["ls-remote", self.remote, self.ref])
+        if r.returncode:
+            raise Unreachable(f"git ls-remote {self.remote}: {(r.stderr or r.stdout).strip()[-300:]}")
+        oid = next((ln.split()[0] for ln in r.stdout.splitlines() if ln.endswith("\t" + self.ref)), "")
+        if not oid:
+            return None, ""
+        if self._call(["cat-file", "-e", oid + "^{commit}"]).returncode:
+            f = self._call(["fetch", "-q", "--no-tags", self.remote, f"+{self.ref}:refs/ttp/seen"])
+            if f.returncode:
+                raise Unreachable(f"git fetch {self.remote}: {f.stderr.strip()[-300:]}")
+        blob = self._call(["cat-file", "blob", f"{oid}:lease.json"])
+        try:
+            rec = json.loads(blob.stdout) if blob.returncode == 0 else None
+        except ValueError:
+            rec = None
+        return (rec if isinstance(rec, dict) else {"unreadable": True}), oid
+
+    def cas(self, version: str, rec: dict) -> bool:
+        """Write `rec` if the record is still at `version`. False: someone else wrote first."""
+        blob = self._call(["hash-object", "-w", "--stdin"], input=json.dumps(rec, indent=1, sort_keys=True) + "\n")
+        tree = self._call(["mktree"], input=f"100644 blob {blob.stdout.strip()}\tlease.json\n")
+        ident = {"GIT_AUTHOR_NAME": "ttp lease", "GIT_AUTHOR_EMAIL": "ttp-lease@localhost",
+                 "GIT_COMMITTER_NAME": "ttp lease", "GIT_COMMITTER_EMAIL": "ttp-lease@localhost"}
+        commit = self._call(["commit-tree", tree.stdout.strip(), "-m",
+                             f"lease epoch {rec.get('epoch')} {rec.get('holder_host') or 'released'}"], env=ident)
+        if blob.returncode or tree.returncode or commit.returncode:
+            raise Unreachable("cannot build the lease commit: " + (commit.stderr or tree.stderr or blob.stderr).strip()[:200])
+        r = self._call(["push", "--porcelain", f"--force-with-lease={self.ref}:{version}", self.remote,
+                        f"{commit.stdout.strip()}:{self.ref}"])
+        if r.returncode == 0:
+            return True
+        out = r.stdout + r.stderr
+        if "stale info" in out or "[rejected]" in out or re.search(r"^!\s", r.stdout, re.M):
+            return False
+        raise Unreachable(f"git push {self.remote}: {out.strip()[-300:]}")
+
+
+# Lease -------------------------------------------------------------------------------------------
+
+class Lease:
+    """This host's view of the lease. `step()` acquires, renews or watches, at most every ttl/5
+    while held; `held()` is the per-call check. The clock is injectable for tests."""
+
+    def __init__(self, store, ident: str, *, host: str, base: str, ttl: float = DEFAULT_TTL_S,
+                 state_file: Path | None = None, clock=time.monotonic):
+        self.store, self.identity, self.host, self.base, self.ttl = store, ident, host, str(base), float(ttl)
+        self.instance = uuid.uuid4().hex[:12]
+        self.state_file, self.clock = state_file, clock
+        self.held_until = 0.0          # monotonic deadline of the holder's own claim
+        self.renew_start = None        # monotonic start of the last successful renewal
+        self.last_check = None         # monotonic start of the last store round
+        self.rec: dict | None = None   # the record as last read or written
+        self.version = ""
+        self.seen = ("", 0.0)          # (version, monotonic time first seen) of another holder's record
+        self.error = ""
+        self.max_epoch = int((self._saved() or {}).get("max_epoch") or 0)
+        self.checked_wall = 0.0
+
+    # views
+    def held(self) -> bool:
+        return self.clock() < self.held_until
+
+    @property
+    def epoch(self) -> int:
+        return int((self.rec or {}).get("epoch") or 0)
+
+    def ours(self, rec: dict | None) -> bool:
+        """Held by this project on this host: an earlier daemon here is dead (state/daemon.lock is
+        one per host), so its lease is renewed after a restart, not waited out."""
+        return bool(rec) and rec.get("holder_host") == self.host and rec.get("holder_base") == self.base
+
+    def lapse(self) -> None:
+        """After a sleep the monotonic deadline means nothing: held again only once a renewal succeeds.
+        A watched record's age restarts too."""
+        self.held_until, self.renew_start, self.last_check = 0.0, None, None
+        self.seen = (self.seen[0], self.clock())
+
+    def _record(self, base: dict | None, epoch: int, now_wall: float) -> dict:
+        rec = dict(base or {})
+        rec.pop("unreadable", None)
+        rec.pop("released", None)
+        rec.update({"identity": self.identity, "epoch": epoch, "holder_host": self.host,
+                    "holder_base": self.base, "holder_instance": self.instance,
+                    "role": rec.get("role") if self.ours(base) else "primary",
+                    "primary_host": rec.get("primary_host") if self.ours(base) else self.host,
+                    "ttl_s": self.ttl, "renewed_wall": now_wall})
+        rec["role"] = rec["role"] or "primary"
+        if not self.ours(base):
+            rec["transitions"] = int(rec.get("transitions") or 0) + 1
+        return rec
+
+    def step(self, force: bool = False) -> str:
+        """One acquire/renew/watch round. Returns what happened: 'kept' (no store call needed),
+        'renewed', 'resumed' (this host's record from before a restart), 'acquired' (free), 'taken' (after
+        another holder's record stood still 1.25 ttl), 'lost', 'watching' (another holder; also between
+        rounds) or 'unreachable'. Watching reads the store at the same ttl/5 pace as renewing."""
+        start = self.clock()
+        if not force and self.last_check is not None and start - self.last_check < self.ttl * RENEW_FRACTION:
+            return "kept" if self.held() else "watching"
+        self.last_check = start
+        now_wall = time.time()
+        self.checked_wall = now_wall
+        try:
+            rec, ver = self.store.read()
+            if rec:
+                self.max_epoch = max(self.max_epoch, int(rec.get("epoch") or 0))
+            if rec is None or rec.get("released") or self.ours(rec):
+                fresh = rec is None or rec.get("released")
+                new = self._record(rec, self.max_epoch + 1 if fresh else int(rec.get("epoch") or 0), now_wall)
+                what = "acquired" if fresh else ("renewed" if rec.get("holder_instance") == self.instance
+                                                 else "resumed")
+            else:
+                if ver != self.seen[0]:
+                    self.seen = (ver, start)
+                self.rec, self.version = rec, ver
+                if start - self.seen[1] < self.ttl * TAKE_FRACTION:
+                    was = self.held()
+                    self.held_until, self.renew_start, self.error = 0.0, None, ""
+                    self._save()
+                    return "lost" if was else "watching"
+                new, what = self._record(rec, self.max_epoch + 1, now_wall), "taken"
+            if not self.store.cas(ver, new):
+                self.held_until, self.renew_start = 0.0, None
+                self.error = ""
+                self.seen = ("", start)
+                self._save()
+                return "lost"
+        except Unreachable as e:
+            self.error = str(e)[:300]
+            self._save()
+            return "unreachable"
+        self.rec, self.version, self.error = new, "", ""
+        self.max_epoch = max(self.max_epoch, new["epoch"])
+        self.renew_start, self.held_until = start, start + self.ttl * HOLD_FRACTION
+        self._save()
+        return what
+
+    def release(self) -> bool:
+        """Give the lease up (planned stop or move): the record stays, marked released at its epoch, so
+        the next holder takes it at once with epoch + 1. False when this host does not hold it."""
+        try:
+            rec, ver = self.store.read()
+            if not self.ours(rec) or rec.get("released"):
+                return False
+            ok = self.store.cas(ver, {**rec, "released": True, "renewed_wall": time.time()})
+        except Unreachable as e:
+            self.error = str(e)[:300]
+            return False
+        self.held_until, self.renew_start = 0.0, None
+        self._save()
+        return ok
+
+    # state/lease.json
+    def _saved(self) -> dict | None:
+        try:
+            return json.loads(self.state_file.read_text()) if self.state_file else None
+        except (OSError, ValueError):
+            return None
+
+    def snapshot(self) -> dict:
+        r = self.rec or {}
+        return {"identity": self.identity, "host": self.host, "held": self.held(), "epoch": self.epoch,
+                "max_epoch": self.max_epoch, "holder_host": r.get("holder_host"), "role": r.get("role"),
+                "released": bool(r.get("released")), "renewed_wall": r.get("renewed_wall"),
+                "ttl_s": self.ttl, "checked_wall": self.checked_wall, "error": self.error}
+
+    def _save(self) -> None:
+        if not self.state_file:
+            return
+        try:
+            tmp = self.state_file.with_name(self.state_file.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self.snapshot(), indent=1))
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+
+def for_project(p, cfg: dict, *, clock=time.monotonic, host: str | None = None) -> Lease:
+    """The project's lease on its configured store (raises Refused for a store it may not use)."""
+    from .project import hostname
+    ident = identity(p, cfg)
+    store = GitStore(resolve_remote(p, cfg), ident, p.state / "lease.git")
+    return Lease(store, ident, host=host or hostname(), base=str(p.base), ttl=ttl_s(cfg),
+                 state_file=p.state / STATE_FILE, clock=clock)
+
+
+# Status ------------------------------------------------------------------------------------------
+
+def _ago(s: float) -> str:
+    s = max(0, int(s))
+    return f"{s} s" if s < 120 else f"{s // 60} min" if s < 7200 else f"{s / 3600:.1f} h"
+
+
+def status_line(p, cfg: dict, now: float | None = None) -> str | None:
+    """One `ttp status` line from state/lease.json, or None with no lease configured."""
+    if not configured(cfg):
+        return None
+    now = time.time() if now is None else now
+    try:
+        s = json.loads((p.state / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return "lease: not checked yet (the daemon takes it before any dispatch)"
+    stale = now - float(s.get("checked_wall") or 0) > float(s.get("ttl_s") or DEFAULT_TTL_S)
+    tail = f"; last checked {_ago(now - float(s.get('checked_wall') or 0))} ago" if stale else ""
+    renewed = f", renewed {_ago(now - float(s['renewed_wall']))} ago" if s.get("renewed_wall") else ""
+    if s.get("error"):
+        line = f"lease: store unreachable ({s['error'][:160]})" + \
+               ("; held until it lapses" if s.get("held") else ": no dispatch")
+    elif s.get("held"):
+        line = f"lease: held here (epoch {s.get('epoch')}{renewed})"
+    elif s.get("holder_host") and not s.get("released"):
+        line = (f"lease: NOT held here (held by {s['holder_host']}, {s.get('role') or 'primary'}, "
+                f"epoch {s.get('epoch')}{renewed}): no dispatch")
+    else:
+        line = "lease: NOT held here (free): no dispatch until it is taken"
+    return line + tail
+
+
+def check(p, cfg: dict) -> tuple[bool, str]:
+    """`ttp lease check`: is the store allowed, does it answer, and how long a read takes."""
+    if not configured(cfg):
+        return True, "no lease configured (failover.lease_remote unset): single-host, always the holder"
+    try:
+        url = resolve_remote(p, cfg)
+    except Refused as e:
+        return False, f"refused: {e}"
+    store = GitStore(url, identity(p, cfg), p.state / "lease.git")
+    t0 = time.monotonic()
+    try:
+        rec, ver = store.read()
+    except Unreachable as e:
+        return False, f"unreachable: {e}"
+    ms = (time.monotonic() - t0) * 1000
+    who = (f"held by {rec.get('holder_host')} at epoch {rec.get('epoch')}" + (" (released)" if rec.get("released") else "")
+           if rec else "no lease record yet")
+    return True, f"ok: {REF_PREFIX}{identity(p, cfg)} on {url}: {who}; read took {ms:.0f} ms"

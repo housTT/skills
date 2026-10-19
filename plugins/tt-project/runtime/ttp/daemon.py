@@ -69,6 +69,7 @@ from . import integrity
 from . import jevuse
 from . import jobuse
 from . import landed
+from . import lease as leasemod
 from . import localspend
 from . import locks
 from . import machine_ledger
@@ -242,6 +243,11 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
+LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py), one event per change
+# Steps a host that does not hold the project lease skips: they start model work, push, or answer
+# people, which only the one live coordinator may do. Maintenance steps go on.
+LEASE_STEPS = ("dispatch", "maybe_coordinate", "run_schedules", "start_pushes", "poll_slack", "deliver_outbound",
+               "route_machines", "backup_branches", "retry_rejected")
 HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
@@ -632,6 +638,8 @@ class Daemon:
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
         self._awake = runner.AwakeClock()   # the daemon's own awake time: a hung run's stale lease counts in it
         self._stale_since: dict[int, float] = {}   # run -> awake time its lease was first seen stale from
+        self._lease: leasemod.Lease | None = None   # the project lease, when failover.lease_remote is set
+        self._lease_key: tuple | None = None
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
         # new runs start on it (net_held). In memory only: a restart tries the network afresh.
@@ -962,18 +970,24 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
+        self.tend_lease()
+        # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
+        lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
+            if step in lease_off:
+                continue
             self._step_name = step.__name__
             step()
             self._progress()
         self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
-            self.deliver_outbound()   # the long-pause alert, and what was posted before, still reach Slack
+            if not lease_off:
+                self.deliver_outbound()   # the long-pause alert, and what was posted before, still reach Slack
             return
         self._refresh_meters()
         self.update_gates()
@@ -996,6 +1010,8 @@ class Daemon:
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
             if cycle and step in (self.dispatch, self.start_pushes):   # the coordinator still runs
+                continue
+            if step in lease_off:   # another host holds the project lease
                 continue
             self._step_name = step.__name__
             step()
@@ -1442,8 +1458,67 @@ class Daemon:
             except Exception:
                 log(self.p, "push queue: closing shipped code tasks failed\n" + traceback.format_exc())
 
+    def lease_held(self) -> bool:
+        """The per-call lease check: no lease configured is today's single host, always the holder."""
+        if not leasemod.configured(self.cfg):
+            return True
+        return bool(self._lease and self._lease.held())
+
+    def tend_lease(self) -> None:
+        """Take or renew the project lease (lease.py) before this tick's coordinator turn and dispatch,
+        when failover.lease_remote is set. A store it may not use, or one that does not answer, holds
+        dispatch (fail-closed). One log line, event and alert per change of state."""
+        cfg = self.cfg
+        if not leasemod.configured(cfg):
+            if self._lease_key is not None:
+                self._lease, self._lease_key = None, None
+                self._lease_announce("off", "project lease switched off: single-host behaviour")
+            return
+        key = (str(leasemod.settings(cfg).get("lease_remote")), leasemod.identity(self.p, cfg), leasemod.ttl_s(cfg),
+               bool(leasemod.settings(cfg).get("allow_delivery_remote")))
+        if key != self._lease_key:
+            self._lease_key = key
+            try:
+                self._lease = leasemod.for_project(self.p, cfg)
+            except leasemod.Refused as e:
+                self._lease = None
+                self._lease_announce("refused", f"project lease: {e}. No dispatch, coordinator turns or pushes "
+                                                f"until failover.lease_remote names an allowed store.")
+                return
+        if not self._lease:
+            return
+        try:
+            what = self._lease.step()
+        except Exception:
+            log(self.p, "project lease: step failed\n" + traceback.format_exc())
+            return
+        s = self._lease.snapshot()
+        if self._lease.held():
+            self._lease_announce("held", f"project lease held here (epoch {s['epoch']}, {what})", severity="low")
+        elif what == "unreachable":
+            self._lease_announce("unreachable", f"project lease store does not answer ({s['error']}): this host "
+                                                f"does not dispatch until a renewal succeeds")
+        elif what != "kept":
+            holder = s.get("holder_host") if not s.get("released") else None
+            self._lease_announce(f"other:{holder}", f"lease held by {holder or 'nobody (released)'} "
+                                                     f"({s.get('role') or 'primary'}, epoch {s['epoch']}): "
+                                                     f"this host does not dispatch")
+
+    def _lease_announce(self, state: str, text: str, severity: str = "normal") -> None:
+        db = self.p.db
+        if db.kv(LEASE_STATE_KEY) == state:
+            return
+        db.set_kv(LEASE_STATE_KEY, state)
+        log(self.p, text)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (time.time(), "daemon", "lease", severity, text[:500], "handled"))
+        if severity != "low":
+            self.alert(f"lease:{state}", text, severity="normal", every_s=0)
+
     def start_pushes(self) -> None:
         """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
+        if not self.lease_held():
+            return
         try:
             pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
         except Exception:
@@ -1462,6 +1537,8 @@ class Daemon:
         if jump < SLEPT_MIN_S:
             return
         self._stale_since.clear()   # every supervisor slept too: its lease gets a fresh look once it renews
+        if self._lease:
+            self._lease.lapse()   # the project lease's monotonic deadline stood still too: held again once renewed
         settle = float(self.cfg["budget"].get("wake_settle_s", 300))
         self._settle_until = mono + settle
         db = self.p.db
@@ -1612,6 +1689,8 @@ class Daemon:
         picks it per coordinator turn (cachettl.py)."""
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
+        if not self.lease_held():
+            raise RuntimeError("this host does not hold the project lease: no model work starts")
         if provider in self._net_holds:
             self._net_holds[provider]["probe"] = time.monotonic()   # the one run that tries the network
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
@@ -1813,6 +1892,7 @@ class Daemon:
             venv_vars = worktree.venv_env(venv, path) if venv else {}
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
+                   **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which
                    # ends with the command: `ttp push --detach` and `ttp detach` compare and have the
@@ -4928,6 +5008,8 @@ class Daemon:
             log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def maybe_coordinate(self) -> None:
+        if not self.lease_held():
+            return
         db, c = self.p.db, self.cfg["coordinator"]
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
             return
@@ -5175,6 +5257,8 @@ class Daemon:
         ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None}
         holds = settinghold.active(db, self.cfg, self.p.root) if ready else {}
         for task in ready:
+            if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
+                break
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
                 continue
