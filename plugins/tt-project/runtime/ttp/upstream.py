@@ -44,6 +44,15 @@ Received notes (with `via`) are never sent on again, and stay untrusted data lik
 The same exchange closes forwarded notes: each answer carries back the resolutions of the notes the
 target received from the sender, and the sender's acks of them go out with its notes (see
 `_resolved_for` below), so a project whose machine cannot be reached still sees its notes resolved.
+
+A target the daemon keeps failing to reach records when the failures began (`fail_since`) and how
+many there were. On macOS, LOCAL_NET_FAILS 'Network is unreachable' answers in a row while the
+daemon runs are read as a suspected Local Network privacy block on the daemon's python (recorded
+with its path): `ttp doctor` names the fix, and `ttp status` and `ttp note --to` say so once the
+target has failed WARN_AFTER_S. Past FALLBACK_AFTER_S, `ttp note` in a run and `ttp status` start
+`ttp upstream --forward-now` in the background, which sends the same pending notes from that
+context under the same lock and cursor, with a back-off of its own; the receiver's dedupe and the
+cursor keep each note filed once.
 """
 from __future__ import annotations
 
@@ -84,6 +93,11 @@ FORWARD_BATCH = 200         # lines per send
 FORWARD_PROBE_S = 6 * 3600  # how often a target is asked whether a project reads its inbox
 PEER_LOOKUP_TIMEOUT_S = 20  # one target's answer to `ttp note --to` asking whether it runs a project
 RECEIVE_BYTES = 4 << 20     # the most `ttp upstream --receive` reads
+LOCAL_NET_FAILS = 3         # daemon sends in a row failing 'Network is unreachable' on macOS: a suspected Local Network block
+FALLBACK_AFTER_S = 1800     # a target the daemon has failed to reach this long is also sent to from runs and the CLI
+WARN_AFTER_S = 3600         # and `ttp status` and `ttp note --to` say it has been failing
+UNREACHABLE_RE = re.compile(r"network is unreachable", re.I)
+LOCAL_NETWORK = "local_network"
 _clock = time.monotonic
 
 
@@ -1527,9 +1541,12 @@ def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict 
     return ack, ""
 
 
-def forward(now: float | None = None, budget_s: float = FORWARD_BUDGET_S) -> int:
+def forward(now: float | None = None, budget_s: float = FORWARD_BUDGET_S, context: str = "daemon") -> int:
     """One pass of sending this machine's own new notes on to the targets. Returns how many lines
-    were acknowledged. Only one daemon of this user forwards at a time; the others skip the pass."""
+    were acknowledged. Only one daemon of this user forwards at a time; the others skip the pass.
+    `context` "run": the fallback (`ttp upstream --forward-now`), which tries only the targets the
+    daemon has failed to reach for FALLBACK_AFTER_S, with its own back-off, and leaves the daemon's
+    failure record alone."""
     now = now or time.time()
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     lock = os.open(project.HOME_DIR / "upstream-forward.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -1538,16 +1555,37 @@ def forward(now: float | None = None, budget_s: float = FORWARD_BUDGET_S) -> int
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return 0
-        return _forward(now, budget_s)
+        return _forward(now, budget_s, context)
     finally:
         os.close(lock)
 
 
-def _forward(now: float, budget_s: float) -> int:
+def _darwin() -> bool:
+    return sys.platform == "darwin"
+
+
+def _failed(st: dict, err: str, now: float) -> None:
+    """Record a failed daemon send in target state `st`: the count and back-off, when the failures
+    began, and on macOS whether they look like a Local Network block on the daemon's python."""
+    fails = int(st.get("fails") or 0) + 1
+    first, most = FORWARD_BACKOFF_S
+    st.update(fails=fails, next=now + min(first * 2 ** (fails - 1), most), last_error=err, error_at=now)
+    st.setdefault("fail_since", now)
+    st["unreachable"] = int(st.get("unreachable") or 0) + 1 if UNREACHABLE_RE.search(err) else 0
+    if _darwin() and st["unreachable"] >= LOCAL_NET_FAILS:
+        st.update(suspect=LOCAL_NETWORK, python=os.path.realpath(sys.executable))
+    else:
+        st.pop("suspect", None)
+
+
+def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
     targets_st: dict = dict(_json(forward_path()).get("targets") or {})
     configured = forward_to()
     projects = _remote_projects()
     targets = configured if configured is not None else sorted(set(projects.values()))
+    daemon = context == "daemon"
+    if not daemon:
+        targets = [t for t in targets if _failing_since(targets_st.get(t), now) >= FALLBACK_AFTER_S]
     here = project.hostname()
     sent, start, tries = 0, _clock(), [0]
     open_fps: set[str] | None = None
@@ -1562,12 +1600,22 @@ def _forward(now: float, budget_s: float) -> int:
         tries[0] += 1
         st["tried"] = now
         ack, err = _ssh_receive(target, lines, FORWARD_TIMEOUT_S)
-        if ack is None:
-            fails = int(st.get("fails") or 0) + 1
+        if ack is None and daemon:
+            _failed(st, err, now)
+        elif ack is None:
+            fails = int(st.get("run_fails") or 0) + 1
             first, most = FORWARD_BACKOFF_S
-            st.update(fails=fails, next=now + min(first * 2 ** (fails - 1), most), last_error=err, error_at=now)
+            st.update(run_fails=fails, run_next=now + min(first * 2 ** (fails - 1), most), run_error=err)
         else:
-            st.update(fails=0, next=0, last_ok=now, probed=now, pulled=now,
+            if daemon:
+                st.update(fails=0, next=0)
+                for k in ("fail_since", "unreachable", "suspect", "python"):
+                    st.pop(k, None)
+            else:
+                st["run_ok"] = now
+            for k in ("run_fails", "run_next", "run_error"):
+                st.pop(k, None)
+            st.update(last_ok=now, probed=now, pulled=now,
                       reader=re.sub(r"[^A-Za-z0-9_.@+-]", "", str(ack.get("reader") or ""))[:80] or None,
                       accepted=int(st.get("accepted") or 0) + ack["accepted"],
                       rejected=int(st.get("rejected") or 0) + ack["rejected"],
@@ -1581,7 +1629,7 @@ def _forward(now: float, budget_s: float) -> int:
     # Targets tried longest ago go first, so a hung one cannot starve the rest pass after pass.
     for target in sorted(targets, key=lambda t: float((targets_st.get(t) or {}).get("tried") or 0)):
         st = dict(targets_st.get(target) or {})
-        if now < float(st.get("next") or 0):
+        if now < float(st.get("next" if daemon else "run_next") or 0):
             continue
         if not fits():
             break                         # out of time this pass: the rest go first on the next
@@ -1629,7 +1677,9 @@ def _forward(now: float, budget_s: float) -> int:
         every = PULL_EVERY_S if st.get("closure") is not False else FORWARD_PROBE_S
         pull = reads and bool(st.get("accepted")) and now - float(st.get("pulled") or 0) >= every and bool(
             open_fps if open_fps is not None else (open_fps := _own_open(now)))
-        if not batch and not acks and not pull:
+        # A target the daemon has been failing to reach gets an empty send when nothing is left for it (a
+        # run's fallback sent it): the daemon learns it is reachable again, and its failure record ends.
+        if not batch and not acks and not pull and not (daemon and st.get("fails")):
             if end != int(st.get("cursor") or 0) or acks_end != int(st.get("acks_cursor") or 0) \
                     or st != (targets_st.get(target) or {}):
                 targets_st[target] = {**st, "cursor": end, **({"acks_cursor": acks_end} if st.get("closure") else {})}
@@ -1670,10 +1720,108 @@ def forward_status(now: float | None = None) -> list[str]:
         if st.get("skipped"):
             line += f", {int(st['skipped'])} skipped (too big to send)"
         if st.get("fails"):
-            line += (f"; failing ({st['fails']}x, last {ago(st.get('error_at'))}: {st.get('last_error')}), "
+            line += (f"; failing ({st['fails']}x since {ago(st.get('fail_since') or st.get('error_at'))}, "
+                     f"last {ago(st.get('error_at'))}: {st.get('last_error')}), "
                      f"next try in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")
+            if fix := local_network_fix(st):
+                line += f"; {fix}"
+        if st.get("run_ok"):
+            line += f"; last sent from a run or the CLI {ago(st['run_ok'])}"
         out.append(line)
     return out
+
+
+def _failing_since(st, now: float) -> float:
+    """How long the daemon has failed to reach a target (0 when its last send went through)."""
+    if not isinstance(st, dict) or not st.get("fails"):
+        return 0.0
+    return max(0.0, now - float(st.get("fail_since") or st.get("error_at") or now))
+
+
+def failing(now: float | None = None, after_s: float = WARN_AFTER_S) -> dict[str, dict]:
+    """The current targets the daemon has failed to reach for at least `after_s`: target -> its state."""
+    now = now or time.time()
+    configured = forward_to()
+    names = configured if configured is not None else sorted(set(_remote_projects().values()))
+    targets_st = _json(forward_path()).get("targets") or {}
+    return {t: targets_st[t] for t in names if isinstance(targets_st.get(t), dict) and targets_st[t].get("fails")
+            and _failing_since(targets_st[t], now) >= after_s}
+
+
+def local_network_fix(st: dict) -> str:
+    """The fix for a suspected macOS Local Network block on the daemon's python, or ''."""
+    if st.get("suspect") != LOCAL_NETWORK:
+        return ""
+    py = st.get("python") or "the python the daemon runs"
+    return (f"suspected macOS Local Network block: the daemon's ssh got 'Network is unreachable' {st.get('unreachable')}x "
+            f"in a row. If ssh to the same machine from a terminal works, grant Local Network access to the daemon's "
+            f"python ({py}) in System Settings > Privacy & Security > Local Network, then restart the daemon "
+            f"(`ttp restart <project>`)")
+
+
+def forward_line(now: float | None = None) -> str:
+    """`ttp status` and `ttp note --to`: the targets the daemon has failed to reach for WARN_AFTER_S."""
+    now = now or time.time()
+    try:
+        bad = failing(now)
+    except OSError:
+        return ""
+    out = []
+    for t, st in bad.items():
+        why = ("suspected macOS Local Network block on the daemon (`ttp doctor <project>` has the fix)"
+               if st.get("suspect") == LOCAL_NETWORK else f"last: {str(st.get('last_error') or '')[:120]}")
+        line = f"sending upstream notes on to {t} has failed for {_failing_since(st, now) / 3600:.1f} h ({st['fails']}x; {why})"
+        if st.get("run_ok"):
+            line += f"; last sent from a run or the CLI {(now - float(st['run_ok'])) / 3600:.1f} h ago"
+        out.append(line)
+    return "; ".join(out)
+
+
+def doctor_lines(where, now: float | None = None) -> list[str]:
+    """`ttp doctor`: each target the daemon is failing to reach, since when, and a known fix."""
+    from . import timefmt
+    now = now or time.time()
+    out = []
+    for t, st in failing(now, after_s=0).items():
+        line = (f"upstream forward to {t}: the daemon failed {st['fails']}x since "
+                f"{timefmt.long(float(st.get('fail_since') or st.get('error_at') or now), where)} "
+                f"(last: {str(st.get('last_error') or '')[:160]})")
+        fix = local_network_fix(st)
+        out.append(line + (f"; {fix}" if fix else ""))
+    return out
+
+
+def fallback_due(now: float | None = None) -> bool:
+    """Whether the fallback should run now: a target the daemon has failed to reach for
+    FALLBACK_AFTER_S, out of the fallback's own back-off, with inbox lines past its cursor."""
+    now = now or time.time()
+    try:
+        size = path().stat().st_size
+        bad = failing(now, after_s=FALLBACK_AFTER_S)
+    except OSError:
+        return False
+    return any(now >= float(st.get("run_next") or 0) and size > int(st.get("cursor") or 0) for st in bad.values())
+
+
+def spawn_fallback() -> bool:
+    """Start `ttp upstream --forward-now` in the background (its own session, no output): the caller
+    never waits on an ssh. False when it could not start."""
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    try:
+        subprocess.Popen([sys.executable, "-m", "ttp", "upstream", "--forward-now"], env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def maybe_fallback(now: float | None = None) -> bool:
+    """Start the fallback when it is due; never raises."""
+    try:
+        return fallback_due(now) and spawn_fallback()
+    except (OSError, ValueError):
+        return False
 
 
 def forwarded_reader(now: float | None = None) -> tuple[str, str] | None:

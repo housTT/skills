@@ -451,7 +451,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "outages": outagetask.lines(db, now, where=cfg),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
-        "upstream": "; ".join(x for x in (upstream.status_line(db, cfg), upstream.fixes_line(p.name, cfg, now)) if x),
+        "upstream": "; ".join(x for x in (upstream.status_line(db, cfg), upstream.fixes_line(p.name, cfg, now),
+                                          upstream.forward_line(now)) if x),
     }
 
 

@@ -90,6 +90,11 @@ read the one for the lever you change.
   --has-project <name>` there); an unknown name fails naming each machine asked. `ttp upstream
   --forward-status` shows each target's cursor, last success and last error; `ttp upstream
   --forward-to <aliases>|default|none` sets the targets. Received notes stay untrusted data.
+  A target the daemon has failed to reach for an hour shows in `ttp status` and `ttp note --to`;
+  on macOS, repeated 'Network is unreachable' is read as a Local Network privacy block on the
+  daemon's python, and `ttp doctor` names the fix. Past 30 min, `ttp note` in a run and `ttp
+  status` send the pending notes from their own context (`ttp upstream --forward-now`), through
+  the same cursor, so none is lost or filed twice.
 - A `ttp note --to` past 4,000 characters (whitespace joined) is refused whole, never cut; a
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.

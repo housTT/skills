@@ -1146,6 +1146,8 @@ def cmd_status(a) -> None:
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
         print(status_text(p))
+    from . import upstream
+    upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this shell
 
 
 def cmd_stats(a) -> None:
@@ -1378,6 +1380,8 @@ def cmd_note(a) -> None:
     if a.to:
         _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
+    from . import upstream
+    upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
 
 
 def cmd_notify(a) -> None:
@@ -1470,6 +1474,10 @@ def _note_to(a, run_dir: str) -> None:
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
           + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else ""))
+    target = (far.get("ssh") or far["host"]) if far else at
+    if target and target in upstream.failing():
+        print(f"warning: {upstream.forward_line()}. The note stays queued and is sent once the target is "
+              f"reached; this run also tries to send it. Nothing to wait for: keep working")
 
 
 def _note_upstream(a, me) -> None:
@@ -1604,6 +1612,11 @@ def cmd_upstream(a) -> None:
         ack, rc = upstream.receive(sys.stdin.buffer.read(upstream.RECEIVE_BYTES + 1), a.via or "")
         print(json.dumps(ack, sort_keys=True))
         raise SystemExit(rc)
+    if a.forward_now:
+        # The fallback for a daemon that cannot reach a target (upstream.maybe_fallback): this context's
+        # ssh, the same lock and cursor, only the targets failing past upstream.FALLBACK_AFTER_S.
+        print(f"{upstream.forward(context='run')} upstream note(s) sent on")
+        return
     if a.forward_to is not None:
         v = a.forward_to.strip()
         try:
@@ -6015,6 +6028,9 @@ def cmd_doctor(a) -> None:
             print(f"delivery.push_checks: {m} matches no file on {ref}; every push would fail on it")
     if line := checks_env_line(p):
         print(line)
+    from . import upstream
+    for line in upstream.doctor_lines(p):
+        print(line)
     for c in _push.unexcluded_log_checks(checks):
         print(f"delivery.push_checks: {c!r} also checks committed *.log output, whose captured lines keep "
               f"trailing whitespace; add the pathspec `-- . {_push.LOG_EXCLUDE}`")
@@ -6135,6 +6151,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--receive", action="store_true", help="file notes sent over ssh (JSON lines on stdin); prints an ack")
     s.add_argument("--via", metavar="ALIAS", help="with --receive: the sending machine's alias")
     s.add_argument("--forward-status", action="store_true", help="per target: cursor, last ok, last error (the default)")
+    s.add_argument("--forward-now", action="store_true", help="send the pending notes from here to the machines "
+                   "the daemon has failed to reach for a while (started in the background by `ttp note` and `ttp status`)")
     s.add_argument("--forward-to", metavar="ALIASES",
                    help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
     s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in)")
