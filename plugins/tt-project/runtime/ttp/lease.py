@@ -39,6 +39,10 @@ class Unreachable(Exception):
     """The store did not answer: the holder lets its lease lapse, nobody takes it."""
 
 
+class Rejected(Unreachable):
+    """The store answered but refused the write (a hook or ruleset): an error, not a lost race."""
+
+
 class Refused(ValueError):
     """The configured store may not hold lease refs."""
 
@@ -72,14 +76,29 @@ def identity(p, cfg: dict) -> str:
 def norm_url(url: str) -> str:
     """A remote URL reduced to host/path for comparison: no scheme, user, port, `.git` or slash."""
     u = url.strip()
-    if "://" not in u and re.match(r"^[^/]+@[^/:]+:", u):     # scp form user@host:path
-        u = u.split("@", 1)[1].replace(":", "/", 1)
+    # scp form [user@]host:path (git's rule: no slash before the first colon); host may be an ssh alias
+    if "://" not in u and (m := re.match(r"^(?:[^/:@]+@)?([^/:@]+):(.*)$", u)):
+        u = f"{m.group(1)}/{m.group(2)}"
     u = re.sub(r"^[a-z+]+://", "", u, flags=re.I)
     u = re.sub(r"^[^/@]+@", "", u)
     u = re.sub(r"^([^/:]+):\d+/", r"\1/", u)
     if u.startswith("/") or u.startswith("."):
         u = str(Path(u).expanduser().resolve())
+    u = re.sub(r"/{2,}", "/", u)
     return re.sub(r"(\.git)?/*$", "", u).lower()
+
+
+def git_url(url: str, cwd: Path | str | None) -> str:
+    """`url` (or a remote name) as git would use it, after its url.<base>.insteadOf rewriting."""
+    try:
+        r = _git(["ls-remote", "--get-url", url], cwd, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return url
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else url
+
+
+def _owner_repo(n: str) -> str:
+    return "/".join(n.split("/")[-2:])
 
 
 def _git(args: list[str], cwd: Path | str | None = None, *, input: str | None = None,
@@ -126,13 +145,15 @@ def resolve_remote(p, cfg: dict) -> str:
         raise Refused("failover.lease_remote is not set")
     remotes = delivery_remotes(p.root)
     url = remotes.get(raw, raw)
-    n = norm_url(url)
-    if any(n == o or n.endswith("/" + "/".join(o.split("/")[-2:])) for o in own_repos()):   # any host alias
+    cwd = p.root if Path(p.root).is_dir() else None
+    forms = {norm_url(url), norm_url(git_url(url, cwd))}     # as written and after insteadOf
+    own = {_owner_repo(o) for o in own_repos()}
+    if any(_owner_repo(n) in own for n in forms):          # any host or alias: by its owner/repo path
         raise Refused(f"failover.lease_remote {raw} is the tt-project plugin's own repository: lease refs "
                       f"may not be pushed there; configure a separate remote")
     if not settings(cfg).get("allow_delivery_remote"):
         for name, other in remotes.items():
-            if norm_url(other) == n:
+            if {norm_url(other), norm_url(git_url(name, cwd))} & forms:
                 raise Refused(f"failover.lease_remote {raw} is the project's delivery remote ({name}): refs "
                               f"under {REF_PREFIX} may break its branch rules; configure a separate remote, or "
                               f"set failover.allow_delivery_remote if its charter allows such refs")
@@ -199,8 +220,11 @@ class GitStore:
         if r.returncode == 0:
             return True
         out = r.stdout + r.stderr
-        if "stale info" in out or "[rejected]" in out or re.search(r"^!\s", r.stdout, re.M):
+        if re.search(r"^!.*\[rejected\] \((stale info|fetch first)\)", r.stdout, re.M):
             return False
+        if bang := re.search(r"^!\s.*?(\[.*)$", r.stdout, re.M):    # the remote's reason first: status cuts it
+            said = "; ".join(ln[7:].strip() for ln in r.stderr.splitlines() if ln.startswith("remote:") and ln[7:].strip())
+            raise Rejected(f"{bang.group(1).strip()}{': ' + said if said else ''} (git push {self.remote})"[:300])
         raise Unreachable(f"git push {self.remote}: {out.strip()[-300:]}")
 
 
@@ -222,6 +246,7 @@ class Lease:
         self.version = ""
         self.seen = ("", 0.0)          # (version, monotonic time first seen) of another holder's record
         self.error = ""
+        self.error_kind = ""           # 'unreachable' or 'rejected' (the store refused the write)
         self.max_epoch = int((self._saved() or {}).get("max_epoch") or 0)
         self.checked_wall = 0.0
 
@@ -296,9 +321,10 @@ class Lease:
                 return "lost"
         except Unreachable as e:
             self.error = str(e)[:300]
+            self.error_kind = "rejected" if isinstance(e, Rejected) else "unreachable"
             self._save()
-            return "unreachable"
-        self.rec, self.version, self.error = new, "", ""
+            return self.error_kind
+        self.rec, self.version, self.error, self.error_kind = new, "", "", ""
         self.max_epoch = max(self.max_epoch, new["epoch"])
         self.renew_start, self.held_until = start, start + self.ttl * HOLD_FRACTION
         self._save()
@@ -331,7 +357,8 @@ class Lease:
         return {"identity": self.identity, "host": self.host, "held": self.held(), "epoch": self.epoch,
                 "max_epoch": self.max_epoch, "holder_host": r.get("holder_host"), "role": r.get("role"),
                 "released": bool(r.get("released")), "renewed_wall": r.get("renewed_wall"),
-                "ttl_s": self.ttl, "checked_wall": self.checked_wall, "error": self.error}
+                "ttl_s": self.ttl, "checked_wall": self.checked_wall, "error": self.error,
+                "error_kind": self.error_kind if self.error else ""}
 
     def _save(self) -> None:
         if not self.state_file:
@@ -341,6 +368,17 @@ class Lease:
             durable_write(self.state_file, json.dumps(self.snapshot(), indent=1))
         except OSError:
             pass
+
+
+def save_refused(p, cfg: dict, why: str) -> None:
+    """state/lease.json for a store the project may not use, so `ttp status` says so."""
+    from .project import durable_write
+    rec = {"identity": identity(p, cfg), "held": False, "ttl_s": ttl_s(cfg), "checked_wall": time.time(),
+           "error": str(why)[:300], "error_kind": "refused"}
+    try:
+        durable_write(p.state / STATE_FILE, json.dumps(rec, indent=1))
+    except OSError:
+        pass
 
 
 def for_project(p, cfg: dict, *, clock=time.monotonic, host: str | None = None) -> Lease:
@@ -368,10 +406,15 @@ def status_line(p, cfg: dict, now: float | None = None) -> str | None:
         s = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):
         return "lease: not checked yet (the daemon takes it before any dispatch)"
+    if s.get("error_kind") == "refused":
+        return f"lease: refused ({s.get('error', '')[:200]}): no dispatch"
     stale = now - float(s.get("checked_wall") or 0) > float(s.get("ttl_s") or DEFAULT_TTL_S)
     tail = f"; last checked {_ago(now - float(s.get('checked_wall') or 0))} ago" if stale else ""
     renewed = f", renewed {_ago(now - float(s['renewed_wall']))} ago" if s.get("renewed_wall") else ""
-    if s.get("error"):
+    if s.get("error") and s.get("error_kind") == "rejected":
+        line = f"lease: store rejected the lease write ({s['error'][:160]})" + \
+               ("; held until it lapses" if s.get("held") else ": no dispatch")
+    elif s.get("error"):
         line = f"lease: store unreachable ({s['error'][:160]})" + \
                ("; held until it lapses" if s.get("held") else ": no dispatch")
     elif s.get("held"):

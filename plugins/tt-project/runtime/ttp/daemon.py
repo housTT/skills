@@ -1482,6 +1482,7 @@ class Daemon:
                 self._lease = leasemod.for_project(self.p, cfg)
             except leasemod.Refused as e:
                 self._lease = None
+                leasemod.save_refused(self.p, cfg, str(e))
                 self._lease_announce("refused", f"project lease: {e}. No dispatch, coordinator turns or pushes "
                                                 f"until failover.lease_remote names an allowed store.")
                 return
@@ -1495,6 +1496,9 @@ class Daemon:
         s = self._lease.snapshot()
         if self._lease.held():
             self._lease_announce("held", f"project lease held here (epoch {s['epoch']}, {what})", severity="low")
+        elif what == "rejected":
+            self._lease_announce("rejected", f"project lease store rejected the lease write ({s['error']}): this "
+                                             f"host does not dispatch until the store accepts {leasemod.REF_PREFIX}*")
         elif what == "unreachable":
             self._lease_announce("unreachable", f"project lease store does not answer ({s['error']}): this host "
                                                 f"does not dispatch until a renewal succeeds")

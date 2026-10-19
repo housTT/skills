@@ -118,12 +118,16 @@ def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys)
     subprocess.run(["git", "-C", str(p.root), "remote", "add", "origin", "git@example.com:org/code.git"], check=True)
     subprocess.run(["git", "-C", str(p.root), "remote", "add", "upstream",
                     "https://github.com/tenstorrent/skills.git"], check=True)
+    # An insteadOf alias is rewritten the way git rewrites it before the comparison.
+    subprocess.run(["git", "-C", str(p.root), "config", "url.https://github.com/tenstorrent/.insteadOf", "tt:"],
+                   check=True)
     for own in ("https://github.com/tenstorrent/skills", "git@github.com:tenstorrent/skills.git",
-                "ssh://git@github.com/Tenstorrent/skills.git/", "upstream"):
+                "ssh://git@github.com/Tenstorrent/skills.git/", "upstream", "github.com:tenstorrent/skills",
+                "gh:tenstorrent/skills", "gh:/Tenstorrent/Skills.git", "tt:skills"):
         cfg = {"id": "x", "failover": {"lease_remote": own, "allow_delivery_remote": True}}
         with pytest.raises(lease.Refused, match="plugin's own repository"):
             lease.resolve_remote(p, cfg)
-    for code in ("origin", "ssh://git@example.com/org/code"):
+    for code in ("origin", "ssh://git@example.com/org/code", "example.com:org/code", "example.com:org/code.git"):
         with pytest.raises(lease.Refused, match="delivery remote"):
             lease.resolve_remote(p, {"failover": {"lease_remote": code}})
         assert lease.resolve_remote(p, {"failover": {"lease_remote": code, "allow_delivery_remote": True}})
@@ -141,6 +145,47 @@ def test_lease_refuses_the_plugins_own_repo_and_the_delivery_remote(env, capsys)
     d.tend_lease()
     assert not d.lease_held()
     assert p.db.one("SELECT text FROM events WHERE kind='lease'")["text"].startswith("project lease: failover")
+    # ...and `ttp status` says the store is refused, not that the lease was never checked.
+    line = cli.status_text(p)
+    assert "lease: refused (failover.lease_remote https://github.com/tenstorrent/skills is the" in line
+    assert ": no dispatch" in line and "not checked yet" not in line
+
+
+def test_lease_store_rejecting_the_lease_ref_is_an_error_not_a_lost_race(env, tmp_path, monkeypatch):
+    """A store whose hook or ruleset rejects refs/ttp/* is a store error: the write raises with the
+    remote's reason, the daemon alerts once and `ttp status` shows it, never 'free' with no error.
+    Only a stale-info rejection of the lease ref is a lost race."""
+    from ttp import cli, lease
+    remote = _lease_remote(tmp_path)
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text('#!/bin/sh\nwhile read o n r; do case "$r" in refs/ttp/*) '
+                    'echo "refs/ttp/* is not allowed here" >&2; exit 1;; esac; done\n')
+    hook.chmod(0o755)
+    store = lease.GitStore(str(remote), "demo", tmp_path / "probe.git")
+    with pytest.raises(lease.Rejected, match="remote rejected"):
+        store.cas("", {"epoch": 1, "holder_host": "h"})
+    t = [0.0]
+    a = _leases(tmp_path, remote, lambda: t[0])("host-a")
+    assert a.step() == "rejected" and not a.held() and "remote rejected" in a.error
+    p = make(env)
+    cfg = json.loads(p.config_path.read_text())
+    cfg["failover"] = {"lease_remote": str(remote), "lease_ttl_s": 100}
+    p.config_path.write_text(json.dumps(cfg))
+    real = lease.for_project
+    monkeypatch.setattr(lease, "for_project", lambda p, cfg, **kw: real(p, cfg, clock=lambda: t[0]))
+    calls: list[str] = []
+    d = _hold_daemon(p.base, calls)
+    d.tick()
+    t[0] += 30
+    d.tick()
+    assert calls == [] and not d.lease_held()
+    line = cli.status_text(p)
+    assert "lease: store rejected the lease write (" in line and "remote rejected" in line and ": no dispatch" in line
+    assert "free" not in line
+    evs = p.db.q("SELECT text FROM events WHERE kind='lease'")
+    assert len(evs) == 1 and "rejected" in evs[0]["text"]
+    alerts = p.db.q("SELECT text FROM messages WHERE kind='alert'")
+    assert len(alerts) == 1 and "remote rejected" in alerts[0]["text"]
 
 
 def test_daemon_without_a_lease_store_behaves_as_today(env):
