@@ -8867,7 +8867,7 @@ def _log(word):
         f.write(word + "\\n")
 
 
-def test_the_role_prompt_stays_small():
+def CAP_TEST():
     _log("cap")
     assert sum(os.path.getsize(f) for f in glob.glob("plugins/p/*.txt")) <= 7
 
@@ -8885,7 +8885,8 @@ def _cap_suite_batch(env, monkeypatch):
     monkeypatch.setenv("CAP_SUITE_LOG", str(log))
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["python3 -m pytest -q -p no:cacheprovider suite"])
     (repo / "suite").mkdir()
-    (repo / "suite/test_suite.py").write_text(_CAP_SUITE)
+    # named here, so the suite's own cap test list (CAP_TESTS) does not take it for one of its tests
+    (repo / "suite/test_suite.py").write_text(_CAP_SUITE.replace("CAP_TEST", "test_the_role_prompt_stays_small"))
     _git_out(repo, "add", "suite")
     _git_out(repo, "commit", "-qm", "the suite")
     _git_out(repo, "push", "-q", "origin", "HEAD:proj")
