@@ -35,6 +35,7 @@ MAX_UNTIL_S = 7 * 86400
 DEFAULT_S = 7 * 86400
 HEALTHY_N, CLEAN_S = 3, 1800   # a health end's thresholds: the same for every pause
 END_FIELDS = ("until", "end_when", "report_from", "end_default")
+FLEET_PREFIX = "machine:"   # owned() keys a fleet hold this project checks by its machine
 DUE_KEY = "pause_end_due"      # kv: {resource: end signature} whose end was reported to the coordinator
 HEALTH_KEY = "pause_health"   # kv: consecutive check results fenced to each pause's identity
 RELEASE_KEY = "pause_release"  # kv: shared pauses whose file removal began, so a crash cannot lose the receipt
@@ -136,12 +137,22 @@ def health_result(p: Project, name: str, rc: int, now: float, pauses: dict) -> N
 
 
 def owned(p: Project, db=None) -> dict[str, dict]:
-    """The pauses this project checks: its own, and shared ones it set."""
+    """The pauses this project checks: its own, shared ones it set, and the fleet holds it checks
+    (fleethold.checker), each once as `machine:<alias>` rather than per resource it covers."""
+    from . import fleethold
     db = db or p.db
-    return {k: v for k, v in db.paused_resources().items() if not v.get("shared") or v.get("project") == p.name}
+    out = {k: v for k, v in db.paused_resources().items()
+           if not v.get("fleet") and (not v.get("shared") or v.get("project") == p.name)}
+    for alias, hold in fleethold.active().items():
+        if fleethold.checker(hold) == p.name:
+            out[f"{FLEET_PREFIX}{alias}"] = fleethold.entry(hold)
+    return out
 
 
 def _queue(db, name: str, v: dict, why: str, now: float) -> None:
+    if v.get("fleet"):
+        _queue_fleet(db, v, why, now)
+        return
     if v.get("by") == "user":
         # The user's pause: their word lifts it, so the coordinator neither lifts it nor asks.
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -154,6 +165,22 @@ def _queue(db, name: str, v: dict, why: str, now: float) -> None:
           f"The pause of `{name}` ({v.get('reason') or 'no reason given'}) is due to end: {why}. Lift it "
           f"(`resource_pause` paused false) if its cause is over; if it must stay, extend it with "
           f"`resource_pause` paused true, a new `until` or `end_when`, and a `reason` saying why.", "queued"))
+
+
+def _queue_fleet(db, v: dict, why: str, now: float) -> None:
+    alias, hid = v.get("machine"), v.get("fleet")
+    if v.get("by") == "user":
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (now, "daemon", "observation", "low",
+              f"The user's machine-wide hold of `{alias}` (hold {hid}) reached its end ({why}). Only the user "
+              f"lifts it: leave it, do not ask about it.", "queued"))
+        return
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+         (now, "daemon", "pause_end_due", "normal",
+          f"The machine-wide hold of `{alias}` (hold {hid}, set by project {v.get('project')}: "
+          f"{v.get('reason') or 'no reason given'}) is due to end: {why}. Lift it (`resource_pause` with "
+          f"`machine` {alias}, paused false) if its cause is over; if it must stay, extend it with "
+          f"`resource_pause` machine {alias}, paused true, a new `until` or `end_when`, and a `reason`.", "queued"))
 
 
 def note_arrived(p: Project, from_project: str | None, now: float | None = None) -> int:

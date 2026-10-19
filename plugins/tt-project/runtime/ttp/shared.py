@@ -93,14 +93,25 @@ def paused(cfg: dict, also: set[str] | None = None) -> dict[str, dict]:
     return out
 
 
-def paused_for_db(db_path: str | Path, seen: Any = None) -> dict[str, dict]:
+def paused_for_db(db_path: str | Path, seen: Any = None, db: Any = None) -> dict[str, dict]:
     """`paused` for the project whose database is at db_path (<project>/state/project.db), with
-    `seen` the shared pauses it last acted on."""
+    `seen` the shared pauses it last acted on, plus the fleet holds that cover its resources
+    (fleethold.py; marked "fleet", `db` reads its open tasks' resources). A shared pause of a
+    resource wins over a fleet hold's entry."""
+    from . import fleethold
     try:
         p = project.Project(Path(db_path).parent.parent)
-        return paused(p.config(), set(seen if isinstance(seen, dict) else ()) | recorded(p))
+        cfg = p.config()
     except Exception:   # a broken config or list must not hide the project's own pauses
         return {}
+    try:
+        out = fleethold.paused(cfg, db)
+    except Exception:
+        out = {}
+    try:
+        return {**out, **paused(cfg, set(seen if isinstance(seen, dict) else ()) | recorded(p))}
+    except Exception:
+        return out
 
 
 def recorded(p) -> set[str]:

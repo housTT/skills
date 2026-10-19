@@ -13171,3 +13171,151 @@ def test_stale_duplicates_flag_a_second_hop_of_one_task_and_a_queued_review_of_a
     assert [e["task"] for e in evs] == [dup, stale]
     assert "already landed (#%d is on origin/work)" % base in evs[1]["text"]
     assert len(check()) == 2 and p.db.task(stale)["status"] == "queued"
+
+
+def _fleet(env, tmp_path):
+    """Projects a (demo) and b (other) on one host, machine box1, and a worker of b on box1-device."""
+    from ttp import machines as mm
+    a, b = make(env), _second_project(env)
+    mm.add("box1", tags="device")
+    run_dir = tmp_path / "brun"
+    run_dir.mkdir()
+    tb = b.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:box1-device"])
+    b.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,'worker','fake',?,'running',?)",
+           (tb, time.time(), str(run_dir)))
+    return a, b, run_dir
+
+
+def _fleet_waits(*ps):
+    """A task of each project that handed off waiting on box1-device (after the hold began)."""
+    waits = {}
+    for p in ps:
+        t = p.db.add_task("waits", "s", kind="work", tier="light", origin="user", labels=["resource:box1-device"])
+        p.db.update_task(t, status="queued", not_before=time.time() + 7200, blocked_reason="waiting for box1-device",
+                         result=json.dumps({"status": "waiting", "waiting_for": "box1-device (paused)",
+                                            "retry_after_s": 7200, "waiting_since": time.time()}))
+        waits[p.name] = t
+    return waits
+
+
+def test_a_fleet_hold_set_in_one_project_holds_every_project_until_the_user_lifts_it(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp import fleethold, pauseends
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    a, b, run_dir = _fleet(env, tmp_path)
+    out = coord.pause_machine(a, "box1", True, reason="vendor maintenance", by="user",
+                              end=pauseends.from_action({"until": "2d"}))
+    assert "box1 held machine-wide (hold 1)" in out, out
+    coord.sync_shared_pauses(b)   # b's daemon tick
+    waits = _fleet_waits(a, b)
+    coord.sync_shared_pauses(a)   # a's daemon ticks after its task handed off waiting
+    got = b.db.paused_resources()["box1-device"]
+    assert got["fleet"] == 1 and got["project"] == "demo" and got["by"] == "user", got
+    assert "box1" in b.db.paused_resources() and not b.db.paused_resources(shared=False)
+    flash = b.db.add_task("flash", "s", kind="work", tier="light", origin="user", labels=["resource:box1-device"])
+    assert not Daemon(b.base)._resources_free(b.db.task(flash))
+    assert (run_dir / "steer.md").read_text().count("`box1-device` is paused (vendor maintenance)") == 1
+    env_b = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(b.base))
+    for res in ("box1", "box1-chip0"):   # any name on the machine, configured or not
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", res, "--", "true"],
+                           env=env_b, capture_output=True, text=True)
+        assert r.returncode == 75 and "vendor maintenance" in r.stderr, r
+    st = status_text(b)
+    assert st.count("box1 held machine-wide (hold 1) by demo for the user") == 1, st
+    assert "resource box1-device paused" not in st, st
+    # A pause asked for a covered resource is a no-op, not a second record.
+    assert coord.apply(b, [{"type": "resource_pause", "resource": "box1-device", "paused": True,
+                            "until": "1d", "reason": "again"}]) == []
+    assert not b.db.paused_resources(shared=False) and len(fleethold.active()) == 1
+    assert "already held machine-wide by hold 1" in coord.pause_resource(b, "box1-device", True, end={"until": 1e12})
+    # Neither a coordinator turn nor a user turn without the user's own words lifts the user's hold.
+    for kw in ({}, {"user_turn": True}):
+        problems = coord.apply(b, [{"type": "resource_pause", "machine": "box1", "paused": False}], **kw)
+        assert any("only the user lifts it" in x for x in problems), problems
+    assert "box1" in fleethold.active()
+    # The user's own words in b's turn lift a's hold; both projects' waiters wake.
+    msg = b.db.post("in", "box1 is back, resume it")
+    assert coord.apply(b, [{"type": "resource_pause", "machine": "box1", "paused": False}],
+                       user_turn=True, messages=[msg]) == []
+    assert not fleethold.active() and "box1-device" not in b.db.paused_resources()
+    assert waits["other"] in {t["id"] for t in b.db.ready_tasks()}
+    assert "no longer paused" in (run_dir / "steer.md").read_text()
+    assert waits["demo"] not in {t["id"] for t in a.db.ready_tasks()}
+    coord.sync_shared_pauses(a)
+    assert waits["demo"] in {t["id"] for t in a.db.ready_tasks()}, "the setter's waiter did not wake"
+
+
+def test_a_coordinators_fleet_hold_is_lifted_by_any_coordinator_and_needs_a_known_machine_and_an_end(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp import fleethold
+    a, b, _ = _fleet(env, tmp_path)
+    problems = coord.apply(a, [{"type": "resource_pause", "machine": "nosuch", "paused": True, "until": "1d"}])
+    assert any("not in the machines list" in x for x in problems), problems
+    problems = coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": True}])
+    assert any("needs an end" in x for x in problems), problems
+    assert coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": True, "until": "1d",
+                            "reason": "fabric errors"}]) == []
+    assert fleethold.active()["box1"]["by"] == "coordinator"
+    # The user's words in the turn make a hold theirs.
+    msg = a.db.post("in", "Stop all device work on box1 for now")
+    assert coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": True, "until": "1d"}],
+                       user_turn=True, messages=[msg]) == []
+    hold = fleethold.active()["box1"]
+    assert hold["by"] == "user" and hold["id"] == 1 and hold["edits"] == 1 and hold["user_msg"] == msg
+    fleethold.lift("box1", True, "test")
+    assert coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": True, "until": "1d"}]) == []
+    assert coord.apply(b, [{"type": "resource_pause", "machine": "box1", "paused": False}]) == []
+    assert not fleethold.active()
+
+
+def test_ttp_pause_machine_from_the_shell_is_the_users_hold(env, tmp_path):
+    from ttp import fleethold
+    a, b, _ = _fleet(env, tmp_path)
+    e = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    for k in ("TTP_RUN_ID", "TTP_TASK", "TTP_PROJECT"):
+        e.pop(k, None)
+    r = subprocess.run([sys.executable, str(TTP), "pause", "demo", "--machine", "box1", "--until", "1d",
+                        "--reason", "rack move"], env=e, capture_output=True, text=True)
+    assert r.returncode == 0 and "held machine-wide" in r.stdout, r
+    assert fleethold.active()["box1"]["by"] == "user"
+    r = subprocess.run([sys.executable, str(TTP), "machines", "list"], env=e, capture_output=True, text=True)
+    assert "held machine-wide (hold 1) by demo for the user" in r.stdout, r
+    r = subprocess.run([sys.executable, str(TTP), "resume", "other", "--machine", "box1"], env=e,
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "lifted for every project" in r.stdout, r
+    assert not fleethold.active()
+
+
+def test_a_fleet_hold_end_is_checked_by_the_setter_or_else_the_recovery_owner(env, tmp_path, monkeypatch):
+    from ttp import fleethold, pauseends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    a, b, _ = _fleet(env, tmp_path)
+    mm.set_recovery("box1", owner="other")
+    fleethold.set_hold("box1", "fabric errors", "coordinator", "demo", {"until": time.time() - 1})
+    able = {"demo": True, "other": True}
+    monkeypatch.setattr(ml, "can_act", lambda name, here=None: (able.get(name, False), ""))
+    assert "machine:box1" in pauseends.owned(a) and "machine:box1" not in pauseends.owned(b)
+    assert not any(v.get("fleet") for v in pauseends.owned(b).values()), "checked per resource"
+    able["demo"] = False   # the setter's daemon is stopped
+    assert "machine:box1" in pauseends.owned(b)
+    assert pauseends.PauseEnds(b).tick() == ["machine:box1"]
+    ev = b.db.q("SELECT kind, text FROM events WHERE kind='pause_end_due'")
+    assert len(ev) == 1 and "`machine` box1, paused false" in ev[0]["text"], ev
+    # A user's hold only reports its end.
+    fleethold.lift("box1", False, "test")
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 1})
+    assert pauseends.PauseEnds(b).tick() == ["machine:box1"]
+    assert "Only the user lifts it" in b.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
+
+
+def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):
+    from ttp import fleethold
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    make(env)
+    mm.add("box1", tags="device")
+    fleethold.set_hold("box1", "rack move", "user", "demo", {"until": time.time() + 3600})
+    why, nobody = ml.quiet_reason({"alias": "box1", "condition": "down"}, time.time())
+    assert why == "held machine-wide (hold 1) by demo for the user: rack move" and nobody is False

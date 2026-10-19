@@ -89,7 +89,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "classify": {"type": "string", "enum": list(ASK_CLASSES)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
-            "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
+            "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "outage": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
@@ -780,7 +780,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
+        from . import fleethold
+        for hold in sorted({v["machine"]: v for v in paused.values() if v.get("fleet")}):
+            if h := fleethold.active().get(hold):
+                lines.append("- " + fleethold.line(h, p))
         for name, v in sorted(paused.items()):
+            if v.get("fleet"):
+                continue   # its hold's one line above
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else "")
@@ -2052,6 +2058,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")
+                if a.get("machine"):
+                    # One hold every project on this host honours (fleethold.py). Only a turn with the
+                    # user's own words makes it theirs or lifts theirs.
+                    mine = a["paused"] and _users_pause(db, a, user_turn, messages)
+                    pause_machine(p, str(a["machine"]).strip(), a["paused"], reason=a.get("reason") or a.get("text") or "",
+                                  by="user" if mine else "coordinator",
+                                  users_word=user_turn and bool(_users_own(db, messages or [])),
+                                  end=pauseends.from_action(a) if a["paused"] else None, key=key,
+                                  user_msg=_users_own(db, messages or [])[-1] if mine else None)
+                    continue
                 name = str(a.get("resource") or "").strip()
                 if not RESOURCE_RE.fullmatch(name):
                     raise ValueError(f"not a resource name: {name!r}")
@@ -2908,6 +2924,11 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
     db, woken = db or p.db, 0
+    from . import fleethold
+    hold = fleethold.covering(name)
+    if hold and paused and not (db.paused_resources(shared=False).get(name) or shared.read_pause(name)):
+        return (f"{name} is already held machine-wide by hold {hold['id']} ({hold.get('alias')}, set by "
+                f"{hold.get('project')}): nothing to do")
     sync_shared_pauses(p, db)   # first keep a pause of a resource no longer shared as the project's own
     is_shared = shared.is_shared(p, name)
     reason = " ".join(str(reason or "").split())[:300]
@@ -2934,7 +2955,8 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
         else:
             was = shared.update_pause(name, lambda w: None)[0] if is_shared else None
             if name not in cur and was is None:
-                return f"{name} is not paused"
+                return (f"{name} has no pause of its own; it is held machine-wide by hold {hold['id']}: lift that "
+                        f"with `machine` {hold.get('alias')}" if hold else f"{name} is not paused")
             since = min(float(x.get("since") or 0) for x in (cur.get(name), was) if x)
             cur.pop(name, None)
             seen.pop(name, None)
@@ -2948,6 +2970,38 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     till = f"; {pauseends.describe(entry, p)}" if paused and pauseends.describe(entry) else ""
     return (f"{name} paused{why}{scope}: tasks using it wait, and `ttp lock {name}` refuses it{till}" if paused
             else f"{name} resumed{scope}" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
+
+
+def pause_machine(p: Project, alias: str, paused: bool, reason: str = "", by: str = "user", users_word: bool = False,
+                  end: dict | None = None, key: str | None = None, user_msg: Any = None, db=None) -> str:
+    """Hold or lift machine `alias` for every project on this host (fleethold.py). A hold needs an end
+    (pauseends.from_action); a user's hold is lifted only with `users_word`. This project's workers
+    are told now; other projects' daemons tell theirs (sync_shared_pauses). A lift by a project other
+    than the setter tells the setter. Returns a line for the user."""
+    from . import fleethold, upstream
+    db = db or p.db
+    if paused:
+        if not end:
+            raise ValueError(pauseends.NEEDS_END.replace("a resource pause", "a machine hold"))
+        hold, new = fleethold.set_hold(alias, reason, by, p.name, end, user_msg=user_msg)
+        sync_shared_pauses(p, db)
+        till = pauseends.describe(fleethold.entry(hold), p)
+        return (f"{alias} held machine-wide (hold {hold['id']}" + ("" if new else ", updated") + ")"
+                + (f" ({hold['reason']})" if hold.get("reason") else "")
+                + ": every project's tasks on it wait, and `ttp lock` refuses it" + (f"; {till}" if till else ""))
+    hold = fleethold.lift(alias, users_word, p.name)
+    if hold is None:
+        return f"{alias} has no machine-wide hold"
+    sync_shared_pauses(p, db)
+    setter = str(hold.get("project") or "")
+    if setter and setter != p.name:
+        try:
+            upstream.send_or_queue(p.state, p.name, None, setter,
+                                   f"Project {p.name} lifted your machine-wide hold {hold['id']} of {alias}"
+                                   + (f" ({hold['reason']})" if hold.get("reason") else "") + ".", "low")
+        except Exception:   # the lift stands; telling the setter is best effort
+            pass
+    return f"{alias} hold {hold['id']} lifted for every project"
 
 
 def _tell_runs(db, name: str, paused: bool, why: str = "", key: str | None = None) -> None:
@@ -2971,7 +3025,11 @@ def sync_shared_pauses(p: Project, db=None) -> None:
     db = db or p.db
     cfg = p.config()
     mine = shared.names(cfg)
-    cur = shared.paused(cfg)
+    from . import fleethold
+    try:
+        cur = {**fleethold.paused(cfg, db), **shared.paused(cfg)}   # fleet holds start and end the same way
+    except Exception:
+        cur = shared.paused(cfg)
     seen = {k: v if isinstance(v, dict) else {"since": v} for k, v in (db.kv(SHARED_SEEN_KEY) or {}).items()}
     left = (set(seen) | shared.recorded(p)) - mine
     if cur != seen or left:

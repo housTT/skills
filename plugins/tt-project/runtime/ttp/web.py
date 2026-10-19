@@ -378,7 +378,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{ready} task(s) ready to start")
     for pr in paused_resources:
         why.append(f"{pr['resource']} is paused" + (f" ({pr['reason']})" if pr.get("reason") else "")
-                   + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
+                   + (f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait "
+                      f"(`ttp resume {p.name} --machine {pr.get('machine')}`)" if pr.get("fleet") else
+                      f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)"))
     if logged_out:
         provs = sorted({t["provider"] or core for t in logged_out})
         why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a login "

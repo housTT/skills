@@ -1128,7 +1128,12 @@ def status_text(p: Project) -> str:
         lines.append(b["line"])
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now, tz)}: {pp['note']} — fix: {pp['fix']}")
+    from . import fleethold
+    for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
+        lines.append(fleethold.line(hold, p))
     for pr in h["resources_paused"]:
+        if pr.get("fleet"):
+            continue   # one line per hold above
         lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now, tz)} by {pr.get('by') or 'user'}"
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "")
@@ -3148,8 +3153,11 @@ def cmd_lock(a) -> None:
     def _pause() -> dict | None:
         try:
             paused = p.db.paused_resources()
-            # A pause of any of the device's names holds them all.
-            return paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None)
+            # A pause of any of the device's names holds them all; a fleet hold, every name on its machine.
+            from . import fleethold
+            hold = fleethold.covering(a.resource)
+            return paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None) \
+                or (fleethold.entry(hold) if hold else None)
         except Exception as e:   # an unreadable database must not stop device commands
             print(f"ttp lock: could not check for a pause of {a.resource}: {e}", file=sys.stderr, flush=True)
             return None
@@ -4504,8 +4512,12 @@ def cmd_machines(a) -> None:
             return
         if not known:
             print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
+        from . import fleethold
+        holds = fleethold.active()
         for alias in sorted(known):
             print(mm.line(alias, known[alias]))
+            if alias in holds:
+                print("  " + fleethold.line(holds[alias]))
 
 
 def _machine_activity(a) -> None:
@@ -4640,8 +4652,23 @@ def _pause_by(p: Project) -> str:
 
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
-    if a.resource and getattr(a, "until_reboot", False):
+    if (a.resource or getattr(a, "machine", None)) and getattr(a, "until_reboot", False):
         die("--until-reboot pauses the whole project; a resource pause ends with --until or --end-when")
+    if getattr(a, "machine", None):
+        if a.resource:
+            die("--machine holds every resource on the machine: give it or --resource, not both")
+        from .coordinator import pause_machine
+        from .project import in_run
+        try:
+            from . import pauseends
+            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from}) \
+                if a.cmd == "pause" else None
+            # Only the user's own command outside a run sets or lifts a hold as theirs.
+            print(f"{p.name}: " + pause_machine(p, a.machine, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
+                                                by=_pause_by(p), users_word=not in_run(), end=end))
+        except ValueError as e:
+            die(str(e))
+        return
     if a.resource:
         from .coordinator import pause_resource
         try:
@@ -6825,6 +6852,11 @@ def main(argv: list[str] | None = None) -> None:
         s.add_argument("name")
         s.add_argument("--resource", help=f"{name} only this resource: tasks using it wait, `ttp lock` refuses it"
                        if name == "pause" else f"{name} only this resource")
+        s.add_argument("--machine", metavar="ALIAS",
+                       help="hold every resource on this machine (from `ttp machines list`) for all your projects on "
+                            "this host: one record they all honour; ends like --resource"
+                       if name == "pause" else "lift the machine-wide hold of this machine (one you set needs you, "
+                                               "outside a run)")
         if name == "pause":
             s.add_argument("--reason", help="why, shown to workers, the coordinator and in status; required "
                                             "for a project pause from a run")

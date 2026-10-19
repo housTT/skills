@@ -660,6 +660,12 @@ def quiet_reason(c: dict, now: float, doc: dict | None = None) -> tuple[str, boo
     for ch in changes({alias}):
         if cond in expects_now(ch, now):
             return f"expected from machine change #{ch['id']} by {ch.get('by')}: {ch['what']}", True
+    from . import fleethold
+    hold = fleethold.active().get(alias)
+    if hold:   # like a user pause: the first target hears of it, nobody past it
+        return (f"held machine-wide (hold {hold.get('id')}) by {hold.get('project')}"
+                + (" for the user" if hold.get("by") == "user" else "")
+                + (f": {hold['reason']}" if hold.get("reason") else "")), False
     d = _demand(alias, list(c.get("seen_by") or []))
     if d["user"]:
         return f"the user paused {', '.join(d['user'])}", False

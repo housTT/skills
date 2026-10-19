@@ -681,6 +681,14 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   keeps a higher slot applies to the next holders. A pause outlives the resource leaving the
   share: `ttp machines` refuses to unshare or remove a paused one, and a project that drops it
   from `shared_resources` keeps the pause as its own.
+  To stop device work on a whole machine for every project on the host, hold it once:
+  `ttp pause <name> --machine <alias>` (or the coordinator's `resource_pause` with `machine`)
+  stores one hold in `~/.tt-project/fleet-holds.json`, and every project pauses each resource
+  it uses on that machine (the alias, `<alias>-...` names, its hostname) with no pause of its
+  own. A pause asked for a resource the hold covers changes nothing. A hold you set from the
+  shell or ask a coordinator for is yours, and only your word lifts it (`ttp resume <name>
+  --machine <alias>`, or a message to any project's coordinator). The setter's daemon checks
+  its end, or the machine's recovery owner when the setter cannot act.
 - Each task edits only its own worktree. A code task branches from the first of:
   `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
   `branch <name>`, each only if it exists here or on origin; the remote's default branch

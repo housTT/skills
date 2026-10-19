@@ -624,12 +624,16 @@ END""")
         """Resources paused by name: {"reason", "since", "by"}. Kept in the database, so a pause
         outlives daemon restarts and reboots until someone lifts it. With shared, pauses of the
         project's shared resources (see shared.py) are in it too, marked "shared" and naming the
-        project that set them."""
+        project that set them, and the resources a machine-wide fleet hold covers (fleethold.py),
+        marked "fleet"."""
         v = self.kv(PAUSED_RESOURCES_KEY, {})
         v = v if isinstance(v, dict) else {}
         if shared:
             from . import shared as sh
-            v = {**v, **sh.paused_for_db(self.path, self.kv(SHARED_SEEN_KEY, {}))}
+            got = sh.paused_for_db(self.path, self.kv(SHARED_SEEN_KEY, {}), db=self)
+            # A fleet hold (fleethold.py) covers what the project has no pause of its own for.
+            v = {**{k: x for k, x in got.items() if x.get("fleet")}, **v,
+                 **{k: x for k, x in got.items() if not x.get("fleet")}}
         return v
 
     def boots(self, since: float) -> list[dict]:
