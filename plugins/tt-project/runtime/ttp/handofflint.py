@@ -10,8 +10,9 @@ run. The hand-off is flagged in the digest as a task note, which also keeps the 
 that follow-up as the next hop by itself (a hand-off with notes is the coordinator's). Upstream
 notes and `continue:` hops are not linted. The remote is asked only when a follow-up matches, and
 only by prefetch, before the transaction that records the hand-off (Daemon._prefetch_remote): lint
-runs inside it and reads that answer, so the write lock never waits on the network. No answer, or
-an unreadable remote, flags nothing."""
+runs inside it and reads that answer, so the write lock never waits on the network. A task that
+worked in another repository's checkout (its branch is not in the project root) is asked about that
+repository's remote, not the root's. No answer, or an unreadable remote, flags nothing."""
 from __future__ import annotations
 
 import re
@@ -48,15 +49,38 @@ def applies(cfg: dict) -> bool:
     return own_push(cfg) == "on" or own_creates_pr_branch(cfg)
 
 
+def _has_branch(repo: Path, branch: str) -> bool:
+    from . import push
+    return push._git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0
+
+
+def _repo_of(p: Project, task: dict, branch: str) -> Path:
+    """The checkout holding `task`'s branch: the project root when it has it (or no other repository
+    of the task's runs does), else the newest other repository the task's runs worked in that has it."""
+    if _has_branch(p.root, branch):
+        return p.root
+    from .landed import _task_repos
+    try:
+        repos = _task_repos(p, int(task.get("id") or 0))
+    except Exception:
+        repos = []
+    return next((r for r in repos if _has_branch(r, branch)), p.root)
+
+
 def _ask_remote(p: Project, repo: Path, branch: str) -> bool | None:
-    """Whether `branch` exists on the remote `ttp push --own` publishes to; None when unreadable or
-    the repo has no remote. Asks the network: never inside a transaction (prefetch only)."""
+    """Whether `branch` exists on the remote `ttp push --own` publishes to (for another repository
+    than the project root: the remote its branch tracks, else origin); None when unreadable or the
+    repo has no remote. Asks the network: never inside a transaction (prefetch only)."""
     from . import push
     d = p.config().get("delivery") or {}
     try:
         if push.remote_less(repo):
             return None
-        remote = push.target(p, repo)[0] if str(d.get("push_branch") or "").strip() else "origin"
+        if repo != p.root:
+            tracked = push._git(repo, "config", "--get", f"branch.{branch}.remote").stdout.strip()
+            remote = tracked if tracked and tracked != "." else "origin"
+        else:
+            remote = push.target(p, repo)[0] if str(d.get("push_branch") or "").strip() else "origin"
     except Exception:
         return None
     ls = push._git_net(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout_s=REMOTE_TIMEOUT_S)
@@ -81,7 +105,7 @@ def prefetch(p: Project, cfg: dict, task: dict, result) -> None:
     branch, _ = _flagged(cfg, task, result)
     if not branch:
         return
-    on = _ask_remote(p, p.root, branch)
+    on = _ask_remote(p, _repo_of(p, task, branch), branch)
     key = (str(p.root), branch)
     if on is None:
         _seen.pop(key, None)

@@ -128,3 +128,44 @@ def test_a_continue_hop_naming_its_unpublished_branch_is_still_queued_by_the_dae
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
     assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"] and "hand-off lint" not in done["text"]
     assert not p.db.q("SELECT 1 FROM events WHERE task=? AND kind='task_notes'", (root,))
+
+
+def test_the_hand_off_lint_asks_the_remote_of_the_repository_the_task_worked_in(env, tmp_path):
+    """A task that worked in another repository's checkout has no branch in the project root: the
+    lint asks that repository's remote, so a branch already published there is not flagged, and one
+    missing there still is."""
+    p = make(env)
+    _with_origin(env)   # the project root's remote, which never has the branch
+    _own_push(p, None)
+    origin2, second = tmp_path / "second.git", tmp_path / "second"
+    git = lambda cwd, *a: subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
+    git(tmp_path, "init", "-q", "--bare", str(origin2))
+    git(tmp_path, "init", "-q", "-b", "main", str(second))
+    _commit_file(second, "lib")
+    git(second, "remote", "add", "origin", str(origin2))
+    git(second, "push", "-q", "origin", "main")
+
+    def task_in_second(branch):
+        tid = p.db.add_task(f"work on {branch}", "s", kind="code", tier="light", origin="user")
+        wt = second / "wt" / f"t{tid}"
+        git(second, "worktree", "add", "-q", "-b", branch, str(wt), "main")
+        _commit_file(wt, branch.replace("/", "-"))
+        p.db.update_task(tid, branch=branch)
+        rid = p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,?,?,?,?)",
+                     (tid, "worker", "done", time.time(), time.time()))
+        run_dir = p.runs / str(rid)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run.json").write_text(json.dumps({"cwd": str(wt)}))
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        return tid, wt
+
+    def push_it(branch):
+        return {"status": "done", "summary": "did it",
+                "followups": [{"title": f"mechanical: push {branch} and open its draft PR", "spec": "push it"}]}
+
+    tid, wt = task_in_second("ttp/t1-published")
+    git(wt, "push", "-q", "-u", "origin", "ttp/t1-published")
+    assert _code_hand_off(p, env, tid, push_it("ttp/t1-published")) == []
+    tid2, _ = task_in_second("ttp/t2-unpublished")
+    (note,) = _code_hand_off(p, env, tid2, push_it("ttp/t2-unpublished"))
+    assert "hand-off lint:" in note and "ttp/t2-unpublished" in note
