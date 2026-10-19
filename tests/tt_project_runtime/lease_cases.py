@@ -278,3 +278,66 @@ def test_daemon_dispatches_only_while_it_holds_the_lease(env, tmp_path, monkeypa
     assert d.lease_held() and d._lease.epoch == 2 and "dispatch" in calls and "coordinate" in calls
     assert "lease: held here (epoch 2" in cli.status_text(p)
     assert json.loads((p.state / "lease.json").read_text())["held"] is True
+
+
+def test_standby_snapshots_only_while_this_host_holds_the_lease(env, tmp_path, monkeypatch):
+    """replicate_state with failover.lease_remote set: another host holding the lease means no snapshot
+    and no stale alert here (an open one closes); once this host takes it, the next call snapshots and
+    staleness counts from the takeover. With no lease configured it snapshots as before."""
+    from ttp import daemon as daemonmod, lease, replica
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("failover.standby", str(tmp_path / "standby"))
+    snaps, seen, closed = [], [], []
+    monkeypatch.setattr(replica, "snapshot", lambda *a, **k: snaps.append(1) or {"outcome": "unchanged"})
+    monkeypatch.setattr(daemonmod.scr, "close_watcher_issues", lambda db, src, **k: closed.append(src))
+
+    def call(d):
+        d._replica_checked = 0.0
+        d.replicate_state()
+        if d._replica_job:
+            d._replica_job.join(10)
+
+    d = Daemon(p.base)   # no lease configured: today's behaviour
+    d.cfg = p.config()
+    monkeypatch.setattr(d, "observe", lambda *a, **k: seen.append(a))
+    call(d)
+    assert snaps == [1] and d.lease_held()
+
+    remote = _lease_remote(tmp_path)
+    p.set_config("failover.lease_remote", str(remote))
+    p.set_config("failover.lease_ttl_s", 100)
+    t = [5000.0]
+    ident = lease.identity(p, p.config())
+    other = lease.Lease(lease.GitStore(str(remote), ident, tmp_path / "other.git"), ident,
+                        host="otherhost", base="/elsewhere", ttl=100, clock=lambda: t[0])
+    assert other.step() == "acquired"
+    real = lease.for_project
+    monkeypatch.setattr(lease, "for_project", lambda p, cfg, **kw: real(p, cfg, clock=lambda: t[0]))
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    monkeypatch.setattr(d, "observe", lambda *a, **k: seen.append(a))
+    st = replica.load_state(p)
+    st["since"] = time.time() - 10 * replica.STALE_MIN_S   # stale by the local view
+    replica._save_state(p, st)
+    d._replica_stale = True   # an alert raised while this host still held the lease
+    snaps.clear(), closed.clear()
+    d.tend_lease()
+    call(d)
+    assert not d.lease_held() and snaps == [] and seen == [], "not the holder: no snapshot, no stale alert"
+    assert closed == [replica.OBS_SOURCE] and d._replica_stale is None
+    call(d)
+    assert snaps == [] and closed == [replica.OBS_SOURCE], "the open alert closes once"
+
+    t[0] += 130   # the other host's record stood still 1.25 ttl: this host takes the lease
+    d.tend_lease()
+    call(d)
+    assert d.lease_held() and snaps == [1], "the holder snapshots at once"
+    assert seen == [], "staleness counts from the takeover, not from the other host's term"
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + 2 * replica.STALE_MIN_S)
+    st = replica.load_state(p)
+    st.update(outcome="failed", error="standby unreachable")
+    replica._save_state(p, st)
+    call(d)
+    assert seen and seen[-1][0] == replica.OBS_SOURCE, "a holder that stays stale is alerted"

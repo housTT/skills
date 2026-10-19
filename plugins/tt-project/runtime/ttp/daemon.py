@@ -608,6 +608,8 @@ class Daemon:
         self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
         self._replica_checked = 0.0
         self._replica_stale: bool | None = None   # None: not looked since start
+        self._replica_held_from = 0.0   # when this host took the project lease back (0: held since start)
+        self._replica_unheld = False    # the last look found another host holding the lease
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -5931,19 +5933,30 @@ class Daemon:
         """Ship a state snapshot to failover.standby when one is due (replica.py): in a thread, one at
         a time, with a project of its own (the database connection stays in this thread). While the
         newest snapshot is stale, one keyed observation; closed once a fresh one ships. Nothing is read
-        while failover.standby is unset. Seam for the project lease: only its holder should snapshot."""
+        while failover.standby is unset. With failover.lease_remote set only the lease holder snapshots:
+        another host's snapshots are the standby's, so this one's stale view raises nothing, and after
+        taking the lease back staleness counts from then."""
         if self._replica_job is not None and not self._replica_job.is_alive():
             self._replica_job = None
         s = replica.settings(self.cfg)
         now = time.time()
-        if not s or now - self._replica_checked < check_every_s:
+        if not s:
+            return
+        if not self.lease_held():
+            if self._replica_stale:
+                scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="another host holds the project lease")
+            self._replica_stale, self._replica_unheld = None, True
+            return
+        if self._replica_unheld:
+            self._replica_unheld, self._replica_held_from, self._replica_checked = False, now, 0.0
+        if now - self._replica_checked < check_every_s:
             return
         self._replica_checked = now
         st = replica.load_state(self.p)
         if self._replica_job is None and not st.get("since"):
             st["since"] = now   # when it was turned on: a snapshot that never ships goes stale from here
             replica._save_state(self.p, st)
-        stale = replica.stale_text(self.p, self.cfg, now)
+        stale = replica.stale_text(self.p, self.cfg, now) if now - self._replica_held_from >= s["stale_s"] else ""
         if stale and not self._replica_stale:
             self.observe(replica.OBS_SOURCE, stale, "normal", key=replica.OBS_KEY, whole=True)
         elif not stale and self._replica_stale is not False:
