@@ -8662,6 +8662,126 @@ def test_operate_doc_names_ttp_skill():
     assert "`ttp skill [<name>]`" in (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
 
 
+def test_the_setup_shim_survives_a_removed_interpreter(tmp_path):
+    """The `ttp` on PATH runs the interpreter setup ran under; once that venv or conda env is removed it
+    falls back to python3 on PATH and says to rerun setup, instead of failing to exec."""
+    from ttp import cli
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "python3").write_text('#!/bin/sh\necho "fallback python3 $*"\n')
+    pinned = tmp_path / "venv" / "bin" / "python"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text('#!/bin/sh\necho "pinned $*"\n')
+    for x in (fake / "python3", pinned):
+        x.chmod(0o755)
+    shim = tmp_path / "ttp"
+    shim.write_text(cli.shim_text(str(pinned), tmp_path / "lib current" / "bin" / "ttp"))
+    shim.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:/usr/bin:/bin"}
+    r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
+    assert (r.returncode, r.stdout, r.stderr) == (0, f"pinned {tmp_path}/lib current/bin/ttp status a b\n", "")
+    pinned.unlink()       # the venv is gone
+    r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0 and r.stdout == f"fallback python3 {tmp_path}/lib current/bin/ttp status a b\n"
+    assert r.stderr.count("\n") == 1 and str(pinned) in r.stderr and "rerun `ttp setup`" in r.stderr
+
+
+def test_new_with_no_service_skips_the_daemon_wait_and_says_how_to_start_it(env, monkeypatch, capsys):
+    """Nothing starts the daemon of a --no-service project: `ttp new` does not wait for it or check its
+    web app (which failed with exit 3), and prints the command that starts it by hand."""
+    from ttp import cli, weblink
+    from ttp.project import Project
+
+    def never(*a, **k):
+        raise AssertionError("waited for a daemon nothing starts")
+    monkeypatch.setattr(cli, "_wait_for_daemon", never)
+    monkeypatch.setattr(weblink, "local", never)
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])   # no SystemExit
+    out = capsys.readouterr().out
+    p = Project(env["repo"])
+    assert cli.hand_start_cmd(p) in out and "`ttp start solo`" in out, out
+    assert f"nohup {p.harness / 'bin' / 'ttp'} daemon {p.base} >> {p.logs / 'daemon.out'} 2>&1 &" in out
+    assert (p.harness / "bin" / "ttp").exists()
+    # Made on another machine: its start line is shown, and no web app is looked for there.
+    from ttp import machines
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 0, "created far\ndaemon: not started (--no-service). Start it by hand with `x`\n", None))
+    monkeypatch.setattr(cli, "remote_web", never)
+    cli.main(["new", "far", "--host", "host-a", "--dir", "/srv/far", "--no-service"])
+    assert "daemon: not started (--no-service)" in capsys.readouterr().out
+
+
+def test_a_cron_fallback_is_named_by_new_doctor_and_setup(env, monkeypatch, capsys, tmp_path):
+    """When systemd --user cannot start the unit, install() still falls back to a crontab watchdog, but
+    `ttp new` and `ttp doctor` say so and why; setup names what new projects would get. Stubbed
+    systemctl and crontab: the real crontab is never read or written."""
+    from ttp import cli, service, weblink
+    from ttp.project import Project
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("systemctl", "crontab") else None)
+    tab = {"text": "0 1 * * * other job\n"}
+    calls = []
+
+    def run(*argv):
+        calls.append(argv)
+        if argv[:2] == ("crontab", "-l"):
+            return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+        if argv[:4] == ("systemctl", "--user", "enable", "--now"):
+            return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    real_run = subprocess.run
+
+    def sub_run(argv, *a, input=None, **k):
+        if argv[0] == "crontab":
+            assert argv == ["crontab", "-"], argv
+            tab["text"] = input
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *a, input=input, **k)
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(service.subprocess, "run", sub_run)
+    monkeypatch.setattr(service, "_spawn", lambda p: None)
+    monkeypatch.setattr(cli, "_wait_for_daemon", lambda p, timeout=20: None)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+    service._WATCHDOG_SEEN.clear()
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake"])
+    out = capsys.readouterr().out
+    assert "systemd failed (Failed to connect to bus)" in out, out
+    assert "Fallback: a crontab watchdog" in out and "because systemd --user could not start the unit" in out
+    p = Project(env["repo"])
+    assert tab["text"].startswith("0 1 * * * other job\n") and tab["text"].count(f"{service.CRON_TAG}{p.base}") == 2
+    assert not any(c[:2] == ("loginctl", "enable-linger") for c in calls)     # the choice is unchanged
+    cli.cmd_doctor(types.SimpleNamespace(name="solo"))
+    line = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("service: ")]
+    assert line == ["service: a crontab watchdog (entries tagged `# tt-project:` in your crontab, see `crontab -l`), "
+                    "a fallback because systemd --user could not start the unit"], line
+    # Without systemd --user at all, the reason says so; linger refused is a fallback too.
+    for absent, why in ((True, "systemd --user is not available here"), (False, "loginctl enable-linger was refused")):
+        monkeypatch.setattr(service.shutil, "which",
+                            lambda name, absent=absent: None if absent and name == "systemctl" else f"/usr/bin/{name}")
+
+        def run2(*argv):
+            if argv[:2] == ("crontab", "-l"):
+                return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+            return subprocess.CompletedProcess(argv, 1 if argv[:2] == ("loginctl", "enable-linger") else 0,
+                                               "Linger=no" if "show-user" in argv else "", "")
+        monkeypatch.setattr(service, "_run", run2)
+        assert f"Fallback: a crontab watchdog (entries tagged `# tt-project:` in your crontab, see `crontab -l`), because {why}" \
+            in service.install(p)
+        assert why in service.service_line(p)
+        assert ("because systemd --user is not available here" in service.plan()) == absent
+        if not absent:
+            assert "also adds a crontab watchdog" in service.plan()
+    # A crontab that refuses the entry: no fallback is claimed, the failure shows instead.
+    monkeypatch.setattr(service.subprocess, "run", lambda argv, *a, **k: subprocess.CompletedProcess(argv, 1, "", "no crontab for you"))
+    monkeypatch.setattr(service.shutil, "which", lambda name: None if name == "systemctl" else f"/usr/bin/{name}")
+    msg = service.install(p)
+    assert msg == "crontab install failed: no crontab for you" and not service.recorded(p)["fallback"]
+
+
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],

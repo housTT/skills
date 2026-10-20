@@ -635,16 +635,28 @@ def cmd_new(a) -> None:
     if not a.no_service:
         from .service import install
         how = install(p)
-    _wait_for_daemon(p)
+        _wait_for_daemon(p)    # with no service nothing starts it: no wait
     print(MARKER.format(name=a.name, host=hostname(), dir=p.root))
     print(f"created {a.name} in {p.base} · daemon via {how}")
     for ln in defaults_lines(p.config()["budget"], bool((load_secrets().get("jev") or {}).get("key")), a.name):
         print(ln)
+    if a.no_service:
+        print(f"daemon: not started (--no-service). Start it by hand with `{hand_start_cmd(p)}`, "
+              f"or `ttp start {a.name}` installs a service that keeps it running")
+        return
     from . import weblink
     line, rc = weblink.local(p, weblink.link(p))
     print(line)
     if rc:
         sys.exit(rc)
+
+
+def hand_start_cmd(p: Project) -> str:
+    """The shell command that starts a project's daemon without a service, as its service would: the
+    harness's own runtime, from the project folder, logging to daemon.out, surviving the shell's exit."""
+    q = shlex.quote
+    return (f"cd {q(str(p.base))} && nohup {q(str(p.harness / 'bin' / 'ttp'))} daemon {q(str(p.base))} "
+            f">> {q(str(p.logs / 'daemon.out'))} 2>&1 &")
 
 
 def _default_root() -> Path:
@@ -724,6 +736,8 @@ def new_remote(a, brief: str) -> None:
         die(f"remote creation on {host} failed", r.returncode)
     entry = {"host": host, "dir": a.dir}
     register(a.name, entry)
+    if a.no_service:        # no daemon there, so no web app yet: its output said how to start one
+        return
     line, rc = remote_web(a.name, entry, r.stdout)
     print(line)
     if rc:
@@ -5195,6 +5209,16 @@ def new_project_defaults_lines() -> list[str]:
     return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
 
 
+def shim_text(python: str, launcher: Path) -> str:
+    """The `ttp` on PATH: the interpreter setup ran under, else (its venv or conda env removed) python3 from
+    PATH, with a hint on stderr."""
+    py, hint = shlex.quote(python), shlex.quote(f"ttp: {python} is gone; using python3 from PATH "
+                                                "(rerun `ttp setup` to pin an interpreter)")
+    return (f"#!/bin/sh\npy={py}\n"
+            f"if [ ! -x \"$py\" ]; then echo {hint} >&2; py=python3; fi\n"
+            f"exec \"$py\" {shlex.quote(str(launcher))} \"$@\"\n")
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -5231,10 +5255,12 @@ def cmd_setup(a) -> None:
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
-    shim.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(cur / 'bin' / 'ttp'))} \"$@\"\n")
+    shim.write_text(shim_text(sys.executable, cur / "bin" / "ttp"))
     shim.chmod(0o755)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
+    from .service import plan
+    print(f"daemon service for new projects here: {plan()}")
     if before and before != commit:
         print(f"replaced ttp {__version__} from commit {before} with commit {commit}")
     from . import shortcut
@@ -6320,6 +6346,8 @@ def cmd_doctor(a) -> None:
     print(f"slack: {'bot saved' if (sec.get('slack') or {}).get('bot_token') else 'not configured'}"
           f" · enabled in project: {p.config()['notify'].get('slack')}")
     print(web_line(p))
+    from .service import service_line
+    print(service_line(p))
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
