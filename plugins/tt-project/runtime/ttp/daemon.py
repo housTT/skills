@@ -981,14 +981,17 @@ class Daemon:
         except OSError:
             pass
 
-    def _run_step(self, step) -> None:
+    def _run_step(self, step, name: str = "", default=None):
         """Run one tick step so that its exception never skips the steps after it (dispatch, Slack,
         outbound delivery, pushes): log it and count it. A step that fails STEP_FAILS_ALERT ticks
         in a row is alerted, normal at first and high once it has failed STEP_FAILS_HIGH_S; its next
-        success clears the count and the alert. The watchdogs still hear of progress either way."""
-        name = self._step_name = step.__name__
+        success clears the count and the alert. The watchdogs still hear of progress either way.
+        Returns the step's result, or `default` when it raised; `name` labels a step that is not a
+        method of this daemon (a lambda)."""
+        name = self._step_name = name or step.__name__
+        result = default
         try:
-            step()
+            result = step()
         except Exception as e:  # one bad step must not stop the rest of the tick
             log(self.p, f"tick step {name} error: " + traceback.format_exc().replace("\n", " | ")[:2000])
             n, since = self._step_fails.get(name, (0, time.time()))
@@ -1005,6 +1008,7 @@ class Daemon:
                 except Exception:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._progress()
+        return result
 
     def _alert_step(self, name: str, fails: int, since: float, err: Exception) -> None:
         db = self.p.db
@@ -1053,16 +1057,17 @@ class Daemon:
         self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
             if not lease_off:
-                self.deliver_outbound()   # the long-pause alert, and what was posted before, still reach Slack
+                self._run_step(self.deliver_outbound)   # the long-pause alert, and what was posted before, still reach Slack
             return
-        self._refresh_meters()
-        self.update_gates()
-        coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
-        scr.expire_mutes(self.p.db, where=self.p)
-        self.check_mute_ends()
-        self.sweep_watcher_issues()
-        self.review_jev()
-        settling = self.settling()
+        self._run_step(self._refresh_meters)
+        self._run_step(self.update_gates)
+        self._run_step(lambda: coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values())),
+                       "expire_asks")
+        self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
+        self._run_step(self.check_mute_ends)
+        self._run_step(self.sweep_watcher_issues)
+        self._run_step(self.review_jev)
+        settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         cycle = self.host_cycle_held(now)

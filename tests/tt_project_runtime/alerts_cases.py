@@ -3236,3 +3236,63 @@ def test_the_desktop_notifier_never_lets_a_later_alert_replace_an_earlier_one(mo
     notifier.show("tt-project · a", "alert one", url="https://example.invalid/x")
     got = argv("terminal-notifier")
     assert b"-group" not in got and got[got.index(b"-message") + 1] == b"alert one"
+
+
+@pytest.mark.parametrize("bare", ["_refresh_meters", "update_gates", "coord.expire_asks", "scr.expire_mutes",
+                                  "check_mute_ends", "sweep_watcher_issues", "review_jev", "settling"])
+def test_a_failing_call_between_the_tick_step_loops_does_not_stop_dispatch_or_delivery(env, monkeypatch, bare):
+    """The calls between the two step loops run guarded like the steps: one that raises is logged
+    with its name and the second loop (dispatch, deliver_outbound) still runs in that tick."""
+    from ttp import daemon as dm
+    p = make(env)
+    calls: list[str] = []
+    d = _failing_step_daemon(p.base, calls)
+
+    def broken(*a, **k):
+        raise RuntimeError(f"{bare} broke")
+    mod, _, attr = bare.rpartition(".")
+    broken.__name__ = attr   # as the daemon's own method would be named
+    if mod:
+        monkeypatch.setattr(getattr(dm, mod), attr, broken)
+    else:
+        setattr(d, attr, broken)
+    d.tick()
+    assert "dispatch" in calls and "deliver" in calls
+    logged = (p.logs / "daemon.log").read_text()
+    assert f"tick step {attr} error:" in logged
+    assert f"RuntimeError: {bare} broke" in logged
+
+
+def test_a_failing_update_gates_still_lets_dispatch_and_delivery_run_and_is_alerted(env):
+    """update_gates raising every tick: dispatch and deliver_outbound still run each tick, and after
+    STEP_FAILS_ALERT ticks it is alerted as tick-step:update_gates like any step."""
+    from ttp import daemon as dm
+    p = make(env)
+    calls: list[str] = []
+    d = _failing_step_daemon(p.base, calls)
+
+    def update_gates():
+        raise RuntimeError("gates broke")
+    d.update_gates = update_gates
+    for _ in range(dm.STEP_FAILS_ALERT):
+        calls.clear()
+        d.tick()
+        assert "dispatch" in calls and "deliver" in calls
+    assert "tick step update_gates error:" in (p.logs / "daemon.log").read_text()
+    assert p.db.one("SELECT id FROM alerts WHERE key='tick-step:update_gates' AND cleared IS NULL")
+
+
+def test_a_failing_delivery_while_paused_is_logged_not_raised(env):
+    """While the project is paused the tick only delivers outbound messages: a delivery that raises
+    is logged and counted as the step, not thrown out of the tick."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.set_kv("paused", True)
+    d = Daemon(p.base)
+
+    def deliver_outbound():
+        raise RuntimeError("slack down")
+    d.deliver_outbound = deliver_outbound
+    d.tick()
+    assert "tick step deliver_outbound error:" in (p.logs / "daemon.log").read_text()
+    assert d._step_fails["deliver_outbound"][0] == 1
