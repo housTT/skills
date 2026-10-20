@@ -4396,8 +4396,8 @@ class Daemon:
             self.observe("daemon:schedule-gap", text, "normal", whole=True, key=f"schedule-gap:{int(since)}")
 
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
-        """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a copy of the
-        daemon with its own database connection; its watchdog pings are the tick's own business."""
+        """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a
+        copy of the daemon with its own database connection; its watchdog pings are the tick's own business."""
         host = copy.copy(self)
         host.p = copy.copy(self.p)
         host.p._db = None
