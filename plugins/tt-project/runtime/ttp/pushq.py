@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, locks, push, runner, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, runner, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -581,7 +581,8 @@ def _gap_left(db, now: float, gap: float) -> float:
 
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
     """The approved rows a batch should take now (at most delivery.push_batch_max, best priority
-    first) and why; or ([], why not). Only local state is read: no fetch, no checks. Unless the batch
+    first) and why; or ([], why not). Only local state is read: no fetch, no checks (an open runner
+    fault, envfault, is probed again at most once a minute and holds every batch). Unless the batch
     is full or holds a priority-1 approval or one the last batch requeued untested, it waits for
     delivery.push_min_gap_s since the last one."""
     now = time.time() if now is None else now
@@ -604,6 +605,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     st = _state(db)
     if float(st.get("backoff_until") or 0) > now:
         return [], f"backing off until {_at(float(st['backoff_until']), now, p)}"
+    if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
+        return [], held
     if not locks.any_free(push.lock_paths(p, remote, branch)) or any(
             not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))):
         return [], "another push holds its turn"
@@ -1375,7 +1378,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             _settle(p, tid, b, m, now)
         # In the transaction that finalizes the batch: a crash before it commits records them again.
         _resolve_upstream(p, shipped, version)
-        if outcome in ("moved", "busy", "rejected", "nothing", "landed", "pushed", "tip_failed") and back:
+        if outcome in ("moved", "busy", "env_fault", "rejected", "nothing", "landed", "pushed", "tip_failed") and back:
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
     for key, text, sev in later:

@@ -519,6 +519,24 @@ def _in_repo(name: str, top: str | Path) -> bool:
     return False
 
 
+def runner_wait(cmds: list, repo: Path, env: dict, say: Callable[[str], None], p: Project | None = None) -> int:
+    """BUSY when a check's runner is missing on this host (envfault): recorded once for the
+    coordinator (in the state of `p`, default TTP_PROJECT's project), said with its retry_when, and
+    nothing run or counted against the change; else 0."""
+    from . import envfault
+    if p is None and (base := os.environ.get("TTP_PROJECT")):
+        p = Project(base)
+        p = p if p.exists() else None
+    fault = envfault.precheck(cmds, repo, env)
+    if not fault:
+        if p:
+            envfault.recheck(p)
+        return 0
+    envfault.record(p, fault, os.environ.get("TTP_TASK"))
+    say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p)}")
+    return BUSY
+
+
 def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = "", proj: Project | None = None):
     """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
@@ -2736,6 +2754,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
                 f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
+        if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir), say)):
+            return why
         try:
             slot = check_slot(head, say) if todo else checkcap.Slot()
         except checkcap.Unavailable as e:
@@ -2930,6 +2950,8 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
+        if todo and (why := runner_wait(todo, repo, check_env("target", tip, check_run_dir), say)):
+            return why
         try:
             slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot()
         except checkcap.Unavailable as e:

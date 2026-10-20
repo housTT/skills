@@ -2014,6 +2014,8 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
+    if getattr(a, "env_ok", False):
+        sys.exit(_checks_env_ok(here()))
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
@@ -2186,6 +2188,22 @@ def cmd_checks(a) -> None:
                 out.write(f"{said}\n")
                 passed, failed, todo = False, c, []
                 break
+        # A runner the host lacks (pytest wiped from the python a check runs with) is an environment
+        # fault, not this head's: wait for it, counting nothing against the change (envfault).
+        from . import envfault
+        pre_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), "PWD": top, **venv_vars}
+        if todo and not hit and (fault := envfault.precheck(todo, top, pre_env)):
+            envfault.record(p, fault, os.environ.get("TTP_TASK"))
+            envfault.write_marker(run_dir, fault)
+            said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p)}"
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "env_fault": fault["sig"]})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        if p:
+            envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
         fresh_ok = not a.fresh
         slot = None
@@ -2901,11 +2919,23 @@ def _checks_child(a) -> int:
     return code if isinstance(code, int) else 1
 
 
+def _checks_env_ok(p: Project | None) -> int:
+    """`retry_when` probe of a check run that stopped at a runner fault (envfault): 0 once every open
+    fault's runner is back (each closes), 1 while one is still missing."""
+    from . import envfault
+    still = envfault.recheck(p) if p else {}
+    for f in still.values():
+        print(f"ttp checks: still missing: {envfault.line(f)}")
+    if not still:
+        print("ttp checks: no check runner is missing")
+    return 1 if still else 0
+
+
 def _checks_result(run_dir: Path) -> int:
     """`retry_when` probe of detached checks: 0 once checks.rc exists or the checks died without
     writing it (it then writes `killed` there), 1 while they run."""
     rc_file = run_dir / CHECKS_RC
-    from . import detach
+    from . import detach, envfault
     _checks_tmp_cleanup(run_dir)
     if detach.pending(rc_file):
         print("ttp checks: queued for the daemon, which starts them outside the sandbox")
@@ -2935,6 +2965,10 @@ def _checks_result(run_dir: Path) -> int:
                   + (checkcap.line() or "they start once one is free"))
         else:
             print(f"ttp checks: running (pid {info['pid']})")
+        return 1
+    if rc_file.exists() and rc_file.read_text().strip() == "75" and (fault := envfault.marker_open(run_dir)):
+        # Stopped at a runner the host lacks: asleep until it is back, then the task runs them again.
+        print(f"ttp checks: waiting: {envfault.line(fault)}")
         return 1
     if rc_file.exists():
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
@@ -6475,6 +6509,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
     s.add_argument("--result", metavar="RUN_DIR",
                    help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
+    s.add_argument("--env-ok", action="store_true",
+                   help="run nothing: exit 0 once no check runner is missing (an environment fault), 1 while one is")
     s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "

@@ -38,7 +38,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, conflictfix, locks, push, pushpass, runner, suitecost, worktree
+from . import checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, suitecost, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -57,7 +57,7 @@ OVER_KEPT = 10                     # overshoot lines a check's tail keeps from i
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
-EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "moved": push.KEPT_MOVING,
+EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "env_fault": push.BUSY, "moved": push.KEPT_MOVING,
         "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED}
 
 
@@ -713,7 +713,14 @@ class Batch:
             self.tip = tip
             self.status, self.detail, self.landed_at = {}, {}, {}
             self._prepare(tip)
-            outcome = self._round(tip, checks)
+            try:
+                outcome = self._round(tip, checks)
+            except envfault.Fault as e:
+                # The host, not an entry: every entry goes back to the queue untouched, which holds
+                # until the runner is back (pushq.due); the coordinator hears of it once.
+                envfault.record(self.p, e.fault)
+                return self._all("requeued", "env_fault", f"{e}; the batch is held, not failed",
+                                 keep=("landed", "refused"))
             if outcome != "moved":
                 return outcome
             say(f"{self.target} moved; round {rnd + 1}")
@@ -1023,6 +1030,12 @@ class Batch:
         m = push.VERSION_RE.search(show.stdout) if show.returncode == 0 else None
         return ".".join(m.group(2, 3, 4)) if m else None
 
+    def _runners(self, cmds: list, env: dict) -> None:
+        """Raise envfault.Fault when a check's runner is missing on this host: the batch is held,
+        not failed (push_phase)."""
+        if fault := envfault.precheck(cmds, self.wt, env):
+            raise envfault.Fault(fault)
+
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
@@ -1064,6 +1077,7 @@ class Batch:
                 run.append((cmd, eid))
         if not run:
             return None
+        self._runners([c for c, _ in run], env)
         suite_out: list[str] = []
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
@@ -1119,6 +1133,7 @@ class Batch:
         if not todo:
             return False
         env = push.check_env("target", self.tip, self.check_run_dir)
+        self._runners(todo, env)
         tree, slot, started = pushpass.tree_of(self.wt, plain), None, time.time()
         try:
             for cmd in todo:
