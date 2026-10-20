@@ -17,7 +17,8 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
 - A task needs a device box, or a box it used is gone.
 - The user asks to set up, reserve or allocate a box.
 - A fresh box needs setting up (broker, host checks, workspace, env, agent CLIs, access): ask the
-  user first, then set it up: `new-box.md`.
+  user first, then set it up: `new-box.md`. It is set up in the user's own account, created when
+  missing, not in a shared admin login: `account.md`.
 - A project still syncs or mirrors files to a box: `migrate-off-sync.md`.
 
 ## Route picker

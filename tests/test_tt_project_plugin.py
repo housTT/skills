@@ -1624,7 +1624,7 @@ def _setup_box(tmp_path, *args, entry=None):
                           capture_output=True, text=True, timeout=60)
 
 
-ALL_NONE = ["broker=none", "host_checks=driver,pcie", "workspace=none", "python_env=none", "agent_clis=none",
+ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "workspace=none", "python_env=none", "agent_clis=none",
             "projects=all", "recovery.owner=none", "lock=shared", "disk_guard=150"]
 
 
@@ -1634,26 +1634,27 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     batches = json.loads(r.stdout)["batches"]
     qs = [q for b in batches for q in b]
     # The first pass asks every top-level topic of the new-box flow; follow-ups wait for their answer.
-    assert [q["id"] for q in qs] == ["broker", "host_checks", "workspace", "python_env", "agent_clis",
+    assert [q["id"] for q in qs] == ["account.user", "account.admin", "account.keys", "account.outbound",
+                                     "broker", "host_checks", "workspace", "python_env", "agent_clis",
                                      "projects", "recovery.owner", "lock", "disk_guard"]
     for b in batches:
         assert 1 <= len(b) <= 4
         for q in b:
             assert len(q["header"]) <= 12 and 2 <= len(q["options"]) <= 4, q
-    broker = qs[0]
+    broker = qs[4]
     assert [o["value"] for o in broker["options"]] == ["install", "none"]
     assert "(suggested)" in broker["options"][0]["label"]   # offered, never filled in
     assert "ttp lock <box-alias>-device -- <cmd>" in broker["options"][1]["description"]
     assert next(q for q in qs if q["id"] == "host_checks")["multiSelect"] is True
     num = _setup_box(tmp_path, "setup", "questions", "<box-alias>", "--format", "numbered").stdout
-    assert num.count("\n1. ") == 1 and "\n9. " in num and "   b) No broker:" in num
+    assert num.count("\n1. ") == 1 and "\n13. " in num and "   b) No broker:" in num
     assert "nothing is assumed" in num and "(suggested: install)" in num
 
 
 def test_setup_box_new_box_answers_save_reload_and_nothing_is_assumed(tmp_path):
     # Defaults are never filled in: an unanswered question keeps the plan closed.
     r = _setup_box(tmp_path, "setup", "save", "<box-alias>", "--set", "broker=none")
-    assert r.returncode == 0 and "still to ask: host_checks" in r.stdout, r.stdout
+    assert r.returncode == 0 and "still to ask: account.user" in r.stdout, r.stdout
     plan = _setup_box(tmp_path, "setup", "plan", "<box-alias>")
     assert plan.returncode == 1 and "ask first" in plan.stdout
     bad = _setup_box(tmp_path, "setup", "save", "<box-alias>", "--set", "lock=sometimes")
@@ -1670,7 +1671,7 @@ def test_setup_box_new_box_answers_save_reload_and_nothing_is_assumed(tmp_path):
     again = _setup_box(tmp_path, "setup", "questions", "<box-alias>")
     assert again.returncode == 0 and again.stdout.startswith("nothing to ask"), again.stdout
     assert _setup_box(tmp_path, "site", "check").returncode == 0
-    assert "broker" in json.loads(_setup_box(tmp_path, "setup", "questions", "<box-alias>", "--all").stdout)[
+    assert "account.user" in json.loads(_setup_box(tmp_path, "setup", "questions", "<box-alias>", "--all").stdout)[
         "batches"][0][0]["id"]
     # A labelled answer (what a question tool returns) maps back to its value; typed values are checked.
     assert _setup_box(tmp_path, "setup", "save", "<box-alias>", "--json",

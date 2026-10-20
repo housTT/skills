@@ -11,7 +11,10 @@ box. Either way the work happens in the box's own checkout (`ssh-workflow.md`).
 | Codex | install it per its current official instructions; check with `codex --version` | `codex login --device-auth` (a code typed on another machine; no browser on the box) |
 | Cursor | Remote-SSH from the user's editor to `<box-alias>`; the `cursor-agent` CLI on the box if used, checked with `cursor-agent --version` | the editor's login carries over Remote-SSH |
 
-- Install for the user only (no root), unless the user says otherwise.
+- Install for the user only (no root), unless the user says otherwise, in the user's own account
+  (`account.md`), never a shared admin login. Logins (agent CLIs, gh) live in the user's home.
+- gh: a distro's packaged gh can be too old for a newer `hosts.yml`; install it from GitHub's own
+  apt repository.
 - Logins and tokens are typed by the user; never paste them into a prompt, task or file.
 
 ## Building and running: tt-buddy

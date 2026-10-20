@@ -25,6 +25,7 @@ import tempfile
 from typing import Dict, List, Optional
 
 import box
+import box_account
 
 KNOWN_KEYS = {"setup"}
 HOST_CHECKS = ("driver", "firmware", "hugepages", "pcie")
@@ -47,6 +48,14 @@ def _names(v: str) -> bool:
     return all(_word(n) for n in v.split(","))
 
 
+def _pubs(v: str) -> bool:
+    return all(n == "here" or _word(n) and n.endswith(".pub") for n in v.split(","))
+
+
+def _abs_paths(v: str) -> bool:
+    return all(_word(n) and n.startswith("/") for n in v.split(","))
+
+
 def _gb(v: str) -> bool:
     try:
         return float(v) >= 0
@@ -58,6 +67,31 @@ def _gb(v: str) -> bool:
 # (offered first and marked, never filled in), multi, other (a validator for a typed answer), when
 # (the earlier answers it needs) and parent (whose change makes it ask again).
 QUESTIONS: List[dict] = [
+    dict(id="account.user", header="Login user", suggest="same", other=box_account.valid_login,
+         text="Your login on {alias}? (another name: type it)", options=[
+             ("same", "Same as here", "{user}, the name you have on your other machines")]),
+    dict(id="account.admin", header="First login", other=_word,
+         text="If your own login does not reach {alias} yet: the ssh alias of the admin or site account "
+              "access came through? (type it)", options=[
+             ("none", "My login works", "ssh as your own user already works; no account is created")]),
+    dict(id="account.ids", header="uid/gid", parent="account.admin", when={"account.admin": "!none"},
+         suggest="here", other=_word,
+         text="Where do your uid and gid come from, so files on shared storage keep their owner? "
+              "(another machine's ssh alias, or a path on {alias} you own: type it)", options=[
+             ("here", "This machine", "`id` here")]),
+    dict(id="account.migrate", header="Move work", parent="account.admin", when={"account.admin": "!none"},
+         other=_abs_paths,
+         text="Work already done in the admin account on {alias} to move into your home? "
+              "(type absolute paths, comma-separated)", options=[
+             ("none", "Nothing to move", "the admin account holds none of your work")]),
+    dict(id="account.keys", header="ssh keys", suggest="here", other=_pubs,
+         text="Public keys for your authorized_keys on {alias}? (others: type .pub paths, comma-separated; "
+              "here = this machine's)", options=[
+             ("here", "This machine's", "every ~/.ssh/*.pub here, so the project host gets in")]),
+    dict(id="account.outbound", header="Outbound", text="Your own ssh keys for git over ssh from {alias}?",
+         options=[
+             ("none", "None to restore", "git over https, or a key set up later"),
+             ("restore", "Restore mine", "you copy your key files into ~/.ssh on {alias}; the plan checks modes")]),
     dict(id="broker", header="Broker", text="Device broker on {alias}?", suggest="install", options=[
         ("install", "Install tt-device-mcp", "through its documented installer; device jobs queue through it"),
         ("none", "No broker", "each device command takes `ttp lock {lock} -- <cmd>` instead")]),
@@ -145,7 +179,7 @@ def pending(saved: dict, ask_all: bool = False) -> List[dict]:
 
 
 def _fmt(s: str, alias: str, lock: str) -> str:
-    return s.replace("{alias}", alias).replace("{lock}", lock)
+    return s.replace("{alias}", alias).replace("{lock}", lock).replace("{user}", box_account.local_user())
 
 
 def render_ask(qs: List[dict], alias: str, lock: str, saved: dict) -> List[dict]:
@@ -261,6 +295,49 @@ def lock_name(alias: str) -> str:
     return f"{alias}-device"
 
 
+def login_user(answers: dict) -> str:
+    u = answers.get("account.user", "same")
+    return box_account.local_user() if u == "same" else u
+
+
+def account_steps(alias: str, entry: dict, answers: dict, box_py: str, step) -> None:
+    """The user's own account first: everything after it is set up in that account (`account.md`)."""
+    user = login_user(answers)
+    admin = answers.get("account.admin", "none")
+    keys = [k for k in (answers.get("account.keys") or "here").split(",") if k]
+    pub = "" if keys == ["here"] else "".join(f"--pubkey {_sh(k)} " for k in keys)
+    if admin != "none":
+        ids = answers.get("account.ids", "here")
+        step("account", f"`{box_py} account create {alias} --via {admin} --user {user} --ids-from {_sh(ids)} "
+                        f"{pub}--run` after reading its dry run: the same uid/gid as on {ids}, a home, a login "
+                        "shell, sudo only if the admin login has it (a drop-in checked with `visudo -cf`), the docker "
+                        "group if there is one, authorized_keys and linger; no other account is changed",
+             f"ssh {alias} 'id; loginctl show-user {user} -p Linger'  (expect: {user} with the uid/gid "
+             f"`{box_py} account ids {_sh(ids)}` prints, Linger=yes)")
+        moves = answers.get("account.migrate", "none")
+        if moves != "none":
+            paths = moves.split(",")
+            step("account.migrate", f"`{box_py} account migrate {alias} --via {admin} --user {user} "
+                                    + " ".join(f"--path {_sh(p)}" for p in paths) + " --run` after its dry run: "
+                                    "mv and chown, never a delete; rebuild each venv and build tree it lists; then "
+                                    "remove from the admin account only what setup-box itself put there",
+                 f"{box_py} account migrate {alias} --via {admin} --user {user} "
+                 + " ".join(f"--path {_sh(p)}" for p in paths) + "  (dry run; expect: each path `moved`, none `to move`)")
+    else:
+        step("account", f"your own login works: `{box_py} account keys {alias} {pub}--run` adds the keys; "
+                        f"`ssh {alias} loginctl enable-linger` (or through the box's admin, if refused)",
+             f"ssh {alias} 'id -un; loginctl show-user {user} -p Linger'  (expect: {user}, Linger=yes)")
+    if answers.get("account.outbound") == "restore":
+        step("account.outbound", f"the user copies their own key files into ~/.ssh on {alias} (agents never "
+                                 "handle private keys)",
+             f"ssh {alias} 'stat -c \"%a %n\" ~/.ssh/id_*'  (expect: 600 for each private key)")
+    step("account.entry", f"`{box_py} account entry {alias} --user {user}"
+                          + (f" --admin {admin}" if admin != "none" else "") + "`: workdir_root under the "
+                          f"home; ssh config `Host {alias}` with `User {user}`"
+                          + (f", and `Host {admin}` for the admin login" if admin != "none" else ""),
+         f"{box_py} site check; ssh {alias} id -un  (expect: ok; {user})")
+
+
 def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-root>") -> List[dict]:
     """Ordered steps, each {"id", "action", "check"}; every answer becomes an action and its check."""
     box_py = f"{plugin_root}/skills/setup-box/scripts/box.py"
@@ -271,6 +348,8 @@ def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-roo
     def step(qid, action, check):
         steps.append({"id": qid, "action": action, "check": check})
 
+    if "account.user" in answers:
+        account_steps(alias, entry, answers, box_py, step)
     if answers.get("broker") == "install":
         ref = answers.get("broker.ref", "latest-release")
         step("broker", f"install tt-device-mcp ({ref}) on {alias} through the tenstorrent/tt-device-mcp "

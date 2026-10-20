@@ -38,6 +38,8 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `route` | yes | `bare`, `ird` or `slurm` (exabox is `slurm`: `exabox.md`) |
 | `jump` | no | ssh alias of the jump host; the box's ssh config uses it as `ProxyJump` |
 | `workdir_root` | yes | absolute path on the box for checkouts and build trees (shared storage on a cluster) |
+| `user` | no | the user's own login on the box, written by `box.py account entry`; `workdir_root` must then be under its home (`account.md`) |
+| `admin` | no | ssh alias of the admin or site account, only while one is still needed (`account.md`) |
 | `scratch_root` | no | absolute node-local scratch path; may be wiped when a job ends |
 | `ird.mgmt` | `ird` | ssh alias of the reservation management host |
 | `ird.pools` | `ird` | non-empty list of pool names the project may reserve from |

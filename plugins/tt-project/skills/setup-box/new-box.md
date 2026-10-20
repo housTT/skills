@@ -27,6 +27,10 @@ box.py setup questions <box-alias> --format numbered  # a plain numbered prompt
 
 | Question | Options |
 |---|---|
+| Login user | your login on the box; default the same name as on your other machines |
+| First login | none (your login works), or the admin or site account's ssh alias |
+| uid/gid, Move work | where your uid/gid come from; paths in the admin account to move (follow-ups) |
+| ssh keys, Outbound | public keys for authorized_keys; your own outbound keys to restore, or none |
 | Device broker | install tt-device-mcp (which release or branch), or none: device work then takes `ttp lock <box-alias>-device -- <command>` |
 | Host checks (read-only) | any of driver, firmware, hugepages, PCIe link |
 | Workspace | a repo checkout and build under `workdir_root` (branch, ccache), or none |
@@ -58,6 +62,11 @@ box.py setup plan <box-alias>
 It refuses while a question is open. Otherwise it prints one step per answer: an action and the
 check that proves it. Do each action, run its check, and report both. A failed check is reported,
 not skipped.
+
+- Account: first, so everything after it is set up in the user's own account, never in the admin
+  or site account access came through: `account.md` (create it with the same uid/gid, keys,
+  linger, move earlier work, write the box entry). Run `plan` again after `account entry`: the
+  later steps then use the new `workdir_root`.
 
 - Broker, install: the tenstorrent/tt-device-mcp repository's documented installer and upgrade
   path at the chosen release or branch; never hand-edit an installed broker, and never start a
