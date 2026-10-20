@@ -176,6 +176,7 @@ def test_issues_close_ends_a_stale_schedule_gap_with_its_reason_and_a_new_sighti
     queued = len(p.db.q("SELECT id FROM events WHERE source='daemon:schedule-gap' AND status='queued'"))
     d.observe("daemon:schedule-gap", text, "normal", whole=True, key="schedule-gap:1700000000")
     assert _gap_issue(p)["status"] == "open" and _gap_issue(p)["closed"] is None
+    assert [h["action"] for h in json.loads(_gap_issue(p)["history"])] == ["closed", "reopened"]
     assert len(p.db.q("SELECT id FROM events WHERE source='daemon:schedule-gap' AND status='queued'")) == queued + 1
 
 
@@ -197,6 +198,9 @@ def test_issues_close_refuses_an_unknown_issue_an_empty_why_and_another_projects
     assert _gap_issue(p)["status"] == "open" and _gap_issue(p)["history"] is None
     assert not p.db.q("SELECT id FROM messages WHERE text LIKE 'Closed issue%'")
     monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"] / "run"))
+    with pytest.raises(SystemExit):  # a run with no TTP_PROJECT cannot name a project either
+        cli.main(["issues", "close", str(iid), "--why", "no project", "--project", "demo"])
+    assert _gap_issue(p)["status"] == "open"
     monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-project"))
     monkeypatch.setenv("TTP_TASK", "7")
     with pytest.raises(SystemExit):

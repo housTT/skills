@@ -163,8 +163,11 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
                 # Closed by a quiet run moments ago and sent again unchanged: counted, not reopened.
                 return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a quiet run",
                                fp, row["id"], "dedupe")
-            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=?, reopens=? WHERE id=?",
-                 ("open" if sev != "info" else "ignored", sev, now, _reopens(row, now), row["id"]))
+            history = json.loads(row.get("history") or "[]")
+            history.append({"ts": now, "action": "reopened", "by": "a new sighting", "why": "regressed after fix"})
+            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=?, reopens=?, "
+                 "history=? WHERE id=?",
+                 ("open" if sev != "info" else "ignored", sev, now, _reopens(row, now), json.dumps(history), row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
             return _jev_missed(db, row, v)
         if seen_at > rank and seen_at >= floor:
