@@ -150,6 +150,13 @@ CREATE TABLE IF NOT EXISTS ttr_incidents (
   started REAL NOT NULL, ended REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS ttr_open ON ttr_incidents(alias) WHERE ended IS NULL;
 CREATE INDEX IF NOT EXISTS ttr_alias ON ttr_incidents(alias, started);
+
+-- One row per finished review (reviewstats.py): reviewed head, changed lines against its merge-base,
+-- areas touched, tier, re-review flag, outcome and cost. A later verdict of the same review replaces it.
+CREATE TABLE IF NOT EXISTS review_stats (
+  task INTEGER PRIMARY KEY, ts REAL NOT NULL, head TEXT, lines INTEGER, areas TEXT, tier TEXT,
+  rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, cost_usd REAL NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS review_stats_ts ON review_stats(ts);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")

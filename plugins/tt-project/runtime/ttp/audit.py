@@ -19,6 +19,8 @@ the project could have saved. Model-free; the review grades it.
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
+- reviews finished (reviewstats): count, spend and failures by diff size, tier and first review
+  against re-review, for retesting review routing;
 - overrides held longer than `blocked_h`: resource pauses and active mutes, and temporary instructions
   whose end only a model can judge that were listed as possibly over a day or more ago; and at any
   age, a resource pause with no end or whose `until` has passed;
@@ -33,7 +35,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, quietgate, sharedchecks, suitecost, turngate, unblock, upstream
+from . import budget, chaincap, ends, quietgate, reviewstats, sharedchecks, suitecost, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -357,6 +359,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                    f"(${(rev + fix) / len(loops):.2f} per change); most costly: " + ", ".join(
                        f"#{x['change']} {_short(x['title'], 50)} {x['rounds']} round{'s' if x['rounds'] > 1 else ''} "
                        f"${x['review_usd']:.2f} + fixes ${x['fix_usd']:.2f}" for x in loops[:3]))
+    if routed := reviewstats.audit_line(db, since):
+        out.append(routed)
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))
@@ -389,4 +393,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since),
             "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
+            "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h)}

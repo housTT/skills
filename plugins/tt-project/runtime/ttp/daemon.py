@@ -91,6 +91,7 @@ from . import release
 from . import responsibilities
 from . import reviewcap
 from . import reviewreuse
+from . import reviewstats
 from . import runner
 from . import schedule as sched
 from . import service
@@ -3622,6 +3623,11 @@ class Daemon:
                 self._wait_started(now_t, result)
             return
         outcome = CHANGES_NEEDED if rejects else new
+        if task["kind"] == "review" and new in ("done", "failed", "pushing", "blocked", "review"):
+            try:   # routing data for the efficiency audit (reviewstats); a miss never stops the hand-off
+                reviewstats.record(self.p, task, outcome)
+            except Exception as e:
+                log(self.p, f"review {task['id']}: its stats were not recorded: {e}")
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = summary if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
             need = upd.get("blocked_reason") if new == "blocked" else None
@@ -8433,6 +8439,7 @@ class Daemon:
                 named = worktree.named_refs(self.p, t) if branch else []
                 if task["id"] in dependency_ids(t) or (branch and branch in named) or (
                         branch and t["status"] == "queued" and branch in worktree.fix_branches(self.p, t, named)):
+                    self._name_new_head(task, t)
                     self._precheck_open(task, t)
                     return t["id"], False
             # No branch on record: the change is the PR it published, read from the hosting service.
@@ -8494,7 +8501,11 @@ class Daemon:
         if fups:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
                          "change, so not a finding by themselves): " + "; ".join(fups[:MAX_FOLLOWUPS]))
-        if prior:
+        failed = reviewstats.failed_head(db, prior["id"]) if prior else ""
+        if prior and failed and not full.startswith(failed[:12]):
+            lines.append(f"Review #{prior['id']} failed on an earlier head. "
+                         + reviewstats.delta_line(failed, head, head, "each of its findings"))
+        elif prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
         if not published and (line := self._verified_review_line(task, full)):
@@ -8663,6 +8674,25 @@ class Daemon:
                 f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")
+
+    def _name_new_head(self, task: dict, review: dict) -> None:
+        """A queued re-review of a failed review gets the new head its fix ended on, and the size of
+        the fix delta from the failed head (reviewstats): once per head."""
+        c, branch = continues_id(review), task.get("branch")
+        if review["status"] != "queued" or review["kind"] != "review" or c is None or not branch:
+            return
+        try:
+            failed = reviewstats.failed_head(self.p.db, c)
+            full = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
+            if not failed or not full or full.startswith(failed) or f"New head: {branch} at {full[:12]}" in (
+                    review.get("spec") or ""):
+                return
+            line = reviewstats.new_head_line(self.p, failed, branch, full)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: review #{review['id']} not told its new head: {e}")
+            return
+        self.p.db.update_task(review["id"], spec=f"{review.get('spec') or ''}\n{line}")
+        review["spec"] = f"{review.get('spec') or ''}\n{line}"
 
     def _precheck_open(self, task: dict, review: dict) -> None:
         """An open review queued before the code task finished (the re-review _fix_failed_review
@@ -8893,7 +8923,8 @@ class Daemon:
                                   f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
                                   f"built on #{code['id']}'s branch {code['branch']} at {head}) addresses its findings:",
                                   found,
-                                  f"Check each is fixed, then review what changed since. Where the first review's "
+                                  reviewstats.delta_line(head, fbranch, f"the tip of {fbranch} once #{fid} is done")
+                                  + f" Where the first review's "
                                   f"spec below names a branch or worktree of this stack (such as {code['branch']} or "
                                   f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
                                   *([step] if step else []),
