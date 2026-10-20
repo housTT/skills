@@ -155,17 +155,16 @@ def test_claude_code_shortcut_is_plain_tt_project_and_loads_the_plugin_skill():
     plugin = json.loads(MANIFESTS[0].read_text())["name"]
     assert f"`{plugin}:{fm['name']}`" in mod.TEXT and (SKILLS / fm["name"] / "SKILL.md").exists()
     assert "$ARGUMENTS" in mod.TEXT and mod.MARK in mod.TEXT
-    readme = " ".join((PLUGIN / "README.md").read_text(encoding="utf-8").split())
-    assert "`/tt-project`" in readme and "`/tt-project:tt-project-harness`" in readme
+    install = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
+    assert "`/tt-project`" in install and "`/tt-project:tt-project-harness`" in install
 
 
-def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
-    """Teammates install from the dogfood tag, not `main` (which has no tt-project): Claude Code
+def test_install_doc_pins_the_release_ref_with_each_hosts_ref_syntax():
+    """Teammates install from a release ref, not `main` (which has no tt-project): Claude Code
     takes the ref after `#`, Codex after `--ref`, Cursor through a git checkout; the marketplace
     and plugin names must be the ones both catalogues register."""
-    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
-    assert "\n## Dogfood install\n" in readme
-    section = readme.split("\n## Dogfood install\n", 1)[1].split("\n## ", 1)[0]
+    section = (PLUGIN / "docs" / "install.md").read_text(encoding="utf-8")
+    assert "\n## Manual install\n" in section and "\n## Uninstall\n" in section
     repo = PLUGIN.parents[1]
     names = {json.loads((repo / f).read_text())["name"] for f in
              (".claude-plugin/marketplace.json", ".agents/plugins/marketplace.json")}
@@ -178,7 +177,7 @@ def test_readme_dogfood_install_pins_the_tag_with_each_hosts_ref_syntax():
     assert f'fetch -q --depth 1 https://github.com/tenstorrent/skills.git "{tag}"' in section
     for cmd in (f"claude plugin install {plugin}@{market}", f"codex plugin add {plugin}@{market}",
                 f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
-                "bin/ttp\" setup", "ttp new ", "ttp stop <name> --kill"):
+                "bin/ttp\" setup", "ttp stop <name> --kill"):
         assert cmd in section, cmd
     # `claude plugin details` lists the skills the plugin ships, sorted.
     skills = sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
@@ -2642,9 +2641,9 @@ def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
     assert "nothing to turn on" in text and "released\n   right after" in text
 
 
-def test_readme_documents_the_product_defaults():
+def test_guide_documents_the_product_defaults():
     """Caps, the plan line and its reserve, free Codex resets, light-tier models and Jev as an add-on."""
-    text = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    text = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
     flat = " ".join(text.split())
     assert "$100 per 24 hours and $200 per 7 days per project by default" in flat
     assert "Global daily cap (usage-billed, $200/day by default)" in flat
@@ -2658,14 +2657,14 @@ def test_readme_documents_the_product_defaults():
     assert "sends log and alert text" in jev and "outside paid service" in jev
 
 
-def test_readme_documents_standby_snapshots():
-    """Every standby snapshot key and each `ttp replicate` flag is in the README's standby section."""
+def test_guide_documents_standby_snapshots():
+    """Every standby snapshot key and each `ttp replicate` flag is in the guide's standby section."""
     sys.path.insert(0, str(RUNTIME.parent))
     try:
         from ttp import project
     finally:
         sys.path.remove(str(RUNTIME.parent))
-    text = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    text = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
     assert "\n## Standby snapshots\n" in text
     section = " ".join(text.split("\n## Standby snapshots\n", 1)[1].split("\n## ", 1)[0].split())
     keys = {"standby", "fleet", "snapshot_every_s", "snapshot_keep"}
@@ -4053,7 +4052,7 @@ def test_setup_box_ird_e2e_value_flag_without_value_exits_2(flag):
     assert "needs a value" in r.stderr
 
 
-# One-line install (README ### One-line install, install.sh). No network: the line's URL is swapped for
+# One-line install (README ## Install, install.sh). No network: the line's URL is swapped for
 # a file:// fixture repository, and claude, codex, cursor-agent and the fixture's bin/ttp are fakes.
 INSTALL_URL = "https://github.com/tenstorrent/skills.git"
 FAKE_CLAUDE = r"""#!/bin/sh
@@ -4086,12 +4085,15 @@ FAKE_TTP = """#!/bin/sh
 echo "ttp $* from $0" >> "$HOME/calls.log"
 [ "ttp $*" != "${FAIL_CALL:-}" ] || exit 3
 mkdir -p "$HOME/.local/bin"
+# like `ttp setup`: the installed shim; FAIL_VERSION=1 makes it broken
+printf '#!/bin/sh\\n[ -z "${FAIL_VERSION:-}" ] || exit 4\\necho "ttp 1.0.0"\\n' > "$HOME/.local/bin/ttp"
+chmod +x "$HOME/.local/bin/ttp"
 """
 
 
 def _install_line() -> str:
     readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
-    section = readme.split("\n### One-line install\n", 1)[1].split("\n## ", 1)[0]
+    section = readme.split("\n## Install\n", 1)[1].split("\n## ", 1)[0]
     blocks = re.findall(r"```bash\n(.*?)\n```", section, re.S)
     assert len(blocks) == 1 and "\n" not in blocks[0], "the one-line install must be a single line"
     return blocks[0]
@@ -4142,7 +4144,7 @@ def install_env(tmp_path):
     for d in (home, tools, tmp):
         d.mkdir()
     for tool in ("git", "python3", "sh", "bash", "dash", "zsh", "mktemp", "rm", "cp", "mv", "mkdir", "sed", "head",
-                 "dirname", "cat"):
+                 "dirname", "cat", "chmod"):
         found = shutil.which(tool)
         if found:
             (tools / tool).symlink_to(found)
@@ -4212,15 +4214,14 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     assert 'sh "$d/plugins/tt-project/install.sh"' in line and "set TT_PROJECT_REF to a release tag" in line
     for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
         assert raw not in line, raw
-    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
-    readme = " ".join(readme.split())
+    readme = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
     assert "Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now" in readme
     assert "a release tag the publisher moves forward as a release channel gives the latest release" in readme
     # Only the line reads TT_PROJECT_REF; install.sh itself never does, so the README must not say it does.
     code = [ln for ln in (PLUGIN / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
     assert not any("TT_PROJECT_REF" in ln for ln in code)
     assert "`install.sh` reads" not in readme
-    assert "the one-line install above reads the same variable" in readme
+    assert "the one-line install reads the same variable" in readme
     assert os.access(PLUGIN / "install.sh", os.X_OK)
 
 
@@ -4400,6 +4401,42 @@ def test_one_line_install_carries_on_when_one_tools_step_fails_and_exits_non_zer
         assert (closing in r.stdout) == (name != tool), (name, r.stdout)
     assert "Cursor: restart it" in r.stdout
     assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
+
+
+def test_plugin_readme_is_short_with_the_one_line_install_and_links_to_the_docs():
+    """The README holds what it is, the one line, a quick start and links; reference text lives in docs/."""
+    text = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert len(text.splitlines()) < 80
+    assert _install_line()
+    assert "ttp new " in text and "ttp web " in text and "connect to project" in text
+    for doc in re.findall(r"\]\((docs/[\w.-]+)(?:#[\w-]+)?\)", text):
+        assert (PLUGIN / doc).is_file(), doc
+    assert {"docs/guide.md", "docs/install.md"} <= set(re.findall(r"\]\((docs/[\w.-]+)", text))
+
+
+def test_one_line_install_without_git_says_so(install_env):
+    (install_env.home.parent / "bin" / "git").unlink()
+    r = install_env()
+    assert r.returncode == 1 and "tt-project: install git first" in r.stderr, r.stderr
+    assert _calls(install_env.home) == []
+
+
+def test_installer_refuses_a_python_older_than_39(install_env):
+    tools = install_env.home.parent / "bin"
+    (tools / "python3").unlink()
+    (tools / "python3").write_text('#!/bin/sh\n[ "$1" = -V ] && echo "Python 3.8.10"\nexit 1\n')
+    (tools / "python3").chmod(0o755)
+    r = install_env()
+    assert r.returncode == 1
+    assert "tt-project: Python 3.9+ is required; python3 here is Python 3.8.10" in r.stderr, r.stderr
+    assert _calls(install_env.home) == []
+
+
+def test_one_line_install_fails_when_the_installed_ttp_does_not_run(install_env):
+    r = install_env(env={"FAIL_VERSION": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "/.local/bin/ttp --version` failed (exit 4)" in r.stderr, r.stderr
+    assert "ttp: ready in this shell" not in r.stdout and "finished with failed steps" in r.stdout
 
 
 def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_env):

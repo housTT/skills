@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Installs tt-project for each of Claude Code, Codex and Cursor found on this machine, then runs
-# `ttp setup`. Safe to rerun: it updates the same clone and config entries in place. A step that
-# fails does not stop the other tools or `ttp setup`: the failures are listed at the end, and the
-# installer then exits 1.
+# `ttp setup` and checks that the installed `ttp` runs. Safe to rerun: it updates the same clone and
+# config entries in place. A step that fails does not stop the other tools or `ttp setup`: the
+# failures are listed at the end, and the installer then exits 1.
 #
 # Usage, from a shell (set TT_PROJECT_REF to a release tag; empty installs the default branch):
 #
-# (TT_PROJECT_REF=; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git init -q "$d" && git -C "$d" fetch -q --depth 1 https://github.com/tenstorrent/skills.git "${TT_PROJECT_REF:-HEAD}" && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+# (TT_PROJECT_REF=; command -v git >/dev/null || { echo "tt-project: install git first" >&2; exit 1; }; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git init -q "$d" && git -C "$d" fetch -q --depth 1 https://github.com/tenstorrent/skills.git "${TT_PROJECT_REF:-HEAD}" && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
 #
 # The line fetches the one ref (a tag, branch or commit) and checks out FETCH_HEAD, rather than
 # `git clone --branch`, which warns that an annotated tag "is not a commit".
@@ -28,6 +28,8 @@ die() { printf 'tt-project: %s\n' "$*" >&2; exit 1; }
 
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v python3 >/dev/null 2>&1 || die "Python 3.9+ (python3) is required"
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null ||
+    die "Python 3.9+ is required; python3 here is $(python3 -V 2>&1)"
 
 src=$(cd "$(dirname "$0")/../.." && pwd -P)
 [ -f "$src/plugins/$PLUGIN/bin/ttp" ] || die "$src has no plugins/$PLUGIN; run install.sh from a checkout of the skills repository"
@@ -134,7 +136,8 @@ fi
 
 tool="ttp setup"
 ttp_ok=""
-step "$plugin/bin/ttp" setup && ttp_ok=1
+# Done only when the installed `ttp` itself runs, not just the plugin's copy.
+step "$plugin/bin/ttp" setup && step "$HOME/.local/bin/ttp" --version && ttp_ok=1
 
 [ -n "$found" ] || say "no Claude Code, Codex or Cursor found: install one, then rerun this installer"
 if [ -n "$failed" ]; then say "finished with failed steps (listed below). To load it:"; else say "done. To load it:"; fi
