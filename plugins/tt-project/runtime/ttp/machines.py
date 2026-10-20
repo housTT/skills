@@ -273,7 +273,7 @@ def push_background(hosts: list[str]) -> Path:
     import sys
     log = push_log()
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text(f"copying the machines list to {', '.join(hosts)}\n")
+    project.durable_write(log, f"copying the machines list to {', '.join(hosts)}\n")
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(
         x for x in (str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH")) if x)}
     with open(log, "a") as f:

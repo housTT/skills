@@ -25112,6 +25112,7 @@ DURABLE_EXEMPT = {
     ("activity.py", "os.replace(log, state / OLD)"): "rotates the bounded activity log; a rename lost to a crash leaves the log one generation longer",
     ("checkcap.py", 'open(state / WAITS_LOCK, "a")'): "a flock guard file, never written",
     ("checkcap.py", "os.replace(log, state / WAITS_OLD)"): "rotates the bounded checks slot wait log; a rename lost to a crash leaves the log one generation longer",
+    ("machines.py", 'open(log, "a")'): "the background copy's stdout; a log cut by a crash has no done line, so its failures are not reported, never misreported",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
