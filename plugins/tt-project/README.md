@@ -223,6 +223,11 @@ and preferences you add later become part of the project's charter and memory.
   With Jev enabled (see [Jev](#jev-optional-add-on)), new observations are screened by a cheap
   decision model first.
 
+`ttp issues list` shows a project's open daemon and watcher issues; `ttp issues close <id-or-key>
+--why "<reason>"` closes a stale one that nothing closes by itself (say a schedule gap after a host
+move), with the reason and time in its history and the activity feed. A condition that is still
+live reopens the issue at its next detection.
+
 Keyed alerts keep their history when closed. `ttp alerts <project>` shows their message IDs;
 `ttp alerts <project> --ack <id> --why "<reason>"` acknowledges that message's episode with the
 reason. One whose condition is over closes; one that still holds moves to the feed and stays quiet

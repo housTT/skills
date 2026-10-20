@@ -4366,6 +4366,51 @@ def cmd_mute(a) -> None:
     print(f"ended the mute of {m['source']} {m['match']!r} ({m['count']} muted); the coordinator gets its summary")
 
 
+def cmd_issues(a) -> None:
+    """Daemon and watcher issues: `list` shows the open ones (--all: closed too), `close <id-or-key> --why`
+    closes one without a DB write by hand. A condition still live reopens at its next detection."""
+    from . import screen
+    if a.project:
+        p = need(a.project, sys.argv[1:])
+    else:
+        base = os.environ.get("TTP_PROJECT") or next(
+            (str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
+        if not base:
+            die("no project here: run it inside a project or a run, or pass --project NAME")
+        p = Project(base)
+    if a.action == "list":
+        rows = p.db.q("SELECT id, source, title, severity, status, count, last_seen, watch_key, closed, cleared_why "
+                      "FROM issues" + ("" if a.all else " WHERE status='open'") + " ORDER BY id DESC LIMIT ?",
+                      (max(1, a.limit),))
+        if a.json:
+            print(json.dumps(rows))
+            return
+        if not rows:
+            print("no open issues" if not a.all else "no issues")
+        for r in rows:
+            key = f" key={r['watch_key']}" if r["watch_key"] else ""
+            end = f" closed {timefmt.short(float(r['closed']), p)}: {r['cleared_why']}" if r["status"] == "fixed" \
+                and r["closed"] else ""
+            print(f"#{r['id']} [{r['severity']}/{r['status']}] {r['source']}{key} x{r['count']} last "
+                  f"{timefmt.short(float(r['last_seen'] or 0), p)}: {(r['title'] or '')[:120]}{end}")
+        return
+    own = os.environ.get("TTP_PROJECT")
+    if os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() != Path(p.base).resolve():
+        die(f"a run may close only its own project's issues, not {a.project}'s")
+    if a.why is None or not a.why.strip():
+        die("ttp issues close: --why <reason> is required and must not be empty")
+    task = os.environ.get("TTP_TASK")
+    who = f"task #{task}" if os.environ.get("TTP_RUN_DIR") and task else "the user (ttp issues close)"
+    try:
+        row = screen.close_issue(p.db, a.issue, a.why, who)
+    except ValueError as e:
+        die(f"ttp issues close: {e}")
+    if row.get("already"):
+        print(f"issue #{row['id']} was already closed: {row['cleared_why'] or 'no reason recorded'}")
+        return
+    print(f"closed issue #{row['id']} ({row['source']}); a new sighting of its condition reopens it")
+
+
 def cmd_heal(a) -> None:
     """Heal checks (command schedules with a `heal` block): `list` shows each with its state,
     `test <name>` runs its check once as a dry run (no fix, no state change)."""
@@ -6745,6 +6790,24 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("check", nargs="?", help="test: the heal check (its schedule's name)")
     s.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     s.set_defaults(fn=cmd_heal)
+
+    s = sub.add_parser("issues", help="daemon and watcher issues: list them, or close a stale one with a reason "
+                       "(list/close)", description=(
+        "Issues are the conditions the daemon and command watchers observed (daemon:schedule-gap, "
+        "watcher:<name> and the rest). `close` ends one whose condition is over but that nothing closes by "
+        "itself (say a schedule gap after a host move); the reason and time go in its history and the "
+        "activity feed. A condition that is still live is seen again at its next detection and reopens."))
+    iss = s.add_subparsers(dest="action", required=True)
+    m = iss.add_parser("list", help="the project's open issues (--all: closed ones too), newest first")
+    m.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
+    m.add_argument("--all", action="store_true", help="include closed and ignored issues")
+    m.add_argument("--limit", type=int, default=50)
+    m.add_argument("--json", action="store_true")
+    m = iss.add_parser("close", help="close an issue with a reason; its condition, if still live, reopens it")
+    m.add_argument("issue", metavar="ID-OR-KEY", help="the issue's id (as `ttp issues list` shows), fingerprint or key")
+    m.add_argument("--why", help="the reason (required, non-empty)")
+    m.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
+    s.set_defaults(fn=cmd_issues)
 
     s = sub.add_parser("mute", help="a project's observation mutes: list them, or end one now (list/end)")
     ms = s.add_subparsers(dest="action", required=True)

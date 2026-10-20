@@ -403,6 +403,50 @@ def _clear(db: DB, fp: str, now: float) -> Verdict:
     return Verdict(False, row["severity"] if row else "info", "cleared", fp, row["id"] if row else 0, "dedupe")
 
 
+def find_issue(db: DB, ref: str) -> dict | None:
+    """The issue `ref` names: its id (`#` optional), its fingerprint, or its key (a keyed watcher line's
+    `key`). A key on several issues names its open one; ValueError when that is still ambiguous."""
+    ref = str(ref).strip()
+    if re.fullmatch(r"#?\d+", ref):
+        return db.one("SELECT * FROM issues WHERE id=?", (int(ref.lstrip("#")),))
+    row = db.one("SELECT * FROM issues WHERE fingerprint=?", (ref,))
+    if row:
+        return row
+    rows = db.q("SELECT * FROM issues WHERE watch_key=? ORDER BY id", (ref,))
+    live = [r for r in rows if r["status"] == "open"] or rows
+    if len(live) > 1:
+        raise ValueError(f"key {ref!r} names issues " + ", ".join(f"#{r['id']} ({r['source']})" for r in live)
+                         + ": give the id")
+    return live[0] if live else None
+
+
+def close_issue(db: DB, ref: str, why: str, who: str, now: float | None = None) -> dict:
+    """Close an issue at someone's word (`ttp issues close`): record when, by whom and why in its history
+    and post it to the activity feed. Closing only ends this sighting: a condition still live is seen
+    again at its next detection and reopens the issue (_issue), so a close never hides it. Returns the
+    row as closed, with "already" set when it was closed before (nothing written). ValueError for an
+    empty why or an issue that does not exist."""
+    why = (why or "").strip()
+    if not why:
+        raise ValueError("closing an issue requires a non-empty --why")
+    now = time.time() if now is None else now
+    with db.tx():
+        row = find_issue(db, ref)
+        if row is None:
+            raise ValueError(f"no issue {ref!r} (an id, fingerprint or key as `ttp issues list --all` shows it)")
+        if row["status"] == "fixed":
+            return {**row, "already": True}
+        history = json.loads(row.get("history") or "[]")
+        history.append({"ts": now, "action": "closed", "by": who, "why": why[:500]})
+        cleared = f"closed by {who}: {why}"[:500]
+        db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
+             (now, cleared, json.dumps(history), row["id"]))
+        db.post("out", f"Closed issue #{row['id']} ({row['source']}: {(row['title'] or '')[:120]}) by {who}: "
+                f"{why[:300]}. A new sighting reopens it.", chat=None, kind="info", severity="low",
+                ref=f"issue:{row['id']}")
+        return {**row, "status": "fixed", "closed": now, "cleared_why": cleared, "history": history}
+
+
 def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | None = None,
                          why: str = QUIET_WHY, now: float | None = None, skip: Any = (),
                          keep_receipts: Any = ()) -> int:

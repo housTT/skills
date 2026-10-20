@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS issues (
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
   closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL, watch_key TEXT, reopens TEXT,
-  episode TEXT);
+  episode TEXT, history TEXT);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -316,6 +316,7 @@ class DB:
         self._migrate_push_landed()
         self._migrate_issue_opened()
         self._migrate_issue_episode()
+        self._migrate_issue_history()
         self._migrate_schedule_tz()
         self._migrate_task_pin()
         self._migrate_message_context()
@@ -462,6 +463,14 @@ END""")
         with self.tx():
             if "episode" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
                 self.x("ALTER TABLE issues ADD COLUMN episode TEXT")
+
+    def _migrate_issue_history(self) -> None:
+        # Closes at someone's word (screen.close_issue: when, by whom, why). Older issues have none.
+        if "history" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+            return
+        with self.tx():
+            if "history" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+                self.x("ALTER TABLE issues ADD COLUMN history TEXT")
 
     def _migrate_push_landed(self) -> None:
         # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older

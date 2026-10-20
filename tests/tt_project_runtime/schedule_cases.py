@@ -136,3 +136,86 @@ def test_a_schedule_disabled_then_re_enabled_is_no_gap(env):
         assert not _gap_events(p), how
     sched.set_enabled(p.db, "watch", False)   # turning one off keeps its next run
     assert p.db.one("SELECT enabled FROM schedules WHERE name='watch'")["enabled"] == 0
+
+
+def _gap_issue(p):
+    return p.db.one("SELECT * FROM issues WHERE source='daemon:schedule-gap'")
+
+
+def test_issues_close_ends_a_stale_schedule_gap_with_its_reason_and_a_new_sighting_reopens_it(env, capsys,
+                                                                                               monkeypatch):
+    """A schedule-gap issue that nothing closes by itself (say after a host move) is closed with
+    `ttp issues close`, not a DB write: the reason and time go in its history and the activity feed,
+    and the same condition seen again reopens it and wakes, so a close never hides a live one."""
+    from ttp import alerts, cli
+    from ttp.daemon import Daemon
+    for k in ("TTP_RUN_DIR", "TTP_TASK", "TTP_PROJECT"):
+        monkeypatch.delenv(k, raising=False)
+    p = make(env)
+    d = Daemon(p.base)
+    text = "Schedules missed runs since 10:00: watch 6. Likely cause: the daemon was not running."
+    d.observe("daemon:schedule-gap", text, "normal", whole=True, key="schedule-gap:1700000000")
+    issue = _gap_issue(p)
+    assert issue["status"] == "open" and issue["watch_key"] == "schedule-gap:1700000000"
+    cli.main(["issues", "list", "--project", "demo"])
+    assert f"#{issue['id']} " in capsys.readouterr().out
+    cli.main(["issues", "close", "schedule-gap:1700000000", "--why", "host moved; the gap is known",
+              "--project", "demo"])
+    assert f"closed issue #{issue['id']}" in capsys.readouterr().out
+    row = _gap_issue(p)
+    assert row["status"] == "fixed" and row["closed"] and "host moved; the gap is known" in row["cleared_why"]
+    [h] = json.loads(row["history"])
+    assert h["action"] == "closed" and h["why"] == "host moved; the gap is known" and h["by"] and h["ts"]
+    feed = [m for m in alerts.feed(p.db, time.time()) if f"issue #{issue['id']}" in m["text"]]
+    assert feed and "host moved" in feed[0]["text"]
+    cli.main(["issues", "list", "--project", "demo"])
+    assert "no open issues" in capsys.readouterr().out
+    cli.main(["issues", "close", str(issue["id"]), "--why", "again", "--project", "demo"])
+    assert "already closed" in capsys.readouterr().out
+    assert len(json.loads(_gap_issue(p)["history"])) == 1
+    queued = len(p.db.q("SELECT id FROM events WHERE source='daemon:schedule-gap' AND status='queued'"))
+    d.observe("daemon:schedule-gap", text, "normal", whole=True, key="schedule-gap:1700000000")
+    assert _gap_issue(p)["status"] == "open" and _gap_issue(p)["closed"] is None
+    assert len(p.db.q("SELECT id FROM events WHERE source='daemon:schedule-gap' AND status='queued'")) == queued + 1
+
+
+def test_issues_close_refuses_an_unknown_issue_an_empty_why_and_another_projects_issue_in_a_run(env, capsys,
+                                                                                                 monkeypatch):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    for k in ("TTP_RUN_DIR", "TTP_TASK", "TTP_PROJECT"):
+        monkeypatch.delenv(k, raising=False)
+    p = make(env)
+    Daemon(p.base).observe("daemon:schedule-gap", "Schedules missed runs since 10:00: watch 6.", "normal",
+                           whole=True, key="schedule-gap:1")
+    iid = _gap_issue(p)["id"]
+    for argv in (["issues", "close", "9999", "--why", "x"], ["issues", "close", "no-such-key", "--why", "x"],
+                 ["issues", "close", str(iid), "--why", "  "], ["issues", "close", str(iid)]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv + ["--project", "demo"])
+        assert e.value.code != 0, argv
+    assert _gap_issue(p)["status"] == "open" and _gap_issue(p)["history"] is None
+    assert not p.db.q("SELECT id FROM messages WHERE text LIKE 'Closed issue%'")
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"] / "run"))
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-project"))
+    monkeypatch.setenv("TTP_TASK", "7")
+    with pytest.raises(SystemExit):
+        cli.main(["issues", "close", str(iid), "--why", "not mine", "--project", "demo"])
+    assert _gap_issue(p)["status"] == "open"
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.main(["issues", "close", f"#{iid}", "--why", "stale", "--project", "demo"])
+    assert json.loads(_gap_issue(p)["history"])[0]["by"] == "task #7"
+
+
+def test_an_issues_table_from_before_history_gains_the_column(env):
+    import sqlite3
+    from ttp.db import DB
+    path = env["tmp"] / "old.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE issues (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT, "
+              "first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT, severity TEXT DEFAULT 'normal', "
+              "status TEXT DEFAULT 'open', task INTEGER, screen TEXT)")
+    c.commit()
+    c.close()
+    db = DB(path)
+    assert "history" in {r["name"] for r in db.q("PRAGMA table_info(issues)")}
