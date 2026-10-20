@@ -300,7 +300,7 @@ def recheck(p, now: float | None = None, every_s: float = 0) -> dict:
             still[sig] = f
             continue
         changed = True
-        if _still(f):
+        if _still({**f, "sig": sig}):
             still[sig] = {**f, "checked": now}
     if changed:
         try:

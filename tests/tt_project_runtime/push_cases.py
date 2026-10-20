@@ -8951,3 +8951,180 @@ def test_a_single_entry_that_breaks_only_a_cap_probes_the_tip_instead_of_a_full_
     assert _statuses(m) == ["check_failed"] and m["outcome"] == "nothing", m
     ran = log.read_text().split()
     assert ran.count("full") == m["checks"]["runs"] == 1 and m["checks"]["cap_probes"] == 1, (ran, m["checks"])
+
+
+def _fake_python(tmp_path, find_rc=0, version="", name="python3"):
+    """A python3 on PATH whose runner precheck (envfault's find_spec probe) exits `find_rc` and prints
+    `version`; any other run is logged to ran.txt."""
+    stub = tmp_path / "fakepy"
+    stub.mkdir(exist_ok=True)
+    ran = tmp_path / "ran.txt"
+    (stub / name).write_text(f'#!/bin/sh\ncase "$2" in *find_spec*) echo "{version}"; exit {find_rc};; esac\n'
+                             f'echo "$@" >> {ran}\n')
+    (stub / name).chmod(0o755)
+    return stub, ran
+
+
+def _env_events(p):
+    return p.db.q("SELECT fingerprint, severity FROM events WHERE kind='observation' AND fingerprint LIKE 'env%'")
+
+
+def test_ttp_checks_waits_on_a_python_that_cannot_import_pytest_and_counts_nothing(env, tmp_path, monkeypatch):
+    """(a) The python of `python3 -m pytest` cannot import pytest: the checks exit 75 with the env-ok
+    retry_when, write no check_failure.json, record env_fault, start no task and run nothing."""
+    from ttp import cli, envfault
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    stub, ran = _fake_python(tmp_path, find_rc=3)
+    monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+    tasks = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "python3 -m pytest -q"])
+    assert e.value.code == 75
+    assert not (run / "check_failure.json").exists()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["env_fault"] == "env:missing-runner:pytest"
+    assert "--env-ok" in (run / "checks.log").read_text()
+    assert not ran.exists(), "the check itself did not run"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "no review or fix task"
+    assert list(envfault.open_faults(p)) == ["env:missing-runner:pytest"]
+
+
+def test_two_tasks_hitting_one_runner_fault_raise_one_observation(env, tmp_path, monkeypatch):
+    """(b) Two tasks hit the same fault: one coordinator observation; kv env_faults lists both."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    stub, _ = _fake_python(tmp_path, find_rc=3)
+    monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+    for task in ("11", "12"):
+        monkeypatch.setenv("TTP_TASK", task)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", "python3 -m pytest -q"])
+        assert e.value.code == 75
+    assert len(_env_events(p)) == 1 and _env_events(p)[0]["severity"] == "high"
+    assert p.db.kv("env_faults")["env:missing-runner:pytest"]["tasks"] == ["11", "12"]
+
+
+def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(env, tmp_path, monkeypatch):
+    """(c) A healthy runner: the check runs once, passes, no kv entry and no event."""
+    from ttp import cli, envfault
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    stub, ran = _fake_python(tmp_path, find_rc=0)
+    monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+    cli.main(["checks", "--fresh", "--", "python3 -m pytest -q"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert ran.read_text().splitlines() == ["-m pytest -q"]
+    assert not envfault.open_faults(p) and not p.db.kv(envfault.KV) and not _env_events(p)
+
+
+def test_a_typod_extra_command_fails_the_check_and_is_no_host_fault(env, tmp_path, monkeypatch):
+    """A task's own extra command that is not on PATH is the command's failure: it fails as before,
+    records no fault and raises no event (it must never hold the push queue)."""
+    from ttp import cli, envfault
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    for cmd in ("no-such-program-ttp", "FOO=1 no-such-program-ttp -q && true", "timeout 5 no-such-program-ttp"):
+        assert envfault.runners(cmd, repo) == []
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", cmd])
+        assert e.value.code not in (0, 75), cmd
+        assert "not found" in (run / "checks.log").read_text()
+    assert not p.db.kv("env_faults") and not _env_events(p)
+    # The shared path's runners still are: a missing python, a bare pytest left as written.
+    assert envfault.precheck(["python9.99 -m pytest"], repo)["sig"] == "env:missing-runner:python9.99"
+    assert envfault.precheck(["pytest -q"], repo, {"PATH": str(tmp_path / "empty")})["sig"] == \
+        "env:missing-runner:pytest"
+
+
+def test_a_pytest_below_the_repositorys_minversion_is_an_environment_fault(tmp_path, monkeypatch):
+    """The runner is there but older than the suite's pytest `minversion`: env:old-runner:pytest."""
+    from ttp import envfault
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)   # pytest is not the repository's own
+    (repo / "pyproject.toml").write_text('[project]\nname = "r"\n\n[tool.pytest.ini_options]\nminversion = "8.2"\n'
+                                         'addopts = "-q"\n')
+    stub, _ = _fake_python(tmp_path, find_rc=0, version="7.4.0")
+    env = {**os.environ, "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"}
+    f = envfault.precheck(["python3 -m pytest -q"], repo, env)
+    assert f and f["sig"] == "env:old-runner:pytest" and f["version"] == "7.4.0" and f["min"] == "8.2"
+    assert "below the repository's minversion 8.2" in envfault.line(f)
+    stub, _ = _fake_python(tmp_path, find_rc=0, version="8.3.1")
+    assert envfault.precheck(["python3 -m pytest -q"], repo, env) is None
+    (repo / "pyproject.toml").write_text('[project]\nname = "r"\n')   # no minversion: the version is not asked
+    stub, _ = _fake_python(tmp_path, find_rc=0, version="1.0")
+    assert envfault.precheck(["python3 -m pytest -q"], repo, env) is None
+    (repo / "pytest.ini").write_text("[pytest]\nminversion = 6.0\n")
+    assert envfault.minversion(repo) == "6.0"
+
+
+def test_a_push_batch_whose_runner_is_missing_is_requeued_as_an_environment_fault(env, monkeypatch):
+    """(d, the batch) A check's runner is missing on the host: the batch ends env_fault, every entry
+    requeued, the fault recorded for the queue with one observation."""
+    from ttp import envfault, push
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["python3 -m ttp_missing_runner_mod -q"])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == push.BUSY and m["outcome"] == "env_fault" and _statuses(m) == ["requeued"], m
+    faults = envfault.open_faults(p)
+    assert list(faults) == ["env:missing-runner:ttp_missing_runner_mod"] and faults[
+        "env:missing-runner:ttp_missing_runner_mod"]["queue"] is True
+    assert len(_env_events(p)) == 1
+
+
+def test_an_env_fault_batch_counts_no_tries_and_holds_the_queue_until_env_ok(env, monkeypatch):
+    """(d, the queue) A batch that ended env_fault puts its approvals back with no try counted, and
+    pushq.due() holds until `ttp checks --env-ok` passes, then resumes. A fault a task found in its
+    own checkout, or one whose checkout is gone, holds nothing."""
+    from ttp import cli, envfault, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="env_fault", row="requeued")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 0}
+    later = lambda: time.time() + 10 ** 6
+    cmd = "python3 -m ttp_missing_runner_mod -q"
+    f = envfault.precheck([cmd], s.repo)
+    assert f and f["sig"] == "env:missing-runner:ttp_missing_runner_mod"
+    envfault.record(s.p, f, "7")   # a task's own: the queue does not hold on it
+    assert pushq.due(s.p, later())[0]
+    envfault.record(s.p, f, queue=True)   # the batch's
+    rows, why = pushq.due(s.p, later())
+    assert rows == [] and why.startswith("held: environment fault env:missing-runner:ttp_missing_runner_mod"), why
+    monkeypatch.chdir(s.p.root)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--env-ok"])
+    assert e.value.code == 1, "still missing"
+    mod = env["tmp"] / "mods"
+    mod.mkdir()
+    (mod / "ttp_missing_runner_mod.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", str(mod))   # the runner is back
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--env-ok"])
+    assert e.value.code == 0 and not envfault.open_faults(s.p)
+    assert pushq.due(s.p, later())[0], "resumes"
+    # A queue fault whose checkout is gone (a removed worktree and its venv) closes instead of holding.
+    monkeypatch.delenv("PYTHONPATH")
+    gone = env["tmp"] / "gone"
+    gone.mkdir()
+    envfault.record(s.p, {**f, "cwd": str(gone), "python": str(gone / ".venv/bin/python")}, queue=True)
+    gone.rmdir()
+    assert pushq.due(s.p, later())[0] and not envfault.open_faults(s.p)
+
+
+def test_a_long_queue_hold_on_an_environment_fault_raises_one_more_observation(env, monkeypatch):
+    from ttp import envfault, pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    f = envfault.precheck(["python3 -m ttp_missing_runner_mod -q"], s.repo)
+    envfault.record(s.p, f, queue=True)
+    assert len(_env_events(s.p)) == 1
+    soon = time.time() + 120
+    assert pushq.due(s.p, soon)[1].startswith("held:") and len(_env_events(s.p)) == 1
+    late = time.time() + envfault.HOLD_ALERT_S + 600
+    for t in (late, late + 120):
+        assert pushq.due(s.p, t)[1].startswith("held:")
+    assert [e["fingerprint"].split(":")[0] for e in _env_events(s.p)] == ["env", "env-hold"]
