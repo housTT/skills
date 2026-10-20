@@ -9074,6 +9074,37 @@ def test_a_push_batch_whose_runner_is_missing_is_requeued_as_an_environment_faul
     assert len(_env_events(p)) == 1
 
 
+def test_env_ok_with_a_sig_waits_only_on_that_fault_not_another_tasks(env, tmp_path, monkeypatch):
+    """Two tasks hit two faults: each retry_when names its own sig, and once fault A's runner is back
+    `ttp checks --env-ok <A>` exits 0 (closing A only) while B, never fixed, stays open."""
+    from ttp import cli, envfault
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    sig = {m: "env:missing-runner:ttp_missing_runner_" + m for m in "ab"}
+    for task, m in (("1", "a"), ("2", "b")):
+        monkeypatch.setenv("TTP_TASK", task)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", f"python3 -m ttp_missing_runner_{m} -q"])
+        assert e.value.code == 75
+        assert f"checks --env-ok {sig[m]}" in (run / "checks.log").read_text()
+    assert sorted(envfault.open_faults(p)) == [sig["a"], sig["b"]]
+    mod = tmp_path / "mods"
+    mod.mkdir()
+    (mod / "ttp_missing_runner_a.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", str(mod))   # A's runner is back; B's never is
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--env-ok", sig["a"]])
+    assert e.value.code == 0
+    assert list(envfault.open_faults(p)) == [sig["b"]], "only A closed"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--env-ok", sig["b"]])
+    assert e.value.code == 1
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--env-ok"])
+    assert e.value.code == 1, "a bare --env-ok still waits on every open fault"
+    assert envfault.retry_when(p, {"sig": sig["b"]}).endswith(f"checks --env-ok {sig['b']}")
+
+
 def test_an_env_fault_batch_counts_no_tries_and_holds_the_queue_until_env_ok(env, monkeypatch):
     """(d, the queue) A batch that ended env_fault puts its approvals back with no try counted, and
     pushq.due() holds until `ttp checks --env-ok` passes, then resumes. A fault a task found in its

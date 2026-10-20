@@ -2014,8 +2014,8 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
-    if getattr(a, "env_ok", False):
-        sys.exit(_checks_env_ok(here()))
+    if getattr(a, "env_ok", None) is not None:
+        sys.exit(_checks_env_ok(here(), a.env_ok))
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
@@ -2195,7 +2195,7 @@ def cmd_checks(a) -> None:
         if todo and not hit and (fault := envfault.precheck(todo, top, pre_env)):
             envfault.record(p, fault, os.environ.get("TTP_TASK"))
             envfault.write_marker(run_dir, fault)
-            said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p)}"
+            said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}"
             out.write(f"ttp checks: {said}\n")
             write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
@@ -2919,11 +2919,12 @@ def _checks_child(a) -> int:
     return code if isinstance(code, int) else 1
 
 
-def _checks_env_ok(p: Project | None) -> int:
-    """`retry_when` probe of a check run that stopped at a runner fault (envfault): 0 once every open
-    fault's runner is back (each closes), 1 while one is still missing."""
+def _checks_env_ok(p: Project | None, sigs: list | None = None) -> int:
+    """`retry_when` probe of a check run that stopped at a runner fault (envfault): 0 once the
+    faults named by `sigs` (every open one when none is named) have their runner back (each
+    closes), 1 while one is still missing. Another task's open fault never holds a named wait."""
     from . import envfault
-    still = envfault.recheck(p) if p else {}
+    still = envfault.recheck(p, sigs=sigs) if p else {}
     for f in still.values():
         print(f"ttp checks: still missing: {envfault.line(f)}")
     if not still:
@@ -6509,8 +6510,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
     s.add_argument("--result", metavar="RUN_DIR",
                    help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
-    s.add_argument("--env-ok", action="store_true",
-                   help="run nothing: exit 0 once no check runner is missing (an environment fault), 1 while one is")
+    s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,
+                   help="run nothing: exit 0 once the named environment faults (or, with none named, every "
+                        "open one) no longer hit a missing check runner, 1 while one does")
     s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "

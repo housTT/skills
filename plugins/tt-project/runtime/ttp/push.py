@@ -532,7 +532,7 @@ def runner_wait(cmds: list, repo: Path, env: dict, say: Callable[[str], None], p
             envfault.recheck(p)
         return 0
     envfault.record(p, fault, os.environ.get("TTP_TASK"))
-    say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p)}")
+    say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
     return BUSY
 
 

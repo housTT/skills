@@ -10,7 +10,7 @@ be on PATH. One that cannot is a fault with the signature env:missing-runner:<na
 than the repository's pytest `minversion` is env:old-runner:pytest. Any other program (a task's own
 extra command, typo or not) is the command's business: it runs and fails as it would.
 A fault counts against no change or branch: `ttp checks` and `ttp push` exit 75 (wait) and print a
-retry_when (`ttp checks --env-ok`), and the push queue requeues the batch and holds until the
+retry_when (`ttp checks --env-ok <sig>`, its own fault only), and the push queue requeues the batch and holds until the
 runner is back, on a fault its own batch found only. Each fault is recorded once in the project's
 state, with one coordinator observation per fault however many tasks hit it; it clears once its
 command, run again where it was found, no longer hits it, or once that checkout is gone."""
@@ -287,11 +287,14 @@ def _still(f: dict) -> dict | None:
     return now if now and now.get("sig") == f.get("sig") else None
 
 
-def recheck(p, now: float | None = None, every_s: float = 0) -> dict:
+def recheck(p, now: float | None = None, every_s: float = 0, sigs=None) -> dict:
     """Probe each open fault again (skipping those probed within `every_s`), close the ones that
-    pass and return those still open."""
+    pass and return those still open. `sigs`: only those faults (a waiting task's own), the rest
+    are neither probed nor closed nor returned."""
     now = time.time() if now is None else now
     faults = open_faults(p)
+    if sigs:
+        faults = {k: f for k, f in faults.items() if k in set(sigs)}
     if not faults:
         return {}
     still, changed = {}, False
@@ -343,9 +346,12 @@ def held(p, now: float | None = None) -> str:
     return "held: environment fault " + ", ".join(sorted(still)) + " (a check runner is missing on this host)"
 
 
-def retry_when(p) -> str:
+def retry_when(p, f: dict | None = None) -> str:
+    """The probe a task waiting on fault `f` hands off: it rechecks only that fault, so another
+    task's fault that never clears keeps it asleep no longer than its own."""
     from . import push
-    return f"{push._own_ttp(p)} checks --env-ok" if p else "ttp checks --env-ok"
+    sig = f" {shlex.quote(str(f['sig']))}" if f and f.get("sig") else ""
+    return (f"{push._own_ttp(p)} checks --env-ok" if p else "ttp checks --env-ok") + sig
 
 
 def write_marker(run_dir: str | Path | None, f: dict) -> None:
