@@ -5513,17 +5513,20 @@ def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
         assert marks + prov.own_cache_breakpoints <= base.MAX_CACHE_BREAKPOINTS, name
 
 
-def test_worker_prompt_pins_the_watcher_thread_clause_and_one_snapshot_rule(env):
+def test_worker_prompt_points_at_the_long_running_script_reference_which_keeps_its_rules(env):
     from ttp.prompts import worker_prompt
     p = make(env)
     tid = p.db.add_task("fix", "fix it", kind="code", tier="light", origin="user")
     prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
-    for phrase in ("reentrant lock", "stage_timeout", "stall guard",
-                   "dumps all thread stacks and exits non-zero"):
-        assert phrase in prompt, phrase
-    assert prompt.count("private snapshot") == 1
-    assert "private snapshot" in prompt and "sha256" in prompt
-    assert "per-script marker" in prompt
+    # The niche rules live in the skill reference; the prompt keeps a one-line pointer to it.
+    assert prompt.count("references/long-running-scripts.md") == 1
+    for phrase in ("reentrant lock", "private snapshot", "per-script marker"):
+        assert phrase not in prompt, phrase
+    ref = (RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "long-running-scripts.md").read_text()
+    for phrase in ("reentrant lock", "stage_timeout", "stall guard", "dumps all thread stacks and exits non-zero",
+                   "private snapshot taken at launch", "sha256", "per-script marker", "temp file plus `mv`",
+                   "`ttp lock <name>`"):
+        assert phrase in ref, phrase
 
 
 def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
@@ -8081,8 +8084,12 @@ def test_the_harness_prompt_explains_worktrees_and_staging_by_name():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-harness.md").read_text(encoding="utf-8").split())
     for phrase in ("yours gets a git worktree of the harness of its own", "the daemon merges your commits",
                    "do not `ttp restart` from a worktree", "stage only the files you changed, by name",
-                   "never `git add -A`, `git add .` or `git commit -a`"):
+                   "never `git add -A`, `git add .` or `git commit -a`",
+                   # Only a runtime change in the harness checkout itself needs a manual restart.
+                   "A runtime change made in the harness checkout itself needs `ttp restart <name>`",
+                   "From a worktree, the merge restarts the daemon for you"):
         assert phrase in text, phrase
+    assert "runtime changes need `ttp restart" not in text
 
 
 def _wait_for_lock_waiter(procs, timeout=60):
@@ -27588,9 +27595,12 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
     assert len(rules["code"]) <= 13_500, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
-    # A question task cannot detach, so it skips the rule for long-running scripts in shared folders.
-    assert "private snapshot taken at launch" in rules["code"]
-    assert "private snapshot taken at launch" not in rules["question"]
+    # A question task cannot detach, so it skips the pointer to the long-running script rules.
+    assert "references/long-running-scripts.md" in rules["code"]
+    assert "references/long-running-scripts.md" not in rules["question"]
+    # A rule its kind file keeps is not repeated in the shared prompt.
+    assert "A follow-up implying a device or machine experiment" not in src
+    assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
     assert len(every) <= 18_100, len(every)  # room for the upstream-note scope rule
     for t in (None, code, question):
@@ -27630,9 +27640,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
         assert "A review does not split" not in s and '"pr": "URL' not in s
     assert "ttp push --own --detach" in rendered(code) and "setsid nohup" in rendered(code)
     assert "A review does not split" in rendered({"kind": "review"}) and '"pr": "URL' in rendered(code)
-    # Harness-only rules only for harness tasks.
-    assert "only this project's own harness" in rendered({"kind": "harness"})
-    assert "only this project's own harness" not in rendered(code)
+    # Harness-only rules only for harness tasks; the stay-in-your-own-harness rule lives in kind-harness.md alone.
+    assert "only this project's own harness" not in rendered({"kind": "harness"})
+    assert "only this project's own harness" in (p.harness / "prompts" / "kind-harness.md").read_text()
     assert "--purpose harness" in rendered({"kind": "harness"}) and "--purpose harness" not in rendered(code)
     # Nothing configured: no device, runner, remote-driver or cluster rules.
     for marker in ("TTP_NO_DEVICE=1", "ttp devq submit", "ttp detach --remote", "## Shared clusters", "needs_deep",
@@ -28003,14 +28013,15 @@ def test_rules_say_draft_prs_need_no_permission_and_no_reviewers_are_requested()
 
 def test_prompts_say_only_the_user_takes_a_pr_out_of_draft():
     prompts = RUNTIME.parent / "template" / "prompts"
-    for name in ("kind-code.md", "kind-review.md"):
-        text = " ".join((prompts / name).read_text().split())
-        assert "NEVER mark a PR ready for review" in text and "only the user takes a PR out of draft" in text, name
+    text = " ".join((prompts / "kind-review.md").read_text().split())
+    assert "NEVER mark a PR ready for review" in text and "only the user takes a PR out of draft" in text
+    # A code task reads the rule once, in the shared prompt's PR block, not again in kind-code.md.
+    assert "NEVER mark a PR ready for review" not in " ".join((prompts / "kind-code.md").read_text().split())
     coord_text = " ".join((prompts / "coordinator.md").read_text().split())
     assert "A PR leaves draft ONLY on the user's explicit yes" in coord_text and "`pr_approve`" in coord_text
     worker = " ".join((prompts / "worker.md").read_text().split())
     assert "NEVER mark a PR ready for review or open one that is not a draft" in worker
-    for name in ("worker.md", "kind-code.md", "kind-review.md"):
+    for name in ("worker.md", "kind-review.md"):
         assert "hand off `blocked` with the PR's URL in `pr`" in " ".join((prompts / name).read_text().split()), name
     assert "`ttp checks`" in " ".join((prompts / "kind-code.md").read_text().split())
     # The order: review, findings cleared, ask the user, pr_approve with their words, then gh pr ready.

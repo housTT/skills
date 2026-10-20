@@ -19,8 +19,9 @@
   Run pytest from the harness root (or your worktree of it): its `pytest.ini` keeps an enclosing
   repository's pytest config and `conftest.py` out and puts `runtime/` on the import path. Add
   other local module paths (such as an `audits/` folder) to its `pythonpath`.
-- The daemon picks up prompt and config changes on its own; runtime changes need `ttp restart <name>`,
-  which rolls `runtime/` back if the daemon cannot start with it. Check its output.
+- The daemon picks up prompt and config changes on its own. A runtime change made in the harness
+  checkout itself needs `ttp restart <name>`, which rolls `runtime/` back if the daemon cannot start
+  with it: check its output. From a worktree, the merge restarts the daemon for you.
 - Change only this project's own harness: its `tt-project/` folder (harness and state). Never
   edit, or create a worktree or branch in, the tt-project plugin's source repository or any other
   project's harness, even to port a fix you just made here. Upgrading another

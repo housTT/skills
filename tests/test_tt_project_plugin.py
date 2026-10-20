@@ -322,21 +322,23 @@ def test_harness_tasks_stay_in_their_own_harness():
     """A harness task never edits the plugin's source or another project's harness; generic lessons
     travel as upstream notes in the hand-off instead."""
     prompts = PLUGIN / "template" / "prompts"
-    for path in (prompts / "kind-harness.md", prompts / "worker.md", SKILLS / "tt-project-harness" / "SKILL.md"):
+    # kind-harness.md carries the rule for harness tasks; the shared worker prompt does not repeat it.
+    for path in (prompts / "kind-harness.md", SKILLS / "tt-project-harness" / "SKILL.md"):
         text = " ".join(path.read_text(encoding="utf-8").split())
         assert "only this project's own harness" in text, f"{path.name}: harness tasks stay in their own harness"
         assert re.search(r"[Nn]ever edit[s]?, or (create|make)s? a worktree or branch in, the tt-project "
                          r"plugin's source repo(sitory)? or (any other|another) project's harness", text), path.name
         assert "upstream note" in text and "`upstream: " in text, f"{path.name}: names the upstream notes"
     worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    assert "upstream note" in worker and "`upstream: " in worker
+    assert "only this project's own harness" not in worker
     assert "in the same run, before the hand-off" in worker and "never leave the entry to a later task" in worker
     coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
     assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
     # A project whose own work is the plugin (its charter says so) may still queue that work.
     assert "unless the charter names that repository as this project's own work" in coordinator
     # Deploying a release with ttp setup/upgrade is not editing another project's harness.
-    for path in (prompts / "kind-harness.md", prompts / "worker.md", prompts / "coordinator.md",
-                 SKILLS / "tt-project-harness" / "SKILL.md"):
+    for path in (prompts / "kind-harness.md", prompts / "coordinator.md", SKILLS / "tt-project-harness" / "SKILL.md"):
         text = " ".join(path.read_text(encoding="utf-8").split())
         assert "`ttp upgrade <name>`" in text and "is not editing" in text, f"{path.name}: deploying is allowed"
         assert "hand edits to its charter, memory, config, state or code" in text, path.name
@@ -4729,8 +4731,11 @@ def test_setup_box_ssh_workflow_scripts_resolve_own_dir():
 
 def test_worker_prompt_keeps_idleness_evidence_and_shared_script_rules():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    for part in ("concurrently only under `ttp lock <name>` or git", "`journalctl` over boots: tt-project-harness watchers reference"):
-        assert part in text, part
+    # The shared-script rules live in the tt-project-harness reference the prompt points at.
+    assert "tt-project-harness reference `references/long-running-scripts.md`" in text
+    ref = " ".join((SKILLS / "tt-project-harness" / "references" / "long-running-scripts.md").read_text(encoding="utf-8").split())
+    for part in ("Concurrent edits happen only under `ttp lock <name>` or in git", "`journalctl _TRANSPORT=kernel"):
+        assert part in ref, part
     raw = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
     sys.path.insert(0, str(RUNTIME.parent))
     try:

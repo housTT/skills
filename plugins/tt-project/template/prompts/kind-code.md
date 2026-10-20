@@ -67,8 +67,6 @@
   only as a fast-forward of the remote's (never main/master, the default or the push branch).
   Another task's branch your spec names in no `pr_branch:` line is refused;
   `ttp push --own-branch --detach` then publishes your own branch under its own name.
-- NEVER mark a PR ready for review: only the user takes a PR out of draft. If `gh` refuses, hand off
-  `blocked` with the PR's URL in `pr`.
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
   briefly answer on the PR why not, until CI is green.
 - Description: what improved and why, one line of how, key numbers. Short, for humans.

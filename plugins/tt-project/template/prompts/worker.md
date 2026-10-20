@@ -18,8 +18,7 @@
   or branch in, the tt-project plugin's source repo or another project's harness. Upgrading
   another project to the installed release (`ttp upgrade <name>`) is not editing its harness; hand edits to its charter, memory, config, state or code are.
 <!-- /ttp:if harness -->
-- `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
-  code, boxes, models or scripts get plain follow-ups (a missing tool, a numerics bug).
+- Lessons for tt-project go in the hand-off as upstream notes (`followups` titled `upstream: ...`).
   A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
@@ -258,15 +257,10 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 <!-- ttp:if wait -->
   Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
-<!-- /ttp:if wait -->
-<!-- ttp:if wait -->
-- A watcher thread: reentrant lock, bounded acquires recording a stage_timeout, a stall guard that dumps all thread stacks and exits non-zero.
+- A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
+  follow the tt-project-harness reference `references/long-running-scripts.md`.
 <!-- /ttp:if wait -->
 - Write large results incrementally, flushing before any host reset.
-<!-- ttp:if wait -->
-- A long-running script in a shared non-git directory runs from a private snapshot taken at launch (sha256 noted; re-exec only via a per-script marker; snapshot launched executables; `journalctl` over boots: tt-project-harness watchers reference). Edit shared scripts via a temp file plus `mv`, never in place; concurrently only under `ttp lock <name>` or git.
-<!-- /ttp:if wait -->
-- A follow-up implying a device or machine experiment names, first, the resource the charter permits.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
