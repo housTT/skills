@@ -371,8 +371,11 @@ def test_coordinator_stores_pointers_not_figures_when_data_stays_out_of_git():
                    "carry pointers (the work file's path, what it holds), never the figures",
                    "`Forbidden data` patterns is refused"):
         assert phrase in coordinator, phrase
-    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8")
-    assert "`memory.forbidden_patterns_file`" in harness and "never the text" in harness
+    skill = PLUGIN / "skills" / "tt-project-harness"
+    harness = (skill / "SKILL.md").read_text(encoding="utf-8")
+    assert "`memory.forbidden_patterns_file`" in harness and "](references/forbidden-data.md)" in harness
+    ref = (skill / "references" / "forbidden-data.md").read_text(encoding="utf-8")
+    assert "`memory.forbidden_patterns_file`" in ref and "never the text" in ref
 
 
 def test_harness_tasks_deliver_by_a_local_commit_not_a_push():
@@ -756,8 +759,10 @@ def test_worker_prompt_driver_chain_fails_fast_and_shared_watchers_lock():
     root = PLUGIN
     worker = (root / "template" / "prompts" / "worker.md").read_text()
     assert "pipefail" in worker and "first non-zero" in worker
-    harness = (root / "skills" / "tt-project-harness" / "SKILL.md").read_text()
-    assert "flock -n" in harness and "condition key" in harness
+    skill = root / "skills" / "tt-project-harness"
+    assert "](references/shared-watchers.md)" in (skill / "SKILL.md").read_text()
+    shared = (skill / "references" / "shared-watchers.md").read_text()
+    assert "flock -n" in shared and "condition key" in shared
 
 
 
@@ -767,8 +772,10 @@ def test_shared_watcher_git_scan_is_bounded_and_still_catches_changes(tmp_path):
     tracked edits and new untracked files."""
     import subprocess
     import time
-    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text()
-    row = next(ln for ln in harness.splitlines() if ln.startswith("| Shared watchers |"))
+    skill = PLUGIN / "skills" / "tt-project-harness"
+    row = next(ln for ln in (skill / "SKILL.md").read_text().splitlines() if ln.startswith("| Shared watchers |"))
+    assert "](references/shared-watchers.md)" in row
+    row = " ".join((skill / "references" / "shared-watchers.md").read_text().split())
     for want in ("--untracked-files=no --ignore-submodules=all", "--untracked-files=normal",
                  "never `--untracked-files=all`", "timeout 20 git", "GIT_TERMINAL_PROMPT=0",
                  "skipped: <step> timed out", '"error": true'):
