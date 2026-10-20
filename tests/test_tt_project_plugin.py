@@ -847,6 +847,101 @@ def test_docs_and_prompts_name_only_real_ttp_subcommands():
     assert not bad, bad
 
 
+def _ttp_parser():
+    """The top-level `ttp` parser, built as `ttp` builds it, without running a command."""
+    import argparse
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import cli
+        seen: list = []
+        real = argparse.ArgumentParser.parse_args
+
+        def grab(self, args=None, namespace=None):
+            seen.append(self)
+            raise SystemExit(0)
+        argparse.ArgumentParser.parse_args = grab
+        try:
+            cli.main(["status"])
+        except SystemExit:
+            pass
+        finally:
+            argparse.ArgumentParser.parse_args = real
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    return seen[0], cli
+
+
+def test_ttp_help_groups_commands_and_hides_internal_ones():
+    import argparse
+    ap, cli = _ttp_parser()
+    text = ap.format_help()
+    assert "==SUPPRESS==" not in text
+    assert "{new," not in text, "the usage line names COMMAND, not every choice"
+    headings = [h for h, _ in cli.COMMAND_GROUPS]
+    assert headings == ["everyday", "inside a run", "probes (retry_when, start_when)", "admin"]
+    assert [text.index(f"\n{h}:\n") for h in headings] == sorted(text.index(f"\n{h}:\n") for h in headings)
+    assert "\nother:\n" not in text, "every command belongs to a group"
+    sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+    grouped = [n for _, names in cli.COMMAND_GROUPS for n in names]
+    assert len(grouped) == len(set(grouped)), "a command is in one group only"
+    listed = [c.dest for c in sub._choices_actions]
+    assert sorted(grouped) == sorted(listed) and "daemon" not in listed and "daemon" in sub.choices
+    assert not re.search(r"^\s+daemon\b", text, re.M)
+    # A word with a hyphen is never split across lines.
+    assert "--start-when" in text and not re.search(r"-\n", text)
+
+
+def test_every_ttp_flag_and_argument_has_help():
+    import argparse
+    ap, _ = _ttp_parser()
+    missing = []
+
+    def walk(p, path):
+        for a in p._actions:
+            if isinstance(a, argparse._HelpAction):
+                continue
+            if not a.help:
+                missing.append(f"{path} {'/'.join(a.option_strings) or a.dest}")
+            if isinstance(a, argparse._SubParsersAction):
+                named = {id(a.choices[c.dest]) for c in a._choices_actions if c.help}   # aliases share a parser
+                missing.extend(f"{path} {n} (command)" for n, sp in a.choices.items()
+                               if id(sp) not in named and n != "daemon")
+                for n, sp in a.choices.items():
+                    walk(sp, f"{path} {n}")
+    walk(ap, "ttp")
+    assert not missing, missing
+
+
+def test_task_help_lists_valid_values_kept_in_step_with_their_sources():
+    ap, cli = _ttp_parser()
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import chaincap, coordinator
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    assert cli.TASK_KINDS == coordinator.TASK_KINDS and cli.TASK_TIERS == chaincap.TIERS
+    import argparse
+    sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+    task = " ".join(sub.choices["task"].format_help().split())
+    for v in (*cli.TASK_KINDS, *cli.TASK_TIERS, "1 (most urgent) to 5"):
+        assert v in task, v
+
+
+def test_fake_provider_is_listed_in_help_only_with_the_test_variable(monkeypatch):
+    import argparse
+    for env, shown in ((None, False), ("1", True)):
+        if env:
+            monkeypatch.setenv("TTP_TEST_FAKE_PROVIDER", env)
+        else:
+            monkeypatch.delenv("TTP_TEST_FAKE_PROVIDER", raising=False)
+        ap, _ = _ttp_parser()
+        sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+        new = sub.choices["new"]
+        assert ("fake" in new.format_help()) is shown
+        # Accepted either way: a remote `ttp new` passes the provider on (behaviour unchanged).
+        assert new.parse_args(["x", "--provider", "fake"]).provider == "fake"
+
+
 def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("scripts and test stubs you run", "`ttp killscan <script>`", "`ttp killscan --shim <dir>`",
