@@ -4142,6 +4142,65 @@ def test_the_slow_tx_log_names_the_slowest_subprocess_of_the_transaction(tmp_pat
     assert second.endswith("; no subprocess"), second
 
 
+def test_a_transaction_sqlite_already_rolled_back_raises_the_original_error(tmp_path):
+    """SQLITE_FULL or IOERR roll the transaction back themselves: a second ROLLBACK would raise
+    'no transaction is active' and hide the error that mattered."""
+    from ttp import db as dbm
+    d = dbm.DB(tmp_path / "x.db")
+    ran = []
+    with pytest.raises(RuntimeError, match="disk full"):
+        with d.tx():
+            d.set_kv("a", 1)
+            d.after_commit(lambda: ran.append(1))
+            d.conn.execute("ROLLBACK")      # what SQLite does on its own after SQLITE_FULL
+            raise RuntimeError("disk full")
+    assert not d.conn.in_transaction and ran == [] and d.kv("a") is None
+    with d.tx():
+        d.set_kv("b", 2)
+    assert d.kv("b") == 2 and ran == [], "a dropped after-commit hook ran with the next commit"
+
+
+def test_a_failed_commit_rolls_back_and_drops_its_after_commit_hooks(tmp_path):
+    import sqlite3
+    from ttp import db as dbm
+    d = dbm.DB(tmp_path / "x.db")
+    d.conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    d.conn.execute("CREATE TABLE child (p INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+    ran = []
+    with pytest.raises(sqlite3.IntegrityError):    # a deferred constraint fails only at COMMIT
+        with d.tx():
+            d.conn.execute("INSERT INTO child VALUES (7)")
+            d.after_commit(lambda: ran.append(1))
+    assert not d.conn.in_transaction, "a failed COMMIT left the transaction open"
+    assert d.conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 0
+    with d.tx():
+        d.set_kv("b", 2)
+    assert d.kv("b") == 2 and ran == [], "the failed transaction's hook ran with the next commit"
+
+
+def test_concurrent_registry_updates_lose_no_entry(tmp_path, monkeypatch):
+    """register and unregister read, change and write registry.json under one lock: two commands
+    at once both keep their change."""
+    import threading
+    from ttp import project
+    monkeypatch.setattr(project, "HOME_DIR", tmp_path)
+    real = project.load_registry
+
+    def slow_load():                      # widen the read-to-write gap a race needs
+        reg = real()
+        time.sleep(0.2)
+        return reg
+    monkeypatch.setattr(project, "load_registry", slow_load)
+    project.register("gone", {"dir": "/g"})
+    threads = [threading.Thread(target=project.register, args=(n, {"dir": f"/{n}"})) for n in ("a", "b")]
+    threads.append(threading.Thread(target=project.unregister, args=("gone",)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(real()["projects"]) == ["a", "b"]
+
+
 def test_the_tx_guard_refuses_a_git_network_command_inside_a_write_transaction(tmp_path, monkeypatch):
     """Under TTP_TX_GUARD=1 (the tests) a git command that asks a remote (ls-remote, fetch, push, pull,
     clone) raises when it starts inside db.tx(): it would hold the write lock for as long as the network
@@ -5588,6 +5647,14 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
     assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
     assert prompt.rstrip().endswith("Never merge to main."), "the restrictions must close the prompt"
+
+
+def test_start_run_refuses_both_system_prompts_as_they_share_one_file(env):
+    from ttp import daemon as dmod
+    p = make(env)
+    with pytest.raises(ValueError, match="not both"):
+        dmod.Daemon(p.base).start_run("worker", "hi", "claude", "light", str(p.base), system="A", append_system="B")
+    assert not p.db.q("SELECT id FROM runs")
 
 
 def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, monkeypatch):

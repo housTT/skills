@@ -569,10 +569,17 @@ END""")
         except BaseException:
             _tx_local.spawns = outer
             self._after_commit.clear()
-            self.conn.execute("ROLLBACK")
+            if self.conn.in_transaction:   # SQLite may have rolled back already (SQLITE_FULL, IOERR)
+                self.conn.execute("ROLLBACK")
             raise
         _tx_local.spawns = outer
-        self.conn.execute("COMMIT")
+        try:
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self._after_commit.clear()
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
         ended = time.monotonic()
         held = ended - began
         if held > SLOW_TX_S:

@@ -31,7 +31,7 @@ RENEW_FRACTION = 0.2       # the holder renews this often
 STATE_FILE = "lease.json"  # under state/: what this host last saw, for status and runs
 REF_PREFIX = "refs/ttp/lease/"
 GIT_TIMEOUT_S = 30
-# Lease refs must never land on the plugin's own repository: its charter allows no such refs.
+# Lease refs never go on the plugin's own published repository.
 OWN_REPOS = ("github.com/tenstorrent/skills",)
 
 

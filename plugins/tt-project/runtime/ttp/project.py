@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import fcntl
 import json
 import math
 import os
@@ -13,8 +14,9 @@ import socket
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import gitlocks
 from .db import DB
@@ -1601,16 +1603,31 @@ def load_registry() -> dict:
         return {"projects": {}}
 
 
+@contextmanager
+def _registry_locked() -> Iterator[None]:
+    """One process at a time reads, changes and writes registry.json, so no entry is lost."""
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(path.with_name("registry.json.lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def register(name: str, entry: dict) -> None:
-    reg = load_registry()
-    reg.setdefault("projects", {})[name] = {**reg["projects"].get(name, {}), **entry, "updated": time.time()}
-    write_json(registry_path(), reg, mode=0o600)
+    with _registry_locked():
+        reg = load_registry()
+        reg.setdefault("projects", {})[name] = {**reg["projects"].get(name, {}), **entry, "updated": time.time()}
+        write_json(registry_path(), reg, mode=0o600)
 
 
 def unregister(name: str) -> None:
-    reg = load_registry()
-    if reg.get("projects", {}).pop(name, None) is not None:
-        write_json(registry_path(), reg)
+    with _registry_locked():
+        reg = load_registry()
+        if reg.get("projects", {}).pop(name, None) is not None:
+            write_json(registry_path(), reg)
 
 
 # Account-level settings: one file per user and machine that every project reads, below the

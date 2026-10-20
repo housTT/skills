@@ -1842,6 +1842,8 @@ class Daemon:
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
         picks it per coordinator turn (cachettl.py)."""
+        if system is not None and append_system is not None:   # both would be run_dir/system.md
+            raise ValueError("start_run takes `system` or `append_system`, not both")
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
         if not self.lease_held():
