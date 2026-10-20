@@ -37,8 +37,13 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript", "
          ".svg": "image/svg+xml", ".json": "application/json"}
 
 
+def token_path(p: Project) -> Path:
+    """The web app's token: whoever reads it acts as the user there, so workers are denied it."""
+    return p.state / "web.token"
+
+
 def token(p: Project) -> str:
-    f = p.state / "web.token"
+    f = token_path(p)
     try:
         have = f.read_text().strip()
     except OSError:

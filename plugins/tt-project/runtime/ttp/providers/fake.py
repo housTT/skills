@@ -34,7 +34,7 @@ class Fake(Provider):
         return sys.executable
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=()):
+              disallowed_tools=(), denied_reads=()):
         return [sys.executable, "-m", "ttp.providers.fake", role], {}
 
     def resume_args(self, session_id: str) -> list[str]:

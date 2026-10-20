@@ -71,6 +71,19 @@
   (daily peaks for the 5-hour window, the last two weekly finals), and one line for dollar caps.
   Pacing, gate reasons and top spenders are in the web app's Budget tab.
 
+## Security notes
+
+- Only the user posts as the user. `ttp say` refuses inside a run: when the run's environment
+  is set, and when a running run's agent is among the command's parent processes (so unsetting
+  the environment does not get past it). Workers are denied the web app's token
+  (`state/web.token`): a Read deny rule for Claude Code, and the Bash hook refuses commands
+  that name it (Claude Code, and Codex when its hook runs). Codex has no read deny rules and its
+  sandbox does not fence reads; Cursor gets neither without a config file in the worktree.
+- These are checks, not a fence. Workers run as the same OS user as the daemon and the user's own
+  commands, so a worker that tries hard (a process that leaves its agent's process tree, a script
+  that reads the token another way) can still read what that user can. For a hard boundary, run
+  workers under a separate OS account or in a sandbox that cannot read the project's `state/`.
+
 ## Budget
 
 - Plan windows (subscription): the project stops at 90% of any window.

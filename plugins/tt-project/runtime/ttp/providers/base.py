@@ -259,9 +259,11 @@ class Provider:
 
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
               read_only: bool, schema: dict | None, restrictions: dict,
-              disallowed_tools: list[str] | tuple = ()) -> tuple[list[str], dict]:
+              disallowed_tools: list[str] | tuple = (), denied_reads: list[str] | tuple = ()) -> tuple[list[str], dict]:
         """Return (argv, extra_env) for a headless run whose prompt arrives on stdin. A worker's run
-        also denies `disallowed_tools` (the project's providers.<p>.disallowed_tools), where the agent can."""
+        also denies `disallowed_tools` (the project's providers.<p>.disallowed_tools), and reads of the
+        files in `denied_reads` (absolute paths: the user's credentials, such as the web token), where
+        the agent can."""
         raise NotImplementedError
 
     def parse(self, output_path: Path, stderr_path: Path | None = None) -> RunUsage:

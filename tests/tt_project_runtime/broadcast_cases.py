@@ -195,3 +195,29 @@ def test_a_full_ledger_keeps_the_open_line_a_claim_writes_and_compacts_only_what
     assert {b["id"], c["id"], d["id"]} <= ids
     assert broadcast.claim("hold all merges!", now + 40)["delivered"] == {"alpha": "7"}
     assert stat.S_IMODE(broadcast.path().stat().st_mode) == 0o600
+
+
+def test_a_run_that_unset_its_environment_still_cannot_say(env, monkeypatch, capsys):
+    """A run's agent among the command's ancestors refuses `ttp say`, whatever the environment says;
+    a pid reused since (another start token) or a run that ended does not."""
+    from ttp import cli
+    from ttp.runner import proc_start
+    p = make(env)
+    run_dir = env["tmp"] / "run-agent"
+    run_dir.mkdir()
+    rid = p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('worker','running',?,?)", (time.time(), str(run_dir)))
+    for var in ("TTP_RUN_ID", "TTP_RUN_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    before = p.db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"]
+    agent = os.getppid()   # the test's parent stands in for the run's agent
+    (run_dir / "child.pid").write_text(f"{agent}\n{proc_start(agent)}\n")
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    assert "refused inside a run" in capsys.readouterr().err
+    assert not p.db.q("SELECT id FROM messages WHERE id>?", (before,))
+    (run_dir / "child.pid").write_text(f"{agent}\nnot-its-start\n")
+    cli.main(["say", "demo", "reused pid", "--chat", "c1"])
+    (run_dir / "child.pid").write_text(f"{agent}\n{proc_start(agent)}\n")
+    p.db.x("UPDATE runs SET status='ok' WHERE id=?", (rid,))
+    cli.main(["say", "demo", "the user's own", "--chat", "c1"])
+    assert [r["text"] for r in p.db.q("SELECT text FROM messages WHERE id>? AND direction='in' ORDER BY id", (before,))] == [
+        "reused pid", "the user's own"]

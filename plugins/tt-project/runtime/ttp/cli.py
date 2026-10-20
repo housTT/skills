@@ -824,9 +824,11 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
 
 
 def cmd_say(a) -> None:
-    if in_run():
+    from . import locks
+    if in_run() or locks.under_run_agent():
         # A message posted here counts as the user's (pr_approve reads approvals from it), so a run
-        # must not post one. Runs report through `ttp note` and their hand-off.
+        # must not post one. Runs report through `ttp note` and their hand-off. The run's agent
+        # among this process's ancestors counts too: a run can unset its environment.
         die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
     from . import broadcast, relay
     if getattr(a, "all", False):

@@ -1875,9 +1875,10 @@ class Daemon:
         if read_only and prov.isolate_read_only:
             cwd = scratch_dir(str(self.p.base))
         denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
+        from .web import token_path
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
-                               disallowed_tools=denied)
+                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve())])
         cache_fp = None
         if cache_ttl == cachettl.AUTO:
             if prov.cache_env("1h"):

@@ -674,3 +674,41 @@ def in_run(run_dir: Path | None) -> bool:
             return True
         pid = nxt
     return True
+
+
+def _ancestors() -> set[int]:
+    """The pids above this process, up to init (this process too)."""
+    out, pid = set(), os.getpid()
+    while pid > 1 and pid not in out and len(out) < 256:
+        out.add(pid)
+        pid = _parent(pid) or 0
+    return out
+
+
+def under_run_agent(dbs: list[Path] | None = None) -> bool:
+    """Whether a live run's agent is an ancestor of this process: the child.pid of a running run of
+    this machine's projects (or of `dbs`, project databases), with the start token it recorded. A
+    worker can unset TTP_RUN_ID and the like, but not change which process started it. A run whose
+    agent's tools were re-parented (`nohup ... &` after its shell exited) is not seen."""
+    import sqlite3
+    from .globalcap import connect_ro, local_projects
+    from .runner import proc_start
+    above = _ancestors()
+    for db in (dbs if dbs is not None else [d for _, d in local_projects()]):
+        try:
+            conn = connect_ro(db)
+            try:
+                rows = conn.execute("SELECT id, dir FROM runs WHERE status='running'").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        for rid, d in rows:
+            try:
+                pid_text, _, started = (Path(d or Path(db).parent / "runs" / str(rid)) / "child.pid").read_text().partition("\n")
+                pid = int(pid_text)
+            except (OSError, ValueError):
+                continue
+            if pid in above and (not started.strip() or proc_start(pid) == started.strip()):
+                return True
+    return False

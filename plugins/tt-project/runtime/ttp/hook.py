@@ -470,6 +470,10 @@ def _log_bypass(cmd: str) -> None:
                      refused=True)
 
 
+# The project's web app token (state/web.token), named in a command
+WEB_TOKEN_RE = re.compile(r"(?:^|[/\s'\"])state/+web\.token\b")
+
+
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if payload.get("tool_name") != "Bash" or not os.environ.get("TTP_RUN_DIR"):
         return None, None
@@ -484,6 +488,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = ("a run must not post messages as the user; report with `ttp note` and the hand-off, "
                    "tell the user with `ttp notify \"<text>\"`, "
                    "and reach another project with `ttp note --to <project> \"<text>\"`")
+    if not why and WEB_TOKEN_RE.search(cmd):
+        # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
+        why = "the web token is the user's credential and a run must not read it"
     if not why:
         path_changed = bool(PATH_CHANGE_RE.search(scan))
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):

@@ -17,7 +17,13 @@ bypassPermissions and no OS sandbox, so they are unfenced today.
 
 File tools (Read, Edit, Write) run outside the sandbox and follow permission rules only, so a fence
 needs both the sandbox and Edit deny rules. `--setting-sources` drops a source's sandbox and Edit
-entries; `--settings` keeps them."""
+entries; `--settings` keeps them.
+
+Credential reads: a worker's `--settings` denies `Read(//<project>/tt-project/state/web.token)`
+(worker_settings); under bypassPermissions it refused both the Read tool and a plain `cat` of the
+file (measured, CLI 2.1.296). The Bash hook also refuses a command naming `state/web.token`. Like
+the Edit rules (a `python3 -c` write passed those), a check and not a fence; reads from an
+interpreter were not probed."""
 from __future__ import annotations
 
 import json
@@ -90,7 +96,7 @@ class Claude(Provider):
             return rc == 0
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=()):
+              disallowed_tools=(), denied_reads=()):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
         if model:
             argv += ["--model", model]
@@ -112,7 +118,7 @@ class Claude(Provider):
                 denied += ["WebFetch", "WebSearch"]
             denied += [t for t in disallowed_tools if t not in denied]   # the project's own denylist
             argv += ["--disallowedTools", *denied]
-            argv += ["--settings", json.dumps(worker_settings())]
+            argv += ["--settings", json.dumps(worker_settings(denied_reads))]
             # Workers start in many different worktrees; with the per-directory sections out of the
             # system prompt, it stays cached across them (measured: ~30% fewer cache-write tokens).
             if self.supports(EXCLUDE_DYNAMIC):
@@ -396,11 +402,16 @@ def hook_settings() -> dict:
             "env": {"PYTHONPATH": runtime}}
 
 
-def worker_settings() -> dict:
+def worker_settings(denied_reads=()) -> dict:
     """The hook, plus a leaner context: bundled skills by name only, no auto-memory (the project
-    keeps its own). Skills from a project's plugin dirs stay fully listed."""
-    return {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
-            "autoMemoryEnabled": False}
+    keeps its own). Skills from a project's plugin dirs stay fully listed. Each absolute path in
+    `denied_reads` gets a Read deny rule (`//` starts an absolute path in a rule); deny rules hold
+    under bypassPermissions."""
+    out = {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
+           "autoMemoryEnabled": False}
+    if denied_reads:
+        out["permissions"] = {"deny": [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]}
+    return out
 
 
 def windows_from_event(ev: dict) -> list[dict]:

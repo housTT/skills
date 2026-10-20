@@ -13,7 +13,9 @@ Write fence (from the docs; Codex was not installed where this was probed). Work
 | Fence writes to a list of dirs | yes, `sandbox_workspace_write.writable_roots`; uses `bwrap` from PATH, else a bundled helper that needs unprivileged user namespaces (startup warning if it can't) | yes, Seatbelt |
 | Unix socket under `state/` from the sandbox | blocked by default; allow it with `permissions.<name>.network.unix_sockets` or `dangerously_allow_all_unix_sockets` | same |
 
-Reads are not fenced, and the roots today include all of the project's state.
+Reads are not fenced, and the roots today include all of the project's state. Codex has no read
+deny rules, so the web token is guarded only by the Bash hook (when it runs) refusing a command
+that names `state/web.token`.
 
 Harness hook (measured on codex-cli 0.160). Codex sends the same PreToolUse/PostToolUse payload as
 Claude Code (`tool_name` "Bash", `tool_input.command`) and takes the same deny and added-context
@@ -106,7 +108,7 @@ class Codex(Provider):
         return any(any((h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")) for h in dict.fromkeys(homes))
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=()):
+              disallowed_tools=(), denied_reads=()):
         exe = self.binary() or "codex"
         argv = [exe, "exec", "--json", "-C", cwd, "--skip-git-repo-check"]
         if model:

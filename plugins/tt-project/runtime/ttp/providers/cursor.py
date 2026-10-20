@@ -14,7 +14,11 @@ Write fence (from the docs; the CLI was not installed where this was probed). Wo
 | Question | Linux | macOS |
 | :- | :- | :- |
 | Fence writes to a list of dirs | yes with `--sandbox enabled`: Landlock + seccomp, kernel 6.2+ with unprivileged user namespaces; extra dirs in `.cursor/sandbox.json` `additionalReadwritePaths` | yes, Seatbelt |
-| Unix socket under `state/` from the sandbox | not documented | not documented |"""
+| Unix socket under `state/` from the sandbox | not documented | not documented |
+
+Credential reads: not enforced. Cursor's permission deny rules live in a config file
+(`.cursor/cli.json` or the user's own), which the harness does not write per run, and the harness
+hook does not run here."""
 from __future__ import annotations
 
 import json
@@ -54,7 +58,7 @@ class Cursor(Provider):
                                              got[1], re.I)
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=()):
+              disallowed_tools=(), denied_reads=()):
         exe = self.binary() or "agent"
         help_text = cli_output(exe, "--help")
         fmt = "stream-json" if "stream-json" in help_text else "json"
