@@ -34981,12 +34981,12 @@ def test_check_commands_have_first_failure_semantics(env, tmp_path):
 
 
 # A pytest plugin for a child test run: an audit hook logs every write, folder, link or socket bind
-# under TTP_TEST_FORBID_ROOT that is not under TTP_TEST_ALLOW_ROOT to TTP_TEST_FORBID_LOG. Forked
-# workers inherit the hook.
+# under TTP_TEST_FORBID_ROOT that is not under one of the TTP_TEST_ALLOW_ROOT folders (os.pathsep
+# separated) to TTP_TEST_FORBID_LOG. Forked workers inherit the hook.
 _FORBID_AUDIT = """
 import os, sys
 _forbid = os.path.realpath(os.environ["TTP_TEST_FORBID_ROOT"])
-_allow = os.path.realpath(os.environ["TTP_TEST_ALLOW_ROOT"])
+_allow = [os.path.realpath(x) for x in os.environ["TTP_TEST_ALLOW_ROOT"].split(os.pathsep) if x]
 _log = os.environ["TTP_TEST_FORBID_LOG"]
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
 
@@ -35009,7 +35009,7 @@ def _hook(event, args):
     if not isinstance(path, (str, os.PathLike)) or not str(path):
         return
     real = os.path.realpath(path)
-    if _under(real, _forbid) and not _under(real, _allow):
+    if _under(real, _forbid) and not any(_under(real, a) for a in _allow):
         with open(_log, "a") as f:
             f.write(f"{event} {real}\\n")
 
@@ -35026,25 +35026,27 @@ def _forbid_audit_plugin(where: pathlib.Path) -> pathlib.Path:
 
 def test_the_forbidden_root_audit_logs_writes_outside_the_allowed_root(tmp_path):
     # Negative control for the audit the isolation regression relies on, with a forbidden root of its
-    # own (never /tmp): writes outside the allowed root are logged, writes inside it are not.
+    # own (never /tmp): writes outside the allowed roots are logged, writes inside either are not.
     forbid, log = tmp_path / "forbid", tmp_path / "audit.log"
-    allow = forbid / "allow"
+    allow, allow2 = forbid / "allow", forbid / "checkout"
     allow.mkdir(parents=True)
+    allow2.mkdir()
     plugin = _forbid_audit_plugin(tmp_path / "plugin")
     code = ("import ttp_forbid_audit, os, sys, tempfile\n"
-            "f, a = sys.argv[1:]\n"
+            "f, a, b = sys.argv[1:]\n"
             "open(os.path.join(a, 'ok'), 'w').close()\n"
             "tempfile.mkdtemp(dir=a)\n"
+            "os.mkdir(os.path.join(b, '__pycache__'))\n"
             "open(os.path.join(f, 'leak'), 'w').close()\n"
             "tempfile.mkdtemp(dir=f, prefix='leakdir')\n"
             "open(os.path.join(f, 'leak')).read()\n")
     env = {**os.environ, "PYTHONPATH": str(plugin), "TTP_TEST_FORBID_ROOT": str(forbid),
-           "TTP_TEST_ALLOW_ROOT": str(allow), "TTP_TEST_FORBID_LOG": str(log)}
-    subprocess.run([sys.executable, "-c", code, str(forbid), str(allow)], env=env, check=True)
+           "TTP_TEST_ALLOW_ROOT": os.pathsep.join([str(allow), str(allow2)]), "TTP_TEST_FORBID_LOG": str(log)}
+    subprocess.run([sys.executable, "-c", code, str(forbid), str(allow), str(allow2)], env=env, check=True)
     lines = log.read_text().splitlines()
     assert any(x.startswith("open ") and x.endswith("/leak") for x in lines), lines
     assert any(x.startswith("tempfile.mkdtemp ") and "/leakdir" in x for x in lines), lines
-    assert not any(str(allow) in x for x in lines), lines
+    assert not any(str(allow) in x or str(allow2) in x for x in lines), lines
     assert len([x for x in lines if x.startswith("open ")]) == 1, "a read is not a write"
 
 
@@ -35083,7 +35085,9 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     plugin = _forbid_audit_plugin(tmp_path / "audit-plugin")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(plugin), os.environ.get("PYTHONPATH")])))
     monkeypatch.setenv("TTP_TEST_FORBID_ROOT", "/tmp")
-    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", str(nested_tmp))
+    # The child pytest's own bytecode and cache in the checkout are not temp files: allow the checkout,
+    # so a checkout under /tmp audits exactly what one elsewhere does.
+    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2])]))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
     for var in ("TMPDIR", "TMP", "TEMP"):

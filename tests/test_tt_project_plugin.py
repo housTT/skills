@@ -905,6 +905,25 @@ def test_the_test_runner_uses_half_the_cpus_up_to_4_off_ci_and_up_to_8_on_ci(cpu
     assert _test_conftest()._auto_jobs(cpus, env) == jobs
 
 
+def _version(text):
+    return tuple(int(x) for x in re.match(r"\d+(?:\.\d+)*", text).group(0).split("."))
+
+
+def test_the_suite_declares_the_oldest_pytest_it_supports():
+    # tests/conftest.py needs item.path (pytest 7.0) and pytest.ini's tmp_path_retention_* need 7.3: an
+    # older pytest must stop with minversion's usage error, before conftest dies with an INTERNALERROR.
+    import configparser
+    root = pathlib.Path(__file__).resolve().parents[1]
+    ini = configparser.ConfigParser()
+    ini.read(root / "pytest.ini")
+    minimum = _version(ini["pytest"]["minversion"])
+    assert minimum >= (7, 3)
+    assert _version(pytest.__version__) >= minimum
+    ci = (root / ".github" / "workflows" / "validate.yml").read_text()
+    (pin,) = re.findall(r"\bpytest==([\d.]+)", ci)
+    assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
+
+
 def test_the_test_runner_summary_line_is_stable_and_greppable():
     line = _test_conftest()._suite_line(312.44, 1840.16, 4)
     assert line == "ttp-suite: wall 312.4s cpu 1840.2s workers 4"
