@@ -4096,6 +4096,8 @@ def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
     if a.action != "add" and (a.start_when, a.start_after, a.why) != (None, None, None):
         die("--start-when, --start-after and --why go with add; for a queued task use set-when")
+    if a.action != "add" and a.budget is not None:
+        die("--budget goes with add")
     if a.action != "set-when" and a.on_pass_cmd is not None:
         die("--on-pass-cmd goes with set-when")
     if a.action != "superseded" and (a.ref is not None or a.repo is not None):
@@ -4186,8 +4188,13 @@ def add_task(p, a) -> tuple[int, str]:
     d = {"start_after": a.start_after, "start_when": a.start_when, "why": a.why}
     if a.why is not None and a.start_when is None:
         raise ValueError("--why explains a --start-when probe; give one")
+    budget = getattr(a, "budget", None)
+    if budget is not None and budget <= 0:
+        raise ValueError("--budget is a dollar amount above 0")
     after, when = _start_args(d, {}, p)
+    from .budget import task_default_usd
     tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user",
+                        budget_usd=budget if budget is not None else task_default_usd(p.config(), a.tier),
                         labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
     stale = marker_only_probe(when)
     return tid, (f"; starts when: {when}" if when else "") \
@@ -6831,6 +6838,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")
     s.add_argument("--priority", type=int, default=3)
+    s.add_argument("--budget", type=float, help="add: its per-run dollar cap (default: budget.task_default_usd for its tier)")
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
     s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
     s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")

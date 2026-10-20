@@ -331,6 +331,11 @@ def default_turn_cap(cfg: dict) -> int:
     return max(int(int((cfg.get("coordinator") or {}).get("max_turns_per_hour", 30)) * 0.8), 1)
 
 
+def task_default_usd(cfg: dict, tier: str | None) -> float:
+    """A task's per-run dollar cap when it was made without one: budget.task_default_usd[tier], else 8."""
+    return float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier or "standard", 8.0))
+
+
 def dollar_caps(b: dict) -> bool:
     """Whether any dollar cap is set (budget.daily_usd, weekly_usd, global_daily_usd; 0 = unset)."""
     return any(float(b.get(k) or 0) > 0 for k in ("daily_usd", "weekly_usd", "global_daily_usd"))

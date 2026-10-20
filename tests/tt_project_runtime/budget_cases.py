@@ -3287,3 +3287,47 @@ def test_claude_overage_rejected_or_disabled_holds_at_the_line_like_no_reading(e
     assert (off.level, off.regime, off.allow_new_work, off.reasons) == (
         bare.level, bare.regime, bare.allow_new_work, bare.reasons), (off.reasons, bare.reasons)
     assert "paid_credits" not in off.numbers
+
+
+def test_an_unbudgeted_task_starts_capped_at_its_tier_default_and_commits_it_under_the_dollar_caps(env, monkeypatch):
+    """A task made without a budget gets budget.task_default_usd[tier] at dispatch: its run gets
+    --max-budget-usd, and its start counts toward committed spend, so one tick cannot start several
+    unbudgeted runs past the daily cap."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    _no_events(p)
+    d = Daemon(p.base)
+    d.cfg["budget"]["task_default_usd"] = {"light": 3.0, "standard": 8.0}
+    prov = d.cfg.get("core_provider", "claude")
+    d.gates = {prov: bud.Gate(provider=prov, regime="caps", max_parallel=5,
+                              numbers={"daily_cap": 12.0, "spent_24h": 0.0, "spent_7d": 0.0})}
+    light = p.db.add_task("light work", "s", kind="work", tier="light", origin="user", priority=1)
+    std = p.db.add_task("standard work", "s", kind="work", tier="standard", origin="user", priority=2)
+    over = p.db.add_task("more work", "s", kind="work", tier="standard", origin="user", priority=3)
+    assert p.db.task(light)["budget_usd"] is None
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((k["task"]["id"], k["budget_usd"])) or 0)
+    d.dispatch()
+    assert started == [(light, 3.0), (std, 8.0)], "3 + 8 committed; another 8 would pass the $12 cap"
+    assert p.db.task(light)["budget_usd"] == 3.0 and p.db.task(std)["budget_usd"] == 8.0
+    assert p.db.task(over)["status"] == "queued"
+    argv, _ = get_provider("claude").build(role="worker", model=None, effort=None, cwd=str(p.root),
+                                           budget_usd=started[1][1], read_only=False, schema=None,
+                                           restrictions={})
+    assert argv[argv.index("--max-budget-usd") + 1] == "8.00"
+
+
+def test_ttp_task_add_takes_a_budget_and_otherwise_stores_its_tier_default(env, capsys):
+    p = make(env)
+    from ttp import cli
+    cli.main(["task", "demo", "add", "capped", "--budget", "2.5"])
+    cli.main(["task", "demo", "add", "default", "--tier", "deep"])
+    rows = {r["title"]: r["budget_usd"] for r in p.db.q("SELECT title, budget_usd FROM tasks")}
+    assert rows["capped"] == 2.5
+    assert rows["default"] == p.config()["budget"]["task_default_usd"]["deep"]
+    for bad in (["add", "zero", "--budget", "0"], ["list", "--budget", "3"]):
+        with pytest.raises(SystemExit):
+            cli.main(["task", "demo", *bad])
+    assert "--budget" in capsys.readouterr().err
