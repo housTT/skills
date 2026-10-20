@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 import subprocess
 import time
 import urllib.error
 import urllib.request
 
-from .project import FOLDER
+from . import sshcmd
+
 
 LINK = re.compile(r"http://127\.0\.0\.1:(\d+)/#token=([0-9a-f]+)")
 UNVERIFIED = 3            # exit code: the command did its work, but the web app link failed the check
@@ -107,7 +107,7 @@ def link(p) -> str | None:
 def _ssh_ok(host: str) -> str:
     """"" when this machine logs in to host without a prompt, else ssh's complaint."""
     try:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, "true"],
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", host, "true"],
                            capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return str(e)
@@ -121,7 +121,10 @@ def remote(name: str, entry: dict, remote_port: int, tok: str) -> tuple[str, int
     check the link through it, and repair: restart the kept tunnel, then the daemon there."""
     from . import consent, tunnel
     from .web import free_port
-    host = entry.get("ssh") or entry["host"]
+    try:
+        host = sshcmd.host(entry)
+    except sshcmd.BadHost as e:
+        return f"web app: not opened: {e}", UNVERIFIED
     if not tunnel.installed(name) and (why := consent.gate("tunnel", f"ttp web {name} --tunnel --keep")):
         return f"web app: not opened: a local view tunnel to {host} is {why}", UNVERIFIED
     local_port, did = tunnel.keep(name, host, remote_port, free_port)
@@ -138,10 +141,9 @@ def remote(name: str, entry: dict, remote_port: int, tok: str) -> tuple[str, int
         cant = _ssh_ok(host)
         if cant:
             return bad_line("tunnel", f"{why}; ssh to {host} fails without a prompt ({cant})", tried), UNVERIFIED
-        remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
         try:
-            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host,
-                                f"{remote_ttp} restart {shlex.quote(name)}"], capture_output=True, text=True, timeout=300)
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", host,
+                                sshcmd.remote_cmd(entry, ["restart", name])], capture_output=True, text=True, timeout=300)
             said = (r.stdout or r.stderr).strip()[-160:] or f"exit {r.returncode}"
         except (OSError, subprocess.SubprocessError) as e:
             said = str(e)[:160]

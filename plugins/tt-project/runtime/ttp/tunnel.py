@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import sshcmd
 from .project import HOME_DIR, durable_write
 
 # The forward's own connection, never a shared master's (an agent without both is replaced).
@@ -36,16 +37,26 @@ def label(name: str) -> str:
 
 def ssh_argv(host: str, local: int, remote: int, ssh: str | None = None) -> list[str]:
     """The forward: this computer's localhost:local to the project machine's localhost:remote."""
+    sshcmd.check_host(host)
     return [ssh or shutil.which("ssh") or "ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=20",
-            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-L", f"127.0.0.1:{local}:127.0.0.1:{remote}", host]
+            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-L", f"127.0.0.1:{local}:127.0.0.1:{remote}", "--", host]
+
+
+def _unit_escape(line: str) -> str:
+    """systemd expands %specifiers and $VARIABLES in ExecStart; doubling them keeps them literal."""
+    return line.replace("%", "%%").replace("$", "$$")
+
+
+def _unit_unescape(line: str) -> str:
+    return re.sub(r"([%$])\1", r"\1", line)
 
 
 def systemd_unit(name: str, argv: list[str]) -> str:
     return (f"[Unit]\nDescription=tt-project: SSH tunnel to the web app of {name}\n"
             # Never give up: a laptop may be offline for hours.
             f"StartLimitIntervalSec=0\n\n"
-            f"[Service]\nExecStart={' '.join(shlex.quote(a) for a in argv)}\n"
+            f"[Service]\nExecStart={_unit_escape(' '.join(shlex.quote(a) for a in argv))}\n"
             # 5 s after a drop, growing to 5 min while the machine stays unreachable (systemd 254+;
             # older versions ignore the two step keys and keep the 5 s).
             f"Restart=always\nRestartSec=5\nRestartSteps=10\nRestartMaxDelaySec=300\n\n"
@@ -75,7 +86,7 @@ def installed(name: str, platform: str | None = None) -> dict | None:
             argv = [str(a) for a in plistlib.loads(f.read_bytes()).get("ProgramArguments") or []]
         else:
             line = next((ln for ln in f.read_text().splitlines() if ln.startswith("ExecStart=")), "")
-            argv = shlex.split(line[len("ExecStart="):])
+            argv = shlex.split(_unit_unescape(line[len("ExecStart="):]))
     except (OSError, ValueError, plistlib.InvalidFileException):
         return {"file": str(f), "host": "", "local": 0, "remote": 0, "own": False}
     words = " ".join(argv).split()   # also sees into `sh -c "exec ssh ... host"`

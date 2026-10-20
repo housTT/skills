@@ -22,9 +22,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import headline, timefmt
+from . import headline, sshcmd, timefmt
 from .db import DB, SEVERITY_RANK
-from .project import FOLDER, HOME_DIR, Project, durable_write, hostname, load_registry, write_json
+from .project import HOME_DIR, Project, durable_write, hostname, load_registry, write_json
 
 STATE = HOME_DIR / "notifier-state.json"
 CONF = HOME_DIR / "notifier.json"
@@ -87,11 +87,15 @@ def _remote_alerts(entry: dict, name: str, after: int, floor: str, state: dict |
     now = time.time() if now is None else now
     no_health = state.setdefault(NO_HEALTH, {}) if state is not None else {}
     host = _host(entry)
+    try:
+        sshcmd.check_host(host)
+    except sshcmd.BadHost:
+        return None, False, None
     ask = now - float(no_health.get(host, 0)) >= HEALTH_RETRY_S
-    cmd = f"{entry['dir']}/{FOLDER}/harness/bin/ttp alerts {shlex.quote(name)} --after {after} --floor {floor} --json"
+    cmd = sshcmd.remote_cmd(entry, ["alerts", name, "--after", after, "--floor", floor, "--json"])
     for flag in (" --health", "") if ask else ("",):
         try:
-            out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+            out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
                                   cmd + flag], capture_output=True, text=True, timeout=40)
         except (OSError, subprocess.SubprocessError):
             return None, False, None

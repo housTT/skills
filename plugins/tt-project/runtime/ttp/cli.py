@@ -30,9 +30,9 @@ from . import __version__, poll_s
 from .db import chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import timefmt
+from . import sshcmd, timefmt
 from . import schedule as sched
-from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
+from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, sync_all)
@@ -178,13 +178,15 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
 
 
 def _ssh_cmd(entry: dict, argv: list[str]) -> list[str]:
-    remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
-    cmd = " ".join(shlex.quote(a) for a in [remote_ttp, *argv])
-    host = entry.get("ssh") or entry["host"]
+    cmd = sshcmd.remote_cmd(entry, argv)
+    try:
+        host = sshcmd.host(entry)
+    except sshcmd.BadHost as e:
+        die(str(e))
     # Keepalives: a connection that died quietly (a laptop asleep, a changed network) ends within
     # about a minute instead of hanging until TCP gives up.
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=4", host, cmd]
+            "-o", "ServerAliveCountMax=4", "--", host, cmd]
 
 
 def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
@@ -352,7 +354,7 @@ def search_transcripts(name: str) -> list[dict]:
     needle = f"tt-project://{name}@"
     roots = [Path.home() / ".claude" / "projects", Path.home() / ".codex" / "sessions", Path.home() / ".cursor" / "projects"]
     hits: dict[str, dict] = {}
-    rx = re.compile(re.escape(needle) + r"([A-Za-z0-9._-]+):(/[^\s\"'\\]+)")
+    rx = re.compile(re.escape(needle) + r"([A-Za-z0-9._-]+):(/[A-Za-z0-9._/~-]+)")
     for root in roots:
         if not root.is_dir():
             continue
@@ -368,9 +370,17 @@ def search_transcripts(name: str) -> list[dict]:
             except OSError:
                 continue
             for m in rx.finditer(text):
+                if m.group(1).startswith("-"):   # ssh would read it as an option
+                    continue
                 hits[f"{m.group(1)}:{m.group(2)}"] = {"host": m.group(1), "dir": m.group(2).rstrip(".,)"),
                                                      "seen_in": f, "mtime": Path(f).stat().st_mtime}
     return sorted(hits.values(), key=lambda h: -h["mtime"])
+
+
+def _found_in_chat_log(name: str, host: str, folder: str, seen_in: str) -> None:
+    from .project import registry_path
+    print(f"ttp: registered {name} at {host}:{folder} (found in the chat log {seen_in}; "
+          f"remove it from {registry_path()} if that is wrong)", file=sys.stderr)
 
 
 def resolve(name: str) -> tuple[Project | None, dict | None]:
@@ -383,10 +393,12 @@ def resolve(name: str) -> tuple[Project | None, dict | None]:
     for hit in search_transcripts(name):
         if hit["host"] == hostname() and Project(hit["dir"]).exists():
             register(name, {"host": hostname(), "dir": str(Project(hit["dir"]).root)})
+            _found_in_chat_log(name, hostname(), str(Project(hit["dir"]).root), hit["seen_in"])
             return Project(hit["dir"]), None
         if hit["host"] != hostname():
             entry = {"host": hit["host"], "dir": hit["dir"]}
             register(name, entry)
+            _found_in_chat_log(name, hit["host"], hit["dir"], hit["seen_in"])
             return None, entry
     return None, None
 
@@ -1441,9 +1453,11 @@ def cmd_web(a) -> None:
         return
     if not entry:
         die(f"no project {a.name!r}")
-    host = entry.get("ssh") or entry["host"]
-    remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, f"{remote_ttp} web {shlex.quote(a.name)}"],
+    try:
+        host = sshcmd.host(entry)
+    except sshcmd.BadHost as e:
+        die(str(e))
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", host, sshcmd.remote_cmd(entry, ["web", a.name])],
                        capture_output=True, text=True)
     if r.returncode == 255:
         _unreachable(entry, r.stderr)

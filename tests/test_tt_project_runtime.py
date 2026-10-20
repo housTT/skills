@@ -21729,7 +21729,7 @@ def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monke
     unit = tunnel.systemd_unit("demo", argv)
     for want in ("Restart=always", "RestartSec=5", "RestartMaxDelaySec=300", "StartLimitIntervalSec=0",
                  "ServerAliveInterval=30", "ExitOnForwardFailure=yes", "BatchMode=yes",
-                 "-o ControlMaster=no -o ControlPath=none", "-L 127.0.0.1:18800:127.0.0.1:18700 the-host", "WantedBy=default.target"):
+                 "-o ControlMaster=no -o ControlPath=none", "-L 127.0.0.1:18800:127.0.0.1:18700 -- the-host", "WantedBy=default.target"):
         assert want in unit, (want, unit)
     plist = tunnel.launchd_plist("demo", argv)
     assert plist["Label"] == "com.tt-project.tunnel.demo" and plist["KeepAlive"] is True
