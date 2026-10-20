@@ -1070,7 +1070,7 @@ def test_boot_check_alerts_once_on_a_change_of_machine_and_clears(env, monkeypat
 
 
 
-def _fake_ssh(env, monkeypatch, script: str) -> None:
+def _fake_ssh_g(env, monkeypatch, script: str) -> None:
     """An `ssh` on PATH that runs `script` (sh), so `ssh -G` never reads the user's own config."""
     bindir = env["tmp"] / "fakebin"
     bindir.mkdir(exist_ok=True)
@@ -1089,7 +1089,7 @@ def test_host_check_takes_a_machines_list_alias_for_this_machine_as_no_move(env,
     p = make(env)
     from ttp import machines as mm
     from ttp.daemon import Daemon
-    _fake_ssh(env, monkeypatch, 'echo "hostname $2"\n')   # no ssh config: an alias resolves to itself
+    _fake_ssh_g(env, monkeypatch, 'echo "hostname $2"\n')   # no ssh config: an alias resolves to itself
     mm.add("box-a", hostname="testhost")
     p.set_config("host", "box-a")
     Daemon(p.base).check_integrity(start=True)
@@ -1108,7 +1108,7 @@ def test_host_check_takes_the_fqdn_for_the_short_name(env, monkeypatch):
     monkeypatch.delenv("TTP_HOST")
     monkeypatch.setattr(socket, "gethostname", lambda: "box-a")
     monkeypatch.setattr(socket, "getfqdn", lambda *a: "box-a.example")
-    _fake_ssh(env, monkeypatch, 'echo "hostname $2"\n')
+    _fake_ssh_g(env, monkeypatch, 'echo "hostname $2"\n')
     for stored in ("box-a.example", "BOX-A", "box-a"):
         p.set_config("host", stored)
         assert integrity.host_change(p) is None, stored
@@ -1122,16 +1122,16 @@ def test_host_check_follows_ssh_aliases_and_falls_back_when_ssh_cannot_say(env, 
     from ttp import integrity, machines as mm
     from ttp.daemon import Daemon
     # `ssh -G` resolves the workstation's alias for this box to this machine: no move.
-    _fake_ssh(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
+    _fake_ssh_g(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
     p.set_config("host", "box-a-alias")
     assert integrity.host_change(p) is None and p.raw_config()["host"] == "testhost"
     # An ssh alias for another machine still alerts.
     p.set_config("host", "box-b-alias")
-    _fake_ssh(env, monkeypatch, 'echo "hostname box-b.example"\n')
+    _fake_ssh_g(env, monkeypatch, 'echo "hostname box-b.example"\n')
     Daemon(p.base).check_integrity(start=True)
     assert len(_host_alerts(p)) == 1
     # ssh fails or times out: the plain compare decides (another name alerts, this one does not).
-    _fake_ssh(env, monkeypatch, 'exit 255\n')
+    _fake_ssh_g(env, monkeypatch, 'exit 255\n')
     p.set_config("host", "box-a-alias")
     assert integrity.host_change(p) == {"was": "box-a-alias", "now": "testhost"}
 
@@ -1146,7 +1146,7 @@ def test_host_check_follows_ssh_aliases_and_falls_back_when_ssh_cannot_say(env, 
 def test_adopt_stores_this_machines_name_for_a_local_alias(env, monkeypatch):
     from ttp import cli, machines as mm
     from ttp.project import load_registry
-    _fake_ssh(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
+    _fake_ssh_g(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
     mm.add("box-a", hostname="testhost")
     for given in ("box-a", "box-a-alias", "testhost"):
         with contextlib.redirect_stdout(io.StringIO()):
