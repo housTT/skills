@@ -33,6 +33,7 @@ box.py setup questions <box-alias> --format numbered  # a plain numbered prompt
 | ssh keys, Outbound | public keys for authorized_keys; your own outbound keys to restore, or none |
 | Device broker | install tt-device-mcp (which release or branch), or none: device work then takes `ttp lock <box-alias>-device -- <command>` |
 | Host checks (read-only) | any of driver, firmware, hugepages, PCIe link |
+| Shared mount | none, or a mount point for shared network storage; its source, type, options and how it persists (follow-ups) |
 | Workspace | a repo checkout and build under `workdir_root` (branch, ccache), or none |
 | Python env | pip ttnn, the workspace's own env, or none |
 | Agent CLIs | Claude Code, Codex, Cursor agent, or none (only if projects will run on the box) |
@@ -76,6 +77,9 @@ not skipped.
 - Host checks: `box.py setup hostcheck <box-alias> [--only driver,pcie]` reads sysfs, /proc and
   `/dev/tenstorrent` listings only; it opens no device. Exit 0 ok, 1 a problem, 255 ssh failed.
   Fixes (driver, firmware, hugepages): tt-buddy's `recipes/developer-setup.md`.
+- Shared mount: `box.py setup mount <box-alias> --run` makes it persistent (fstab or a systemd
+  unit), `box.py setup mountcheck <box-alias>` verifies it now and `--after-reboot` once the box
+  rebooted; record the change with `ttp machines change add`: `storage.md`.
 - Workspace and Python env: tt-buddy's `recipes/workspace.md`, `recipes/tt-metal/build.md` and
   `recipes/tt-metal/env.md`, plus the notes in `bare-metal.md` (submodules, ccache, build in
   place). A broker job needs an env too: the `tt-buddy:run` skill's `skills/run/mcp.md`.

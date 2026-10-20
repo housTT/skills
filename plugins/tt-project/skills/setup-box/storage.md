@@ -1,0 +1,65 @@
+# setup-box: shared network storage that survives a reboot
+
+A network filesystem mounted by hand on a device box is gone after the next reboot, and projects on
+the box lose the caches and backups they keep there. The new-box flow (`new-box.md`) asks once
+whether the box should mount shared storage at boot; on yes it makes the mount persistent and
+verifies it now and again after the next reboot.
+
+Every command below is `<plugin-root>/skills/setup-box/scripts/box.py`, shortened to `box.py`.
+
+## 1. Ask
+
+`box.py setup questions <box-alias>` asks `storage` once: no shared mount, or its mount point. A
+mount point brings the follow-ups. Each answer is the user's, saved in the local site file, never
+taken from a repository:
+
+| Question | Answer |
+|---|---|
+| Mount source | `live` (what is mounted there now, by hand) or typed, such as `<server>:/<export>` |
+| Mount type | `live` or typed, such as the filesystem's type name |
+| Mount opts | `defaults` or typed; `_netdev` (and `nofail` in fstab) are always added |
+| Persist how | `fstab`, or `systemd` for a filesystem whose client agent service must run first |
+| Client agent | systemd only: that service's unit name, or none |
+
+Nothing is assumed: no filesystem, server, path or option is built in.
+
+## 2. Persist
+
+```
+box.py setup mount <box-alias>          # dry run: probes the box, prints the root script, the undo and the ledger line
+box.py setup mount <box-alias> --run    # runs the root script with sudo -n, then the check below
+```
+
+- `fstab`: one /etc/fstab line `<source> <mount point> <type> <options>,_netdev,nofail 0 0`.
+  `_netdev` waits for the network; `nofail` lets the box boot without the mount. /etc/fstab is
+  backed up first; a line already there is left as it is.
+- `systemd`: a `.mount` unit (named for the mount point, as `systemd-escape --path` names it) with
+  `Wants=` and `After=` on `network-online.target` and the client agent service, enabled with
+  `WantedBy=remote-fs.target`.
+- It never replaces another fstab entry or unit for the mount point: it stops with exit 3 and
+  says what is there.
+- Root goes only through `sudo -n` on the user's own login (`account.md`). Without passwordless
+  sudo, nothing changes: report it to the user as a step needing their privileges, with the root
+  script the dry run printed.
+- Record the live change in the same run, with the line `mount` prints:
+  `ttp machines change add <box-alias> "<what>" --undo "<cmd>" --until-probe "<post-reboot check>"`.
+  The undo unmounts and removes only what was added.
+
+## 3. Verify now
+
+`box.py setup mountcheck <box-alias>`: `mountpoint -q`, a read of the mount point under a timeout,
+the mounted source against the saved one, and the fstab entry or the unit enabled. Exit 0 ok,
+1 a problem, 255 ssh failed. A pass records the box's boot id in the site file.
+
+## 4. Verify after the next reboot
+
+`box.py setup mountcheck <box-alias> --after-reboot` (read-only): 0 the box rebooted since the
+first check and the mount came back, 1 no reboot yet, 2 failed after a reboot (or no first check),
+255 ssh failed.
+
+- It stays pending as the change entry's `--until-probe`, so no task waits for it; never reboot a
+  shared box only to run it.
+- Once it passes the entry turns due: check the output, keep the mount and close the entry
+  (`ttp machines change close <id>`). Run the undo only if the mount is no longer wanted.
+- A failure after a reboot: fix the cause (network order, the agent service, the options), run
+  `mount --run` again and repeat the checks.

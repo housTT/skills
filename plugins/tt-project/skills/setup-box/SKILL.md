@@ -71,6 +71,8 @@ and build/run recipes on the box).
 - `scratch_root` (site file): node-local scratch, fast but wiped when a job ends on some clusters.
   Copy results you keep back to `workdir_root` before the job ends.
 - Never assume a path: take both from the site file, and check free space with `df <path>`.
+- Shared network storage mounted by hand is gone after a reboot: make it persistent and verify it
+  now and after the next reboot: `storage.md`.
 
 ## Hand-off from a box task
 

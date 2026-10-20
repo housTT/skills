@@ -10,6 +10,8 @@
 - `plan` turns the saved answers into steps, each an action and the check that proves it. It
   refuses while a question is pending. The actions link to tt-buddy and tt-device-mcp's own docs.
 - `hostcheck` is one read-only ssh probe: driver, firmware, hugepages, PCIe link.
+- `mount` makes the saved shared network mount persistent (sudo -n, else printed for the user);
+  `mountcheck` verifies it now and, with `--after-reboot`, once the box has rebooted (`box_storage`).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from typing import Dict, List, Optional
 
 import box
 import box_account
+import box_storage
 
 KNOWN_KEYS = {"setup"}
 HOST_CHECKS = ("driver", "firmware", "hugepages", "pcie")
@@ -105,6 +108,32 @@ QUESTIONS: List[dict] = [
              ("firmware", "Firmware", "firmware versions the driver reports"),
              ("hugepages", "Hugepages", "1 GB hugepages reserved"),
              ("pcie", "PCIe link", "each card's link speed and width against its maximum")]),
+    dict(id="storage", header="Shared mount", other=box_storage.valid_mountpoint,
+         text="Should {alias} mount shared network storage (caches, backups) at every boot? A mount made by "
+              "hand is gone after the next reboot. (yes: type its mount point, an absolute path)", options=[
+             ("none", "No shared mount", "nothing is mounted or changed")]),
+    dict(id="storage.source", header="Mount source", parent="storage", when={"storage": "!none"},
+         suggest="live", other=box_storage.valid_spec,
+         text="What to mount there, as the filesystem's client names it? (type it, e.g. <server>:/<export>)",
+         options=[("live", "As mounted now", "the source mounted at the mount point on {alias} now")]),
+    dict(id="storage.fstype", header="Mount type", parent="storage", when={"storage": "!none"},
+         suggest="live", other=box_storage.valid_fstype,
+         text="Its filesystem type? (type it, e.g. nfs4)", options=[
+             ("live", "As mounted now", "the type mounted at the mount point on {alias} now")]),
+    dict(id="storage.options", header="Mount opts", parent="storage", when={"storage": "!none"},
+         suggest="defaults", other=box_storage.valid_spec,
+         text="Mount options? _netdev (and nofail in fstab) are always added. (others: type them, comma-separated)",
+         options=[("defaults", "Defaults", "the filesystem's default options")]),
+    dict(id="storage.method", header="Persist how", parent="storage", when={"storage": "!none"},
+         suggest="fstab", text="How should the mount come back after a reboot?", options=[
+             ("fstab", "fstab line", "an /etc/fstab line with _netdev,nofail: waits for the network, never "
+                                     "blocks boot"),
+             ("systemd", "systemd unit", "a .mount unit ordered after the network and the filesystem's client "
+                                         "agent service, for filesystems that need one")]),
+    dict(id="storage.agent", header="Client agent", parent="storage.method", when={"storage.method": "systemd"},
+         other=box_storage.valid_unit,
+         text="The filesystem's client agent service on {alias}, if it has one? (type its unit name)", options=[
+             ("none", "No client agent", "the unit waits for the network only")]),
     dict(id="workspace", header="Workspace", suggest="tenstorrent/tt-metal", other=_repo,
          text="A repo checkout and build under the workdir root? (another repo: type owner/name)", options=[
              ("tenstorrent/tt-metal", "tt-metal", "clone and build tenstorrent/tt-metal"),
@@ -264,19 +293,22 @@ def merge(saved: dict, new: Dict[str, object]) -> dict:
     """`saved` with `new` answers recorded; a changed answer drops the answers that depend on it."""
     answers = dict(saved.get("answers") or {})
     asked = dict(saved.get("asked") or {})
+    rest = {k: v for k, v in saved.items() if k not in ("answers", "asked", "saved")}
     for qid, raw in new.items():
         q = BY_ID.get(qid)
         if q is None:
             raise ValueError(f"unknown question {qid!r} (known: {', '.join(BY_ID)})")
         val = parse_value(q, raw)
         if qid in answers and answers[qid] != val:
+            if qid.split(".")[0] == "storage":
+                rest.pop("storage_verify", None)  # a first check of another mount proves nothing
             for dep in _dependents(qid):
                 if dep not in new:
                     answers.pop(dep, None)
                     asked.pop(dep, None)
         answers[qid] = val
         asked[qid] = qhash(q)
-    return {"answers": answers, "asked": asked,
+    return {**rest, "answers": answers, "asked": asked,
             "saved": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -364,6 +396,21 @@ def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-roo
         step("host_checks", "nothing to change: the checks are read-only; fix what they report with tt-buddy's "
                             "`recipes/developer-setup.md`",
              f"{box_py} setup hostcheck {alias} --only {','.join(checks)}")
+    mnt = box_storage.spec(answers)
+    if mnt:
+        how = ("a systemd .mount unit" + (f" after {box_storage.agent_unit(mnt['agent'])}"
+                                          if box_storage.agent_unit(mnt["agent"]) else "")
+               if mnt["method"] == "systemd" else "an /etc/fstab line with _netdev,nofail")
+        step("storage", f"`{box_py} setup mount {alias} --run` after reading its dry run: {mnt['where']} mounted at "
+                        f"every boot through {how}, as root with sudo -n (without passwordless sudo it prints the "
+                        "root script: a step for the user to run with their privileges); then record the change "
+                        "with the `ttp machines change add` line it prints",
+             f"{box_py} setup mountcheck {alias}  (expect: mounted, read ok, persistent; it records the boot id)")
+        step("storage.reboot", "nothing now, and never reboot a shared box for it: the post-reboot check stays "
+                               "pending as the change entry's --until-probe until the box next reboots; once it "
+                               "passes, close the entry and keep the mount",
+             f"{box_py} setup mountcheck {alias} --after-reboot  (exit 0 verified after a reboot, 1 no reboot "
+             "yet, 2 failed after a reboot, 255 ssh failed)")
     ws = answers.get("workspace")
     if ws and ws != "none":
         name = ws.split("/")[1]
@@ -584,6 +631,117 @@ def cmd_hostcheck(args) -> int:
     return 1 if problems else 0
 
 
+def _mount_spec(args) -> "tuple[dict, dict, dict]":
+    """(site, entry, storage spec); SiteError or ValueError when the box has no complete storage answers."""
+    site, entry = _entry(args)
+    answers = (entry.get("setup") or {}).get("answers") or {}
+    mnt = box_storage.spec(answers)
+    if not mnt:
+        raise ValueError(f"{args.alias} mounts no shared storage (`box.py setup save {args.alias} "
+                         "--set storage=<mount point>` to add one)")
+    missing = [f"storage.{k}" for k in ("source", "fstype", "method") if not mnt.get(k)]
+    if missing:
+        raise ValueError(f"ask first ({', '.join(missing)}); `box.py setup questions {args.alias}`")
+    return site, entry, mnt
+
+
+def _mount_probe(alias: str, where: str) -> "tuple[Optional[dict], int]":
+    r = box.ssh_run(alias, box_storage.probe_script(where), timeout=box_storage.READ_TIMEOUT_S + 40)
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+        print(f"ssh: connection to {alias} failed (exit {r.returncode}) {tail[0]}".rstrip())
+        return None, 255
+    return box_storage.read_probe(r.stdout), 0
+
+
+def _verify_now(args, site: dict, entry: dict, mnt: dict) -> int:
+    """Check the mount now; on a pass record the boot id the post-reboot check compares against."""
+    probe, rc = _mount_probe(args.alias, mnt["where"])
+    if probe is None:
+        return rc
+    lines, problems = box_storage.judge(mnt, probe)
+    print("\n".join(lines + ["verdict: " + ("problems: " + ", ".join(problems) if problems else "ok")]))
+    if problems:
+        return 1
+    setup = entry.setdefault("setup", {})
+    rec = setup.get("storage_verify") or {}
+    if rec.get("where") != mnt["where"] or not rec.get("boot_id"):
+        setup["storage_verify"] = {"where": mnt["where"], "boot_id": probe.get("boot_id", ""),
+                                   "checked": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                                       timespec="seconds")}
+        save_site(box.site_path(args.site), site)
+        print(f"recorded this boot; pending: `box.py setup mountcheck {args.alias} --after-reboot` once {args.alias} "
+              "has rebooted")
+    return 0
+
+
+def cmd_mount(args) -> int:
+    try:
+        site, entry, mnt = _mount_spec(args)
+    except (ValueError, box.SiteError) as e:
+        print(f"error: {e}")
+        return 1
+    probe, rc = _mount_probe(args.alias, mnt["where"])
+    if probe is None:
+        return rc
+    mnt, errs = box_storage.resolve(mnt, probe)
+    if errs:
+        print("\n".join(f"error: {e}" for e in errs))
+        return 1
+    script = box_storage.apply_script(mnt)
+    undo = box_storage.undo_command(args.alias, mnt)
+    box_py = str(pathlib.Path(__file__).resolve().parent / "box.py")
+    ledger = shlex.join(["ttp", "machines", "change", "add", args.alias, box_storage.change_what(mnt),
+                         "--undo", undo, "--until-probe", f"{box_py} setup mountcheck {args.alias} --after-reboot"])
+    if not args.run:
+        print("dry run; the root script (`--run` runs it with sudo -n):")
+        print(script)
+        print(f"undo: {undo}")
+        print(f"then record it: {ledger}")
+        return 0
+    r = box.ssh_run(args.alias, "sudo -n bash -c " + shlex.quote(script), timeout=180)
+    print((r.stdout + r.stderr).strip())
+    if r.returncode == 255:
+        return 255
+    if r.returncode != 0:
+        if "sudo" in r.stderr and ("password" in r.stderr or "not allowed" in r.stderr
+                                   or "not in the sudoers" in r.stderr):
+            print(f"needs root: sudo -n is refused on {args.alias}. This is a step for the user: run the root script "
+                  "from the dry run as root there, then `box.py setup mountcheck` and record the change:\n"
+                  f"{ledger}")
+        else:
+            print(f"error: the root script failed (exit {r.returncode}); nothing else was changed after that point")
+        return 1
+    rc = _verify_now(args, site, entry, mnt)
+    print(f"record the change now: {ledger}")
+    return rc
+
+
+def cmd_mountcheck(args) -> int:
+    try:
+        site, entry, mnt = _mount_spec(args)
+    except (ValueError, box.SiteError) as e:
+        print(f"error: {e}")
+        return 2 if args.after_reboot else 1
+    if not args.after_reboot:
+        return _verify_now(args, site, entry, mnt)
+    rec = (entry.get("setup") or {}).get("storage_verify") or {}
+    if rec.get("where") != mnt["where"] or not rec.get("boot_id"):
+        print(f"error: no first check recorded for {mnt['where']}: `box.py setup mountcheck {args.alias}` first")
+        return 2
+    probe, rc = _mount_probe(args.alias, mnt["where"])
+    if probe is None:
+        return rc
+    boot = probe.get("boot_id", "")
+    if not boot or boot == rec["boot_id"]:
+        print(f"pending: {args.alias} has not rebooted since the first check ({rec.get('checked', '?')})")
+        return 1
+    lines, problems = box_storage.judge(mnt, probe)
+    print("\n".join(lines + ["after reboot: " + ("problems: " + ", ".join(problems) if problems
+                                                   else "ok, the mount came back")]))
+    return 2 if problems else 0
+
+
 def check_setup(alias: str, e: dict) -> List[str]:
     s = e.get("setup")
     if s is None:
@@ -621,3 +779,12 @@ def register(sub) -> None:
     h.add_argument("--only", help=f"comma-separated subset of {','.join(HOST_CHECKS)}")
     h.add_argument("--json", action="store_true")
     h.set_defaults(func=cmd_hostcheck)
+    m = st.add_parser("mount", help="make the saved shared network mount persistent (dry run unless --run)")
+    m.add_argument("alias")
+    m.add_argument("--run", action="store_true", help="run the root script with sudo -n")
+    m.set_defaults(func=cmd_mount)
+    c = st.add_parser("mountcheck", help="verify the shared mount now, or --after-reboot once the box rebooted")
+    c.add_argument("alias")
+    c.add_argument("--after-reboot", action="store_true",
+                   help="read-only: 0 came back after a reboot, 1 no reboot yet, 2 failed, 255 ssh failed")
+    c.set_defaults(func=cmd_mountcheck)

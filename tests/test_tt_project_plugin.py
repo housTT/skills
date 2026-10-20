@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import sys
 
 import pytest
@@ -1650,7 +1651,7 @@ def _setup_box(tmp_path, *args, entry=None):
                           capture_output=True, text=True, timeout=60)
 
 
-ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "workspace=none", "python_env=none", "agent_clis=none",
+ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "storage=none", "workspace=none", "python_env=none", "agent_clis=none",
             "projects=all", "recovery.owner=none", "lock=shared", "disk_guard=150"]
 
 
@@ -1661,7 +1662,7 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     qs = [q for b in batches for q in b]
     # The first pass asks every top-level topic of the new-box flow; follow-ups wait for their answer.
     assert [q["id"] for q in qs] == ["account.user", "account.admin", "account.keys", "account.outbound",
-                                     "broker", "host_checks", "workspace", "python_env", "agent_clis",
+                                     "broker", "host_checks", "storage", "workspace", "python_env", "agent_clis",
                                      "projects", "recovery.owner", "lock", "disk_guard"]
     for b in batches:
         assert 1 <= len(b) <= 4
@@ -1673,7 +1674,7 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     assert "ttp lock <box-alias>-device -- <cmd>" in broker["options"][1]["description"]
     assert next(q for q in qs if q["id"] == "host_checks")["multiSelect"] is True
     num = _setup_box(tmp_path, "setup", "questions", "<box-alias>", "--format", "numbered").stdout
-    assert num.count("\n1. ") == 1 and "\n13. " in num and "   b) No broker:" in num
+    assert num.count("\n1. ") == 1 and "\n14. " in num and "   b) No broker:" in num
     assert "nothing is assumed" in num and "(suggested: install)" in num
 
 
@@ -1810,6 +1811,214 @@ def test_setup_box_new_box_page_covers_the_flow():
         assert part in page, part
     assert "`new-box.md`" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
     assert "`new-box.md`" in (SKILLS / "setup-box" / "bare-metal.md").read_text(encoding="utf-8")
+
+
+MNT = {"storage": "/path/to/mount", "storage.source": "fileserver.example:/export", "storage.fstype": "nfs4",
+       "storage.options": "defaults", "storage.method": "fstab"}
+
+
+def _storage(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    import box_storage as st
+    return bs, st
+
+
+def test_setup_box_storage_asks_once_then_plans_persist_verify_now_and_after_reboot(monkeypatch):
+    bs, st = _storage(monkeypatch)
+    saved = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))
+    assert bs.pending(saved) == [] and not any(s["id"].startswith("storage") for s in bs.plan("b", {}, saved["answers"]))
+    # Yes is a typed mount point; only then come its follow-ups, the agent only for a systemd unit.
+    saved = bs.merge(saved, {"storage": "/path/to/mount"})
+    assert [q["id"] for q in bs.pending(saved)] == ["storage.source", "storage.fstype", "storage.options",
+                                                    "storage.method"]
+    saved = bs.merge(saved, {"storage.source": "live", "storage.fstype": "live", "storage.options": "defaults",
+                             "storage.method": "systemd"})
+    assert [q["id"] for q in bs.pending(saved)] == ["storage.agent"]
+    saved = bs.merge(saved, {"storage.agent": "fsclient"})
+    steps = {s["id"]: s for s in bs.plan("<box-alias>", {}, saved["answers"])}
+    assert "setup mount <box-alias> --run" in steps["storage"]["action"]
+    assert "after fsclient.service" in steps["storage"]["action"] and "sudo -n" in steps["storage"]["action"]
+    assert "ttp machines change add" in steps["storage"]["action"]
+    assert steps["storage"]["check"].startswith("<plugin-root>/skills/setup-box/scripts/box.py setup mountcheck")
+    assert "--after-reboot" in steps["storage.reboot"]["check"] and "pending" in steps["storage.reboot"]["action"]
+    ids = [s["id"] for s in bs.plan("<box-alias>", {}, saved["answers"])]
+    assert ids.index("storage") < ids.index("storage.reboot") < ids.index("projects")
+    # The recorded first check survives other answers, and is dropped when the mount changes.
+    saved["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    assert bs.merge(saved, {"disk_guard": "10"})["storage_verify"]["boot_id"] == "b1"
+    assert "storage_verify" not in bs.merge(saved, {"storage.method": "fstab"})
+    # Only safe values: no spaces, quotes, specifiers or relative paths.
+    for qid, bad in (("storage", "rel/path"), ("storage", "/a b"), ("storage", "/"), ("storage", "/a/../b"),
+                     ("storage.source", "x'y"), ("storage.source", "a%b"), ("storage.options", "-o x"),
+                     ("storage.fstype", "NFS;rm"), ("storage.agent", "a b")):
+        with pytest.raises(ValueError):
+            bs.parse_value(bs.BY_ID[qid], bad)
+    for batch in bs.render_ask(bs.QUESTIONS, "<box-alias>", "<lock>", {}):
+        for q in batch:
+            assert len(q["header"]) <= 12 and 2 <= len(q["options"]) <= 4, q
+
+
+def test_setup_box_storage_unit_fstab_and_scripts_are_generic_and_parse(monkeypatch):
+    import shutil
+    import subprocess
+    _, st = _storage(monkeypatch)
+    for where, unit in (("/path/to/mount", "path-to-mount.mount"), ("/a-b//c/", "a\\x2db-c.mount"),
+                        ("/.hidden/x", "\\x2ehidden-x.mount"), ("/a:b_c.d", "a:b_c.d.mount")):
+        assert st.unit_name(where) == unit
+        if shutil.which("systemd-escape"):
+            out = subprocess.run(["systemd-escape", "--path", "--suffix=mount", where], capture_output=True, text=True)
+            assert out.stdout.strip() == unit, where
+    s = st.spec(MNT)
+    assert st.fstab_line(s["source"], s["where"], s["fstype"], "defaults") == \
+        "fileserver.example:/export /path/to/mount nfs4 defaults,_netdev,nofail 0 0"
+    assert st.mount_options("rw,nofail,_netdev") == "rw,nofail,_netdev"
+    text = st.unit_text(s["source"], s["where"], "nfs4", "rw", "fsclient")
+    assert "After=network-online.target fsclient.service" in text and "Wants=network-online.target fsclient.service" in text
+    assert "WantedBy=remote-fs.target" in text and "Options=rw,_netdev" in text and "Where=/path/to/mount" in text
+    assert "After=network-online.target\n" in st.unit_text("x:/y", "/m", "nfs", "defaults", "none")
+    for method in ("fstab", "systemd"):
+        m = dict(s, method=method, agent="fsclient")
+        assert subprocess.run(["bash", "-n", "-c", st.apply_script(m)]).returncode == 0
+        undo = st.undo_command("<box-alias>", m)
+        remote = shlex.split(undo)
+        assert remote[:2] == ["ssh", "<box-alias>"] and len(remote) == 3 and len(undo) <= 1000
+        root = shlex.split(remote[2])
+        assert root[:4] == ["sudo", "-n", "sh", "-c"] and subprocess.run(["sh", "-n", "-c", root[4]]).returncode == 0
+    probe = st.probe_script("/path/to/mount")
+    assert subprocess.run(["bash", "-n", "-c", probe]).returncode == 0
+    assert "mountpoint -q" in probe and "timeout" in probe and "sudo" not in probe and "boot_id" in probe
+
+
+def test_setup_box_storage_fstab_apply_is_idempotent_refuses_others_and_undo_removes_only_its_line(tmp_path, monkeypatch):
+    _, st = _storage(monkeypatch)
+    fstab, bin_ = tmp_path / "fstab", tmp_path / "bin"
+    bin_.mkdir()
+    fstab.write_text("UUID=root / ext4 defaults 0 1\n")
+    monkeypatch.setattr(st, "FSTAB", str(fstab))
+    for name, body in (("findmnt", f'for a; do m=$a; done; awk -v m="$m" \'$2==m {{f=1}} END {{exit !f}}\' {fstab}'),
+                       ("systemctl", f'echo "systemctl $*" >> {tmp_path}/log'),
+                       ("mountpoint", "exit 1"), ("mount", f'echo "mount $*" >> {tmp_path}/log'),
+                       ("umount", f'echo "umount $*" >> {tmp_path}/log')):
+        (bin_ / name).write_text("#!/bin/bash\n" + body + "\n")
+        (bin_ / name).chmod(0o755)
+    env = {"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    s = st.spec(dict(MNT, storage=str(tmp_path / "mnt")))
+    r = _bash(st.apply_script(s), env)
+    assert r.returncode == 0 and "fstab line added" in r.stdout, r.stderr
+    line = st.fstab_line(s["source"], s["where"], s["fstype"], s["options"])
+    assert fstab.read_text().splitlines() == ["UUID=root / ext4 defaults 0 1", line]
+    assert (tmp_path / "mnt").is_dir() and list(tmp_path.glob("fstab.setup-box.*"))   # a backup first
+    assert f"mount -- {tmp_path}/mnt" in (tmp_path / "log").read_text()
+    r = _bash(st.apply_script(s), env)
+    assert r.returncode == 0 and "already there" in r.stdout and fstab.read_text().count(line) == 1
+    other = dict(s, source="otherserver.example:/export")
+    r = _bash(st.apply_script(other), env)
+    assert r.returncode == 3 and "not changed" in r.stderr and "otherserver" not in fstab.read_text()
+    root = shlex.split(shlex.split(st.undo_command("<box-alias>", s))[2])[4]
+    assert _bash(root, env).returncode == 0
+    assert fstab.read_text() == "UUID=root / ext4 defaults 0 1\n"
+
+
+def _mount_box(tmp_path, monkeypatch, answers=None, replies=None):
+    """box.py setup mount|mountcheck in-process, with ssh answered from `replies` (a list of
+    (rc, stdout, stderr) or a callable taking the remote command)."""
+    import subprocess
+    bs, st = _storage(monkeypatch)
+    import box
+    site = tmp_path / "boxes.json"
+    if not site.exists():
+        site.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": {
+            "route": "bare", "workdir_root": "~/<w>", "setup": bs.merge({}, answers or MNT)}}}))
+    calls = []
+
+    def fake(alias, cmd, **kw):
+        calls.append(cmd)
+        rc, out, err = replies(cmd) if callable(replies) else replies.pop(0)
+        return subprocess.CompletedProcess(["ssh"], rc, out, err)
+    monkeypatch.setattr(box, "ssh_run", fake)
+
+    def run(*args):
+        return box.main(["--site", str(site), "setup", *args])
+    return run, calls, site
+
+
+def _probe_out(boot="b1", mounted=True, read=True, live="fileserver.example:/export nfs4",
+               fstab="fileserver.example:/export nfs4 defaults,_netdev,nofail", unit=""):
+    return (f"boot_id={boot}\nmounted={'yes' if mounted else 'no'}\n" + (f"read={'yes' if read else 'no'}\n" if mounted else "")
+            + f"live={live if mounted else ''}\nfstab={fstab}\nunit={unit}\n")
+
+
+def test_setup_box_mountcheck_verifies_now_records_the_boot_and_passes_only_after_a_reboot(tmp_path, monkeypatch, capsys):
+    replies = [(0, _probe_out(), "")]
+    run, calls, site = _mount_box(tmp_path, monkeypatch, replies=replies)
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 2       # no first check yet
+    assert "first" in capsys.readouterr().out and not calls
+    assert run("mountcheck", "<box-alias>") == 0
+    out = capsys.readouterr().out
+    assert "verdict: ok" in out and "pending" in out
+    rec = json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["storage_verify"]
+    assert rec["where"] == "/path/to/mount" and rec["boot_id"] == "b1"
+    for reply, rc, says in (((0, _probe_out("b1"), ""), 1, "has not rebooted"),
+                            ((255, "", "ssh: connect: no route"), 255, "ssh"),
+                            ((0, _probe_out("b2", mounted=False), ""), 2, "problems: mounted"),
+                            ((0, _probe_out("b2", read=False), ""), 2, "problems: read"),
+                            ((0, _probe_out("b2", fstab=""), ""), 2, "persistent"),
+                            ((0, _probe_out("b2", live="other.example:/x nfs4"), ""), 2, "problems: source"),
+                            ((0, _probe_out("b2"), ""), 0, "came back")):
+        replies.append(reply)
+        assert run("mountcheck", "<box-alias>", "--after-reboot") == rc, says
+        assert says in capsys.readouterr().out
+    # A later check now keeps the first boot id, so a pending post-reboot check is never reset.
+    replies.append((0, _probe_out("b1"), ""))
+    assert run("mountcheck", "<box-alias>") == 0
+    assert json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["storage_verify"]["boot_id"] == "b1"
+    replies.append((0, _probe_out(unit="disabled"), ""))
+    sysd = dict(MNT, **{"storage.method": "systemd", "storage.agent": "none"})
+    site.unlink()
+    run, _, _ = _mount_box(tmp_path, monkeypatch, answers=sysd, replies=replies)
+    assert run("mountcheck", "<box-alias>") == 1 and "path-to-mount.mount disabled" in capsys.readouterr().out
+
+
+def test_setup_box_mount_dry_run_live_values_sudo_refusal_and_the_ledger_line(tmp_path, monkeypatch, capsys):
+    import subprocess
+    live = dict(MNT, **{"storage.source": "live", "storage.fstype": "live"})
+    replies = [(0, _probe_out(mounted=False), "")]
+    run, calls, _ = _mount_box(tmp_path, monkeypatch, answers=live, replies=replies)
+    assert run("mount", "<box-alias>") == 1 and "mount it by hand once" in capsys.readouterr().out
+    replies.append((0, _probe_out(fstab=""), ""))
+    assert run("mount", "<box-alias>") == 0
+    out = capsys.readouterr().out
+    assert "dry run" in out and "fileserver.example:/export /path/to/mount nfs4 defaults,_netdev,nofail 0 0" in out
+    assert len(calls) == 2 and all("sudo" not in c for c in calls)     # a dry run only probes
+    ledger = next(ln for ln in out.splitlines() if "ttp machines change add" in ln).split(": ", 1)[1]
+    argv = shlex.split(ledger)
+    assert argv[:5] == ["ttp", "machines", "change", "add", "<box-alias>"] and argv[6] == "--undo"
+    assert argv[8] == "--until-probe" and argv[9].endswith("box.py setup mountcheck <box-alias> --after-reboot")
+    assert "close this entry" in argv[5] and subprocess.run(["sh", "-n", "-c", argv[9]]).returncode == 0
+    replies += [(0, _probe_out(fstab=""), ""), (1, "", "sudo: a password is required")]
+    assert run("mount", "<box-alias>", "--run") == 1
+    out = capsys.readouterr().out
+    assert "needs root" in out and "step for the user" in out and "ttp machines change add" in out
+    replies += [(0, _probe_out(fstab=""), ""), (0, "persistent: fstab line added", ""), (0, _probe_out(), "")]
+    assert run("mount", "<box-alias>", "--run") == 0
+    out = capsys.readouterr().out
+    assert calls[-2].startswith("sudo -n bash -c ") and "verdict: ok" in out and "record the change now" in out
+    none = dict(MNT, storage="none")
+    (tmp_path / "boxes.json").unlink()
+    run, _, _ = _mount_box(tmp_path, monkeypatch, answers=none, replies=[])
+    assert run("mount", "<box-alias>") == 1 and "mounts no shared storage" in capsys.readouterr().out
+
+
+def test_setup_box_storage_page_covers_ask_persist_verify_and_reboot():
+    page = (SKILLS / "setup-box" / "storage.md").read_text(encoding="utf-8")
+    for part in ("box.py setup mount <box-alias>", "--run", "_netdev", "nofail", "After=", "Wants=",
+                 "client agent", "mountpoint -q", "box.py setup mountcheck <box-alias> --after-reboot",
+                 "ttp machines change add", "--undo", "--until-probe", "sudo -n", "their privileges",
+                 "<server>:/<export>", "never reboot", "ttp machines change close"):
+        assert part in page, part
+    for doc in ("SKILL.md", "new-box.md"):
+        assert "`storage.md`" in (SKILLS / "setup-box" / doc).read_text(encoding="utf-8"), doc
 
 
 def _account(monkeypatch):
