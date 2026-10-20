@@ -1,12 +1,14 @@
 # Watchers
 
 `kind: command` schedules; scripts under `watchers/` in the harness.
-One JSON line per observation: `{"text", "severity", "repeat", "whole", "key", "episode"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet.
+One JSON line per observation: `{"text", "severity", "repeat", "whole", "key", "episode", "pin_severity"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet.
 Write a line as `<subject>: <item>; <item>`: each item is one issue (counts masked), an item may start with `now`, `still:`, `changed:` or `cleared:`, and `cleared: <item>` closes it.
 A JSON line with `"whole": true` is one observation instead: one issue for all the text after its subject, never split at `; ` (a long title is truncated); a leading `cleared:` closes it.
 An optional `"key"` (a short stable string) is the issue's identity instead of its text, so a changed text under the same key updates that issue and opens no new one.
 An optional `"episode"` on a keyed line names one occurrence of that condition (say its start time or a job id): a different non-empty episode closes the key's open or closed issue as `superseded by a new episode` and opens a new one, which wakes like any new issue (severity floor and mutes apply, the reraise window does not).
 The same episode, or none, changes nothing; an issue opened without one adopts the first it sees.
+Stepped alerts (a condition that escalates as it lasts, such as `down for over 1h`, then `over 2h`): keep one `key` for the condition and give each step its own `episode` (the step's threshold, plus the outage's start time if one key covers several outages), so each step wakes once even when a quiet run closed the issue in between; a step at a higher `severity` reopens and wakes without one, but a step at the same severity without a new episode within `screen.reraise_window_h` of a quiet run only counts.
+`"pin_severity": true` with a `severity` keeps that severity: Jev does not judge the line (no call is made) and no mute covers it, so it wakes whenever that severity reaches `screen.wake_min_severity`; use it only for lines that must never be lowered or muted (a box down for hours, data loss), since a pinned line costs a coordinator wake each time it opens or reopens. Without a `severity` it changes nothing.
 On a keyed line, text after the subject that starts with the word `cleared` (any case, colon optional: `cleared: X`, `cleared X`, `Cleared by ops`) is a clear: it closes the open issue under that key, if there is one, and never opens one, so `fleet gate: cleared: X` with key `X:cleared` raises nothing.
 Put the state after the item instead (`fleet gate: X cleared`).
 A leading `now`, `still` or `changed` is stripped and the keyed issue opens or updates as usual.

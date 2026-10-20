@@ -4589,7 +4589,8 @@ class Daemon:
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None,
-                         episode=obs.get("episode") if isinstance(obs.get("episode"), str) else None)
+                         episode=obs.get("episode") if isinstance(obs.get("episode"), str) else None,
+                         pin=not error and obs.get("pin_severity") is True)
             if kind == scr.RECEIPT:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
@@ -4786,11 +4787,11 @@ class Daemon:
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
                 repeat: bool = False, lifecycle: str | None = None, whole: bool = False,
-                key: str | None = None, episode: str | None = None) -> None:
+                key: str | None = None, episode: str | None = None, pin: bool = False) -> None:
         if not text.strip():
             return
         again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle, "whole": whole,
-                 "key": key, "episode": episode}
+                 "key": key, "episode": episode, "pin": pin}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")

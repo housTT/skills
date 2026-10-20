@@ -3296,3 +3296,91 @@ def test_a_failing_delivery_while_paused_is_logged_not_raised(env):
     d.tick()
     assert "tick step deliver_outbound error:" in (p.logs / "daemon.log").read_text()
     assert d._step_fails["deliver_outbound"][0] == 1
+
+
+def test_a_pinned_watcher_line_keeps_its_severity_through_jev_and_mutes(env, monkeypatch):
+    """"pin_severity": true keeps a command watcher line's severity: Jev is not asked (it could only
+    lower it) and no mute covers it; an unpinned line is still lowered and muted as before."""
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    p.set_config("jev.uses.screen", "on")
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+    d.jev = quiet = _FakeJev(0.1, 0.0)   # rates everything routine: would lower any line to info
+
+    def run(text, severity, key, pin):
+        out["stdout"] = json.dumps({"text": text, "severity": severity, "key": key,
+                                    **({"pin_severity": True} if pin else {})})
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    def wake(key):
+        fp = scr.key_fingerprint("watcher:hw", key)
+        return p.db.one("SELECT severity FROM events WHERE kind='observation' AND fingerprint=?", (fp,))
+
+    def issue(key):
+        return p.db.one("SELECT severity, status, screen FROM issues WHERE fingerprint=?",
+                        (scr.key_fingerprint("watcher:hw", key),))
+
+    run("box-a: down for 2.5h", "critical", "box-a down", pin=False)
+    assert quiet.calls == 1 and issue("box-a down")["severity"] == "info" and wake("box-a down") is None
+    run("box-b: down for 2.5h", "critical", "box-b down", pin=True)
+    assert quiet.calls == 1, "a pinned line costs no Jev call"
+    i = issue("box-b down")
+    assert (i["severity"], i["status"]) == ("critical", "open") and "pinned severity critical" in i["screen"]
+    assert wake("box-b down")["severity"] == "critical"
+    # A mute that covers the line silences the unpinned one only.
+    scr.mute(p.db, "watcher:hw", "link flapping", 4, "critical")
+    run("box-c: link flapping", "high", "box-c link", pin=False)
+    assert quiet.calls == 2 and wake("box-c link") is None
+    d.jev = None
+    run("box-d: link flapping", "high", "box-d link", pin=False)
+    assert wake("box-d link") is None and issue("box-d link")["severity"] == "high", "muted, not lowered"
+    run("box-e: link flapping", "high", "box-e link", pin=True)
+    assert wake("box-e link")["severity"] == "high"
+    # An issue Jev lowered before the line was pinned is raised back to the pinned severity and wakes.
+    d.jev = quiet
+    run("box-a: down for 3h", "critical", "box-a down", pin=True)
+    assert issue("box-a down")["severity"] == "critical" and wake("box-a down")["severity"] == "critical"
+    # pin_severity needs a severity: without one it changes nothing (Jev judges as before).
+    calls = quiet.calls
+    out["stdout"] = json.dumps({"text": "box-f: odd output", "key": "box-f odd", "pin_severity": True})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert quiet.calls == calls + 1 and issue("box-f odd")["severity"] == "info"
+
+
+def test_a_stepped_alert_re_raises_by_severity_or_by_episode_as_documented(env, monkeypatch):
+    """A keyed alert that steps up after quiet runs (references/watchers.md, stepped alerts): a raised
+    severity reopens and wakes; a step at the same severity wakes only with an episode of its own."""
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def run(text="", severity="high", key="box-a down", episode=None):
+        obs = {"text": text, "severity": severity, "key": key, **({"episode": episode} if episode else {})}
+        out["stdout"] = json.dumps(obs) if text else ""
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    run("box-a: down for 0.5h", "normal")
+    assert wakes() == 1
+    run()   # a quiet run closes it
+    run("box-a: down for 1h", "high")   # a higher step: reopens and wakes
+    assert wakes() == 2
+    run()
+    run("box-a: down for 2h", "high")   # the same severity within the reraise window: counted only
+    assert wakes() == 2
+    # The documented pattern: one episode per step (here the step's threshold), so each step wakes once.
+    for step in ("1h", "2h", "4h"):
+        run()
+        run(f"box-a: down for over {step}", "high", key="box-b down", episode=f"down>{step}")
+        run(f"box-a: down for over {step}", "high", key="box-b down", episode=f"down>{step}")
+    assert wakes() == 5
+    assert len(p.db.q("SELECT id FROM issues WHERE fingerprint LIKE ?",
+                      (scr.key_fingerprint("watcher:hw", "box-b down") + "%",))) == 3
