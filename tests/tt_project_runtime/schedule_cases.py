@@ -201,6 +201,11 @@ def test_issues_close_refuses_an_unknown_issue_an_empty_why_and_another_projects
     with pytest.raises(SystemExit):  # a run with no TTP_PROJECT cannot name a project either
         cli.main(["issues", "close", str(iid), "--why", "no project", "--project", "demo"])
     assert _gap_issue(p)["status"] == "open"
+    monkeypatch.chdir(p.base)  # no --project: the resolved project is named, never 'None'
+    with pytest.raises(SystemExit):
+        cli.main(["issues", "close", str(iid), "--why", "no project"])
+    err = capsys.readouterr().err
+    assert "None" not in err and ("demo" in err or str(p.base) in err)
     monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-project"))
     monkeypatch.setenv("TTP_TASK", "7")
     with pytest.raises(SystemExit):

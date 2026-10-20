@@ -4465,7 +4465,7 @@ def cmd_issues(a) -> None:
         return
     own = os.environ.get("TTP_PROJECT")
     if os.environ.get("TTP_RUN_DIR") and (not own or Path(own).resolve() != Path(p.base).resolve()):
-        die(f"a run may close only its own project's issues, not {a.project}'s")
+        die(f"a run may close only its own project's issues, not {p.name or p.base}'s")
     if a.why is None or not a.why.strip():
         die("ttp issues close: --why <reason> is required and must not be empty")
     task = os.environ.get("TTP_TASK")
