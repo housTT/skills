@@ -509,6 +509,34 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     return (theirs[key], head) if key in theirs else None
 
 
+def on_push_branch(p, branch: str) -> tuple[str, str] | None:
+    """(commit on the push branch, branch head) when `branch` already is on the push branch as it
+    stands (a plain landing, which equivalent leaves out): its head is an ancestor of the tip (the
+    commit is its head), or each of its commits has an equivalent there (on_branch: patch-id, the same
+    author, date and subject, or a replay trailer; the commit is the match of its top one by author,
+    date and subject, else the tip). None when it is not, it has no commit of its own (its head is
+    where it was created), or it cannot be read. Local refs only: no fetch."""
+    repo = p.root
+    head = _commit(repo, f"refs/heads/{branch}")
+    try:
+        tip = _commit(repo, _push_ref(p, repo))
+    except ValueError:
+        return None
+    if not head or not tip or head == _start(repo, branch):
+        return None
+    if _git(repo, "merge-base", "--is-ancestor", head, tip).returncode == 0:
+        return head, head
+    if not on_branch(repo, head, tip):
+        return None
+    base = _git(repo, "merge-base", tip, head).stdout.strip()
+    fmt = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
+    top = _key(_git(repo, "log", "-1", fmt, head).stdout.strip())
+    for ln in _git(repo, "log", "--no-merges", fmt, f"{base}..{tip}").stdout.splitlines():
+        if top and (k := _key(ln)) and k[1] == top[1]:
+            return k[0], head
+    return tip, head
+
+
 def superseded(db, tids) -> dict[int, list[tuple[str, str]]]:
     """{task: [(recorded head, sha)]} of record_superseded for tasks `tids`."""
     tids = [int(t) for t in tids]

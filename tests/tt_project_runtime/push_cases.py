@@ -450,6 +450,87 @@ def test_a_task_whose_change_landed_under_another_commit_gets_no_review_or_fix(e
     closed()
 
 
+def test_a_reviewed_task_whose_branch_already_is_on_the_push_branch_closes_as_landed(env, monkeypatch):
+    """A code task whose review passed but pushed nothing, because its branch already is on the push
+    branch (pushed or fast-forwarded as is, or rebased there with the same author, date and subject),
+    is closed as landed by the review sweep, the landed commit recorded. A review that failed, asked
+    for changes, still runs or pushed, and a branch not on the push branch, leave it in review."""
+    from ttp import landed
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    d = Daemon(p.base)
+
+    def task(name):
+        tid, path, branch = _code_task(p, name, status="review")
+        p.db.update_task(tid, result=json.dumps({"status": "done", "summary": f"made {name}"}))
+        _commit(path, f"{name}.txt", f"{name}\n")
+        _ran(p, tid, time.time() - 1900)
+        return tid, path, branch, _git_out(path, "rev-parse", "HEAD")
+
+    def review(tid, status, result=None):
+        rid = p.db.add_task(f"Review #{tid}", "Review it.", kind="review", origin="coordinator", depends_on=[tid])
+        p.db.update_task(rid, status=status, result=json.dumps(result or {"status": status, "summary": "ok"}))
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() + 1, rid))
+        return rid
+
+    def status(tid):
+        return p.db.task(tid)["status"]
+
+    # Not on the push branch yet: a passed review leaves it in review (the push queue's to ship).
+    tid, path, branch, head = task("plain")
+    rid = review(tid, "done")
+    assert landed.on_push_branch(p, branch) is None
+    _sweep(d)
+    assert status(tid) == "review" and not landed.superseded(p.db, [tid])
+    # Pushed as is (a plain landing): an ancestor of the tip, which equivalent leaves out.
+    _git_out(path, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    assert landed.equivalent(p, branch, None) is None and landed.on_push_branch(p, branch) == (head, head)
+    for bad in ("failed", "running", "queued"):
+        p.db.update_task(rid, status=bad)
+        _sweep(d)
+        assert status(tid) == "review", bad
+    p.db.update_task(rid, status="done", result=json.dumps({"status": "done", "metrics": {"verdict": "changes needed"}}))
+    _sweep(d)
+    assert status(tid) == "review", "a review that asked for changes"
+    p.db.update_task(rid, result=json.dumps({"status": "done", "summary": "ok"}))
+    late = review(tid, "failed")
+    _sweep(d)
+    assert status(tid) == "review", "a later review failed"
+    p.db.update_task(late, status="cancelled")
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (rid, branch, head, "origin/proj", "failed", time.time(), time.time()))
+    _sweep(d)
+    assert status(tid) == "review", "a review that pushed is the push queue's to settle"
+    p.db.x("DELETE FROM push_queue WHERE task=?", (rid,))
+    _sweep(d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["landed_as"] == head
+    assert landed.superseded(p.db, [tid]) == {tid: [(head, head)]}
+    (e,) = p.db.q("SELECT status, text FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert e["status"] == "handled" and "already is on origin/proj" in e["text"]
+    _sweep(d)
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind='task_done' AND task=?", (tid,))) == 1, "once"
+    # Rebased there under the same author, date and subject, with a touch-up: patch-ids and changed
+    # lines differ, so only the commit's identity finds it.
+    tid, path, branch, head = task("rebased")
+    rid = review(tid, "done")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    _commit(other, "neighbour.txt", "someone else\n")
+    _git_out(other, "fetch", "-q", repo, branch)
+    _git_out(other, "cherry-pick", "FETCH_HEAD")
+    (other / "rebased.txt").write_text("rebased, touched up\n")
+    _git_out(other, "commit", "-q", "--amend", "--no-edit", "-a")
+    relanded = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    assert landed.equivalent(p, branch, None) is None
+    assert landed.on_push_branch(p, branch) == (relanded, head)
+    _sweep(d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["landed_as"] == relanded
+
+
 def test_backup_remote_refuses_to_name_a_branch(env):
     p = make(env)
     from ttp import coordinator as coord, push

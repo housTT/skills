@@ -8115,24 +8115,73 @@ class Daemon:
         if not found:
             return ""
         sha, head = found
-        db, now = self.p.db, time.time()
         line = (f"its change already landed on {d['push_branch']} as {sha[:10]} under another commit (the same "
                 f"changed lines, version files aside): branch {branch} at {head[:10]} is superseded")
+        if self._close_superseded(task, sha, head, line, "superseded_by", "task_superseded", True,
+                                  lambda closed: f"#{task['id']} {task['title']}: {line}; "
+                                                 + ("closed as done; " if closed else "")
+                                                 + "no review or fix queued for it.") is not None:
+            log(self.p, f"task {task['id']}: superseded by {sha[:10]}; no review or fix queued")
+        return sha
+
+    def _close_superseded(self, task: dict, sha: str, head: str, line: str, key: str, kind: str, queued: bool,
+                          text) -> bool | None:
+        """Record commit `sha` on the push branch as carrying code task `task` at branch head `head`
+        (task_superseded), and close the task as done if it is still in 'review', its result naming
+        `sha` under `key` and its summary ending in `line`; one `kind` event with `text(closed)`. None
+        when that head and commit were recorded before (nothing done), else whether it closed it."""
+        db, now = self.p.db, time.time()
         with db.tx():
             if not db.conn.execute("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) "
                                    "ON CONFLICT DO NOTHING", (task["id"], head, sha, now)).rowcount:
-                return sha
+                return None
             prev = load_result((db.task(task["id"]) or task).get("result"))
-            result = {**prev, "status": "done", "superseded_by": sha,
+            result = {**prev, "status": "done", key: sha,
                       "summary": f"{str(prev.get('summary') or '').rstrip()} ({line})".strip()[:1500]}
-            closed = db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
-                                     "WHERE id=? AND status='review'", (dump_result(result), now, task["id"])).rowcount
+            closed = bool(db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
+                                          "WHERE id=? AND status='review'",
+                                          (dump_result(result), now, task["id"])).rowcount)
             db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                            (now, f"task:{task['id']}", "task_superseded", "normal",
-                             f"#{task['id']} {task['title']}: {line}; "
-                             + ("closed as done; " if closed else "") + "no review or fix queued for it.",
-                             "queued", task["id"]))
-        log(self.p, f"task {task['id']}: superseded by {sha[:10]}; no review or fix queued")
+                            (now, f"task:{task['id']}", kind, "normal", text(closed),
+                             "queued" if queued else "handled", task["id"]))
+            if closed and not queued:
+                pushq._reply(db, task, "done", result["summary"])
+        return closed
+
+    def _reviewed_on_push_branch(self, task: dict, reviews: list[dict], covers: dict[int, set[int]],
+                                 since: float) -> str:
+        """Close code task `task`, left in 'review', whose review passed but pushed nothing because its
+        branch already is on the push branch (landed.on_push_branch: pushed or fast-forwarded as is,
+        or rebased there): every review covering it (`covers`) since it entered review (`since`) is
+        done, passed (no rejecting verdict) and has no push-queue rows, and there is at least one. The
+        landed commit is recorded (task_superseded) and named in its result. Returns it, or "": a
+        review that failed, asked for changes, still runs or pushed leaves the task alone (the push
+        queue settles a pushed one, pushq.settle_reviewed)."""
+        d = self.cfg.get("delivery") or {}
+        branch = task.get("branch")
+        if task.get("kind") != "code" or not branch or not d.get("push_branch"):
+            return ""
+        mine = [r for r in reviews if task["id"] in covers.get(r["id"], set())
+                and (r["status"] not in ("done", "failed") or float(r["updated"] or 0) >= since)]
+        if not mine or any(r["status"] != "done" or review_rejects(load_result(r["result"])) for r in mine):
+            return ""
+        db = self.p.db
+        if db.one("SELECT 1 FROM push_queue WHERE task IN (%s)" % ",".join("?" * len(mine)), [r["id"] for r in mine]):
+            return ""
+        try:
+            found = landed.on_push_branch(self.p, branch)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: could not look for its branch on the push branch: {e}")
+            return ""
+        if not found:
+            return ""
+        sha, head = found
+        line = (f"review #{mine[-1]['id']} passed and its branch {branch} at {head[:10]} already is on "
+                f"{d['push_branch']} as {sha[:10]}: landed, nothing to push")
+        if self._close_superseded(task, sha, head, line, "landed_as", "task_done", False,
+                                  lambda closed: f"#{task['id']} {task['title']} → "
+                                                 + ("done" if closed else "recorded") + f" ({line})") is not None:
+            log(self.p, f"task {task['id']}: reviewed and already on the push branch as {sha[:10]}; closed")
         return sha
 
     def check_unqueued_continues(self) -> None:
@@ -8237,7 +8286,8 @@ class Daemon:
         gets its review (_auto_review), so a hand-off with notes the coordinator queued no review for
         does not sit there. It only queues reviews and never closes or changes a task, except one
         whose change already landed under other commits (_landed_elsewhere): that one is closed as
-        superseded, with no review. Coverage here
+        superseded, with no review; and one whose review passed but pushed nothing as its branch already
+        is on the push branch (_reviewed_on_push_branch): that one is closed as landed. Coverage here
         is direct (pushq._covers without following continues:<id>): a continuation need not carry the
         task's commits, so a task whose continuation passed review stays in review and gets its own
         review (known gap: one review each, no work lost)."""
@@ -8274,9 +8324,15 @@ class Daemon:
                 # task is closed as superseded (it may have had its say from a review already).
                 if self._landed_elsewhere(t):
                     continue
+                start = float(since.get(t["id"]) or 0)
+                for r in reviews:
+                    if r["id"] not in covers:
+                        covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
+                # A review that passed but pushed nothing, as the branch already is on the push branch.
+                if self._reviewed_on_push_branch(t, reviews, covers, start):
+                    continue
                 # A review that ran or still runs since the task entered review had its say: what it
                 # found is the coordinator's (or the push queue's) to act on, not a second review's.
-                start = float(since.get(t["id"]) or 0)
                 seen = False
                 for r in reviews:
                     if r["id"] not in covers:
