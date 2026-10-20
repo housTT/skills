@@ -1841,7 +1841,7 @@ def test_setup_box_storage_asks_once_then_plans_persist_verify_now_and_after_reb
     assert "after fsclient.service" in steps["storage"]["action"] and "sudo -n" in steps["storage"]["action"]
     assert "ttp machines change add" in steps["storage"]["action"]
     assert steps["storage"]["check"].startswith("<plugin-root>/skills/setup-box/scripts/box.py setup mountcheck")
-    assert "--after-reboot" in steps["storage.reboot"]["check"] and "pending" in steps["storage.reboot"]["action"]
+    assert "--after-reboot" in steps["storage.reboot"]["check"] and "--rebooted" in steps["storage.reboot"]["action"]
     ids = [s["id"] for s in bs.plan("<box-alias>", {}, saved["answers"])]
     assert ids.index("storage") < ids.index("storage.reboot") < ids.index("projects")
     # The recorded first check survives other answers, and is dropped when the mount changes.
@@ -1920,7 +1920,7 @@ def test_setup_box_storage_fstab_apply_is_idempotent_refuses_others_and_undo_rem
     assert fstab.read_text() == "UUID=root / ext4 defaults 0 1\n"
 
 
-def _mount_box(tmp_path, monkeypatch, answers=None, replies=None):
+def _mount_box(tmp_path, monkeypatch, answers=None, replies=None, alias="<box-alias>"):
     """box.py setup mount|mountcheck in-process, with ssh answered from `replies` (a list of
     (rc, stdout, stderr) or a callable taking the remote command)."""
     import subprocess
@@ -1928,7 +1928,7 @@ def _mount_box(tmp_path, monkeypatch, answers=None, replies=None):
     import box
     site = tmp_path / "boxes.json"
     if not site.exists():
-        site.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": {
+        site.write_text(json.dumps({"version": 1, "boxes": {alias: {
             "route": "bare", "workdir_root": "~/<w>", "setup": bs.merge({}, answers or MNT)}}}))
     calls = []
 
@@ -1959,20 +1959,26 @@ def test_setup_box_mountcheck_verifies_now_records_the_boot_and_passes_only_afte
     assert "verdict: ok" in out and "pending" in out
     rec = json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["storage_verify"]
     assert rec["where"] == "/path/to/mount" and rec["boot_id"] == "b1"
-    for reply, rc, says in (((0, _probe_out("b1"), ""), 1, "has not rebooted"),
-                            ((255, "", "ssh: connect: no route"), 255, "ssh"),
-                            ((0, _probe_out("b2", mounted=False), ""), 2, "problems: mounted"),
-                            ((0, _probe_out("b2", read=False), ""), 2, "problems: read"),
-                            ((0, _probe_out("b2", fstab=""), ""), 2, "persistent"),
-                            ((0, _probe_out("b2", live="other.example:/x nfs4"), ""), 2, "problems: source"),
-                            ((0, _probe_out("b2"), ""), 0, "came back")):
-        replies.append(reply)
-        assert run("mountcheck", "<box-alias>", "--after-reboot") == rc, says
-        assert says in capsys.readouterr().out
     # A later check now keeps the first boot id, so a pending post-reboot check is never reset.
     replies.append((0, _probe_out("b1"), ""))
     assert run("mountcheck", "<box-alias>") == 0
     assert json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["storage_verify"]["boot_id"] == "b1"
+    # Each failure after a reboot makes that boot the baseline, so each case comes on a boot of its own.
+    for n, (reply, rc, says) in enumerate((((0, _probe_out("b1"), ""), 1, "has not rebooted"),
+                                           ((255, "", "ssh: connect: no route"), 255, "connection to <box-alias>"),
+                                           ((124, "", "timed out after 60s"), 124, "no answer from <box-alias>"),
+                                           ((0, _probe_out("b2", mounted=False), ""), 2, "problems: mounted"),
+                                           ((0, _probe_out("b3", read=False), ""), 2, "problems: read"),
+                                           ((0, _probe_out("b4", fstab=""), ""), 2, "persistent"),
+                                           ((0, _probe_out("b5", live="other.example:/x nfs4"), ""), 2,
+                                            "problems: source"),
+                                           ((0, _probe_out("b6"), ""), 0, "came back"))):
+        replies.append(reply)
+        assert run("mountcheck", "<box-alias>", "--after-reboot") == rc, says
+        out, err = capsys.readouterr()
+        assert says in (err if rc in (124, 255) else out), (n, out, err)
+    replies.append((0, _probe_out("b1").replace("mounted=yes", "mounted=hung"), ""))
+    assert run("mountcheck", "<box-alias>") == 1 and "a hung mount" in capsys.readouterr().out
     replies.append((0, _probe_out(unit="disabled"), ""))
     sysd = dict(MNT, **{"storage.method": "systemd", "storage.agent": "none"})
     site.unlink()
@@ -1980,11 +1986,89 @@ def test_setup_box_mountcheck_verifies_now_records_the_boot_and_passes_only_afte
     assert run("mountcheck", "<box-alias>") == 1 and "path-to-mount.mount disabled" in capsys.readouterr().out
 
 
+def test_setup_box_post_reboot_check_needs_a_reboot_after_a_failure_or_a_new_mount(tmp_path, monkeypatch, capsys):
+    """A failed post-reboot check, a fix in the same boot and a fresh check never pass without another reboot."""
+    replies = [(0, _probe_out("b1"), "")]
+    run, _, site = _mount_box(tmp_path, monkeypatch, replies=replies)
+
+    def rec():
+        return json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["storage_verify"]
+    assert run("mountcheck", "<box-alias>") == 0 and rec()["boot_id"] == "b1"
+    replies.append((0, _probe_out("b2", mounted=False), ""))
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 2 and rec()["boot_id"] == "b2"
+    # Fixed in boot b2 (re-run mount, or mounted by hand): the post-reboot check stays pending until b3.
+    replies += [(0, _probe_out("b2", fstab=""), ""), (0, "persistent: fstab line added", ""), (0, _probe_out("b2"), "")]
+    assert run("mount", "<box-alias>", "--run") == 0
+    replies.append((0, _probe_out("b2"), ""))
+    assert run("mountcheck", "<box-alias>") == 0 and rec() == {**rec(), "boot_id": "b2"} and "failed" not in rec()
+    capsys.readouterr()
+    replies.append((0, _probe_out("b2"), ""))
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 1 and "has not rebooted" in capsys.readouterr().out
+    replies.append((0, _probe_out("b3"), ""))
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 0
+    # A failure then a now-check (no mount --run) in the same boot: also pending until the next boot.
+    replies += [(0, _probe_out("b4", read=False), ""), (0, _probe_out("b4"), ""), (0, _probe_out("b4"), ""),
+                (0, _probe_out("b5"), "")]
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 2 and rec()["failed"] == "read"
+    assert run("mountcheck", "<box-alias>") == 0 and "failed" not in rec()
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 1
+    assert run("mountcheck", "<box-alias>", "--after-reboot") == 0
+    # A successful mount --run always starts a new baseline, even with one pending from an older boot.
+    replies += [(0, _probe_out("b6", fstab=""), ""), (0, "ok", ""), (0, _probe_out("b6"), "")]
+    assert run("mount", "<box-alias>", "--run") == 0 and rec()["boot_id"] == "b6"
+
+
+def test_setup_box_mount_ledger_probe_fits_the_change_ledger_contract(tmp_path, monkeypatch, capsys):
+    """The printed --until-probe, run as the daemon runs it (shell, stdout dropped): 1 before a reboot,
+    0 after one whatever the mount does, and an ssh failure the ledger confirms as the box unreachable."""
+    import subprocess
+    sys.path.insert(0, str(RUNTIME.parent))
+    from ttp import netwait
+    replies = [(0, _probe_out("b1", fstab=""), "")]
+    run, _, site = _mount_box(tmp_path, monkeypatch, replies=replies, alias="box-a")
+    assert run("mount", "box-a") == 0
+    probe = shlex.split(next(ln for ln in capsys.readouterr().out.splitlines()
+                             if "ttp machines change add" in ln).split(": ", 1)[1])[9]
+    assert "ssh" not in shlex.split(probe) and "--rebooted" in probe
+    data = json.loads(site.read_text())
+    data["boxes"]["box-a"]["setup"]["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    site.write_text(json.dumps(data))
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(f"#!/bin/bash\n[ -e {tmp_path}/down ] && {{ echo 'kex_exchange_identification: "
+                              f"read: Connection reset by peer' >&2; exit 255; }}\n"
+                              f'[[ "${{@: -1}}" == *boot_id* ]] || exit 9\ncat {tmp_path}/boot\n')
+    (bin_ / "ssh").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "TTP_BOXES_FILE"}
+    env["PATH"] = f"{bin_}:/usr/bin:/bin"
+
+    def daemon_run():
+        r = subprocess.run(probe, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                           timeout=60, env=env)
+        return r.returncode, r.stderr
+    (tmp_path / "boot").write_text("b1\n")
+    assert daemon_run()[0] == 1                       # no reboot yet: not over
+    (tmp_path / "down").write_text("")
+    rc, err = daemon_run()                            # rebooting: ssh's own 255, the box named on stderr
+    assert rc == 255 and netwait.hosts(probe, err) == ["box-a"], err
+    assert netwait.confirm(probe, err, lambda h: False) == ""   # unreachable, not a broken probe
+    assert netwait.confirm(probe, err, lambda h: True).startswith("exit 255 though ssh reaches box-a")
+    (tmp_path / "down").unlink()
+    (tmp_path / "boot").write_text("b2\n")
+    assert daemon_run()[0] == 0                       # rebooted: due, whether the mount came back or not
+    assert json.loads(site.read_text())["boxes"]["box-a"]["setup"]["storage_verify"]["boot_id"] == "b1"
+    # No first check recorded: exit 2, which the ledger reports as a broken probe, with the reason on stderr.
+    data["boxes"]["box-a"]["setup"].pop("storage_verify")
+    site.write_text(json.dumps(data))
+    rc, err = daemon_run()
+    assert rc == 2 and "no first check" in err
+
+
 def test_setup_box_mount_dry_run_live_values_sudo_refusal_and_the_ledger_line(tmp_path, monkeypatch, capsys):
     import subprocess
     live = dict(MNT, **{"storage.source": "live", "storage.fstype": "live"})
     replies = [(0, _probe_out(mounted=False), "")]
-    run, calls, _ = _mount_box(tmp_path, monkeypatch, answers=live, replies=replies)
+    run, calls, site = _mount_box(tmp_path, monkeypatch, answers=live, replies=replies)
     assert run("mount", "<box-alias>") == 1 and "mount it by hand once" in capsys.readouterr().out
     replies.append((0, _probe_out(fstab=""), ""))
     assert run("mount", "<box-alias>") == 0
@@ -1994,8 +2078,12 @@ def test_setup_box_mount_dry_run_live_values_sudo_refusal_and_the_ledger_line(tm
     ledger = next(ln for ln in out.splitlines() if "ttp machines change add" in ln).split(": ", 1)[1]
     argv = shlex.split(ledger)
     assert argv[:5] == ["ttp", "machines", "change", "add", "<box-alias>"] and argv[6] == "--undo"
-    assert argv[8] == "--until-probe" and argv[9].endswith("box.py setup mountcheck <box-alias> --after-reboot")
-    assert "close this entry" in argv[5] and subprocess.run(["sh", "-n", "-c", argv[9]]).returncode == 0
+    probe = shlex.split(argv[9])
+    assert argv[8] == "--until-probe" and probe[0].endswith("box.py") and probe[1:3] == ["--site", str(site)]
+    assert probe[3:] == ["setup", "mountcheck", "<box-alias>", "--rebooted"] and len(argv) == 10
+    # The ledger makes a probe-only entry due after 7 days with no reboot: its text says to check, not undo.
+    assert "7 days" in argv[5] and "--after-reboot" in argv[5] and "storage.md" in argv[5] and "keep it" in argv[5]
+    assert subprocess.run(["sh", "-n", "-c", argv[9]]).returncode == 0
     replies += [(0, _probe_out(fstab=""), ""), (1, "", "sudo: a password is required")]
     assert run("mount", "<box-alias>", "--run") == 1
     out = capsys.readouterr().out

@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 FSTAB = "/etc/fstab"
 UNIT_DIR = "/etc/systemd/system"
 READ_TIMEOUT_S = 20
+BOOT_ID_SCRIPT = "cat /proc/sys/kernel/random/boot_id"   # the ledger's probe reads only this
 _SPEC = re.compile(r"^[A-Za-z0-9._:/@=,+-]+$")
 _FSTYPE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _UNIT = re.compile(r"^[A-Za-z0-9@._:-]+$")
@@ -160,14 +161,15 @@ def undo_command(alias: str, s: dict) -> str:
 
 
 def probe_script(where: str) -> str:
-    """Read-only, as the user: boot id, mounted, a read under a timeout, fstab entry, unit state."""
+    """Read-only, as the user: boot id, mounted and a read (each under a timeout, so a hung mount shows as
+    one), fstab entry, unit state."""
     unit = shlex.quote(unit_name(where))
     return (
         f"mp={shlex.quote(where)}; "
         'echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; '
-        'if mountpoint -q -- "$mp"; then echo mounted=yes; '
+        f'if timeout {READ_TIMEOUT_S} mountpoint -q -- "$mp"; then echo mounted=yes; '
         f'if timeout {READ_TIMEOUT_S} ls -A -- "$mp" >/dev/null 2>&1; then echo read=yes; else echo read=no; fi; '
-        "else echo mounted=no; fi; "
+        'elif [ "$?" -eq 124 ]; then echo mounted=hung; else echo mounted=no; fi; '
         'echo "live=$(findmnt -rn -o SOURCE,FSTYPE --mountpoint "$mp" 2>/dev/null | head -n1)"; '
         'echo "fstab=$(findmnt --fstab -rn -o SOURCE,FSTYPE,OPTIONS --mountpoint "$mp" 2>/dev/null | head -n1)"; '
         f'echo "unit=$(systemctl is-enabled {unit} 2>/dev/null)"; true'
@@ -184,7 +186,10 @@ def judge(s: dict, probe: dict) -> "tuple[List[str], List[str]]":
     lines: List[str] = []
     problems: List[str] = []
     where = s["where"]
-    if probe.get("mounted") != "yes":
+    if probe.get("mounted") == "hung":
+        problems.append("mounted")
+        lines.append(f"mounted: `mountpoint -q {where}` took over {READ_TIMEOUT_S}s (a hung mount)")
+    elif probe.get("mounted") != "yes":
         problems.append("mounted")
         lines.append(f"mounted: no, nothing is mounted at {where}")
     else:
@@ -213,7 +218,10 @@ def judge(s: dict, probe: dict) -> "tuple[List[str], List[str]]":
     return lines, problems
 
 
-def change_what(s: dict) -> str:
+def change_what(alias: str, s: dict) -> str:
+    """The ledger entry's text. Its until-probe turns it due once the box rebooted, and the ledger makes a
+    probe-only entry due after 7 days anyway: either way the reader runs the check, never the undo."""
     how = "a systemd .mount unit" if s["method"] == "systemd" else f"an {FSTAB} line"
-    return (f"setup-box: shared storage at {s['where']} mounted at boot through {how}; keep it. Its until-probe is "
-            "the pending post-reboot check: once it passes, close this entry; the undo only removes the mount")
+    return (f"setup-box: shared storage at {s['where']} mounted at boot through {how}; keep it. Due (rebooted, or "
+            f"7 days up): run `box.py setup mountcheck {alias} --after-reboot` and act on its exit as setup-box "
+            "storage.md says; the undo only removes the mount")

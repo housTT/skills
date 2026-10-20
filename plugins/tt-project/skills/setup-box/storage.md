@@ -42,24 +42,34 @@ box.py setup mount <box-alias> --run    # runs the root script with sudo -n, the
   sudo, nothing changes: report it to the user as a step needing their privileges, with the root
   script the dry run printed.
 - Record the live change in the same run, with the line `mount` prints:
-  `ttp machines change add <box-alias> "<what>" --undo "<cmd>" --until-probe "<post-reboot check>"`.
-  The undo unmounts and removes only what was added.
+  `ttp machines change add <box-alias> "<what>" --undo "<cmd>" --until-probe "box.py setup mountcheck <box-alias> --rebooted"`.
+  The undo unmounts and removes only what was added. A successful `--run` makes this boot the
+  baseline the post-reboot check compares against.
 
 ## 3. Verify now
 
-`box.py setup mountcheck <box-alias>`: `mountpoint -q`, a read of the mount point under a timeout,
-the mounted source against the saved one, and the fstab entry or the unit enabled. Exit 0 ok,
-1 a problem, 255 ssh failed. A pass records the box's boot id in the site file.
+`box.py setup mountcheck <box-alias>`: `mountpoint -q` and a read of the mount point, each under a
+timeout (a hung mount is a problem, not an ssh failure), the mounted source against the saved one,
+and the fstab entry or the unit enabled. Exit 0 ok, 1 a problem, 124 no answer in time, 255 ssh
+failed (errors go to stderr). A first pass records the box's boot id in the site file as the
+baseline; a later pass keeps it, unless the last post-reboot check failed.
 
 ## 4. Verify after the next reboot
 
-`box.py setup mountcheck <box-alias> --after-reboot` (read-only): 0 the box rebooted since the
-first check and the mount came back, 1 no reboot yet, 2 failed after a reboot (or no first check),
-255 ssh failed.
+`box.py setup mountcheck <box-alias> --after-reboot`: 0 the box rebooted since the baseline and the
+mount came back, 1 no reboot yet, 2 failed after a reboot (or no first check), 124 no answer in time,
+255 ssh failed. A failure makes that boot the new baseline, so a fix or a mount by hand in the same
+boot never passes it: only the next reboot does.
 
-- It stays pending as the change entry's `--until-probe`, so no task waits for it; never reboot a
-  shared box only to run it.
-- Once it passes the entry turns due: check the output, keep the mount and close the entry
-  (`ttp machines change close <id>`). Run the undo only if the mount is no longer wanted.
-- A failure after a reboot: fix the cause (network order, the agent service, the options), run
-  `mount --run` again and repeat the checks.
+- The change entry's `--until-probe` is `mountcheck --rebooted`, which reads only the boot id and
+  never the mount: 0 the box rebooted (the entry turns due, whatever the result), 1 not yet, 255 ssh
+  could not reach the box (it names the box on stderr, so the ledger counts it as down while it
+  reboots, not as a broken probe). No task waits for it; never reboot a shared box only to run it.
+- When the entry turns due, run `--after-reboot` and act on its exit. Never run the undo for a
+  mount that is still wanted:
+  - 0: keep the mount and close the entry (`ttp machines change close <id>`).
+  - 1: the ledger made the entry due after 7 days with no reboot. The persistent entry was checked
+    in step 3: close the entry and keep the mount. The baseline stays in the site file, so
+    `--after-reboot` still proves the next reboot whenever it is run.
+  - 2: fix the cause (network order, the agent service, the options), run `mount --run` again,
+    close the entry and record the new line it prints, then repeat the checks.
