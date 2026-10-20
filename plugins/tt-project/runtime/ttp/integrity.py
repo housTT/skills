@@ -6,7 +6,9 @@ The harness repository gets a bounded `git fsck --connectivity-only`; its charte
 entries and memory index are checked for the marks of a cut write (empty, NUL bytes, cut short)
 and put back from the harness's last commit (the config from its last good copy). Task worktrees
 of unfinished tasks get a `git status`; one that fails is reported, never repaired. The user's own
-repositories are never fsck'd.
+repositories are never fsck'd. Every kept task worktree's repository must still have its .git
+directory (a copied or restored project can bring the folders without it), and a project.json
+made on another machine is reported once: its machine-specific settings may not hold here.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import Project, durable_write
+from .project import Project, durable_write, hostname
 
 FSCK_TIMEOUT_S = 20
 STATUS_TIMEOUT_S = 10
@@ -196,10 +198,47 @@ def check_worktrees(paths: list[tuple[int, Path]]) -> list[dict]:
     return bad
 
 
-def check(p: Project, worktrees: list[tuple[int, Path]] = ()) -> dict:
+def check_clones(paths: list[tuple[int, Path]]) -> list[dict]:
+    """Repositories of kept task worktrees that have no .git directory ({"repo", "tasks", "empty"}):
+    an empty or partly copied clone the worktrees can no longer work from. Reads files only."""
+    from .worktree import _repo_of
+    bad: dict[str, dict] = {}
+    for task, path in paths:
+        repo = _repo_of(path) if path.exists() else None
+        if repo is None or (repo / ".git").is_dir():
+            continue
+        try:
+            empty = not any(repo.iterdir())
+        except OSError:
+            empty = True
+        bad.setdefault(str(repo), {"repo": str(repo), "tasks": [], "empty": empty})["tasks"].append(task)
+    return list(bad.values())
+
+
+def host_change(p: Project) -> dict | None:
+    """{"was", "now"} when project.json names another machine than this one, else None."""
+    try:
+        was = p.raw_config().get("host")
+    except Exception:
+        return None
+    now = hostname()
+    return {"was": was, "now": now} if isinstance(was, str) and was and was != now else None
+
+
+def host_text(change: dict) -> str:
+    return (f"This project was set up on machine '{change['was']}' but its daemon now runs on "
+            f"'{change['now']}': the project folder was moved, copied or restored. Check its machine-specific "
+            f"settings (runners, machines, ssh aliases, paths) and its repositories, then set project.json's "
+            f"host to '{change['now']}' to confirm the move.")[:2000]
+
+
+def check(p: Project, worktrees: list[tuple[int, Path]] = (), kept: list[tuple[int, Path]] = ()) -> dict:
+    """`worktrees`: unfinished tasks' worktrees, `git status`ed; `kept`: every kept task worktree,
+    whose repository must have its .git directory."""
     t0 = time.monotonic()
     out = check_harness(p)
     out["worktrees"] = check_worktrees(list(worktrees))
+    out["clones"] = check_clones(list(kept))
     out["seconds"] = round(time.monotonic() - t0, 3)
     return out
 
@@ -208,6 +247,9 @@ def problem_text(res: dict) -> str | None:
     """The alert for what the check could not repair, or None when nothing is left."""
     parts = list(res.get("bad") or [])
     parts += [f"task #{w['task']}'s worktree fails git status ({w['error']})" for w in res.get("worktrees") or []]
+    parts += [f"repository {c['repo']} ({'empty' if c['empty'] else 'not empty'}) has no .git directory, so the "
+              f"worktree(s) of task(s) {', '.join(f'#{t}' for t in c['tasks'])} cannot work from it: an empty or "
+              f"partly copied clone; clone it again or restore its .git" for c in res.get("clones") or []]
     if not parts:
         return None
     return ("After a reboot the harness check found damage it could not repair; nothing was changed in "

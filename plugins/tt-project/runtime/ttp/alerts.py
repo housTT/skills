@@ -58,7 +58,8 @@ CLEARED_TEXT = {
     "run-start": "Runs start again.",
     "schedule": "Schedule {arg} runs again.",
     "release-older": "The installed tt-project is no longer older than this harness.",
-    "integrity": "The harness and the task worktrees check out again.",
+    "integrity": "The harness, the task worktrees and their repositories check out again.",
+    "integrity-host": "project.json names this machine as the project's host again.",
     "pr-ready": "{arg} is back in draft, closed or approved.",
     "config": "project.json reads again; new work starts again.",
     "push_rejected": "Pushes go through again: a push batch pushed.",
@@ -191,7 +192,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool(db.kv("release_older"))
     if key == "integrity":
         last = db.kv("integrity") or {}
-        return bool(last.get("bad") or last.get("worktrees"))
+        return bool(last.get("bad") or last.get("worktrees") or last.get("clones"))
+    if key == "integrity-host":   # the daemon keeps the change while project.json names another machine
+        return bool(db.kv("integrity_host"))
     if kind == "schedule":
         # The next run that does not fail ends it, as does disabling or removing the schedule.
         row = db.one("SELECT last_status FROM schedules WHERE name=? AND enabled=1", (arg,))
@@ -268,7 +271,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
-                                         "schedule", "release-older", "integrity", "pr-ready", "config",
+                                         "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
                                          "coord-budget", "account-mismatch", "linger-off")

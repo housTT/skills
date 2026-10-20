@@ -278,6 +278,7 @@ LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked ag
 LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
 KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for branches only on this machine
 KV_INTEGRITY = "integrity"   # kv: the last boot integrity check (see Daemon.check_integrity)
+KV_INTEGRITY_HOST = "integrity_host"   # kv: the change of machine last alerted (see Daemon._check_host)
 INTEGRITY_RECHECK_S = 3600
 KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
 KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}}: branches for delivery.backup_remote
@@ -5716,11 +5717,14 @@ class Daemon:
     def check_integrity(self, start: bool = False) -> None:
         """On the first start of a new boot, check the harness for damage a power cut left and repair
         what its last commit can (see ttp.integrity); also report unfinished code tasks' worktrees
-        whose `git status` fails. While something stays broken, check again at each start and
-        hourly. Repairs are a note in the feed; what stays broken is one alert keyed `integrity`."""
+        whose `git status` fails, and kept task worktrees whose repository has no .git directory
+        (an empty clone). While something stays broken, check again at each start and hourly.
+        Repairs are a note in the feed; what stays broken is one alert keyed `integrity`. At each
+        start, a project.json made on another machine is one alert per change (`integrity-host`)."""
         db = self.p.db
+        self._check_host(start)
         last = db.kv(KV_INTEGRITY) or {}
-        broken = bool(last.get("bad") or last.get("worktrees"))
+        broken = bool(last.get("bad") or last.get("worktrees") or last.get("clones"))
         if start:
             due = not self._this_boot(last.get("boot")) or broken
         else:   # a tick: only the hourly re-check of something still broken
@@ -5730,20 +5734,40 @@ class Daemon:
         try:
             ids = [r["id"] for r in db.q(f"SELECT id FROM tasks WHERE {worktree.OWN_WORKTREE_SQL} AND status NOT IN "
                                          f"({','.join('?' * len(TERMINAL_TASK_STATES))})", TERMINAL_TASK_STATES)]
-            res = integrity.check(self.p, [(t, self.p.worktrees / f"t{t}") for t in ids])
+            kept = sorted((int(w.name[1:]), w) for w in self.p.worktrees.glob("t*") if w.name[1:].isdigit())
+            res = integrity.check(self.p, [(t, self.p.worktrees / f"t{t}") for t in ids], kept)
         except Exception:
             log(self.p, "integrity check: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return
         res.update(boot=self.boot, at=time.time())
         db.set_kv(KV_INTEGRITY, res)
         log(self.p, f"integrity check in {res['seconds']} s: fsck {res['fsck']}, {len(res['restored'])} restored, "
-                    f"{len(res['bad'])} unrepaired, {len(res['worktrees'])} broken worktree(s)")
+                    f"{len(res['bad'])} unrepaired, {len(res['worktrees'])} broken worktree(s), "
+                    f"{len(res['clones'])} repo(s) without .git")
         if res["restored"]:
             db.post("out", "The harness check after a restart repaired files a cut write had damaged: "
                            + "; ".join(res["restored"])[:2000], kind="info", severity="low")
         text = integrity.problem_text(res)
         if text:
             self.alert("integrity", text, severity="high", every_s=86400)
+
+    def _check_host(self, start: bool) -> None:
+        """At start, and hourly while it is open: does project.json name another machine than this
+        one? One alert per change of machine; kv KV_INTEGRITY_HOST keeps the open change, so a
+        restart does not repeat it, and the alert clears once project.json names this machine."""
+        db = self.p.db
+        seen = db.kv(KV_INTEGRITY_HOST) or None
+        if not start and not (seen and time.time() - float(seen.get("at") or 0) >= INTEGRITY_RECHECK_S):
+            return
+        try:
+            change = integrity.host_change(self.p)
+        except Exception:
+            log(self.p, "host check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return
+        db.set_kv(KV_INTEGRITY_HOST, {**change, "at": time.time()} if change else None)
+        if change and not (seen and (seen.get("was"), seen.get("now")) == (change["was"], change["now"])):
+            log(self.p, f"host check: project.json names {change['was']}, this machine is {change['now']}")
+            self.alert("integrity-host", integrity.host_text(change), severity="high", every_s=0)
 
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and

@@ -1040,6 +1040,67 @@ def test_boot_check_restores_an_empty_memory_file_and_a_truncated_index(env):
 
 
 
+def test_boot_check_alerts_once_on_a_change_of_machine_and_clears(env, monkeypatch):
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon, KV_INTEGRITY_HOST
+    assert p.raw_config().get("host") == "testhost"
+    d = Daemon(p.base)
+    d.check_integrity(start=True)
+    assert not p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity-host'")
+    # The project folder now runs on another machine: one alert, not repeated by a restart.
+    monkeypatch.setenv("TTP_HOST", "otherhost")
+    d.check_integrity(start=True)
+    Daemon(p.base).check_integrity(start=True)
+    al = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity-host'")
+    assert len(al) == 1 and "'testhost'" in al[0]["text"] and "'otherhost'" in al[0]["text"], al
+    assert p.db.kv(KV_INTEGRITY_HOST)["now"] == "otherhost"
+    assert alerts.holds(p.db, "integrity-host", al[0]["ts"], time.time())
+    # Confirmed by setting project.json's host: the hourly re-check clears it.
+    p.set_config("host", "otherhost")
+    d.check_integrity()   # not an hour yet
+    assert p.db.kv(KV_INTEGRITY_HOST)
+    monkeypatch.setattr(time, "time", lambda real=time.time: real() + 2 * 3600)
+    d.check_integrity()
+    assert p.db.kv(KV_INTEGRITY_HOST) is None
+    assert not alerts.holds(p.db, "integrity-host", al[0]["ts"], time.time())
+
+
+
+def test_boot_check_flags_an_empty_clone_under_a_kept_worktree(env):
+    p = make(env)
+    from ttp import alerts, integrity
+    from ttp.daemon import Daemon, KV_INTEGRITY
+    repo = env["tmp"] / "code"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@x"})
+    done = p.db.add_task("old", "s", kind="code", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (done,))
+    wt = p.worktrees / f"t{done}"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+    d = Daemon(p.base)
+    d.check_integrity(start=True)
+    assert p.db.kv(KV_INTEGRITY)["clones"] == []
+    # The clone comes back without its .git (a copy that left it out): a finished task's kept worktree flags it.
+    (repo / ".git").rename(env["tmp"] / "saved-git")
+    p.db.set_kv(KV_INTEGRITY, {**p.db.kv(KV_INTEGRITY), "boot": "an earlier boot"})   # the start after a reboot
+    d.check_integrity(start=True)
+    res = p.db.kv(KV_INTEGRITY)
+    assert res["clones"] == [{"repo": str(repo.resolve()), "tasks": [done], "empty": True}], res
+    al = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity'")
+    assert len(al) == 1 and "no .git directory" in al[0]["text"] and f"#{done}" in al[0]["text"], al
+    assert alerts.holds(p.db, "integrity", al[0]["ts"], time.time())
+    assert "no .git" in integrity.problem_text(res)
+    # Restored: the next start checks again and the alert clears.
+    (env["tmp"] / "saved-git").rename(repo / ".git")
+    d.check_integrity(start=True)
+    assert p.db.kv(KV_INTEGRITY)["clones"] == []
+    assert not alerts.holds(p.db, "integrity", al[0]["ts"], time.time())
+
+
+
 def test_boot_check_alerts_once_on_what_it_cannot_repair_and_clears(env, monkeypatch):
     p = make(env)
     from ttp import alerts, integrity
