@@ -21248,6 +21248,8 @@ def test_machines_push_skips_hosts_out_or_decommissioned(env):
     ml.set_outage("box-c", "repair", "proj", "1d")
     got = mm.push_skips(["box-a", "b-host.example", "box-c", "box-z"])
     assert got == {"b-host.example": "box-b is tagged decommissioned", "box-c": "box-c has an open known outage"}
+    mm.add("box-d", tags="device,decommissioned", hostname="d-host.example.com")
+    assert mm.push_skips(["d-host"]) == {"d-host": "box-d is tagged decommissioned"}
 
 
 def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tmp_path, monkeypatch, capsys):

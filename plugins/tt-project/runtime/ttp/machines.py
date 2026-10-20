@@ -258,7 +258,7 @@ def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
     out = {}
     for host in hosts:
         names = {host, host.split(".")[0]}
-        aliases = {a for a, m in known.items() if a in names or (m.get("hostname") or "") in names} | (names & set(outages))
+        aliases = {a for a, m in known.items() if a in names or {(m.get("hostname") or ""), (m.get("hostname") or "").split(".")[0]} & names - {""}} | (names & set(outages))
         for alias in sorted(aliases):
             if DECOMMISSIONED in tag_names((known.get(alias) or {}).get("tags")):
                 out[host] = f"{alias} is tagged {DECOMMISSIONED}"
