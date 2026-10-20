@@ -14787,6 +14787,8 @@ def test_a_dangling_worktree_whose_repository_is_there_is_made_again_on_its_bran
     assert "Run-start checks found" in prompt and "was dangling" in prompt
     assert len(note["start_checks"]) == 1 and "was dangling" in note["start_checks"][0]
     assert startcheck.of_run(json.dumps(note)) == note["start_checks"]
+    # A session that worked in the old worktree is not resumed in the new one.
+    assert startcheck.remade(note["start_checks"]) and not startcheck.remade(["~/.ssh/known_hosts is missing"])
     assert p.db.one("SELECT severity FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling:%'")[
         "severity"] == "normal"
 

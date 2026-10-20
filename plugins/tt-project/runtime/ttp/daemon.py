@@ -5575,14 +5575,14 @@ class Daemon:
                     note["review_tier"] = review_pick
                     if review_pick.get(conflictfix.KEY):
                         note[conflictfix.KEY] = review_pick[conflictfix.KEY]
-                if lost and lost["cwd"] == cwd:
+                if lost and lost["cwd"] == cwd and not startcheck.remade(found):
                     # The session holds the task and its own work: a short prompt continues it.
                     prompt = worker_resume(self.p, task, lost)
                     note["resumes"] = {"run": lost["run"], "session": lost["session"]}
                 else:
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
                                                conflict=note.get(conflictfix.KEY)), None
-                prompt += startcheck.prompt_lines(found)
+                prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,

@@ -28,6 +28,7 @@ from .project import Project
 KV_BASE = "startcheck_base"            # {"root": path}: the root was a git repository when last checked
 KV_KNOWN_HOSTS = "startcheck_known_hosts"  # {"path": ..., "seen": ts}: known_hosts held entries once
 EVENT = "start_check"
+REMADE = "was dangling"   # the finding of a worktree made again: a session that worked in the old one is not resumed
 VOLATILE_FS = {"tmpfs", "ramfs"}
 REPEAT_S = 86400
 # Set where a temporary root is expected (the test suite runs on tmpfs): no volatile-file-system finding.
@@ -141,7 +142,7 @@ def check(p: Project, task: dict, now: float | None = None) -> list[str]:
             _observe(p, f"dangling:{task['id']}:{d['gitdir']}", "high", text, task, now)
             raise worktree.WorkspaceStuck(f"worktree dangling: its repository {d['repo']} is gone, with any commits "
                                           f"not pushed; files moved to {dest}; restore it or requeue to start afresh")
-        text = (f"Task #{task['id']}'s worktree {path} was dangling: its git dir {d['gitdir']} was gone, but its "
+        text = (f"Task #{task['id']}'s worktree {path} {REMADE}: its git dir {d['gitdir']} was gone, but its "
                 f"repository {d['repo']} is there, so the branch's commits are kept. Its files moved to {dest} "
                 f"and the worktree is made again; uncommitted changes are only in {dest}.")
         _observe(p, f"dangling:{task['id']}:{d['gitdir']}", "normal", text, task, now)
@@ -203,6 +204,11 @@ def _check_known_hosts(p: Project, task: dict, now: float) -> list[str]:
             f"never accept an unverified key blindly.")
     _observe(p, f"known_hosts:{f}:{why}", "high", text, task, now)
     return [text]
+
+
+def remade(found: list[str]) -> bool:
+    """Whether the task's worktree was made again (a dangling one moved aside)."""
+    return any(REMADE in f for f in found)
 
 
 def prompt_lines(found: list[str]) -> str:
