@@ -215,6 +215,8 @@ def parse_value(q: dict, raw) -> object:
                 raise ValueError(f"{q['id']}: none goes alone")
             return []
         return sorted(set(items), key=values.index)
+    if raw is None or not str(raw).strip():
+        raise ValueError(f"{q['id']}: an answer is needed, not an empty one")
     s = one(raw)
     if s in values:
         return s
@@ -301,10 +303,15 @@ def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-roo
                            "`recipes/developer-setup.md` says",
              f"ssh {alias} {_sh(venv)}/bin/python -m pip show ttnn")
     elif env == "workspace":
-        where = f"{root.rstrip('/')}/{ws.split('/')[1]}" if ws and ws != "none" else "<workspace>"
-        step("python_env", "the workspace's own env, built with it (tt-buddy's `recipes/tt-metal/env.md`); "
-                           "a broker job needs it too (the `tt-buddy:run` skill's `skills/run/mcp.md`)",
-             f"ssh {alias} test -x {_sh(where)}/python_env/bin/python")
+        if not ws or ws == "none":
+            step("python_env", "WARNING: python_env is workspace but there is no workspace; ask python_env "
+                               "again (pip-ttnn or none) or answer workspace first",
+                 "none: no check until python_env or workspace is changed")
+        else:
+            where = f"{root.rstrip('/')}/{ws.split('/')[1]}"
+            step("python_env", "the workspace's own env, built with it (tt-buddy's `recipes/tt-metal/env.md`); "
+                               "a broker job needs it too (the `tt-buddy:run` skill's `skills/run/mcp.md`)",
+                 f"ssh {alias} test -x {_sh(where)}/python_env/bin/python")
     for cli in answers.get("agent_clis") or []:
         step("agent_clis", f"install the {cli} CLI on {alias} for the user, per `agents.md`; the user logs in",
              f"ssh {alias} {AGENT_CLIS[cli]}")

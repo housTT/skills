@@ -1761,6 +1761,18 @@ def test_setup_box_hostcheck_reads_sysfs_without_opening_a_device(monkeypatch):
     assert problems == ["pcie"]
 
 
+def test_setup_box_rejects_null_answers_and_workspace_env_without_workspace(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    q = next(x for x in bs.QUESTIONS if x.get("other") is bs._word)
+    for raw in (None, "", "  "):
+        with pytest.raises(ValueError):
+            bs.parse_value(q, raw)
+    steps = bs.plan("box", {"workdir_root": "/w"}, {"workspace": "none", "python_env": "workspace"})
+    env = next(s for s in steps if s["id"] == "python_env")
+    assert "WARNING" in env["action"] and "<workspace>" not in env["check"]
+
+
 def test_setup_box_new_box_page_covers_the_flow():
     page = (SKILLS / "setup-box" / "new-box.md").read_text(encoding="utf-8")
     for part in ("box.py setup questions <box-alias>", "--format numbered", "AskUserQuestion",
