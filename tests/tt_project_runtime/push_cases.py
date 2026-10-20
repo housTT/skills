@@ -5699,7 +5699,9 @@ def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_
     p.set_config("delivery.push_checks", [{"run": cmd, "if_exists": "a.txt"}])
     cli.main(["checks", "--fresh", "--", cmd])
     out = capsys.readouterr().out
-    runs = lambda: [ln for ln in ran.read_text().splitlines() if ln != "-c pass"]   # not the venv probe
+    from ttp import envfault
+    runs = lambda: [ln for ln in ran.read_text().splitlines()   # not the venv probe nor the runner precheck
+                    if ln != "-c pass" and not ln.startswith("-c " + envfault._FIND)]
     assert runs() == ["-m pytest -q --no-device-tests"], "once, with the project venv's python"
     assert "a scoped delivery.push_checks entry runs it on this head" in out
     # Another spelling of the same pytest run is the same command.

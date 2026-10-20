@@ -3,13 +3,17 @@
 """A check runner the host lacks: an environment fault, not a failed check.
 
 Before check commands run (`ttp checks`, `ttp push`, the push queue's batch), precheck() looks at
-each one's runners: the program of its first simple command must be on PATH (or an existing absolute
-path), and a `python -m <module>` there (a bare pytest included, after push.venv_cmd) must find
-that module with that python. One that cannot is a fault with the signature env:missing-runner:<name>.
-It counts against no change or branch: `ttp checks` and `ttp push` exit 75 (wait) and print a
+each one's first runner, when it is the shared check path's: the python of its first simple command
+must be on PATH (or an existing absolute path), a `python -m <module>` there (a bare pytest included,
+after push.venv_cmd) must find that module with that python, and a bare pytest left as written must
+be on PATH. One that cannot is a fault with the signature env:missing-runner:<name>; a pytest older
+than the repository's pytest `minversion` is env:old-runner:pytest. Any other program (a task's own
+extra command, typo or not) is the command's business: it runs and fails as it would.
+A fault counts against no change or branch: `ttp checks` and `ttp push` exit 75 (wait) and print a
 retry_when (`ttp checks --env-ok`), and the push queue requeues the batch and holds until the
-runner is back. Each fault is recorded once in the project's state, with one coordinator
-observation per fault however many tasks hit it; it clears once its probe passes."""
+runner is back, on a fault its own batch found only. Each fault is recorded once in the project's
+state, with one coordinator observation per fault however many tasks hit it; it clears once its
+command, run again where it was found, no longer hits it, or once that checkout is gone."""
 from __future__ import annotations
 
 import os
@@ -23,16 +27,21 @@ from typing import Any
 
 KV = "env_faults"
 PREFIX = "env:missing-runner:"
+OLD = "env:old-runner:"
 PROBE_S = 60            # the push queue's recheck of open faults: at most once per this
 PROBE_TIMEOUT_S = 30
+HOLD_ALERT_S = 6 * 3600   # a queue hold this old raises one more observation
 _PY = re.compile(r"python[0-9.]*$")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _OPS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&", "\n"}
 _KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time"}
 _SKIP = {"for", "case", "function", "select", "[[", "[", "test"}   # the segment is no plain program run
 _WRAPPERS = {"nice", "nohup"}
-_FIND = ("import importlib.util, sys\n"
-         "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 3)")
+_TEST_RUNNERS = {"pytest", "py.test"}
+# One line (a stand-in python that logs "$@" logs one line); with a 2nd argument it prints __version__.
+_FIND = ("import sys, importlib.util as u; u.find_spec(sys.argv[1]) or sys.exit(3); "
+         "len(sys.argv) > 2 and print(getattr(__import__(sys.argv[1]), '__version__', ''))")
+_MINVERSION = re.compile(r"""^\s*minversion\s*[=:]\s*["']?([0-9][0-9A-Za-z.]*)""", re.M)
 
 
 class Fault(Exception):
@@ -105,11 +114,35 @@ def _resolve(prog: str, path: str) -> str | None:
     return shutil.which(prog, path=path)
 
 
+def _version(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def minversion(top: str | Path) -> str:
+    """The pytest `minversion` of the config file pytest reads in `top` (pytest.ini, .pytest.ini,
+    pyproject.toml [tool.pytest.ini_options], tox.ini [pytest], setup.cfg [tool:pytest]), or ""."""
+    for name, section in (("pytest.ini", "pytest"), (".pytest.ini", "pytest"),
+                          ("pyproject.toml", "tool.pytest.ini_options"), ("tox.ini", "pytest"),
+                          ("setup.cfg", "tool:pytest")):
+        try:
+            text = (Path(top) / name).read_text(errors="replace")
+        except OSError:
+            continue
+        body = re.split(r"^\s*\[" + re.escape(section) + r"\]\s*$", text, maxsplit=1, flags=re.M)
+        if len(body) < 2:
+            continue   # pytest reads the next file only when this one has no pytest section
+        m = _MINVERSION.search(re.split(r"^\s*\[", body[1], maxsplit=1, flags=re.M)[0])
+        return m.group(1) if m else ""
+    return ""
+
+
 def runners(cmd: str, top: str | Path, env: dict | None = None) -> list[dict]:
-    """The runner `cmd` needs first as it would run in `top` (push.venv_cmd applied): a probe of the
-    program of its first simple command that runs one, or of its `python -m <module>` when that
-    module is not the repository's own. Only the first: a later command may run what an earlier one
-    installs. None after a step that may change PATH (source, export, eval, a PATH= assignment)."""
+    """The runner `cmd` needs first as it would run in `top` (push.venv_cmd applied), when it is the
+    shared check path's: the python of its first simple command that runs one (and its
+    `python -m <module>` when that module is not the repository's own), or a bare pytest. Any other
+    first program is none: the command runs and says what is wrong. Only the first: a later command
+    may run what an earlier one installs. None after a step that may change PATH (source, export,
+    eval, a PATH= assignment)."""
     from . import push
     env = dict(os.environ if env is None else env)
     path = env.get("PATH") or os.defpath
@@ -133,10 +166,15 @@ def runners(cmd: str, top: str | Path, env: dict | None = None) -> list[dict]:
             continue
         if "/" in prog and not os.path.isabs(prog):
             return []   # a script of the repository's: the change's business
-        mod = _module(args) if _PY.search(Path(prog).name) else None
+        python = bool(_PY.search(Path(prog).name))
+        if not python and Path(prog).name not in _TEST_RUNNERS:
+            return []
+        mod = _module(args) if python else None
         if mod and not push._in_repo(mod.split(".")[0], top):
-            return [{"kind": "module", "python": prog, "module": mod.split(".")[0], "path": path,
-                     "cmd": cmd, "cwd": str(top)}]
+            mod = mod.split(".")[0]
+            low = minversion(top) if mod == "pytest" else ""
+            return [{"kind": "module", "python": prog, "module": mod, "path": path, "cmd": cmd,
+                     "cwd": str(top), **({"min": low} if low else {})}]
         return [{"kind": "program", "name": prog, "path": path, "cmd": cmd, "cwd": str(top)}]
     return []
 
@@ -156,14 +194,18 @@ def probe(r: dict, env: dict | None = None) -> dict | None:
         return {**r, "sig": PREFIX + name, "runner": name, "python": str(r.get("python") or "")}
     run_env = {**(os.environ if env is None else env), "PATH": path}
     cwd = r.get("cwd") if r.get("cwd") and Path(str(r["cwd"])).is_dir() else None
+    low = str(r.get("min") or "")
     try:
-        rc = subprocess.run([py, "-c", _FIND, str(r["module"])], cwd=cwd, env=run_env, capture_output=True,
-                            timeout=PROBE_TIMEOUT_S).returncode
+        got = subprocess.run([py, "-c", _FIND, str(r["module"]), *(["v"] if low else [])], cwd=cwd, env=run_env,
+                             capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
-    if rc != 3:
-        return None
-    return {**r, "sig": PREFIX + str(r["module"]), "runner": str(r["module"]), "python": py}
+    if got.returncode == 3:
+        return {**r, "sig": PREFIX + str(r["module"]), "runner": str(r["module"]), "python": py}
+    have = got.stdout.strip().splitlines()[-1:] if got.returncode == 0 and low else []
+    if have and _version(have[0]) and _version(have[0]) < _version(low):
+        return {**r, "sig": OLD + str(r["module"]), "runner": str(r["module"]), "python": py, "version": have[0]}
+    return None
 
 
 def precheck(cmds: list, top: str | Path, env: dict | None = None) -> dict | None:
@@ -176,15 +218,19 @@ def precheck(cmds: list, top: str | Path, env: dict | None = None) -> dict | Non
 
 
 def line(f: dict) -> str:
-    what = (f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
+    what = (f"{f['python']} has {f['runner']} {f['version']}, below the repository's minversion {f.get('min')}"
+            if f.get("version") else
+            f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
             else f"{f.get('runner')} is not on PATH or not executable")
     return (f"environment fault {f.get('sig')}: {what} (needed by {f.get('cmd')!r}). This is the host, "
             "not the change: nothing is counted against it")
 
 
-def record(p, f: dict, task: str | None = None) -> bool:
+def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
     """Keep the fault open in the project's state, and raise one coordinator observation the first
-    time its signature is seen in this episode. True when this call raised it. Never raises."""
+    time its signature is seen in this episode. True when this call raised it. Never raises.
+    `queue`: the push queue's batch found it, so the queue holds on it (held); a fault a task found
+    in its own checkout never holds the queue, and does not replace how the queue's is probed."""
     if p is None:
         return False
     try:
@@ -197,10 +243,12 @@ def record(p, f: dict, task: str | None = None) -> bool:
             tasks = list((old or {}).get("tasks") or [])
             if task and task not in tasks:
                 tasks = (tasks + [task])[-20:]
-            keep = {k: f.get(k) for k in ("kind", "name", "python", "module", "path", "cwd", "cmd", "runner")
-                    if f.get(k) is not None}
+            keep = {k: f.get(k) for k in ("kind", "name", "python", "module", "path", "cwd", "cmd", "runner",
+                                          "min", "version") if f.get(k) is not None}
+            if old and old.get("queue") and not queue:
+                keep = {k: old[k] for k in keep.keys() | old.keys() if k in old}
             faults[sig] = {**keep, "since": (old or {}).get("since") or now, "last": now, "tasks": tasks,
-                           "checked": now}
+                           "checked": now, **({"queue": True} if queue or (old or {}).get("queue") else {})}
             db.set_kv(KV, faults)
             if old:
                 return False
@@ -226,6 +274,19 @@ def open_faults(p) -> dict:
     return {k: f for k, f in v.items() if isinstance(f, dict)} if isinstance(v, dict) else {}
 
 
+def _still(f: dict) -> dict | None:
+    """The fault `f` as its command, looked at again in the checkout it was found in, still hits it;
+    None once it does not (the runner is back, or the command now resolves another one) or once that
+    checkout is gone (a removed worktree and its venv: nothing there to wait for)."""
+    cwd = str(f.get("cwd") or "")
+    if not cwd or not Path(cwd).is_dir():
+        return None
+    if not f.get("cmd"):
+        return probe(f)
+    now = precheck([str(f["cmd"])], cwd, {**os.environ, "PATH": str(f.get("path") or os.defpath)})
+    return now if now and now.get("sig") == f.get("sig") else None
+
+
 def recheck(p, now: float | None = None, every_s: float = 0) -> dict:
     """Probe each open fault again (skipping those probed within `every_s`), close the ones that
     pass and return those still open."""
@@ -239,7 +300,7 @@ def recheck(p, now: float | None = None, every_s: float = 0) -> dict:
             still[sig] = f
             continue
         changed = True
-        if probe(f):
+        if _still(f):
             still[sig] = {**f, "checked": now}
     if changed:
         try:
@@ -255,12 +316,30 @@ def recheck(p, now: float | None = None, every_s: float = 0) -> dict:
 
 
 def held(p, now: float | None = None) -> str:
-    """Why the push queue holds (an open fault whose runner is still missing), or ""."""
-    if not open_faults(p):
+    """Why the push queue holds (an open fault its own batch found, whose runner is still missing),
+    or "". A hold past HOLD_ALERT_S raises one more coordinator observation."""
+    if not any(f.get("queue") for f in open_faults(p).values()):
         return ""
-    still = recheck(p, now, PROBE_S)
+    now = time.time() if now is None else now
+    still = {k: f for k, f in recheck(p, now, PROBE_S).items() if f.get("queue")}
     if not still:
         return ""
+    long = [k for k, f in still.items() if now - float(f.get("since") or now) > HOLD_ALERT_S and not f.get("alerted")]
+    if long:
+        try:
+            with p.db.tx():
+                cur = p.db.kv(KV, {}) or {}
+                for k in long:
+                    if isinstance(cur.get(k), dict):
+                        cur[k]["alerted"] = now
+                p.db.set_kv(KV, cur)
+                p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                       (now, "checks", "observation", f"env-hold:{','.join(sorted(long))}:{now:.0f}", "high",
+                        f"The push queue has held for over {HOLD_ALERT_S // 3600} h on environment fault "
+                        f"{', '.join(sorted(long))}: no batch runs until the runner is back on the host "
+                        "(`ttp checks --env-ok` passes).", "queued"))
+        except Exception:
+            pass
     return "held: environment fault " + ", ".join(sorted(still)) + " (a check runner is missing on this host)"
 
 
@@ -291,4 +370,4 @@ def marker_open(run_dir: Path) -> dict | None:
         return None
     if not isinstance(f, dict):
         return None
-    return probe(f)
+    return _still(f)

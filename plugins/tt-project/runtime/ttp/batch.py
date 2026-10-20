@@ -718,7 +718,7 @@ class Batch:
             except envfault.Fault as e:
                 # The host, not an entry: every entry goes back to the queue untouched, which holds
                 # until the runner is back (pushq.due); the coordinator hears of it once.
-                envfault.record(self.p, e.fault)
+                envfault.record(self.p, e.fault, queue=True)
                 return self._all("requeued", "env_fault", f"{e}; the batch is held, not failed",
                                  keep=("landed", "refused"))
             if outcome != "moved":

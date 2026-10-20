@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkcap, checkdirs, landed, locks, machines, prguard, runner, settinghold, timefmt, worktree
+from . import checkcap, checkdirs, envfault, landed, locks, machines, prguard, runner, settinghold, timefmt, worktree
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_creates_pr_branch,
@@ -523,7 +523,6 @@ def runner_wait(cmds: list, repo: Path, env: dict, say: Callable[[str], None], p
     """BUSY when a check's runner is missing on this host (envfault): recorded once for the
     coordinator (in the state of `p`, default TTP_PROJECT's project), said with its retry_when, and
     nothing run or counted against the change; else 0."""
-    from . import envfault
     if p is None and (base := os.environ.get("TTP_PROJECT")):
         p = Project(base)
         p = p if p.exists() else None
