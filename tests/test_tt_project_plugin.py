@@ -186,8 +186,36 @@ def test_install_doc_pins_the_release_ref_with_each_hosts_ref_syntax():
     assert '"${XDG_CACHE_HOME:-$HOME/.cache}/ttp"' in section
 
 
+def _is_stdlib(name):
+    """sys.stdlib_module_names is 3.10+; on 3.9 a module is standard library when it is built in or
+    found under the interpreter's own stdlib directories, never under site-packages."""
+    names = getattr(sys, "stdlib_module_names", None)
+    if names is not None:
+        return name in names
+    import importlib.util
+    import sysconfig
+    if name in sys.builtin_module_names:
+        return True
+    spec = importlib.util.find_spec(name)
+    if spec is None or not spec.origin:
+        return False
+    if spec.origin in ("built-in", "frozen"):
+        return True
+    origin = pathlib.Path(spec.origin).resolve()
+    roots = {pathlib.Path(sysconfig.get_paths()[k]).resolve() for k in ("stdlib", "platstdlib")}
+    site = {pathlib.Path(sysconfig.get_paths()[k]).resolve() for k in ("purelib", "platlib")}
+    return (any(r in origin.parents for r in roots)
+            and not any(s in origin.parents or "site-packages" in origin.parts for s in site))
+
+
+def test_stdlib_check_tells_standard_library_from_installed_packages():
+    for name in ("json", "sys", "sqlite3", "concurrent", "importlib"):
+        assert _is_stdlib(name), name
+    for name in ("pytest", "yaml", "ttp_no_such_module"):
+        assert not _is_stdlib(name), name
+
+
 def test_runtime_is_standard_library_only_and_python39_compatible():
-    stdlib = set(sys.stdlib_module_names)
     for py in RUNTIME.rglob("*.py"):
         src = py.read_text(encoding="utf-8")
         tree = ast.parse(src, feature_version=(3, 9))   # rejects syntax newer than 3.9
@@ -201,7 +229,7 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
             # The resume plugin is loaded only into the checked repo's own pytest, never by the runtime.
             plugin = py.parent.name == "pytest_resume" and names == ["pytest"]
             for n in names:
-                assert n in stdlib or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
+                assert _is_stdlib(n) or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
         if re.search(r"\w\]?\s*\|\s*None\b", src):
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 
@@ -901,7 +929,11 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     assert forked.returncode == 1, forked.stdout
     assert "2 failed, 63 passed, 1 skipped, 1 warning" in forked.stdout, forked.stdout
     assert "FAILED test_tt_project_sample.py::test_fail - AssertionError: boom" in forked.stdout
-    assert "test_tt_project_sample.py::test_crash - the test worker process" in forked.stdout
+    # pytest < 9 leaves a plain-text reason out of the short summary line: match the full report.
+    assert "FAILED test_tt_project_sample.py::test_crash" in forked.stdout
+    crash = forked.stdout.split(" test_crash ", 1)[1]
+    assert re.match(r"_+\nthe test worker process \d+ ended \(wait status \d+\) before this test finished",
+                    crash), forked.stdout
     assert "SKIPPED [1] test_tt_project_sample.py:" in forked.stdout and "UserWarning: careful" in forked.stdout
     pids = {(out / f"ok-{i}").read_text() for i in range(60)}
     assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
@@ -946,8 +978,16 @@ def test_the_suite_declares_the_oldest_pytest_it_supports():
     assert minimum >= (7, 3)
     assert _version(pytest.__version__) >= minimum
     ci = (root / ".github" / "workflows" / "validate.yml").read_text()
-    (pin,) = re.findall(r"\bpytest==([\d.]+)", ci)
-    assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
+    pins = re.findall(r"\bpytest==([\d.]+)", ci)
+    assert len(pins) == 2   # the main job's and the Python 3.9 job's
+    for pin in pins:
+        assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
+    # The runtime's stated minimum Python runs the required suite on CI too.
+    job = yaml.safe_load(ci)["jobs"]["tt-project-python39"]
+    steps = json.dumps(job["steps"])
+    assert 'python-version": "3.9"' in steps
+    assert all(f in steps for f in ("tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py",
+                                    "tests/test_plugin_catalogue.py"))
 
 
 def test_the_test_runner_summary_line_is_stable_and_greppable():
