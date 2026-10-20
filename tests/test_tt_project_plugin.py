@@ -1786,6 +1786,258 @@ def test_setup_box_new_box_page_covers_the_flow():
     assert "`new-box.md`" in (SKILLS / "setup-box" / "bare-metal.md").read_text(encoding="utf-8")
 
 
+def _account(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_account as ba
+    return ba
+
+
+def _root_shims(tmp_path, visudo_rc=0):
+    """A fake root for the account scripts: getent/useradd/groupadd over flat files, visudo with a set
+    exit code (it logs what it checked and whether the final drop-in was already there)."""
+    fake, bin_ = tmp_path / "fake", tmp_path / "bin"
+    for d in (fake / "home", fake / "sudoers.d", bin_):
+        d.mkdir(parents=True)
+    (fake / "passwd").write_text("other:x:4242:4242::/x/other:/bin/sh\n")
+    (fake / "group").write_text("docker:x:999:\n")
+
+    def shim(name, body):
+        (bin_ / name).write_text("#!/bin/bash\n" + body, encoding="utf-8")
+        (bin_ / name).chmod(0o755)
+    shim("getent", f'db={fake}/$1; awk -F: -v k="$2" \'$1==k || $3==k\' "$db" | grep . \n')
+    shim("useradd", f'if [ "$1" = -D ]; then echo HOME={fake}/home; exit 0; fi\n'
+                    'mk=0; while [ $# -gt 1 ]; do case $1 in -m) mk=1;; -M) ;; -d) d=$2; shift;; -u) u=$2; shift;;\n'
+                    '-g) g=$2; shift;; -s) s=$2; shift;; esac; shift; done\n'
+                    f'h=${{d:-{fake}/home/$1}}; echo "$1:x:$u:$g::$h:$s" >> {fake}/passwd\n'
+                    '[ $mk = 1 ] && mkdir -p "$h"; echo "useradd $1" >> ' f'{fake}/log\n')
+    shim("groupadd", f'echo "$3:x:$2:" >> {fake}/group\n')
+    shim("usermod", f'echo "usermod $*" >> {fake}/log\n')
+    shim("visudo", f'echo "visudo $* final=$(ls {fake}/sudoers.d | grep -v "^\\." | wc -l)" >> {fake}/log\n'
+                   f'exit {visudo_rc}\n')
+    shim("install", 'for a; do :; done; mkdir -p "$a"\n')
+    shim("chown", "exit 0\n")
+    shim("loginctl", f'echo "loginctl $*" >> {fake}/log\n')
+    shim("id", 'echo "uid=fake($1)"\n')
+    env = {"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    return fake, env
+
+
+def _bash(script, env):
+    import subprocess
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+
+
+KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOnlyForTests user@project-box"
+
+
+def test_setup_box_account_ids_come_from_here_another_machine_or_a_shared_files_owner(monkeypatch):
+    import subprocess
+    ba = _account(monkeypatch)
+    calls = []
+
+    def run(alias, cmd, timeout=60):
+        calls.append((alias, cmd))
+        out = "1234 5678 grp\n" if "stat" not in cmd else "1234 5678 UNKNOWN\n"
+        return subprocess.CompletedProcess([], 0, out, "")
+    assert ba.discover_ids("here")["uid"] == os.getuid()
+    ids = ba.discover_ids("<other-machine>", run=run)
+    assert ids == {"uid": 1234, "gid": 5678, "group": "grp", "from": "<other-machine>"}
+    assert calls[-1] == ("<other-machine>", 'echo "$(id -u) $(id -g) $(id -gn)"')
+    ids = ba.discover_ids("/mnt/shared/u/file", via="<admin-alias>", run=run)
+    assert ids["uid"] == 1234 and ids["group"] == "" and calls[-1][0] == "<admin-alias>"
+    # The owner is read plainly first (root may be squashed on a network mount), then as root.
+    assert calls[-1][1].startswith("stat -c '%u %g %G' -- /mnt/shared/u/file 2>/dev/null || sudo -n stat")
+    with pytest.raises(ValueError, match="--via"):
+        ba.discover_ids("/<shared>/x")
+    with pytest.raises(ValueError, match="no uid and gid"):
+        ba.parse_ids("id: no such user\n", "x")
+    fail = lambda *a, **k: subprocess.CompletedProcess([], 255, "", "unreachable")
+    with pytest.raises(ValueError, match="exit 255"):
+        ba.discover_ids("<other-machine>", run=fail)
+
+
+def test_setup_box_account_existence_is_checked_as_root_and_no_other_account_changes(tmp_path, monkeypatch):
+    ba = _account(monkeypatch)
+    fake, env = _root_shims(tmp_path)
+    (fake / "home" / "me").mkdir()
+    env_bin = pathlib.Path(env["PATH"].split(":")[0])
+    script = ba.probe_script("me", 1234, 1234)
+    # Every root check goes through sudo -n; a plain test of another user's home is never used.
+    assert 'sudo -n test -e "$h"' in script and re.search(r'(?<!-n )test -e "\$h"', script) is None
+    (env_bin / "sudo").write_text('#!/bin/bash\n[ "$1" = -n ] && shift; [ "$1" = true ] && exit 0; exec "$@"\n')
+    (env_bin / "sudo").chmod(0o755)
+    p = ba.read_probe(_bash(script, env).stdout)
+    assert p["sudo"] and p["home_exists"] == "yes" and p["account"] is None and p["docker"]
+    assert p["uid_owner"] == "" and p["home_base"] == str(fake / "home")
+    (env_bin / "sudo").write_text("#!/bin/bash\nexit 1\n")
+    p_nosudo = ba.read_probe(_bash(script, env).stdout)
+    assert not p_nosudo["sudo"] and p_nosudo["home_exists"] == "unknown"
+
+    ids = {"uid": 1234, "gid": 1234, "group": "me", "from": "here"}
+    todo, problems = ba.decide("me", ids, dict(p, home_owner="1234"))
+    assert problems == [] and any("visudo -cf" in t for t in todo) and any("docker" in t for t in todo)
+    _, problems = ba.decide("me", ids, p_nosudo)
+    assert any("no passwordless sudo" in x for x in problems)
+    _, problems = ba.decide("me", ids, dict(p, home_owner="4242"))
+    assert any("left alone" in x for x in problems)
+    _, problems = ba.decide("me", ids, dict(p, uid_owner="other"))
+    assert any("belongs to other" in x for x in problems)
+    _, problems = ba.decide("me", ids, dict(p, account={"uid": 1, "gid": 1, "home": "/h", "shell": "/bin/sh"}))
+    assert any("never changed" in x for x in problems)
+    todo, problems = ba.decide("me", ids, dict(p, account={"uid": 1234, "gid": 1234, "home": "/h", "shell": ""}))
+    assert problems == [] and "complete it" in todo[0]
+
+
+def test_setup_box_account_create_validates_the_sudoers_drop_in_before_installing_it(tmp_path, monkeypatch):
+    ba = _account(monkeypatch)
+    with pytest.raises(ValueError):
+        ba.create_script("Bad User", 1, 1, "", [KEY], sudo=True)
+    fake, env = _root_shims(tmp_path / "bad", visudo_rc=1)
+    bad = _bash(ba.create_script("me", 1234, 1234, "me", [KEY], sudo=True, sudoers_dir=str(fake / "sudoers.d")), env)
+    assert bad.returncode == 3 and "failed visudo -cf; not installed" in bad.stderr
+    assert list((fake / "sudoers.d").iterdir()) == []      # neither the drop-in nor its temp file
+    assert "visudo -cf " + str(fake / "sudoers.d" / ".ttp-me.") in (fake / "log").read_text()
+
+    fake, env = _root_shims(tmp_path / "ok")
+    script = ba.create_script("me", 1234, 1234, "me", [KEY], sudo=True, sudoers_dir=str(fake / "sudoers.d"))
+    for _ in range(2):                                     # a rerun completes, never duplicates
+        r = _bash(script, env)
+        assert r.returncode == 0, r.stdout + r.stderr
+    drop = fake / "sudoers.d" / "90-ttp-me"
+    assert drop.read_text() == "me ALL=(ALL) NOPASSWD:ALL\n" and drop.stat().st_mode & 0o777 == 0o440
+    log = (fake / "log").read_text()
+    assert "final=0" in log and log.count("visudo") == 1   # checked before anything was in place
+    assert "usermod -aG docker me" in log and "loginctl enable-linger me" in log
+    assert (fake / "home" / "me" / ".ssh" / "authorized_keys").read_text() == KEY + "\n"
+    passwd = (fake / "passwd").read_text()
+    assert "other:x:4242:4242::/x/other:/bin/sh\n" in passwd and passwd.count("me:x:1234:1234:") == 1
+    # No sudo on the admin login: no drop-in at all.
+    assert "visudo" not in ba.create_script("me", 1, 1, "me", [KEY], sudo=False)
+    # An existing login with other ids, or a uid someone else owns: refused, nothing changes.
+    fake, env = _root_shims(tmp_path / "taken")
+    before = (fake / "passwd").read_text()
+    r = _bash(ba.create_script("other", 1234, 1234, "", [KEY], sudo=True, sudoers_dir=str(fake / "sudoers.d")), env)
+    assert r.returncode == 3 and "never changed" in r.stderr
+    r = _bash(ba.create_script("me", 4242, 4242, "", [KEY], sudo=True, sudoers_dir=str(fake / "sudoers.d")), env)
+    assert r.returncode == 3 and "belongs to other" in r.stderr
+    assert (fake / "passwd").read_text() == before and not (fake / "log").exists()
+
+
+def test_setup_box_account_keys_are_public_only(tmp_path, monkeypatch):
+    ba = _account(monkeypatch)
+    pub = tmp_path / "k.pub"
+    pub.write_text(KEY + "\n# comment\n" + KEY + "\n")
+    assert ba.read_keys([str(pub)]) == [KEY]
+    (tmp_path / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    with pytest.raises(ValueError, match="only public keys"):
+        ba.read_keys([str(tmp_path / "id_ed25519")])
+    pub.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    with pytest.raises(ValueError, match="not a public key"):
+        ba.read_keys([str(pub)])
+    home = tmp_path / "h"
+    home.mkdir()
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
+    for _ in range(2):
+        assert _bash(ba.keys_script([KEY]), env).stdout.strip() == "keys=ok"
+    ak = home / ".ssh" / "authorized_keys"
+    assert ak.read_text() == KEY + "\n" and ak.stat().st_mode & 0o777 == 0o600
+
+
+def test_setup_box_account_migration_moves_never_deletes_and_lists_rebuilds(tmp_path, monkeypatch):
+    ba = _account(monkeypatch)
+    admin, user = tmp_path / "admin", tmp_path / "me"
+    (admin / "work" / "tt-metal" / "python_env").mkdir(parents=True)
+    (admin / "work" / "tt-metal" / "python_env" / "pyvenv.cfg").write_text(f"home = {admin}\n")
+    (admin / "work" / "tt-metal" / "build").mkdir()
+    (admin / "work" / "tt-metal" / "build" / "CMakeCache.txt").write_text("x")
+    (admin / "keep.txt").write_text("the admin's own")
+    user.mkdir()
+    with pytest.raises(ValueError, match="only paths inside"):
+        ba.migrate_moves(str(admin), str(user), ["/etc/passwd"])
+    with pytest.raises(ValueError, match="only paths inside"):
+        ba.migrate_moves(str(admin), str(user), [str(admin) + "x/y"])
+    moves = ba.migrate_moves(str(admin), str(user), [str(admin / "work" / "tt-metal"), str(admin / "gone")])
+    assert moves[0]["dst"] == str(user / "work" / "tt-metal")
+    script = ba.migrate_script("me", 1234, moves)
+    assert "rm " not in script and "mv -- " in script and 'chown -R "$u:$gid"' in script
+    _, env = _root_shims(tmp_path)
+    r = _bash(script, env)
+    assert r.returncode == 0, r.stderr
+    assert (user / "work" / "tt-metal" / "build" / "CMakeCache.txt").exists()
+    assert not (admin / "work" / "tt-metal").exists() and (admin / "keep.txt").exists()
+    assert f"rebuild={user}/work/tt-metal/python_env" in r.stdout and f"rebuild={user}/work/tt-metal/build" in r.stdout
+    assert f"gone={admin}/gone" in r.stdout
+    # A target that already exists stops the move; the source stays.
+    (admin / "work" / "again").mkdir()
+    (user / "work" / "again").mkdir()
+    r = _bash(ba.migrate_script("me", 1234, ba.migrate_moves(str(admin), str(user), [str(admin / "work" / "again")])),
+              env)
+    assert r.returncode == 3 and "exists" in r.stderr and (admin / "work" / "again").exists()
+    st = ba.read_migrate_status("pending=/a\nmoved=/b\nblocked=/c\n")
+    assert st == ["to move: /a", "moved: /b", "target exists, refused: /c"]
+    assert "sudo -n test -e" in ba.migrate_status_script(moves)
+
+
+def test_setup_box_account_entry_puts_the_workdir_in_the_users_home(tmp_path, monkeypatch):
+    ba = _account(monkeypatch)
+    e = ba.entry_fields({"route": "bare", "workdir_root": "/<shared>/x"}, "me", "/home/me", "<box-alias>-admin")
+    assert e == {"route": "bare", "workdir_root": "/home/me/work", "user": "me", "admin": "<box-alias>-admin"}
+    e = ba.entry_fields({"route": "bare", "workdir_root": "/home/me/src", "admin": "a"}, "me", "/home/me/", None)
+    assert e["workdir_root"] == "/home/me/src" and "admin" not in e
+    with pytest.raises(ValueError, match="not under"):
+        ba.entry_fields({"route": "bare"}, "me", "/home/me", None, workdir="/opt/x")
+    assert ba.check_account("b", {"user": "me", "workdir_root": "/opt/x"}) == [
+        "b: workdir_root must be under me's home (account.md)"]
+    assert ba.check_account("b", {"user": "me", "workdir_root": "~/w", "admin": "b"})[0].startswith("b: admin")
+    r = _setup_box(tmp_path, "account", "entry", "<box-alias>", "--user", "me", "--home", "/home/me",
+                   "--admin", "<box-alias>-admin")
+    assert r.returncode == 0 and "~/<workdir> -> " not in r.stdout, r.stdout   # ~/... is in the home already
+    entry = json.loads((tmp_path / "boxes.json").read_text())["boxes"]["<box-alias>"]
+    assert entry == {"route": "bare", "workdir_root": "~/<workdir>", "user": "me", "admin": "<box-alias>-admin"}
+    assert _setup_box(tmp_path, "site", "check").returncode == 0
+
+
+def test_setup_box_new_box_asks_for_the_users_own_login_and_plans_the_account_first(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_account as ba
+    import box_setup as bs
+    saved = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))
+    saved = bs.merge(saved, {"account.admin": "<box-alias>-admin"})
+    assert [q["id"] for q in bs.pending(saved)] == ["account.ids", "account.migrate"]
+    ans = bs.merge(saved, {"account.ids": "/mnt/shared/u", "account.migrate": "/home/admin/tt-metal",
+                           "account.keys": "here,~/.ssh/laptop.pub"})["answers"]
+    steps = bs.plan("<box-alias>", {"workdir_root": "~/work"}, ans)
+    ids = [s["id"] for s in steps]
+    assert ids[:3] == ["account", "account.migrate", "account.entry"] and ids[3] == "broker"
+    me = ba.local_user()
+    a = steps[0]["action"]
+    assert f"account create <box-alias> --via <box-alias>-admin --user {me} --ids-from /mnt/shared/u" in a
+    assert "--pubkey here --pubkey ~/.ssh/laptop.pub --run" in a and "visudo -cf" in a
+    assert "Linger=yes" in steps[0]["check"]
+    assert "never a delete" in steps[1]["action"] and "rebuild" in steps[1]["action"]
+    assert f"--user {me} --admin <box-alias>-admin" in steps[2]["action"]
+    # Own login works: keys and linger as the user; no account is created.
+    own = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE + ["account.user=someone"]))["answers"]
+    steps = {s["id"]: s for s in bs.plan("<box-alias>", {}, own)}
+    assert "account keys <box-alias> --run" in steps["account"]["action"]
+    assert "create" not in steps["account"]["action"] and "(expect: someone" in steps["account"]["check"]
+    with pytest.raises(ValueError):
+        bs.merge({}, {"account.user": "Not A Login"})
+    q = bs.render_ask([bs.BY_ID["account.user"]], "<box-alias>", "<lock>", {})[0][0]
+    assert q["options"][0]["description"].startswith(me + ",")
+
+
+def test_setup_box_account_page_covers_the_flow():
+    page = (SKILLS / "setup-box" / "account.md").read_text(encoding="utf-8")
+    for part in ("same user name", "uid and gid", "shared mount", "as root", "visudo -cf", "docker group",
+                 "authorized_keys", "linger", "never changes or deletes another account", "/opt or /usr/local",
+                 "gh login", "never a delete", "rebuild", "only what setup-box itself added",
+                 "Host <admin-alias>", "GitHub's own", "too old"):
+        assert part in page, part
+    for page in ("new-box.md", "SKILL.md", "agents.md", "site.md"):
+        assert "`account.md`" in (SKILLS / "setup-box" / page).read_text(encoding="utf-8"), page
+
+
 def _migrate_home(tmp_path, present):
     """A fake HOME (plus PATH stubs for mutagen and crontab), with every sync leftover or none."""
     home, stubs, repo = tmp_path / "home", tmp_path / "stubs", tmp_path / "proj"
