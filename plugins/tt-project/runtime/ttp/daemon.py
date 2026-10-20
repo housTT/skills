@@ -5497,9 +5497,11 @@ class Daemon:
             if holds and self._setting_hold(task, holds, now):
                 continue
             # No run starts without a dollar cap: an unbudgeted run would get no --max-budget-usd and
-            # commit nothing toward the dollar caps, so one tick could start several past them.
+            # commit nothing toward the dollar caps, so one tick could start several past them. The
+            # cap counts from what the task already spent, so an older unbudgeted task is not stopped.
             if not task["budget_usd"]:
-                task = dict(task, budget_usd=bud.task_default_usd(self.cfg, task["tier"]))
+                task = dict(task, budget_usd=round((task["spent_usd"] or 0)
+                                                   + bud.task_default_usd(self.cfg, task["tier"]), 2))
                 db.update_task(task["id"], budget_usd=task["budget_usd"])
             provider = task["provider"] or core
             why = self._start_hold(task, provider, ctx, reserve=True)

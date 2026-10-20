@@ -3319,6 +3319,22 @@ def test_an_unbudgeted_task_starts_capped_at_its_tier_default_and_commits_it_und
     assert argv[argv.index("--max-budget-usd") + 1] == "8.00"
 
 
+def test_an_unbudgeted_task_that_already_spent_gets_its_tier_default_on_top(env, monkeypatch):
+    """A task that ran before it had a budget is not stopped by the default: its cap starts at what it spent."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    _no_events(p)
+    d = Daemon(p.base)
+    d.cfg["budget"]["task_default_usd"] = {"standard": 8.0}
+    tid = p.db.add_task("resumed work", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, spent_usd=11.5)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((k["task"]["id"], k["budget_usd"])) or 0)
+    d.dispatch()
+    assert started == [(tid, 8.0)]
+    assert p.db.task(tid)["budget_usd"] == 19.5
+
+
 def test_ttp_task_add_takes_a_budget_and_otherwise_stores_its_tier_default(env, capsys):
     p = make(env)
     from ttp import cli

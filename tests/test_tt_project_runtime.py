@@ -18698,6 +18698,8 @@ def _reboot_notices(p):
 def test_runs_lost_to_a_reboot_are_not_runaway_waste_and_are_announced_once(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
+    # Room under the daily cap for both deep runs' default budgets on top of the $53 already spent.
+    p.set_config("budget.daily_usd", 200.0)
     d = Daemon(p.base)
     tids, rids = _lost_deep_runs(p, tmp_path, "an-earlier-boot")
     nxt = p.db.add_task("next", "s", kind="work", tier="light", origin="user")
