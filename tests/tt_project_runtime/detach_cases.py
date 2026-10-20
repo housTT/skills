@@ -314,3 +314,43 @@ def test_detach_mirror_probe_reads_the_verdict_before_the_tail(env, tmp_path, mo
     r, lines = detach.mirror_probe("box-m", str(job), d)
     assert r.returncode == 0 and lines[-1] == "running 1", lines
     assert (d / "job.remote.log").read_text() == "early\nlate\n", "the tail was taken before the verdict"
+
+
+def test_a_relative_rc_never_leaves_a_lost_marker_in_the_callers_checkout(env, tmp_path, monkeypatch):
+    """A probe run from a checkout names a path no job wrote, relative to its cwd: it still reads as gone
+    (4), but no <name>.lost lands in that checkout, from the CLI or from detach.state."""
+    from ttp import detach
+    p = make(env)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    r = subprocess.run([sys.executable, str(TTP), "detach", "--check", "job.rc"], cwd=checkout,
+                       capture_output=True, text=True, env=dict(os.environ, TTP_PROJECT=str(p.root)))
+    assert r.returncode == 4 and "gone" in r.stdout, (r.stdout, r.stderr)
+    monkeypatch.chdir(checkout)
+    assert detach.state("job.rc")[0] == "lost"
+    assert detach._mark_lost_first("other.rc", "x") == "x"
+    assert not list(checkout.iterdir()), "a marker landed in the caller's checkout"
+
+
+def test_lost_markers_go_only_into_state_and_run_folders(env, tmp_path, monkeypatch):
+    from ttp import detach
+    p = make(env)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    monkeypatch.setattr(detach.os, "killpg", lambda pid, sig: None)
+    detach._mark_lost(outside / "a.rc", "why")
+    detach.stop(outside / "b.rc", 4242, "why")
+    detach.end_remote(outside / "c.rc", "why")
+    assert detach.state(outside / "d.rc")[0] == "lost"
+    assert not list(outside.iterdir()), "a marker was written outside the state and run folders"
+    run_dir, fix = p.runs / "7", p.state / "heal-fix" / "x"   # a run's folder, the daemon's own jobs
+    for d in (run_dir, fix):
+        d.mkdir(parents=True)
+        detach._mark_lost(d / "job.rc", "killed")
+        assert detach.lost(d / "job.rc").read_text().strip() == "killed"
+    own = tmp_path / "own-run"   # the calling run's folder, wherever it is
+    own.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(own))
+    monkeypatch.chdir(own)
+    assert detach._mark_lost_first("job.rc", "it never started") == "it never started"
+    assert detach.lost(own / "job.rc").read_text().strip() == "it never started"

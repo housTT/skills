@@ -42,6 +42,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -49,7 +50,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import locks, machines, shorttmp
-from .project import Project, durable_write, nice_level, renice, write_json
+from .project import FOLDER, Project, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
@@ -369,7 +370,27 @@ def _settle(q: Path, rc: Path, rid: str | None, lost_why: str = "") -> None:
             queued(rc).unlink(missing_ok=True)
 
 
+def _markable(rc: Path) -> Path | None:
+    """The absolute .rc path when a marker may go next to it: inside a project's state (its runs, the
+    daemon's own jobs), the calling run's folder ($TTP_RUN_DIR) or a run folder that records detached
+    jobs (detached.json). Else None, with a warning: a relative path a probe names resolves against
+    its cwd, and a stray <name>.lost would land in the caller's checkout."""
+    p = Path(os.path.abspath(Path(rc).expanduser()))
+    real = p.parent.resolve()
+    run = os.environ.get("TTP_RUN_DIR")
+    up = [real, *real.parents]
+    if (any(a.name == "state" and a.parent.name == FOLDER for a in up) or (real / "detached.json").is_file()
+            or (run and Path(run).resolve() in up)):
+        return p
+    print(f"ttp detach: not marking {p.with_suffix('.lost')}: outside the project state and run folders",
+          file=sys.stderr)
+    return None
+
+
 def _mark_lost(rc: Path, why: str) -> None:
+    rc = _markable(rc)
+    if rc is None:
+        return
     try:
         durable_write(lost(rc), why + "\n")
     except OSError:
@@ -379,6 +400,9 @@ def _mark_lost(rc: Path, why: str) -> None:
 def _mark_lost_first(rc: Path, why: str) -> str:
     """Record `why` in <name>.lost unless a reason is already there, and return the one that stands:
     a guess made from the outside never replaces a verdict written meanwhile (stop, remote_verdict)."""
+    rc = _markable(rc)
+    if rc is None:
+        return why
     target = lost(rc)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
