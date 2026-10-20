@@ -2890,6 +2890,7 @@ def test_the_desktop_notifier_still_gets_alerts_from_an_older_remote_without_hea
     assert rows == [{"id": 7, "text": "x"}] and ok and h["service"] == "systemd"
     assert len(calls) == 1 and st["_no_health"] == {}
 
+
 def _linger_daemon(env, monkeypatch, kind="systemd", answer="Linger=no"):
     """A daemon whose service is `kind` and whose loginctl answers `answer`; returns it and the calls."""
     from ttp import downtime, service
