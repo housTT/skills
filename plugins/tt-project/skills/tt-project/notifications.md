@@ -12,6 +12,8 @@ Default channels need no accounts or setup.
 - A remote host ssh cannot reach for 20 min (`host_down_after_s` in `notifier.json`) gets one
   notification, since its projects cannot page, and one more when it answers again. The 20 min
   count only polls in a row: after a sleep or a stopped notifier it starts again.
+- A project whose daemon has not beaten for 3 h (`daemon_down_after_s`) while its service should keep it
+  running gets one notification naming `ttp restart`, and one more when it runs again.
 - `ttp notifier test` shows a sample notification.
 - Only `high` severity notifies by default: decisions, reviews, merges, funds, outages.
 - The user can ask the coordinator for more or fewer alerts.

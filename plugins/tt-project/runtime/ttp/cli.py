@@ -6078,10 +6078,10 @@ def cmd_alerts(a) -> None:
         print(json.dumps(ep) if a.json else f"Acknowledged alert #{a.ack}: " + (
             ep["cleared_why"] if ep["cleared"] else f"{ep['acked']['why']} (kept in the feed until it clears)"))
         return
-    from .notifier import alerts_since
+    from .notifier import alerts_since, health
     rows = alerts_since(p, a.after, a.floor)
     if a.json:
-        print(json.dumps(rows))
+        print(json.dumps({"alerts": rows, "health": health(p)} if a.health else rows))
     else:
         for r in rows:
             if not r["cleared"]:
@@ -6939,6 +6939,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--after", type=int, default=0)
     s.add_argument("--floor", default="high")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--health", action="store_true", help="with --json: {alerts, health: {heartbeat_age_s, service, "
+                   "paused}}, the heartbeat's age taken on this host (the desktop notifier's daemon-down check)")
     s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the keyed alert of this message id: it closes, or moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)

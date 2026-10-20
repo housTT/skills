@@ -2568,7 +2568,7 @@ def test_the_desktop_notifier_alarms_once_when_a_remote_host_stays_unreachable_a
         "b1": {"dir": "/w/b1", "host": "host-b"}}})
     up = {"host-a": True, "host-b": True}
     monkeypatch.setattr(notifier, "_remote_alerts",
-                        lambda entry, name, after, floor: ([], True) if up[entry["host"]] else (None, False))
+                        lambda entry, name, after, floor, *a: ([], True, None) if up[entry["host"]] else (None, False, None))
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
     monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
@@ -2652,9 +2652,9 @@ def _slow_ssh_notifier(monkeypatch, n_projects=9, ssh_s=40):
         f"p{i}": {"dir": f"/w/p{i}", "host": "host-a"} for i in range(n_projects)}})
     up = {"host-a": True}
 
-    def remote(entry, name, after, floor):
+    def remote(entry, name, after, floor, *a):
         clock["t"] += ssh_s
-        return ([], True) if up["host-a"] else (None, False)
+        return ([], True, None) if up["host-a"] else (None, False, None)
     monkeypatch.setattr(notifier, "_remote_alerts", remote)
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
@@ -2707,8 +2707,185 @@ def test_the_desktop_notifier_counts_only_an_ssh_connect_failure_as_a_host_down(
     monkeypatch.setattr(notifier.subprocess, "run",
                         lambda *a, **k: SimpleNamespace(returncode=rc["code"], stdout="", stderr=""))
     entry = {"dir": "/w/a1", "host": "host-a"}
-    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, False)
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, False, None)
     rc["code"] = 1   # the host answered; the remote command failed
-    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, True)
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == (None, True, None)
     rc["code"] = 0
-    assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True)
+    assert notifier._remote_alerts(entry, "a1", 0, "high") == ([], True, None)
+
+
+def _daemon_notifier(monkeypatch, projects):
+    """A notifier over remote `projects` {name: host} whose answers come from `up` {host: bool} and
+    `hb` {name: health dict or None}. Returns (poll(t, state), up, hb, shown, reg)."""
+    from ttp import notifier, timefmt
+    reg = {n: {"dir": f"/w/{n}", "host": h} for n, h in projects.items()}
+    monkeypatch.setattr(notifier, "load_registry", lambda: {"projects": dict(reg)})
+    up = {h: True for h in projects.values()}
+    hb = {n: {"heartbeat_age_s": 10.0, "service": "systemd", "paused": False} for n in projects}
+
+    def remote(entry, name, after, floor, *a):
+        return ([], True, hb[name]) if up[entry["host"]] else (None, False, None)
+    monkeypatch.setattr(notifier, "_remote_alerts", remote)
+    monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+
+    def poll(t, st):   # a round trip through the state file, as the notifier keeps it
+        return json.loads(json.dumps(notifier.run_once(st, "high", 1200, now=1_800_000_000 + t,
+                                                         daemon_down_after_s=3 * 3600)))
+    return poll, up, hb, shown, reg
+
+
+def _down(hb, name, age):
+    hb[name] = {**hb[name], "heartbeat_age_s": float(age)}
+
+
+def test_the_desktop_notifier_alarms_once_when_a_daemon_stays_down_on_an_answering_host_and_once_on_recovery(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    poll, up, hb, shown, reg = _daemon_notifier(monkeypatch, {"proj-a": "host-a", "proj-b": "host-a"})
+    st = poll(0, {})
+    _down(hb, "proj-a", 3 * 3600 - 1)
+    st = poll(60, st)
+    assert shown == [], "a daemon under the threshold alarmed"
+    _down(hb, "proj-a", 3 * 3600)
+    st = poll(120, st)
+    since = datetime.fromtimestamp(1_800_000_000 + 120 - 3 * 3600, ZoneInfo("Europe/Berlin")).strftime("%H:%M %Z")
+    assert shown == [f"proj-a daemon down since {since} (no heartbeat for 3.0 h); its host host-a answers. "
+                     "`ttp restart proj-a` on that host."], shown
+    for t in range(180, 1800, 60):
+        _down(hb, "proj-a", 3 * 3600 + t)
+        st = poll(t, st)
+    assert len(shown) == 1, "repeated polls of a down daemon alarmed again"
+    # Projects are tracked apart: proj-b going down alarms once on its own.
+    _down(hb, "proj-b", 4 * 3600)
+    st = poll(1800, st)
+    st = poll(1860, st)
+    assert len(shown) == 2 and shown[1].startswith("proj-b daemon down since"), shown
+    _down(hb, "proj-a", 5)
+    st = poll(1920, st)
+    st = poll(1980, st)
+    assert shown[2:] == ["proj-a daemon runs again; it can page again"], shown
+    assert "proj-a" not in st["_daemons"] and st["_daemons"]["proj-b"]
+    # A project that leaves the registry goes from the state with no notice; an empty read keeps it.
+    reg.clear()
+    st = poll(2040, st)
+    assert st["_daemons"].get("proj-b"), "an empty registry read dropped an alarmed project"
+    reg["proj-a"] = {"dir": "/w/proj-a", "host": "host-a"}
+    st = poll(2100, st)
+    assert "proj-b" not in st["_daemons"] and len(shown) == 3, shown
+
+
+def test_the_desktop_notifier_never_alarms_a_daemon_with_no_service_or_unknown_health(monkeypatch):
+    poll, up, hb, shown, reg = _daemon_notifier(monkeypatch, {"proj-a": "host-a", "proj-b": "host-b"})
+    st = poll(0, {})
+    hb["proj-a"] = {"heartbeat_age_s": 9 * 3600.0, "service": None, "paused": False}   # stopped on purpose
+    hb["proj-b"] = None   # an older ttp: health unknown
+    for t in range(60, 600, 60):
+        st = poll(t, st)
+    assert shown == [], shown
+    # An alarmed daemon whose health turns unknown stays alarmed; its service going away ends it quietly.
+    hb["proj-b"] = {"heartbeat_age_s": 9 * 3600.0, "service": "cron", "paused": False}
+    st = poll(660, st)
+    assert len(shown) == 1 and shown[0].startswith("proj-b daemon down since"), shown
+    hb["proj-b"] = None
+    st = poll(720, st)
+    assert st["_daemons"].get("proj-b"), "unknown health cleared the alarm"
+    hb["proj-b"] = {"heartbeat_age_s": 9 * 3600.0, "service": None, "paused": False}
+    st = poll(780, st)
+    assert "proj-b" not in st["_daemons"] and len(shown) == 1, shown
+
+
+def test_the_desktop_notifier_sends_only_the_host_alarm_while_a_host_is_unreachable(monkeypatch):
+    poll, up, hb, shown, reg = _daemon_notifier(monkeypatch, {"proj-a": "host-a", "proj-b": "host-a"})
+    st = poll(0, {})
+    _down(hb, "proj-a", 4 * 3600)   # down before the host goes away: alarmed
+    st = poll(60, st)
+    assert len(shown) == 1 and shown[0].startswith("proj-a daemon down"), shown
+    up["host-a"] = False
+    for t in range(120, 120 + 1300, 60):
+        st = poll(t, st)
+    assert shown[1:] and shown[1].startswith("host-a unreachable since") and len(shown) == 2, shown
+    # It answers again: proj-a is fine now (the host's notice covers it), proj-b's daemon is stale.
+    up["host-a"] = True
+    _down(hb, "proj-a", 5)
+    _down(hb, "proj-b", 4 * 3600)
+    st = poll(1500, st)
+    st = poll(1560, st)
+    assert shown[2] == "host-a answers again; its projects can page again", shown
+    assert len(shown) == 4 and shown[3].startswith("proj-b daemon down since"), shown
+    assert "proj-a" not in st["_daemons"]
+
+
+def test_the_desktop_notifier_alarms_a_down_local_daemon_from_its_own_health(env, monkeypatch):
+    import os
+    from ttp import notifier, service, timefmt
+    p = make(env)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    monkeypatch.setattr(timefmt, "ambient", lambda: "UTC")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    hb = p.state / "heartbeat"
+    hb.write_text("{}")
+    now = time.time()
+    os.utime(hb, (now - 4 * 3600, now - 4 * 3600))
+    h = notifier.health(p, now)
+    assert h["service"] == "systemd" and h["paused"] is False and abs(h["heartbeat_age_s"] - 4 * 3600) < 1
+    st = notifier.run_once({}, "high", 1200, now=now)
+    assert len(shown) == 1 and shown[0].endswith("`ttp restart demo` on this machine."), shown
+    st = notifier.run_once(json.loads(json.dumps(st)), "high", 1200, now=now + 60)
+    assert len(shown) == 1, shown
+    os.utime(hb, None)
+    notifier.run_once(st, "high", 1200, now=time.time())
+    assert shown[1:] == ["demo daemon runs again; it can page again"], shown
+
+
+def test_alerts_health_flag_adds_the_daemon_health_and_leaves_the_default_output_alone(env, monkeypatch, capsys):
+    import os
+    from ttp import cli, service
+    from ttp.daemon import Daemon
+    p = make(env)
+    Daemon(p.base).alert("coordinator", "The coordinator keeps failing", "high")
+    monkeypatch.setattr(service, "installed", lambda p: None)
+    cli.main(["alerts", "demo", "--json"])
+    plain = json.loads(capsys.readouterr().out)
+    assert isinstance(plain, list) and plain and plain[0]["text"] == "The coordinator keeps failing"
+    hb = p.state / "heartbeat"
+    hb.write_text("{}")
+    os.utime(hb, (time.time() - 600, time.time() - 600))
+    p.db.set_kv("paused", True)
+    cli.main(["alerts", "demo", "--json", "--health"])
+    got = json.loads(capsys.readouterr().out)
+    assert got["alerts"] == plain
+    assert got["health"]["service"] is None and got["health"]["paused"] is True
+    assert 600 <= got["health"]["heartbeat_age_s"] < 660
+
+
+def test_the_desktop_notifier_still_gets_alerts_from_an_older_remote_without_health(monkeypatch):
+    from types import SimpleNamespace
+    from ttp import notifier
+    calls = []
+    new = {"on": False}
+
+    def run(argv, **k):
+        calls.append(argv[-1])
+        if "--health" in argv[-1]:
+            if new["on"]:
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                    {"alerts": [{"id": 7, "text": "x"}], "health": {"heartbeat_age_s": 3.0, "service": "systemd",
+                                                                     "paused": False}}))
+            return SimpleNamespace(returncode=2, stdout="", stderr="ttp: error: unrecognized arguments: --health")
+        return SimpleNamespace(returncode=0, stderr="", stdout='[{"id": 7, "text": "x"}]')
+    monkeypatch.setattr(notifier.subprocess, "run", run)
+    entry, st, t0 = {"dir": "/w/proj-a", "host": "host-a"}, {}, 1_800_000_000
+    assert notifier._remote_alerts(entry, "proj-a", 0, "high", st, t0) == ([{"id": 7, "text": "x"}], True, None)
+    assert len(calls) == 2 and "--health" in calls[0] and "--health" not in calls[1]
+    assert st["_no_health"] == {"host-a": t0}
+    calls.clear()
+    assert notifier._remote_alerts(entry, "proj-a", 0, "high", st, t0 + 3599)[0] == [{"id": 7, "text": "x"}]
+    assert len(calls) == 1 and "--health" not in calls[0], "the flag was retried within the hour"
+    calls.clear()
+    new["on"] = True   # upgraded: an hour on, the flag is asked again and the memory goes
+    rows, ok, h = notifier._remote_alerts(entry, "proj-a", 0, "high", st, t0 + 3600)
+    assert rows == [{"id": 7, "text": "x"}] and ok and h["service"] == "systemd"
+    assert len(calls) == 1 and st["_no_health"] == {}
