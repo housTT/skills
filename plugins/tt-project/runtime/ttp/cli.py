@@ -1836,6 +1836,11 @@ def _command_key(c) -> str:
     structured check, is compared as written."""
     if not isinstance(c, str):
         return str(c)
+    from . import push
+    if host := push.remote_host(c):   # another machine's pass is not this one's, nor one with other env
+        return json.dumps([str(c), host, dict(getattr(c, "env", ()) or ())])
+    if getattr(c, "env", ()):
+        return json.dumps([str(c), dict(c.env)])
     try:
         words = shlex.split(c)
     except ValueError:
@@ -2063,7 +2068,8 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
-    own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
+    checks_host = (cfg.get("delivery") or {}).get("checks_host")   # where checks without a host run
+    own = push.with_host(push.check_list((cfg.get("delivery") or {}).get("push_checks")), checks_host)
     not_run: list[str] = []
     default_harness = False
     if purpose == "harness":
@@ -2097,6 +2103,7 @@ def cmd_checks(a) -> None:
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
+    mine = push.with_host(mine, checks_host)
     if dropped:
         print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
               f"delivery.push_checks already runs it")
@@ -2262,8 +2269,8 @@ def cmd_checks(a) -> None:
         for c in [] if hit or handover else todo:
             executed.append(c)
             # A progress line per check: the commands' own output goes only to checks.log.
-            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}", flush=True)
-            out.write(f"$ {c}\n")
+            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}{push.where(c)}", flush=True)
+            out.write(f"$ {c}{push.where(c)}\n")
             out.flush()
             check_start = out.tell()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
@@ -2276,6 +2283,19 @@ def cmd_checks(a) -> None:
                 break
         if slot and not passed:
             slot.close()
+        # A check host ssh could not reach (or that could not take the tree) is the environment, as a
+        # missing runner is: wait for it, counting nothing against the change (envfault).
+        if not passed and (fault := push.remote_fault(failed, rc, top)):
+            envfault.record(p, fault, os.environ.get("TTP_TASK"))
+            envfault.write_marker(run_dir, fault)
+            said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}"
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "env_fault": fault["sig"],
+                                                             "hosts": push.hosts_of(todo)})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
     if handover:
         try:
             _checks_detach(a, Path(run_dir), p, top, head, arrived)
@@ -2325,7 +2345,8 @@ def cmd_checks(a) -> None:
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
-                                                     **({"env_problem": env_problem} if env_problem else {})})
+                                                     **({"env_problem": env_problem} if env_problem else {}),
+                                                     **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)

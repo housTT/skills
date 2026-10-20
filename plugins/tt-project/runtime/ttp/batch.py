@@ -687,7 +687,7 @@ class Batch:
         if not (allowed is None or allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
             return self._all("refused", "refused", "this project does not allow pushing (delivery.push_allowed)")
         try:
-            checks = push.check_list(self.d.get("push_checks"))
+            checks = push.with_host(push.check_list(self.d.get("push_checks")), self.d.get("checks_host"))
             rounds = push.rounds_of(self.d.get("push_rounds"))
             self.cfg = push.bump_of(self.d.get("version_bump"))
             now = "/".join(push.target(self.p, self.repo))
@@ -1069,7 +1069,7 @@ class Batch:
         env = push.check_env("target", self.tip, self.check_run_dir)
         tree, run = pushpass.tree_of(self.wt, head), []
         for cmd in todo:
-            eid = pushpass.env_id(self.wt, str(cmd), env, self.tip or "")
+            eid = pushpass.env_id(self.wt, cmd, env, self.tip or "")
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
@@ -1088,11 +1088,15 @@ class Batch:
                 extra = pushpass.resume_env(resume, env) if resume else {}
                 if done := pushpass.resumed(resume) if resume else []:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
+                if push.remote_host(cmd):
+                    say(f"running {cmd}{push.where(cmd)}")
                 rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
                                       env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited())
                 suite_out.append(tail)
+                if fault := push.remote_fault(cmd, rc, self.wt):
+                    raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                 if rc != 0:
-                    say(f"check failed on {head[:10]}: {cmd}")
+                    say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
                     return cmd, tail
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id):
                     say(f"could not record the pass of {cmd}: {why}")
@@ -1138,7 +1142,7 @@ class Batch:
         try:
             for cmd in todo:
                 label = f"caps {rx}: {cmd}"
-                eid = pushpass.env_id(self.wt, str(cmd), env, self.tip or "")
+                eid = pushpass.env_id(self.wt, cmd, env, self.tip or "")
                 if hit := pushpass.probe_known(self.p, tree, label, eid):
                     ok, tail = bool(hit.get("ok")), str(hit.get("tail") or "")
                     say(f"cap probe of {head[:10]} {'passed' if ok else 'failed'} in {hit.get('batch') or '?'} "
@@ -1153,6 +1157,8 @@ class Batch:
                     rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
                                           env={**env, **pushpass.select_env(rx, env), **slot.env()},
                                           pass_fds=checkdirs.inherited())
+                    if fault := push.remote_fault(cmd, rc, self.wt):
+                        raise envfault.Fault(fault)
                     ok = rc in (0, NO_TESTS)
                     self.checks["cap_probes"] = self.checks.get("cap_probes", 0) + 1
                     if why := pushpass.probe_record(self.p, tree, label, eid, ok, tail, self.id):

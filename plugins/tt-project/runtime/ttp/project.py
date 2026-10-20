@@ -390,7 +390,8 @@ EXTRA_KEYS = {
                  "push_solo_paths", "push_cap_tests",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard",
-                 "checks_fast_globs", "checks_fast_exclude"},   # the last two: `ttp checks` fast path (push.FAST_GLOBS),
+                 "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
+                 "checks_host"},   # where checks run (remotecheck)
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -658,6 +659,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
             out.append(f"delivery.{k}: not a list of glob strings")
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
+    if delivery.get("checks_host") not in (None, ""):
+        from .remotecheck import host_problem
+        out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]
     out += bump_problems(delivery.get("version_bump"))
     coord = raw.get("coordinator")
     if isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip():
