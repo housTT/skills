@@ -228,3 +228,25 @@ def test_an_issues_table_from_before_history_gains_the_column(env):
     c.close()
     db = DB(path)
     assert "history" in {r["name"] for r in db.q("PRAGMA table_info(issues)")}
+
+
+def test_a_schedule_name_outside_the_safe_set_is_refused_everywhere_but_a_stored_one_keeps_working(env):
+    """Schedule names show in the web app: letters, digits and . _ - only (1-64). upsert, the schedules
+    file and schedule_set refuse others; a row stored before the check can still be changed."""
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    p = make(env)
+    for bad in ("x');alert(1);//", 'a"b', "has space", "", "x" * 65, None):
+        with pytest.raises(ValueError, match="not allowed"):
+            sched.upsert(p.db, bad, "llm", "1d")
+    sched.upsert(p.db, "nightly-build.v2_a", "llm", "1d")
+    out = coord.apply(p, [{"type": "schedule_set", "name": "it's", "kind": "llm", "every": "1d", "spec": "go"}])
+    assert len(out) == 1 and "schedule_set rejected" in out[0] and "not allowed" in out[0], out
+    assert not p.db.one("SELECT name FROM schedules WHERE name=?", ("it's",))
+    with pytest.raises(ValueError, match="entry 1: schedule name"):
+        sched.parse_file(json.dumps([{"name": "a'b", "kind": "llm", "every": "1d"}]))
+    # A legacy row: changed and switched off as before, in upsert and in the file.
+    p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES('old name','llm',86400,1,'{}')")
+    sched.upsert(p.db, "old name", "llm", "2d", enabled=False)
+    assert p.db.one("SELECT every_s, enabled FROM schedules WHERE name='old name'") == {"every_s": 172800, "enabled": 0}
+    assert sched.parse_file(json.dumps([{"name": "old name", "kind": "llm", "every": "1d"}]), {"old name"})

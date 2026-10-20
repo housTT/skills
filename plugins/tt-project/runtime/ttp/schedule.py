@@ -88,14 +88,26 @@ def at_text(row: dict, home: str | None, now: float | None = None) -> str:
     return f"at {row['at']} {timefmt.abbrev(tz, float(when))}" + (f" ({tz})" if pinned else "")
 
 
+# Schedule names show in the web app and in commands: letters, digits and . _ - only. A row stored
+# under another name before this check keeps working (it can still be changed or switched off).
+NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def check_name(name: Any, known: Any = ()) -> None:
+    """Raises ValueError unless `name` is a valid schedule name or one of the `known` names already stored."""
+    if not (isinstance(name, str) and (NAME_RE.fullmatch(name) or name in known)):
+        raise ValueError(f"schedule name {str(name)[:80]!r} is not allowed: use 1-64 letters, digits, '.', '_' or '-'")
+
+
 def upsert(db: DB, name: str, kind: str, every: str | int, at: str | None = None, enabled: bool = True,
            budget_usd_day: float | None = None, description: str = "", payload: dict | None = None,
            home: str | None = None) -> None:
     """Add or change a schedule. A new `at` is read in the project's home zone `home`, and so is
     every later run (the row follows the home zone); an unchanged `at` keeps the zone it had."""
+    existing = db.one("SELECT * FROM schedules WHERE name=?", (name,))
+    check_name(name, (name,) if existing else ())
     every_s = parse_every(every)
     at = at or None
-    existing = db.one("SELECT * FROM schedules WHERE name=?", (name,))
     same_at = bool(existing) and (existing["at"] or None) == at
     tz = existing.get("tz") if same_at else None
     keep = existing and existing["next_run"] and same_at and not reenabled(existing, enabled)
@@ -249,9 +261,10 @@ def entry(row: dict) -> dict:
     return out
 
 
-def parse_file(text: str | bytes) -> list[dict]:
+def parse_file(text: str | bytes, known: Any = ()) -> list[dict]:
     """The file's schedules, checked whole: one bad entry rejects the file, so a half-applied
-    edit never leaves some schedules changed and others not. Raises ValueError saying what is wrong."""
+    edit never leaves some schedules changed and others not. Raises ValueError saying what is wrong.
+    `known`: names already stored, kept even when they predate the name check (check_name)."""
     try:
         data = json.loads(text)
     except ValueError as e:
@@ -265,6 +278,10 @@ def parse_file(text: str | bytes) -> list[dict]:
             raise ValueError(f"{where} needs a `name`")
         name = e["name"]
         where = f"schedule {name!r}"
+        try:
+            check_name(name, known)
+        except ValueError as err:
+            raise ValueError(f"entry {i + 1}: {err}") from None
         if name in seen:
             raise ValueError(f"{where} appears twice")
         seen.add(name)
@@ -322,7 +339,7 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
     if not force and db.kv(_APPLIED) == sha:
         return False, None
     try:
-        entries = parse_file(raw)
+        entries = parse_file(raw, {r["name"] for r in db.q("SELECT name FROM schedules")})
     except ValueError as e:
         return False, f"{FILE}: {e}"
     with db.tx():

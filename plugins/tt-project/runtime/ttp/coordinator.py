@@ -1950,6 +1950,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "schedule_set":
                 sched.before_change(p)
                 old = db.one("SELECT * FROM schedules WHERE name=?", (a.get("name"),))
+                try:   # the name shows in the web app: a stored name is kept, a new one is checked
+                    sched.check_name(a.get("name"), (old["name"],) if old else ())
+                except ValueError as e:
+                    raise ValueError(f"schedule_set rejected: {e}") from None
                 kind = a.get("kind") or (old["kind"] if old else "llm")
                 kept = json.loads(old["payload"] or "{}") if old and old["kind"] == kind else {}
                 # Fields the action leaves out keep their current values; only a new schedule gets defaults.

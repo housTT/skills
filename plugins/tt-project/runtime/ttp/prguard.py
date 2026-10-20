@@ -146,6 +146,14 @@ def pr_key(text: str) -> str | None:
     return f"{m.group(1)}/{m.group(2)}#{int(m.group(3))}".lower() if m else None
 
 
+def safe_pr_url(text) -> str:
+    """`text` when it is an https:// PR URL (pr_key parses it from its start, no spaces or quotes), else ''.
+    A hand-off's `pr` is stored and shown as a link only then: never a javascript: or other URL."""
+    t = text.strip() if isinstance(text, str) else ""
+    ok = t.lower().startswith("https://") and PR_URL_RE.match(t) and pr_key(t) and not re.search(r"[\s\"'<>`\\]", t)
+    return t if ok else ""
+
+
 def task_pr(task: dict) -> str:
     """The URL of the PR a code task published its change as: its pr_url, else the `pr` its hand-off names."""
     from .db import load_result

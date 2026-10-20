@@ -3713,7 +3713,11 @@ class Daemon:
         elif new == "queued" and status not in ("limit", "auth"):
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
-            upd["pr_url"] = str(result["pr"])[:300]
+            if url := prguard.safe_pr_url(result["pr"])[:300]:
+                upd["pr_url"] = url
+            else:   # shown as a link in the web app: only an https:// PR URL is kept
+                log(self.p, f"task {task['id']}: hand-off pr {str(result['pr'])[:120]!r} is not an https:// "
+                            f"PR URL; not stored")
         if approval:
             with db.tx():   # rows, pins and the status together: a failed pin leaves the run to be retried
                 pushq.approve(self.p, task["id"], r.get("id"), approval)

@@ -5,7 +5,10 @@ const $ = (s) => document.querySelector(s);
 // Page updates go through render.js: unchanged parts are left alone, held ones wait for the user.
 const R = window.TTPRender, put = (el, html) => R.patch(el, html), text = (el, s) => R.text(el, s);
 const agoH = R.agoHtml;
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// A link only to an http(s) URL: any other value (javascript:, data:, ...) shows as plain text.
+const isHttp = (url) => /^https?:\/\//i.test(String(url || ""));
+const link = (url, label) => isHttp(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${label}</a>` : label;
 const ago = R.ago;
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
 // Every time is shown in the project's home zone (the daemon sends it), with its abbreviation: never
@@ -42,7 +45,7 @@ document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
 // registry gives the project a link.
 async function projects() {
   const o = await api("/api/overview");
-  const name = (r) => r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a>` : esc(r.name);
+  const name = (r) => link(r.url, esc(r.name));
   put($("#projlist"), o.projects.length ? `<table><tr><th>Project</th><th>Daemon</th><th>Version</th><th>Open asks</th><th>Waiting on you</th><th>Running</th><th>Spend</th></tr>` +
     o.projects.map((r) => !r.ok ? `<tr><td><b>${name(r)}</b></td><td colspan="6" class="meta">${esc(r.note)}</td></tr>`
       : `<tr><td><b>${name(r)}</b></td><td><span class="pill ${r.daemon === "running" ? "" : "lv-red"}">${esc(r.daemon)}</span></td>` +
@@ -103,15 +106,20 @@ function taskRow(t) {
   const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
-    <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
+    <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
     ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age_text)})</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}${t.gate ? `<p class="meta">${t.gate.warn ? "<b>warning:</b> " : ""}${esc(t.gate.text)}</p>` : ""}
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}${trendHtml(t.trend)}
     ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
-    ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}
-    ${["blocked", "failed"].includes(t.outcome || t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
+    ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" data-task-act="cancelled" data-task="${esc(t.id)}">Cancel</button>` : ""}
+    ${["blocked", "failed"].includes(t.outcome || t.status) ? `<button class="ghost" data-task-act="queued" data-task="${esc(t.id)}">Retry</button>` : ""}</details>`;
 }
-window.taskAct = async (id, status) => { const r = await api(`/api/task/${id}`, { status }); if (r.error) alert(r.error); refresh(); };
+// One delegated listener for the task rows' buttons (no inline handlers): rows patched later keep working.
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-task-act]");
+  if (!b) return;
+  const r = await api(`/api/task/${encodeURIComponent(b.dataset.task)}`, { status: b.dataset.taskAct }); if (r.error) alert(r.error); refresh();
+});
 
 function bars(el, rows, key, label, cap) {
   if (!rows.length) { put(el, `<p class="muted">No data yet.</p>`); return; }
@@ -295,8 +303,8 @@ async function refresh() {
   put($("#schedlist"), `<table><tr><th>Name</th><th>Kind</th><th>Every</th><th>Last run</th><th>7-day cost</th><th>Daily budget</th><th>On</th></tr>` +
     st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}</td><td>${Math.round(s.every_s / 60)} min${s.at_text ? " " + esc(s.at_text) : ""}</td>
       <td>${agoH(s.last_run)} ago<div class="meta">${esc((s.last_status || "").startsWith("skipped: budget ") ? "waiting for budget" : s.last_status || "")}</div></td><td>${money(s.cost_7d)}</td>
-      <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day == null ? "" : s.budget_usd_day}" style="width:6em" onchange="setSched('${esc(s.name)}',{budget_usd_day:this.value})"></td>
-      <td><input type="checkbox" ${s.enabled ? "checked" : ""} onchange="setSched('${esc(s.name)}',{enabled:this.checked})"></td></tr>`).join("") + `</table>`);
+      <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day == null ? "" : esc(s.budget_usd_day)}" style="width:6em" data-schedule="${esc(s.name)}" data-field="budget_usd_day"></td>
+      <td><input type="checkbox" ${s.enabled ? "checked" : ""} data-schedule="${esc(s.name)}" data-field="enabled"></td></tr>`).join("") + `</table>`);
   put($("#accounts"), (st.accounts || []).map((a) => `<div class="row"><b>${esc(a.provider)}</b><span class="meta">${esc(a.account || "unknown")}</span><span class="meta">last used ${agoH(a.last)} ago</span></div>`).join("") || `<p class="muted">No runs yet.</p>`);
   bars($("#spendchart"), st.budget.daily_spend, "usd", "daily spend", cfg.budget && cfg.budget.daily_usd);
   bars($("#peakchart"), st.budget.window_peaks, "peak", "window peaks", cfg.budget ? 100 - cfg.budget.reserve_pct : 90);
@@ -311,7 +319,13 @@ async function refresh() {
   };
   R.tick();
 }
-window.setSched = async (name, body) => { await api(`/api/schedule/${encodeURIComponent(name)}`, body); refresh(); };
+const setSched = async (name, body) => { await api(`/api/schedule/${encodeURIComponent(name)}`, body); refresh(); };
+// One delegated listener for the schedule inputs: the name comes from data-schedule, never from inline script.
+$("#schedlist").addEventListener("change", (e) => {
+  const el = e.target.closest("[data-schedule]");
+  if (!el) return;
+  setSched(el.dataset.schedule, el.dataset.field === "enabled" ? { enabled: el.checked } : { budget_usd_day: el.value });
+});
 $("#savecaps").onclick = async () => {
   await api("/api/config", { key: "budget.daily_usd", value: $("#daily").value });
   await api("/api/config", { key: "budget.weekly_usd", value: $("#weekly").value }); refresh();

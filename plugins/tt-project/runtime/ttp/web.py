@@ -618,6 +618,10 @@ def state_payload(p: Project, db: DB) -> dict:
     }
 
 
+# What a handler raises on a malformed path, query or body (int("x"), float(None), a list body's .get).
+BAD_REQUEST = (ValueError, TypeError, AttributeError)
+
+
 class Handler(BaseHTTPRequestHandler):
     daemon_ref = None
     server_version = "tt-project"
@@ -699,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"progress": tail("progress.md"), "result": tail("result.json"),
                                         "stderr": tail("stderr.log"), "archived": archived_files(self._proj(), r["task"])})
             return self._send(404, {"error": "unknown endpoint"})
+        except BAD_REQUEST as e:   # a bad id, number or body shape: the caller's mistake, never a dropped connection
+            return self._send(400, {"error": f"bad request: {type(e).__name__}: {str(e)[:200]}"})
         finally:
             db.close()
 
@@ -782,6 +788,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"error": str(e)})
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "unknown endpoint"})
+        except BAD_REQUEST as e:   # a bad id, number or body shape: the caller's mistake, never a dropped connection
+            return self._send(400, {"error": f"bad request: {type(e).__name__}: {str(e)[:200]}"})
         finally:
             db.close()
 

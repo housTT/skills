@@ -4653,7 +4653,7 @@ def test_web_app_writes_the_page_through_render_js():
     client) and the page loads render.js first."""
     web = RUNTIME / "ttp" / "web"
     js = (web / "app.js").read_text()
-    body = js[js.index("async function refresh()"):js.index("window.setSched")]
+    body = js[js.index("async function refresh()"):js.index("const setSched")]
     assert ".innerHTML" not in body and ".textContent =" not in body and "ago(" not in body.replace("ago(lastOk", ""), body
     assert "R.key(st" in body and "R.rows(" in body
     html = (web / "index.html").read_text()
@@ -25393,6 +25393,72 @@ def test_web_api_config_rejects_a_bad_value_with_400(env):
     assert code == 400 and "lots" in err["error"], err
     assert post({"key": "budget.max_parallel_workers", "value": 3}) == (200, None)
     assert p.config()["budget"]["max_parallel_workers"] == 3
+
+
+def test_web_api_answers_a_malformed_request_with_400(env):
+    """A bad number in a path or query, a bad budget value or a body that is not an object: 400 with
+    the reason, never a dropped connection; the server keeps serving."""
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp import web
+    sched.upsert(p.db, "nightly", "llm", "1d")
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    port = _start_web(p)
+
+    def call(path, body=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET" if body is None else "POST",
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+        for _ in range(50):
+            try:
+                return urllib.request.urlopen(req, timeout=5).status, None
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("the web app did not start")
+    for path, body in (("/api/messages?after=x", None), ("/api/run/abc", None), ("/api/task/abc", {"status": "queued"}),
+                       (f"/api/task/{tid}", {"priority": "high"}), ("/api/schedule/nightly", {"budget_usd_day": "lots"}),
+                       ("/api/say", ["not", "an", "object"])):
+        code, err = call(path, body)
+        assert code == 400 and err["error"].startswith("bad request:"), (path, code, err)
+    assert call("/api/messages?after=0")[0] == 200 and call("/api/schedule/nightly", {"budget_usd_day": 2})[0] == 200
+
+
+def test_a_hand_off_pr_is_stored_only_as_an_https_pr_url(env):
+    """pr_url is shown as a link in the web app: a hand-off's `pr` is kept only when it is an https://
+    PR URL; anything else (javascript:, a bare reference, a quote-breaking value) is dropped and logged."""
+    from ttp import prguard
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    d = Daemon(p.base)
+    good = "https://github.com/acme/app/pull/7"
+    for i, (pr, want) in enumerate(((good, good), ("javascript:alert(1)//https://github.com/a/b/pull/1", None),
+                                    ("http://github.com/acme/app/pull/7", None), ("acme/app#7", None),
+                                    ('https://github.com/acme/app/pull/7"onmouseover="x', None), (["x"], None))):
+        tid = p.db.add_task(f"t{i}", "spec", kind="work", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="running")
+        run_dir = env["tmp"] / f"run-pr-{tid}"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok", "pr": pr}))
+        d._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+        assert p.db.task(tid)["pr_url"] == want, pr
+        if want is None:
+            assert f"task {tid}: hand-off pr" in (p.logs / "daemon.log").read_text()
+    assert prguard.safe_pr_url(" " + good + " ") == good and not prguard.safe_pr_url("javascript:" + good)
+
+
+def test_web_app_links_only_http_urls_and_uses_no_inline_handlers():
+    """app.js renders an href only for an http(s) URL, escapes single quotes, and wires its buttons and
+    schedule inputs through delegated listeners, never inline on* attributes built from data."""
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert not re.search(r'\bon[a-z]+="', js), re.findall(r'\bon[a-z]+="[^"]*', js)
+    assert '"\'": "&#39;"' in js and "[&<>\"']" in js
+    assert js.count('href="${') == 1 and 'isHttp(url) ? `<a href="${esc(url)}"' in js
+    assert "link(r.url," in js and "isHttp(t.pr_url) ? link(t.pr_url" in js
+    assert 'data-schedule="${esc(s.name)}"' in js and '$("#schedlist").addEventListener("change"' in js
+    assert 'closest("[data-task-act]")' in js and "window.taskAct" not in js and "window.setSched" not in js
 
 
 def test_worker_prompt_keeps_real_parenthesised_paragraphs(env):
