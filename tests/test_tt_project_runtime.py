@@ -19216,7 +19216,7 @@ def test_a_waiting_hand_offs_top_level_followups_survive_its_on_pass(env, monkey
     p = make(env)
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     d = dmod.Daemon(p.base)
-    note = {"title": "upstream: waits lose their followups", "spec": "keep them"}
+    note = {"title": "upstream: waits lose their followups", "spec": "the daemon should keep them"}
     later = {"title": "tidy the parser", "spec": "later"}
     tid, _ = _checks_wait_task(p, tmp_path, {**DONE_ON_PASS, "followups": [later]}, on_pass_cmd=cmd)
     run_dir = tmp_path / f"run-{tid}"
@@ -23194,9 +23194,9 @@ def _upstream_inbox(env):
 def test_upstream_notes_are_filed_once_in_the_users_inbox(env):
     p = make(env)
     from ttp import upstream
-    note = {"title": "upstream: status hides waits", "spec": "Show waiting tasks in status."}
+    note = {"title": "upstream: status hides waits", "spec": "Show waiting tasks in ttp status."}
     tid, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [
-        note, {"title": "Upstream:  STATUS hides waits", "spec": "show waiting tasks  in status."},
+        note, {"title": "Upstream:  STATUS hides waits", "spec": "show waiting tasks  in ttp status."},
         {"title": "next step here", "spec": "local work"}]})
     inbox = _upstream_inbox(env)
     assert len(inbox) == 1, "the same note in other case and spacing was filed twice"
@@ -23906,11 +23906,11 @@ def test_an_upstream_note_or_page_past_the_limit_is_cut_saying_so(env):
     daemon's page to another project."""
     from ttp import upstream
     p = make(env)
-    spec = "do this first. " + "detail " * 700
+    spec = "the daemon does this first. " + "detail " * 700
     _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [{"title": "upstream: big", "spec": spec}]})
     (n,) = _upstream_inbox(env)
     kept = len(n["spec"]) - len(n["spec"].split(" … [cut: ")[1]) - len(" … [cut: ")
-    assert len(n["spec"]) <= upstream.SPEC_CHARS and n["spec"].startswith("do this first.")
+    assert len(n["spec"]) <= upstream.SPEC_CHARS and n["spec"].startswith("the daemon does this first.")
     assert f"[cut: {kept} of {len(spec.strip())} characters kept; the whole text is in the hand-off of demo #" in n["spec"]
     assert upstream.send("demo", None, "other", "page " * 1000, sender="daemon") == "sent"
     m = _upstream_inbox(env)[-1]
@@ -24481,7 +24481,7 @@ def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(en
     p = make(env)
     from ttp import upstream, coordinator as coord
     _, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok",
-                                   "followups": [{"title": "upstream: a lesson", "spec": "s"}]})
+                                   "followups": [{"title": "upstream: a lesson", "spec": "the worker prompt could say so"}]})
     assert "no project reads the user's upstream inbox. Pass" in coord.digest(p, {}, ids, [])
     upstream.reader_path().write_text(json.dumps({"project": "dev", "host": "box", "ts": time.time()}))
     dig = coord.digest(p, {}, ids, [])
@@ -27181,7 +27181,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "private snapshot taken at launch" in rules["code"]
     assert "private snapshot taken at launch" not in rules["question"]
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 18_000, len(every)
+    assert len(every) <= 18_100, len(every)  # room for the upstream-note scope rule
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system

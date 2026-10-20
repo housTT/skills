@@ -81,7 +81,13 @@ read the one for the lever you change.
   tt-project plugin's source repository or another project's harness. Upgrading another
   project on this machine to the installed release (`ttp upgrade <name>`) is not editing its harness; hand edits to its charter, memory, config, state or code are.
 - A lesson every project would benefit from → an upstream note in the hand-off: a follow-up
-  titled `upstream: …`.
+  titled `upstream: …`. It is only for a defect or missing feature in the tt-project plugin itself
+  (runtime, CLI, web app, prompts, skills): for example, a daemon that misreads a wait probe, or a
+  worker prompt rule that leaves workers guessing. The project's own code, machines, models, test
+  environment or its own harness scripts get a normal follow-up in this project: for example, a
+  box missing a tool version, or a model output mismatch. The daemon files an `upstream:` follow-up
+  that names nothing of tt-project (no word such as tt-project, ttp, daemon, harness, coordinator,
+  worker, schedule, push, review or runtime) as this project's own follow-up, and logs it.
 - Notes reach the project that reads them even when its machine cannot reach this one (a laptop
   behind NAT): each daemon sends this machine's own notes on over ssh to `ttp upstream --receive`
   there, with the user's keys and known hosts and no new port. Notes go only where they are read;

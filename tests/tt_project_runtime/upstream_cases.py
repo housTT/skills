@@ -127,3 +127,45 @@ def test_note_to_and_status_warn_when_the_forward_target_has_failed_for_hours(en
     # A target no longer among the forward targets is not reported.
     upstream.set_forward_to(["other-host"])
     assert upstream.forward_line() == "" and upstream.failing() == {}
+
+
+@pytest.mark.parametrize("fup,kept", [
+    ({"title": "upstream: the worker prompt could name the lock command", "spec": "workers guess it"}, True),
+    ({"title": "upstream: retries lose the spec", "spec": "the daemon drops it on a retry"}, True),
+    ({"title": "upstream: ttp status hides waits", "spec": "show them"}, True),
+    ({"title": "upstream: the build box needs a newer Node", "spec": "install it before the next run"}, False),
+    ({"title": "upstream: model output drifts in bf16", "spec": "compare against the fp32 reference"}, False),
+    ({"title": "upstream:", "spec": "the test machine lacks write access to the cache folder"}, False),
+])
+def test_an_upstream_follow_up_naming_nothing_of_tt_project_stays_with_its_project(fup, kept):
+    from ttp import upstream
+    (out,), moved = upstream.reroute([fup])
+    assert upstream.is_note(out) == kept and bool(moved) != kept
+    if not kept:
+        assert out["title"] == moved[0] and out["title"] and out["spec"] == fup["spec"]
+    other = {"title": "plain follow-up", "spec": "s"}
+    assert upstream.reroute([other]) == ([other], [])
+
+
+def test_the_daemon_files_a_project_local_upstream_follow_up_as_its_own(env):
+    """Only the note about tt-project reaches the user's inbox; the other is proposed to this
+    project's coordinator without the prefix, with a log line and a note saying why."""
+    p = make(env)
+    tid, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [
+        {"title": "upstream: the coordinator re-reads the whole digest", "spec": "cache it"},
+        {"title": "upstream: the build box needs a newer Node", "spec": "install it"}]})
+    assert [n["title"] for n in _upstream_inbox(env)] == ["upstream: the coordinator re-reads the whole digest"]
+    texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE task=?", (tid,))]
+    assert any(t.startswith("proposed follow-up: the build box needs a newer Node") for t in texts), texts
+    assert any("Not an upstream note" in t and "the build box needs a newer Node" in t for t in texts), texts
+    assert "names nothing of tt-project; kept as this project's follow-up" in (p.logs / "daemon.log").read_text()
+
+
+def test_the_worker_prompt_and_harness_skill_keep_project_work_out_of_upstream_notes():
+    plugin = RUNTIME.parent
+    worker = " ".join((plugin / "template" / "prompts" / "worker.md").read_text().split())
+    assert "`upstream: ...` follow-ups are only for tt-project faults" in worker
+    assert "your own code, boxes, models or scripts get plain follow-ups" in worker
+    skill = " ".join((plugin / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
+    assert "only for a defect or missing feature in the tt-project plugin itself" in skill
+    assert "names nothing of tt-project" in skill

@@ -3784,6 +3784,11 @@ class Daemon:
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
+        # An `upstream:` note that names nothing of tt-project is this project's own follow-up.
+        fups, local = upstream.reroute(fups)
+        for t in local:
+            log(self.p, f"task {task['id']}: `upstream:` follow-up names nothing of tt-project; "
+                        f"kept as this project's follow-up: {t[:200]}")
         try:
             upstream.append(self.p.name, task["id"], fups)   # the user's inbox of notes for tt-project
         except OSError as e:
@@ -3794,7 +3799,8 @@ class Daemon:
         head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): ")
         text = ""   # the daemon's own lines after the summary, which the digest must show whole
-        notes = ""
+        notes = "".join(f"\nNot an upstream note (names nothing of tt-project), so proposed as this project's "
+                        f"follow-up: {t[:200]}" for t in local)
         if len(fups) > MAX_FOLLOWUPS:
             notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
                       + "; ".join(str(f["title"])[:120] for f in fups[MAX_FOLLOWUPS:]))
