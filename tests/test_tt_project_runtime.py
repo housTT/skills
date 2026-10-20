@@ -14500,6 +14500,31 @@ def test_a_transient_git_failure_never_removes_a_workspace_with_uncommitted_work
         assert (path / "work.txt").read_text() == "uncommitted"
 
 
+def test_a_plain_folder_at_a_workspace_path_is_moved_aside_never_deleted(env):
+    # A copy restored from another host left a folder git does not know at the task's worktree path:
+    # ensure moves it to worktrees/.stale-<UTC time>/<name>, says so, and makes the worktree.
+    p = make(env)
+    from ttp import worktree
+    task = p.db.task(p.db.add_task("restored", "s", kind="code", tier="light", origin="user"))
+    path = p.worktrees / f"t{task['id']}"
+    (path / "sub").mkdir(parents=True)
+    (path / "sub" / "old.txt").write_text("keep me")
+    assert worktree.ensure(p, task)[0] == path
+    assert worktree.is_git(path) and not (path / "sub").exists()
+    stale = [d for d in p.worktrees.iterdir() if d.name.startswith(worktree.STALE_PREFIX)]
+    assert len(stale) == 1 and re.fullmatch(r"\.stale-\d{8}T\d{6}Z", stale[0].name)
+    assert (stale[0] / path.name / "sub" / "old.txt").read_text() == "keep me"
+    assert f"moved aside to {stale[0] / path.name}" in worktree.recovery_note(p, task)
+    # A second stray folder at the same path: moved aside too, the first copy untouched.
+    _git_out(p.root, "worktree", "remove", "--force", str(path))
+    path.mkdir()
+    (path / "x").write_text("x")
+    worktree.ensure(p, task)
+    kept = sorted(str(f.relative_to(p.worktrees)).split("/", 1)[1] for f in p.worktrees.glob(".stale-*/*/**/*")
+                  if f.is_file())
+    assert kept == [f"{path.name}/sub/old.txt", f"{path.name}/x"]
+
+
 def test_a_workspace_locked_initializing_with_an_index_and_edits_is_kept_and_reused(env):
     p = make(env)
     from ttp import worktree

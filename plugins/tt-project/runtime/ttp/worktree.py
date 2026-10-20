@@ -170,18 +170,33 @@ def _whole(p: Project, path: Path, rec: dict, branch: str) -> bool:
         raise RuntimeError(f"worktree {path} left as it is: {e}") from e
 
 
-def _clear_partial(p: Project, path: Path, rec: dict | None, repo: Path | None = None) -> None:
+STALE_PREFIX = ".stale-"   # worktrees/.stale-<UTC time>/<name>: a folder _clear_partial moved aside
+
+
+def _clear_partial(p: Project, path: Path, rec: dict | None, repo: Path | None = None,
+                   task: dict | None = None) -> None:
     """Remove what an unfinished `git worktree add` left at `path` so it can be made again: a half-made
     registered worktree (`rec`, which _whole found half-made), or git's record of one whose directory is
     gone. A directory git does not know holding more than a `.git` file is never deleted: it is not
-    ours. `repo`: the repository it belongs to (default the project's)."""
+    ours (a copy restored from another host, say). It moves aside to <parent>/.stale-<UTC time>/<name>
+    and a worktree_recovered event says where. `repo`: the repository it belongs to (default the
+    project's); `task`: the task whose worktree this is, for the event."""
     repo = repo or p.root
     if rec and not rec["prunable"]:
         _git(repo, "worktree", "remove", "--force", "--force", str(path), check=False, timeout=git_timeout(p))
     _git(repo, "worktree", "prune", check=False, timeout=git_timeout(p))
     if path.is_dir() and not _registered(p, path, repo):
         if any(c.name != ".git" for c in path.iterdir()):
-            raise RuntimeError(f"{path} exists, is no worktree of this repository and is not empty")
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            dest = next(d for n in range(1000) if not (d := path.parent / f"{STALE_PREFIX}{stamp}"
+                                                       f"{f'-{n}' if n else ''}" / path.name).exists())
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(dest)
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", RECOVERED_EVENT, "low",
+                    f"{path} was a folder git does not know as a worktree: moved aside to {dest}"[:500],
+                    json.dumps({"stale": str(dest), "was": str(path)}), "handled", task["id"] if task else None))
+            return
         shutil.rmtree(path)
 
 
@@ -199,7 +214,7 @@ class WorkspaceStuck(RuntimeError):
     final = True
 
 
-RECOVERED_EVENT = "worktree_recovered"   # the task's event when ensure fixed a worktree on another branch
+RECOVERED_EVENT = "worktree_recovered"   # the task's event when ensure fixed a worktree on another branch or moved a folder aside
 
 
 def _owns(p: Project, task: dict, name: str) -> bool:
@@ -344,7 +359,7 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
             break
         try:
             if path.exists() or rec:
-                _clear_partial(p, path, rec)
+                _clear_partial(p, path, rec, task=task)
             _create(p, task, path, branch, carried, git_timeout(p, 1 + n / 2))
             break
         except (RuntimeError, subprocess.SubprocessError):
