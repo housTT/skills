@@ -74,8 +74,34 @@ def base_ref(p: Project) -> str:
     branch, `delivery.push_branch`, then a branch the charter names (`branch <name>`), each as
     origin/<name> when the remote has it (a local branch of that name may be behind; ensure()
     fetches first), else the local name; the remote's default branch (origin/HEAD); the
-    checked-out branch."""
-    return named_base(p) or _git(p.root, "rev-parse", "--abbrev-ref", "HEAD")
+    checked-out branch, never a detached HEAD or a branch the root was moved to (root_base)."""
+    return named_base(p) or root_base(p)
+
+
+ROOT_HOME_KEY = "root_home"   # kv: the branch the daemon last saw the project root's checkout on, no alert open
+
+
+def root_branch(p: Project) -> str:
+    """The branch the project root's checkout belongs on: `worktree.root_branch` as set, else the one
+    the daemon last saw it on with no root alert open (ROOT_HOME_KEY); "" when neither is known."""
+    w = p.config().get("worktree") or {}
+    if str(w.get("root_branch") or "").strip():
+        return str(w["root_branch"]).strip()
+    try:
+        return str(p.db.kv(ROOT_HOME_KEY, "") or "")
+    except Exception:
+        return ""
+
+
+def root_base(p: Project) -> str:
+    """base_ref's last fallback: the root's checked-out branch, unless the root is detached or on
+    another branch than root_branch; then root_branch when it exists, else "" (resolve_base refuses:
+    no worktree is branched from a HEAD a task moved the root to)."""
+    cur = _git(p.root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    home = root_branch(p)
+    if home and cur != home and _has(p, f"refs/heads/{home}"):
+        return home
+    return cur
 
 
 def named_base(p: Project) -> str:
@@ -509,7 +535,8 @@ NEVER_OWN_KINDS = ("review", "harness")   # reviews work in the change's worktre
 def gets_worktree(p: Project, kind: str) -> bool:
     """Whether a task of this kind runs in a worktree of its own: code always; another kind when
     `worktree.kinds` lists it (off by default: a fresh worktree lacks the root's untracked build
-    trees, outputs and submodule checkouts that such tasks often use). Never review or harness."""
+    trees, outputs and submodule checkouts that such tasks often use, which no check can tell from
+    disposable ones; the root's HEAD is guarded instead: Daemon.guard_root_head). Never review or harness."""
     if kind == "code":
         return True
     kinds = (p.config().get("worktree") or {}).get("kinds")
@@ -691,17 +718,24 @@ def review_workdir(p: Project, review: dict, prefer: str = "") -> Path | None:
 GIT_BUSY = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
 
 
-def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60) -> tuple[bool, str]:
+def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60, tag: str = "") -> tuple[bool, str]:
     """Put the checkout at `repo` back on `branch` after a run left it detached or on another branch,
-    losing nothing: a detached HEAD with commits `branch` lacks is saved first as rescue/root-run<id>-<sha>,
+    losing nothing: a detached HEAD with commits `branch` lacks is saved first as rescue/root-run<id>-<sha>
+    (rescue/root-<tag>-<sha> with a `tag`),
     then `git checkout <branch>` (never forced or reset: git refuses to overwrite uncommitted changes,
     and `branch` itself is not moved). Not while a rebase, merge, cherry-pick, revert or bisect is under
-    way there. (True, the rescue branch or "") or (False, why)."""
+    way there, nor while tracked paths have uncommitted changes (they would move onto `branch`).
+    (True, the rescue branch or "") or (False, why)."""
     try:
         gd = Path(_git(repo, "rev-parse", "--absolute-git-dir", timeout=timeout_s))
         busy = [x for x in GIT_BUSY if (gd / x).exists()]
         if busy:
             return False, f"a git operation is under way there ({busy[0]})"
+        dirty = dirty_tracked(repo, timeout_s)
+        if dirty is None or dirty:
+            return False, (f"{len(dirty)} tracked path{'' if len(dirty) == 1 else 's'} there "
+                           f"{'has' if len(dirty) == 1 else 'have'} uncommitted changes ({', '.join(dirty[:3])})"
+                           if dirty else "git could not list its uncommitted changes")
         if not _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False, timeout=timeout_s):
             return False, f"branch {branch} is gone"
         head = _git(repo, "rev-parse", "HEAD", timeout=timeout_s)
@@ -709,7 +743,7 @@ def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60) ->
         rescue = ""
         if detached and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head,
                                         f"refs/heads/{branch}"], capture_output=True, timeout=timeout_s).returncode:
-            rescue = f"rescue/root-run{run_id}-{head[:12]}"
+            rescue = f"rescue/root-{tag or f'run{run_id}'}-{head[:12]}"
             if _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{rescue}", check=False,
                     timeout=timeout_s) != head:
                 _git(repo, "branch", rescue, head, timeout=timeout_s)   # no -f: an existing one is kept
@@ -735,6 +769,10 @@ def resolve_base(p: Project) -> str:
     that name (a fresh clone has `origin/<name>` but no local `<name>`). A miss names close matches,
     so whoever set it can fix it in one step."""
     ref = base_ref(p)
+    if not ref:
+        raise RuntimeError("the project root's checkout is on a detached HEAD and no base branch is named or "
+                           "known: set delivery.base_ref (or worktree.root_branch), or put the root back on its "
+                           "branch; no worktree is branched from a detached HEAD")
     for cand in (ref, f"origin/{ref}"):
         if _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False):
             return cand
@@ -1753,10 +1791,10 @@ def dirty_tracked(repo: Path, timeout_s: float = 30) -> list[str] | None:
 CHECKOUT_DIRTY_MAX = 2000   # checkout_state: past this many dirty paths, `dirty` is None (not compared)
 
 
-def checkout_state(repo: Path, timeout_s: float = 30) -> dict | None:
+def checkout_state(repo: Path, timeout_s: float = 30, dirty: bool = True) -> dict | None:
     """Where the checkout at `repo` stands: `branch` (its short name, "" when HEAD is detached),
-    `head` (the commit) and `dirty` (dirty_tracked; None past CHECKOUT_DIRTY_MAX or when git
-    failed). None when `repo` is not a git work tree or git fails. Reads only."""
+    `head` (the commit) and `dirty` (dirty_tracked; None past CHECKOUT_DIRTY_MAX, when git
+    failed or without `dirty`). None when `repo` is not a git work tree or git fails. Reads only."""
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "HEAD"],
@@ -1767,7 +1805,7 @@ def checkout_state(repo: Path, timeout_s: float = 30) -> dict | None:
                                 capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
-    dirty = dirty_tracked(repo, timeout_s)
+    dirty = dirty_tracked(repo, timeout_s) if dirty else None
     return {"branch": branch.stdout.strip() if branch.returncode == 0 else "", "head": head.stdout.strip(),
             "dirty": dirty if dirty is not None and len(dirty) <= CHECKOUT_DIRTY_MAX else None}
 

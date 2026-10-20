@@ -699,8 +699,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
   `branch <name>`, each only if it exists here or on origin; the remote's default branch
   (`origin/HEAD`); the checked-out branch.
-  Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); a run
-  that leaves the root on another branch or with new uncommitted changes raises an alert naming it.
+  Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
+  must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
+  changes raises an alert naming it. Before a worktree is made, a root left detached or off its
+  branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
+  uncommitted changes, else alerted; worktrees never start from such a HEAD.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

@@ -222,11 +222,18 @@
   as also running; it clears once the checkout is back and those paths are clean. A root left
   detached or on another branch is first put back on its branch when no other run works there and
   no rebase or merge is under way: a detached HEAD's commits are kept on `rescue/root-run<id>-<sha>`,
-  nothing is reset or forced, and a coordinator event says so instead of the alert.
+  nothing is reset or forced, and a coordinator event says so instead of the alert. Uncommitted
+  tracked changes there block the repair (an alert instead: they are never carried or discarded).
+  Before a worktree is branched from the root, the daemon checks its HEAD the same way against
+  `worktree.root_branch` (unset: the branch it was last seen on with no root alert open; a user's
+  own switch is adopted): put back when safe and reported low, else one `root-head` alert that
+  clears once it is back. Meanwhile new worktrees start from the base or that branch, never the
+  detached HEAD; with neither known they wait with that reason.
   Code tasks always get their own worktree; `worktree.kinds` (default `[]`) gives other kinds one
   too (say `["work"]`; never harness). A review runs in the worktree holding the branch it reviews,
   else in a detached worktree of its own at the reviewed head (`worktrees/t<id>`), never the root. Off by default because a fresh worktree lacks the
-  root's untracked build trees, outputs and submodule checkouts that work tasks often use. Such a
+  root's untracked build trees, outputs and submodule checkouts that work tasks often use (no check
+  tells them from disposable ones); work tasks in the root must leave its HEAD alone. Such a
   task's branch gets the local-only, backup and integrity checks of a code task, but no review.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

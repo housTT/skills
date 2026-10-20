@@ -286,8 +286,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # each git command gets git_timeout_s, scaled by the host's load per CPU (at most
     # git_timeout_max_s); create_attempts tries in one go (a whole worktree a timed-out one left is
     # reused, a half-made one remade); then the task is queued again create_retries times, after
-    # retry_backoff_s (doubling), before it is blocked for the coordinator.
-    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "git_timeout_s": 120,
+    # retry_backoff_s (doubling), before it is blocked for the coordinator. root_branch: the branch the
+    # project root's checkout belongs on (unset: the one the daemon last saw it on); a root left
+    # detached or off it is put back when clean, else alerted, and never branched from.
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
     # A lock file in its .git older than stale_lock_s (unset: 600 s; 0: off) that no process holds (one a

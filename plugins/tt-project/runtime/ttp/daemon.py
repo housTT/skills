@@ -248,6 +248,7 @@ KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
+ROOT_HEAD_KEY = "root_head"   # kv: the open alert on a project root left detached or off its branch (guard_root_head)
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
 LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py), one event per change
 # Steps a host that does not hold the project lease skips: they start model work, push, or answer
@@ -601,6 +602,7 @@ class Daemon:
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
+        self._root_head_checked = 0.0   # when guard_root_head last looked at the project root's HEAD
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
@@ -1243,13 +1245,10 @@ class Daemon:
         branch than `branch`, where it started. Put it back (worktree.restore_root: a rescue branch
         keeps a detached HEAD's commits; no reset, no force) unless another run still works in the
         root, and record it in the log and as an event for the coordinator. Whether it is back."""
-        root = os.path.realpath(self.p.root)
-        for o in self.p.db.q("SELECT id, dir FROM runs WHERE status='running' AND role!='coordinator' AND id!=?",
-                             (r["id"],)):
-            cwd = (_read_result(self._run_dir(o) / "run.json") or {}).get("cwd")
-            if cwd and os.path.realpath(str(cwd)) == root:
-                log(self.p, f"run {r['id']}: the project root is off {branch}; not restored while run {o['id']} works there")
-                return False
+        busy = self._run_in_root(r["id"])
+        if busy:
+            log(self.p, f"run {r['id']}: the project root is off {branch}; not restored while run {busy} works there")
+            return False
         ok, info = worktree.restore_root(self.p.root, branch, r["id"])
         where = f"branch {now_at['branch']}" if now_at["branch"] else f"a detached HEAD at {now_at['head'][:12]}"
         if not ok:
@@ -1262,6 +1261,91 @@ class Daemon:
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                     (time.time(), "daemon", "observation", "normal", text, "queued", int(r["task"])))
         return True
+
+    def _run_in_root(self, exclude: int = 0) -> int:
+        """A running worker or reviewer run (not `exclude`) whose working directory is the project root, or 0."""
+        root = os.path.realpath(self.p.root)
+        for o in self.p.db.q("SELECT id, dir FROM runs WHERE status='running' AND role!='coordinator' AND id!=?",
+                             (exclude,)):
+            cwd = (_read_result(self._run_dir(o) / "run.json") or {}).get("cwd")
+            if cwd and os.path.realpath(str(cwd)) == root:
+                return int(o["id"])
+        return 0
+
+    def _root_home(self, branch: str) -> None:
+        """Record `branch`, where the project root's checkout is seen, as the branch it belongs on
+        (worktree.root_branch), unless a root alert is open or a run works there: a move a task made
+        is never adopted, a user's own switch is."""
+        db = self.p.db
+        if not branch or branch == db.kv(worktree.ROOT_HOME_KEY) or db.kv(ROOT_HEAD_KEY) \
+                or any(i.get("branch") for i in (db.kv(ROOT_CHECKOUT_KEY, {}) or {}).values()) or self._run_in_root():
+            return
+        db.set_kv(worktree.ROOT_HOME_KEY, branch)
+
+    def guard_root_head(self) -> None:
+        """Before a worktree is branched from the project root, and every ROOT_RECHECK_S while its alert
+        is open: when the root's checkout is detached or on another branch than worktree.root_branch and
+        no run works there, put it back (worktree.restore_root: no uncommitted tracked changes, no git
+        operation under way, the branch exists; a detached HEAD's commits kept on a rescue branch),
+        reported low; else one low alert (ROOT_HEAD_KEY) that clears once it is back. Nothing is reset,
+        forced or discarded. Meanwhile new worktrees start from the named base or root_branch, never
+        from that HEAD (worktree.root_base). A run still in the root is left to check_root_checkout."""
+        db = self.p.db
+        self._root_head_checked = time.time()
+        try:
+            at = worktree.checkout_state(self.p.root, dirty=False)
+            if not at:
+                return
+            self._root_home(at["branch"])
+            home = worktree.root_branch(self.p)
+            info = db.kv(ROOT_HEAD_KEY) or None
+            if at["branch"] and (at["branch"] == home or not home):
+                return self._clear_root_head(info, at["branch"])
+            busy = self._run_in_root()
+            if busy:
+                return
+            where = f"branch {at['branch']}" if at["branch"] else f"a detached HEAD at {at['head'][:12]}"
+            if home:
+                ok, why = worktree.restore_root(self.p.root, home, 0, tag="guard")
+            else:
+                ok, why = False, "no branch is known for it (worktree.root_branch is unset and it was never seen on one)"
+            if ok:
+                text = (f"The project root's checkout was on {where}; before branching a worktree the daemon put it "
+                        f"back on {home}" + (f" and kept the detached commits on branch {why}" if why else "")
+                        + ". Nothing was reset or forced.")
+                log(self.p, text)
+                self.alert(f"root-head-restored:{at['head'][:12]}", text, severity="low", every_s=0)
+                return self._clear_root_head(info, home)
+            if info and info.get("at") == (at["branch"] or at["head"]):
+                return
+            key = "root-head"
+            text = (f"The project root's checkout ({self.p.root}) is on {where}"
+                    + (f", not on its branch {home}" if home else "") + f", and the daemon could not put it back: {why}. "
+                    "New worktrees start from the project's base branch"
+                    + (f" or {home}" if home else "") + ", never from that HEAD"
+                    + ("" if home or worktree.named_base(self.p) else
+                       "; with no base named, tasks that need a new worktree wait (set delivery.base_ref)")
+                    + ". Nothing was changed; this clears once the root is back on its branch.")
+            db.set_kv(ROOT_HEAD_KEY, {"key": key, "at": at["branch"] or at["head"], "since": time.time()})
+            log(self.p, text)
+            self.alert(key, text, severity="low", every_s=0)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "daemon", "observation", "normal", text[:1500], "queued"))
+        except Exception:   # never in the way of dispatch: the base choice (root_base) holds without it
+            log(self.p, "root HEAD guard: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _clear_root_head(self, info: dict | None, branch: str) -> None:
+        """guard_root_head's alert is over: the root is on `branch`, its branch."""
+        db = self.p.db
+        if not info:
+            return
+        db.set_kv(ROOT_HEAD_KEY, None)
+        db.post("out", f"Cleared: the project root's checkout is back on branch {branch}.",
+                chat=None, kind="resolved", severity="low", ref=info.get("key"))
+        sent = db.kv("alerts_sent", {}) or {}
+        if sent.pop(info.get("key"), None) is not None:
+            db.set_kv("alerts_sent", sent)   # the same condition may alert again
+        self._root_home(branch)
 
     def clear_root_checkout(self, force: bool = False) -> None:
         """Close each open root-checkout alert (check_root_checkout) whose checkout is back on the
@@ -1893,6 +1977,7 @@ class Daemon:
             root = worktree.checkout_state(self.p.root) if worktree.is_git(self.p.root) else None
             if root:
                 note = {**(note or {}), "root": root}
+                self._root_home(root.get("branch") or "")
         db = self.p.db
         run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note,"
                       "session_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -5962,7 +6047,8 @@ class Daemon:
             job["done"].set()
             return self._apply_local_only(job)
         try:
-            branches, targets, known = [t["branch"] for t in tasks], [worktree.base_ref(self.p)], set(self._local_only_ok.items())
+            branches, known = [t["branch"] for t in tasks], set(self._local_only_ok.items())
+            targets = [b for b in [worktree.base_ref(self.p)] if b]
             pushed = pushq.pushed_heads(self.p.db)
             recorded = landed.superseded(db, [t["id"] for t in tasks])
             superseded = {t["branch"]: recorded[t["id"]] for t in tasks if t["id"] in recorded}
@@ -9249,6 +9335,7 @@ class Daemon:
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
+            self.guard_root_head()   # never a worktree branched from a HEAD a task moved the root to
             path, branch = worktree.ensure(self.p, task)
             return str(path), branch
         if task["kind"] == "review" and worktree.is_git(self.p.root):
@@ -9439,6 +9526,8 @@ class Daemon:
                 self.p.db.x("UPDATE tasks SET blocked_reason=NULL WHERE status='queued' AND blocked_reason LIKE ?",
                             (f"{LOGGED_OUT_NOTE} ({prov})%",))
         self.clear_root_checkout()
+        if time.time() - self._root_head_checked >= ROOT_RECHECK_S and self.p.db.kv(ROOT_HEAD_KEY):
+            self.guard_root_head()
 
     def slack(self):
         if not self.cfg["notify"].get("slack"):
