@@ -15,7 +15,8 @@ broker where it has one.
     past it, the note is stale, so check the box instead of trusting it.
 - Probe the device lock: `ttp lock --probe <box-alias>-device` exits 0 when it is free. Exit 75
   means busy or paused: hand off `waiting` with that probe as `retry_when`. Never override a pause
-  or a held lock, and never lift a pause someone else set.
+  or a held lock, and never lift a pause someone else set. Outside a project it answers only for a
+  lock `ttp machines add <box-alias> --shared` makes machine-wide; any other exits 3 (n/a).
 - Check it in one go, read-only:
 
 ```

@@ -19,7 +19,9 @@ daemon runs on is the one whose alias, or `hostname`, is this machine's short ho
 
 A project created with --host runs its daemon on that machine, which reads its own copy of the list.
 `push` copies the list there, merged alias by alias with what is there: the newest change wins, a
-removal included, so a list edited on that machine is never overwritten by an older one.
+removal included, so a list edited on that machine is never overwritten by an older one. A change
+(`ttp machines add|set|remove`) copies it in the background, never waiting for a host that is down;
+hosts whose machine has an open known outage or the `decommissioned` tag are skipped.
 """
 from __future__ import annotations
 
@@ -234,6 +236,73 @@ _WRITE = ("import hashlib,json,os,sys;h=os.path.expanduser('~/.tt-project');os.m
           "os.chmod(p+'.tmp',0o600);os.replace(p+'.tmp',p)")
 
 
+# A copy gives up on a host that is down within seconds, whatever the user's own ssh retry settings say.
+PUSH_SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
+PUSH_TIMEOUT_S = 60         # one ssh call of a copy, at most
+DECOMMISSIONED = "decommissioned"   # the tag of a machine that is gone for good: nothing is copied to it
+PUSH_LOG = "machines-push.log"      # in ~/.tt-project: what the last background copy did
+PUSH_DONE = "finished"              # the background copy's last line
+
+
+def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
+               outages: dict[str, dict] | None = None) -> dict[str, str]:
+    """{host: why} of the hosts a copy of the list skips: its machine has an open known outage or the
+    decommissioned tag. A host is matched to a machine by alias or `hostname`, short names included."""
+    from . import machine_ledger as ml
+    known = load() if known is None else known
+    outages = ml.outages() if outages is None else outages
+    out = {}
+    for host in hosts:
+        names = {host, host.split(".")[0]}
+        aliases = {a for a, m in known.items() if a in names or (m.get("hostname") or "") in names} | (names & set(outages))
+        for alias in sorted(aliases):
+            if DECOMMISSIONED in tag_names((known.get(alias) or {}).get("tags")):
+                out[host] = f"{alias} is tagged {DECOMMISSIONED}"
+            elif alias in outages:
+                out[host] = f"{alias} has an open known outage"
+    return out
+
+
+def push_log() -> Path:
+    return project.HOME_DIR / PUSH_LOG
+
+
+def push_background(hosts: list[str]) -> Path:
+    """Start `ttp machines push --log` for `hosts` in its own session and return its log; never waits."""
+    import sys
+    log = push_log()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"copying the machines list to {', '.join(hosts)}\n")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        x for x in (str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH")) if x)}
+    with open(log, "a") as f:
+        subprocess.Popen([sys.executable, "-m", "ttp", "machines", "push", "--log", *[f"--to={h}" for h in hosts]],
+                         stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env,
+                         start_new_session=True)
+    return log
+
+
+def push_failures() -> list[str]:
+    """The failed copies of the last background copy, once it has finished."""
+    try:
+        lines = push_log().read_text().splitlines()
+    except OSError:
+        return []
+    if PUSH_DONE not in lines:
+        return []
+    return [ln for ln in lines if ln.startswith(("could not copy", "left the machines list"))]
+
+
+def _ssh(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    """One ssh call of a copy, bounded by PUSH_TIMEOUT_S; a timeout is exit 124."""
+    try:
+        return subprocess.run(argv, timeout=PUSH_TIMEOUT_S, **kw)
+    except subprocess.TimeoutExpired:
+        err = f"timed out after {PUSH_TIMEOUT_S} s"
+        return subprocess.CompletedProcess(argv, 124, "", err if kw.get("text") else err.encode())
+
+
 def push(host: str, tries: int = 3) -> str:
     """Copy this user's machines list to another machine (same user), merged with the list there.
     A list there that cannot be read is left alone."""
@@ -241,7 +310,7 @@ def push(host: str, tries: int = 3) -> str:
     if not _part(mine, "machines") and not _part(mine, "removed"):
         return "no machines list to copy"
     for _ in range(tries):
-        r = subprocess.run([*SSH, host, f"cat {REMOTE} 2>/dev/null || true"], capture_output=True)
+        r = _ssh([*PUSH_SSH, host, f"cat {REMOTE} 2>/dev/null || true"], capture_output=True)
         if r.returncode != 0:
             return f"could not copy the machines list to {host}: {r.stderr.decode(errors='replace').strip()[-200:]}"
         try:
@@ -253,8 +322,8 @@ def push(host: str, tries: int = 3) -> str:
         doc = merge(mine, theirs)
         if doc == merge(theirs, {}):
             return f"machines list on {host} is up to date ({len(doc['machines'])} machines)"
-        w = subprocess.run([*SSH, host, f"python3 -c {shlex.quote(_WRITE)}"], text=True, capture_output=True,
-                           input=json.dumps({"expect": hashlib.sha256(r.stdout).hexdigest(), "doc": doc}))
+        w = _ssh([*PUSH_SSH, host, f"python3 -c {shlex.quote(_WRITE)}"], text=True, capture_output=True,
+                 input=json.dumps({"expect": hashlib.sha256(r.stdout).hexdigest(), "doc": doc}))
         if w.returncode == 0:
             return f"copied the machines list ({len(doc['machines'])} machines) to {host}"
         if w.returncode != 3:

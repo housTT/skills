@@ -3105,6 +3105,32 @@ def cmd_goal(a) -> None:
     sys.exit(goalchecks.run(a))
 
 
+LOCK_NA = 3   # `ttp lock --probe` outside a project, of a lock only a project keeps: no answer here
+
+
+def _probe_machine_lock(resource: str, shared_mode: bool) -> None:
+    """`ttp lock --probe` outside any project. A resource shared through `ttp machines` keeps its lock
+    under ~/.tt-project/locks, where every project takes it: that lock answers, as the plain probe does
+    (0 free, 75 busy, paused or reserved). Any other lock lives in some project's state, so there is
+    nothing here to read: it says n/a and exits LOCK_NA."""
+    from . import fleethold, locks as lk, shared
+    if resource not in shared.names({}):
+        print(f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)")
+        sys.exit(LOCK_NA)
+    hold = fleethold.covering(resource)
+    held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
+    if held is not None:
+        print(f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else ""))
+        sys.exit(75)
+    where = shared.root() / resource
+    paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
+    free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
+    n, who_r = len(lk.queued(where, resource)), lk.reserved_by(lk.reserve_path(where, resource))
+    print(f"{resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders_now(paths)) or 'nobody'}"
+                                                 f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
+    sys.exit(0 if free else 75)
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -3136,7 +3162,8 @@ def cmd_lock(a) -> None:
     runs under the run's agent, there is no cap.
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75; with --shared, when no exclusive holder or waiter has it and it is
-    neither paused nor reserved.
+    neither paused nor reserved. Outside any project, `--probe` answers for a resource `ttp machines`
+    shares (its lock is machine-wide) and says n/a, exit 3, for any other.
     """
     from . import hold, locks as lk
     cmd = list(a.command or [])
@@ -3149,6 +3176,8 @@ def cmd_lock(a) -> None:
     base = os.environ.get("TTP_PROJECT")
     if not base and a.probe:
         base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
+    if not base and a.probe:
+        return _probe_machine_lock(a.resource, a.shared)
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
@@ -4548,11 +4577,29 @@ def cmd_machines(a) -> None:
             die(str(e))
         print(f"removed {a.alias}")
     if a.action in ("add", "remove", "push", "set"):
-        hosts = [a.host] if getattr(a, "host", None) else remote_hosts()
+        named = getattr(a, "to", None) or ([a.host] if getattr(a, "host", None) else [])
+        hosts = named or remote_hosts()
         if a.action == "push" and not hosts:
             print("no projects on other machines; nothing to copy")
-        for host in hosts:
-            print(mm.push(host))
+        if not named:   # a host named on purpose is tried whatever its state
+            skips = mm.push_skips(hosts)
+            for host in hosts:
+                if host in skips:
+                    print(f"skipped {host}: {skips[host]}")
+            hosts = [h for h in hosts if h not in skips]
+        if a.action == "push":
+            for host in hosts:
+                print(mm.push(host), flush=True)
+            if getattr(a, "log", False):
+                print(mm.PUSH_DONE, flush=True)
+        else:
+            # A change never waits for hosts that are down: the copy runs on in the background.
+            for line in mm.push_failures():
+                print(f"last background copy: {line}")
+            if hosts:
+                log = mm.push_background(hosts)
+                print(f"copying the machines list to {', '.join(hosts)} in the background (results: {log}; "
+                      f"`ttp machines push` copies in the foreground)")
     else:
         known = mm.load()
         if a.json:
@@ -6852,6 +6899,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("alias")
     m = ms.add_parser("push", help="copy the list to the machines your --host projects run on, merged")
     m.add_argument("--host", help="only this machine")
+    m.add_argument("--to", action="append", help=argparse.SUPPRESS)    # the background copy's hosts
+    m.add_argument("--log", action="store_true", help=argparse.SUPPRESS)   # it ends its log with PUSH_DONE
     m = ms.add_parser("outage", help="a known outage (hardware repair, an external ticket): nobody is paged "
                                      "about the machine until it ends; the daily review lists it")
     m.add_argument("alias", nargs="?", help="the machine (none: list the known outages)")

@@ -2,7 +2,8 @@
 
 One ssh call reads free disk under the box's workdir root and whether the tt-device-mcp broker is
 installed and its service active; locally, `ttp machines list --json` gives the box's tags, note
-and disk guard, and `ttp lock --probe <alias>-device` says whether the device is free.
+and disk guard, and `ttp lock --probe <alias>-device` says whether the device is free (outside a project, only a lock
+`ttp machines` shares has an answer; any other is reported n/a, not as a problem).
 
 Exit 0 ready, 1 a problem to fix (disk below the guard, broker installed but not active), 75 the
 device lock is busy or paused (wait; never override it), 255 ssh failed. Usable as a retry_when.
@@ -21,6 +22,7 @@ import box
 DEFAULT_MIN_FREE_GB = 150.0  # the harness's own disk.min_free_gb default
 BROKER_CMD = "tt-device-mcp"
 BROKER_SERVICE = "tt-device-broker"
+LOCK_NA = 3   # `ttp lock --probe` outside a project, of a lock only a project keeps
 _PLAIN = re.compile(r"[A-Za-z0-9_./${}~-]+")
 
 
@@ -145,8 +147,9 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
                          f"runs as `ttp lock {resource} -- <command>`, never where TT_VISIBLE_DEVICES masks it")
 
     p = _local(["ttp", "lock", "--probe", resource])
-    lock = ("unknown" if p is None else "free" if p.returncode == 0
-            else "busy or paused" if p.returncode == 75 else f"error (exit {p.returncode})")
+    # Exit 3: outside a project, a lock no `ttp machines` share makes machine-wide; nothing holds it here.
+    lock = ("unknown" if p is None else "free" if p.returncode == 0 else "busy or paused" if p.returncode == 75
+            else "n/a (no project here; not a shared lock)" if p.returncode == LOCK_NA else f"error (exit {p.returncode})")
     facts["lock"] = lock
     if lock == "unknown" or lock.startswith("error"):
         problems.append("lock: could not probe")

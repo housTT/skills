@@ -1511,6 +1511,7 @@ def test_setup_box_bare_check_ready_box(tmp_path):
     (dict(broker=False, svc="inactive"), (), 0, "broker: none"),
     (dict(lock_rc=75), (), 75, "busy or paused: wait for it, never override it"),
     (dict(lock_rc=2), (), 1, "lock: could not probe"),
+    (dict(lock_rc=3), (), 0, "lock <box-alias>-device: n/a (no project here; not a shared lock)"),
     (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: connection to <box-alias> failed (exit 255) connection refused"),
     (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
     (dict(machines={}), (), 0, "not in `ttp machines list`"),

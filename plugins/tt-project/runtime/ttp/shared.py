@@ -202,6 +202,11 @@ def slot_counts(p, res: str, cfg: dict | None = None) -> dict[str, int]:
     return out
 
 
+def machine_slots(res: str) -> int:
+    """The resource's slot count with no project at hand: the smallest one recorded (default 1)."""
+    return min([e["slots"] for e in _counts(res).values()] or [1])
+
+
 def slots(p, res: str, cfg: dict | None = None) -> int:
     """How many slots the resource has for this project: its own count, or on a shared resource the
     smallest count any project sharing it gives, so none of them holds more slots than another

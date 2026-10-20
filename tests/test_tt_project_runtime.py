@@ -21239,12 +21239,64 @@ def test_machines_push_rereads_a_list_that_changed_during_the_copy(env, tmp_path
     assert len(calls) == 4      # read, refused write, read again, write
 
 
+def test_machines_push_skips_hosts_out_or_decommissioned(env):
+    from ttp import machines as mm
+    from ttp import machine_ledger as ml
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device,decommissioned", hostname="b-host")
+    mm.add("box-c", tags="device")
+    ml.set_outage("box-c", "repair", "proj", "1d")
+    got = mm.push_skips(["box-a", "b-host.example", "box-c", "box-z"])
+    assert got == {"b-host.example": "box-b is tagged decommissioned", "box-c": "box-c has an open known outage"}
+
+
+def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tmp_path, monkeypatch, capsys):
+    """A down host never holds `ttp machines add`: the copy runs on in its own session with a short ssh
+    timeout, skipped hosts are named at once, and a failed copy is reported by the next change."""
+    from ttp import cli
+    from ttp import machines as mm
+    from ttp import machine_ledger as ml
+    from ttp.project import register
+    bin_, gate, calls = tmp_path / "bin", tmp_path / "gate", tmp_path / "ssh.log"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(f"#!/bin/bash\necho \"$*\" >> {calls}\n"
+                              f"for i in $(seq 300); do [ -e {gate} ] && break; sleep 0.1; done\n"
+                              "echo 'connect to host far-down port 22: Connection timed out' >&2; exit 255\n")
+    (bin_ / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    register("down", {"host": "far-down", "dir": "/p1"})
+    register("out", {"host": "far-out", "dir": "/p2"})
+    mm.add("far-out", tags="x")
+    ml.set_outage("far-out", "repair", "proj", "1d")
+    t0 = time.monotonic()
+    cli.main(["machines", "add", "box-a", "--tags", "device"])
+    assert time.monotonic() - t0 < 20 and not gate.exists()   # returned while the ssh still hangs
+    out = capsys.readouterr().out
+    assert "skipped far-out: far-out has an open known outage" in out
+    assert "copying the machines list to far-down in the background" in out
+    gate.touch()
+    for _ in range(300):
+        if mm.PUSH_DONE in mm.push_log().read_text().splitlines():
+            break
+        time.sleep(0.1)
+    args = calls.read_text()
+    assert "far-down" in args and "far-out" not in args
+    assert "BatchMode=yes" in args and "ConnectTimeout=5" in args and "ConnectionAttempts=1" in args
+    assert mm.push_failures() == [f"could not copy the machines list to far-down: "
+                                  f"connect to host far-down port 22: Connection timed out"]
+    gate.unlink()
+    monkeypatch.setattr(mm, "push_background", lambda hosts: "log")
+    cli.main(["machines", "add", "box-b", "--tags", "device"])
+    assert "last background copy: could not copy the machines list to far-down" in capsys.readouterr().out
+
+
 def test_machine_changes_are_copied_to_remote_project_machines(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     from ttp import machines as mm
     from ttp.project import register
     pushed = []
     monkeypatch.setattr(mm, "push", lambda host: pushed.append(host) or f"pushed {host}")
+    monkeypatch.setattr(mm, "push_background", lambda hosts: pushed.extend(hosts) or "log")
     cli.main(["machines", "add", "box-a", "--tags", "device"])
     assert pushed == []                                     # no projects elsewhere: no ssh
     register("far1", {"host": "far", "dir": "/p1"})
@@ -31793,6 +31845,33 @@ def test_lock_probe_finds_the_project_from_cwd(env):
     r = subprocess.run([sys.executable, str(TTP), "lock", "--probe", "device-a"], cwd=str(p.root),
                        env=e, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
+
+
+def test_lock_probe_outside_a_project_answers_for_a_machine_shared_lock(env, tmp_path):
+    """No project here (the setup-box bare check run by hand): a lock `ttp machines` shares is
+    machine-wide, so it answers; any other has no holder to read: n/a, exit 3, never a failure."""
+    from ttp import locks as lk
+    from ttp import machines as mm
+    from ttp import shared
+    e = {k: v for k, v in os.environ.items() if k not in ("TTP_PROJECT", "TTP_RUN_DIR")}
+    out = tmp_path / "nowhere"
+    out.mkdir()
+
+    def probe(res):
+        return subprocess.run([sys.executable, str(TTP), "lock", "--probe", res], cwd=str(out), env=e,
+                              capture_output=True, text=True, timeout=30)
+    r = probe("box-a-device")
+    assert r.returncode == 3 and "n/a" in r.stdout, r.stdout + r.stderr
+    mm.add("box-a", tags="device", shared="box-a-device")
+    r = probe("box-a-device")
+    assert r.returncode == 0 and "free" in r.stdout, r.stdout + r.stderr
+    held = lk.try_take(lk.slot_paths(shared.root() / "box-a-device", "box-a-device", 1), "proj task #1")
+    r = probe("box-a-device")
+    assert r.returncode == 75 and "busy (held by proj task #1" in r.stdout, r.stdout + r.stderr
+    held.close()
+    shared.update_pause("box-a-device", lambda was: {"reason": "repair", "since": time.time()})
+    r = probe("box-a-device")
+    assert r.returncode == 75 and "paused (repair)" in r.stdout, r.stdout + r.stderr
 
 
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
