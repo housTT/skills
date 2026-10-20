@@ -782,6 +782,20 @@ END""")
                 self.set_kv(WORKSPACE_TRIES_KEY, tries)
         return ""
 
+    def cancel(self, task_id: int) -> str:
+        """Cancel a task that has not finished (`ttp task cancel`, the web app). Returns "" when done,
+        else why not; an unknown or finished (done, failed, cancelled) task is left as it is."""
+        with self.tx():
+            t = self.task(task_id)
+            if not t:
+                return f"no task #{task_id}"
+            # One statement, so a run finishing between a check and the write keeps its outcome.
+            if not self.conn.execute("UPDATE tasks SET status='cancelled', updated=? WHERE id=? "
+                                     "AND status NOT IN ('done','failed','cancelled')",
+                                     (time.time(), task_id)).rowcount:
+                return f"task #{task_id} is already {t['status']}"
+        return ""
+
     def task(self, task_id: int) -> dict | None:
         return self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
 

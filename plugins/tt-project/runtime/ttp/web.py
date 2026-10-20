@@ -764,7 +764,9 @@ class Handler(BaseHTTPRequestHandler):
                     if why:
                         return self._send(409, {"error": why})
                 elif body.get("status") == "cancelled":
-                    db.update_task(tid, status="cancelled")
+                    why = db.cancel(tid)
+                    if why:
+                        return self._send(409, {"error": why})
                     stop_runs(db, p.runs, tid)
                 if body.get("priority"):
                     db.update_task(tid, priority=int(body["priority"]))

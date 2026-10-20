@@ -8283,6 +8283,102 @@ def test_stop_file_appears_whole_so_a_kill_is_never_read_as_a_cancel(env, tmp_pa
     assert runner.stop_reason(run_dir) == "shutdown" and [f.name for f in run_dir.iterdir()] == ["STOP"]
 
 
+def test_task_cancel_refuses_unknown_and_finished_tasks_and_changes_nothing(env, capsys):
+    p = make(env)
+    from ttp import cli
+    ids = {}
+    for status in ("done", "failed", "cancelled"):
+        ids[status] = p.db.add_task(status, "s", kind="work", tier="light", origin="user")
+        p.db.update_task(ids[status], status=status)
+    for status, tid in ids.items():
+        with pytest.raises(SystemExit) as e:
+            cli.main(["task", "demo", "cancel", str(tid)])
+        assert e.value.code == 2 and f"already {status}" in capsys.readouterr().err
+        assert p.db.task(tid)["status"] == status
+    for bad, said in (("x1", "cancel needs a task id"), ("9999", "no task #9999")):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["task", "demo", "cancel", bad])
+        assert e.value.code == 2 and said in capsys.readouterr().err
+    assert p.db.cancel(9999) == "no task #9999"
+    queued = p.db.add_task("queued", "s", kind="work", tier="light", origin="user")
+    cli.main(["task", "demo", "cancel", str(queued)])
+    assert p.db.task(queued)["status"] == "cancelled" and capsys.readouterr().out.startswith("cancelled")
+
+
+def test_project_name_is_optional_from_the_run_or_the_current_folder(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("from here", "s", kind="work", tier="light", origin="user")
+    outside = env["tmp"] / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    with pytest.raises(SystemExit) as e:   # no project here: the name is still required
+        cli.main(["task", "list"])
+    assert e.value.code == 2
+    capsys.readouterr()
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # a run's project
+    cli.main(["task", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    cli.main(["task", "show", str(tid)])
+    assert "from here" in capsys.readouterr().out
+    monkeypatch.delenv("TTP_PROJECT")
+    monkeypatch.chdir(p.root)   # the current folder's project
+    cli.main(["task", "cancel", str(tid)])
+    assert p.db.task(tid)["status"] == "cancelled"
+    cli.main(["config", "budget.daily_usd"])
+    assert capsys.readouterr().out.strip()
+    cli.main(["schedules"])
+    cli.main(["memory", "--search", "nothing-matches-this"])
+    capsys.readouterr()
+    sub = p.root / "sub" / "dir"   # a folder under the project's git top level
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    cli.main(["task", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    # A given name still wins, and the slot is not filled when the first word names a known project.
+    cli.main(["task", "demo", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    with pytest.raises(SystemExit):   # an unknown first word that is no action stays the name
+        cli.main(["task", "nosuch", "list"])
+    assert "no project named 'nosuch'" in capsys.readouterr().err
+    cli.main(["say", "hello from here", "--chat", "c1"])
+    assert p.db.one("SELECT text FROM messages ORDER BY id DESC LIMIT 1")["text"] == "hello from here"
+
+
+def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import budget, checkcap, cli, upstream
+    words = " ".join(f"word{i}" for i in range(80))
+    p.db.post("out", words, kind="ask")
+    monkeypatch.setattr(budget, "coordinator_cache", lambda db, now: {"24h": {"turns": 3}})
+    monkeypatch.setattr(budget, "coordinator_cache_line", lambda s: "coordinator cache: 50% token hit")
+    monkeypatch.setattr(checkcap, "wait_line", lambda state, now=None: "checks slot waits (24 h): 2 taken")
+    monkeypatch.setattr(upstream, "fixes_line", lambda name, cfg, now=None: f"1 upstream fix {upstream.SHIPPED}: abc123")
+    monkeypatch.setattr(upstream, "forward_line", lambda now=None: "sending upstream notes on to x has failed")
+    moved = ("coordinator cache:", "checks slot waits", "upstream fix")
+    plain = cli.status_text(p)
+    assert not any(m in plain for m in moved) and "sending upstream notes on to x has failed" in plain
+    ask = next(ln for ln in plain.splitlines() if "word0 " in ln)
+    assert len(ask) < 340 and re.search(r" word\d+…$", ask), ask
+    p.db.post("out", "note " + words, kind="alert")   # the recent feed's quoted texts end at a word too
+    recent = [ln for ln in cli.status_text(p).splitlines() if "note word0 " in ln]
+    assert recent and all(re.search(r" word\d+…$", ln) for ln in recent), recent
+    assert all(len(ln) <= cli.STATUS_WIDTH for ln in cli.status_text(p).splitlines())
+    cli.main(["status", "demo", "--verbose"])
+    out = capsys.readouterr().out
+    assert all(m in out for m in moved), out
+    assert cli.clip("short") == "short" and cli.clip("aaa bbb ccc", 9) == "aaa bbb…"
+
+
+def test_unknown_project_name_suggests_close_registered_names(env, capsys):
+    make(env)
+    from ttp import cli
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demp", "list"])
+    err = capsys.readouterr().err
+    assert "did you mean demo?" in err and "ttp find" not in err
+
+
 def test_cancel_and_stop_kill_end_running_workers_but_stop_keeps_them(env, monkeypatch):
     p = make(env)
     from ttp import cli, service
@@ -28780,6 +28876,10 @@ def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
     assert call("/api/pause", {"resource": "board", "paused": False})[0] == 200
     assert call("/api/schedule/pr-watch", {"enabled": False})[0] == 200
     assert call(f"/api/task/{other}", {"status": "cancelled"})[0] == 200
+    finished = p.db.add_task("finished", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(finished, status="done")
+    code, why = call(f"/api/task/{finished}", {"status": "cancelled"})
+    assert code == 409 and "already done" in why and p.db.task(finished)["status"] == "done"
     assert call("/api/config", {"key": "budget.daily_usd", "value": 7})[0] == 200
     assert p.db.task(other)["status"] == "cancelled" and p.config()["budget"]["daily_usd"] == 7
 

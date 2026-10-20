@@ -48,7 +48,12 @@ def die(msg: str, code: int = 2) -> None:
 
 
 # locating projects --------------------------------------------------------------------------------
+_HERE: Project | None = None   # the project _project_name_argv put in a command's empty name slot
+
+
 def local_project(name: str) -> Project | None:
+    if _HERE is not None and _HERE.name == name:
+        return _HERE
     entry = load_registry().get("projects", {}).get(name)
     if entry and entry.get("host") in (None, hostname()) and Path(entry["dir"]).is_dir():
         return Project(entry["dir"])
@@ -419,7 +424,10 @@ def need(name: str, argv: list[str]) -> Project:
             print(f"{n} message(s) queued here for {name}; they go out once it is reachable")
         sys.exit(rc)
     if not p:
-        die(f"no project named {name!r} on this machine or in the registry; try `ttp find {name}`")
+        import difflib
+        close = difflib.get_close_matches(name, list(load_registry().get("projects", {})), n=3)
+        die(f"no project named {name!r} on this machine or in the registry"
+            + (f"; did you mean {', '.join(close)}?" if close else ""))
     return p
 
 
@@ -1093,8 +1101,22 @@ def _listen_write(db, sql: str, args: tuple, what: str) -> None:
               file=sys.stderr, flush=True)
 
 
-def status_text(p: Project) -> str:
-    """One screen: what needs the user now first, then the budget and the work, then information."""
+STATUS_WIDTH = 400   # `ttp status` lines end by here, at a word (quoted texts end sooner)
+
+
+def clip(text: str, width: int = STATUS_WIDTH) -> str:
+    """`text` cut at the last word boundary within `width`, with an ellipsis when cut."""
+    if len(text) <= width:
+        return text
+    cut = text[:width - 1]
+    if (sp := cut.rfind(" ")) > width // 2:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:—-") + "…"
+
+
+def status_text(p: Project, verbose: bool = False) -> str:
+    """One screen: what needs the user now first, then the budget and the work, then information.
+    `verbose` adds the diagnostic lines (coordinator cache, checks slot waits, unacked upstream fixes)."""
     from .alerts import feed
     from .web import at, attention, health, since
     db = p.db
@@ -1120,7 +1142,7 @@ def status_text(p: Project) -> str:
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
-        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
+        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
     you, stuck = waits.blocked(db, now, tz)
@@ -1142,8 +1164,8 @@ def status_text(p: Project) -> str:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
     from . import budget
-    cache = budget.coordinator_cache(db, now)["24h"]
-    if cache["turns"]:
+    cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
+    if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))
     from . import pushq
     pq = pushq.status_line(p, now)
@@ -1170,7 +1192,7 @@ def status_text(p: Project) -> str:
     from . import checkcap, locks, shared
     if host := checkcap.line():
         lines.append(host)
-    if slot_waits := checkcap.wait_line(p.state, now):
+    if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res, p)
@@ -1220,8 +1242,12 @@ def status_text(p: Project) -> str:
         lines.append(h["local_only"])
     if h.get("uncommitted"):
         lines.append(h["uncommitted"])
-    if h.get("upstream"):
-        lines.append(h["upstream"])
+    from . import upstream
+    cfg = p.config()
+    ups = "; ".join(x for x in (upstream.status_line(db, cfg), verbose and upstream.fixes_line(p.name, cfg, now),
+                                upstream.forward_line(now)) if x)
+    if ups:
+        lines.append(ups)
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
@@ -1252,8 +1278,8 @@ def status_text(p: Project) -> str:
     for m in recent:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
-        lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {text[:160]}")
-    return "\n".join(lines)
+        lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
+    return "\n".join(clip(ln) for ln in lines)
 
 
 def daemon_state(p: Project) -> str:
@@ -1270,10 +1296,76 @@ def daemon_state(p: Project) -> str:
 
 
 def here() -> Project | None:
-    """The project this process runs in: its run's project, else the folder it was started in."""
+    """The project this process runs in: its run's project, else the one at the folder it was started
+    in or above it (its git top level included), else, in a git worktree, the one at its main checkout."""
     if os.environ.get("TTP_PROJECT") and Project(os.environ["TTP_PROJECT"]).exists():
         return Project(os.environ["TTP_PROJECT"])
-    return next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None)
+    if p := next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None):
+        return p
+    try:
+        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = (Path.cwd() / r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
+    if common and common.name == ".git" and (c := Project(common.parent)).exists():
+        return c
+    return None
+
+
+# Commands whose first positional is the project: with none given, it is the one here().
+PROJECT_CMDS = frozenset({"web", "connect", "logs", "prune", "say", "listen", "task", "memory", "schedules", "pause",
+                          "resume", "drain", "start", "stop", "restart", "config", "upgrade", "alerts"})
+
+
+def _positionals(sp: argparse.ArgumentParser, args: list[str]) -> list[str]:
+    """The positional words of `args` for subcommand parser `sp`, skipping its options and their values."""
+    out, i = [], 0
+    while i < len(args):
+        t = args[i]
+        i += 1
+        if t == "--":
+            return out + args[i:]
+        if not t.startswith("-") or t == "-":
+            out.append(t)
+            continue
+        act = sp._option_string_actions.get(t)
+        if act is None or act.nargs == 0:
+            continue
+        if act.nargs in ("*", "+"):
+            while i < len(args) and not args[i].startswith("-"):
+                i += 1
+        elif act.nargs == "?":
+            i += i < len(args) and not args[i].startswith("-")
+        else:
+            i += act.nargs if isinstance(act.nargs, int) else 1
+    return out
+
+
+def _project_name_argv(sub, argv: list[str]) -> list[str]:
+    """`ttp <command>` without its project name: put the project here() (the run's, else the current
+    folder's) in the name slot. The slot counts as empty when no positional is given, or when the first
+    is no known project, a later slot is free and the word fits the next slot's choices (`task list`).
+    With no project here, argv is unchanged and argparse asks for the name as before."""
+    global _HERE
+    _HERE = None
+    if not argv or argv[0] not in PROJECT_CMDS or argv[0] not in sub.choices:
+        return argv
+    if argv[0] == "config" and "--account" in argv:   # its first word is the account key
+        return argv
+    sp = sub.choices[argv[0]]
+    slots = [x for x in sp._actions if not x.option_strings]
+    if not slots or slots[0].dest != "name":
+        return argv
+    room = sum(1 if x.nargs in (None, "?") else x.nargs if isinstance(x.nargs, int) else 99 for x in slots)
+    pos = _positionals(sp, argv[1:])
+    if pos and (len(pos) >= room or local_project(pos[0]) or remote_entry(pos[0])
+                or (slots[1].choices and pos[0] not in slots[1].choices)):
+        return argv
+    p = here()
+    if not p:
+        return argv
+    _HERE = p
+    return [argv[0], p.name, *argv[1:]]
 
 
 def cmd_status(a) -> None:
@@ -1287,7 +1379,7 @@ def cmd_status(a) -> None:
         from .web import state_payload
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
-        print(status_text(p))
+        print(status_text(p, verbose=a.verbose))
     from . import upstream
     upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this shell
 
@@ -4160,8 +4252,12 @@ def cmd_task(a) -> None:
         print(json.dumps(t, indent=2, default=str) if a.json else show_task(t))
     elif a.action == "cancel":
         from .runner import stop_runs
+        if not a.title.strip().isdigit():
+            die(f"cancel needs a task id, not {a.title!r}")
         tid = int(a.title)
-        p.db.update_task(tid, status="cancelled")
+        why = p.db.cancel(tid)
+        if why:
+            die(why)
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
@@ -6441,6 +6537,8 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
         if name == "status":
             s.add_argument("--json", action="store_true")
+            s.add_argument("--verbose", action="store_true",
+                           help="also the coordinator cache, checks slot waits and unacked upstream fix lines")
         if name == "prune":
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
             s.add_argument("--archived", type=int, metavar="TASK",
@@ -7187,7 +7285,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_say_all_argv(sys.argv[1:] if argv is None else list(argv)))
+    a = ap.parse_args(_project_name_argv(sub, _say_all_argv(sys.argv[1:] if argv is None else list(argv))))
     a.fn(a)
 
 

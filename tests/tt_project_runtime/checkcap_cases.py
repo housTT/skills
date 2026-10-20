@@ -584,7 +584,7 @@ def test_status_shows_the_last_24h_checks_slot_wait_median_and_p90_across_rotati
     assert checkcap.wait_stats(p.state, now) == {"n": 10, "median_s": 35.0, "p90_s": 70.0}
     line = "checks slot waits (24 h): 10 taken, median 35s, p90 1.2 min"
     assert checkcap.wait_line(p.state, now) == line
-    assert line in cli.status_text(p)
+    assert line in cli.status_text(p, verbose=True) and line not in cli.status_text(p)   # a --verbose line
 
 
 def _grants():
