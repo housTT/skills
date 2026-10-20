@@ -251,7 +251,10 @@ def check(p: Project, worktrees: list[tuple[int, Path]] = (), kept: list[tuple[i
     """`worktrees`: unfinished tasks' worktrees, `git status`ed; `kept`: every kept task worktree,
     whose repository must have its .git directory."""
     t0 = time.monotonic()
+    from .worktree import dangling_root
     out = check_harness(p)
+    if (why := dangling_root(p)):
+        out["bad"].append(why + ", so no task worktree can be made")
     out["worktrees"] = check_worktrees(list(worktrees))
     out["clones"] = check_clones(list(kept))
     out["seconds"] = round(time.monotonic() - t0, 3)

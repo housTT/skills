@@ -14884,6 +14884,27 @@ def test_a_workspace_on_another_branch_without_commits_keeps_its_files_and_is_ma
     assert _git_out(p.root, "rev-parse", "--verify", "elsewhere"), "the other branch was deleted"
 
 
+def test_a_dangling_worktrees_symlink_gives_a_clear_error_and_is_flagged_by_the_integrity_check(env, tmp_path):
+    p = make(env)
+    from ttp import integrity, worktree
+    import shutil
+    if p.worktrees.exists():
+        shutil.rmtree(p.worktrees)
+    gone = tmp_path / "moved-away" / "worktrees"
+    p.worktrees.symlink_to(gone)
+    task = p.db.task(p.db.add_task("dangling", "s", kind="code", tier="light", origin="user"))
+    # Not a bare "[Errno 17] File exists": the link and its missing target, and no retries.
+    with pytest.raises(worktree.WorkspaceStuck, match=f"symlink to {gone}, which does not exist"):
+        worktree.ensure(p, task)
+    res = integrity.check(p)
+    assert any(str(p.worktrees) in b and str(gone) in b for b in res["bad"]), res["bad"]
+    assert str(gone) in integrity.problem_text(res)
+    gone.mkdir(parents=True)
+    path, _ = worktree.ensure(p, task)
+    assert path.is_dir() and worktree.dangling_root(p) is None
+    assert not any(str(gone) in b for b in integrity.check(p)["bad"])
+
+
 def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(env, monkeypatch):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     from ttp import worktree
