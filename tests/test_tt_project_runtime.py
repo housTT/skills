@@ -3320,6 +3320,51 @@ def test_web_api_requires_the_token(env):
     assert data["project"]["name"] == "demo"
 
 
+@needs_sockets
+def test_web_post_needs_the_token_header_json_and_its_own_origin(env):
+    """A page on another localhost port is same-site, so it carries the token cookie and can post a
+    plain form: a change needs the X-TTP-Token header, a JSON body and no foreign Origin."""
+    p = make(env)
+    from ttp import web
+    port = _start_web(p)
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    tok = web.token(p)
+
+    def post(headers, body=b'{"text": "hello"}'):
+        req = urllib.request.Request(base + "/api/" + "say", method="POST", data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def said():
+        return p.db.one("SELECT COUNT(*) n FROM messages WHERE channel='web'")["n"]
+
+    cookie = {"Cookie": f"ttp_token={tok}"}
+    assert post({**cookie, "Content-Type": "application/json"}) == 401
+    assert post({**cookie, "Content-Type": "text/plain"}) == 401
+    assert post({"X-TTP-Token": tok, "Content-Type": "text/plain"}) == 415
+    assert post({"X-TTP-Token": tok}) == 415
+    assert post({"X-TTP-Token": tok, "Content-Type": "application/json",
+                 "Origin": "http://127.0.0.1:1"}) == 403
+    assert post({"X-TTP-Token": tok, "Content-Type": "application/json", "Origin": "null"}) == 403
+    assert said() == 0, "a refused post still reached the project"
+    assert post({"X-TTP-Token": tok, "Content-Type": "application/json; charset=utf-8"}) == 200
+    assert post({"X-TTP-Token": tok, "Content-Type": "application/json", "Origin": base}) == 200
+    assert said() == 2
+    get = urllib.request.Request(base + "/api/state", headers=cookie)
+    assert json.loads(urllib.request.urlopen(get, timeout=5).read())["project"]["name"] == p.name
+    app = (web.STATIC / "app.js").read_text()
+    assert '"X-TTP-Token": TOKEN, "Content-Type": "application/json"' in app
+
+
 def test_broken_config_keeps_the_last_good_one(env):
     p = make(env)
     p.set_config("budget.daily_usd", 42)
