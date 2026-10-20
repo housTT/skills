@@ -657,3 +657,105 @@ def test_a_waiting_task_whose_job_held_a_device_at_an_abrupt_reboot_is_blocked_n
     d.wake_after_reboot()
     t = p.db.task(tid)
     assert t["status"] == "queued" and (survives or json.loads(t["result"]).get("woke") == "the host rebooted"), dict(t)
+
+
+def _down_since(p, d, age_s, boot=None):
+    """The heartbeat a daemon left `age_s` ago on `boot` (this boot by default)."""
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 1, "boot": boot or d.boot, "held": []}))
+    os.utime(hb, (time.time() - age_s, time.time() - age_s))
+
+
+def _down_notices(p):
+    return p.db.q("SELECT text, severity, kind FROM messages WHERE direction='out' AND text LIKE '%daemon was down%'")
+
+
+def _late_watch(p, late_s):
+    from ttp import schedule as sched
+    sched.upsert(p.db, "watch", "command", "30m", payload={"command": "true", "timeout_s": 30})
+    now = time.time()
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='watch'", (now - late_s - 1800, now - late_s))
+
+
+def test_a_daemon_back_after_a_long_stop_posts_one_notice(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _late_watch(p, 3 * 3600)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    run_dir = tmp_path / "gone"
+    run_dir.mkdir()
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 4 * 3600, time.time() - 4 * 3600))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 5 * 3600, "running", str(run_dir), d.boot))
+    _down_since(p, d, 3 * 3600 + 300)
+    d._last_stop = {"boot": d.boot, "ts": time.time() - 3 * 3600 - 200}
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert msg["severity"] == "normal" and msg["kind"] == "info", msg
+    assert "down for 3.1 h" in msg["text"] and "the daemon was stopped." in msg["text"], msg["text"]
+    assert "6 schedule run(s) were missed; 1 run(s) were cut short" in msg["text"], msg["text"]
+    d.reap_runs()
+    assert len(_down_notices(p)) == 1, "told twice"
+
+
+def test_a_short_restart_posts_no_down_notice(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _late_watch(p, 3 * 3600)   # schedule runs missed alone are the schedule-gap check's to tell
+    _down_since(p, d, 600)
+    d._note_down()
+    d.reap_runs()
+    assert not _down_notices(p)
+
+
+def test_a_threshold_from_config_and_a_notice_kept_across_a_second_start(env):
+    from ttp import downtime
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, "daemon": {"down_notice_s": 600}}
+    _down_since(p, d, 900)
+    d._note_down()
+    # It died before its first tick; the next start finds a fresh heartbeat but keeps the notice.
+    e = Daemon(p.base)
+    _down_since(p, e, 5)
+    e._note_down()
+    assert p.db.kv(downtime.DOWN_KEY)
+    e.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "down for 15 min" in msg["text"] and "without a clean stop" in msg["text"], msg["text"]
+
+
+def test_a_long_reboot_downtime_joins_the_reboot_notice_in_one_message(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    _abrupt_reboot_held(p, d, [])
+    _down_since(p, d, 6 * 3600, boot="an-earlier-boot")
+    d._note_down()
+    _lost_to_reboot(p, d, tmp_path, tid)
+    out = p.db.q("SELECT text, severity, ref FROM messages WHERE direction='out' AND kind='info'")
+    assert len(out) == 1, out
+    text = out[0]["text"]
+    assert text.startswith("The daemon was down for 6.0 h") and "the host rebooted (abrupt)" in text, text
+    assert "The host rebooted (abrupt; 1st reboot in 24 h); 1 run(s) were cut short" in text, text
+    assert out[0]["severity"] == "normal" and out[0]["ref"] == f"reboot:{d.boot}"
+    d.reap_runs()
+    assert len(p.db.q("SELECT id FROM messages WHERE direction='out' AND kind='info'")) == 1
+
+
+def test_a_long_reboot_downtime_with_no_run_cut_short_still_posts_the_notice(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [], shutdown="orderly")
+    _down_since(p, d, 2 * 3600, boot="an-earlier-boot")
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "the host rebooted (orderly)" in msg["text"] and "0 run(s) were cut short" in msg["text"], msg["text"]

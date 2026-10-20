@@ -2889,3 +2889,81 @@ def test_the_desktop_notifier_still_gets_alerts_from_an_older_remote_without_hea
     rows, ok, h = notifier._remote_alerts(entry, "proj-a", 0, "high", st, t0 + 3600)
     assert rows == [{"id": 7, "text": "x"}] and ok and h["service"] == "systemd"
     assert len(calls) == 1 and st["_no_health"] == {}
+
+def _linger_daemon(env, monkeypatch, kind="systemd", answer="Linger=no"):
+    """A daemon whose service is `kind` and whose loginctl answers `answer`; returns it and the calls."""
+    from ttp import downtime, service
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    calls, said = [], {"out": answer}
+
+    def loginctl(*argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(list(argv), 0, said["out"] + "\n", "")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(service, "installed", lambda _p: {"kind": kind, "watchdog": True} if kind else None)
+    monkeypatch.setattr(downtime, "_run", loginctl)
+    return p, d, calls, said
+
+
+def _linger_alerts(p):
+    return p.db.q("SELECT text, severity FROM messages WHERE direction='out' AND ref='linger-off' "
+                  "AND text NOT LIKE 'Cleared:%'")
+
+
+def test_linger_off_under_systemd_raises_one_normal_alert_that_clears_once_linger_is_on(env, monkeypatch):
+    """The incident: linger was off, so after a reboot the systemd user service waited for a login (about
+    6 h down). The daemon looks at start and once a day; one alert names the fix and clears by itself."""
+    from ttp import alerts, downtime
+    p, d, calls, said = _linger_daemon(env, monkeypatch)
+    d.check_linger()
+    d.check_linger()   # within the recheck window: not looked at again
+    assert len(calls) == 1 and calls[0][:2] == ("loginctl", "show-user")
+    for _ in range(2):   # looked at again later, still off: still the one alert
+        d._linger_at -= downtime.RECHECK_OFF_S + 1
+        d.check_linger()
+    assert len(calls) == 3
+    (msg,) = _linger_alerts(p)
+    assert msg["severity"] == "normal" and "loginctl enable-linger" in msg["text"], msg
+    assert "start only at the user's next login" in msg["text"]
+    assert alerts.tracked("alert", "normal", downtime.LINGER_KEY)
+    assert not alerts.sweep(p.db), "cleared while linger was still off"
+    said["out"] = "Linger=yes"
+    d._linger_at -= downtime.RECHECK_OFF_S + 1
+    d.check_linger()
+    (ep,) = alerts.sweep(p.db)
+    assert ep["key"] == downtime.LINGER_KEY
+    assert not p.db.one("SELECT id FROM alerts WHERE cleared IS NULL")
+    assert p.db.one("SELECT severity FROM messages WHERE text LIKE 'Cleared: Linger is on again%'")["severity"] == "low"
+    # On, it is looked at once a day only.
+    d._linger_at -= downtime.RECHECK_OFF_S + 1
+    d.check_linger()
+    assert len(calls) == 4
+    d._linger_at -= downtime.CHECK_EVERY_S
+    d.check_linger()
+    assert len(calls) == 5 and len(_linger_alerts(p)) == 1
+
+
+def test_a_user_neither_logged_in_nor_lingering_counts_as_linger_off_and_an_unclear_answer_changes_nothing(env, monkeypatch):
+    from ttp import downtime
+    fail = lambda err: (lambda *a: subprocess.CompletedProcess(list(a), 1, "", err))
+    assert downtime.lingers("u", fail("Failed to get user: User ID 1000 is not logged in or lingering")) is False
+    assert downtime.lingers("u", fail("Failed to connect to bus")) is None
+    p, d, calls, said = _linger_daemon(env, monkeypatch, answer="")
+    d.check_linger()
+    assert calls and not _linger_alerts(p) and not p.db.kv(downtime.LINGER_KV)
+
+
+@pytest.mark.parametrize("kind", ["launchd", "cron", None])
+def test_launchd_cron_and_no_service_are_not_checked_for_linger(env, monkeypatch, kind):
+    p, d, calls, _ = _linger_daemon(env, monkeypatch, kind=kind)
+    d.check_linger()
+    assert calls == [] and not _linger_alerts(p)
+
+
+def test_macos_is_not_checked_for_linger(env, monkeypatch):
+    p, d, calls, _ = _linger_daemon(env, monkeypatch)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    d.check_linger()
+    assert calls == [] and not _linger_alerts(p)

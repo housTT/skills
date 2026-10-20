@@ -94,6 +94,12 @@
   the next wait; the `watchdog.restarts`-th (3) sends one high alert. systemd's `WatchdogSec` is only
   the backstop. Only a service installed before the watchdog needs `ttp restart <name>` (which adds
   it); still down → `ttp logs <name>`.
+- Linger (Linux, systemd service only): the daemon checks `loginctl show-user` at start and daily.
+  While linger is off, one normal `linger-off` alert says the daemon and its watchdog start only at
+  the next login after a reboot and names `loginctl enable-linger`; it clears once linger is on.
+- Downtime: a daemon that starts more than `daemon.down_notice_s` (3600 s) after its last heartbeat
+  posts one message: how long it was down, why (reboot or stopped), schedule runs missed and runs
+  cut short, merged into the reboot notice when there is one. A short restart posts nothing.
 - Only one daemon runs per project (a lock file), whatever starts it.
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;

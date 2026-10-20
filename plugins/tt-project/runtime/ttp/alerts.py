@@ -75,12 +75,15 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
+    "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
-USER_BLOCKERS = ("network", "paused", "coord-budget")   # paused: a long project pause (projpause)
-CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low"}
+# linger-off: the systemd service would not start at boot without a login (downtime.py).
+USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off")   # paused: a long project pause (projpause)
+CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low",
+                    "linger-off": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
@@ -235,6 +238,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "coord-budget":   # an item it named is still parked over its per-turn budget (turnsize.py)
         from . import turnsize
         return turnsize.holds(db)
+    if key == "linger-off":   # Daemon.check_linger keeps the flag while linger is off
+        return bool(db.kv("linger_off"))
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
@@ -266,7 +271,7 @@ def _checkable(key: str) -> bool:
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
-                                         "coord-budget", "account-mismatch")
+                                         "coord-budget", "account-mismatch", "linger-off")
 
 
 def _since(ep: dict) -> float:

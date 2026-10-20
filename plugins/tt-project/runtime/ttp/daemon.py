@@ -51,6 +51,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import coordlimits
 from . import detach
+from . import downtime
 from . import effort
 from . import failover
 from . import outagetask
@@ -637,6 +638,7 @@ class Daemon:
         self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
+        self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
@@ -669,6 +671,7 @@ class Daemon:
         # reboot that finds none of this boot's was abrupt.
         self._last_stop = self.p.db.kv(CLEAN_STOP_KEY) or {}   # for schedules' gap causes (_schedule_gaps)
         self.p.db.x("DELETE FROM kv WHERE key=?", (CLEAN_STOP_KEY,))
+        self._note_down()
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
         self._stacks = register_stack_dump(self.p.state)
@@ -985,7 +988,8 @@ class Daemon:
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
-                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause):
+                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
+                     self.check_linger):
             if step in lease_off:
                 continue
             self._step_name = step.__name__
@@ -2118,6 +2122,65 @@ class Daemon:
                 if n >= 3:
                     self._abandon_run(r)
         self._tell_reboot()
+        self._tell_down()
+
+    def _note_down(self) -> None:
+        """At start, before the first tick rewrites the heartbeat: keep a down notice when the last
+        one is older than daemon.down_notice_s (downtime.note_start), with the cause and the schedule
+        runs missed, counted before the first tick runs them."""
+        try:
+            db, now = self.p.db, time.time()
+            hb = heartbeat(self.p) or {}
+            last = now - hb["age"] if "age" in hb else None
+            prev = db.kv("boot_prev") or {}
+            if self._this_boot(prev.get("boot")):
+                how = prev.get("shutdown") or "abrupt"
+                if prev.get("prev_boot") and self._planned_cycle(prev["prev_boot"]):
+                    how = "planned"
+                cause = f"the host rebooted ({how})"
+            elif self._this_boot(self._last_stop.get("boot")) and self._last_stop.get("ts"):
+                cause = "the daemon was stopped"
+            else:
+                cause = "the daemon was stopped (it ended without a clean stop)"
+            sleeps = (db.kv("host_sleeps", []) or []) + (projpause.windows(db, last, now) if last else [])
+            downtime.note_start(db, last, now, downtime.down_notice_s(self.cfg), cause,
+                                downtime.missed_runs(db, now, sleeps))
+        except Exception:
+            log(self.p, "down notice: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _tell_down(self) -> None:
+        """Post the pending down notice once the runs an earlier boot left are reaped, unless the
+        reboot notice already carried it."""
+        db = self.p.db
+        if not self._reboot_told or not db.kv(downtime.DOWN_KEY):
+            return
+        with db.tx():
+            rec = downtime.take(db)
+            if not rec:
+                return
+            fmt = lambda ts: timefmt.short(float(ts), self.p)
+            db.post("out", downtime.text(rec, fmt, downtime.cut_short(db, rec)), kind="info", severity="normal",
+                    ref=f"down:{int(float(rec['last']))}")
+
+    def check_linger(self) -> None:
+        """At start and once a day: alert while the systemd service would not start at boot for lack
+        of linger (downtime.py); the alert clears once linger is on again."""
+        now = time.time()
+        if downtime.checked_ago(self._linger_at, self._linger_off, now):
+            return
+        self._linger_at = now
+        name = downtime.user()
+        off = downtime.linger_off(service.installed(self.p), name)
+        if off is None:
+            return   # loginctl could not tell: the last answer stands
+        self._linger_off = off
+        db = self.p.db
+        if off:
+            if not db.kv(downtime.LINGER_KV):
+                db.set_kv(downtime.LINGER_KV, {"since": now, "user": name})
+            self.alert(downtime.LINGER_KEY, downtime.linger_text(name), severity="normal")
+        elif db.kv(downtime.LINGER_KV):
+            db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
     def _tell_reboot(self) -> None:
         """Once per boot, after every run of an earlier boot is reaped: record the boot (when, the
@@ -2183,8 +2246,14 @@ class Daemon:
                 parts.append(f"run {r['id']} (#{task['id']} {task['title'][:60]} → {task['status']})" if task
                              else f"run {r['id']} ({r['role']})")
             nth = ordinal(max(len(boots), 1))
+            # A long downtime this start also noted goes out in this one message (downtime.py).
+            down = downtime.take(db)
+            if down:
+                fmt = lambda ts: timefmt.short(float(ts), self.p)
+                severity = max(severity, "normal", key=lambda s: SEVERITY_RANK.get(s, 1))
+            lead = downtime.text(down, fmt, None) + " " if down else ""
             # Information, never a "needs you" alert: the lost runs are already requeued.
-            db.post("out", f"The host rebooted ({how}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
+            db.post("out", f"{lead}The host rebooted ({how}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
                            f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
                     kind="info", severity=severity, ref=f"reboot:{self.boot}")
 
@@ -9177,9 +9246,9 @@ class Daemon:
 
     def _machine_wide(self, key: str) -> str | None:
         """The per-user claim key of a condition every project on this machine sees alike: a
-        logged-out CLI, a lost VPN or network sign-in (netwait), or a low disk on the filesystem the
+        logged-out CLI, a lost VPN or network sign-in (netwait), linger off (downtime), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith(("auth:", "account-mismatch:")) or key == netwait.KEY:
+        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY):
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")
