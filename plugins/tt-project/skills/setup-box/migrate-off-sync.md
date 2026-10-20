@@ -1,8 +1,8 @@
 # setup-box: Migrating off file sync
 
-Moving from file syncing or mirroring (devsync, mutagen, tt-workflows) to working on the box over
-ssh in its own git checkout (`ssh-workflow.md`). After this, git is the only channel between
-machines.
+Moving from file syncing or mirroring (devsync, mutagen, an older sync-based workflow repo) to
+working on the box over ssh in its own git checkout (`ssh-workflow.md`). After this, git is the only
+channel between machines.
 
 ## See what is left
 
@@ -12,13 +12,15 @@ python3 <plugin-root>/skills/setup-box/scripts/box.py migrate check [--repo <che
 
 - Read-only: it reports and changes nothing. Exit 0 when nothing active is left, 1 when something
   is.
+- A workflow clone is a checkout of such a repo: a directory holding `scripts/devrun.sh` next to
+  `skills/`, under any name.
 - It covers devsync launchd/systemd units, devsync's `ssh-hosts` `Include` line in `~/.ssh/config`,
-  `mutagen sync list` sessions (it never starts a mutagen daemon to look), tt-workflows skills
+  `mutagen sync list` sessions (it never starts a mutagen daemon to look), workflow-clone skills
   symlinked into `~/.claude/skills`, `~/.agents/skills` or `~/.cursor/skills`, hooks in
   `~/.claude/settings.json`, `~/.codex/hooks.json` or `~/.cursor/hooks.json` whose command runs a
-  script inside a tt-workflows clone, launchd agents in `~/Library/LaunchAgents` and systemd user
-  units in `~/.config/systemd/user` that run a script inside a tt-workflows clone (e.g. a loop agent
-  running `<clone>/scripts/cron_lap.sh`), cron lines that call tt-workflows scripts (commented ones
+  script inside a workflow clone, launchd agents in `~/Library/LaunchAgents` and systemd user
+  units in `~/.config/systemd/user` that run a script inside a workflow clone (e.g. a loop agent
+  running `<clone>/scripts/cron_lap.sh`), cron lines that call workflow-clone scripts (commented ones
   are `inactive`), `device_host`/`remote_root` in a project's `ttw.toml`, and scripts that call
   `devrun.sh` or `devlock.sh`.
 - A cron line or agent whose loop directory holds a `DONE` or `STOP` marker is `inert`: it still
@@ -43,7 +45,7 @@ python3 <plugin-root>/skills/setup-box/scripts/box.py migrate check [--repo <che
      still counts, so `launchctl bootout gui/$(id -u) <plist>` and delete it; for a systemd user
      unit, `systemctl --user disable --now <unit>`, after which `migrate check` lists it as
      inactive; delete the unit file and run `systemctl --user daemon-reload` to clear it).
-   - Stop each `agent` `migrate check` lists (tt-workflows loops run by launchd or systemd), after
+   - Stop each `agent` `migrate check` lists (workflow-clone loops run by launchd or systemd), after
      backing up its file (`cp <file> ~/<backup-dir>/`):
      - launchd (macOS): `launchctl bootout gui/$(id -u) <plist>`, then move the plist out of
        `~/Library/LaunchAgents` (to the backup directory), so it does not load again at login.
@@ -69,7 +71,8 @@ python3 <plugin-root>/skills/setup-box/scripts/box.py migrate check [--repo <che
    right after, re-reserved when needed, and never auto-extended (`SKILL.md`, Etiquette).
 5. **Remove the skill symlinks** `migrate check` lists, in each agent's skills directory. tt-project's
    own skills come with the plugin install.
-6. **Archive tt-workflows.** Once `migrate check` exits 0, the clone's owner archives the repository.
+6. **Archive the workflow repo.** Once `migrate check` exits 0, the clone's owner archives the
+   repository.
    Cron lines left as comments and `inert` cron lines or agents can go then too (back up and remove
    them as in step 1, or with `crontab -e`).
 

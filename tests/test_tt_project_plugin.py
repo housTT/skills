@@ -81,6 +81,23 @@ def plugin_text_files(root: pathlib.Path = PLUGIN):
             if f.is_file() and f.suffix in {".py", ".md", ".json", ".js", ".html", ".css", ".sh", ""}]
 
 
+def runtime_test_files():
+    """The runtime tests and their area case files: they ship in the same open-source repository."""
+    return [TESTS / "test_tt_project_runtime.py", *sorted((TESTS / "tt_project_runtime").glob("*.py"))]
+
+
+def tt_project_changesets():
+    """The changesets that bump tt-project: their text becomes the published release notes."""
+    return [f for f in sorted((PLUGIN.parents[1] / ".changeset").glob("*.md"))
+            if re.search(r'^"?tt-project"?\s*:', f.read_text(encoding="utf-8"), re.M)]
+
+
+def leak_scan_files():
+    """Everything of tt-project's this repository publishes: the plugin, its tests and changesets."""
+    return sorted(set(plugin_text_files() + sorted(TESTS.glob("test_tt_project_*.py")) + runtime_test_files()
+                      + tt_project_changesets()))
+
+
 def frontmatter(path: pathlib.Path) -> dict:
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\n"), f"{path}: no frontmatter"
@@ -192,11 +209,11 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
 def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
     # The plugin's tests ship in the same open-source repository, the runtime tests' area case files
-    # too. This file names the patterns themselves (as regex source), so it is checked with that
-    # list cut out.
-    runtime_tests = [TESTS / "test_tt_project_runtime.py", *sorted((TESTS / "tt_project_runtime").glob("*.py"))]
-    assert len(runtime_tests) > 1
-    assert_no_leaks([re.compile(p) for p in FORBIDDEN], runtime_tests)
+    # and the changesets too. This file names the patterns themselves (as regex source), so it is
+    # checked with that list cut out.
+    runtime_tests, changesets = runtime_test_files(), tt_project_changesets()
+    assert len(runtime_tests) > 1 and changesets
+    assert_no_leaks([re.compile(p) for p in FORBIDDEN], runtime_tests + changesets)
     own = (TESTS / "test_tt_project_plugin.py").read_text(encoding="utf-8")
     own = own[:own.index("FORBIDDEN = [")] + own[own.index("]\n", own.index("FORBIDDEN = [")):]
     for pattern in map(re.compile, FORBIDDEN):
@@ -212,8 +229,17 @@ def test_no_local_leak_patterns_in_plugin():
         pytest.skip(f"setup-specific leak check skipped: no local pattern file at {path} "
                     f"(set {LEAK_PATTERNS_ENV} or create it)")
     patterns = load_leak_patterns(path)
-    assert_no_leaks(patterns, plugin_text_files() + sorted(TESTS.glob("test_tt_project_*.py")),
-                    allow=published_plugin_names())
+    assert_no_leaks(patterns, leak_scan_files(), allow=published_plugin_names())
+
+
+def test_leak_scan_covers_tests_case_files_and_changesets():
+    files = set(leak_scan_files())
+    assert TESTS / "test_tt_project_plugin.py" in files and TESTS / "test_tt_project_runtime.py" in files
+    assert (TESTS / "tt_project_runtime" / "heal_cases.py") in files
+    assert PLUGIN / "skills" / "setup-box" / "migrate-off-sync.md" in files
+    changesets = [f for f in files if f.parent.name == ".changeset"]
+    assert changesets and all("tt-project" in f.read_text(encoding="utf-8").split("---")[1] for f in changesets)
+    assert PLUGIN.parents[1] / ".changeset" / "add-tt-buddy.md" not in files   # another plugin's
 
 
 def test_local_leak_patterns_are_found_and_checked(tmp_path, monkeypatch):
@@ -2048,7 +2074,7 @@ def _migrate_home(tmp_path, present):
     mutagen = "echo 'unable to connect to daemon' >&2; exit 1"
     crontab = "echo 'no crontab for user' >&2; exit 1"
     if present:
-        ttw = home / "tt-workflows"
+        ttw = home / "old-workflows"
         for d in ("skills/tt-old", "hooks", "scripts"):
             (ttw / d).mkdir(parents=True)
         (ttw / "scripts" / "devrun.sh").write_text("#!/bin/sh\n")
@@ -2081,7 +2107,7 @@ def _migrate_home(tmp_path, present):
         crontab = (f"echo '*/5 * * * * {ttw}/scripts/cron_lap.sh --dir x'; "
                    f"echo '# 0 * * * * {ttw}/scripts/old.sh'; echo '0 1 * * * /usr/bin/true'")
         (repo / "ttw.toml").write_text('[host]\ndevice_host = "<box-alias>"\nremote_root = "/<workdir>"\n')
-        (repo / "run.sh").write_text("#!/bin/sh\n~/tt-workflows/scripts/devrun.sh make\n")
+        (repo / "run.sh").write_text("#!/bin/sh\n~/old-workflows/scripts/devrun.sh make\n")
         (repo / "run.log").write_text("devrun.sh quoted in a log\n")
     systemctl = "exit 3"  # is-active: inactive
     for name, body in (("mutagen", mutagen), ("crontab", crontab), ("systemctl", systemctl)):
@@ -2165,7 +2191,7 @@ def test_setup_box_migrate_check_skips_tt_projects_own_files(tmp_path):
     for rel, src in own:
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(src, repo / rel)
-    (repo / "run.sh").write_text("#!/bin/sh\n~/tt-workflows/scripts/devrun.sh make\n")
+    (repo / "run.sh").write_text("#!/bin/sh\n~/old-workflows/scripts/devrun.sh make\n")
     (repo / "tools").mkdir()
     (repo / "tools" / "go.py").write_text('import subprocess\nsubprocess.run(["devlock.sh", "x"])\n')
     for git_repo in (False, True):
@@ -2180,14 +2206,15 @@ def test_setup_box_migrate_check_skips_tt_projects_own_files(tmp_path):
 
 
 def _ttw_clone(home):
-    ttw = home / "tt-workflows"
+    ttw = home / "old-workflows"
     (ttw / "scripts").mkdir(parents=True)
     (ttw / "skills").mkdir()
     (ttw / "scripts" / "cron_lap.sh").write_text("#!/bin/sh\n")
+    (ttw / "scripts" / "devrun.sh").write_text("#!/bin/sh\n")   # what makes it a clone, under any name
     return ttw
 
 
-def test_setup_box_migrate_check_lists_launchd_agents_running_a_tt_workflows_clone(tmp_path):
+def test_setup_box_migrate_check_lists_launchd_agents_running_a_workflow_clone(tmp_path):
     import plistlib
     home, stubs, repo = _migrate_home(tmp_path, present=False)
     ttw = _ttw_clone(home)
@@ -2198,15 +2225,15 @@ def test_setup_box_migrate_check_lists_launchd_agents_running_a_tt_workflows_clo
     agents = home / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
     for name, loop in loops.items():
-        with (agents / f"com.tt-workflows.loop.{name}.plist").open("wb") as f:
-            plistlib.dump({"Label": f"com.tt-workflows.loop.{name}", "ProgramArguments": [
+        with (agents / f"com.example.loop.{name}.plist").open("wb") as f:
+            plistlib.dump({"Label": f"com.example.loop.{name}", "ProgramArguments": [
                 "/bin/bash", str(ttw / "scripts" / "cron_lap.sh"), "--dir", str(loop)]}, f)
     with (agents / "org.example.other.plist").open("wb") as f:
         plistlib.dump({"Label": "org.example.other", "ProgramArguments": ["/usr/bin/true"]}, f)
     r = _migrate_run(home, stubs, repo)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert f"found agent: {agents / 'com.tt-workflows.loop.live.plist'}: " in r.stdout
-    assert f"inert agent: {agents / 'com.tt-workflows.loop.done.plist'}: " in r.stdout
+    assert f"found agent: {agents / 'com.example.loop.live.plist'}: " in r.stdout
+    assert f"inert agent: {agents / 'com.example.loop.done.plist'}: " in r.stdout
     assert f"(inert: {loops['done'] / 'DONE'})" in r.stdout and "org.example.other" not in r.stdout
     assert "1 active leftover(s)" in r.stdout
     (loops["live"] / "STOP").write_text("")
@@ -2214,7 +2241,7 @@ def test_setup_box_migrate_check_lists_launchd_agents_running_a_tt_workflows_clo
     assert r.returncode == 0 and "found agent" not in r.stdout, r.stdout
 
 
-def test_setup_box_migrate_check_lists_systemd_user_units_running_a_tt_workflows_clone(tmp_path):
+def test_setup_box_migrate_check_lists_systemd_user_units_running_a_workflow_clone(tmp_path):
     home, stubs, repo = _migrate_home(tmp_path, present=False)
     ttw = _ttw_clone(home)
     units = home / ".config" / "systemd" / "user"
@@ -2306,7 +2333,7 @@ def test_setup_box_migration_guide_orders_steps_and_keeps_defaults_on():
     text = (SKILLS / "setup-box" / "migrate-off-sync.md").read_text(encoding="utf-8")
     steps = ["devsync is-finished", "mutagen sync terminate", "git worktree", "tt-buddy:run",
              "managed\n     include", "after its replacement is in place", "skill symlinks",
-             "Archive tt-workflows"]
+             "Archive the workflow repo"]
     pos = [text.find(s) for s in steps]
     assert -1 not in pos and pos == sorted(pos), dict(zip(steps, pos))
     assert "box.py migrate check" in text and "ttp note --to <project>" in text

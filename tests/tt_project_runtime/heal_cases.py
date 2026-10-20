@@ -1158,7 +1158,7 @@ def test_heal_outage_on_another_machine_does_not_quiet_the_check(env, block):
 
 @pytest.mark.parametrize("finding", ["chip", "unknown"])
 def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, finding):
-    """[note f7b7938ee8de232f] An outage recorded for one service (`--covers ltx`) quieted every unhealthy
+    """[note f7b7938ee8de232f] An outage recorded for one service (`--covers demo-serve`) quieted every unhealthy
     result on the machine, so a chip loss went unnoticed for hours. Only a check whose identity names a
     covered part stays quiet."""
     from ttp import heal, timefmt
@@ -1167,13 +1167,13 @@ def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, findi
     mm.add("box-a", tags="device")
     p, d, up = _heal_setup(env, fix=None, unknown_cap_s=600, escalate="coordinator", machine="box-a")
     spec, now = _heal_spec(p), time.time()
-    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="LTX")
-    assert rec["covers"] == ["ltx"]
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="DEMO-SERVE")
+    assert rec["covers"] == ["demo-serve"]
     until = timefmt.long(rec["until"], p)
     # The covered service's own check stays quiet, as under a whole-machine outage.
-    ltx = dict(spec, unit="ltx.service", check="echo 'ltx service inactive'; exit 1")
-    assert heal.outage_explains(rec, "svc", ltx, 1, "ltx service inactive")
-    assert heal.run(d, "svc", ltx, now)[0] == f"unhealthy (known outage until {until})"
+    serve = dict(spec, unit="demo-serve.service", check="echo 'demo-serve service inactive'; exit 1")
+    assert heal.outage_explains(rec, "svc", serve, 1, "demo-serve service inactive")
+    assert heal.run(d, "svc", serve, now)[0] == f"unhealthy (known outage until {until})"
     assert heal.state(p.db, "svc")["known_outage"] == "box-a"
     if finding == "chip":   # a chip loss is not explained: it escalates as usual
         lost = dict(spec, check="echo 'chip 0 missing from the device list'; exit 1")
@@ -1199,7 +1199,7 @@ def test_heal_outage_with_covers_quiets_only_the_findings_it_explains(env, findi
 
 
 def test_heal_outage_covers_match_the_checks_identity_never_its_output(env):
-    """[note f7b7938ee8de232f] Under `--covers ltx`, a health check reporting the held service and a lost
+    """[note f7b7938ee8de232f] Under `--covers demo-serve`, a health check reporting the held service and a lost
     chip escalates: its output never makes the outage explain it. A check named after the service stays
     quiet, even for a chip loss: the accepted gap (heal module doc)."""
     from ttp import heal
@@ -1208,19 +1208,19 @@ def test_heal_outage_covers_match_the_checks_identity_never_its_output(env):
     mm.add("box-a", tags="device")
     p, d, up = _heal_setup(env, fix=None, escalate="coordinator", machine="box-a")
     spec, now = _heal_spec(p), time.time()
-    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="ltx")
-    out = "ltx: held (paused by user)\nchip 0 missing"
-    health = dict(spec, check="echo 'ltx: held (paused by user)'; echo 'chip 0 missing'; exit 1")
+    rec = ml.set_outage("box-a", "service off for testing", "user", "4h", now=now, covers="demo-serve")
+    out = "demo-serve: held (paused by user)\nchip 0 missing"
+    health = dict(spec, check="echo 'demo-serve: held (paused by user)'; echo 'chip 0 missing'; exit 1")
     assert not heal.outage_explains(rec, "svc", health, 1, out)
     assert "self-fix task" in heal.run(d, "svc", health, now)[0]
     assert "known_outage" not in heal.state(p.db, "svc")
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
     # The check's name, resource or unit naming the service: quiet, whatever its output says.
-    assert heal.outage_explains(rec, "ltx", spec, 1, out)
-    assert heal.outage_explains(rec, "svc", dict(spec, resource="box-a-ltx"), 1, out)
-    assert heal.outage_explains(rec, "svc", dict(spec, unit="ltx.service"), 1, out)
-    assert heal.run(d, "ltx", health, now)[0].startswith("unhealthy (known outage until ")
-    assert heal.state(p.db, "ltx")["known_outage"] == "box-a"
+    assert heal.outage_explains(rec, "demo-serve", spec, 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, resource="box-a-demo-serve"), 1, out)
+    assert heal.outage_explains(rec, "svc", dict(spec, unit="demo-serve.service"), 1, out)
+    assert heal.run(d, "demo-serve", health, now)[0].startswith("unhealthy (known outage until ")
+    assert heal.state(p.db, "demo-serve")["known_outage"] == "box-a"
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
 
 

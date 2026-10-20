@@ -1,5 +1,6 @@
 """`box.py migrate check`: what a machine still depends on from file syncing (devsync, mutagen)
-and tt-workflows. Read-only: it reports, it changes nothing. Steps: `migrate-off-sync.md`.
+and an older sync-based workflow repo. Read-only: it reports, it changes nothing. Steps:
+`migrate-off-sync.md`.
 
 Exit 0 when nothing active is left, 1 when something is (commented-out cron lines, dangling
 skill links and loops whose directory holds a DONE or STOP marker count as inactive), 2 when the
@@ -20,7 +21,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 SKILL_DIRS = (".claude/skills", ".agents/skills", ".cursor/skills")
 HOOK_FILES = (".claude/settings.json", ".codex/hooks.json", ".cursor/hooks.json")
-TTW_NAME = "tt-workflows"
 DEVRUN_RE = re.compile(r"\bdev(run|lock)\.sh\b")
 PATH_RE = re.compile(r"(?:~|\$HOME|/)[^\s'\"`;|&<>()]*")
 SCRIPT_SUFFIXES = {"", ".sh", ".bash", ".zsh", ".py", ".mk"}
@@ -41,13 +41,10 @@ def _expand(p: str, home: pathlib.Path) -> pathlib.Path:
 
 
 def ttw_root(path: pathlib.Path) -> Optional[pathlib.Path]:
-    """The tt-workflows clone `path` lies in, or None.
+    """The workflow clone `path` lies in, or None.
 
-    A clone is a directory named tt-workflows, or one holding scripts/devrun.sh next to skills/
-    (a copy under another name)."""
+    A clone is a directory holding scripts/devrun.sh next to skills/, under any name."""
     for d in (path, *path.parents):
-        if d.name == TTW_NAME:
-            return d
         try:
             if (d / "scripts" / "devrun.sh").is_file() and (d / "skills").is_dir():
                 return d
@@ -264,7 +261,7 @@ def _plist_command(p: pathlib.Path) -> str:
 
 
 def check_agents(home: pathlib.Path, found: list) -> None:
-    """launchd agents (macOS) and systemd user units (Linux) that run a script in a tt-workflows
+    """launchd agents (macOS) and systemd user units (Linux) that run a script in a workflow
     clone, e.g. a loop agent running <clone>/scripts/cron_lap.sh. devsync's own are check_devsync's."""
     agents = home / "Library" / "LaunchAgents"
     if agents.is_dir():
@@ -479,7 +476,7 @@ def cmd_migrate_check(args) -> int:
 
 
 def register(sub) -> None:
-    mig = sub.add_parser("migrate", help="moving off file syncing and tt-workflows")
+    mig = sub.add_parser("migrate", help="moving off file syncing and a sync-based workflow repo")
     msub = mig.add_subparsers(dest="migrate_cmd", required=True)
     c = msub.add_parser("check", help="report what this machine still depends on (read-only)")
     c.add_argument("--home", help="home directory to inspect (default: yours)")
