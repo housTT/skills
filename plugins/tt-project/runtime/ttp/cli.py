@@ -2535,11 +2535,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
+    prio, owns = checkcap.task_rank(p)
     try:
         return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
-                                p.name if p else None, checkcap.task_priority(p), same, done, lambda: _checks_cancelled(run_dir),
-                                p.state if p else None)
+                                p.name if p else None, prio, same, done, lambda: _checks_cancelled(run_dir),
+                                p.state if p else None, owns)
     except checkcap.Cancelled as e:
         said = f"not run: stopped waiting for a host-wide checks slot: {e}"
         out.write(f"ttp checks: {said}\n")

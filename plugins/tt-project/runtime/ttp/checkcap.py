@@ -51,7 +51,10 @@ pass makes the run needless, and `stop` ends it when the task the checks belong 
 
 Each slot taken is logged in the taker's project state (record_wait: WAITS_LOG, one synced JSON line
 with the project, task, priority, queued_at and granted_at); `ttp status` shows that project's median
-and p90 wait over the last 24 h (wait_line).
+and p90 wait over the last 24 h (wait_line). Each grant is also logged host-wide (record_grant: GRANTS_LOG
+under ~/.tt-project, readable by every run), and a grant after a wait of more than GRANT_TELL_S from its
+arrival (queued here, or inherited by a relaunch) says its priority, the obligations behind a boost and
+when it arrived (grant_line).
 """
 from __future__ import annotations
 
@@ -63,7 +66,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import locks, obligations, poll_s, project
+from . import locks, obligations, poll_s, project, timefmt
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -201,18 +204,24 @@ def label(project_name: str | None, what: str = "") -> str:
 def task_priority(p) -> int | None:
     """The priority of the task this process runs for (TTP_TASK) in project `p`; None without one.
     OBLIGATION_PRIORITY while the task is a required owner of an open obligation."""
+    return task_rank(p)[0]
+
+
+def task_rank(p) -> tuple[int | None, list[str]]:
+    """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else [])."""
     task = os.environ.get("TTP_TASK") or ""
     if p is None or not task.isdigit():
-        return None
+        return None, []
     try:
         t = p.db.task(int(task))
         prio = int(t["priority"]) if t and t.get("priority") is not None else None
     except Exception:   # an unreadable database only loses the ordering, never the slot
-        return None
+        return None, []
     try:
-        return OBLIGATION_PRIORITY if t and obligations.owned_open(p.db, int(task)) else prio
+        owned = list(obligations.owned_open(p.db, int(task))) if t else []
     except Exception:   # unreadable obligations only lose the boost
-        return prio
+        return prio, []
+    return (OBLIGATION_PRIORITY, owned) if owned else (prio, [])
 
 
 def paths(n: int | None = None) -> list[Path]:
@@ -312,7 +321,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
             since: float | None = None, project_name: str | None = None,
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
-            stop: Callable[[], str] | None = None, state: Path | None = None) -> Slot | None:
+            stop: Callable[[], str] | None = None, state: Path | None = None,
+            owns: list[str] | tuple = ()) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -327,7 +337,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     slot it waits for them outside the queue, keeping `since`, and queues again once they end. `done()`
     true (their pass was recorded) ends any wait with no slot held, Slot(served=True); a reason from `stop()`
     ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra()).
-    With `state` (a project's state directory) each slot taken is logged there (record_wait)."""
+    With `state` (a project's state directory) each slot taken is logged there (record_wait); every one is
+    logged host-wide (record_grant). `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
+    A slot taken more than GRANT_TELL_S after `since` is told with its priority and arrival (grant_line),
+    also when a relaunch that inherited `since` takes it at once."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -339,7 +352,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
-            record_wait(state, project_name, priority, since, time.time())
+            _granted(tell, state, project_name, priority, owns, since)
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
@@ -379,9 +392,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
-                record_wait(state, project_name, priority, since, time.time())
-                if told and tell:
-                    tell(f"host-wide checks slot taken after {(time.time() - started) / 60:.1f} min")
+                _granted(tell, state, project_name, priority, owns, since, bool(told))
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
@@ -404,6 +415,28 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 
 
 DONE_S = 30.0   # how often a waiter reads whether a recorded pass made its run needless
+GRANT_TELL_S = 5.0   # a slot taken longer than this after its arrival is told (grant_line)
+
+
+def grant_line(priority: int | None, owns, since: float, now: float | None = None) -> str:
+    """'host-wide checks slot taken after N min (priority pK[, owner of oX,oY], arrived HH:MM ZONE)'."""
+    now = time.time() if now is None else now
+    owner = f", owner of {','.join(owns)}" if owns else ""
+    try:
+        at = timefmt.short(since, timefmt.ambient(), now)
+    except Exception:   # an unknown zone only costs the zone, never the line
+        at = time.strftime("%H:%M", time.localtime(since))
+    prio = f"p{priority}" if priority is not None else "none"
+    return (f"host-wide checks slot taken after {max(0.0, now - since) / 60:.1f} min "
+            f"(priority {prio}{owner}, arrived {at})")
+
+
+def _granted(tell, state, project_name, priority, owns, since: float, told: bool = False) -> None:
+    """Log a slot taken (record_wait) and tell it when it waited, here or before a relaunch."""
+    now = time.time()
+    record_wait(state, project_name, priority, since, now, owns=owns)
+    if tell and (told or now - since > GRANT_TELL_S):
+        tell(grant_line(priority, owns, since, now))
 
 
 def _running(every: list[Path], same: str) -> str:
@@ -489,30 +522,60 @@ WAITS_WINDOW_S = 24 * 3600
 
 
 def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
-                granted_at: float, slot: str = "queue") -> None:
-    """Append one slot wait to `state`/WAITS_LOG and sync it. Never raises: a log that cannot be
-    written must not cost the checks their slot. No `state`: nothing is logged."""
-    if state is None:
-        return
-    state = Path(state)
+                granted_at: float, slot: str = "queue", owns: list[str] | tuple = ()) -> None:
+    """Append one slot wait to `state`/WAITS_LOG and sync it, and the grant to the host-wide log
+    (record_grant). Never raises: a log that cannot be written must not cost the checks their slot.
+    No `state`: only the host-wide line is logged."""
     task = os.environ.get("TTP_TASK") or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
            "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
+    if state is not None:
+        _append(Path(state), WAITS_LOG, WAITS_OLD, WAITS_LOCK, WAITS_MAX_BYTES, rec)
+    record_grant(rec, owns)
+
+
+def _append(d: Path, name: str, old: str, lock: str, cap: int, rec: dict) -> None:
+    """Append `rec` as one synced JSON line to `d`/`name`, rotating it to `old` past `cap` bytes. Never raises."""
     line = json.dumps(rec, sort_keys=True) + "\n"
     try:
-        with open(state / WAITS_LOCK, "a") as lf:
+        with open(d / lock, "a") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
-            log = state / WAITS_LOG
+            log = d / name
             try:
                 size = log.stat().st_size
             except FileNotFoundError:
                 size = 0
-            if size and size + len(line) > WAITS_MAX_BYTES:
-                os.replace(log, state / WAITS_OLD)
+            if size and size + len(line) > cap:
+                os.replace(log, d / old)
             project.durable_append(log, line)
     except OSError:
         pass
+
+
+# Every slot taken on this host, by any project, as one JSON line in ~/.tt-project/GRANTS_LOG: {"ts" (the
+# grant), "project", "task", "run", "slot", "priority", "obligations" (the ids behind a boost), "since" (the
+# arrival), "waited_s"}. Any run may read it to see who took slots ahead of it and why. Bounded like
+# WAITS_LOG: past GRANTS_MAX_BYTES it rotates to one old generation.
+GRANTS_LOG, GRANTS_OLD, GRANTS_LOCK = "checks-slot-grants.jsonl", "checks-slot-grants.1.jsonl", "checks-slot-grants.flock"
+GRANTS_MAX_BYTES = 1024 * 1024
+
+
+def grants_dir() -> Path:
+    return project.HOME_DIR
+
+
+def record_grant(rec: dict, owns: list[str] | tuple = ()) -> None:
+    """Append the slot grant `rec` (record_wait's record) to the host-wide GRANTS_LOG. Never raises."""
+    row = {"ts": rec["granted_at"], "project": rec["project"], "task": rec["task"], "run": rec["run"],
+           "slot": rec["slot"], "priority": rec["priority"], "obligations": list(owns or ()),
+           "since": rec["queued_at"], "waited_s": round(max(0.0, rec["granted_at"] - rec["queued_at"]), 3)}
+    d = grants_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    _append(d, GRANTS_LOG, GRANTS_OLD, GRANTS_LOCK, GRANTS_MAX_BYTES, row)
 
 
 def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[float]:

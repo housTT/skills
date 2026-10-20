@@ -535,7 +535,8 @@ def test_each_checks_slot_taken_logs_its_wait_durably_in_the_takers_project_stat
     assert [(r["project"], r["task"], r["priority"], r["slot"]) for r in rows] == [(p.name, 7, 2, "queue"), (p.name, 7, None, "queue")]
     assert 29 <= rows[0]["granted_at"] - rows[0]["queued_at"] < 60, "the wait counts from the place in the queue"
     assert rows[1]["granted_at"] - rows[1]["queued_at"] >= 0.3
-    assert synced == [log, log], "each line is appended with a sync"
+    grants = checkcap.grants_dir() / checkcap.GRANTS_LOG
+    assert synced == [log, grants, log, grants], "each line is appended with a sync, here and host-wide"
     # No project state (or the cap off): nothing logged; an unwritable state never costs the slot.
     checkcap.acquire("no project").close()
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")
@@ -584,3 +585,115 @@ def test_status_shows_the_last_24h_checks_slot_wait_median_and_p90_across_rotati
     line = "checks slot waits (24 h): 10 taken, median 35s, p90 1.2 min"
     assert checkcap.wait_line(p.state, now) == line
     assert line in cli.status_text(p)
+
+
+def _grants():
+    from ttp import checkcap
+    log = checkcap.grants_dir() / checkcap.GRANTS_LOG
+    return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_a_queued_checks_grant_says_its_priority_and_arrival_and_logs_host_wide(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TASK", "7")
+    held = checkcap.acquire("h")
+    arrived = time.time() - 120   # queued two minutes ago
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "w", tell=told.append, since=arrived, project_name=p.name, priority=2, state=p.state)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any(x.startswith("queued for") for x in told))
+    finally:
+        held.close()
+    t.join(30)
+    got[0].close()
+    at = time.strftime("%H:%M", time.gmtime(arrived))
+    line = [x for x in told if "slot taken" in x]
+    assert len(line) == 1 and line[0].startswith("host-wide checks slot taken after 2.0 min (priority p2, arrived ")
+    assert line[0].endswith(f"arrived {at} UTC)") and "owner of" not in line[0]
+    rows = [r for r in _grants() if r["project"] == p.name]
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r["task"], r["priority"], r["obligations"], r["slot"]) == (7, 2, [], "queue")
+    assert r["since"] == round(arrived, 3) and 119 <= r["waited_s"] < 180 and r["ts"] >= r["since"]
+    assert set(r) >= {"ts", "project", "task", "priority", "obligations", "since", "waited_s"}
+    # The project's own wait record is the same grant (record_wait), not a second measurement.
+    w = json.loads((p.state / checkcap.WAITS_LOG).read_text().splitlines()[-1])
+    assert (w["queued_at"], w["granted_at"]) == (r["since"], r["ts"])
+
+
+def test_an_obligation_boosted_checks_grant_names_the_obligations_behind_it(env, monkeypatch):
+    import threading
+    from ttp import checkcap
+    from ttp import obligations as ob
+    p = make(env)
+    tid = p.db.add_task("owner", "s", kind="code", tier="light", origin="coordinator", priority=1)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    assert checkcap.task_rank(p) == (1, [])
+    o1, o2 = ob.add(p, "the urgent report", [tid]), ob.add(p, "another urgent report", [tid])
+    prio, owns = checkcap.task_rank(p)
+    assert prio == checkcap.OBLIGATION_PRIORITY and sorted(owns) == sorted([o1, o2])
+    assert checkcap.task_rank(None) == (None, [])
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "owner", tell=told.append, since=time.time() - 60, project_name=p.name, priority=prio, state=p.state,
+        owns=owns)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any(x.startswith("queued for") for x in told))
+    finally:
+        held.close()
+    t.join(30)
+    got[0].close()
+    line = next(x for x in told if "slot taken" in x)
+    assert f"(priority p{checkcap.OBLIGATION_PRIORITY}, owner of {','.join(owns)}, arrived " in line
+    r = [r for r in _grants() if r["project"] == p.name][-1]
+    assert (r["priority"], r["obligations"]) == (checkcap.OBLIGATION_PRIORITY, owns)
+    # Push checks of the same task pass the boost and its obligations through.
+    from ttp import push
+    push.check_slot("abc", lambda s: None, proj=p).close()
+    r = [r for r in _grants() if r["project"] == p.name][-1]
+    assert (r["priority"], r["obligations"]) == (checkcap.OBLIGATION_PRIORITY, owns)
+
+
+def test_a_relaunch_taking_a_slot_at_once_still_tells_the_wait_it_inherited(env, monkeypatch):
+    # A detached hand-over or a relaunch after a reboot queues at its first arrival (`since`): even when a
+    # slot is free at once, the grant line and the host-wide log keep the wait it inherited.
+    from ttp import checkcap
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    told = []
+    arrived = time.time() - 600
+    checkcap.acquire("relaunch", tell=told.append, since=arrived, project_name=p.name, priority=3, state=p.state).close()
+    assert len(told) == 1 and told[0].startswith("host-wide checks slot taken after 10.0 min (priority p3, arrived ")
+    assert 599 <= _grants()[-1]["waited_s"] < 700
+    # A slot taken at once with no inherited wait says nothing, but every grant is logged host-wide,
+    # with no project as well.
+    told.clear()
+    checkcap.acquire("fresh", tell=told.append, project_name=p.name, priority=None, state=p.state).close()
+    checkcap.acquire("no project", tell=told.append).close()
+    assert told == []
+    rows = _grants()
+    assert len(rows) == 3 and rows[1]["priority"] is None and rows[1]["waited_s"] < checkcap.GRANT_TELL_S
+    assert rows[2]["project"] is None
+    assert "priority none" in checkcap.grant_line(None, [], time.time() - 60)
+
+
+def test_the_host_wide_grants_log_is_bounded_and_never_costs_a_slot(env, monkeypatch):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "GRANTS_MAX_BYTES", 600)
+    for _ in range(12):
+        checkcap.acquire("x", project_name="P").close()
+    d = checkcap.grants_dir()
+    assert (d / checkcap.GRANTS_OLD).exists()
+    assert (d / checkcap.GRANTS_LOG).stat().st_size <= 600 and (d / checkcap.GRANTS_OLD).stat().st_size <= 600
+    assert not list(checkcap.slot_dir().glob("*grants*")), "the slot directory holds only slots and the queue"
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: d / checkcap.GRANTS_LOG / "not-a-dir")
+    checkcap.acquire("unwritable log").close()

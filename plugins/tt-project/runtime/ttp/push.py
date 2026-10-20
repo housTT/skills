@@ -551,8 +551,9 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
         who = checkcap.label(name, "ttp push")
     if priority:
         return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state)
+    prio, owns = checkcap.task_rank(proj)
     return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
-                            priority=checkcap.task_priority(proj), state=state)
+                            priority=prio, state=state, owns=owns)
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:
