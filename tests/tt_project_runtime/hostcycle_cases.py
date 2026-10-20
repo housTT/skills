@@ -701,6 +701,38 @@ def test_a_daemon_back_after_a_long_stop_posts_one_notice(env, tmp_path):
     assert len(_down_notices(p)) == 1, "told twice"
 
 
+def test_a_long_stop_later_on_the_same_boot_is_no_reboot(env):
+    # boot_prev stays for every start on this boot: a later long stop is the daemon's, not a reboot.
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [])
+    p.db.set_kv("reboot_told", d.boot)
+    _down_since(p, d, 3 * 3600)
+    d._last_stop = {"boot": d.boot, "ts": time.time() - 3 * 3600 + 60}
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert "the daemon was stopped." in msg["text"] and "rebooted" not in msg["text"], msg["text"]
+
+
+@pytest.mark.parametrize("told", [False, True])
+def test_an_old_heartbeat_with_no_boot_id_is_a_reboot_only_until_it_is_told(env, told):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _abrupt_reboot_held(p, d, [])
+    if told:
+        p.db.set_kv("reboot_told", d.boot)
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 1, "held": []}))
+    os.utime(hb, (time.time() - 2 * 3600, time.time() - 2 * 3600))
+    d._note_down()
+    d.reap_runs()
+    (msg,) = _down_notices(p)
+    assert ("the host rebooted (abrupt)" in msg["text"]) != told, msg["text"]
+
+
 def test_a_short_restart_posts_no_down_notice(env):
     from ttp.daemon import Daemon
     p = make(env)

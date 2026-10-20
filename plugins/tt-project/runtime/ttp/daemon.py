@@ -2133,7 +2133,13 @@ class Daemon:
             hb = heartbeat(self.p) or {}
             last = now - hb["age"] if "age" in hb else None
             prev = db.kv("boot_prev") or {}
-            if self._this_boot(prev.get("boot")):
+            if not self._this_boot(prev.get("boot")):
+                prev = {}
+            # boot_prev stays for every later start on this boot: only a last heartbeat from an
+            # earlier boot says the host rebooted (an older one with no boot id: a reboot not told yet).
+            rebooted = not self._this_boot(hb["boot"]) if hb.get("boot") \
+                else bool(prev) and not self._this_boot(db.kv("reboot_told"))
+            if rebooted:
                 how = prev.get("shutdown") or "abrupt"
                 if prev.get("prev_boot") and self._planned_cycle(prev["prev_boot"]):
                     how = "planned"
