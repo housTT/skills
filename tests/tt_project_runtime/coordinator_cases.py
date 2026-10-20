@@ -432,7 +432,7 @@ def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_
     # Watcher authors are told to key changing text, in the skill and the coordinator's schedule_set notes.
     skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "watchers.md").read_text().split())
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    assert '"whole", "key", "episode"}' in skill and "Give every line whose text changes from run to run a key" in skill
+    assert '"whole", "key", "episode", "pin_severity"}' in skill and "Give every line whose text changes from run to run a key" in skill
     assert "`screen.same_subject_warn`" in skill
     assert "also carries `\"key\"`, a short stable name of the condition" in prompt
     assert "Noisy command watchers" in prompt
