@@ -3120,3 +3120,72 @@ def test_macos_is_not_checked_for_linger(env, monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     d.check_linger()
     assert calls == [] and not _linger_alerts(p)
+
+
+def _failing_step_daemon(base, calls):
+    """A Daemon whose dispatch and deliver_outbound only record that they ran, and whose
+    sweep_alerts (first step loop) and retry_rejected (second loop) raise while `calls` holds 'fail'."""
+    from ttp.daemon import Daemon
+    d = Daemon(base)
+    d.dispatch = lambda: calls.append("dispatch")
+    real_deliver = d.deliver_outbound
+    d.deliver_outbound = lambda: calls.append("deliver") or real_deliver()
+    real_sweep = d.sweep_alerts
+
+    def sweep_alerts():
+        if "fail" in calls:
+            raise RuntimeError("sweep broke")
+        return real_sweep()
+
+    def retry_rejected():
+        if "fail" in calls:
+            raise ValueError("bad row 7\nsecond line")
+    d.sweep_alerts, d.retry_rejected = sweep_alerts, retry_rejected
+    return d
+
+
+def test_a_failing_tick_step_does_not_stop_dispatch_or_delivery(env):
+    """A step that raises is logged with its name and the tick goes on: later steps in both loops
+    (dispatch, deliver_outbound) still run in that tick."""
+    p = make(env)
+    calls: list[str] = ["fail"]
+    d = _failing_step_daemon(p.base, calls)
+    d.tick()
+    assert "dispatch" in calls and "deliver" in calls
+    logged = (p.logs / "daemon.log").read_text()
+    assert "tick step sweep_alerts error:" in logged and "RuntimeError: sweep broke" in logged
+    assert "tick step retry_rejected error:" in logged
+    assert d._step_fails["sweep_alerts"][0] == 1 and d._step_fails["retry_rejected"][0] == 1
+    assert not p.db.one("SELECT id FROM messages WHERE ref LIKE 'tick-step:%'"), "one failure is not alerted"
+
+
+def test_a_tick_step_failing_three_ticks_in_a_row_is_alerted_then_cleared_by_a_success(env):
+    """STEP_FAILS_ALERT failing ticks raise tick-step:<name> at normal severity naming the step and
+    the error's first line; past STEP_FAILS_HIGH_S it rises to high; the next success clears it
+    and the count."""
+    from ttp import alerts
+    from ttp import daemon as dm
+    p = make(env)
+    calls: list[str] = ["fail"]
+    d = _failing_step_daemon(p.base, calls)
+    for _ in range(dm.STEP_FAILS_ALERT - 1):
+        d.tick()
+    assert not p.db.one("SELECT id FROM alerts WHERE key='tick-step:retry_rejected'")
+    d.tick()
+    ep = p.db.one("SELECT * FROM alerts WHERE key='tick-step:retry_rejected' AND cleared IS NULL")
+    assert ep and ep["severity"] == "normal"
+    assert "retry_rejected" in ep["text"] and "ValueError: bad row 7" in ep["text"] and "second line" not in ep["text"]
+    assert alerts.active(p.db, "tick-step:retry_rejected", ep["raised"], time.time())
+    n, since = d._step_fails["retry_rejected"]
+    d._step_fails["retry_rejected"] = (n, since - dm.STEP_FAILS_HIGH_S)   # failing for half an hour
+    d.tick()
+    ep = p.db.one("SELECT * FROM alerts WHERE key='tick-step:retry_rejected' AND cleared IS NULL")
+    assert ep["severity"] == "high"
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE kind='alert' AND ref='tick-step:retry_rejected'")["n"] == 2
+    calls.remove("fail")
+    d.tick()
+    assert "retry_rejected" not in d._step_fails and "sweep_alerts" not in d._step_fails
+    assert not p.db.one("SELECT id FROM alerts WHERE key LIKE 'tick-step:%' AND cleared IS NULL")
+    told = p.db.one("SELECT * FROM messages WHERE kind='resolved' AND ref='tick-step:retry_rejected'")
+    assert told and "retry_rejected runs again" in told["text"]
+    assert not alerts.holds(p.db, "tick-step:retry_rejected", ep["raised"], time.time())

@@ -138,6 +138,9 @@ LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
+STEP_FAILS_ALERT = 3      # consecutive ticks a tick step fails before it is alerted (Daemon._run_step)
+STEP_FAILS_HIGH_S = 1800  # a step failing this long since its first failure: the alert rises to high
+STEP_FAILING_KEY = "tick_steps_failing"   # kv: {step: since} of the alerted steps (alerts.holds, tick-step:)
 # A tick still running this long gets every thread's stack written to STACKS_FILE (faulthandler) and,
 # once it ends, an alert: a slow step that keeps telling the watchdogs it moves is never restarted.
 TICK_OVERRUN_S = 900
@@ -621,6 +624,8 @@ class Daemon:
         self._disk_swept = 0.0   # when the disk guard last swept finished tasks' worktrees
         self._disk_free: float | None = None
         self._tick_errors = 0
+        self._step_fails: dict[str, tuple[int, float]] = {}   # tick step -> (consecutive failures, first failed)
+        self.p.db.set_kv(STEP_FAILING_KEY, {})   # counts start again with this daemon (an episode then clears)
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
         self._jobs_sampled = 0.0   # sample_jobs' last pass
@@ -973,6 +978,53 @@ class Daemon:
         except OSError:
             pass
 
+    def _run_step(self, step) -> None:
+        """Run one tick step so that its exception never skips the steps after it (dispatch, Slack,
+        outbound delivery, pushes): log it and count it. A step that fails STEP_FAILS_ALERT ticks
+        in a row is alerted, normal at first and high once it has failed STEP_FAILS_HIGH_S; its next
+        success clears the count and the alert. The watchdogs still hear of progress either way."""
+        name = self._step_name = step.__name__
+        try:
+            step()
+        except Exception as e:  # one bad step must not stop the rest of the tick
+            log(self.p, f"tick step {name} error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+            n, since = self._step_fails.get(name, (0, time.time()))
+            self._step_fails[name] = (n + 1, since)
+            if n + 1 >= STEP_FAILS_ALERT:
+                try:
+                    self._alert_step(name, n + 1, since, e)
+                except Exception:
+                    log(self.p, "tick step alert error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        else:
+            if self._step_fails.pop(name, None):
+                try:
+                    self._clear_step(name)
+                except Exception:
+                    log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        self._progress()
+
+    def _alert_step(self, name: str, fails: int, since: float, err: Exception) -> None:
+        db = self.p.db
+        failing = db.kv(STEP_FAILING_KEY, {}) or {}
+        if name not in failing:
+            failing[name] = since
+            db.set_kv(STEP_FAILING_KEY, failing)
+        mins = int((time.time() - since) // 60)
+        first = (traceback.format_exception_only(type(err), err) or [type(err).__name__])[0].strip().splitlines()[0]
+        severity = "high" if time.time() - since >= STEP_FAILS_HIGH_S else "normal"
+        self.alert(f"tick-step:{name}", f"Daemon tick step {name} failed {fails} ticks in a row "
+                   f"(for {mins} min): {first[:300]}. The other steps still run; the daemon log has the "
+                   f"traceback.", severity=severity)
+
+    def _clear_step(self, name: str) -> None:
+        db = self.p.db
+        failing = db.kv(STEP_FAILING_KEY, {}) or {}
+        if failing.pop(name, None) is None:
+            return   # never alerted
+        db.set_kv(STEP_FAILING_KEY, failing)
+        alerts.close_key(db, f"tick-step:{name}", "the step succeeded",
+                         text="Cleared: " + alerts.CLEARED_TEXT["tick-step"].format(arg=name))
+
     def tick(self) -> None:
         self._tick_began = self._moved = time.monotonic()
         self._step_name = ""
@@ -994,9 +1046,7 @@ class Daemon:
                      self.check_linger):
             if step in lease_off:
                 continue
-            self._step_name = step.__name__
-            step()
-            self._progress()
+            self._run_step(step)
         self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
             if not lease_off:
@@ -1026,9 +1076,7 @@ class Daemon:
                 continue
             if step in lease_off:   # another host holds the project lease
                 continue
-            self._step_name = step.__name__
-            step()
-            self._progress()
+            self._run_step(step)
 
     def review_jev(self, every_s: float = 600) -> None:
         """Settle screening calls (scr.settle_jev), then switch off the Jev uses that do not save money

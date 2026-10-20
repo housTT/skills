@@ -77,6 +77,7 @@ CLEARED_TEXT = {
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
+    "tick-step": "Daemon tick step {arg} runs again.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
@@ -88,7 +89,8 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "a
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
-STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch")
+# tick-step: a daemon tick step that keeps failing (Daemon._run_step); its next success clears it.
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch", "tick-step")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -243,6 +245,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return turnsize.holds(db)
     if key == "linger-off":   # Daemon.check_linger keeps the flag while linger is off
         return bool(db.kv("linger_off"))
+    if kind == "tick-step":   # Daemon._run_step keeps the step while it keeps failing
+        return arg in (db.kv("tick_steps_failing", {}) or {})
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
@@ -274,7 +278,7 @@ def _checkable(key: str) -> bool:
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
-                                         "coord-budget", "account-mismatch", "linger-off")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step")
 
 
 def _since(ep: dict) -> float:
@@ -374,11 +378,13 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
         return {**ep, "acked": rec}
 
 
-def close_key(db: DB, key: str, why: str, now: float | None = None) -> list[dict]:
-    """Retire open episodes when a check no longer requires user escalation."""
+def close_key(db: DB, key: str, why: str, now: float | None = None, text: str | None = None) -> list[dict]:
+    """Retire open episodes when a check no longer requires user escalation. With `text`, the
+    clearing is told as that, as quietly as sweep tells a status condition's."""
     now = time.time() if now is None else now
     with db.tx():
-        return [_close(db, ep, now, why, f"Cleared: {key} user alert: {why}.")
+        return [_close(db, ep, now, why, text or f"Cleared: {key} user alert: {why}.",
+                       ("normal" if _urgent(ep["severity"]) else "low") if text else None)
                 for ep in db.q("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id", (key,))]
 
 
