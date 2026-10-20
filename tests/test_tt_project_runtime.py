@@ -23621,7 +23621,8 @@ def test_an_upstream_fix_wakes_the_project_that_filed_it_once_its_daemon_runs_it
     assert upstream.fixes_line("demo", {"upstream": {"ingest": True}}, later).startswith(f"2 upstream fixes {upstream.SHIPPED}")
     with monkeypatch.context() as m:
         m.setattr(upstream.time, "time", lambda: later)
-        assert "shipped, not confirmed" in cli.status_text(p)
+        assert "shipped, not confirmed" in cli.status_text(p, verbose=True)
+        assert "shipped, not confirmed" not in cli.status_text(p), "unacked fixes are a --verbose line"
     # An ack closes it; an ack needs evidence and a resolution.
     assert _upstream_cli(cli, "--ack", fp, " ") == 2
     assert _upstream_cli(cli, "--ack", "0" * 16, "works") == 2
