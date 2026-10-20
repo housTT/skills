@@ -23,6 +23,11 @@ earns it, and evidence that changed (a task moved, the user wrote) runs again. S
 also keeps its period owed while its previous run is open or its daily budget is used, and
 retries every half hour instead of a full period on.
 
+An llm schedule may name a `precheck`: a shell command, run off the tick from the project root after
+the budget, open-run, debounce and idle gates (`precheck_timeout_s`, 120, capped like a command
+watcher's). Exit 0 skips the trigger as "skipped: precheck: <its first output line>"; any other exit,
+a timeout or an error lets the run go ahead and is logged. It judges outside state no model needs to.
+
 A project may keep its schedules in `harness/schedules.json` (the format of the template's
 recurring.json), so every change to them is a commit in the harness. Once that file exists it is
 the source of truth: the daemon applies it at start and whenever it changes (a schedule missing
@@ -314,6 +319,14 @@ def parse_file(text: str | bytes, known: Any = ()) -> list[dict]:
                 raise ValueError(f"{where}: only a command schedule takes `payload.heal`")
             from .heal import validate
             validate(payload["heal"], f"{where}: payload.heal")
+        if payload.get("precheck") is not None:
+            if e["kind"] != "llm":
+                raise ValueError(f"{where}: only an llm schedule takes `payload.precheck`")
+            if not isinstance(payload["precheck"], str):
+                raise ValueError(f"{where}: `payload.precheck` is a shell command")
+        t = payload.get("precheck_timeout_s")
+        if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0):
+            raise ValueError(f"{where}: `payload.precheck_timeout_s` is a number of seconds")
         if e["kind"] == "command" and e.get("enabled", True) and not str(payload.get("command") or "").strip() \
                 and not payload.get("heal"):
             raise ValueError(f"{where}: an enabled command schedule needs `payload.command` or `payload.heal`")

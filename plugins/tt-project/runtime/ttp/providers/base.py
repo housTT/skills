@@ -44,7 +44,7 @@ def request_rejected(text: str) -> bool:
 # Strict output pads absent optional fields with null. These schedule fields also have an
 # explicit-null operation; clear_fields distinguishes that operation from padding. Sparse
 # legacy actions without clear_fields retain their original explicit-null semantics.
-NULL_OPERATIONS = ("debounce_h", "rewake_after_h", "issue_lifecycle", "heal")
+NULL_OPERATIONS = ("debounce_h", "rewake_after_h", "issue_lifecycle", "heal", "precheck")
 
 
 def normalize_action(action: dict) -> dict:

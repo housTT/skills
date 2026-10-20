@@ -11233,7 +11233,7 @@ def test_coordinator_padded_nulls_keep_schedule_defaults_and_explicit_off(env, t
     from ttp import coordinator as coord
     from ttp.providers import get_provider
     p = make(env)
-    for name, kind, fields in [('llm-check', 'llm', {'debounce_h': 2}),
+    for name, kind, fields in [('llm-check', 'llm', {'debounce_h': 2, 'precheck': 'true'}),
                                ('command-check', 'command', {'command': 'true', 'rewake_after_h': 6,
                                 'issue_lifecycle': 'explicit_clear', 'heal': {'check': 'true'}})]:
         assert coord.apply(p, [{'type': 'schedule_set', 'name': name, 'kind': kind, **fields}]) == []
@@ -11256,7 +11256,7 @@ def test_coordinator_padded_nulls_keep_schedule_defaults_and_explicit_off(env, t
         assert row['enabled'] == 1
         if explicit:
             if kind == 'llm':
-                assert kept['debounce_h'] is None
+                assert kept['debounce_h'] is None and 'precheck' not in kept
             else:
                 assert kept['rewake_after_h'] is None
                 assert 'heal' not in kept and 'issue_lifecycle' not in kept

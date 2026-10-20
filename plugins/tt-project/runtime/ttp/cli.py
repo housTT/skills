@@ -4658,9 +4658,11 @@ def cmd_schedules(a) -> None:
     for r in p.db.q("SELECT * FROM schedules ORDER BY name"):
         e = sched.entry(r)
         t = e["payload"].get("timeout_s") if isinstance(e["payload"], dict) else None
+        pre = str(e["payload"].get("precheck") or "").strip() if isinstance(e["payload"], dict) else ""
         at = sched.at_text(r, home)
         print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}"
-              f"{f' timeout {t}s' if t else ''}{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
+              f"{f' timeout {t}s' if t else ''}{f' precheck: {pre[:60]}' if pre else ''}"
+              f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
 
 
 def cmd_mute(a) -> None:

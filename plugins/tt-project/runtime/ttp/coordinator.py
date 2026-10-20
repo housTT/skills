@@ -81,6 +81,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "command": {"type": "string"}, "timeout_s": {"type": "number"},
             "rewake_after_h": {"type": ["number", "null"]}, "debounce_h": {"type": ["number", "null"]},
+            "precheck": {"type": ["string", "null"]}, "precheck_timeout_s": {"type": "number"},
             "issue_lifecycle": {"type": ["string", "null"]},
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
@@ -1987,6 +1988,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                "tier": a.get("tier") or kept.get("tier") or "standard"}
                     if "debounce_h" in a:   # null or 0: no debounce
                         payload["debounce_h"] = _hours_or_none(a, "debounce_h")
+                    if "precheck" in a:   # null or "": no precheck
+                        payload.pop("precheck", None)
+                        if str(a["precheck"] or "").strip():
+                            payload["precheck"] = str(a["precheck"]).strip()
+                    if a.get("precheck_timeout_s"):
+                        payload["precheck_timeout_s"] = a["precheck_timeout_s"]
                 elif kind == "watcher" and old:
                     payload = kept   # a built-in probe: only its timing and switch change
                 else:

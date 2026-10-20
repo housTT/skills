@@ -250,3 +250,131 @@ def test_a_schedule_name_outside_the_safe_set_is_refused_everywhere_but_a_stored
     sched.upsert(p.db, "old name", "llm", "2d", enabled=False)
     assert p.db.one("SELECT every_s, enabled FROM schedules WHERE name='old name'") == {"every_s": 172800, "enabled": 0}
     assert sched.parse_file(json.dumps([{"name": "old name", "kind": "llm", "every": "1d"}]), {"old name"})
+
+
+def _run(d):
+    """run_schedules, then record a prechecked run still going after the tick's short wait."""
+    d.run_schedules()
+    for run in list(d._sched_runs.values()):
+        run.done.wait(30)
+    d.run_schedules()
+
+
+def _prechecked(p, precheck, **extra):
+    """An llm schedule `summary`, due now, whose precheck is `precheck`."""
+    from ttp import schedule as sched
+    sched.upsert(p.db, "summary", "llm", "1d", payload={"spec": "sum up", "precheck": precheck, **extra})
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='summary'", (time.time() - 1,))
+
+
+def _summary(p):
+    s = p.db.one("SELECT last_status FROM schedules WHERE name='summary'")["last_status"]
+    n = p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule' AND labels=?", (json.dumps(["summary"]),))["n"]
+    log = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    return s, n, log
+
+
+def test_an_llm_precheck_that_exits_0_skips_the_trigger_with_its_first_line(env):
+    """The case behind it: a recurring llm schedule spent model runs on empty windows a script could judge."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    _prechecked(p, "echo; echo '  nothing new in the window  '; echo second line")
+    d = Daemon(p.base)
+    d.gates = {}
+    _run(d)
+    status, n, log = _summary(p)
+    assert status == "skipped: precheck: nothing new in the window" and n == 0, (status, log)
+    row = p.db.one("SELECT last_run, next_run FROM schedules WHERE name='summary'")
+    assert row["last_run"] and row["next_run"] > time.time() + 86400 - 120   # a full period on, not owed
+    _prechecked(p, "true")   # no output: still a skip, with a reason
+    _run(d)
+    assert _summary(p)[:2] == ("skipped: precheck: exit 0", 0)
+
+
+@pytest.mark.parametrize("precheck,extra,logged", [
+    ("echo busy; echo why >&2; exit 3", {}, "precheck exited rc=3 (why); the run goes ahead"),
+    ("sleep 5", {"precheck_timeout_s": 1}, "precheck timed out after 1 s; the run goes ahead"),
+])
+def test_an_llm_precheck_that_fails_or_times_out_lets_the_run_go_ahead(env, precheck, extra, logged):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _prechecked(p, precheck, **extra)
+    d = Daemon(p.base)
+    d.gates = {}
+    _run(d)
+    status, n, log = _summary(p)
+    assert status == "queued" and n == 1, status
+    assert f"schedule summary: {logged}" in log, log
+
+
+def test_an_llm_precheck_that_raises_lets_the_run_go_ahead(env, monkeypatch):
+    from ttp import schedrun
+    from ttp.daemon import Daemon
+    p = make(env)
+    _prechecked(p, "true")
+
+    def boom(*a, **k):
+        raise OSError("no shell")
+    monkeypatch.setattr(schedrun, "run_group", boom)
+    d = Daemon(p.base)
+    d.gates = {}
+    _run(d)
+    status, n, log = _summary(p)
+    assert status == "queued" and n == 1, status
+    assert "schedule summary: precheck failed (OSError: no shell); the run goes ahead" in log, log
+
+
+def test_an_llm_precheck_is_not_run_when_an_earlier_gate_already_skipped(env, tmp_path):
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    p = make(env)
+    ran = tmp_path / "ran"
+    d = Daemon(p.base)
+    # The open-run gate.
+    _prechecked(p, f"touch {ran}")
+    tid = p.db.add_task("[summary] open", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["summary"]), tid))
+    d.gates = {}
+    _run(d)
+    assert _summary(p)[0] == "skipped: previous run still open" and not ran.exists()
+    p.db.update_task(tid, status="done")
+    # The budget gate, then the schedule's daily budget.
+    _prechecked(p, f"touch {ran}")
+    d.gates = {d.cfg.get("core_provider", "claude"): SimpleNamespace(allow_optional=False, level="tight")}
+    _run(d)
+    assert _summary(p)[0] == "skipped: budget tight" and not ran.exists()
+    d.gates = {}
+    p.db.x("UPDATE schedules SET budget_usd_day=1, next_run=? WHERE name='summary'", (time.time() - 1,))
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:summary", 2.0))
+    _run(d)
+    assert _summary(p)[0] == "skipped: daily budget used" and not ran.exists()
+    # The idle gate: nothing happened since its last run.
+    p.db.x("UPDATE schedules SET budget_usd_day=NULL WHERE name='summary'")
+    _prechecked(p, f"touch {ran}", skip_if_idle=True)
+    p.db.x("UPDATE messages SET ts=?", (time.time() - 2 * 86400,))
+    p.db.x("UPDATE runs SET started=?, ended=?", (time.time() - 2 * 86400, time.time() - 2 * 86400))
+    p.db.x("UPDATE schedules SET last_run=? WHERE name='summary'", (time.time() - 86400,))
+    _run(d)
+    assert _summary(p)[0] == "skipped: nothing happened since the last run" and not ran.exists()
+
+
+def test_a_precheck_is_set_and_cleared_by_schedule_set_and_shown_and_validated(env, capsys):
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    p = make(env)
+    pay = lambda: json.loads(p.db.one("SELECT payload FROM schedules WHERE name='summary'")["payload"])
+    assert coord.apply(p, [{"type": "schedule_set", "name": "summary", "kind": "llm", "spec": "sum up",
+                            "precheck": " scripts/window-empty ", "precheck_timeout_s": 30}]) == []
+    assert pay()["precheck"] == "scripts/window-empty" and pay()["precheck_timeout_s"] == 30
+    assert coord.apply(p, [{"type": "schedule_set", "name": "summary", "tier": "light"}]) == []
+    assert pay()["precheck"] == "scripts/window-empty"   # left out: kept
+    from ttp import cli
+    cli.main(["schedules", p.name])
+    assert "precheck: scripts/window-empty" in capsys.readouterr().out
+    assert coord.apply(p, [{"type": "schedule_set", "name": "summary", "precheck": None}]) == []
+    assert "precheck" not in pay()
+    for kind, payload, why in [("command", {"command": "true", "precheck": "true"}, "only an llm schedule"),
+                               ("llm", {"precheck": 3}, "is a shell command"),
+                               ("llm", {"precheck": "true", "precheck_timeout_s": 0}, "number of seconds")]:
+        with pytest.raises(ValueError, match=why):
+            sched.parse_file(json.dumps([{"name": "x", "kind": kind, "every": "1d", "payload": payload}]))

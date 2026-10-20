@@ -4298,7 +4298,8 @@ class Daemon:
         that does not answer) never holds messages or dispatch; the tick waits at most SCHEDULE_WAIT_S
         for them. A run past its timeout (_schedule_timeout) has its process groups killed and is
         recorded as a failed run; one still going schedrun.STUCK_FACTOR x its timeout after that kill (a
-        builtin watcher stuck in Python) is observed once more, under its own key."""
+        builtin watcher stuck in Python) is observed once more, under its own key. An llm schedule with a
+        `precheck` runs off the tick too, so its shell check never holds the tick either."""
         db, runs = self.p.db, self._sched_runs
         if not self._sched_swept:   # what an earlier daemon's runs left: their schedules are still due
             self._sched_swept = True
@@ -4311,7 +4312,7 @@ class Daemon:
             log(self.p, "schedule gaps: " + traceback.format_exc().replace("\n", " | ")[:1000])
         for s in due:
             payload = json.loads(s["payload"] or "{}")
-            if s["kind"] in ("command", "watcher"):
+            if s["kind"] in ("command", "watcher") or (s["kind"] == "llm" and _precheck_cmd(payload)):
                 runs[s["name"]] = self._start_schedule(s, payload)
                 continue
             try:
@@ -4395,7 +4396,7 @@ class Daemon:
             self.observe("daemon:schedule-gap", text, "normal", whole=True, key=f"schedule-gap:{int(since)}")
 
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
-        """Start one command, heal or builtin watcher run in its own thread. It works on a copy of the
+        """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a copy of the
         daemon with its own database connection; its watchdog pings are the tick's own business."""
         host = copy.copy(self)
         host.p = copy.copy(self.p)
@@ -4404,6 +4405,8 @@ class Daemon:
 
         def body() -> tuple[str, float | None]:
             host.jev = Jev(host.cfg, db=host.p.db, pause=host._jev_pause)
+            if s["kind"] == "llm":
+                return host._schedule_llm(s, payload), None
             if s["kind"] == "command" and payload.get("heal"):
                 return host._run_heal(s, payload)
             if s["kind"] == "command":
@@ -4418,6 +4421,8 @@ class Daemon:
         if s["kind"] == "watcher":
             from .watchers import bounds
             return bounds(self, payload)[0] + SCHEDULE_GRACE_S
+        if s["kind"] == "llm":   # its precheck, then the gates and the enqueue around it
+            return _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")}) + 2 * SCHEDULE_GRACE_S
         t = _watcher_timeout(payload) if str(payload.get("command") or "").strip() else 0
         if payload.get("heal"):
             try:
@@ -4677,6 +4682,9 @@ class Daemon:
         if (not owed and payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"]
                 and not self._active_since(float(s["last_run"]), s["name"])):
             return "skipped: nothing happened since the last run"
+        skip = self._schedule_precheck(s, payload)
+        if skip:
+            return skip
         spec = payload.get("spec") or s["description"]
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
@@ -4774,6 +4782,29 @@ class Daemon:
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
         return "queued"
+
+    def _schedule_precheck(self, s: dict, payload: dict) -> str:
+        """An llm schedule's model-free `precheck` (shell, run from the project root, `precheck_timeout_s`
+        capped like a command watcher's): exit 0 skips this trigger, its first output line the reason.
+        Any other exit, a timeout or an error lets the run go ahead (fail open) and is logged."""
+        cmd = _precheck_cmd(payload)
+        if not cmd:
+            return ""
+        timeout = _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")})
+        try:
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
+        except subprocess.TimeoutExpired:
+            log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s; the run goes ahead")
+            return ""
+        except Exception as e:
+            log(self.p, f"schedule {s['name']}: precheck failed ({type(e).__name__}: {e}); the run goes ahead")
+            return ""
+        if out.returncode != 0:
+            log(self.p, f"schedule {s['name']}: precheck exited rc={out.returncode} "
+                        f"({output_tail(out.stderr) or 'no stderr'}); the run goes ahead")
+            return ""
+        line = next((x.strip() for x in (out.stdout or "").splitlines() if x.strip()), "") or "exit 0"
+        return f"skipped: precheck: {line}"[:200]
 
     def _active_since(self, since: float, schedule: str) -> bool:
         """Whether any worker ran or finished, other than this schedule's own, or the user wrote, since
@@ -9864,6 +9895,11 @@ def _watcher_timeout(payload: dict) -> int:
     except (TypeError, ValueError):
         want = 120
     return max(1, min(want, WATCHER_MAX_S))
+
+
+def _precheck_cmd(payload: dict) -> str:
+    """An llm schedule's `precheck` shell command, or "" when it has none."""
+    return str(payload.get("precheck") or "").strip()
 
 
 def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
