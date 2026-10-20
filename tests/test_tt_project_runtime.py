@@ -21290,6 +21290,44 @@ def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tm
     assert "last background copy: could not copy the machines list to far-down" in capsys.readouterr().out
 
 
+def test_two_quick_machine_changes_keep_both_background_copies_results(env, tmp_path, monkeypatch, capsys):
+    """A second change while the first copy still runs starts its own log: the first copy's results
+    are never lost, each failure is reported once, and only the newest few logs are kept."""
+    from ttp import cli
+    from ttp import machines as mm
+    from ttp.project import register
+    bin_, gate = tmp_path / "bin", tmp_path / "gate"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(f"#!/bin/bash\nfor i in $(seq 300); do [ -e {gate} ] && break; sleep 0.1; done\n"
+                              "echo \"connection timed out (copy $COPY_ID)\" >&2; exit 255\n")
+    (bin_ / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    register("down", {"host": "far-down", "dir": "/p1"})
+    for n, alias in ((1, "box-a"), (2, "box-b")):   # both start before either copy ends
+        monkeypatch.setenv("COPY_ID", str(n))
+        cli.main(["machines", "add", alias, "--tags", "device"])
+    gate.touch()
+    logs = []
+    for _ in range(300):
+        logs = sorted((mm.project.HOME_DIR / mm.PUSH_LOGS).glob("*.log"))
+        if len(logs) == 2 and all(mm.PUSH_DONE in p.read_text().splitlines() for p in logs):
+            break
+        time.sleep(0.1)
+    want = [f"could not copy the machines list to far-down: connection timed out (copy {n})" for n in (1, 2)]
+    assert sorted(mm.push_failures()) == want
+    capsys.readouterr()
+    monkeypatch.setattr(mm, "push_background", lambda hosts: "log")
+    cli.main(["machines", "add", "box-c", "--tags", "device"])
+    out = capsys.readouterr().out
+    assert all(f"last background copy: {w}" in out for w in want)
+    cli.main(["machines", "add", "box-d", "--tags", "device"])
+    assert "last background copy" not in capsys.readouterr().out      # each failure is reported once
+    for n in range(mm.PUSH_KEEP + 2):
+        (logs[0].parent / f"{n:019d}-1.log").write_text(f"x\n{mm.PUSH_DONE}\n")
+    mm.prune_push_logs()
+    assert len(list(logs[0].parent.glob("*.log"))) == mm.PUSH_KEEP and logs[-1].exists()
+
+
 def test_machine_changes_are_copied_to_remote_project_machines(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     from ttp import machines as mm

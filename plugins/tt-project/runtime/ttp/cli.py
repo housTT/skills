@@ -4633,7 +4633,7 @@ def cmd_machines(a) -> None:
                 print(mm.PUSH_DONE, flush=True)
         else:
             # A change never waits for hosts that are down: the copy runs on in the background.
-            for line in mm.push_failures():
+            for line in mm.push_failures(mark=True):
                 print(f"last background copy: {line}")
             if hosts:
                 log = mm.push_background(hosts)

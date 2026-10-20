@@ -241,7 +241,10 @@ PUSH_SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "Conne
             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
 PUSH_TIMEOUT_S = 60         # one ssh call of a copy, at most
 DECOMMISSIONED = "decommissioned"   # the tag of a machine that is gone for good: nothing is copied to it
-PUSH_LOG = "machines-push.log"      # in ~/.tt-project: what the last background copy did
+PUSH_LOGS = "machines-push"         # in ~/.tt-project: one log per background copy, so copies never mix
+PUSH_KEEP = 5                       # the newest copies' logs kept
+PUSH_STALE_S = 86400                # an older log with no done line (its copy died) goes after this
+PUSH_REPORTED = "reported"          # in PUSH_LOGS: the logs whose failures a change already reported
 PUSH_DONE = "finished"              # the background copy's last line
 
 
@@ -265,14 +268,40 @@ def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
 
 
 def push_log() -> Path:
-    return project.HOME_DIR / PUSH_LOG
+    """The newest background copy's log (a name in PUSH_LOGS that may not exist yet)."""
+    logs = _push_logs()
+    return logs[-1] if logs else project.HOME_DIR / PUSH_LOGS / "none.log"
+
+
+def _push_logs() -> list[Path]:
+    """The background copies' logs, oldest first (each name starts with its start time in ns)."""
+    return sorted((project.HOME_DIR / PUSH_LOGS).glob("*.log"))
+
+
+def _push_done(log: Path) -> bool:
+    try:
+        return PUSH_DONE in log.read_text().splitlines()
+    except OSError:
+        return False
+
+
+def prune_push_logs() -> None:
+    """Keep the newest PUSH_KEEP logs; an older one goes once its copy is done or died long ago."""
+    now = time.time()
+    for log in _push_logs()[:-PUSH_KEEP]:
+        try:
+            if _push_done(log) or now - log.stat().st_mtime > PUSH_STALE_S:
+                log.unlink()
+        except OSError:
+            pass
 
 
 def push_background(hosts: list[str]) -> Path:
-    """Start `ttp machines push --log` for `hosts` in its own session and return its log; never waits."""
+    """Start `ttp machines push --log` for `hosts` in its own session and return its log; never waits.
+    Each copy writes its own log, so a copy started while another still runs loses neither's results."""
     import sys
-    log = push_log()
-    log.parent.mkdir(parents=True, exist_ok=True)
+    prune_push_logs()
+    log = project.HOME_DIR / PUSH_LOGS / f"{time.time_ns():019d}-{os.getpid()}.log"
     project.durable_write(log, f"copying the machines list to {', '.join(hosts)}\n")
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(
         x for x in (str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH")) if x)}
@@ -283,15 +312,28 @@ def push_background(hosts: list[str]) -> Path:
     return log
 
 
-def push_failures() -> list[str]:
-    """The failed copies of the last background copy, once it has finished."""
+def push_failures(mark: bool = False) -> list[str]:
+    """The failed copies of the finished background copies not yet reported, oldest first; `mark`
+    records those logs as reported, so the next change does not repeat them."""
+    seen_file = project.HOME_DIR / PUSH_LOGS / PUSH_REPORTED
     try:
-        lines = push_log().read_text().splitlines()
-    except OSError:
-        return []
-    if PUSH_DONE not in lines:
-        return []
-    return [ln for ln in lines if ln.startswith(("could not copy", "left the machines list"))]
+        seen = set(json.loads(seen_file.read_text()))
+    except (OSError, ValueError, TypeError):
+        seen = set()
+    logs = _push_logs()
+    out, done = [], []
+    for log in logs:
+        if log.name in seen or not _push_done(log):
+            continue
+        done.append(log.name)
+        try:
+            out += [ln for ln in log.read_text().splitlines() if ln.startswith(("could not copy", "left the machines list"))]
+        except OSError:
+            pass
+    if mark and done:
+        names = {p.name for p in logs}
+        project.durable_write(seen_file, json.dumps(sorted((seen & names) | set(done))) + "\n")
+    return out
 
 
 def _ssh(argv: list[str], **kw) -> subprocess.CompletedProcess:
