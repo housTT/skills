@@ -34954,8 +34954,8 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     row = p.db.one("SELECT * FROM runs WHERE id=?", (d.start_run("worker", "go", "claude", "light", str(path),
                                                                  task=p.db.task(work)),))
     checked = []
-    monkeypatch.setattr(integrity, "check", lambda proj, wts: checked.extend(t for t, _ in wts)
-                        or {"seconds": 0, "fsck": "ok", "restored": [], "bad": [], "worktrees": []})
+    monkeypatch.setattr(integrity, "check", lambda proj, wts, kept=(): checked.extend(t for t, _ in wts)
+                        or {"seconds": 0, "fsck": "ok", "restored": [], "bad": [], "worktrees": [], "clones": []})
     d.check_integrity(start=True)
     assert checked == [work], checked
     _end_run(p, d, row)

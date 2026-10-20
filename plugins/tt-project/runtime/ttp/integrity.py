@@ -229,7 +229,9 @@ def host_text(change: dict) -> str:
     return (f"This project was set up on machine '{change['was']}' but its daemon now runs on "
             f"'{change['now']}': the project folder was moved, copied or restored. Check its machine-specific "
             f"settings (runners, machines, ssh aliases, paths) and its repositories, then set project.json's "
-            f"host to '{change['now']}' to confirm the move.")[:2000]
+            f"host to '{change['now']}' to confirm the move. A move changes no task labels: re-point open tasks whose "
+            f"resource labels name machines no longer in use with task_update `resources` (a running one: cancel it "
+            f"and task_add one that `continues` it).")[:2000]
 
 
 def check(p: Project, worktrees: list[tuple[int, Path]] = (), kept: list[tuple[int, Path]] = ()) -> dict:

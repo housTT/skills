@@ -5743,7 +5743,7 @@ class Daemon:
         db.set_kv(KV_INTEGRITY, res)
         log(self.p, f"integrity check in {res['seconds']} s: fsck {res['fsck']}, {len(res['restored'])} restored, "
                     f"{len(res['bad'])} unrepaired, {len(res['worktrees'])} broken worktree(s), "
-                    f"{len(res['clones'])} repo(s) without .git")
+                    f"{len(res.get('clones') or [])} repo(s) without .git")
         if res["restored"]:
             db.post("out", "The harness check after a restart repaired files a cut write had damaged: "
                            + "; ".join(res["restored"])[:2000], kind="info", severity="low")

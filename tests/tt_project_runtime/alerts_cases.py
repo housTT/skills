@@ -1054,6 +1054,9 @@ def test_boot_check_alerts_once_on_a_change_of_machine_and_clears(env, monkeypat
     Daemon(p.base).check_integrity(start=True)
     al = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity-host'")
     assert len(al) == 1 and "'testhost'" in al[0]["text"] and "'otherhost'" in al[0]["text"], al
+    # It tells the coordinator a move re-points no task: open tasks' machine labels are its to fix.
+    assert "changes no task labels" in al[0]["text"] and "task_update `resources`" in al[0]["text"], al[0]["text"]
+    assert "`continues`" in al[0]["text"], al[0]["text"]
     assert p.db.kv(KV_INTEGRITY_HOST)["now"] == "otherhost"
     assert alerts.holds(p.db, "integrity-host", al[0]["ts"], time.time())
     # Confirmed by setting project.json's host: the hourly re-check clears it.
