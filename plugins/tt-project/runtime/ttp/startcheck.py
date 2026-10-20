@@ -3,7 +3,8 @@
 - the task's worktree, when its `.git` file names a git dir that is gone (dangling). When the
   repository it belonged to is gone too (a clone left empty or removed), the commits it never
   pushed went with it: its files move aside and the task is blocked (worktree.WorkspaceStuck), never
-  continued on a fresh worktree as if nothing happened. When only git's record of it is gone, its
+  continued on a fresh worktree as if nothing happened. So is one whose repository is there but no
+  longer has the task's recorded branch (cloned again). When only git's record of it is gone, its
   commits are kept in the repository: its files move aside and the worktree is made again.
 - the clone code worktrees are made from (the project root): one that was a git repository and
   now has no .git directory blocks the task; one on a file system a reboot empties (tmpfs, ramfs)
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -120,10 +122,18 @@ def _move_aside(path: Path) -> Path:
     return dest
 
 
+def _has_branch(repo: Path, ref: str) -> bool:
+    try:
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def check(p: Project, task: dict, now: float | None = None) -> list[str]:
     """Run the checks for `task`, which is about to start; returns the findings it may start with.
     Raises worktree.WorkspaceStuck (the daemon blocks the task) for a dangling worktree whose
-    repository is gone, and for a root that was a git repository and has no .git directory now,
+    repository or recorded branch is gone, and for a root that was a git repository and has no .git directory now,
     when the task would work in a worktree of it."""
     now = time.time() if now is None else now
     found: list[str] = []
@@ -142,6 +152,19 @@ def check(p: Project, task: dict, now: float | None = None) -> list[str]:
             _observe(p, f"dangling:{task['id']}:{d['gitdir']}", "high", text, task, now)
             raise worktree.WorkspaceStuck(f"worktree dangling: its repository {d['repo']} is gone, with any commits "
                                           f"not pushed; files moved to {dest}; restore it or requeue to start afresh")
+        branch = task.get("branch") or ""
+        if branch and not _has_branch(Path(d["repo"]), f"refs/heads/{branch}"):
+            # The repository was emptied and cloned again: it is there, but the task's branch is not.
+            on_origin = _has_branch(Path(d["repo"]), f"refs/remotes/origin/{branch}")
+            lost = (f"only origin/{branch} has it, so its commits not pushed may be lost" if on_origin
+                    else "its commits not pushed are lost")
+            text = (f"Task #{task['id']}'s worktree {path} is dangling: its git dir {d['gitdir']} is gone, and its "
+                    f"repository {d['repo']} no longer has the task's branch {branch} (cloned again?): {lost} unless "
+                    f"the branch is restored. Its files moved to {dest}. The task is blocked: restore {branch} in "
+                    f"{d['repo']} and requeue it, or requeue it to start afresh.")
+            _observe(p, f"dangling:{task['id']}:{d['gitdir']}", "high", text, task, now)
+            raise worktree.WorkspaceStuck(f"worktree dangling: branch {branch} is gone from {d['repo']} ({lost}); "
+                                          f"files moved to {dest}; restore the branch or requeue to start afresh")
         text = (f"Task #{task['id']}'s worktree {path} {REMADE}: its git dir {d['gitdir']} was gone, but its "
                 f"repository {d['repo']} is there, so the branch's commits are kept. Its files moved to {dest} "
                 f"and the worktree is made again; uncommitted changes are only in {dest}.")

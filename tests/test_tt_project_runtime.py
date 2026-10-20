@@ -14738,7 +14738,9 @@ def _dangling_setup(env, monkeypatch):
     from ttp import worktree
     from ttp.daemon import Daemon
     task = p.db.task(p.db.add_task("lost clone", "s", kind="code", tier="light", origin="user"))
-    path, _ = worktree.ensure(p, task)
+    path, branch = worktree.ensure(p, task)
+    p.db.update_task(task["id"], branch=branch)   # recorded, as a run's start does
+    task = p.db.task(task["id"])
     (path / "draft.txt").write_text("not committed")
     d, starts = Daemon(p.base), []
     monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: starts.append(
@@ -14791,6 +14793,29 @@ def test_a_dangling_worktree_whose_repository_is_there_is_made_again_on_its_bran
     assert startcheck.remade(note["start_checks"]) and not startcheck.remade(["~/.ssh/known_hosts is missing"])
     assert p.db.one("SELECT severity FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling:%'")[
         "severity"] == "normal"
+
+
+def test_a_dangling_worktree_whose_repository_lost_the_tasks_branch_blocks_its_task(env, monkeypatch):
+    # The clone was emptied and cloned again: the repository is there, but the task's branch with
+    # its unpushed commits is not. The task is never restarted on a fresh branch as if they were kept.
+    p, task, path, d, starts = _dangling_setup(env, monkeypatch)
+    from ttp import startcheck, worktree
+    _commit_file_in(path, "work.txt")
+    shutil.rmtree(pathlib.Path(_git_out(path, "rev-parse", "--absolute-git-dir")))
+    _git_out(p.root, "worktree", "prune")
+    _git_out(p.root, "branch", "-D", task["branch"])
+    assert startcheck.dangling(path)["repo_gone"] is False
+    d.dispatch()
+    t = p.db.task(task["id"])
+    assert not starts and t["status"] == "blocked", "a task restarted after its branch was lost"
+    assert t["blocked_reason"].startswith("workspace: ") and "not retried" in t["blocked_reason"]
+    assert task["branch"] in t["blocked_reason"]
+    obs = p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling:%'")
+    assert len(obs) == 1 and obs[0]["severity"] == "high" and task["branch"] in obs[0]["text"]
+    assert "lost" in obs[0]["text"] and "kept" not in obs[0]["text"]
+    stale, = [s / path.name for s in p.worktrees.iterdir() if s.name.startswith(worktree.STALE_PREFIX)]
+    assert (stale / "work.txt").exists() and (stale / "draft.txt").read_text() == "not committed"
+    assert not path.exists()
 
 
 def test_a_base_clone_that_lost_its_git_dir_blocks_code_tasks_and_one_on_tmpfs_is_reported(env, monkeypatch):
