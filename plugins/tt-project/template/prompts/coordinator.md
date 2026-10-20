@@ -398,6 +398,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   takes `"if_changed": "<glob or list>"`. Scope a check by what it covers, never by whether it
   passes; rescoping needs a fresh review of every head it affects; never add blanket
   skip-if-missing guards.
+  Checks that cannot run here run on another machine: `delivery.checks_host: "<ssh alias>"` (all),
+  or a check's own `"host"` (`"local"` keeps one here) and `"env"`; an unreachable host waits, never fails.
 - A head already delivered as a PR (draft or open, same head) is delivered: its review is review
   only, with no push step or push-queue approval in the spec, unless the user asked to publish it
   to the push branch as well.
