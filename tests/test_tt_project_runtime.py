@@ -14731,6 +14731,136 @@ def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run
     assert d._workspace_tries(tid) == 0, "a cancelled task's workspace tries were kept"
 
 
+def _dangling_setup(env, monkeypatch):
+    """A code task whose worktree was made, holding an uncommitted file, and a daemon whose starts
+    are recorded. Returns (p, task, path, daemon, starts)."""
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    task = p.db.task(p.db.add_task("lost clone", "s", kind="code", tier="light", origin="user"))
+    path, _ = worktree.ensure(p, task)
+    (path / "draft.txt").write_text("not committed")
+    d, starts = Daemon(p.base), []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: starts.append(
+        (prompt, cwd, k["note"])) or 0)
+    return p, task, path, d, starts
+
+
+def test_a_dangling_worktree_whose_repository_is_gone_is_moved_aside_and_blocks_its_task(env, monkeypatch):
+    # After a reboot the clone a worktree pointed into was left empty: its git dir is gone and its
+    # unpushed commits with it. The run never starts on a fresh worktree as if nothing happened.
+    p, task, path, d, starts = _dangling_setup(env, monkeypatch)
+    from ttp import startcheck, worktree
+    gone = p.root.parent / "vanished-clone"
+    gone.mkdir()   # left as an empty folder
+    (path / ".git").write_text(f"gitdir: {gone}/.git/worktrees/{path.name}\n")
+    assert startcheck.dangling(path) == {"gitdir": f"{gone}/.git/worktrees/{path.name}", "repo": str(gone),
+                                         "repo_gone": True}
+    d.dispatch()
+    t = p.db.task(task["id"])
+    assert not starts and t["status"] == "blocked", "a task started on a dangling worktree"
+    assert t["blocked_reason"].startswith("workspace: ") and "dangling" in t["blocked_reason"]
+    assert "not retried" in t["blocked_reason"]
+    obs = p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling:%'")
+    assert len(obs) == 1 and obs[0]["severity"] == "high" and obs[0]["status"] == "queued"
+    assert str(gone) in obs[0]["text"] and "lost" in obs[0]["text"]
+    stale, = [s / path.name for s in p.worktrees.iterdir() if s.name.startswith(worktree.STALE_PREFIX)]
+    assert (stale / "draft.txt").read_text() == "not committed" and not path.exists()
+    # Requeued (the coordinator's decision): it starts afresh on a whole worktree.
+    p.db.update_task(task["id"], status="queued", blocked_reason=None)
+    d._workspace_tries(task["id"], clear=True)
+    d.dispatch()
+    assert len(starts) == 1 and worktree.is_git(path) and starts[0][1] == str(path)
+
+
+def test_a_dangling_worktree_whose_repository_is_there_is_made_again_on_its_branch_and_reported(env, monkeypatch):
+    # Only git's record of the worktree is gone: the branch's commits are in the repository, so the
+    # worktree is made again on them, the old files kept aside, and the run and its hand-off say so.
+    p, task, path, d, starts = _dangling_setup(env, monkeypatch)
+    from ttp import startcheck
+    head = _commit_file_in(path, "work.txt")
+    shutil.rmtree(pathlib.Path(_git_out(path, "rev-parse", "--absolute-git-dir")))
+    assert startcheck.dangling(path)["repo_gone"] is False
+    d.dispatch()
+    (prompt, cwd, note), = starts
+    assert cwd == str(path) and _git_out(path, "rev-parse", "HEAD") == head, "the branch's commits were lost"
+    assert "Run-start checks found" in prompt and "was dangling" in prompt
+    assert len(note["start_checks"]) == 1 and "was dangling" in note["start_checks"][0]
+    assert startcheck.of_run(json.dumps(note)) == note["start_checks"]
+    assert p.db.one("SELECT severity FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling:%'")[
+        "severity"] == "normal"
+
+
+def test_a_base_clone_that_lost_its_git_dir_blocks_code_tasks_and_one_on_tmpfs_is_reported(env, monkeypatch):
+    p = make(env)
+    from ttp import startcheck, worktree
+    task = p.db.task(p.db.add_task("build", "s", kind="code", tier="light", origin="user"))
+    assert startcheck.check(p, task) == []
+    assert p.db.kv(startcheck.KV_BASE) == {"root": str(p.root)}
+    (p.root / ".git").rename(p.root.parent / "moved-git")
+    try:
+        with pytest.raises(worktree.WorkspaceStuck, match="no .git directory"):
+            startcheck.check(p, task)
+        obs = p.db.one("SELECT * FROM events WHERE kind='observation' AND fingerprint=?", (f"base-gone:{p.root}",))
+        assert obs["severity"] == "high"
+        # A task that works in no worktree of the root is not held by it.
+        other = p.db.task(p.db.add_task("look", "s", kind="question", tier="light", origin="user"))
+        assert startcheck.check(p, other) == []
+        # A root that was never a git repository (tasks work in it, as before): nothing to report.
+        p.db.set_kv(startcheck.KV_BASE, None)
+        assert startcheck.check(p, task) == []
+    finally:
+        (p.root.parent / "moved-git").rename(p.root / ".git")
+    # On a file system a reboot empties: reported, not blocked.
+    monkeypatch.delenv(startcheck.ALLOW_VOLATILE_ENV, raising=False)
+    monkeypatch.setattr(startcheck, "volatile", lambda where: "tmpfs" if where == p.root else None)
+    found = startcheck.check(p, task)
+    assert len(found) == 1 and "tmpfs" in found[0] and str(p.root) in found[0]
+    monkeypatch.setenv(startcheck.ALLOW_VOLATILE_ENV, "1")
+    assert startcheck.check(p, task) == []
+
+
+def test_volatile_reads_the_file_system_type_of_the_deepest_mount(tmp_path, monkeypatch):
+    from ttp import startcheck
+    monkeypatch.setattr(startcheck.sys, "platform", "linux")
+    mounts = tmp_path / "mounts"
+    mounts.write_text("/dev/sda1 / ext4 rw 0 0\ntmpfs /scratch tmpfs rw 0 0\n/dev/sdb1 /scratch/disk xfs rw 0 0\n")
+    assert startcheck.volatile(pathlib.Path("/scratch/clone"), str(mounts)) == "tmpfs"
+    assert startcheck.volatile(pathlib.Path("/scratch"), str(mounts)) == "tmpfs"
+    assert startcheck.volatile(pathlib.Path("/scratch/disk/clone"), str(mounts)) is None
+    assert startcheck.volatile(pathlib.Path("/scratchy"), str(mounts)) is None
+    assert startcheck.volatile(pathlib.Path("/x"), str(tmp_path / "none")) is None
+
+
+def test_a_missing_or_empty_known_hosts_is_reported_at_run_start_once_a_day(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import machines, startcheck
+    home = tmp_path / "kh-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(machines, "load", lambda: {})
+    task = p.db.task(p.db.add_task("ssh work", "s", kind="work", tier="light", origin="user"))
+    assert startcheck.check(p, task) == [], "a project that never used ssh was told about known_hosts"
+    kh = home / ".ssh" / "known_hosts"
+    kh.parent.mkdir()
+    kh.write_text("host ssh-ed25519 AAAA\n")
+    assert startcheck.check(p, task) == [] and p.db.kv(startcheck.KV_KNOWN_HOSTS)["path"] == str(kh)
+    kh.write_text("")
+    found, = startcheck.check(p, task)
+    assert str(kh) in found and "is empty" in found
+    kh.unlink()
+    for _ in range(2):
+        found, = startcheck.check(p, task)
+        assert "is missing" in found
+    fps = [r["fingerprint"] for r in p.db.q("SELECT fingerprint FROM events WHERE kind='observation' "
+                                            "AND fingerprint LIKE 'known_hosts:%' ORDER BY id")]
+    assert fps == [f"known_hosts:{kh}:empty", f"known_hosts:{kh}:missing"], "an observation was repeated"
+    # Never seen here, but machines are listed: reported too.
+    p.db.set_kv(startcheck.KV_KNOWN_HOSTS, None)
+    monkeypatch.setattr(machines, "load", lambda: {"box": {}})
+    assert "is missing" in startcheck.check(p, task)[0]
+
+
 def _moved_branch(p, worktree):
     """A task continuing another whose worktree was made on its own branch, after which its recorded
     branch changed to the continued task's (the reported case). Returns (task, path, own branch)."""

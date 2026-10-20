@@ -48,6 +48,7 @@ _SHARDED = "test_tt_project_"
 # tt-project's db.tx() refuses a git network command (ls-remote, fetch, push) started inside a write
 # transaction while this is set: every test, and every process it starts, runs under that guard.
 os.environ.setdefault("TTP_TX_GUARD", "1")
+os.environ.setdefault("TTP_ALLOW_VOLATILE_BASE", "1")   # the suite runs on tmpfs on purpose
 
 
 def _jobs(config, items) -> int:

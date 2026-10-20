@@ -97,6 +97,7 @@ from . import schedule as sched
 from . import service
 from . import settinghold
 from . import sharedchecks
+from . import startcheck
 from . import startgate
 from . import sweep
 from . import timefmt
@@ -3411,6 +3412,8 @@ class Daemon:
         result = handoff or last_json_object(usage.final_text or "") or {}
         if past_cap and isinstance(result, dict):
             result = dict(result, escalations_dropped=past_cap)
+        if isinstance(result, dict) and (found := startcheck.of_run(r.get("note"))):
+            result = dict(result, start_checks=found)   # what the run started with, whatever it reported
         try:   # a known defect degrading a live service gets a workaround with a due time, beside its fix
             if (mids := mitigate.file(db, self.cfg, task, result, where=self.p)):
                 log(self.p, f"task {task['id']}: live impact; mitigation " + ", ".join(f"#{m}" for m in mids))
@@ -5551,6 +5554,7 @@ class Daemon:
             # Before _workdir_for, which would make a missing worktree afresh.
             lost = self._resumable(task, provider)
             try:
+                found = startcheck.check(self.p, task)   # a dangling worktree or a lost base clone blocks
                 cwd, branch = self._workdir_for(task)
             except Exception as e:
                 self._workspace_failed(task, e)
@@ -5561,6 +5565,8 @@ class Daemon:
             try:
                 system = worker_system(self.p, task)
                 note = {"spec_sha": spec_digest(task)}
+                if found:
+                    note["start_checks"] = found
                 if wake:
                     note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
                 if picked:
@@ -5576,6 +5582,7 @@ class Daemon:
                 else:
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
                                                conflict=note.get(conflictfix.KEY)), None
+                prompt += startcheck.prompt_lines(found)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,

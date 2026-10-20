@@ -265,6 +265,14 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   `harness_git.stale_lock_s` (600 s; 0: off; the old `watchdog.stale_git_lock_s` counts while the new
   key is unset) and no process holds it (none has it open, and no git process of the user runs in
   or names the repository), and logged (`ttp.gitlocks`).
+- Before a task's workspace is made, run-start checks (`ttp.startcheck`) look for what a reboot
+  or cleanup took away. A worktree whose git dir is gone moves aside to `worktrees/.stale-<time>/`.
+  If its repository is gone too, the task is blocked, since its unpushed commits went with it.
+  Otherwise the worktree is made again on its branch. A root that was a git repository and has no
+  `.git` now blocks worktree tasks. A root or worktrees folder on tmpfs or ramfs is reported, and so
+  is a missing or empty `~/.ssh/known_hosts` while the project uses ssh. Each finding is an
+  observation (once a day) and goes into the worker's prompt, the run's note and the stored hand-off
+  (`start_checks`).
 - Stopping or restarting the daemon leaves running workers alone; the next daemon adopts them.
   A cancel ends the task's runs; `ttp stop --kill` ends all runs and requeues their tasks.
 - Generic lessons from a project come back as follow-ups titled `upstream: …`.
