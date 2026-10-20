@@ -609,7 +609,8 @@ def cmd_new(a) -> None:
     brief = a.describe or ""
     if a.describe_file:
         brief = sys.stdin.read() if a.describe_file == "-" else Path(a.describe_file).expanduser().read_text()
-    if a.host and a.host not in (hostname(), "localhost"):
+    from . import machines
+    if a.host and not machines.names_here(a.host):   # an alias for this machine creates it here
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
     p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "")
@@ -4067,8 +4068,11 @@ def cmd_find(a) -> None:
 
 
 def cmd_adopt(a) -> None:
-    register(a.name, {"host": a.host or hostname(), "dir": a.dir})
-    print(MARKER.format(name=a.name, host=a.host or hostname(), dir=a.dir))
+    from . import machines
+    # Another name for this machine (an alias, its FQDN) is stored as its own short name.
+    host = a.host if a.host and not machines.names_here(a.host) else hostname()
+    register(a.name, {"host": host, "dir": a.dir})
+    print(MARKER.format(name=a.name, host=host, dir=a.dir))
 
 
 def cmd_task(a) -> None:

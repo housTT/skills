@@ -216,13 +216,26 @@ def check_clones(paths: list[tuple[int, Path]]) -> list[dict]:
 
 
 def host_change(p: Project) -> dict | None:
-    """{"was", "now"} when project.json names another machine than this one, else None."""
+    """{"was", "now"} when project.json names another machine than this one, else None. Another name
+    for this machine (its FQDN, a machines-list alias or ssh alias for it: machines.names_here) is
+    no move: project.json's host is quietly rewritten to this machine's short name (when the file
+    reads cleanly), so later checks compare plainly and skip the ssh lookup."""
     try:
         was = p.raw_config().get("host")
     except Exception:
         return None
     now = hostname()
-    return {"was": was, "now": now} if isinstance(was, str) and was and was != now else None
+    if not isinstance(was, str) or not was or was == now:
+        return None
+    from . import machines
+    if not machines.names_here(was):
+        return {"was": was, "now": now}
+    if p.config_status == "ok":
+        try:
+            p.set_config("host", now)
+        except Exception:
+            pass
+    return None
 
 
 def host_text(change: dict) -> str:

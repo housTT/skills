@@ -1070,6 +1070,94 @@ def test_boot_check_alerts_once_on_a_change_of_machine_and_clears(env, monkeypat
 
 
 
+def _fake_ssh(env, monkeypatch, script: str) -> None:
+    """An `ssh` on PATH that runs `script` (sh), so `ssh -G` never reads the user's own config."""
+    bindir = env["tmp"] / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "ssh").write_text("#!/bin/sh\n" + script)
+    (bindir / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
+def _host_alerts(p) -> list:
+    return p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity-host'")
+
+
+def test_host_check_takes_a_machines_list_alias_for_this_machine_as_no_move(env, monkeypatch):
+    """project.json names a machines-list alias whose hostname is this machine: no alert, and the
+    alias is rewritten to this machine's short name."""
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    _fake_ssh(env, monkeypatch, 'echo "hostname $2"\n')   # no ssh config: an alias resolves to itself
+    mm.add("box-a", hostname="testhost")
+    p.set_config("host", "box-a")
+    Daemon(p.base).check_integrity(start=True)
+    assert not _host_alerts(p)
+    assert p.raw_config()["host"] == "testhost"
+    # An alias of the list for another machine is a move.
+    mm.add("box-b", hostname="box-b.example")
+    p.set_config("host", "box-b")
+    Daemon(p.base).check_integrity(start=True)
+    assert len(_host_alerts(p)) == 1 and p.raw_config()["host"] == "box-b"
+
+
+def test_host_check_takes_the_fqdn_for_the_short_name(env, monkeypatch):
+    p = make(env)
+    from ttp import integrity
+    monkeypatch.delenv("TTP_HOST")
+    monkeypatch.setattr(socket, "gethostname", lambda: "box-a")
+    monkeypatch.setattr(socket, "getfqdn", lambda *a: "box-a.example")
+    _fake_ssh(env, monkeypatch, 'echo "hostname $2"\n')
+    for stored in ("box-a.example", "BOX-A", "box-a"):
+        p.set_config("host", stored)
+        assert integrity.host_change(p) is None, stored
+        assert p.raw_config()["host"] == "box-a"
+    p.set_config("host", "box-b.example")
+    assert integrity.host_change(p) == {"was": "box-b.example", "now": "box-a"}
+
+
+def test_host_check_follows_ssh_aliases_and_falls_back_when_ssh_cannot_say(env, monkeypatch):
+    p = make(env)
+    from ttp import integrity, machines as mm
+    from ttp.daemon import Daemon
+    # `ssh -G` resolves the workstation's alias for this box to this machine: no move.
+    _fake_ssh(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
+    p.set_config("host", "box-a-alias")
+    assert integrity.host_change(p) is None and p.raw_config()["host"] == "testhost"
+    # An ssh alias for another machine still alerts.
+    p.set_config("host", "box-b-alias")
+    _fake_ssh(env, monkeypatch, 'echo "hostname box-b.example"\n')
+    Daemon(p.base).check_integrity(start=True)
+    assert len(_host_alerts(p)) == 1
+    # ssh fails or times out: the plain compare decides (another name alerts, this one does not).
+    _fake_ssh(env, monkeypatch, 'exit 255\n')
+    p.set_config("host", "box-a-alias")
+    assert integrity.host_change(p) == {"was": "box-a-alias", "now": "testhost"}
+
+    def timeout(alias):
+        raise subprocess.TimeoutExpired(["ssh", "-G", alias], 10)
+    monkeypatch.setattr(mm, "ssh_hostname", timeout)
+    assert integrity.host_change(p) == {"was": "box-a-alias", "now": "testhost"}
+    p.set_config("host", "testhost")
+    assert integrity.host_change(p) is None
+
+
+def test_adopt_stores_this_machines_name_for_a_local_alias(env, monkeypatch):
+    from ttp import cli, machines as mm
+    from ttp.project import load_registry
+    _fake_ssh(env, monkeypatch, '[ "$2" = box-a-alias ] && echo "hostname testhost" || echo "hostname $2"\n')
+    mm.add("box-a", hostname="testhost")
+    for given in ("box-a", "box-a-alias", "testhost"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["adopt", "demo", "--host", given, "--dir", "/srv/demo"])
+        assert load_registry()["projects"]["demo"]["host"] == "testhost", given
+    # Another machine keeps the name it was given.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["adopt", "demo", "--host", "box-b", "--dir", "/srv/demo"])
+    assert load_registry()["projects"]["demo"]["host"] == "box-b"
+
+
 def test_boot_check_flags_an_empty_clone_under_a_kept_worktree(env):
     p = make(env)
     from ttp import alerts, integrity

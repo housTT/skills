@@ -343,6 +343,46 @@ def here(known: dict[str, dict] | None = None) -> tuple[str, dict] | None:
     return None
 
 
+def local_names() -> set[str]:
+    """The names this machine answers to, lower case: its short name, full host name and FQDN, and
+    loopback. With TTP_HOST set, that name stands in for the host's own names."""
+    names = {project.hostname().lower(), "localhost", "127.0.0.1", "::1"}
+    if not os.environ.get("TTP_HOST"):
+        import socket
+        for get in (socket.gethostname, socket.getfqdn):
+            try:
+                names.add(get().lower())
+            except OSError:
+                pass
+    return names - {""}
+
+
+def ssh_hostname(alias: str) -> str:
+    """The host `ssh -G` resolves `alias` to (no connection; `alias` itself when it cannot say)."""
+    from .lease import ssh_hostname as resolve
+    return resolve(alias)
+
+
+def names_here(value: str, known: dict[str, dict] | None = None) -> bool:
+    """Whether `value` names the machine this runs on: one of local_names, a machines-list alias whose
+    `hostname` is one of them, or an ssh alias that `ssh -G` resolves to one. The ssh lookup is best
+    effort: an error or timeout leaves the plain compare."""
+    v = str(value or "").strip().lower()
+    if not v:
+        return False
+    mine = local_names()
+    if v in mine:
+        return True
+    known = load() if known is None else known
+    if any(a.lower() == v and str(m.get("hostname") or "").strip().lower() in mine for a, m in known.items()):
+        return True
+    try:
+        real = ssh_hostname(v).strip().lower()
+    except Exception:
+        return False
+    return real != v and real in mine
+
+
 def device_host(known: dict[str, dict] | None = None) -> bool:
     """Whether this machine's entry is tagged `device`."""
     hit = here(known)
