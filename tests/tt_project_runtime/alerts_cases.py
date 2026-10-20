@@ -3189,3 +3189,50 @@ def test_a_tick_step_failing_three_ticks_in_a_row_is_alerted_then_cleared_by_a_s
     told = p.db.one("SELECT * FROM messages WHERE kind='resolved' AND ref='tick-step:retry_rejected'")
     assert told and "retry_rejected runs again" in told["text"]
     assert not alerts.holds(p.db, "tick-step:retry_rejected", ep["raised"], time.time())
+
+
+def _notifier_stubs(monkeypatch, tmp_path, names, rc=0):
+    """Stub notifier commands on an otherwise empty PATH; each records its argv NUL-separated."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in names:
+        stub = bindir / name
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{tmp_path}/{name}.argv\"\n"
+                        f"echo 'stub refused' >&2\nexit {rc}\n")
+        stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    return lambda name: (tmp_path / f"{name}.argv").read_bytes().split(b"\0")[:-1]
+
+
+def test_the_desktop_notifier_passes_non_ascii_text_to_osascript_byte_for_byte(monkeypatch, tmp_path, capsys):
+    from ttp import notifier
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["osascript"])
+    body, title = "build → done, “quoted” — \"plain\" \\ end", "tt-project · proj‑a"
+    notifier.show(title, body)
+    got = argv("osascript")
+    assert got[-2:] == [body.encode(), title.encode()], "text arrives as arguments, unchanged"
+    assert not any(body.encode() in a for a in got[:-2]), "the text is never spliced into the script"
+    assert b"item 1 of argv" in b" ".join(got) and capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("platform,cmd", [("darwin", "osascript"), ("darwin", "terminal-notifier"),
+                                          ("linux", "notify-send")])
+def test_the_desktop_notifier_logs_a_failing_notifier_command(monkeypatch, tmp_path, capsys, platform, cmd):
+    from ttp import notifier
+    monkeypatch.setattr(notifier.sys, "platform", platform)
+    monkeypatch.setenv("DISPLAY", ":0")
+    argv = _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=3)
+    notifier.show("tt-project · a", "alert one")
+    assert argv(cmd), "the stub ran"
+    err = capsys.readouterr().err
+    assert f"{cmd} exited 3" in err and "stub refused" in err
+
+
+def test_the_desktop_notifier_never_lets_a_later_alert_replace_an_earlier_one(monkeypatch, tmp_path):
+    from ttp import notifier
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["terminal-notifier"])
+    notifier.show("tt-project · a", "alert one", url="https://example.invalid/x")
+    got = argv("terminal-notifier")
+    assert b"-group" not in got and got[got.index(b"-message") + 1] == b"alert one"

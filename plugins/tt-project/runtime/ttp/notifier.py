@@ -188,20 +188,31 @@ def _track_daemons(state: dict, health: dict[str, dict | None], hosts_of: dict[s
         daemons[name] = {"alarmed": now, "since": since}
 
 
+def _notify(args: list[str]) -> None:
+    """Run one notifier command; a failure goes to the notifier log, never silently."""
+    r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=10)
+    if r.returncode != 0:
+        print(f"notifier: {Path(args[0]).name} exited {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}",
+              file=sys.stderr, flush=True)
+
+
 def show(title: str, body: str, url: str | None = None) -> None:
     body = headline.clip(body, 240)
     if sys.platform == "darwin":
         tn = shutil.which("terminal-notifier")
         if tn:
-            args = [tn, "-title", title, "-message", body, "-sound", "default", "-group", title]
+            # no -group: a shared group would let a later alert replace an earlier unread one
+            args = [tn, "-title", title, "-message", body, "-sound", "default"]
             if url:
                 args += ["-open", url]
-            subprocess.run(args, capture_output=True, timeout=10)
+            _notify(args)
             return
-        script = f"display notification {json.dumps(body)} with title {json.dumps(title)} sound name \"Glass\""
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        # text goes as argv, never into the script source: non-ASCII or quotes cannot break it
+        _notify(["osascript", "-e", "on run argv",
+                 "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
+                 "-e", "end run", body, title])
     elif shutil.which("notify-send") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        subprocess.run(["notify-send", "-a", "tt-project", title, body], capture_output=True, timeout=10)
+        _notify(["notify-send", "-a", "tt-project", title, body])
 
 
 def run_once(state: dict, floor: str, down_after_s: float = HOST_DOWN_AFTER_S, now: float | None = None,
