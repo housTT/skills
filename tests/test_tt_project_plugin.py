@@ -1928,10 +1928,11 @@ def test_setup_box_account_keys_are_public_only(tmp_path, monkeypatch):
     pub = tmp_path / "k.pub"
     pub.write_text(KEY + "\n# comment\n" + KEY + "\n")
     assert ba.read_keys([str(pub)]) == [KEY]
-    (tmp_path / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    private = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\n"   # built here so this file holds no key header itself
+    (tmp_path / "id_ed25519").write_text(private)
     with pytest.raises(ValueError, match="only public keys"):
         ba.read_keys([str(tmp_path / "id_ed25519")])
-    pub.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    pub.write_text(private)
     with pytest.raises(ValueError, match="not a public key"):
         ba.read_keys([str(pub)])
     home = tmp_path / "h"
@@ -1980,16 +1981,16 @@ def test_setup_box_account_migration_moves_never_deletes_and_lists_rebuilds(tmp_
 
 def test_setup_box_account_entry_puts_the_workdir_in_the_users_home(tmp_path, monkeypatch):
     ba = _account(monkeypatch)
-    e = ba.entry_fields({"route": "bare", "workdir_root": "/<shared>/x"}, "me", "/home/me", "<box-alias>-admin")
-    assert e == {"route": "bare", "workdir_root": "/home/me/work", "user": "me", "admin": "<box-alias>-admin"}
-    e = ba.entry_fields({"route": "bare", "workdir_root": "/home/me/src", "admin": "a"}, "me", "/home/me/", None)
-    assert e["workdir_root"] == "/home/me/src" and "admin" not in e
+    e = ba.entry_fields({"route": "bare", "workdir_root": "/<shared>/x"}, "me", "/u/me", "<box-alias>-admin")
+    assert e == {"route": "bare", "workdir_root": "/u/me/work", "user": "me", "admin": "<box-alias>-admin"}
+    e = ba.entry_fields({"route": "bare", "workdir_root": "/u/me/src", "admin": "a"}, "me", "/u/me/", None)
+    assert e["workdir_root"] == "/u/me/src" and "admin" not in e
     with pytest.raises(ValueError, match="not under"):
-        ba.entry_fields({"route": "bare"}, "me", "/home/me", None, workdir="/opt/x")
+        ba.entry_fields({"route": "bare"}, "me", "/u/me", None, workdir="/opt/x")
     assert ba.check_account("b", {"user": "me", "workdir_root": "/opt/x"}) == [
         "b: workdir_root must be under me's home (account.md)"]
     assert ba.check_account("b", {"user": "me", "workdir_root": "~/w", "admin": "b"})[0].startswith("b: admin")
-    r = _setup_box(tmp_path, "account", "entry", "<box-alias>", "--user", "me", "--home", "/home/me",
+    r = _setup_box(tmp_path, "account", "entry", "<box-alias>", "--user", "me", "--home", "/u/me",
                    "--admin", "<box-alias>-admin")
     assert r.returncode == 0 and "~/<workdir> -> " not in r.stdout, r.stdout   # ~/... is in the home already
     entry = json.loads((tmp_path / "boxes.json").read_text())["boxes"]["<box-alias>"]
@@ -2004,7 +2005,7 @@ def test_setup_box_new_box_asks_for_the_users_own_login_and_plans_the_account_fi
     saved = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))
     saved = bs.merge(saved, {"account.admin": "<box-alias>-admin"})
     assert [q["id"] for q in bs.pending(saved)] == ["account.ids", "account.migrate"]
-    ans = bs.merge(saved, {"account.ids": "/mnt/shared/u", "account.migrate": "/home/admin/tt-metal",
+    ans = bs.merge(saved, {"account.ids": "/mnt/shared/u", "account.migrate": "/u/admin/tt-metal",
                            "account.keys": "here,~/.ssh/laptop.pub"})["answers"]
     steps = bs.plan("<box-alias>", {"workdir_root": "~/work"}, ans)
     ids = [s["id"] for s in steps]
