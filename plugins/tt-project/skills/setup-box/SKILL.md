@@ -16,6 +16,8 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
 
 - A task needs a device box, or a box it used is gone.
 - The user asks to set up, reserve or allocate a box.
+- A fresh box needs setting up (broker, host checks, workspace, env, agent CLIs, access): ask the
+  user first, then set it up: `new-box.md`.
 - A project still syncs or mirrors files to a box: `migrate-off-sync.md`.
 
 ## Route picker
@@ -30,6 +32,7 @@ with `<plugin-root>/skills/setup-box/scripts/box.py site check`. Its `route` pic
 | A Slurm cluster (1-chip, 4-chip or whole-node jobs) | `slurm` | `slurm.md` |
 | A Slurm cluster with whole-node exclusive partitions | `slurm` | `exabox.md` |
 | No entry yet | ask the user for the route and aliases, write the entry | `site.md` |
+| A fresh box to set up | questionnaire, then each answer as an action and its check | `new-box.md` |
 
 All routes share `ssh-workflow.md` (aliases, jump host, detached jobs) and `agents.md` (agent CLIs
 and build/run recipes on the box).

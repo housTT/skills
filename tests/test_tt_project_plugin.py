@@ -1594,6 +1594,165 @@ def test_setup_box_bare_metal_page_covers_the_route():
         assert part in page, part
 
 
+def _setup_box(tmp_path, *args, entry=None):
+    import subprocess
+    path = tmp_path / "boxes.json"
+    if not path.exists():
+        path.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": entry or {
+            "route": "bare", "workdir_root": "~/<workdir>"}}}), encoding="utf-8")
+    return subprocess.run([sys.executable, str(BOX_PY), "--site", str(path), *args],
+                          capture_output=True, text=True, timeout=60)
+
+
+ALL_NONE = ["broker=none", "host_checks=driver,pcie", "workspace=none", "python_env=none", "agent_clis=none",
+            "projects=all", "recovery.owner=none", "lock=shared", "disk_guard=150"]
+
+
+def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_fallback(tmp_path):
+    r = _setup_box(tmp_path, "setup", "questions", "<box-alias>")
+    assert r.returncode == 0, r.stdout + r.stderr
+    batches = json.loads(r.stdout)["batches"]
+    qs = [q for b in batches for q in b]
+    # The first pass asks every top-level topic of the new-box flow; follow-ups wait for their answer.
+    assert [q["id"] for q in qs] == ["broker", "host_checks", "workspace", "python_env", "agent_clis",
+                                     "projects", "recovery.owner", "lock", "disk_guard"]
+    for b in batches:
+        assert 1 <= len(b) <= 4
+        for q in b:
+            assert len(q["header"]) <= 12 and 2 <= len(q["options"]) <= 4, q
+    broker = qs[0]
+    assert [o["value"] for o in broker["options"]] == ["install", "none"]
+    assert "(suggested)" in broker["options"][0]["label"]   # offered, never filled in
+    assert "ttp lock <box-alias>-device -- <cmd>" in broker["options"][1]["description"]
+    assert next(q for q in qs if q["id"] == "host_checks")["multiSelect"] is True
+    num = _setup_box(tmp_path, "setup", "questions", "<box-alias>", "--format", "numbered").stdout
+    assert num.count("\n1. ") == 1 and "\n9. " in num and "   b) No broker:" in num
+    assert "nothing is assumed" in num and "(suggested: install)" in num
+
+
+def test_setup_box_new_box_answers_save_reload_and_nothing_is_assumed(tmp_path):
+    # Defaults are never filled in: an unanswered question keeps the plan closed.
+    r = _setup_box(tmp_path, "setup", "save", "<box-alias>", "--set", "broker=none")
+    assert r.returncode == 0 and "still to ask: host_checks" in r.stdout, r.stdout
+    plan = _setup_box(tmp_path, "setup", "plan", "<box-alias>")
+    assert plan.returncode == 1 and "ask first" in plan.stdout
+    bad = _setup_box(tmp_path, "setup", "save", "<box-alias>", "--set", "lock=sometimes")
+    assert bad.returncode == 1 and "not one of shared, per-project" in bad.stdout
+    bad = _setup_box(tmp_path, "setup", "save", "<box-alias>", "--set", "nope=1")
+    assert bad.returncode == 1 and "unknown question" in bad.stdout
+    args = [a for kv in ALL_NONE for a in ("--set", kv)]
+    assert _setup_box(tmp_path, "setup", "save", "<box-alias>", *args).returncode == 0
+    site = json.loads((tmp_path / "boxes.json").read_text())
+    setup = site["boxes"]["<box-alias>"]["setup"]
+    assert setup["answers"]["host_checks"] == ["driver", "pcie"] and setup["answers"]["agent_clis"] == []
+    assert set(setup["asked"]) == set(setup["answers"])
+    assert (tmp_path / "boxes.json").stat().st_mode & 0o077 == 0
+    again = _setup_box(tmp_path, "setup", "questions", "<box-alias>")
+    assert again.returncode == 0 and again.stdout.startswith("nothing to ask"), again.stdout
+    assert _setup_box(tmp_path, "site", "check").returncode == 0
+    assert "broker" in json.loads(_setup_box(tmp_path, "setup", "questions", "<box-alias>", "--all").stdout)[
+        "batches"][0][0]["id"]
+    # A labelled answer (what a question tool returns) maps back to its value; typed values are checked.
+    assert _setup_box(tmp_path, "setup", "save", "<box-alias>", "--json",
+                      '{"lock": "Per project", "disk_guard": "75", "broker": "No broker (saved)"}').returncode == 0
+    answers = json.loads((tmp_path / "boxes.json").read_text())["boxes"]["<box-alias>"]["setup"]["answers"]
+    assert answers["lock"] == "per-project" and answers["disk_guard"] == "75"
+
+
+def test_setup_box_new_box_rerun_asks_only_what_changed(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    saved = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))
+    assert bs.pending(saved) == []
+    # A changed answer brings in its follow-ups, and only those.
+    saved = bs.merge(saved, {"broker": "install", "workspace": "tenstorrent/tt-metal"})
+    assert [q["id"] for q in bs.pending(saved)] == ["broker.ref", "workspace.branch", "workspace.ccache"]
+    saved = bs.merge(saved, {"broker.ref": "main", "workspace.branch": "main", "workspace.ccache": "yes"})
+    assert bs.pending(saved) == []
+    # Changing the parent drops its follow-ups' stale answers, so they are asked again.
+    saved = bs.merge(saved, {"workspace": "tenstorrent/tt-mlir"})
+    assert [q["id"] for q in bs.pending(saved)] == ["workspace.branch", "workspace.ccache"]
+    assert saved["answers"]["broker.ref"] == "main"
+    saved = bs.merge(saved, {"workspace.branch": "main", "workspace.ccache": "no"})
+    # A question whose wording or options changed since it was answered is asked again; a new one too.
+    q = dict(bs.BY_ID["lock"], text=bs.BY_ID["lock"]["text"] + " (reworded)")
+    new = dict(id="new_topic", header="New", text="?", options=[("a", "A", ""), ("b", "B", "")])
+    monkeypatch.setattr(bs, "QUESTIONS", [q if x["id"] == "lock" else x for x in bs.QUESTIONS] + [new])
+    assert [x["id"] for x in bs.pending(saved)] == ["lock", "new_topic"]
+
+
+def test_setup_box_new_box_broker_none_leads_to_the_lock_path(tmp_path):
+    args = [a for kv in ALL_NONE for a in ("--set", kv)]
+    assert _setup_box(tmp_path, "setup", "save", "<box-alias>", *args).returncode == 0
+    r = _setup_box(tmp_path, "setup", "plan", "<box-alias>", "--json")
+    assert r.returncode == 0, r.stdout
+    steps = {s["id"]: s for s in json.loads(r.stdout)}
+    assert "ttp lock <box-alias>-device -- <command>" in steps["broker"]["action"]
+    assert steps["broker"]["check"].startswith("ttp lock --probe <box-alias>-device")
+    assert "setup hostcheck <box-alias> --only driver,pcie" in steps["host_checks"]["check"]
+    assert steps["lock"]["action"] == "ttp machines add <box-alias> --shared <box-alias>-device"
+    assert "--min-free-gb 150" in steps["disk_guard"]["action"]
+    assert "workspace" not in steps and "agent_clis" not in steps   # "none" adds no step
+    # Every answer that sets something up comes with a check.
+    assert all(s["action"] and s["check"] for s in steps.values())
+    # The bare check of a box without a broker names the same lock path.
+    env, _ = _bare_env(tmp_path, broker=False, svc="inactive")
+    out = _bare_check(tmp_path, env).stdout
+    assert "broker: none" in out and "`ttp lock <box-alias>-device -- <command>`" in out
+
+
+def test_setup_box_new_box_install_plan_links_the_recipes(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    answers = bs.merge({}, {"broker": "install", "broker.ref": "main", "host_checks": "none",
+                            "workspace": "tenstorrent/tt-metal", "workspace.branch": "main",
+                            "workspace.ccache": "yes", "python_env": "workspace", "agent_clis": "claude,codex",
+                            "projects": "proj-a,proj-b", "recovery.owner": "proj-a",
+                            "recovery.fallback": "proj-b", "lock": "per-project", "disk_guard": "0"})["answers"]
+    steps = bs.plan("<box-alias>", {"workdir_root": "~/work"}, answers)
+    text = "\n".join(s["action"] + " | " + s["check"] for s in steps)
+    for part in ("tenstorrent/tt-device-mcp", "documented installer", "never hand-edit",
+                 "tt-device-broker active", "recipes/tt-metal/build.md", "ccache",
+                 "git submodule update --init --recursive", "skills/run/mcp.md",
+                 "ssh <box-alias> claude --version", "ssh <box-alias> codex --version",
+                 "--owner proj-a --fallback proj-b", "--unshared", "--min-free-gb 0",
+                 "ssh <box-alias> test -x ~/work/tt-metal/python_env/bin/python"):
+        assert part in text, part
+    assert not any(s["id"] == "host_checks" for s in steps)
+
+
+def test_setup_box_hostcheck_reads_sysfs_without_opening_a_device(monkeypatch):
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    script = bs.hostcheck_script()
+    assert subprocess.run(["bash", "-n", "-c", script]).returncode == 0
+    assert "/sys/" in script and "tt-smi" not in script and "open" not in script
+    good = ("driver=2.0.0\ndev_nodes=2\nfw=tenstorrent!0 18.7.0\nhp1g=2\n"
+            "pcie=0000:01:00.0 16.0_GT/s_PCIe 16 16.0_GT/s_PCIe 16\n")
+    lines, problems = bs.read_hostcheck(good)
+    assert problems == [] and "driver: tenstorrent 2.0.0, 2 device node(s)" in lines
+    assert "firmware: tenstorrent!0 18.7.0" in lines and "hugepages: 2 x 1 GB reserved" in lines
+    lines, problems = bs.read_hostcheck("driver=\ndev_nodes=0\nhp1g=0\n"
+                                        "pcie=0000:01:00.0 8.0_GT/s_PCIe 4 16.0_GT/s_PCIe 16\n")
+    assert problems == ["driver"] and any("below its maximum 16.0 GT/s PCIe x16" in ln for ln in lines)
+    assert any("not reported by the driver" in ln for ln in lines)
+    _, problems = bs.read_hostcheck("driver=2.0.0\ndev_nodes=1\n", only=("pcie",))
+    assert problems == ["pcie"]
+
+
+def test_setup_box_new_box_page_covers_the_flow():
+    page = (SKILLS / "setup-box" / "new-box.md").read_text(encoding="utf-8")
+    for part in ("box.py setup questions <box-alias>", "--format numbered", "AskUserQuestion",
+                 "Codex, Cursor", "box.py setup save", "box.py setup plan <box-alias>", "Nothing is assumed",
+                 "ttp lock <box-alias>-device -- <command>", "tenstorrent/tt-device-mcp", "never hand-edit",
+                 "recipes/developer-setup.md", "recipes/tt-metal/build.md", "tt-buddy:run", "`agents.md`",
+                 "box.py setup hostcheck <box-alias>", "only what is new"):
+        assert part in page, part
+    assert "`new-box.md`" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
+    assert "`new-box.md`" in (SKILLS / "setup-box" / "bare-metal.md").read_text(encoding="utf-8")
+
+
 def _migrate_home(tmp_path, present):
     """A fake HOME (plus PATH stubs for mutagen and crontab), with every sync leftover or none."""
     home, stubs, repo = tmp_path / "home", tmp_path / "stubs", tmp_path / "proj"

@@ -141,8 +141,8 @@ def check(alias: str, site_entry: Optional[dict], min_free_gb: Optional[float], 
             lines.append(f"broker: {BROKER_CMD} {'present' if has_cmd else 'missing'}, {service} {svc}: "
                          "do not start a second broker; report it")
         else:
-            lines.append(f"broker: none ({BROKER_CMD} missing, {service} {svc}); open the device only "
-                         "where TT_VISIBLE_DEVICES does not mask it")
+            lines.append(f"broker: none ({BROKER_CMD} missing, {service} {svc}); each device command "
+                         f"runs as `ttp lock {resource} -- <command>`, never where TT_VISIBLE_DEVICES masks it")
 
     p = _local(["ttp", "lock", "--probe", resource])
     lock = ("unknown" if p is None else "free" if p.returncode == 0

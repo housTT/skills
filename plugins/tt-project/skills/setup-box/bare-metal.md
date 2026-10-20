@@ -64,6 +64,8 @@ broker where it has one.
 
 ## Set up a fresh host
 
+- Ask the user what the box needs, then set it up answer by answer: `new-box.md`. These are the
+  recipes its steps follow.
 - The broker: follow the tenstorrent/tt-device-mcp repository's documented installer and upgrade
   path. Never hand-edit an installed broker.
 - Toolchain, drivers, firmware checks and cache paths: tt-buddy's `recipes/developer-setup.md`.

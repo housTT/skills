@@ -166,6 +166,7 @@ history. If you ran `ttp notifier install`, also remove its `tt-project-notifier
 
 - Cursor install is verified by clone and `ttp setup` only, not end to end.
 - The setup-box IRD route is tested against a fake `ird`; a live run needs a network that reaches the IRD service.
+- The setup-box new-box flow (`new-box.md`) is tested with fakes only; its install steps have not yet run on a live box.
 - Codex and Cursor spend is estimated from a price table (see Limits).
 - Not on Codex: worker plugins. Not yet on Cursor: worker plugins, worker isolation, mid-run coordinator updates (see Limits).
 - Older Cursor builds print nothing until a run ends, so set `stall_s` above their longest run.

@@ -48,6 +48,7 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `demo_nodes` | no | nodes kept for demos: never allocate them |
 | `excluded_nodes` | no | nodes never to use |
 | `mcp` | no | site-only MCP endpoints by server name |
+| `setup` | no | the new-box answers, written by `box.py setup save` (`new-box.md`); never edit by hand |
 | `note` | no | free text for the reader |
 
 Other keys are reported as warnings, not errors.
