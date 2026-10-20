@@ -13335,6 +13335,17 @@ def test_a_users_pause_under_a_coordinators_fleet_hold_outlives_the_holds_lift(e
     assert a.db.paused_resources(shared=False)["box1-chip0"]["by"] == "coordinator"
 
 
+def test_a_probe_only_coordinator_pause_outlasts_a_timed_coordinator_hold(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp import pauseends
+    a, b, _ = _fleet(env, tmp_path)
+    coord.pause_machine(a, "box1", True, by="coordinator", end=pauseends.from_action({"until": "1d"}))
+    assert coord.apply(a, [{"type": "resource_pause", "resource": "box1-chip0", "paused": True,
+                            "end_when": "true"}]) == []
+    got = a.db.paused_resources(shared=False)["box1-chip0"]
+    assert got["by"] == "coordinator" and not got.get("until"), got
+
+
 def test_ttp_pause_machine_from_the_shell_is_the_users_hold(env, tmp_path):
     from ttp import fleethold
     a, b, _ = _fleet(env, tmp_path)

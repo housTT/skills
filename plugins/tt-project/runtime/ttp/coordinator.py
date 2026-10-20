@@ -2937,9 +2937,9 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     from . import fleethold
     hold = fleethold.covering(name)
     # A pause under a hold is a no-op unless it would outlive the hold: the user's own pause under a
-    # hold not theirs (any coordinator may lift that hold), or an end later than the hold's.
+    # hold not theirs (any coordinator may lift that hold), or an end later than the hold's (a probe-only end has no time, so it outlasts a timed hold).
     outlives = hold and (by == "user" and hold.get("by") != "user" or hold.get("by") != "user" and end is not None
-                         and float(end.get("until") or 0) > float(hold.get("until") or float("inf")))
+                         and (not end.get("until") or float(end["until"]) > float(hold.get("until") or float("inf"))))
     if hold and paused and not outlives and not (db.paused_resources(shared=False).get(name)
                                                  or shared.read_pause(name)):
         return (f"{name} is already held machine-wide by hold {hold['id']} ({hold.get('alias')}, set by "
