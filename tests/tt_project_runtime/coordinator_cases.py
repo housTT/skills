@@ -13398,3 +13398,52 @@ def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):
     fleethold.set_hold("box1", "rack move", "user", "demo", {"until": time.time() + 3600})
     why, nobody = ml.quiet_reason({"alias": "box1", "condition": "down"}, time.time())
     assert why == "held machine-wide (hold 1) by demo for the user: rack move" and nobody is False
+
+
+def test_a_spec_that_states_another_tasks_status_gets_its_live_record_at_dispatch(env):
+    """A hand-back spec written from memory ("#A's fix is not pushed, the switch is not live") is
+    stale once the records show the push and the machine change: the worker prompt carries a 'facts
+    at send time' block, read at dispatch, with each named task's status, the commit its push queue
+    landing, detached push or supersession recorded, a push still queued, and the machine changes it
+    recorded. Message, PR and change numbers are not tasks; the task itself and unknown ids get no line."""
+    from ttp import machine_ledger as ml, machines, taskfacts
+    from ttp.prompts import worker_task
+    p = make(env)
+    machines.add("box-a")
+    pushed = p.db.add_task("fix the relay", "s", kind="code", status="done")
+    switched = p.db.add_task("switch the service version", "s", kind="work", status="done")
+    queued = p.db.add_task("trim the digest", "s", kind="code", status="pushing")
+    gone = p.db.add_task("old idea", "s", kind="code", status="done")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha,landed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (pushed, "b1", "a" * 40, "main", "landed", now, now, "c" * 40, "c" * 40))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (queued, "b3", "b" * 40, "main", "approved", now, now))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (gone, "e" * 40, "f" * 40, now))
+    ml.add_change("box-a", "switched the service to the new version", "switch back", p.name, expires="2d",
+                  task=switched)
+    ml.add_change("box-a", "another project's change", "undo", "other-project", expires="2d", task=switched)
+    spec = (f"Hand back: #{pushed}'s fix is not pushed yet and #{switched}'s switch is not serving; "
+            f"#{queued} and #{gone} too (user msg #{switched}, PR #{pushed}, machine change #1, #99999).")
+    tid = p.db.add_task("hand back", spec, kind="code")
+    assert taskfacts.ids_in(spec + f" #{tid}", skip={tid}) == [pushed, switched, queued, gone, 99999]
+    prompt = worker_task(p, p.db.task(tid), str(p.root), None)
+    block = prompt[prompt.index("## Facts at send time"):]
+    assert prompt.index("## Spec") < prompt.index("## Facts at send time")
+    assert "check it against these lines before acting" in block and "The records win" in block
+    rows = [x for x in block.splitlines() if x.startswith("- #")]
+    assert len(rows) == 4, rows
+    assert rows[0].startswith(f"- #{pushed} fix the relay (code, done); on the push branch as cccccccccc (its push "
+                              "queue landing)"), rows[0]
+    assert rows[1].startswith(f"- #{switched} switch the service version (work, done); no push or landing recorded; "
+                              "machine change #1 on box-a (open): switched the service"), rows[1]
+    assert "another project's" not in block
+    assert f"#{queued} trim the digest (code, pushing); push queue: approved" in rows[2], rows[2]
+    assert f"#{gone} old idea (code, done); on the push branch as ffffffffff (the commit recorded as superseding it)" \
+        in rows[3], rows[3]
+    assert f"- #{tid} " not in block
+    # Read at dispatch: a later record shows in the next prompt; a spec naming no task gets no block.
+    ml.close_change(1, "switched back")
+    assert "machine change #1 on box-a (closed: switched back)" in worker_task(p, p.db.task(tid), str(p.root), None)
+    plain = p.db.add_task("plain", "Nothing named here; see user msg #3.", kind="code")
+    assert "## Facts at send time" not in worker_task(p, p.db.task(plain), str(p.root), None)

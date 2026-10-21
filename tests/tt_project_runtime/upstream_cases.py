@@ -186,3 +186,34 @@ def test_a_rerouted_upstream_follow_up_is_never_a_failed_reviews_fix(env):
           p.db.q("SELECT text, status FROM events WHERE task=? AND kind='followup_proposed'", (rev["id"],))}
     assert ev == {"proposed follow-up: add the missing test": "handled",
                   "proposed follow-up: the build box needs a newer Node": "queued"}
+
+
+def test_a_note_to_another_project_carries_the_named_tasks_records_at_send_time(env, monkeypatch, capsys):
+    """`ttp note --to` appends the live record of each task the note names (status, the commit recorded
+    for its landing, its machine changes) so the receiver does not act on a stale claim. The facts fit
+    within the note limit: they are dropped, never the note refused, when they do not."""
+    from ttp import cli, machine_ledger as ml, machines, upstream
+    machines.add("box-a")
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    src = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    dst = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(dst.root)})
+    done = src.db.add_task("switch the service version", "s", kind="code", status="done")
+    now = time.time()
+    src.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, ?, 'main')", (done, "d" * 40))
+    ml.add_change("box-a", "switched the service", "switch back", src.name, expires="2d", task=done)
+    _note_run(env, monkeypatch, src)
+    assert _note(cli, "--to", "second", f"#{done} is not live yet; please wait") == 0
+    out = capsys.readouterr().out
+    (n,) = _upstream_inbox(env)
+    assert n["spec"].startswith(f"#{done} is not live yet; please wait [facts at send time from {src.name}'s records: "
+                                f"#{done} switch the service version (code, done); on the push branch as dddddddddd "
+                                "(its detached push landing); machine change #1 on box-a (open): switched the service]"), n
+    assert f"stored {upstream.receipt(n['spec'])}" in out
+    # A note at the limit goes as written.
+    long = f"#{done} " + "x" * (upstream.SPEC_CHARS - len(str(done)) - 2)
+    assert _note(cli, "--to", "second", long) == 0
+    assert any(x["spec"] == long for x in _upstream_inbox(env))

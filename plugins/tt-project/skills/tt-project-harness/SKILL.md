@@ -106,6 +106,10 @@ read the one for the lever you change.
 - A `ttp note --to` past 4,000 characters (whitespace joined) is refused whole, never cut; a
   filed or queued one prints its stored length and a short hash. Put the request first. A hand-off
   `upstream:` note past the limit is cut with a marker saying how much was kept.
+- Each task a `ttp note --to` names (`#<id>`) gets its live record appended, as fits the limit:
+  `[facts at send time from <project>'s records: ...]` (status, landed or superseded commit, machine
+  changes). A worker's prompt gets the same for the tasks its spec names, read at dispatch (`## Facts
+  at send time`): where the text states their status, the records win.
 - Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>` (or `--wontfix "<reason>"` for a note that is not a
   plugin bug: closed, no release), or a
   code task's hand-off lists the note in `resolves` and the push queue records it with the version

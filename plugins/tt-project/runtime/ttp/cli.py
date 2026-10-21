@@ -1785,6 +1785,9 @@ def _note_to(a, run_dir: str) -> None:
     except upstream.NoteTooLong as e:
         die(f"not sent: {e}. Nothing was filed or cut. Shorten it, with the question or request first, "
             f"or put the whole text in the hand-off as a follow-up")
+    from . import taskfacts
+    # The tasks it names, as the records show them now: what it states of them may be stale.
+    text = taskfacts.note_suffix(me, text, upstream.SPEC_CHARS)
     sent = f"; stored {upstream.receipt(text)}"
     task = os.environ.get("TTP_TASK") or ""
     try:
