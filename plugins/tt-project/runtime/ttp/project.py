@@ -1251,7 +1251,8 @@ class Project:
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
                              restated=None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, while
-        they fit `pinned_limit` (None: all); then, only if every pinned one fits: for `task`, the
+        they fit `pinned_limit` (None: all; when not all fit, those that share the most words with
+        `task` first, then the oldest); then, only if every pinned one fits: for `task`, the
         others that share words with its title and spec (task_words; a word few entries share weighs
         more), most shared first, then newest, each that fits; then those that speak of workers and
         then the facts, newest first while all fit `limit_chars`. An entry whose text `restated(text)`
@@ -1262,8 +1263,19 @@ class Project:
         dup = {e["name"] for e in entries if restated and restated(e.get("body", ""))}
         pinned = [e for e in entries if worker_memory(e) == 1 and e["name"] not in dup]
         pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
+        want = task_words(f"{task.get('title') or ''}\n{task.get('spec') or ''}") if task else set()
+
+        def scores(group: list[dict]) -> dict[str, float]:
+            words = {e["name"]: task_words(e["line"]) & want for e in group}
+            df: dict[str, int] = {}
+            for ws in words.values():
+                for w in ws:
+                    df[w] = df.get(w, 0) + 1
+            return {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
         used, chosen = 0, set()
-        for e in pinned:
+        over = pinned_limit is not None and pinned_chars > pinned_limit
+        score = scores(pinned) if over and want else {}
+        for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0), x[0])):
             if pinned_limit is None or used + len(e["line"]) + 1 <= pinned_limit:
                 chosen.add(e["name"])
                 used += len(e["line"]) + 1
@@ -1271,13 +1283,7 @@ class Project:
         rest = [e for e in entries if worker_memory(e) != 1 and e["name"] not in dup] \
             if len(chosen) == len(pinned) else []
         if task:
-            want = task_words(f"{task.get('title') or ''}\n{task.get('spec') or ''}")
-            words = {e["name"]: task_words(e["line"]) & want for e in rest}
-            df: dict[str, int] = {}
-            for ws in words.values():
-                for w in ws:
-                    df[w] = df.get(w, 0) + 1
-            score = {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
+            score = scores(rest)
             for i, e in sorted(enumerate(rest), key=lambda x: (-score[x[1]["name"]], -x[0])):
                 if score[e["name"]] and used + len(e["line"]) + 1 <= limit_chars:
                     chosen.add(e["name"])

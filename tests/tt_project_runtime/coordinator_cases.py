@@ -5903,8 +5903,8 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     n = use["pinned_dropped"]
     shown = [i for i in range(10) if f"RULE-{i} " in system]
     assert 0 < n < 10 and shown == list(range(10 - n)), (n, shown)   # the oldest that fit, whole
-    assert f"({n} more pinned memory entries for workers did not fit this prompt: read them in {p.memory_dir}/)" \
-        in system
+    assert f"({n} more entries for workers are in {p.memory_dir}/: read those your task touches)" in system
+    assert "did not fit" not in system
     assert "NEW-FACT" not in system and "OLD-FACT" not in system
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     assert len(alerts()) == 1 and f"so {n} of them reach workers only as a pointer" in alerts()[0]["text"]
@@ -13567,6 +13567,33 @@ _LONG_GOALS_CHARTER = ("# demo — charter\n\n## Goals\n"
                        "## Resources\n- Box A (alias box-a): the only machine for benchmark jobs.\n")
 
 
+def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain_pointer(env):
+    """Many entries pinned for workers (audience: workers) past their room: the worker's prompt keeps
+    those its task names before the oldest, never shows an unpinned one in their place, and points to
+    the rest in one short line that does not read as a fault."""
+    p = make(env)
+    from ttp.prompts import worker_context, worker_system
+    pinned = [p.add_memory(f"WORKER-{i:02} uses rack-{i:02} " + "w" * 600, kind="decision", audience="workers")
+              for i in range(20)]
+    for i, f in enumerate(pinned):
+        os.utime(f, (1_000_000 + i, 1_000_000 + i))
+    p.add_memory("FACT-NEWEST workers may reuse the build cache on rack-17.", kind="fact")
+    task = {"title": "code: fix the rack-17 cooling script", "spec": "Edit the script for rack-17 only."}
+    text, mem, use = worker_context(p, task)
+    shown = [e["name"] for e in mem]
+    n = use["pinned_dropped"]
+    assert 0 < n < 20 and len(shown) == 20 - n and use["memory_limit"] < use["pinned_chars"], use
+    assert pinned[17].stem in shown and pinned[0].stem in shown and pinned[19].stem not in shown, shown
+    assert not any("FACT-NEWEST" in e["line"] for e in mem)
+    system = worker_system(p, task)
+    assert "WORKER-17 uses rack-17" in system and "WORKER-19 " not in system
+    assert system.rstrip().endswith(f"({n} more entries for workers are in {p.memory_dir}/: read those your task "
+                                    f"touches)")
+    assert "did not fit" not in system
+    # No task: the oldest that fit, as before.
+    assert [e["name"] for e in worker_context(p)[1]] == [f.stem for f in pinned[:20 - n]]
+
+
 def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_marks_overflow(env, capsys):
     """A charter whose Goals take most of the workers' budget, memory restrictions that restate the
     charter's, and pinned memory several times the budget: every worker policy stays, restated
@@ -13593,7 +13620,7 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
     assert any(x.endswith("] Never push.") for x in names) and use["duplicates"] == 2
     assert 0 < use["pinned_dropped"] < 30 and use["shown"] == len(mem)
     n = use["pinned_dropped"]
-    assert f"{n} more pinned memory entries for workers did not fit" in block and str(p.memory_dir) in block
+    assert f"{n} more entries for workers are in {p.memory_dir}/" in block
     assert len(block) <= WORKER_MEMORY_CHARS + WORKER_MEMORY_CHARS // 2, len(block)
     line = coord.worker_pinned_line(p)
     assert f"leaves {n} of 31 pinned entries out of worker prompts" in line, line
@@ -13782,7 +13809,7 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
         assert item in text, item[:20]
     assert 0 < use["pinned_dropped"] < 30
     block = worker_system(p)
-    assert "Policy 9: workers open a draft PR" in block and "more pinned memory entries for workers did not fit" in block
+    assert "Policy 9: workers open a draft PR" in block and "more entries for workers are in" in block
 
 
 def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env):

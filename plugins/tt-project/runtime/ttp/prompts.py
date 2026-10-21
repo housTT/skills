@@ -349,7 +349,8 @@ def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
     return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
 
 
-_PINNED_MORE = "({n} more pinned memory entries for workers did not fit this prompt: read them in {path}/)"
+# Where a worker finds the memory pinned for it that its prompt has no room for: a pointer, not a fault.
+_PINNED_MORE = "({n} more entries for workers are in {path}/: read those your task touches)"
 
 
 def _norm(text: str) -> str:
