@@ -13688,3 +13688,31 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     assert ml.apply_requests(p.state, log=logged.append) == []
     [failed] = (p.state / ml.REQUESTS).glob("*.failed.json")
     assert "no machine 'box-a'" in json.loads(failed.read_text())["error"] and "refused" in logged[0]
+
+
+def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):
+    """Old `audience: workers` decisions that worker prompts leave out (pinned overflow, or restated
+    in the charter's restrictions) and the coordinator's budget hides are never archived as hidden;
+    an old plain decision both hide still is."""
+    p = make(env)
+    from ttp.prompts import worker_context
+    p.charter_path.write_text(_LONG_GOALS_CHARTER)
+    day, t0 = 86400, time.time()
+    restated = p.add_memory("Push only to branch dev/widget.", kind="decision", audience="workers")
+    pinned = [p.add_memory(f"WORKER-{i:02} " + "w" * 900, kind="decision", audience="workers") for i in range(12)]
+    plain = p.add_memory("Routine: the nightly build moved to the large runner.", kind="decision")
+    for f in (restated, *pinned, plain):
+        f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
+    filler = [p.add_memory(f"Newer note {i}: " + "n" * 900, kind="decision") for i in range(14)]
+    p.note_memory_shown([], now=t0 - 30 * day)
+    _, mem, use = worker_context(p)
+    cut = {f.stem for f in (restated, *pinned)} - {e["name"] for e in mem}
+    assert use["pinned_dropped"] and use["duplicates"] == 1 and restated.stem in cut and len(cut) > 1, use
+    p.note_memory_shown([e["name"] for e in mem], now=t0)
+    coordinator = {e["name"] for e in p.memory_select()[0]}
+    assert not cut & coordinator and plain.stem not in coordinator
+    p.note_memory_shown(list(coordinator), now=t0)
+    hidden = p.hidden_memory(7)
+    assert not cut & set(hidden) and plain.stem in hidden, hidden
+    assert p.archive_hidden_memory(7) == [plain.stem]
+    assert all(f.exists() for f in (restated, *pinned)) and not plain.exists()

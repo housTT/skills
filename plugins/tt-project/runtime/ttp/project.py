@@ -1443,8 +1443,13 @@ class Project:
             return []
         built, shown = float(m["built"]), m.get("entries") or {}
         since = float(m.get("since") or built)
+        # An entry pinned for workers (worker_memory 1: tagged `audience: workers`) is never hidden,
+        # like the coordinator's pinned kinds: worker_memory_select may leave it out of a prompt for
+        # pinned overflow or because it matches a charter restriction, and neither is a sign it is
+        # spent. The restriction match is fuzzy and the charter can change, so it is no proof the entry
+        # is covered either. Retire one by hand (`ttp memory --forget`).
         return [e["name"] for e in self._memory_entries()
-                if e["kind"] in ARCHIVABLE_MEMORY_KINDS and not e["standing"]
+                if e["kind"] in ARCHIVABLE_MEMORY_KINDS and not e["standing"] and worker_memory(e) != 1
                 and built - max(float(shown.get(e["name"]) or 0), since, _stamp_ts(e["created"])) >= days * 86400]
 
     def archive_hidden_memory(self, days: float) -> list[str]:
