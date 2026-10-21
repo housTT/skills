@@ -6579,6 +6579,12 @@ def cmd_notifier(a) -> None:
         print(notifier.install())
     elif a.action == "run":
         sys.exit(notifier.main())
+    elif a.action == "test" and a.slack:
+        from .slack import send_test
+        ok, text = send_test()
+        print(text)
+        if not ok:
+            sys.exit(1)
     elif a.action == "test":
         notifier.show("tt-project", "Test notification: desktop alerts work on this machine.")
         print("sent a test notification")
@@ -6631,8 +6637,9 @@ def cmd_doctor(a) -> None:
     sec = load_secrets()
     print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
           f" · enabled in project: {p.config()['jev'].get('enabled')}")
-    print(f"slack: {'bot saved' if (sec.get('slack') or {}).get('bot_token') else 'not configured'}"
-          f" · enabled in project: {p.config()['notify'].get('slack')}")
+    from .daemon import SLACK_ERROR_KEY
+    from .slack import status as slack_status
+    print(slack_status(p.config(), p.db.kv(SLACK_ERROR_KEY))["line"] + " · `ttp notifier test --slack` sends a test")
     print(web_line(p))
     from .service import service_line
     print(service_line(p))
@@ -7545,6 +7552,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")
     s.add_argument("action", choices=["install", "run", "test"],
                    help="install: start it at login; run: run it here; test: show one test notification")
+    s.add_argument("--slack", action="store_true",
+                   help="with test: send one test message to your Slack DM instead (optional; set up with `ttp secret slack`)")
     s.set_defaults(fn=cmd_notifier)
 
     s = sub.add_parser("daemon")   # the service runs it; no help, so --help does not list it

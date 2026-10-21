@@ -225,6 +225,7 @@ ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 # this far past its own wall clock, stall limit and waits.
 LEASE_HUNG_S = 600
 BACKSTOP_SLACK_S = 600
+SLACK_ERROR_KEY = "slack_error"   # kv: {ts, error} of the last failed Slack send; None after a good one
 HUNG_STOPS = ("hung", "overdue", "supervisor_error")   # a broken supervisor's ends: they count as a stall
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
@@ -9630,8 +9631,11 @@ class Daemon:
                         threads = set(db.kv("slack_threads", []))
                         threads.add(ts)
                         db.set_kv("slack_threads", sorted(threads)[-500:])
+                        if db.kv(SLACK_ERROR_KEY):
+                            db.set_kv(SLACK_ERROR_KEY, None)
                 except Exception as e:
                     log(self.p, f"slack post failed: {e}")
+                    db.set_kv(SLACK_ERROR_KEY, {"ts": time.time(), "error": str(e)[:300]})   # shown in the web app
                     if not sl.rejected_message(e):
                         return
                     tries = self._slack_rejects[m["id"]] = self._slack_rejects.get(m["id"], 0) + 1

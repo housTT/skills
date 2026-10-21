@@ -162,6 +162,51 @@ def from_config(cfg: dict) -> Slack | None:
     return Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email")) if sec.get("bot_token") else None
 
 
+# Slack is optional: how a user sets it up, said wherever its state is shown.
+SETUP = ("`ttp secret slack --email <your Slack email>` saves a bot token for this user; "
+         "`ttp config <project> notify.slack true` turns it on for a project")
+
+
+def status(cfg: dict, last_error: dict | None = None) -> dict:
+    """Slack for one project, for the web app and `ttp doctor`: {"state", "line"}. state is on, error
+    (on, but its last send failed: `last_error`, cleared by the next good send), off (a bot is saved
+    but this project does not use it), no_token (on in the config, no bot saved) or not_configured."""
+    from .project import load_secrets
+    saved = bool((load_secrets().get("slack") or {}).get("bot_token"))
+    notify = cfg.get("notify") or {}
+    if notify.get("slack") and saved:
+        line = f"Slack: on; messages at {notify.get('slack_min_severity', 'high')} severity and above go to your Slack DM"
+        if last_error:
+            return {"state": "error", "line": f"{line}; the last send failed: {last_error.get('error')}",
+                    "since": last_error.get("ts")}
+        return {"state": "on", "line": line}
+    if saved:
+        return {"state": "off", "line": "Slack: a bot is saved but this project does not use it (optional): "
+                                        "`ttp config <project> notify.slack true` turns it on"}
+    if notify.get("slack"):
+        return {"state": "no_token", "line": "Slack: on in this project's config but no bot token is saved on "
+                                             "this machine: `ttp secret slack --email <your Slack email>`"}
+    return {"state": "not_configured", "line": f"Slack: not configured (optional). {SETUP}"}
+
+
+def send_test(project: str = "tt-project") -> tuple[bool, str]:
+    """Post one test message to the user's Slack DM with the saved bot: (sent, what happened, with
+    Slack's exact error when it failed)."""
+    from .project import load_secrets
+    sec = load_secrets().get("slack") or {}
+    if not sec.get("bot_token"):
+        return False, f"Slack is not configured (optional): {SETUP}"
+    s = Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email"))
+    try:
+        s.call("auth.test")
+        s.post(project, "Test message: tt-project notifications reach you on Slack.")
+    except SlackError as e:
+        return False, f"Slack test failed: {e}"
+    except (OSError, ValueError) as e:   # no network, a TLS or proxy fault, a reply that is not JSON
+        return False, f"Slack test failed: could not reach Slack: {e}"
+    return True, f"sent a test message to your Slack DM (user {s.user_id})"
+
+
 PREFIX = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,62})\s*:\s*(.+)$", re.S)
 BOT_TAG = re.compile(r"^\[([A-Za-z0-9][A-Za-z0-9._-]{0,62})\] ")
 

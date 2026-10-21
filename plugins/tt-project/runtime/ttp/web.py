@@ -21,7 +21,7 @@ from . import credits, heal, identity, obligations, outagetask, projpause, pushq
 from . import schedule as sched
 from . import startgate, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
-                     WAIT_KEYS, heartbeat, idle_wake)
+                     SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result, task_outcome)
@@ -541,6 +541,24 @@ def attention(db: DB, now: float) -> list[dict]:
     return alerts.needs_you(db, now)
 
 
+def notify_state(p: Project, db: DB) -> dict:
+    """The optional Slack channel's state for the web app's notifications card (the browser's own
+    permission is known only in the browser)."""
+    from . import slack
+    return {"slack": slack.status(p.config(), db.kv(SLACK_ERROR_KEY))}
+
+
+def notify_test(p: Project, body: dict) -> dict:
+    """The web app's 'Send test': the notification the browser shows, through the same code as a real
+    alert, and with {"slack": true} one test message to Slack with its outcome."""
+    out = {"title": f"{p.name}: test", "body": "Test notification: tt-project alerts from this page reach you."}
+    if body.get("slack"):
+        from . import slack
+        ok, text = slack.send_test(p.name)
+        out["slack"] = {"ok": ok, "text": text}
+    return out
+
+
 def archived_files(p: Project, task_id: int | None) -> list[dict]:
     """The files the worktree sweep archived from a task's worktree (archive.where), so a run's
     hand-off artifacts are still found once its worktree is gone: path, size, sha256, where."""
@@ -611,6 +629,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db, timefmt.home(p)),
         "attention": attention(db, now),
+        "notify": notify_state(p, db),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
@@ -784,6 +803,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True})
                 db.set_paused(bool(body.get("paused")), by="user", via="web app", reason=str(body.get("reason") or ""))
                 return self._send(200, {"ok": True})
+            if url.path == "/api/notify/test":
+                return self._send(200, notify_test(p, body))
             if url.path == "/api/config":
                 from .coordinator import USER_SETTABLE
                 key = body.get("key")

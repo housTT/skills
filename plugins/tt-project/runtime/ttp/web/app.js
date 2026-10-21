@@ -139,19 +139,64 @@ function bars(el, rows, key, label, cap) {
   put(el, s + `</svg>`);
 }
 
-// One-click desktop notifications while this page is open in any tab (localhost is a secure
-// context, so no certificate or push service is needed).
-const notifyBtn = $("#notify");
-if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") notifyBtn.hidden = false;
-notifyBtn.onclick = async () => { const r = await Notification.requestPermission(); notifyBtn.hidden = r === "granted" || r === "denied"; };
-let seenAlert = +(sessionStorage.getItem("ttp_seen_alert") || 0), unseen = 0;
-function announce(items, project) {
-  const fresh = items.filter((m) => m.id > seenAlert);
+// Browser notifications while this page is open in any tab. Browsers allow them only in a secure
+// context: https, or http on localhost/127.0.0.1 (the address `ttp web` prints, also through its tunnel).
+// on | ask (not allowed yet) | blocked (by the browser) | insecure (this address) | unsupported.
+const notifyState = (w) => w.isSecureContext === false ? "insecure" : !("Notification" in w) ? "unsupported"
+  : ({ granted: "on", denied: "blocked" })[w.Notification.permission] || "ask";
+const NOTIFY_TEXT = {
+  on: "on: new asks, problems and work ready for review pop up while this page is open in a tab.",
+  ask: "not allowed yet. Allow them to get a pop-up for new asks, problems and work ready for review.",
+  blocked: "blocked by this browser. To allow them again: click the icon left of the address bar, set Notifications to Allow, and reload.",
+  insecure: "unavailable on this address: browsers allow them only on https or localhost. Open the link `ttp web` prints (http://127.0.0.1:…).",
+  unsupported: "not supported by this browser.",
+};
+const NOTIFY_PILL = { ask: "Turn on notifications", blocked: "Notifications blocked", insecure: "Notifications unavailable", unsupported: "Notifications unavailable" };
+// "" once shown, else why not (Chrome on Android shows them only from a service worker).
+function popup(title, body, tag) {
+  try { const n = new Notification(title, { body: String(body || "").slice(0, 240), tag }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
+  catch (e) { return String((e && e.message) || e); }
+}
+let slackState = null;
+function notifyCard() {
+  const s = notifyState(window), pill = $("#notify");
+  pill.hidden = s === "on"; text(pill, NOTIFY_PILL[s] || "");
+  put($("#notifystate"), `<b>Browser notifications:</b> ${codes(NOTIFY_TEXT[s])}`);
+  $("#notifyask").hidden = s !== "ask";
+  put($("#slackline"), slackState ? codes(slackState.line) + (slackState.since ? ` (${at(slackState.since)})` : "") : "");
+}
+const allowNotify = async () => {
+  // Called from a click: browsers ignore a permission request that no user gesture started.
+  await new Promise((done) => { const r = Notification.requestPermission(done); if (r && r.then) r.then(done, done); });
+  notifyCard();
+};
+$("#notifyask").onclick = allowNotify;
+$("#notify").onclick = () => {
+  if (notifyState(window) === "ask") return allowNotify();
+  document.querySelector('#tabs button[data-tab="overview"]').click(); $("#notifycard").scrollIntoView();
+};
+$("#notifytest").onclick = async () => {
+  const slack = !!slackState && !["not_configured", "no_token"].includes(slackState.state);
+  text($("#notifyresult"), "sending…");
+  const r = await api("/api/notify/test", slack ? { slack: true } : {}), s = notifyState(window), out = [];
+  if (s !== "on") out.push(`Browser: not sent, notifications are ${s === "ask" ? "not allowed yet" : s}.`);
+  else { const err = popup(r.title, r.body, "ttp-test");
+    out.push(err ? `Browser: could not show it: ${err}` : "Browser: sent. None appeared? Check the system's do-not-disturb or focus mode and its setting for this browser."); }
+  if (r.slack) out.push(`${r.slack.ok ? "Slack" : "Slack failed"}: ${r.slack.text}`);
+  put($("#notifyresult"), codes(out.join(" ")));
+};
+// What this tab has seen. Its first look notifies nothing (it is all on screen); after that each new
+// ask, problem and task ready for review notifies once, also while the tab is in the background.
+let seenKeys = JSON.parse(sessionStorage.getItem("ttp_seen") || "null"), unseen = 0;
+const ready = (t) => t.status === "review" || (t.pr_url && t.status === "done");
+function announce(st) {
+  const items = (st.attention || []).map((m) => ({ key: `m${m.id}`, title: m.kind === "ask" ? "needs you" : "problem", body: m.text, tag: `ttp-${m.id}` }))
+    .concat((st.tasks || []).filter(ready).map((t) => ({ key: `r${t.id}`, title: "ready for review", body: `#${t.id} ${t.title}`, tag: `ttp-review-${t.id}` })));
+  const fresh = seenKeys ? items.filter((m) => !seenKeys.includes(m.key)) : [];
+  seenKeys = items.map((m) => m.key); sessionStorage.setItem("ttp_seen", JSON.stringify(seenKeys));
   if (!fresh.length) return;
-  if (seenAlert && "Notification" in window && Notification.permission === "granted")
-    fresh.slice(-3).forEach((m) => new Notification(`${project}: ${m.kind === "ask" ? "needs you" : "alert"}`, { body: m.text.slice(0, 240), tag: `ttp-${m.id}` }));
+  if (notifyState(window) === "on") fresh.slice(-3).forEach((m) => popup(`${st.project.name}: ${m.title}`, m.body, m.tag));
   if (document.hidden) unseen += fresh.length;
-  seenAlert = Math.max(...fresh.map((m) => m.id)); sessionStorage.setItem("ttp_seen_alert", seenAlert);
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) unseen = 0; });
 
@@ -165,7 +210,7 @@ function board(st) {
     ["you", "Waiting on you", stuck(st, "user").map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age_text})`])
       .concat(asks.map((m) => [`${m.text}`, "", `ask ${m.id}, ${agoH(m.ts)} ago: `]))],
     ["stuck", "Stuck, the project is on it", stuck(st).map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age_text})`])],
-    ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
+    ["review", "Ready for review", st.tasks.filter(ready).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => [`#${t.id} ${t.title}`])],
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],
   ];
@@ -282,7 +327,8 @@ async function refresh() {
   put($("#chealth"), healthHtml(h));
   $("#pqcard").hidden = !st.push_queue;
   if (st.push_queue) { text($("#pqline"), st.push_queue.line || ""); put($("#pq"), pushQueueHtml(st.push_queue, st.now || Date.now() / 1000)); }
-  announce(st.attention || [], st.project.name);
+  slackState = (st.notify && st.notify.slack) || null; notifyCard();
+  announce(st);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
   const muted = (s) => [{ key: "empty", html: `<p class="muted">${s}</p>` }];
@@ -350,4 +396,6 @@ async function pollChat() {
 $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
 
 refresh(); pollChat();
-setInterval(() => { if (!document.hidden) { refresh(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } }, 4000);
+// A hidden tab still looks every 30 s, so its notifications still come; the rest waits until it is shown.
+let ticks = 0;
+setInterval(() => { ticks++; if (!document.hidden) { refresh(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } else if (ticks % 8 === 0) refresh(); }, 4000);
