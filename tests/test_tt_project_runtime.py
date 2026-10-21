@@ -26557,6 +26557,22 @@ def _gone_pid(pid):
     return not _alive(pid)
 
 
+def _host_pid(argv, timeout=10.0):
+    """The host pid of this user's process running exactly `argv`: a check runs in a PID namespace
+    (sandbox.py), where its `$$` or os.getpid() is not the pid this test can see or signal."""
+    want = "\0".join(map(str, argv)).encode() + b"\0"
+    deadline = time.time() + timeout
+    while True:
+        for d in pathlib.Path("/proc").iterdir():
+            try:
+                if d.name.isdigit() and d.stat().st_uid == os.getuid() and (d / "cmdline").read_bytes() == want:
+                    return int(d.name)
+            except OSError:
+                pass
+        assert time.time() < deadline, f"no process runs {argv!r}"
+        time.sleep(0.05)
+
+
 @pytest.mark.parametrize("proc", [True, False], ids=["proc", "ps"])
 def test_a_zombie_child_counts_as_gone(monkeypatch, proc):
     """A killed child stays a zombie until it is reaped and kill(pid, 0) still finds it. On macOS,
@@ -26591,20 +26607,22 @@ def test_detached_ttp_checks_write_their_exit_code_when_another_worker_pkills_th
     check it ran (no orphan writing on), and its probe answers at once."""
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     started, child = tmp_path / "started", tmp_path / "child.pid"
-    pid = _detached_checks(run, capsys, "sh", "-c", f"echo $$ > {child}; touch {started}; sleep 60")
+    script = f"echo $$ > {child}; touch {started}; sleep 60"
+    pid, host = _detached_checks(run, capsys, "sh", "-c", script), 0
     try:
         assert _wait_for(started.exists), (run / "checks.out").read_text()
+        host = _host_pid(["sh", "-c", script])
         assert _ttp("checks", "--result", str(run)) == 1
         assert "running" in capsys.readouterr().out
         os.kill(pid, signal.SIGTERM)                       # what `pkill -f "ttp checks"` does
         assert _wait_for(lambda: (run / "checks.rc").exists(), 15), "no exit code after a TERM"
         assert (run / "checks.rc").read_text().strip() == str(128 + signal.SIGTERM)
-        assert _wait_for(lambda: _gone_pid(int(child.read_text())), 10), "the check outlived ttp checks"
+        assert _wait_for(lambda: _gone_pid(host), 10), "the check outlived ttp checks"
         assert _ttp("checks", "--result", str(run)) == 0
         assert "finished with exit code 143" in capsys.readouterr().out
         assert "stopped by signal 15" in (run / "checks.log").read_text()
     finally:
-        for k in (pid, int(child.read_text()) if child.exists() else 0):
+        for k in (pid, host):
             try:
                 if k:
                     os.killpg(k, signal.SIGKILL)
@@ -41873,7 +41891,7 @@ def test_detached_checks_recovery_preserves_scratch_after_supervisor_killed(env,
     child = None
     try:
         assert _wait_for(ready.exists)
-        child = int(ready.read_text())
+        child = _host_pid([sys.executable, "-c", code])
         output = pathlib.Path(cli._read_checks_pid(run)["check_run_dir"])
         scratch = pathlib.Path(json.loads((output / "owner.json").read_text())["tmp"])   # short (shorttmp)
         os.killpg(pid, signal.SIGKILL)

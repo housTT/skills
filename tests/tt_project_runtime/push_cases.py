@@ -4235,9 +4235,11 @@ def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeyp
     from ttp import cli, detach, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     started, child = tmp_path / "started", tmp_path / "child.pid"
-    first = _detached_checks(run, capsys, "sh", "-c", f"echo $$ > {child}; touch {started}; sleep 60")
+    script = f"echo $$ > {child}; touch {started}; sleep 60"
+    first, host = _detached_checks(run, capsys, "sh", "-c", script), 0
     try:
         assert _wait_for(started.exists)
+        host = _host_pid(["sh", "-c", script])
         monkeypatch.setattr(push, "_boxed", lambda: True)
         cli.main(["checks", "--detach", "--", "false"])
         cli.main(["checks", "--detach", "--", "true"])
@@ -4246,11 +4248,11 @@ def test_queued_checks_replace_pending_and_running_checks(env, tmp_path, monkeyp
         assert cli._checks_result(run) == 1
         detach.tend(p)
         # the whole group got the signal; on a loaded host its members may take a moment to exit
-        assert _wait_for(lambda: _gone_pid(first) and _gone_pid(int(child.read_text())))
+        assert _wait_for(lambda: _gone_pid(first) and _gone_pid(host))
         assert _wait_precheck(run) == "0", "the latest request replaces the pending one"
         assert cli._read_checks_pid(run)["cmd"] == ["--", "true"]
     finally:
-        for pid in (first, int(child.read_text()) if child.exists() else 0):
+        for pid in (first, host):
             if pid:
                 try:
                     os.killpg(pid, signal.SIGKILL)
