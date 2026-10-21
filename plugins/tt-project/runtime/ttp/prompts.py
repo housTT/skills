@@ -349,11 +349,12 @@ def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
     return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
 
 
-def worker_context(p: Project) -> tuple[str, list[dict], dict]:
+def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict], dict]:
     """A worker's digest of the charter and memory, within WORKER_MEMORY_CHARS together: the Goals
     and Resources whole (the Brief only when no Goals are stated), memory entries pinned for workers
     (see worker_memory) whatever the budget, then the policies and other charter items meant for
-    workers (see for_workers) and the newest facts that fit. The Restrictions are not in it: the
+    workers (see for_workers) and the facts that fit, those sharing words with `task` first (see
+    worker_memory_select). The Restrictions are not in it: the
     prompt states them whole in their own block. Returns (charter text, memory entries, usage)."""
     raw = p.charter_path.read_text() if p.charter_path.exists() else ""
     secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
@@ -385,7 +386,7 @@ def worker_context(p: Project) -> tuple[str, list[dict], dict]:
         else:
             used -= len(h) + 3
     text = "\n\n".join(out)
-    mem, use = p.worker_memory_select(max(0, WORKER_MEMORY_CHARS - heads - len(text)))
+    mem, use = p.worker_memory_select(max(0, WORKER_MEMORY_CHARS - heads - len(text)), task)
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS)
 
 
@@ -460,12 +461,13 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
 def worker_system(p: Project, task: dict | None = None) -> str:
     """The part of a worker's prompt shared by every task of the same shape (kind, devices, machines
     it names) until the charter or memory changes: sent as the system prompt where the agent allows
-    it, so the provider caches it across the project's workers. Only worker_features() may read the
-    task; nothing else about it goes in here."""
+    it, so the provider caches it across the project's workers. Only worker_features() and the memory
+    entries' choice may read the task; the memory comes last, so on a project whose memory does not fit
+    whole only it differs between tasks and everything before it still caches."""
     parts = [restrictions_block(p), _read(p, "worker.md", worker_features(p, task))]
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
-    charter, mem, use = worker_context(p)
+    charter, mem, use = worker_context(p, task)
     p.note_memory_shown([e["name"] for e in mem])
     head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
     parts.append(head + (charter or "(none)"))

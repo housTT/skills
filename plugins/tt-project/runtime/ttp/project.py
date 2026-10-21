@@ -820,6 +820,28 @@ def worker_memory(e: dict) -> int:
     return 2 if _WORKER_WORD.search(e["line"]) else 3 if e["kind"] == "fact" else 0
 
 
+# Words too common in specs and memory to tie an entry to a task (see task_words).
+_COMMON_WORDS = frozenset("""
+about after again against also and any are because been before being both but can could did does
+done each else every few for from had has have here how into its just keep more most must need never
+new not now off once only other our out over own same should since some still such than that the
+their them then there these they this those through too under until upon very was were what when
+where which while who why will with within without would yes you your task tasks run runs worker
+workers change changes test tests use used using make made one two""".split())
+_TOKEN = re.compile(r"[a-z0-9][a-z0-9_./#:-]*[a-z0-9]")
+
+
+def task_words(text: str) -> set[str]:
+    """The words of `text` that can tie a memory entry to a task: identifiers, paths and their
+    parts, resource names, task and message numbers; lower-cased, 3+ characters, common words out."""
+    out = set()
+    for tok in _TOKEN.findall(text.lower()):
+        out.add(tok)
+        if "/" in tok or "." in tok:
+            out.update(re.split(r"[/.]", tok))
+    return {w for w in out if len(w) >= 3 and w not in _COMMON_WORDS}
+
+
 class Project:
     """A project rooted at <root>/tt-project. `harness/` is its own git repo (charter, memory,
     config, prompts, runtime); `state/` holds the database, run directories and logs."""
@@ -1169,17 +1191,33 @@ class Project:
                         "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
                         "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
 
-    def worker_memory_select(self, limit_chars: int) -> tuple[list[dict], dict]:
+    def worker_memory_select(self, limit_chars: int, task: dict | None = None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory always shows
-        (even past the budget), then those that speak of workers and then the facts, newest first
-        while they fit `limit_chars`. Usage numbers as memory_select's, counting only the entries
-        meant for workers."""
+        (even past the budget); then, for `task`, the others that share words with its title and spec
+        (task_words; a word few entries share weighs more), most shared first, then newest, each that
+        fits; then those that speak of workers and then the facts, newest first while they fit
+        `limit_chars`. Usage numbers as memory_select's, counting only the entries meant for workers."""
         entries = [e for e in self._memory_entries() if worker_memory(e)]
         pinned = [e for e in entries if worker_memory(e) == 1]
         used = pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
         chosen = {e["name"] for e in pinned}
+        rest = [e for e in entries if e["name"] not in chosen]
+        if task:
+            want = task_words(f"{task.get('title') or ''}\n{task.get('spec') or ''}")
+            words = {e["name"]: task_words(e["line"]) & want for e in rest}
+            df: dict[str, int] = {}
+            for ws in words.values():
+                for w in ws:
+                    df[w] = df.get(w, 0) + 1
+            score = {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
+            for i, e in sorted(enumerate(rest), key=lambda x: (-score[x[1]["name"]], -x[0])):
+                if score[e["name"]] and used + len(e["line"]) + 1 <= limit_chars:
+                    chosen.add(e["name"])
+                    used += len(e["line"]) + 1
         for rank in (2, 3):
-            for e in reversed([e for e in entries if worker_memory(e) == rank]):
+            for e in reversed([e for e in rest if worker_memory(e) == rank]):
+                if e["name"] in chosen:
+                    continue
                 if used + len(e["line"]) + 1 > limit_chars:
                     break   # whole entries only, and no older one slips in past a gap
                 chosen.add(e["name"])

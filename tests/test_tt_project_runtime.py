@@ -15943,6 +15943,42 @@ def test_memory_is_cut_at_whole_entries_and_keeps_pinned_kinds_first(env):
     assert use["entries"] == 43 and use["shown"] == 3 + len(shown) and not use["pinned_over"]
 
 
+def test_worker_memory_puts_entries_naming_the_tasks_paths_and_resources_first(env):
+    """Past its budget, a worker's memory takes the unpinned entries that share words with the task's
+    title and spec (paths, resources, task numbers) before newer unrelated ones; pinned entries stay
+    whatever the task, whole entries only, within the limit, oldest first. No task, or a task naming
+    nothing in memory: the newest, as before."""
+    p = make(env)
+    from ttp.prompts import worker_system
+    _memories(p, [("resource", "Box A is ours."), ("restriction", "Never reboot box A mid-job.")]
+              + [("fact", "OLD-PATH: src/widget/cache.py holds the warm-up switch; " + "a" * 300),
+                 ("fact", "OLD-BOX: bench-box-7 needs its fan profile reset after each run; " + "b" * 300),
+                 ("fact", "OLD-TASK: #4711 left a stale lock file behind; " + "c" * 300)]
+              + [("fact", f"NEW-FACT-{i:02} unrelated news " + "n" * 300) for i in range(12)])
+    pins = p.worker_memory_select(0)[1]["pinned_chars"]
+    limit = pins + 2 * max(len(e["line"]) + 1 for e in p._memory_entries())   # room for two more
+    names = lambda sel: [e["line"].split("] ", 1)[1].split(":")[0].split(" ")[0] for e in sel[0]]
+    plain = p.worker_memory_select(limit)
+    assert names(plain)[2:] == ["NEW-FACT-10", "NEW-FACT-11"], names(plain)
+    for spec, want in (("Speed up the warm-up in src/widget/cache.py.", "OLD-PATH"),
+                       ("Benchmark the change on bench-box-7.", "OLD-BOX"),
+                       ("Follow up on task #4711.", "OLD-TASK")):
+        task = {"title": "code task", "spec": spec, "kind": "code"}
+        sel = p.worker_memory_select(limit, task)
+        got = names(sel)
+        assert got[:2] == names(plain)[:2], "pinned entries unchanged"
+        assert want in got and "NEW-FACT-11" in got, got
+        assert sel[1]["shown"] == len(got) == 4 and sel[1]["pinned"] == 2
+        assert sum(len(e["line"]) + 1 for e in sel[0]) <= limit
+        assert [e["name"] for e in sel[0]] == [e["name"] for e in p._memory_entries() if e in sel[0]]
+        assert want in worker_system(p, task)
+    unrelated = {"title": "code: docs", "spec": "Fix a typo in the readme.", "kind": "code"}
+    assert names(p.worker_memory_select(limit, unrelated)) == names(plain)
+    # An entry's words count less the more entries share them: a path part every entry names ties
+    # the task to none of them, the specific path still wins.
+    both = {"title": "code task", "spec": "Unrelated news about src/widget/cache.py.", "kind": "code"}
+    assert "OLD-PATH" in names(p.worker_memory_select(limit, both))
+
 _BIG_CHARTER = """# demo — charter
 
 Created 2026-01-01. The coordinator keeps this file current.
@@ -16010,7 +16046,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
               + [("fact", f"FACT-{i:02} " + "f" * 300) for i in range(30)])
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
-    spec = "SPEC-MARKER"
+    spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
     for kind, cap in (("code", 29_000), ("question", 24_000)):
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
@@ -16020,6 +16056,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
         assert "\n" + charter_restrictions(charter) + "\n" in prompt
         for r in rules:
             assert r in prompt, (kind, r)
+        assert "FACT-03 " in prompt and "FACT-07 " in prompt and "FACT-00 " not in prompt, kind
 
 
 def test_memory_cli_retires_an_entry(env):
