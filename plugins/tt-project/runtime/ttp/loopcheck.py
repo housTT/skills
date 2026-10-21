@@ -164,7 +164,8 @@ class Watch:
             if rv["status"] in ENDED:
                 self.say(f"review-end{rv['id']}", "review", f"review #{rv['id']} {rv['status']}", False)
                 return f"review #{rv['id']} {rv['status']}"
-        for q in db.q("SELECT * FROM push_queue ORDER BY id"):
+        queue = db.q("SELECT * FROM push_queue ORDER BY id")
+        for q in queue:
             self.say(f"approved{q['id']}", "review", f"review #{q['task']} passed: approved {q['head'][:12]} "
                      f"for {q['target']}")
             if q["batch"]:
@@ -177,8 +178,13 @@ class Watch:
         sha = self.landed()
         if sha:
             self.say("landed", "landed", f"{sha[:12]} on {BRANCH} of the bare remote has the line")
+            if not any(q["batch"] for q in queue):
+                # The line reached the remote before any review approved it or the push queue pushed it.
+                self.say("bypass", "landed", "the change reached the remote outside the review and push queue",
+                         False)
+                return "landed without the review and push queue"
             open_ = [rv["id"] for rv in reviews if rv["status"] not in ("done",) + ENDED]
-            if not open_:
+            if not open_ and self.steps.get("push") and self.steps.get("review"):
                 return "pass"
         return None
 
@@ -239,5 +245,9 @@ def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_us
     finally:
         if p is not None:
             stop_all(p)
-        shutil.rmtree(tmp, ignore_errors=True)
+        for _ in range(STOP_WAIT_S):   # a stopped run's runner may still write its last files
+            shutil.rmtree(tmp, ignore_errors=True)
+            if not tmp.exists():
+                break
+            time.sleep(1)
     return out

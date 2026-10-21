@@ -5847,6 +5847,18 @@ def test_doctor_loop_lands_one_code_task_on_a_local_bare_remote_through_review(e
     assert not (home / "registry.json").exists(), "and was never registered"
 
 
+def test_doctor_loop_fails_a_change_that_lands_outside_the_review_and_push_queue(env, monkeypatch):
+    """A worker that pushes its commit straight to the remote is a FAIL, not a pass: the loop must
+    show the review and the push queue doing the landing."""
+    from ttp import loopcheck
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL.replace(
+        'commit -qm "notes: $w"', 'commit -qm "notes: $w" && git push -q origin HEAD:loop-check'))
+    lines = []
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=120, emit=lines.append)
+    assert r["outcome"] == "landed without the review and push queue", (r, lines)
+    assert r["steps"]["landed"] is False and lines[-1].split()[1] == "FAIL", lines
+
+
 def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_0(env, monkeypatch, capsys):
     from ttp import cli, loopcheck
     from ttp.providers import base
