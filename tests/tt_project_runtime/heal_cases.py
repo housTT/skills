@@ -3039,3 +3039,41 @@ def test_heal_schedule_level_error_drops_back_to_every(env, monkeypatch, ending)
     assert row["next_run"] - row["last_run"] <= 300, row["last_status"]
     assert heal.STREAK_KEY not in heal.state(p.db, "svc")
     assert heal.interval(p.db, row, _heal_spec(p)) == 300
+
+
+@pytest.mark.parametrize("hook", ["_run", "_save"])
+def test_heal_timed_out_run_that_ends_healthy_late_does_not_extend_the_streak(env, monkeypatch, hook):
+    # The daemon's timeout records the run failed (end_streak) while heal.run is still in its check
+    # (_run) or saving the streak (_save); the healthy result it returns later must not count.
+    from ttp import heal, schedrun
+    p, d, up = _heal_setup(env, healthy_every="1h")
+    up.touch()
+    for _ in range(heal.HEALTHY_RUNS - 1):
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        d.run_schedules()
+    assert heal.state(p.db, "svc")[heal.STREAK_KEY] == heal.HEALTHY_RUNS - 1
+    inside, go, real = threading.Event(), threading.Event(), getattr(heal, hook)
+
+    def held(*a, **k):
+        if hook == "_save" and heal.STREAK_KEY not in a[2]:
+            return real(*a, **k)
+        out = real(*a, **k) if hook == "_run" else None
+        inside.set()
+        assert go.wait(10)
+        return out if hook == "_run" else real(*a, **k)
+    monkeypatch.setattr(heal, hook, held)
+    row = dict(p.db.one("SELECT * FROM schedules WHERE name='svc'"))
+    run = d._start_schedule(row, json.loads(row["payload"]))
+    assert inside.wait(10)
+    run.timed_out = True   # what Daemon.run_schedules does at the run's deadline
+    schedrun.kill(p.db, run)
+    d._schedule_ran(run.s, "error: timed out after 1 s", None)
+    go.set()
+    assert run.done.wait(10) and run.result[0] == "ok (healthy)"   # its late result, which the daemon drops
+    assert heal.STREAK_KEY not in heal.state(p.db, "svc")
+    monkeypatch.setattr(heal, hook, real)
+    p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+    d.run_schedules()   # the next healthy run starts a new streak and stays at `every`
+    row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert heal.state(p.db, "svc")[heal.STREAK_KEY] == 1
+    assert row["next_run"] - row["last_run"] == pytest.approx(300)

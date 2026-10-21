@@ -129,7 +129,8 @@ handled as healthy or unhealthy as above.
 Backing off while healthy: `healthy_every` (an interval like the schedule's `every`, e.g. "1h", at least
 `every`) runs the check that often once it was healthy `healthy_runs` (HEALTHY_RUNS, 3) runs in a row. The
 first run that is anything else (unhealthy, unknown, a known state, an error or a fix that ran, and a run
-that timed out, crashed or whose own command failed) goes straight back to `every`. The streak lives in the check's state (`healthy_streak`); `ttp heal list` and `ttp schedules`
+that timed out, crashed or whose own command failed) goes straight back to `every`; a run the daemon
+recorded failed at its timeout never extends the streak, even when it ends healthy later. The streak lives in the check's state (`healthy_streak`); `ttp heal list` and `ttp schedules`
 show the interval in force.
 
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
@@ -791,16 +792,25 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     streak = int(state(host.p.db, name).get(STREAK_KEY) or 0)
     out = _run(host, name, spec, now)
     st = state(host.p.db, name)   # only a plain healthy run keeps the streak going (module doc: backing off)
-    if out[0] == "ok (healthy)":
+    if out[0] == "ok (healthy)" and not _timed_out():
         st[STREAK_KEY] = streak + 1
     else:
         st.pop(STREAK_KEY, None)
     _save(host.p.db, name, st)
+    if STREAK_KEY in st and _timed_out():   # the daemon's timeout (end_streak) came while it was saved
+        end_streak(host.p.db, name)
     try:
         _report_machine(host, name, spec, now)
     except Exception as e:   # the ledger is shared and best effort: the check's own result stands
         print(f"heal {name}: machine ledger report failed: {e}", file=sys.stderr)
     return out
+
+
+def _timed_out() -> bool:
+    """The daemon stopped the schedule run on this thread (its timeout recorded it failed, or a stop):
+    whatever it returns late must not extend the healthy streak."""
+    run = schedrun.current()
+    return run is not None and run.stopping.is_set()
 
 
 def end_streak(db: DB, name: str) -> None:
