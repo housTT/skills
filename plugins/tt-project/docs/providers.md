@@ -62,7 +62,9 @@ The project chooses which plugin directories load, per provider, in
 ## Open gaps
 
 Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
-`ttp doctor --live <provider>` after a CLI upgrade.
+`ttp doctor --live <provider>` after a CLI upgrade. On 2026-10-21 `ttp doctor --loop` passed
+with Claude Code 2.1.296 (landed after review in 31 s, $0.09) and Codex CLI 0.160.0 (66 s,
+$0.21). Cursor agent: not measured, CLI not installed.
 
 - Any provider: only the prompt keeps a worker's raw `git push` off the push branch. On
   2026-10-21 a Claude Code worker whose task said to land its change pushed it straight to the
