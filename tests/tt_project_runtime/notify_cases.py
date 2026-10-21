@@ -150,8 +150,9 @@ def test_web_app_notification_state_permission_and_announce(env):
     # A permission request no click started is ignored by browsers: only the buttons' handlers ask.
     assert js.count("requestPermission") == 1 and js.count("allowNotify") == 3
     assert "$(\"#notifyask\").onclick = allowNotify" in js and "return allowNotify()" in js
-    # A hidden tab keeps looking, less often, so its notifications still come.
-    assert "else if (ticks % 8 === 0) refresh()" in js
+    # A hidden tab keeps looking by elapsed time (30 s), and looks at once when shown.
+    assert "Date.now() - lastLook >= 30000" in js and "ticks" not in js
+    assert 'addEventListener("visibilitychange"' in js
     node = shutil.which("node")
     if not node:
         return

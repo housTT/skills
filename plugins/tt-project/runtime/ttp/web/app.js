@@ -397,6 +397,9 @@ async function pollChat() {
 $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
 
 refresh(); pollChat();
-// A hidden tab still looks every 30 s, so its notifications still come; the rest waits until it is shown.
-let ticks = 0;
-setInterval(() => { ticks++; if (!document.hidden) { refresh(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } else if (ticks % 8 === 0) refresh(); }, 4000);
+// A hidden tab still looks once 30 s have passed since its last look (by the clock, not by ticks:
+// browsers slow timers in long-hidden tabs), so its notifications still come; it also looks when shown.
+let lastLook = Date.now();
+const look = () => { lastLook = Date.now(); return refresh(); };
+setInterval(() => { if (!document.hidden) { look(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } else if (Date.now() - lastLook >= 30000) look(); }, 4000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) look(); });
