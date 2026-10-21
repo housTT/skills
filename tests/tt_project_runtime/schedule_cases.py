@@ -252,7 +252,7 @@ def test_a_schedule_name_outside_the_safe_set_is_refused_everywhere_but_a_stored
     assert sched.parse_file(json.dumps([{"name": "old name", "kind": "llm", "every": "1d"}]), {"old name"})
 
 
-def _run(d):
+def _run_precheck_schedule(d):
     """run_schedules, then record a prechecked run still going after the tick's short wait."""
     d.run_schedules()
     for run in list(d._sched_runs.values()):
@@ -281,13 +281,13 @@ def test_an_llm_precheck_that_exits_0_skips_the_trigger_with_its_first_line(env)
     _prechecked(p, "echo; echo '  nothing new in the window  '; echo second line")
     d = Daemon(p.base)
     d.gates = {}
-    _run(d)
+    _run_precheck_schedule(d)
     status, n, log = _summary(p)
     assert status == "skipped: precheck: nothing new in the window" and n == 0, (status, log)
     row = p.db.one("SELECT last_run, next_run FROM schedules WHERE name='summary'")
     assert row["last_run"] and row["next_run"] > time.time() + 86400 - 120   # a full period on, not owed
     _prechecked(p, "true")   # no output: still a skip, with a reason
-    _run(d)
+    _run_precheck_schedule(d)
     assert _summary(p)[:2] == ("skipped: precheck: exit 0", 0)
 
 
@@ -301,7 +301,7 @@ def test_an_llm_precheck_that_fails_or_times_out_lets_the_run_go_ahead(env, prec
     _prechecked(p, precheck, **extra)
     d = Daemon(p.base)
     d.gates = {}
-    _run(d)
+    _run_precheck_schedule(d)
     status, n, log = _summary(p)
     assert status == "queued" and n == 1, status
     assert f"schedule summary: {logged}" in log, log
@@ -318,7 +318,7 @@ def test_an_llm_precheck_that_raises_lets_the_run_go_ahead(env, monkeypatch):
     monkeypatch.setattr(schedrun, "run_group", boom)
     d = Daemon(p.base)
     d.gates = {}
-    _run(d)
+    _run_precheck_schedule(d)
     status, n, log = _summary(p)
     assert status == "queued" and n == 1, status
     assert "schedule summary: precheck failed (OSError: no shell); the run goes ahead" in log, log
@@ -335,18 +335,18 @@ def test_an_llm_precheck_is_not_run_when_an_earlier_gate_already_skipped(env, tm
     tid = p.db.add_task("[summary] open", "x", origin="schedule")
     p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["summary"]), tid))
     d.gates = {}
-    _run(d)
+    _run_precheck_schedule(d)
     assert _summary(p)[0] == "skipped: previous run still open" and not ran.exists()
     p.db.update_task(tid, status="done")
     # The budget gate, then the schedule's daily budget.
     _prechecked(p, f"touch {ran}")
     d.gates = {d.cfg.get("core_provider", "claude"): SimpleNamespace(allow_optional=False, level="tight")}
-    _run(d)
+    _run_precheck_schedule(d)
     assert _summary(p)[0] == "skipped: budget tight" and not ran.exists()
     d.gates = {}
     p.db.x("UPDATE schedules SET budget_usd_day=1, next_run=? WHERE name='summary'", (time.time() - 1,))
     p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:summary", 2.0))
-    _run(d)
+    _run_precheck_schedule(d)
     assert _summary(p)[0] == "skipped: daily budget used" and not ran.exists()
     # The idle gate: nothing happened since its last run.
     p.db.x("UPDATE schedules SET budget_usd_day=NULL WHERE name='summary'")
@@ -354,7 +354,7 @@ def test_an_llm_precheck_is_not_run_when_an_earlier_gate_already_skipped(env, tm
     p.db.x("UPDATE messages SET ts=?", (time.time() - 2 * 86400,))
     p.db.x("UPDATE runs SET started=?, ended=?", (time.time() - 2 * 86400, time.time() - 2 * 86400))
     p.db.x("UPDATE schedules SET last_run=? WHERE name='summary'", (time.time() - 86400,))
-    _run(d)
+    _run_precheck_schedule(d)
     assert _summary(p)[0] == "skipped: nothing happened since the last run" and not ran.exists()
 
 
