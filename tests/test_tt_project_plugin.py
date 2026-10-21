@@ -1965,6 +1965,7 @@ def _mount_box(tmp_path, monkeypatch, answers=None, replies=None, alias="<box-al
     import subprocess
     bs, st = _storage(monkeypatch)
     import box
+    monkeypatch.setenv("TTP_HOME", str(tmp_path / "ttp-home"))   # no stable copy unless a test makes one
     site = tmp_path / "boxes.json"
     if not site.exists():
         site.write_text(json.dumps({"version": 1, "boxes": {alias: {
@@ -2101,6 +2102,68 @@ def test_setup_box_mount_ledger_probe_fits_the_change_ledger_contract(tmp_path, 
     site.write_text(json.dumps(data))
     rc, err = daemon_run()
     assert rc == 2 and "no first check" in err
+
+
+def test_setup_box_mount_probe_survives_a_plugin_upgrade_and_names_the_site_file(tmp_path, monkeypatch, capsys):
+    """The until-probe names the stable copy `ttp setup` installs (lib/current, unresolved), so an upgrade that
+    prunes the old version keeps it working (not exit 127), and the site file chosen through $TTP_BOXES_FILE by
+    its full path, so the daemon's environment does not change which box it reads. No stable copy: a note."""
+    import shutil
+    import subprocess
+    replies = [(0, _probe_out("b1", fstab=""), "")] * 3
+    run, _, site = _mount_box(tmp_path, monkeypatch, replies=replies, alias="box-a")
+    import box
+
+    def until_probe():
+        monkeypatch.setenv("TTP_BOXES_FILE", str(site))
+        assert box.main(["setup", "mount", "box-a"]) == 0       # no --site: the site file comes from the env
+        out = capsys.readouterr().out
+        argv = shlex.split(next(ln for ln in out.splitlines() if "ttp machines change add" in ln).split(": ", 1)[1])
+        return shlex.split(argv[9]), out
+    probe, out = until_probe()
+    assert probe[0] == str(BOX_PY.resolve()) and probe[1:3] == ["--site", str(site)]
+    assert "a plugin upgrade may remove" in out and "ttp machines change edit <id> --until-probe" in out
+    lib = tmp_path / "ttp-home" / "lib"
+    shutil.copytree(BOX_PY.parent.parent, lib / "0.0.1" / "skills" / "setup-box")
+    (lib / "current").symlink_to(lib / "0.0.1")
+    probe, out = until_probe()
+    assert probe[0] == str(lib / "current" / "skills" / "setup-box" / "scripts" / "box.py")
+    assert "may remove" not in out and probe[1:3] == ["--site", str(site)]
+    data = json.loads(site.read_text())
+    data["boxes"]["box-a"]["setup"]["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    site.write_text(json.dumps(data))
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text("#!/bin/bash\necho b1\n")
+    (bin_ / "ssh").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_BOXES_FILE", "TTP_HOME")}
+    env["PATH"] = f"{bin_}:/usr/bin:/bin"
+
+    def daemon_run():
+        return subprocess.run(shlex.join(probe), shell=True, capture_output=True, text=True, timeout=60,
+                              env=env).returncode
+    assert daemon_run() == 1
+    # An upgrade installs 0.0.2, re-points current and prunes 0.0.1: the same probe still answers.
+    shutil.copytree(lib / "0.0.1", lib / "0.0.2")
+    (lib / "current").unlink()
+    (lib / "current").symlink_to(lib / "0.0.2")
+    shutil.rmtree(lib / "0.0.1")
+    assert daemon_run() == 1
+
+
+def test_setup_box_rebooted_probe_reads_a_mid_boot_timeout_as_not_yet(tmp_path, monkeypatch, capsys):
+    """sshd accepting but stalling mid-boot past the probe's timeout (124) is not over and not a broken probe."""
+    replies = [(124, "", "timed out after 40s")]
+    run, calls, site = _mount_box(tmp_path, monkeypatch, replies=replies)
+    data = json.loads(site.read_text())
+    data["boxes"]["<box-alias>"]["setup"]["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    site.write_text(json.dumps(data))
+    assert run("mountcheck", "<box-alias>", "--rebooted") == 1
+    out, err = capsys.readouterr()
+    assert "pending" in out and "no answer" in out and not err and len(calls) == 1
+    replies.append((255, "", "ssh: connect: no route"))       # ssh failing stays 255, named on stderr
+    assert run("mountcheck", "<box-alias>", "--rebooted") == 255
+    assert "connection to <box-alias>" in capsys.readouterr().err
 
 
 def test_setup_box_mount_dry_run_live_values_sudo_refusal_and_the_ledger_line(tmp_path, monkeypatch, capsys):

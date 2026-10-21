@@ -43,6 +43,10 @@ box.py setup mount <box-alias> --run    # runs the root script with sudo -n, the
   script the dry run printed.
 - Record the live change in the same run, with the line `mount` prints:
   `ttp machines change add <box-alias> "<what>" --undo "<cmd>" --until-probe "box.py setup mountcheck <box-alias> --rebooted"`.
+  The probe names the stable copy `ttp setup` installs (`$TTP_HOME/lib/current`, which survives plugin
+  upgrades) and the site file by its full path, so it reads the same box wherever the daemon runs it.
+  Without that copy, `mount` says so: after `ttp setup`, re-point the entry with
+  `ttp machines change edit <id> --until-probe "<stable box.py> --site <file> setup mountcheck <box-alias> --rebooted"`.
   The undo unmounts and removes only what was added. A successful `--run` makes this boot the
   baseline the post-reboot check compares against.
 
@@ -62,9 +66,9 @@ mount came back, 1 no reboot yet, 2 failed after a reboot (or no first check), 1
 boot never passes it: only the next reboot does.
 
 - The change entry's `--until-probe` is `mountcheck --rebooted`, which reads only the boot id and
-  never the mount: 0 the box rebooted (the entry turns due, whatever the result), 1 not yet, 255 ssh
-  could not reach the box (it names the box on stderr, so the ledger counts it as down while it
-  reboots, not as a broken probe). No task waits for it; never reboot a shared box only to run it.
+  never the mount: 0 the box rebooted (the entry turns due, whatever the result), 1 not yet (also no
+  answer within 40 s, as when sshd accepts mid-boot), 255 ssh could not reach the box (it names the
+  box on stderr, so the ledger counts it as down while it reboots, not as a broken probe). No task waits for it; never reboot a shared box only to run it.
 - When the entry turns due, run `--after-reboot` and act on its exit. Never run the undo for a
   mount that is still wanted:
   - 0: keep the mount and close the entry (`ttp machines change close <id>`).
