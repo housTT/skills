@@ -13,7 +13,15 @@ The [README](../README.md#install) line runs `plugins/tt-project/install.sh`, wh
 
 A failed step for one tool does not stop the others; the installer lists failures and exits 1.
 
-Options, set on `sh` at the end of the line, e.g. `... | TT_PROJECT_REF=<tag> sh`:
+To install a release tag or branch, name it in the URL and in `TT_PROJECT_REF` (the README's `HEAD`
+URL works only once tt-project is on the default branch; until then curl reports a 404 and nothing
+is installed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/<tag>/plugins/tt-project/install.sh | TT_PROJECT_REF=<tag> sh
+```
+
+Options, set on `sh` at the end of the line:
 
 - `TT_PROJECT_REF`: a release tag, branch or commit; default the default branch. Rerunning with the
   same ref installs what it points at now: a branch or a moving release tag gives its latest commit,
@@ -21,7 +29,8 @@ Options, set on `sh` at the end of the line, e.g. `... | TT_PROJECT_REF=<tag> sh
 - `TT_PROJECT_REPO`: another git URL to install from, such as a fork or a local mirror.
 
 Rerun the line to update or switch refs; it updates the clone and the same entries in place.
-`sh <checkout>/plugins/tt-project/install.sh` installs the commit a checkout has.
+`sh <checkout>/plugins/tt-project/install.sh` installs the commit a checkout has; a downloaded
+`install.sh` run on its own fetches the ref like the piped line.
 
 ## Loading it
 

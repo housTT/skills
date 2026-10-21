@@ -4417,13 +4417,13 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     assert len(line) < 150, len(line)
     assert line == f"curl -fsSL {RAW_INSTALL_URL} | sh"
     script = (PLUGIN / "install.sh").read_text()
-    usage = [ln[2:] for ln in script.splitlines() if ln.startswith("# curl ")]
-    assert usage == [line]
+    usage = [ln[2:].strip() for ln in script.splitlines() if ln.startswith("# ") and ln[2:].strip().startswith("curl ")]
+    assert usage[0] == line and len(usage) == 2
     code = "\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
     assert "command -v git" in code and "sys.version_info < (3, 9)" in code
     assert "TT_PROJECT_REF" in code and "TT_PROJECT_REPO" in code
     doc = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
-    assert "`... | TT_PROJECT_REF=<tag> sh`" in doc and "`TT_PROJECT_REPO`" in doc
+    assert "`TT_PROJECT_REF`" in doc and "`TT_PROJECT_REPO`" in doc
     assert "Rerunning with the same ref installs what it points at now" in doc
     assert os.access(PLUGIN / "install.sh", os.X_OK)
 
@@ -4432,14 +4432,47 @@ def test_install_download_cut_short_does_nothing(install_env, tmp_path):
     """Piped from curl, a download cut off before the line that starts the work runs nothing."""
     import subprocess
     lines = (PLUGIN / "install.sh").read_text().splitlines(keepends=True)
-    start = next(i for i, ln in enumerate(lines) if ln.startswith("case $0 in"))
+    start = next(i for i, ln in enumerate(lines) if ln.startswith('if [ -f "$0" ]'))
     part = tmp_path / "part.sh"
-    part.write_text("".join(lines[:start + 1]))
     env = {"HOME": str(install_env.home), "PATH": str(install_env.home.parent / "bin"), "LC_ALL": "C",
            "TT_PROJECT_REPO": "file://" + str(install_env.repo)}
-    r = subprocess.run(["sh", "-c", f"cat {part} | sh"], env=env, capture_output=True, text=True, timeout=60)
-    assert r.returncode != 0 or r.stdout == ""
-    assert not (install_env.home / ".local").exists() and _calls(install_env.home) == []
+    line = lines[start].rstrip("\n")
+    assert line.endswith("; fi")
+    for cut in [0] + [i for i, c in enumerate(line) if c == " "] + [len(line) - 1]:    # cut anywhere in it
+        part.write_text("".join(lines[:start]) + line[:cut])
+        r = subprocess.run(["sh", "-c", f"cat {part} | sh"], env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0 or r.stdout == "", line[:cut]
+        assert not (install_env.home / ".local").exists() and _calls(install_env.home) == [], line[:cut]
+
+
+def test_install_line_url_ref_matches_the_ref_the_installer_fetches():
+    """The raw URL's ref and the ref install.sh fetches must agree: the README's HEAD line fetches the
+    default branch, and the release form names the same tag in the URL and in TT_PROJECT_REF (a HEAD
+    URL 404s while the default branch has no tt-project, whatever TT_PROJECT_REF says)."""
+    url_ref = re.fullmatch(r"https://raw\.githubusercontent\.com/tenstorrent/skills/([^ ]+)/plugins/tt-project/install\.sh",
+                           RAW_INSTALL_URL).group(1)
+    script = (PLUGIN / "install.sh").read_text()
+    assert re.findall(r'"\$\{TT_PROJECT_REF:-([^}]*)\}"', script) == [url_ref]
+    doc = (PLUGIN / "docs" / "install.md").read_text(encoding="utf-8")
+    release = re.findall(r"^curl -fsSL (\S+) \| TT_PROJECT_REF=(\S+) sh$", doc, re.M)
+    assert release == [(RAW_INSTALL_URL.replace(f"/{url_ref}/", "/<tag>/"), "<tag>")], release
+    usage = [ln[2:].strip() for ln in script.splitlines() if ln.startswith("# ") and ln[2:].strip().startswith("curl ")]
+    assert usage[1] == f"curl -fsSL {release[0][0]} | TT_PROJECT_REF=<tag> sh"
+
+
+def test_downloaded_install_sh_run_on_its_own_fetches_the_ref(install_env, tmp_path):
+    """`curl -o install.sh <url> && sh install.sh` is not in a checkout, so it fetches like the piped line."""
+    import shutil
+    import subprocess
+    dl = tmp_path / "dl"
+    dl.mkdir()
+    shutil.copy(PLUGIN / "install.sh", dl / "install.sh")
+    env = {"HOME": str(install_env.home), "PATH": str(install_env.home.parent / "bin"), "TMPDIR": str(install_env.tmp),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C",
+           "TT_PROJECT_REPO": "file://" + str(install_env.repo), "TT_PROJECT_REF": "v1"}
+    r = subprocess.run(["sh", "install.sh"], cwd=dl, env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _clone_head(install_env.home) == _head(install_env.repo, "v1")
 
 
 def _need_shell(shell: str) -> None:

@@ -13,7 +13,8 @@ Needs Python 3.9+, `git`, and Claude Code, Codex or Cursor. In a terminal:
 curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
 ```
 
-Rerun it to update, then start a new agent session. Release tags, manual steps and uninstall:
+Rerun it to update, then start a new agent session. Release tags (needed until tt-project is on the
+default branch), manual steps and uninstall:
 [docs/install.md](docs/install.md).
 
 ## Quick start

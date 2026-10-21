@@ -11,7 +11,11 @@
 #
 # curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
 #
-# Piped like that, it fetches TT_PROJECT_REF (a release tag, branch or commit; default: the default
+# HEAD is the default branch. To install a release tag (or branch), name it in the URL and here:
+#
+#   curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/<tag>/plugins/tt-project/install.sh | TT_PROJECT_REF=<tag> sh
+#
+# Piped like that (or downloaded and run with sh), it fetches TT_PROJECT_REF (a release tag, branch or commit; default: the default
 # branch) of TT_PROJECT_REPO (default: the public repository) into one clone kept at
 # $XDG_DATA_HOME/tt-project/skills (default ~/.local/share/tt-project/skills), then runs that
 # commit's own install.sh. `sh <checkout>/plugins/tt-project/install.sh` installs the commit that
@@ -66,10 +70,9 @@ fetch_and_run() {
     exec sh "$dest/plugins/$PLUGIN/install.sh"
 }
 
-case $0 in
-*install.sh) need ;;
-*) need; fetch_and_run ;;
-esac
+# Run from a checkout (this file sits in its plugins/tt-project): install that checkout. Otherwise
+# (piped, or downloaded and run on its own): fetch the ref. One `if`, so a cut-short line runs nothing.
+if [ -f "$0" ] && [ -f "$(dirname "$0")/bin/ttp" ]; then need; else need; fetch_and_run; fi
 
 src=$(cd "$(dirname "$0")/../.." && pwd -P)
 [ -f "$src/plugins/$PLUGIN/bin/ttp" ] || die "$src has no plugins/$PLUGIN; run install.sh from a checkout of the skills repository"
