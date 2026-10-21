@@ -1361,6 +1361,8 @@ class Project:
                 a, b = self.memory_dir / "archive" / f"{n}.md", self.memory_dir / f"{n}.md"
                 if a.exists() and not b.exists():
                     os.replace(a, b)
+            fsync_dir(self.memory_dir)
+            fsync_dir(self.memory_dir / "archive")
             self._reindex_memory(add=dropped, before=before, after=after)
         self.db.on_rollback(undo)
         if commit:
