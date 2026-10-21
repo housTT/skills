@@ -18,9 +18,13 @@ its recovery owner (else its fallback) runs an enabled heal check naming it, and
 check), it is covered when another project on this machine (a co-tenant) has an enabled heal check
 naming it that ran healthy within FRESH_INTERVALS of its interval: 'machine <alias> covered by <project>
 heal check'. A stale or unhealthy co-tenant check does not cover it. Other projects' databases are only
-read, read-only. Failing all of these, a machine with a known outage recorded (`ttp machines outage`)
-counts as covered until that outage ends: 'machine <alias> covered by a known outage'. A machine is
-missing only when no project checks it and no outage covers it. The rest the daemon
+read, read-only. Failing those, a recovery owner whose database cannot be read here (it runs on another
+host) is trusted as declared: 'machine <alias> covered by owner <project> (declared)'; an owner readable
+here with no such check stays a gap. Failing all of these, a machine with a known outage recorded
+(`ttp machines outage`) counts as covered until that outage ends: 'machine <alias> covered by a known
+outage', and one config health.exclude_machines lists ([{alias, reason}]) counts as opted out:
+'machine <alias> excluded: <reason>'. A machine is missing only when no project checks it, no owner is
+declared and no outage or exclusion covers it. The rest the daemon
 already watches by itself (a schedule failing twice queues its fix task, the push queue recovers dead
 batches, the PR watcher reads open PRs, a wait probe wakes its task when the remote job ends or its host
 is gone), so they are covered by `builtin`; open PRs need the built-in PR watcher schedule to be on.
@@ -136,6 +140,7 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
         down = machine_ledger.outages(now)
     except Exception:
         down = {}
+    skip = excluded_machines(cfg)
     for alias in machine_ledger.resource_machines(p):
         needles = [alias] + ([str(known[alias]["hostname"])] if (known.get(alias) or {}).get("hostname") else [])
         item = _mark_report_only({"kind": "machine", "name": alias, "covered_by": covering(needles, found)}, found)
@@ -143,10 +148,14 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
             via, checks = _owner_checks(p, known.get(alias) or {}, needles)
             if not checks:
                 via, checks = _cotenant_checks(p, needles, now)
+            if not checks:
+                via, checks = _declared_owner(p, known.get(alias) or {})
             if checks:
                 item.update(covered_by=checks, via=via)
             elif alias in down:
                 item.update(covered_by=["known outage"], via=OUTAGE_VIA)
+            elif alias in skip:
+                item.update(covered_by=[f"excluded: {skip[alias]}"], excluded=skip[alias])
         items.append(item)
     runners = ((cfg.get("device") or {}).get("runners") or {})
     for name in sorted(runners if isinstance(runners, dict) else {}):
@@ -248,6 +257,44 @@ def _owner_checks(p, rec: dict, needles: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def _declared_owner(p, rec: dict) -> tuple[str, list[str]]:
+    """('owner <project> (declared)', ['declared: recovery owner <project>']) when the machine's recovery owner
+    is another project whose database cannot be read here (it runs on another host, or is not registered on
+    this one), so its heal checks cannot be looked at; ("", []) otherwise. An owner readable here that runs
+    no heal check naming the machine stays a gap."""
+    who = str(rec.get("recovery_owner") or "")
+    if not who or who == p.name:
+        return "", []
+    base = dict(_projects(project.hostname())).get(who)
+    if base is not None and _readable(base):
+        return "", []
+    return f"owner {who} (declared)", [f"declared: recovery owner {who}"]
+
+
+def _readable(base: Path) -> bool:
+    """The project database at `base` opens read-only here."""
+    from . import globalcap
+    db_path = base / "state" / "project.db"
+    if not db_path.is_file():
+        return False
+    try:
+        globalcap.connect_ro(db_path).close()
+    except Exception:
+        return False
+    return True
+
+
+def excluded_machines(cfg: dict) -> dict[str, str]:
+    """{alias: reason} from config health.exclude_machines ([{alias, reason}]): machines this project opts out
+    of coverage for. An entry with no alias is ignored; one with no reason reads 'no reason given'."""
+    rows = (cfg.get("health") or {}).get("exclude_machines") if isinstance(cfg.get("health"), dict) else None
+    out: dict[str, str] = {}
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and str(r.get("alias") or "").strip():
+            out[str(r["alias"]).strip()] = str(r.get("reason") or "").strip() or "no reason given"
+    return out
+
+
 # Which healthy heal checks rule out each ledger condition: any check that reached the machine rules out
 # `down` (the only condition a route-failed or unknown outage check reports); only a broker check, which
 # reads the hold field itself, rules out `held`.
@@ -285,7 +332,7 @@ def check_cover(items: list[dict]) -> dict[str, list[str]]:
     """{this project's check: ['machine <alias>', ...]}: the inventory items each check covers."""
     out: dict[str, list[str]] = {}
     for i in items:
-        if not i.get("via"):
+        if not i.get("via") and "excluded" not in i:
             for c in i["covered_by"]:
                 if not c.startswith("builtin:"):
                     out.setdefault(c, []).append(f"{i['kind']} {i['name']}")
@@ -324,7 +371,8 @@ def line_of(items: list[dict]) -> str:
     gaps = missing(items)
     plain = report_only(items)
     notes = (([f"missing: {', '.join(gaps[:8])}{', …' if len(gaps) > 8 else ''}"] if gaps else []) + by_owner(items)
-             + ([f"report-only: {', '.join(plain[:8])}{', …' if len(plain) > 8 else ''}"] if plain else []))
+             + ([f"report-only: {', '.join(plain[:8])}{', …' if len(plain) > 8 else ''}"] if plain else [])
+             + [f"{i['kind']} {i['name']} excluded: {i['excluded']}" for i in items if "excluded" in i])
     return f"health coverage: {len(items) - len(gaps)}/{len(items)}" + (f" ({'; '.join(notes)})" if notes else "")
 
 

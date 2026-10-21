@@ -2873,3 +2873,57 @@ def test_health_coverage_counts_report_only_checks_named_by_schedule_and_known_o
     advice = rs.review_advice(me.db)
     assert "before that outage ends" in advice and "another project's heal check" not in advice
     assert rs.refresh(me, now=now + 3 * 3600)["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-b)"
+
+
+def test_health_coverage_trusts_a_recovery_owner_on_another_host_and_names_exclusions(env):
+    """A machine's recovery owner whose database is readable here covers it only with a heal check naming
+    it; an owner registered on another host (or not on this one) is trusted as declared; config
+    health.exclude_machines opts a machine out with its reason; no owner set stays a gap."""
+    from ttp import machines as mm
+    from ttp import project as pj
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    for a in ("box-a", "box-b", "box-c", "box-d"):
+        mm.add(a, tags="device")
+    me = make(env)
+    _resources(me, "Machines: box-a, box-b, box-c, box-d")
+    cfg = me.config()
+
+    def machine(name, c=cfg):
+        return next(i for i in rs.inventory(me, c) if i["kind"] == "machine" and i["name"] == name)
+
+    # Same-host owner: its heal check covers the machine; with no check it stays missing (no declared trust).
+    mm.set_recovery("box-a", owner="alpha")
+    alpha = _second_project(env, "alpha")
+    assert machine("box-a")["covered_by"] == []
+    sched.upsert(alpha.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true"}})
+    assert machine("box-a") == {"kind": "machine", "name": "box-a", "covered_by": ["alpha/box-a-up"],
+                                "via": "owner alpha"}
+    # Other-host owner (registered elsewhere) and an owner not registered here: covered as declared.
+    mm.set_recovery("box-b", owner="beta")
+    pj.register("beta", {"host": "other-host", "dir": str(env["tmp"] / "nowhere")})
+    assert machine("box-b") == {"kind": "machine", "name": "box-b", "covered_by": ["declared: recovery owner beta"],
+                                "via": "owner beta (declared)"}
+    mm.set_recovery("box-c", owner="gamma")
+    assert machine("box-c")["via"] == "owner gamma (declared)"
+    # This project as its own owner is no declared cover; no owner set is a real gap.
+    mm.set_recovery("box-c", owner=me.name)
+    assert machine("box-c")["covered_by"] == [] and machine("box-d")["covered_by"] == []
+    items = rs.inventory(me, cfg)
+    n = len(items)
+    assert rs.line_of(items) == (f"health coverage: {n - 2}/{n} (missing: machine box-c, machine box-d; "
+                                 f"machine box-a covered by owner alpha; machine box-b covered by owner beta (declared))")
+    assert "box-b" not in str(rs.check_cover(items))
+    # An explicit exclusion covers a machine with its reason; one with no alias is ignored.
+    ex = {**cfg, "health": {"exclude_machines": [{"alias": "box-d", "reason": "bench box, checked by hand"},
+                                                 {"reason": "no alias"}]}}
+    assert rs.excluded_machines(ex) == {"box-d": "bench box, checked by hand"}
+    assert machine("box-d", ex) == {"kind": "machine", "name": "box-d",
+                                    "covered_by": ["excluded: bench box, checked by hand"],
+                                    "excluded": "bench box, checked by hand"}
+    items = rs.inventory(me, ex)
+    line = rs.line_of(items)
+    assert line.startswith(f"health coverage: {n - 1}/{n} (missing: machine box-c;")
+    assert line.endswith("; machine box-d excluded: bench box, checked by hand)")
+    assert "box-d" not in str(rs.check_cover(items))
+    assert pj.unknown_key_hint("health.exclude_machines") is None

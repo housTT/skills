@@ -317,6 +317,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # untenanted_hold_s: how long a check may report a device held with no tenant before it pages, even
     # under a known machine outage or a mute.
     "heal": {"escalate": "user", "paused_quiet_s": 21600, "untenanted_hold_s": 14400},
+    # exclude_machines: [{alias, reason}], machines health coverage counts as opted out, named with the reason
+    # (responsibilities.excluded_machines).
+    "health": {"exclude_machines": []},
     # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
     # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
     # and the `restarts`-th in that window sends one high alert.
