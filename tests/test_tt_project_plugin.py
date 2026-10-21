@@ -1083,7 +1083,7 @@ def test_the_suite_declares_the_oldest_pytest_it_supports():
     assert _version(pytest.__version__) >= minimum
     ci = (root / ".github" / "workflows" / "validate.yml").read_text()
     pins = re.findall(r"\bpytest==([\d.]+)", ci)
-    assert len(pins) == 2   # the main job's and the Python 3.9 job's
+    assert len(pins) == 3   # the main job's, the Python 3.9 job's and the macOS job's
     for pin in pins:
         assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
     # The runtime's stated minimum Python runs the required suite on CI too.
@@ -1092,6 +1092,19 @@ def test_the_suite_declares_the_oldest_pytest_it_supports():
     assert 'python-version": "3.9"' in steps
     assert all(f in steps for f in ("tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py",
                                     "tests/test_plugin_catalogue.py"))
+
+
+def test_the_macos_ci_job_runs_existing_launchd_and_service_tests():
+    # The macOS job names its tt-project tests by id: a renamed test would otherwise drop out quietly.
+    root = pathlib.Path(__file__).resolve().parents[1]
+    job = yaml.safe_load((root / ".github" / "workflows" / "validate.yml").read_text())["jobs"]["macos-launcher"]
+    run = next(s["run"] for s in job["steps"] if "launchd" in s.get("name", ""))
+    ids = [w for w in run.split() if "::" in w]
+    assert any("launchd" in i for i in ids) and len(ids) >= 10
+    for test_id in ids:
+        path, name = test_id.split("::")
+        files = [root / path] + sorted((root / "tests" / "tt_project_runtime").glob("*_cases.py"))
+        assert any(re.search(rf"^def {name}\(", f.read_text(), re.M) for f in files), test_id
 
 
 def test_the_test_runner_summary_line_is_stable_and_greppable():
